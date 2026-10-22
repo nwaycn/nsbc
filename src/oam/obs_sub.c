@@ -378,3 +378,11 @@ int obs_sub_publish_metrics(const char *fmt, ...)
     if (n >= OBS_FRAME_MAX - 1) n = OBS_FRAME_MAX - 2;
     return obs_sub_publish(g_sub_hub, OBS_TOPIC_METRICS, "%s\n", frame);
 }
+
+/*
+    Author:       李浩 (Li Hao)
+    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
+    Email:        1354608370@qq.com
+    Licensed:     Apache License 2.0
+    Copyright:    2024-2026
+*/

@@ -1,5 +1,9 @@
 # ============================================================
 # NSBC unified config file (shared by nsbcd + nsbc-web)
+#
+# Copyright 2024-2026 李浩 (Li Hao), 上海宁卫信息技术有限公司
+# Contact: 1354608370@qq.com
+# Licensed under the Apache License, Version 2.0. See LICENSE in project root.
 # ============================================================
 #
 # [Deployment conventions]

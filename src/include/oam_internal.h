@@ -16,3 +16,11 @@ void reload_commands_register(cmd_reg_t *reg);
 void call_commands_register(cmd_reg_t *reg, nsbc_ctx_t *ctx);
 
 #endif
+
+/*
+    Author:       李浩 (Li Hao)
+    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
+    Email:        1354608370@qq.com
+    Licensed:     Apache License 2.0
+    Copyright:    2024-2026
+*/

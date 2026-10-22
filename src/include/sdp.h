@@ -183,3 +183,11 @@ const sdp_attr_t *sdp_attr_find(const sdp_attr_t *a, int n,
 nsbc_rc_t sdp_static_pt_lookup(int pt, sip_tok_t *enc, sip_tok_t *rate);
 
 #endif /* NSBC_SDP_H */
+
+/*
+    Author:       李浩 (Li Hao)
+    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
+    Email:        1354608370@qq.com
+    Licensed:     Apache License 2.0
+    Copyright:    2024-2026
+*/

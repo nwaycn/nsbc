@@ -90,3 +90,11 @@ int topo_strip_header(sip_msg_t *msg, sip_hdr_type_t ht)
      * 当前只完成存在性扫描，返回 NOTSUP 提示调用方未真正改写。 */
     return NSBC_NOTSUP;
 }
+
+/*
+    Author:       李浩 (Li Hao)
+    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
+    Email:        1354608370@qq.com
+    Licensed:     Apache License 2.0
+    Copyright:    2024-2026
+*/

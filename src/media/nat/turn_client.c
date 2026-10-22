@@ -117,3 +117,11 @@ int turn_relay_addr(const turn_sess_t *t, nsbc_sa_t *out)
     /* TODO：Allocate 成功响应的 XOR-RELAYED-ADDRESS 回填 */
     return NSBC_NOTSUP;
 }
+
+/*
+    Author:       李浩 (Li Hao)
+    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
+    Email:        1354608370@qq.com
+    Licensed:     Apache License 2.0
+    Copyright:    2024-2026
+*/

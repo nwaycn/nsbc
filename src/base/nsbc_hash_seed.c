@@ -22,3 +22,11 @@ uint64_t nsbc_hash_seed(void)
     uint64_t old = sat_cas(&g_seed, 0, s);
     return old == 0 ? s : old;
 }
+
+/*
+    Author:       李浩 (Li Hao)
+    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
+    Email:        1354608370@qq.com
+    Licensed:     Apache License 2.0
+    Copyright:    2024-2026
+*/

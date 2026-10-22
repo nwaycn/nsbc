@@ -85,3 +85,11 @@ nsbc_rc_t sip_parse_params(sip_param_t *out, int cap, const char *p,
 nsbc_rc_t sip_parse_firstline(sip_msg_t *m, const char *p, const char *end);
 
 #endif /* NSBC_SIP_COMMON_H */
+
+/*
+    Author:       李浩 (Li Hao)
+    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
+    Email:        1354608370@qq.com
+    Licensed:     Apache License 2.0
+    Copyright:    2024-2026
+*/

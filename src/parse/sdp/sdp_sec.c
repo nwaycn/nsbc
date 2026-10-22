@@ -88,3 +88,11 @@ int sdp_media_is_legacy_hold(const sdp_t *s, const sdp_media_t *m)
     return (c->addr.len == 7 && memcmp(c->addr.p, "0.0.0.0", 7) == 0) ||
            (c->addr.len == 2 && memcmp(c->addr.p, "::", 2) == 0);
 }
+
+/*
+    Author:       李浩 (Li Hao)
+    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
+    Email:        1354608370@qq.com
+    Licensed:     Apache License 2.0
+    Copyright:    2024-2026
+*/

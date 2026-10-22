@@ -1,5 +1,10 @@
 // =============================================================================
 // NSBC Web — Core层
+//
+// Copyright 2024-2026 李浩 (Li Hao), 上海宁卫信息技术有限公司
+// Contact: 1354608370@qq.com
+// Licensed under the Apache License, Version 2.0. See LICENSE in project root.
+//
 // 包含：API wrapper、结构化Edit器、Vue App Create、CRUD/Live 工厂
 // 加载顺序：必须在 vendor/*.js 之后，pages/*.js 之前
 // =============================================================================

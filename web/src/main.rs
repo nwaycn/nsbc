@@ -1,5 +1,9 @@
 //! NSBC Web management sidecar (REQ-WEB-001~021, P0 skeleton)
 //!
+//! Copyright 2024-2026 李浩 (Li Hao), 上海宁卫信息技术有限公司
+//! Contact: 1354608370@qq.com
+//! Licensed under the Apache License, Version 2.0. See LICENSE in project root.
+//!
 //! Isolation principle (REQ-WEB-001/013): separate process / separate account /
 //! separate dependency tree; access to the core is only through the REST API
 //! (REQ-OAM-001) and the real-time control protocol (REQ-OAM-004). Faults,

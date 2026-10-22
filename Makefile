@@ -1,5 +1,9 @@
 # NSBC core daemon build (REQ-ENV/LANG: Linux x86_64, GCC 4.8 compatible)
 # =====================================================================
+# Copyright 2024-2026 李浩 (Li Hao), 上海宁卫信息技术有限公司
+# Contact: 1354608370@qq.com
+# Licensed under the Apache License, Version 2.0. See LICENSE in project root.
+# =====================================================================
 # FreeSWITCH-style dual control:
 #   build-time  ./configure [--with-modules=a,b,c] [--without-modules=x,y,z]
 #           reads conf/modules.conf -> splits into STATIC/DYNAMIC groups

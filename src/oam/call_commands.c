@@ -1576,3 +1576,11 @@ void call_commands_register(cmd_reg_t *reg, nsbc_ctx_t *ctx)
             llog(LOG_WARN, "oam", "cmd '%s' register rc=%d", descs[i].name, rc);
     }
 }
+
+/*
+    Author:       李浩 (Li Hao)
+    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
+    Email:        1354608370@qq.com
+    Licensed:     Apache License 2.0
+    Copyright:    2024-2026
+*/

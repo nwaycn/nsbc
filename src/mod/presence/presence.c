@@ -236,3 +236,11 @@ static int presence_init(struct nsbc_ctx *ctx)
 }
 
 NSBC_MOD0_CAT(presence, 1, MOD_L_FINAL, 0, MOD_CAT_UTILITY, presence_init, NULL);
+
+/*
+    Author:       李浩 (Li Hao)
+    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
+    Email:        1354608370@qq.com
+    Licensed:     Apache License 2.0
+    Copyright:    2024-2026
+*/

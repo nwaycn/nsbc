@@ -249,3 +249,11 @@ int shm_validate(shm_seg_t *seg, uint64_t *epoch, uint32_t *crc)
         *crc = h->crc;
     return NSBC_OK;
 }
+
+/*
+    Author:       李浩 (Li Hao)
+    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
+    Email:        1354608370@qq.com
+    Licensed:     Apache License 2.0
+    Copyright:    2024-2026
+*/

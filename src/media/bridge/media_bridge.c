@@ -1,3 +1,11 @@
+/*
+ * NSBC media bridge — RTP relay, DTLS-SRTP, SDP rewrite, transcoding orchestration.
+ * Copyright 2024-2026 李浩 (Li Hao), 上海宁卫信息技术有限公司
+ * Contact: 1354608370@qq.com
+ *
+ * Licensed under the Apache License, Version 2.0. See LICENSE in project root.
+ */
+
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -3568,3 +3576,11 @@ nsbc_sa_t rtp_relay_latch_addr(const rtp_relay_t *r, int side)
     if (!r || side < 0 || side > 1 || !r->latched[side]) return empty;
     return r->latch[side];
 }
+
+/*
+    Author:       李浩 (Li Hao)
+    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
+    Email:        1354608370@qq.com
+    Licensed:     Apache License 2.0
+    Copyright:    2024-2026
+*/

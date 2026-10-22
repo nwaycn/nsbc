@@ -855,3 +855,11 @@ int gw_table_reload_json(const char *json, char *out_err, size_t err_sz)
 { (void)json; if (out_err) snprintf(out_err, err_sz, "not implemented"); return NSBC_ERR; }
 
 /* nsbcm_dialplan 定义在 src/mod/dialplans/dialplan.c，本文件不重复定义 */
+
+/*
+    Author:       李浩 (Li Hao)
+    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
+    Email:        1354608370@qq.com
+    Licensed:     Apache License 2.0
+    Copyright:    2024-2026
+*/

@@ -3,6 +3,8 @@ name = "nsbc-web"
 version = "2.5.5"
 edition = "2021"
 description = "NSBC Web management sidecar (REQ-WEB-001~021, deployed separately from the core process)"
+authors = ["李浩 <1354608370@qq.com>", "上海宁卫信息技术有限公司"]
+license = "Apache-2.0"
 publish = false
 
 [[bin]]

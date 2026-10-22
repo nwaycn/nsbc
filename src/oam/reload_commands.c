@@ -157,3 +157,11 @@ void reload_commands_register(cmd_reg_t *reg)
     for (size_t i = 0; i < sizeof(descs)/sizeof(descs[0]); ++i)
         cmd_register(reg, &descs[i]);
 }
+
+/*
+    Author:       李浩 (Li Hao)
+    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
+    Email:        1354608370@qq.com
+    Licensed:     Apache License 2.0
+    Copyright:    2024-2026
+*/

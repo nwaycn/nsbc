@@ -282,3 +282,11 @@ int codec_fmtp_negotiate(codec_id_t id, const char *offer, const char *answer,
     (void)answer;
     return NSBC_NOTSUP;
 }
+
+/*
+    Author:       李浩 (Li Hao)
+    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
+    Email:        1354608370@qq.com
+    Licensed:     Apache License 2.0
+    Copyright:    2024-2026
+*/

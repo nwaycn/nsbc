@@ -412,6 +412,8 @@ We welcome contributions. Before opening a PR, please:
 
 NSBC is licensed under the **Apache License, Version 2.0**. See [LICENSE](LICENSE) for the full text.
 
+**Copyright 2024-2026 李浩 (Li Hao)** · 上海宁卫信息技术有限公司 · 1354608370@qq.com
+
 The vendored third-party dependencies under `3rd/` retain their own licenses:
 - `bcg729` — GNU LGPL v2.1 (see `3rd/bcg729/LICENSE`)
 - `cJSON` — MIT (see `3rd/cjson/LICENSE`)

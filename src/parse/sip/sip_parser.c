@@ -175,3 +175,11 @@ sip_hdr_t *sip_hdr_next(const sip_msg_t *m, const sip_hdr_t *h)
     const sip_hdr_t *n = h + (h->next_same - (int)(h - m->hdrs));
     return (sip_hdr_t *)n;
 }
+
+/*
+    Author:       李浩 (Li Hao)
+    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
+    Email:        1354608370@qq.com
+    Licensed:     Apache License 2.0
+    Copyright:    2024-2026
+*/

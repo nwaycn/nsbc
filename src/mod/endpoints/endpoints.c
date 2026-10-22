@@ -553,3 +553,11 @@ static void ep_fini(struct nsbc_ctx *ctx)
 /* signaling 依赖本模块：在 WORKER_READY 层初始化，早于 FINAL 的 signaling */
 NSBC_MOD0_CAT(endpoints, 1, MOD_L_WORKER_READY, MOD_F_REQUIRED, MOD_CAT_ENDPOINT, ep_init,
           ep_fini);
+
+/*
+    Author:       李浩 (Li Hao)
+    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
+    Email:        1354608370@qq.com
+    Licensed:     Apache License 2.0
+    Copyright:    2024-2026
+*/

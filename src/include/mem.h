@@ -225,3 +225,11 @@ uint64_t mem_rcu_reclaimed(const mem_rcu_t *r);
 void mem_rcu_retire_obj(mem_rcu_t *r, void *obj);
 
 #endif /* NSBC_MEM_H */
+
+/*
+    Author:       李浩 (Li Hao)
+    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
+    Email:        1354608370@qq.com
+    Licensed:     Apache License 2.0
+    Copyright:    2024-2026
+*/

@@ -176,3 +176,11 @@ int dp_execute(const dp_ctx_t *ctx, const dp_call_t *call, dp_result_t *res);
 const dp_rule_t *dp_find_immediate(const dp_ctx_t *ctx, const char *digits);
 
 #endif /* NSBC_DIALPLAN_H */
+
+/*
+    Author:       李浩 (Li Hao)
+    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
+    Email:        1354608370@qq.com
+    Licensed:     Apache License 2.0
+    Copyright:    2024-2026
+*/

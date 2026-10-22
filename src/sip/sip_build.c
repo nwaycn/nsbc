@@ -261,3 +261,11 @@ int sip_build_request(char *buf, size_t cap, const sip_req_spec_t *s)
         sipb_catn(&b, s->body, s->bodylen);
     return b.overflow ? NSBC_NOSPC : (int)b.len;
 }
+
+/*
+    Author:       李浩 (Li Hao)
+    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
+    Email:        1354608370@qq.com
+    Licensed:     Apache License 2.0
+    Copyright:    2024-2026
+*/

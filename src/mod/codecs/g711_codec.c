@@ -72,3 +72,11 @@ void g711_pcm16_to_ulaw(const int16_t *in, uint8_t *out, size_t n)
 {
     for (size_t i = 0; i < n; ++i) out[i] = pcm_to_ulaw(in[i]);
 }
+
+/*
+    Author:       李浩 (Li Hao)
+    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
+    Email:        1354608370@qq.com
+    Licensed:     Apache License 2.0
+    Copyright:    2024-2026
+*/

@@ -163,3 +163,11 @@ int cfg_secret_decrypt_gcm(const char *b64, char *out, size_t outsz)
     return NSBC_NOTSUP; /* P0 生产构建必须带 NSBC_WITH_OPENSSL */
 }
 #endif
+
+/*
+    Author:       李浩 (Li Hao)
+    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
+    Email:        1354608370@qq.com
+    Licensed:     Apache License 2.0
+    Copyright:    2024-2026
+*/

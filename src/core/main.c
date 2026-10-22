@@ -1,3 +1,11 @@
+/*
+ * NSBC core daemon entry — FreeSWITCH-style module loader + reactor main loop.
+ * Copyright 2024-2026 李浩 (Li Hao), 上海宁卫信息技术有限公司
+ * Contact: 1354608370@qq.com
+ *
+ * Licensed under the Apache License, Version 2.0. See LICENSE in project root.
+ */
+
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -798,3 +806,11 @@ shutdown_failed:
     unlink("/var/run/nsbc/nsbcd.pid");
     return 1;
 }
+
+/*
+    Author:       李浩 (Li Hao)
+    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
+    Email:        1354608370@qq.com
+    Licensed:     Apache License 2.0
+    Copyright:    2024-2026
+*/

@@ -1,3 +1,11 @@
+/*
+ * NSBC B2BUA core — SIP dialog state machine, call session lifecycle.
+ * Copyright 2024-2026 李浩 (Li Hao), 上海宁卫信息技术有限公司
+ * Contact: 1354608370@qq.com
+ *
+ * Licensed under the Apache License, Version 2.0. See LICENSE in project root.
+ */
+
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -6822,3 +6830,11 @@ void b2b_media_view_hook_rm(b2b_media_view_fn fn, void *ud)
     g_mv_hook_n = out;
     pthread_mutex_unlock(&g_mv_hook_lock);
 }
+
+/*
+    Author:       李浩 (Li Hao)
+    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
+    Email:        1354608370@qq.com
+    Licensed:     Apache License 2.0
+    Copyright:    2024-2026
+*/

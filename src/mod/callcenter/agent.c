@@ -236,3 +236,11 @@ static void agent_pool_mod_fini(struct nsbc_ctx *ctx)
 
 NSBC_MOD0_CAT(agent_pool, 1, MOD_L_NET_READY, MOD_F_REQUIRED, MOD_CAT_CALL_CENTER,
           agent_pool_mod_init, agent_pool_mod_fini);
+
+/*
+    Author:       李浩 (Li Hao)
+    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
+    Email:        1354608370@qq.com
+    Licensed:     Apache License 2.0
+    Copyright:    2024-2026
+*/

@@ -33,3 +33,11 @@ int nsbc_wall_iso8601(char *out, size_t outsz)
                      (aoff % 3600) / 60);
     return (n > 0 && (size_t)n < outsz) ? NSBC_OK : NSBC_NOMEM;
 }
+
+/*
+    Author:       李浩 (Li Hao)
+    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
+    Email:        1354608370@qq.com
+    Licensed:     Apache License 2.0
+    Copyright:    2024-2026
+*/

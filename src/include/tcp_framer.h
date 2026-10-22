@@ -43,3 +43,11 @@ int tcp_framer_feed(tcp_framer_t *f, const uint8_t *data, size_t len,
 #define TCP_KEEPALIVE "\r\n\r\n"
 
 #endif /* NSBC_TCP_FRAMER_H */
+
+/*
+    Author:       李浩 (Li Hao)
+    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
+    Email:        1354608370@qq.com
+    Licensed:     Apache License 2.0
+    Copyright:    2024-2026
+*/

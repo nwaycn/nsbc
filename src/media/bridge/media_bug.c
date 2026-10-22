@@ -450,3 +450,11 @@ int media_bug_registry_count(void)
 {
     return __atomic_load_n(&g_mb_ops_count, __ATOMIC_ACQUIRE);
 }
+
+/*
+    Author:       李浩 (Li Hao)
+    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
+    Email:        1354608370@qq.com
+    Licensed:     Apache License 2.0
+    Copyright:    2024-2026
+*/

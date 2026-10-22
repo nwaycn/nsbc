@@ -177,3 +177,11 @@ static void billing_fini(struct nsbc_ctx *ctx)
 }
 
 NSBC_MOD0_CAT(billing, 1, MOD_L_FINAL, 0, MOD_CAT_BILLING, billing_init, billing_fini);
+
+/*
+    Author:       李浩 (Li Hao)
+    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
+    Email:        1354608370@qq.com
+    Licensed:     Apache License 2.0
+    Copyright:    2024-2026
+*/

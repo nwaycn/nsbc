@@ -179,3 +179,11 @@ int vm_delete(vm_store_t *s, const char *tenant, const char *ext, int idx)
                                 b->n_new, b->n_total);
     return NSBC_OK;
 }
+
+/*
+    Author:       李浩 (Li Hao)
+    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
+    Email:        1354608370@qq.com
+    Licensed:     Apache License 2.0
+    Copyright:    2024-2026
+*/

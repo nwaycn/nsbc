@@ -17,3 +17,11 @@ nsbc_rc_t rtp_parse_dtmf(const uint8_t *buf, size_t len, rtp_dtmf_t *d)
     d->duration = rtp_rd16(buf + 2);
     return NSBC_OK;
 }
+
+/*
+    Author:       李浩 (Li Hao)
+    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
+    Email:        1354608370@qq.com
+    Licensed:     Apache License 2.0
+    Copyright:    2024-2026
+*/

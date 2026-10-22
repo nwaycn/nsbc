@@ -122,3 +122,11 @@ static void oam_stop(struct nsbc_ctx *ctx)
 static const char *oam_deps[] = {"signaling"};
 NSBC_MOD_CAT(oam, 1, MOD_L_FINAL, MOD_F_REQUIRED, MOD_CAT_OBSERVABILITY, oam_deps, oam_init, oam_start,
          oam_stop, NULL);
+
+/*
+    Author:       李浩 (Li Hao)
+    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
+    Email:        1354608370@qq.com
+    Licensed:     Apache License 2.0
+    Copyright:    2024-2026
+*/

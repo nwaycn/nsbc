@@ -175,3 +175,11 @@ int tcp_framer_feed(tcp_framer_t *f, const uint8_t *data, size_t len,
      * 只有单包超缓冲这类资源错误才以返回值上报 */
     return NSBC_OK;
 }
+
+/*
+    Author:       李浩 (Li Hao)
+    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
+    Email:        1354608370@qq.com
+    Licensed:     Apache License 2.0
+    Copyright:    2024-2026
+*/

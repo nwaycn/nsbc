@@ -412,6 +412,8 @@ nsbc_cli metrics             # dump 内部 metric registry
 
 NSBC 基于 **Apache License 2.0** 发布，详见 [LICENSE](LICENSE)。
 
+**版权所有 © 2024-2026 李浩** · 上海宁卫信息技术有限公司 · 1354608370@qq.com
+
 `3rd/` 下 vendored 第三方依赖保留其自有许可证：
 - `bcg729` —— GNU LGPL v2.1（见 `3rd/bcg729/LICENSE`）
 - `cJSON` —— MIT（见 `3rd/cjson/LICENSE`）

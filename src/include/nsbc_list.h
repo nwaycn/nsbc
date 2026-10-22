@@ -63,3 +63,11 @@ static inline void nsbc_hnode_init(nsbc_hnode_t *h) { h->next = NULL; }
     for ((pos) = (head); (pos) != NULL; (pos) = (pos)->next)
 
 #endif /* NSBC_LIST_H */
+
+/*
+    Author:       李浩 (Li Hao)
+    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
+    Email:        1354608370@qq.com
+    Licensed:     Apache License 2.0
+    Copyright:    2024-2026
+*/

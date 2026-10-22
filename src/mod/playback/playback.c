@@ -256,3 +256,11 @@ NSBC_MOD(playback,         /* name */
          NULL,             /* start：engine_start 在 init 内完成 */
          NULL,             /* stop */
          pb_fini);         /* fini */
+
+/*
+    Author:       李浩 (Li Hao)
+    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
+    Email:        1354608370@qq.com
+    Licensed:     Apache License 2.0
+    Copyright:    2024-2026
+*/

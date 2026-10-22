@@ -317,3 +317,11 @@ double mem_arena_frag_rate(const mem_arena_t *a)
         return 0.0;
     return 1.0 - (double)mem_arena_largest_free(a) / (double)free_total;
 }
+
+/*
+    Author:       李浩 (Li Hao)
+    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
+    Email:        1354608370@qq.com
+    Licensed:     Apache License 2.0
+    Copyright:    2024-2026
+*/
