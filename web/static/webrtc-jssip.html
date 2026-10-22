@@ -1,0 +1,1043 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NSBC WebRTC 视频通话</title>
+<script src="js/jssip-3.10.0.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: -apple-system, Segoe UI, 'PingFang SC', sans-serif;
+         background: linear-gradient(135deg, #0f172a 0%, #1e3a5f 100%);
+         min-height: 100vh; color: #e2e8f0; }
+  .wrap { max-width: 1200px; margin: 0 auto; padding: 20px; }
+  h1 { font-size: 22px; margin: 0 0 16px 0; }
+  h1 .tag { font-size: 11px; background:#2563eb; padding:2px 8px; border-radius:10px; margin-left:8px; }
+  .grid { display:grid; grid-template-columns: 1fr 1fr; gap:16px; margin-bottom:16px; }
+  .card { background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1);
+          border-radius:12px; padding:16px; backdrop-filter: blur(10px); }
+  .card h3 { margin:0 0 12px 0; font-size:14px; color:#94a3b8; font-weight:500; text-transform:uppercase; letter-spacing:1px; }
+  .row { display:flex; gap:12px; align-items:center; margin-bottom:10px; }
+  .row label { width:90px; font-size:13px; color:#cbd5e1; flex-shrink:0; }
+  .row input { flex:1; background:rgba(0,0,0,0.3); border:1px solid rgba(255,255,255,0.15);
+               border-radius:8px; padding:8px 12px; color:#e2e8f0; font-size:14px; outline:none; }
+  .row input:focus { border-color:#3b82f6; }
+  .row input[disabled] { opacity:0.5; cursor:not-allowed; }
+  .btn { padding:8px 18px; border-radius:8px; border:none; font-size:13px; font-weight:500;
+         cursor:pointer; transition: all .15s; }
+  .btn:disabled { opacity:0.4; cursor:not-allowed; }
+  .btn-blue { background:#3b82f6; color:#fff; }  .btn-blue:hover:not(:disabled){ background:#2563eb; }
+  .btn-green{ background:#10b981; color:#fff; }  .btn-green:hover:not(:disabled){ background:#059669; }
+  .btn-red  { background:#ef4444; color:#fff; }  .btn-red:hover:not(:disabled){ background:#dc2626; }
+  .btn-gray { background:#475569; color:#fff; }  .btn-gray:hover:not(:disabled){ background:#334155; }
+  .status { font-size:13px; }
+  .status.ok { color:#4ade80; } .status.err { color:#f87171; }
+  .videos { display:grid; grid-template-columns: 1fr 1fr; gap:12px; }
+  .video-box { position:relative; aspect-ratio: 4/3; background:#000; border-radius:10px; overflow:hidden; border:1px solid rgba(255,255,255,0.1); }
+  .video-box video { width:100%; height:100%; object-fit:cover; }
+  .video-box .lbl { position:absolute; bottom:8px; left:8px; font-size:11px;
+                    background:rgba(0,0,0,0.6); padding:2px 8px; border-radius:4px; color:#94a3b8; }
+  .video-box .dot { display:inline-block; width:6px; height:6px; border-radius:50%; margin-right:4px; }
+  .video-box .dot.on { background:#4ade80; box-shadow:0 0 6px #4ade80; }
+  .video-box .dot.off { background:#64748b; }
+  .incoming { background:rgba(234,179,8,0.1); border:1px solid #eab308; border-radius:10px;
+              padding:12px 16px; display:none; align-items:center; justify-content:space-between; }
+  .incoming.show { display:flex; }
+  .incoming .from { font-weight:600; color:#fbbf24; }
+  .dc-area { display:flex; gap:8px; margin-bottom:8px; }
+  .dc-area input { flex:1; }
+  .dc-log { height:160px; overflow-y:auto; background:rgba(0,0,0,0.3); border-radius:8px;
+            padding:8px; font-family: 'JetBrains Mono', monospace; font-size:12px; }
+  .dc-log .in  { color:#60a5fa; }
+  .dc-log .out { color:#a78bfa; }
+  .dc-log .sys { color:#64748b; }
+  .sip-log { height:200px; overflow-y:auto; background:#0a0f1a; border-radius:8px; padding:10px;
+             font-family: 'JetBrains Mono', monospace; font-size:12px; line-height:1.6; }
+  .sip-log .ts { color:#475569; }
+  .sip-log .ok { color:#4ade80; }
+  .sip-log .err { color:#f87171; }
+  .sip-log .info { color:#93c5fd; }
+  .sip-log .warn { color:#fbbf24; }
+  .sip-log .tx { color:#f472b6; }
+  .sip-log .rx { color:#34d399; }
+  .controls { display:flex; gap:8px; margin-top:10px; }
+  .toolbar { display:flex; gap:6px; flex-wrap:wrap; }
+  .toolbar button { padding:4px 12px; font-size:12px; }
+
+  .ring { animation: ring 0.6s ease-in-out infinite; }
+  @keyframes ring { 0%,100%{ transform:rotate(-3deg);} 50%{ transform:rotate(3deg);} }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>NSBC WebRTC 视频通话 <span class="tag">独立页面 · JsSIP + WSS</span></h1>
+
+  <div class="grid">
+
+    <div class="card">
+      <h3>SIP 账号</h3>
+      <div class="row"><label>WSS 服务器</label><input id="wss" value="" placeholder="自动从 URL 推导"></div>
+      <div class="row"><label>STUN</label><input id="stun" value="" placeholder="自动从 URL 推导"></div>
+      <div class="row"><label>分机号</label><input id="user" value="1000"></div>
+      <div class="row"><label>密码</label><input id="pass" type="password" value=""></div>
+      <div class="row"><label>Realm / 租户</label><input id="realm" value="nsbc.local" placeholder="nsbc.local · SIP 域 / 租户名"></div>
+      <div class="row">
+        <button class="btn btn-green" id="btnReg" onclick="doRegister()">▶ Register</button>
+        <button class="btn btn-red"   id="btnUnreg" onclick="doUnregister()" disabled>Unregister</button>
+        <span class="status" id="regStatus">未注册</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>视频</h3>
+      <div class="videos">
+        <div class="video-box">
+          <video id="localVideo" autoplay muted playsinline></video>
+          <div class="lbl"><span class="dot off" id="localDot"></span>本地</div>
+        </div>
+        <div class="video-box">
+          <video id="remoteVideo" autoplay playsinline></video>
+          <div class="lbl"><span class="dot off" id="remoteDot"></span>远端</div>
+        </div>
+      </div>
+      <div class="toolbar">
+        <button class="btn btn-gray" onclick="muteAudio()" id="btnMute">🔊 Mute</button>
+        <button class="btn btn-gray" onclick="stopVideo()" id="btnStopVid">📷 Stop Video</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="incoming" id="incoming">
+    <div>📞 来电: <span class="from" id="inFrom">—</span> <span class="ring">🔔</span></div>
+    <div>
+      <button class="btn btn-green" onclick="doAccept()" style="margin-right:6px">Accept</button>
+      <button class="btn btn-red"   onclick="doReject()">Reject</button>
+    </div>
+  </div>
+
+  <div class="grid" style="margin-top:16px">
+
+    <div class="card">
+      <h3>呼叫</h3>
+      <div class="row"><label>被叫</label><input id="target" value="1001"></div>
+      <div class="row">
+        <button class="btn btn-green" id="btnCall" onclick="doCall()" disabled>📞 Call</button>
+        <button class="btn btn-red"   id="btnHang" onclick="doHangup()" disabled>✕ Hangup</button>
+        <span class="status" id="callStatus">空闲</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>DataChannel</h3>
+      <div class="dc-area">
+        <input id="dcMsg" placeholder="输入消息，回车发送..." disabled onkeydown="if(event.key==='Enter') dcSend()">
+        <button class="btn btn-blue" onclick="dcSend()" id="btnDc" disabled>Send</button>
+      </div>
+      <div class="dc-log" id="dcLog"><div class="sys">等待 DataChannel open...</div></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <h3>SIP 实时日志</h3>
+    <div class="sip-log" id="sipLog"></div>
+  </div>
+
+</div>
+<script>
+/* global JsSIP */
+// =============================================================================
+// NSBC WebRTC — JsSIP 3.10.x 终极修复版（修正重复/顺序错误）
+// =============================================================================
+
+const $ = (id) => document.getElementById(id);
+let ua = null;
+let currentSession = null;
+let pendingSession = null;
+let localStream = null;
+let remoteStream = null;
+let dc = null, dcOpen = false;
+let isHangingUp = false;
+// ===== Realm / 租户动态化 =====
+function getSipDomain() {
+  const dom = document.getElementById('realm');
+  if (dom && dom.value && dom.value.trim()) {
+    const v = dom.value.trim();
+    try { localStorage.setItem('nsbc_sip_domain', v); } catch(_) {}
+    return v;
+  }
+  return localStorage.getItem('nsbc_sip_domain') || 'nsbc.local';
+}
+Object.defineProperty(window, 'SIP_DOMAIN', { get: getSipDomain, configurable: true });
+// NOTE: 本文件所有 SIP_DOMAIN 引用已改为 getSipDomain() 显式调用，
+// 上面 defineProperty 仅作为 window 级 fallback 保留。
+const PC_CONFIG = {
+  iceServers: [],
+  iceTransportPolicy: 'all',
+  bundlePolicy: 'max-bundle',
+  rtcpMuxPolicy: 'require',
+};
+const AUDIO_KEEP_MAIN = new Set(['pcma']);
+const VIDEO_KEEP_MAIN = new Set(['h264', 'vp9']);
+
+// ============================================================================
+// 【工具函数】fixVideoPortForLocal — 必须在所有 patch 之前定义
+// ============================================================================
+function fixVideoPortForLocal(sdp) {
+  const lines = sdp.split(/\r\n|\n/);
+  let validPort = null;
+  for (const line of lines) {
+    const m = line.match(/^m=\w+ (\d+)/);
+    if (m && m[1] !== '0' && m[1] !== '9') {
+      validPort = m[1];
+      break;
+    }
+  }
+  if (!validPort) {
+    console.log('[NSBC] 🔧 fixVideoPort: no valid port found, skip');
+    return sdp;
+  }
+  let fixed = 0;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^m=(audio|video) 9 /.test(lines[i])) {
+      lines[i] = lines[i].replace(/^m=(audio|video) 9 /, 'm=$1 ' + validPort + ' ');
+      fixed++;
+    }
+  }
+  if (fixed > 0) {
+    console.log('[NSBC] 🔧 fixVideoPort: ' + fixed + ' m-lines 9→' + validPort);
+  }
+  return lines.join('\r\n');
+}
+
+// ============================================================================
+// 【修复 0】patch addTrack — 同一 track 重复加，直接返回已有 sender
+// ============================================================================
+// 背景：我们在 peerconnection 事件里手动 addTrack，抢在 JsSIP 自己的 addTrack 之前。
+// JsSIP 3.10 的 _createOffer() 里会对同一 track 再调一次 addTrack，Chrome 会抛
+// InvalidAccessError，而 JsSIP 没有 catch，promise 链静默中断 → createOffer 永不触发。
+// 这里让重复 addTrack 变成幂等操作。
+(function() {
+  if (!window.RTCPeerConnection) return;
+  const orig = RTCPeerConnection.prototype.addTrack;
+  RTCPeerConnection.prototype.addTrack = function(track, ...streams) {
+    const existing = this.getSenders().find(s => s.track && s.track.id === track.id);
+    if (existing) {
+      console.log('[NSBC] 🔧 addTrack skip (already exists):', track.kind, track.id);
+      return existing;
+    }
+    console.log('[NSBC] 🔧 addTrack:', track.kind, track.id);
+    return orig.call(this, track, ...streams);
+  };
+  console.log('[NSBC] ✅ patched addTrack');
+})();
+
+// ============================================================================
+// 【修复】patch setLocalDescription — 诊断用（仅打 m-lines 日志）
+// ============================================================================
+(function() {
+  if (!window.RTCPeerConnection) return;
+  const orig = RTCPeerConnection.prototype.setLocalDescription;
+  RTCPeerConnection.prototype.setLocalDescription = function(description) {
+    if (description?.sdp) {
+      const mlines = description.sdp.split(/\r\n|\n/).filter(l => l.startsWith('m='));
+      console.log('[NSBC] 📋 setLocalDescription m-lines:', mlines.join(' | '));
+    }
+    return orig.call(this, description);
+  };
+  console.log('[NSBC] ✅ patched setLocalDescription (diagnostic only)');
+})();
+// ============================================================================
+// SDP codec 白名单
+// ============================================================================
+
+
+
+function sdpCodecWhitelist(description) {
+  if (!description?.sdp) return description;
+  const lines = description.sdp.split(/\r\n|\n/);
+
+  const ptToCodec = new Map();
+  const aptToRedPts = new Map();
+  for (const line of lines) {
+    const rm = line.match(/^a=rtpmap:(\d+)\s+([^/\s]+)/i);
+    if (rm) ptToCodec.set(rm[1], rm[2].toLowerCase());
+    const fm = line.match(/^a=fmtp:(\d+)\s+apt=(\d+)/i);
+    if (fm) {
+      const redPt = fm[1], mainPt = fm[2];
+      if (!aptToRedPts.has(mainPt)) aptToRedPts.set(mainPt, []);
+      aptToRedPts.get(mainPt).push(redPt);
+    }
+  }
+
+  const mKeepPts = [];
+  let curMediaIdx = -1;
+  let curKind = null;
+  for (const line of lines) {
+    if (line.startsWith('m=')) {
+      curMediaIdx++;
+      curKind = line.startsWith('m=audio ') ? 'audio'
+               : line.startsWith('m=video ') ? 'video' : null;
+      if (curKind) {
+        const parts = line.split(' ');
+        const pts = parts.slice(3);
+        const mainKeep = curKind === 'audio' ? AUDIO_KEEP_MAIN : VIDEO_KEEP_MAIN;
+        const keep = new Set();
+        for (const pt of pts) {
+          const codec = ptToCodec.get(pt);
+          if (!codec) continue;
+          if (mainKeep.has(codec)) {
+            keep.add(pt);
+            const reds = aptToRedPts.get(pt);
+            if (reds) reds.forEach(r => keep.add(r));
+          }
+        }
+        if (curKind === 'audio') {
+          for (const pt of pts) {
+            if (ptToCodec.get(pt) === 'telephone-event') keep.add(pt);
+          }
+        }
+        mKeepPts.push(keep);
+      } else {
+        mKeepPts.push(null);
+      }
+    }
+  }
+
+  curMediaIdx = -1;
+  curKind = null;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    if (line.startsWith('m=')) {
+      curMediaIdx++;
+      curKind = line.startsWith('m=audio ') ? 'audio'
+               : line.startsWith('m=video ') ? 'video' : null;
+      const keep = mKeepPts[curMediaIdx];
+      if (keep) {
+        const parts = line.split(' ');
+        const allPts = parts.slice(3);
+        const filtered = allPts.filter(pt => keep.has(pt));
+        if (filtered.length > 0) {
+          lines[i] = [...parts.slice(0, 3), ...filtered].join(' ');
+        }
+      }
+      continue;
+    }
+
+    if (line.startsWith('a=extmap-allow-mixed') || line.startsWith('a=rtcp-xr:')) {
+      lines.splice(i, 1); i--; continue;
+    }
+
+    const attrMatch = line.match(/^a=(?:rtpmap|fmtp|rtcp-fb):(\d+)/);
+    if (attrMatch && curKind) {
+      const pt = attrMatch[1];
+      const keep = mKeepPts[curMediaIdx];
+      if (keep && !keep.has(pt)) {
+        lines.splice(i, 1); i--;
+      }
+    }
+  }
+
+  const mlines = lines.filter(l => l.startsWith('m='));
+  console.log(`[NSBC] 📋 SDP after whitelist type=${description.type} (${mlines.length} media):`);
+  mlines.forEach(m => console.log(`  ${m}`));
+
+  return { sdp: lines.join('\r\n'), type: description.type };
+}
+
+// ============ 日志 ============
+function log(cls, msg) {
+  const ts = new Date().toLocaleTimeString();
+  const div = document.createElement('div');
+  div.innerHTML = `<span class="ts">[${ts}]</span> <span class="${cls}">${msg}</span>`;
+  const box = $('sipLog');
+  box.appendChild(div); box.scrollTop = box.scrollHeight;
+  while (box.children.length > 500) box.removeChild(box.firstChild);
+  const cmap = { info: 'log', ok: 'log', warn: 'warn', err: 'error' };
+  const fn = cmap[cls] || 'log';
+  console[fn](`[NSBC] ${msg}`);
+}
+function dcLog(text, incoming) {
+  const div = document.createElement('div');
+  div.className = incoming ? 'in' : 'out';
+  div.textContent = (incoming ? '◀ ' : '▶ ') + text;
+  $('dcLog').appendChild(div); $('dcLog').scrollTop = $('dcLog').scrollHeight;
+}
+
+// ============ SIP 消息日志 ============
+function onSipMessage(e) {
+  try {
+    if (e.direction === 'incoming') {
+      if (e.response) log('rx', `← ${e.response.status_code} ${e.response.reason_phrase}`);
+      else if (e.request) log('rx', `← ${e.request.method}`);
+    } else if (e.direction === 'outgoing') {
+      if (e.request) log('tx', `→ ${e.request.method}`);
+      else if (e.response) log('tx', `→ ${e.response.status_code} ${e.response.reason_phrase}`);
+    }
+  } catch(_) {}
+}
+
+// ============ SDP 过滤事件 ============
+// JsSIP 的 sdp 事件参数: { sdp, originator: 'local'|'remote', type: 'offer'|'answer' }
+// 只过滤本地生成的（我们发给对端的）。远端收到的 SDP 保持原样——对端的 codec 选择不应被干预。
+function handleSdpEvent(e) {
+  if (!e || !e.sdp) return;
+  // ★ 诊断：无论本地还是远端，把所有 m= 行的端口打出来，一眼看出 video 是不是 9
+  const mlines = e.sdp.split(/\r\n/).filter(l => l.startsWith('m='));
+  const mports = mlines.map(l => {
+    const m = l.match(/^m=(\w+) (\d+)/);
+    return m ? `${m[1]}:${m[2]}` : '?';
+  }).join(' ');
+  log('info', `📨 SDP ${e.originator}/${e.type} ports: [${mports}] (${mlines.length} media)`);
+
+  if (e.originator !== 'local') {
+    // 远端收到的 —— 只打日志，不过滤
+    return;
+  }
+  try {
+    // ★ 第一步：修 m=video 端口 9（自研 SBC 不认端口 9，必须改成真实端口）
+    e.sdp = fixVideoPortForLocal(e.sdp);
+    // ★ 第二步：codec 白名单过滤
+    const filtered = sdpCodecWhitelist({ sdp: e.sdp, type: e.type });
+    e.sdp = filtered.sdp;
+    const after = e.sdp.split(/\r\n/).filter(l => l.startsWith('m='));
+    const mports2 = after.map(l => {
+      const m = l.match(/^m=(\w+) (\d+)/);
+      return m ? `${m[1]}:${m[2]}` : '?';
+    }).join(' ');
+    log('info', `🔧 sdp(${e.originator}/${e.type}): 修复后 ports: [${mports2}]`);
+  } catch (err) {
+    console.warn('[NSBC] SDP filter failed:', err);
+  }
+}
+
+// ============ Chrome autoplay 策略绕过 ============
+// Chrome 要求 play() 必须在"用户激活"（user activation）窗口内执行。
+// Accept 按钮点击触发的 doAccept() 是异步的，等 ontrack 触发时用户激活已过期，
+// play() 会挂起（Promise pending）不被拒绝也不播放。
+// 修法：先尝试 play()，若挂起/拒绝，挂到下一次任意用户手势（click/touch/keydown）上重试。
+const _playingEls = new WeakMap();  // el → 正在 pending 的 play() Promise（防打断）
+const _mediaPending = new Set();    // 挂起等手势解锁的元素集合
+function tryPlayWithGesture(el) {
+  if (!el) return;
+  if (!el.paused && el.readyState >= 2) return;   // 已经在播 → 直接返回
+  // ★ 防打断：若该元素已有 play() 在 pending → 直接返回，不触发新的 load request
+  if (_playingEls.has(el)) return;
+  const p = el.play();
+  if (p && typeof p.then === 'function') {
+    _playingEls.set(el, p);
+    p.then(() => {
+      _playingEls.delete(el);
+      _mediaPending.delete(el);
+      console.log('[NSBC] ✅ 播放成功:', el.id);
+    }).catch(err => {
+      _playingEls.delete(el);
+      console.warn('[NSBC] ⚠️ 播放挂起/拒绝:', el.id, err.message);
+      _mediaPending.add(el);
+    });
+  }
+  // 用户手势解锁（只装一次）
+  if (!document.body.__nsbcGestureBound) {
+    document.body.__nsbcGestureBound = true;
+    const unlock = () => {
+      _mediaPending.forEach(el2 => {
+        el2.play().then(() => {
+          _mediaPending.delete(el2);
+          console.log('[NSBC] 🔓 手势解锁播放:', el2.id);
+        }).catch(() => {});
+      });
+    };
+    ['click','touchstart','keydown'].forEach(ev =>
+      document.body.addEventListener(ev, unlock, { once: true, capture: true, passive: true }));
+  }
+}
+
+// ============ PC 装配：绑定 ontrack / 状态监控 / DataChannel 接收端 ============
+function attachPC(pc, session) {
+  if (!pc) return;
+  window.__pc = pc;
+
+  // ---- 远端流 ----
+  if (!remoteStream) remoteStream = new MediaStream();
+  pc.ontrack = (e) => {
+    log('ok', `🎬 ONTRACK: ${e.track.kind} label=${e.track.label} enabled=${e.track.enabled}`);
+    if (!remoteStream.getTrackById(e.track.id)) {
+      remoteStream.addTrack(e.track);
+    }
+
+    // ★ 每次 ontrack 重置 300ms 定时器，只有最后一次生效。
+    // 保证 audio + video 两个 track 都 addTrack 完成后，才一次性设 srcObject + play()。
+    // 这样 Chrome 不会因为中间的 addTrack 触发 stream 重载而打断 play()。
+    clearTimeout(window.__nsbcRvTimer);
+    window.__nsbcRvTimer = setTimeout(() => {
+      const rv = $('remoteVideo');
+      if (rv.srcObject !== remoteStream) {
+        rv.srcObject = remoteStream;
+        log('info', `📺 remoteVideo.srcObject 绑定 (${remoteStream.getTracks().length} tracks)`);
+      }
+      tryPlayWithGesture(rv);
+    }, 300);
+
+    $('remoteDot').className = 'dot on';
+  };
+
+  // ---- DataChannel 接收端（来电侧）----
+  pc.ondatachannel = (e) => {
+    log('info', `📥 DC inbound: ${e.channel.label}`);
+    dc = e.channel;
+    bindDC();
+  };
+
+  // ---- 连接状态监控 ----
+  pc.onconnectionstatechange = () => {
+    const st = pc.connectionState;
+    log(st === 'connected' || st === 'completed' ? 'ok' : 'info', `📶 PC conn: ${st}`);
+    if (st === 'connected' || st === 'completed') dumpMediaStats(pc, 'connected');
+    if (st === 'failed' || st === 'disconnected') {
+      log('err', `❌ PC conn ${st}`);
+      dumpMediaStats(pc, `fail-${st}`);
+    }
+  };
+  pc.oniceconnectionstatechange = () => log('info', `🧊 ICE: ${pc.iceConnectionState}`);
+  pc.onicegatheringstatechange = () => log('info', `🧊 ICE gather: ${pc.iceGatheringState}`);
+  pc.onsignalingstatechange = () => log('info', `📡 signaling: ${pc.signalingState}`);
+
+  // ---- 延迟统计 ----
+  setTimeout(() => {
+    bindRemoteTracks(pc);
+    dumpMediaStats(pc, 'defer-3s');
+  }, 3000);
+
+  dumpMediaStats(pc, 'entry');
+}
+
+// 兜底：从 receivers 补绑远端 track（万一 ontrack 没触发）
+// ★ 注意：不在这里设 srcObject——srcObject 由 ontrack 里的 300ms 定时器一次性处理，
+// 这里 addTrack 可能在定时器之后触发，会让 Chrome 重新 load stream 打断 play()。
+// 这里只做 addTrack 兜底 + UI dot 更新，不碰 video 元素。
+function bindRemoteTracks(pc) {
+  if (!pc) return;
+  if (!remoteStream) remoteStream = new MediaStream();
+  let added = 0;
+  pc.getReceivers().forEach(r => {
+    if (r.track && !remoteStream.getTrackById(r.track.id)) {
+      remoteStream.addTrack(r.track);
+      added++;
+    }
+  });
+  if (added > 0) {
+    log('info', `📥 bindRemoteTracks: 兜底 addTrack ${added} 个 (现有 ${remoteStream.getTracks().length})`);
+    // ★ addTrack 后也重置定时器，让它等一下再 srcObject + play
+    clearTimeout(window.__nsbcRvTimer);
+    window.__nsbcRvTimer = setTimeout(() => {
+      const rv = $('remoteVideo');
+      if (rv.srcObject !== remoteStream) {
+        rv.srcObject = remoteStream;
+        log('info', `📺 remoteVideo.srcObject 绑定 (${remoteStream.getTracks().length} tracks)`);
+      }
+      tryPlayWithGesture(rv);
+    }, 300);
+  }
+  if (remoteStream.getTracks().length > 0) {
+    $('remoteDot').className = 'dot on';
+  }
+}
+
+// 从 PC 的 senders 重建本地流（JsSIP 内部的 getUserMedia stream 拿不到引用）
+function setupLocalPreview(pc) {
+  if (!pc) return;
+  const senders = pc.getSenders();
+  if (!localStream) localStream = new MediaStream();
+  senders.forEach(s => {
+    if (s.track && !localStream.getTrackById(s.track.id)) {
+      localStream.addTrack(s.track);
+    }
+  });
+  if (localStream.getTracks().length > 0) {
+    $('localVideo').srcObject = localStream;
+    $('localDot').className = 'dot on';
+    log('ok', `📺 本地流 OK (${localStream.getTracks().length} tracks)`);
+  }
+  const sndDescr = senders.map(s => s.track ? `${s.track.kind}[${s.track.label||'?'}]` : 'null').join(',');
+  log('info', `📤 SENDERS(${senders.length}): ${sndDescr}`);
+}
+
+// ★ 等 video track 真正 unmute（readyState=live 且 muted=false）
+// Chrome 对 muted 的 video track，createOffer 会给 m=video 端口 9（discard 语义），
+// 还会连带把整个 BUNDLE group 降级（音频也被影响）。
+// getUserMedia 刚完成时 videoTrack.muted 通常是 true，摄像头要等 100-500ms 才推帧。
+async function ensureVideoReady(stream, timeoutMs = 2500) {
+  const v = stream.getVideoTracks()[0];
+  if (!v) {
+    log('warn', '⚠️ 流里没有 video track');
+    return;
+  }
+  if (v.readyState === 'live' && !v.muted) {
+    log('ok', `🎥 video track 已就绪 (readyState=live, muted=false)`);
+    return;
+  }
+  log('warn', `⏳ 等待 video unmute (readyState=${v.readyState}, muted=${v.muted})`);
+  await new Promise(resolve => {
+    const done = (why) => {
+      log('ok', `🎥 video track ${why} (readyState=${v.readyState}, muted=${v.muted})`);
+      resolve();
+    };
+    const timer = setTimeout(() => done('超时'), timeoutMs);
+    v.addEventListener('unmute', () => { clearTimeout(timer); done('unmute'); }, { once: true });
+  });
+}
+
+// ============ Session 事件绑定拆分 ============
+// JsSIP 3.10 呼出路径时序坑：ua.call() 内部先建 PC + 触发 peerconnection，
+// 之后才触发 newRTCSession → 在 newRTCSession 里 session.on('peerconnection', …) 会错过。
+// 修法：用 eventHandlers 构造选项提前绑定 peerconnection（RTCSession 构造时立即注册）。
+function makeSessionHandlers(isCallee) {
+  return {
+    peerconnection: (data) => {
+      const pc = data.peerconnection;
+      log('info', `🔗 peerconnection event (callee=${isCallee})`);
+
+      // ★ 关键修复：在 JsSIP 调 createOffer 之前，手动把本地 track 加进 PC。
+      // 否则 JsSIP 会在 createOffer 之后才 addTrack，导致 Chrome 生成 m=video 端口 9（拒绝），
+      // 之后无论怎么改 SDP 端口，PC 自己都不认，RTP 也不会流动。
+      if (localStream) {
+        const existingIds = new Set(
+          pc.getSenders().map(s => s.track?.id).filter(Boolean)
+        );
+        let added = 0;
+        localStream.getTracks().forEach(track => {
+          if (existingIds.has(track.id)) return;
+          try {
+            pc.addTrack(track, localStream);
+            added++;
+            log('ok', `➕ pre-offer addTrack ${track.kind} (${track.label || '?'})`);
+          } catch(e) {
+            log('warn', `pre-offer addTrack ${track.kind} 失败: ${e.message}`);
+          }
+        });
+        log('info', `📤 senders after addTrack: ${pc.getSenders().length} (+${added})`);
+      }
+
+      // ★ 调试：监听协商时机，验证 JsSIP 是否走到 createOffer/createAnswer
+      pc.addEventListener('negotiationneeded', () =>
+        log('warn', '⚠️ negotiationneeded fired'));
+
+      attachPC(pc, null);
+
+      const senders = pc.getSenders();
+      log('info', `📤 PC senders: [${senders.map(s=>s.track?.kind||'null').join(',')}] total=${senders.length}`);
+    },
+  };
+}
+
+// ② confirmed 后统一处理
+function onSessionConfirmed(session, isCallee) {
+  currentSession = session;
+  pendingSession = null;
+  $('callStatus').textContent = '通话中 ✅';
+  $('btnHang').disabled = false;
+  $('incoming').classList.remove('show');
+
+  const pc = session.connection;
+  if (pc) {
+    setupLocalPreview(pc);
+    bindRemoteTracks(pc);
+    // ★ 不再在这里调 tryPlayWithGesture：
+    // ontrack 已经调过 remoteVideo，setupLocalPreview 内部会调 localVideo。
+    // 这里再调只会触发第三次打断（之前日志里 play() interrupted 第 3 次来自这里）。
+    if (!isCallee && !dc) {
+      try {
+        dc = pc.createDataChannel('nsbc-chat');
+        log('info', '📤 DC created');
+        bindDC();
+      } catch (err) {
+        log('warn', 'DC create: ' + err.message);
+      }
+    }
+  }
+}
+
+// ③ 其他事件绑定（来电路径 & 呼出兜底）
+// skipPeerConn=true 时跳过 peerconnection 绑定（呼出路径由 eventHandlers 提前处理）
+// skipPeerConn=false 时正常绑定（来电路径 PC 尚未创建，session.on 注册来得及）
+function bindSessionNonPC(session, isCallee, skipPeerConn) {
+  if (!skipPeerConn) {
+    session.on('peerconnection', makeSessionHandlers(isCallee).peerconnection);
+  }
+  session.on('sdp', handleSdpEvent);
+  session.on('progress', (e) => {
+    const r = e.response;
+    log('info', `📞 progress: ${r?.status_code || ''} ${r?.reason_phrase || ''}`);
+  });
+  session.on('accepted', () => log('ok', '✅ accepted (180/183)'));
+  session.on('confirmed', () => {
+    log('ok', '✅ confirmed (Established)');
+    onSessionConfirmed(session, isCallee);
+  });
+  session.on('ended', (e) => {
+    const org = e && e.originator;   // 'local' | 'remote' | undefined
+    log('info', `📴 ended (originator=${org})`);
+    // 根据 originator 判断本地/对端挂断，不再一律显示"对端挂断"
+    onCallEnd(org === 'remote' ? '对端挂断' : '本地挂断');
+  });
+  session.on('failed', (e) => { log('err', `❌ failed: ${e.cause || ''}`); onCallEnd('失败: ' + (e.cause || '')); });
+  session.on('getusermediafailed', (e) => log('err', '❌ getUserMedia FAIL: ' + (e.error?.message || e.error)));
+  session.on('peerconnection:createofferfailed', (e) => log('err', '❌ createOffer FAIL: ' + (e.error?.message || e.error)));
+  session.on('peerconnection:createanswerfailed', (e) => log('err', '❌ createAnswer FAIL: ' + (e.error?.message || e.error)));
+  session.on('peerconnection:setlocaldescriptionfailed', (e) => log('err', '❌ setLocalDesc FAIL: ' + (e.error?.message || e.error)));
+  session.on('peerconnection:setremotedescriptionfailed', (e) => log('err', '❌ setRemoteDesc FAIL: ' + (e.error?.message || e.error)));
+}
+
+// ============ 自动推导 WSS / STUN ============
+(function autoDeriveServers() {
+  const host = window.location.hostname;
+  const wssEl = document.getElementById('wss');
+  const stunEl = document.getElementById('stun');
+  if (!wssEl || !stunEl) return;
+  if (host) {
+    wssEl.value = 'wss://' + host + ':5062';
+    stunEl.value = 'stun:' + host + ':3478';
+    console.log('[NSBC] 自动探测 host=' + host + ' → WSS=' + wssEl.value);
+  } else {
+    wssEl.placeholder = '手动填写 (如 wss://10.0.0.80:5062)';
+    stunEl.placeholder = '手动填写 (如 stun:10.0.0.80:3478)';
+  }
+})();
+
+// ============ Register ============
+async function doRegister() {
+  if (!window.JsSIP) { alert('JsSIP 未加载！请检查 static/js/jssip-3.10.0.min.js'); return; }
+  $('regStatus').textContent = '连接中...'; $('regStatus').className = 'status';
+  $('btnReg').disabled = true;
+
+  try {
+    const user = $('user').value.trim();
+    const pass = $('pass').value;
+    const wssUrl = $('wss').value.trim();
+
+    const socket = new JsSIP.WebSocketInterface(wssUrl);
+
+    ua = new JsSIP.UA({
+      sockets: [socket],
+      uri: `sip:${user}@${getSipDomain()}`,
+      password: pass,
+      register: false,          // 手动注册
+      session_timers: false,
+      pcConfig: PC_CONFIG,
+      connection_recovery_min_interval: 2,
+      connection_recovery_max_interval: 30,
+    });
+
+    // ---- UA 连接生命周期 ----
+    ua.on('connecting',      () => log('info', '🔌 JsSIP connecting...'));
+    ua.on('connected',       () => { log('ok', '🔌 JsSIP connected'); ua.register(); });
+    ua.on('disconnected',    () => log('warn', '🔌 JsSIP disconnected'));
+
+    ua.on('registered', () => {
+      $('regStatus').textContent = '✅ 已注册 ' + user;
+      $('regStatus').className = 'status ok';
+      $('btnUnreg').disabled = false; $('btnCall').disabled = false;
+      log('ok', `REGISTERED as ${user}`);
+    });
+    ua.on('unregistered', () => {
+      $('regStatus').textContent = '未注册'; $('regStatus').className = 'status';
+      $('btnUnreg').disabled = true; $('btnCall').disabled = true;
+      log('info', 'UNREGISTERED');
+    });
+    ua.on('registrationFailed', (e) => {
+      $('regStatus').textContent = '❌ 注册失败';
+      $('regStatus').className = 'status err';
+      $('btnReg').disabled = false;
+      log('err', `REGISTRATION FAILED: ${e.cause}`);
+    });
+
+    // ---- SIP 报文日志 ----
+    ua.on('sip', onSipMessage);
+
+    // ---- 来电/呼出（统一入口） ----
+    ua.on('newRTCSession', (e) => {
+      const session = e.session;
+      const from = session.remote_identity?.uri?.toString() || '?';
+
+      if (e.originator === 'remote') {
+        // 来电：newRTCSession 时 PC 还没建 → session.on('peerconnection') 注册来得及
+        log('warn', `📞 INCOMING from ${from}`);
+        pendingSession = session;
+        $('inFrom').textContent = from;
+        $('incoming').classList.add('show');
+        bindSessionNonPC(session, true, false);        // skipPeerConn=false：绑定
+      } else {
+        // 呼出：doCall 已用 eventHandlers 提前绑定 peerconnection → 跳过
+        log('info', `📤 outgoing to ${from}`);
+        bindSessionNonPC(session, false, true);        // skipPeerConn=true：跳过
+      }
+    });
+
+    ua.start();
+    log('info', 'JsSIP UA 已启动，等待 WebSocket 连接...');
+  } catch(e) {
+    $('regStatus').textContent = '❌ 异常';
+    $('regStatus').className = 'status err';
+    $('btnReg').disabled = false;
+    log('err', 'EXCEPTION: ' + (e.message || e));
+  }
+}
+
+async function doUnregister() {
+  try { if (ua) ua.unregister(); } catch(e) { log('warn', 'unreg err: ' + e.message); }
+  setTimeout(() => {
+    try { if (ua) ua.stop(); } catch(e) { log('warn', 'stop err: ' + e.message); }
+    ua = null; currentSession = null; pendingSession = null;
+    stopMedia(); closePC();
+  }, 500);
+}
+
+// ============ 呼出 ============
+async function doCall() {
+  if (!ua) return;
+  let target = $('target').value.trim();
+  if (!target) { log('err', '被叫为空'); return; }
+  if (!target.startsWith('sip:')) target = 'sip:' + target;
+  if (!target.includes('@')) target = target + '@' + getSipDomain();
+
+  log('tx', `📤 INVITE → ${target}`);
+  $('callStatus').textContent = '呼叫中...'; $('btnCall').disabled = true;
+
+  // ★ 关键：先 await getUserMedia，再把 stream 传给 JsSIP。
+  // JsSIP 内部 _createLocalMediaStream 是 fire-and-forget 的，
+  // 如果传 mediaConstraints，它会异步 getUserMedia，PC 在 createOffer 时还是空的 → m=video 9。
+  // 传 mediaStream: stream → JsSIP 发现 _localMediaStream 已存在 → 直接 addTrack（同步），
+  // PC 在 createOffer 之前就有 audio+video sender。
+  try {
+    if (!localStream) {
+      localStream = await navigator.mediaDevices.getUserMedia(
+        { audio: true, video: true });
+      await ensureVideoReady(localStream);   // ★ 等 video track unmute 再继续
+      $('localVideo').srcObject = localStream;
+      $('localDot').className = 'dot on';
+      log('ok', `📺 本地流就绪 (${localStream.getTracks().length} tracks)`);
+    }
+  } catch(e) {
+    log('err', '❌ getUserMedia FAIL: ' + e.message);
+    $('callStatus').textContent = '❌ 无媒体';
+    $('btnCall').disabled = false;
+    return;
+  }
+  await new Promise(r => setTimeout(r, 0));
+  try {
+    ua.call(target, {
+        mediaStream: localStream,
+        pcConfig: PC_CONFIG,
+        eventHandlers: makeSessionHandlers(false),
+    });
+  } catch(e) {
+    $('callStatus').textContent = '❌ 呼叫失败';
+    $('btnCall').disabled = false;
+    log('err', 'CALL FAIL: ' + (e.message || e));
+  }
+}
+
+// ============ 接听 ============
+async function doAccept() {
+  if (!pendingSession) return;
+  $('incoming').classList.remove('show');
+  log('ok', '✅ ACCEPT');
+  $('callStatus').textContent = '接听中...';
+
+  // ★ 同样的修复：先 await getUserMedia，再把 stream 交给 JsSIP。
+  // JsSIP 内部 answer() 里的 _createLocalMediaStream 也是 fire-and-forget，
+  // PC 在 createAnswer 时还是空 → m=video 9。
+  try {
+    if (!localStream) {
+      localStream = await navigator.mediaDevices.getUserMedia(
+        { audio: true, video: true });
+      await ensureVideoReady(localStream);   // ★ 等 video track unmute 再继续
+      $('localVideo').srcObject = localStream;
+      $('localDot').className = 'dot on';
+      log('ok', `📺 本地流就绪 (${localStream.getTracks().length} tracks)`);
+    }
+  } catch(e) {
+    log('err', '❌ getUserMedia FAIL: ' + e.message);
+    $('callStatus').textContent = '❌ 无媒体';
+    return;
+  }
+
+  try {
+    pendingSession.answer({
+        mediaStream: localStream,
+        pcConfig: PC_CONFIG,
+        });
+  } catch(e) {
+    log('err', 'ACCEPT FAIL: ' + (e.message || e));
+  }
+}
+
+// ============ 拒接 ============
+function doReject() {
+  if (pendingSession) {
+    try {
+      pendingSession.terminate({ status_code: 486, reason_phrase: 'Busy Here' });
+    } catch(e) {}
+    pendingSession = null;
+  }
+  $('incoming').classList.remove('show');
+  log('info', 'REJECTED');
+}
+
+// ============ 挂断 ============
+async function doHangup() {
+  if (isHangingUp) { log('warn', '⚠️ 挂断进行中，忽略重复点击'); return; }
+  isHangingUp = true;
+
+  log('info', `📞 HANGUP REQ current=${!!currentSession} pending=${!!pendingSession}`);
+  try {
+    const s = currentSession || pendingSession;
+    if (s) {
+      s.terminate();
+    } else {
+      log('warn', '⚠️ 无会话可挂断');
+    }
+  } catch(e) {
+    log('err', 'HANGUP FAIL: ' + (e.message || e));
+  }
+  onCallEnd('本地挂断');
+  isHangingUp = false;
+}
+
+function onCallEnd(reason) {
+  log('info', 'CALL END: ' + reason);
+  $('callStatus').textContent = '空闲';
+  $('btnCall').disabled = !ua; $('btnHang').disabled = true;
+  closePC(); stopMedia();
+  currentSession = null; pendingSession = null;
+  isHangingUp = false;
+}
+
+// ============ 媒体控制 ============
+function stopMedia() {
+  // ★ 清掉所有 pending 的定时器，避免通话结束后还触发 srcObject 赋值 / play
+  if (window.__nsbcRvTimer) { clearTimeout(window.__nsbcRvTimer); window.__nsbcRvTimer = null; }
+  _playingEls.delete($('remoteVideo'));
+  _playingEls.delete($('localVideo'));
+  _mediaPending.delete($('remoteVideo'));
+  _mediaPending.delete($('localVideo'));
+
+  if (localStream) {
+    localStream.getTracks().forEach(t => { try { t.stop(); } catch(_) {} });
+    localStream = null;
+  }
+  if ($('localVideo')) $('localVideo').srcObject = null;
+  if ($('remoteVideo')) $('remoteVideo').srcObject = null;
+  remoteStream = null;
+  $('localDot').className = 'dot off'; $('remoteDot').className = 'dot off';
+}
+
+function closePC() {
+  if (dc) { try { dc.close(); } catch(_) {} dc = null; }
+  dcOpen = false;
+  $('dcMsg').disabled = true; $('btnDc').disabled = true;
+
+  const pc = currentSession?.connection;
+  if (pc && pc.signalingState !== 'closed') {
+    try { pc.close(); log('info', '🛑 PeerConnection closed'); } catch(_) {}
+  }
+}
+
+function muteAudio() {
+  if (!localStream) return;
+  const t = localStream.getAudioTracks()[0];
+  if (!t) return;
+  t.enabled = !t.enabled;
+  $('btnMute').textContent = t.enabled ? '🔊 Mute' : '🔇 Unmute';
+}
+function stopVideo() {
+  if (!localStream) return;
+  const t = localStream.getVideoTracks()[0];
+  if (!t) return;
+  t.enabled = !t.enabled;
+  $('btnStopVid').textContent = t.enabled ? '📷 Stop Video' : '📷 Start Video';
+}
+
+// ============ DataChannel ============
+function bindDC() {
+  if (!dc) return;
+  if (dc.readyState === 'open') {
+    dcOpen = true;
+    $('dcMsg').disabled = false; $('btnDc').disabled = false;
+    log('ok', '📨 DC Already OPEN');
+    return;
+  }
+  dc.onopen = () => {
+    dcOpen = true;
+    $('dcMsg').disabled = false; $('btnDc').disabled = false;
+    log('ok', '📨 DC OPEN');
+    dcLog('[system] DataChannel 已连接', false);
+    $('dcMsg').focus();
+  };
+  dc.onclose = () => {
+    dcOpen = false;
+    $('dcMsg').disabled = true; $('btnDc').disabled = true;
+    log('info', '📨 DC CLOSED');
+    dcLog('[system] DataChannel 已断开', false);
+  };
+  dc.onmessage = (e) => dcLog(e.data, true);
+  dc.onerror = (e) => log('err', 'DC error: ' + e);
+}
+function dcSend() {
+  if (!dc || dc.readyState !== 'open') return;
+  const msg = $('dcMsg').value.trim();
+  if (!msg) return;
+  dc.send(msg);
+  dcLog(msg, false);
+  $('dcMsg').value = '';
+}
+
+// ============ Media Stats ============
+async function dumpMediaStats(pc, tag) {
+  try {
+    const stats = await pc.getStats();
+    let rtpSent = 0, rtpRecv = 0;
+    let pktSent = 0, pktRecv = 0;
+    let decErr = 0, ploss = 0;
+    let dtlsState = '?';
+
+    stats.forEach(s => {
+      if (s.type === 'transport') dtlsState = s.dtlsState || '?';
+      if (s.type === 'remote-inbound-rtp' || s.type === 'inbound-rtp') {
+        rtpRecv += s.bytesReceived || 0;
+        pktRecv += s.packetsReceived || 0;
+        decErr += s.decodeErrors || 0;
+        ploss += s.packetsLost || 0;
+      }
+      if (s.type === 'outbound-rtp') {
+        rtpSent += s.bytesSent || 0;
+        pktSent += s.packetsSent || 0;
+      }
+    });
+
+    const mediaFlowing = (rtpSent > 0 || rtpRecv > 0) ? '✅ MEDIA' : '❌ NO MEDIA';
+    log('info', `📊 STATS[${tag}] ${mediaFlowing} DTLS=${dtlsState}
+      RTP sent=${rtpSent}B pkt=${pktSent} recv=${rtpRecv}B pkt=${pktRecv}
+      decodeErr=${decErr} pktLost=${ploss}`);
+  } catch(e) {
+    log('warn', `📊 STATS[${tag}] fail: ${e.message}`);
+  }
+}
+
+// ============ 页面关闭 ============
+window.addEventListener('beforeunload', () => {
+  try { if (currentSession) currentSession.terminate(); } catch(_) {}
+  try { if (pendingSession) pendingSession.terminate(); } catch(_) {}
+  try { if (ua) ua.stop(); } catch(_) {}
+  stopMedia(); closePC();
+});
+
+// ============ 启动 ============
+log('info', '页面加载完成 · JsSIP ' + (window.JsSIP ? (window.JsSIP.version || '3.x') + ' ✅' : '❌ 未加载'));
+if (window.location.protocol !== 'https:' && window.location.hostname !== 'localhost') {
+  log('warn', 'getUserMedia 需要 HTTPS 或 localhost');
+}
+</script>
+</body>
+</html>

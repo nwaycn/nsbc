@@ -1,0 +1,2423 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include "media_bridge.h"
+#include "sdp.h"
+#include "rtp.h"
+#include "sip_common.h"   /* sip_ci_eq */
+#include "media_bug.h"
+#ifdef NSBC_WITH_OPENSSL
+#include "openssl_compat.h" /* NSBC_OPENSSL_HAS_DTLS_FEED 版本探测（先于 dtls_srtp.h） */
+#endif
+#include "dtls_srtp.h"
+#include "net_sock.h"
+#include "net_mmsg.h"
+#include "nsbc_id.h"
+#include "log.h"
+
+#include <arpa/inet.h>
+#include <ctype.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#define BR_SHARDS 64
+#define SSRC_MAP_N 16
+#define RELAY_BUF 2048
+
+typedef struct cnode {
+    struct cnode *next;
+    void *call; /* 不透明呼叫键（b2b_call_t*），仅比较/哈希，禁止解引用 */
+    rtp_relay_t *relay;
+    mb_mode_t mode;
+    char a_ip[64];
+    uint16_t a_port; /* A 的 SDP 媒体地址（peer A） */
+    /* REQ-DTLS-001：DTLS-SRTP 终结器，按 relay 物理侧索引：
+     *   dtls[0] —— A=WebRTC 时建在 fd_rtp[0]（offer_hook 按 offer SDP 判定）
+     *   dtls[1] —— B=WebRTC 时建在 fd_rtp[1]（offer 纯 SDP 时经组合根
+     *              call_b_is_ws 回调判定；双 WebRTC 时两侧各一个）
+     * 握手中 → reactor 驱动 peek 分型 demux 推进；ESTABLISHED →
+     * dtls_server_take_srtp() 导出 nsbc_srtp_sess_t 挂 r->srtp[side]，
+     * 入向 srtp_unprotect / 出向 srtp_protect。
+     * 明文侧（MicroSIP）恒 NULL，纯明文 relay。 */
+    void *dtls[2];
+} cnode_t;
+
+typedef struct {
+    pthread_mutex_t lock;
+    cnode_t *head;
+} br_shard_t;
+
+struct bridge_mgr {
+    mb_cfg_t cfg;
+    br_shard_t sh[BR_SHARDS];
+};
+
+/* ------------------------------------------------------------------ */
+/* SSRC 出向重写映射                                                    */
+/* ------------------------------------------------------------------ */
+typedef struct {
+    uint32_t in;
+    uint32_t out;
+    int used;
+} smap_t;
+
+/* ★ REQ-VQ-001：RTP seq 跟踪按 SSRC 分槽
+ * 之前 d_last_seq[side] 单槽被 audio + rejected video 交替污染，
+ * 6 秒内 fake lost=32974、exp=34002——完全不可用。
+ * 改为每个 side 最多 SEQ_SLOTS 个 SSRC 独立跟踪，OAM 汇总时累加。 */
+#define SEQ_SLOTS 8
+typedef struct {
+    uint32_t ssrc;
+    uint16_t last_seq;
+    uint32_t expected;  /* relay_cb 单线程写 __atomic_fetch_add；OAM __atomic_load_n 读 */
+    uint32_t lost;      /* 同上 */
+    int      primed;
+} seq_track_t;
+
+static uint32_t smap_lookup(smap_t *m, uint32_t in)
+{
+    for (int i = 0; i < SSRC_MAP_N; ++i) {
+        if (m[i].used && m[i].in == in)
+            return m[i].out;
+    }
+    for (int i = 0; i < SSRC_MAP_N; ++i) {
+        if (!m[i].used) {
+            m[i].used = 1;
+            m[i].in = in;
+            do
+                m[i].out = nsbc_ssrc_random();
+            while (!m[i].out || m[i].out == in);
+            return m[i].out;
+        }
+    }
+    return in; /* 表满：原样（计数异常可观测） */
+}
+
+/* ------------------------------------------------------------------ */
+/* relay 实例                                                           */
+/* ------------------------------------------------------------------ */
+struct rtp_relay {
+    bridge_mgr_t *m;
+    cnode_t *node;
+    int fd_rtp[2];
+    int fd_rtcp[2];
+    uint16_t rtp_port[2]; /* 端口表回收凭据（不依赖 socket 名） */
+    nsbc_sa_t peer[2];  /* 配置期望对端（可空：纯 latching） */
+    int have_peer[2];
+    nsbc_sa_t latch[2];
+    int latched[2];
+    ssrc_policy_t pol[2];
+    smap_t map[2];
+    uint64_t pkts, drops;
+    /* REQ-DTLS-001：per-side SRTP 会话（该侧 dtls_server ESTABLISHED 后
+     * 经 dtls_server_take_srtp() 导出挂这里）。哪一侧是 WebRTC 由
+     * cnode_t.dtls[side] 非空标识（A 或 B 均可能，双 WebRTC 时两侧都有）；
+     * 无 dtls 的侧恒 NULL 明文。 */
+    nsbc_srtp_sess_t *srtp[2];
+    /* OAM 诊断槽（REQ-MEDIA-SEC-003⑤/REQ-OBS-010）：媒体线程写、
+     * bridge_call_view 读，全部 __atomic；view 不持 relay 引用锁。 */
+    int d_latched[2];
+    uint32_t d_in_ssrc[2];   /* 入向学习主源（0=未学习） */
+    uint32_t d_out_ssrc[2];  /* 重写后发往对侧的主源 SSRC */
+    int d_have_rr[2];
+    uint32_t d_rr_frac[2], d_rr_lost[2], d_rr_jitter[2];
+    /* RTP seq-gap 本地丢包计数（按 SSRC 分槽，避免多 SSRC 交替污染） */
+    seq_track_t seq[2][SEQ_SLOTS];
+    uint32_t d_rtp_jitter_ticks[2]; /* RTP 时钟 tick 原 jitter（未换算 ms，仅 RTCP 旁证） */
+    /* REQ-MEDIA-SEC-003⑤ P0：SSRC↔CNAME 绑定（SDES CNAME）；
+     * 媒体线程写，relay 侧 [0]朝A/[1]朝B。 */
+    char d_cname[2][64];
+    int d_have_cname[2];
+    /* ★ RACE-FIX: arm 标志。rtp_relay_start 只 open fd + alloc port，
+     * 延迟到所有初始化完成后 rtp_relay_arm 才 reactor_add。
+     * rtp_relay_stop 里 arm=0 时跳过 reactor_del（fd 还没注册）。 */
+    int armed;
+};
+
+static void relay_rtcp_observe(rtp_relay_t *r, int side, const uint8_t *buf,
+                               size_t len);
+
+/* REQ-MEDIA-SSRC-003②：从远端 SDP 提取所有 a=ssrc: / a=ssrc-group:FID，
+ * 预登记进 ssrc_policy，避免 "先来先学" 策略让后到的视频 SSRC 被 inject_drops 丢弃。
+ *
+ * 位置：bridge_offer_hook（side=0，offer SDP）和 bridge_answer_hook（side=1，answer SDP），
+ * 必须在 bridge_rewrite_sdp 之前（rewrite 会剥掉 a=ssrc: / a=ssrc-group: 行）。 */
+static void admit_ssrc_from_sdp(rtp_relay_t *r, int side,
+                                const char *sdp, size_t len)
+{
+    if (!r || !sdp || !len || side < 0 || side > 1)
+        return;
+    ssrc_policy_t *pol = &r->pol[side];
+    int admitted = 0;
+
+    /* 扫描所有 a=ssrc:<n> ... 行 */
+    const char *p = sdp;
+    const char *end = sdp + len;
+    while (p < end) {
+        const char *line_end = memchr(p, '\n', (size_t)(end - p));
+        const char *line_end_nul = line_end ? line_end : end;
+        size_t llen = (size_t)(line_end_nul - p);
+
+        /* 去掉尾部 \r */
+        while (llen > 0 && p[llen - 1] == '\r') --llen;
+
+        if (llen >= 8 && strncmp(p, "a=ssrc:", 7) == 0) {
+            uint32_t ssrc = 0;
+            const char *num_start = p + 7;
+            char *tail = NULL;
+            unsigned long v = strtoul(num_start, &tail, 10);
+            if (tail != num_start) {
+                ssrc = (uint32_t)v;
+                ssrc_policy_admit(pol, ssrc, 0);  /* 先按主源登记 */
+                ++admitted;
+            }
+        } else if (llen >= 20 && strncmp(p, "a=ssrc-group:FID ", 18) == 0) {
+            /* a=ssrc-group:FID <primary> <rtx> — primary 主源，secondary RTX 修复流 */
+            uint32_t primary = 0, rtx = 0;
+            const char *nums = p + 18;
+            char *p2 = NULL, *r2 = NULL;
+            unsigned long v1 = strtoul(nums, &p2, 10);
+            if (p2 && *p2 == ' ') {
+                unsigned long v2 = strtoul(p2 + 1, &r2, 10);
+                if (r2 != p2 + 1) {
+                    primary = (uint32_t)v1;
+                    rtx = (uint32_t)v2;
+                    ssrc_policy_admit(pol, primary, 0);  /* primary */
+                    ssrc_policy_admit(pol, rtx, 1);      /* RTX aux   */
+                    admitted += 2;
+                }
+            }
+        }
+        /* a=rtpmap:<pt> rtx/... — 登记 RTX payload type，让 is_aux_pt(pt) 命中 */
+        /* 这条是额外保险：即使漏扫 FID group，rtpmap 也能让 RTX pt 被识别 */
+        if (llen >= 16 && strncmp(p, "a=rtpmap:", 9) == 0) {
+            /* a=rtpmap:103 rtx/90000 cname:... — rtx 在斜杠前的 token */
+            const char *pt_end = memchr(p + 9, ' ', llen - 9);
+            if (pt_end && pt_end > p + 9) {
+                char pt_buf[16];
+                size_t ptlen = (size_t)(pt_end - (p + 9));
+                if (ptlen < sizeof(pt_buf)) {
+                    memcpy(pt_buf, p + 9, ptlen);
+                    pt_buf[ptlen] = '\0';
+                    int pt = atoi(pt_buf);
+                    if (pt > 0 && pt < 256) {
+                        /* 查一下本行里有没有 "rtx/" */
+                        const char *rtx_marker = memmem(p, llen, "rtx/", 4);
+                        if (rtx_marker)
+                            ssrc_policy_set_aux_pt(pol, (uint8_t)pt);
+                    }
+                }
+            }
+        }
+
+        if (!line_end) break;
+        p = line_end + 1;
+    }
+    if (admitted > 0) {
+        llog(LOG_DEBUG, "media",
+             "admit_ssrc_from_sdp side=%d admitted=%d max_sources=%d "
+             "learned_primary=%d",
+             side, admitted, pol->cfg.max_sources, pol->learned_primary);
+    }
+}
+
+/* 首字节分型（与 dtls_srtp.c pkt_classify 同规则的本文件拷贝）：
+ * 1=STUN 2=DTLS 3=RTP/SRTP -1=未知 */
+static int rx_classify(const uint8_t *buf, size_t len)
+{
+    if (len < 2) return -1;
+    uint16_t t = (uint16_t)((buf[0] << 8) | buf[1]);
+    if ((t & 0xC000) == 0x0000 && len >= 20) {
+        uint32_t ck = ntohl(*(const uint32_t *)(buf + 4));
+        if (ck == 0x2112A442u) return 1;
+    }
+    if (buf[0] >= 20 && buf[0] <= 25) return 2;
+    if ((buf[0] & 0xC0) == 0x80) return 3;
+    return -1;
+}
+
+/* ★ RFC 5761 §4 rtcp-mux 解复用（纯 RTP/RTCP 包判别，不含 STUN/DTLS）：
+ *
+ * RTP：byte[1] = M(1) | PT(7)，PT∈0-127 → byte[1] 可以是 0-127（M=0）
+ *       或 128-255（M=1, PT≥0）
+ * RTCP：byte[1] = PT(8)，PT∈200-255 → byte[1] 固定在 200-255
+ *
+ * 冲突区：byte[1] ∈ 200-255 既可能是 RTP(M=1,PT≥72)
+ *         也可能是 RTCP(PT≥200)
+ *
+ * 两级验证：
+ *   L1. compound 精确匹配：所有 RTCP 子包 length 正好铺满 buffer → RTCP
+ *   L2. 弱验证回退（L1 失败时）：第一个子包 PT ∈[200,255] 且 length 合理
+ *       且子包不溢出 → 判 RTCP（Chrome 有时发非标准 padding 的 compound）
+ *   RTP 的 seq 字段当 RTCP length 解析会巨大（>64KB）→ 溢出 → RTP */
+static int is_rtcp_packet(const uint8_t *buf, size_t len)
+{
+    if (len < 4)
+        return 0;
+    /* RTP/RTCP Version 必须是 2（高两位 10） */
+    if ((buf[0] & 0xC0) != 0x80)
+        return 0;
+    uint8_t pt_byte = buf[1];
+    if (pt_byte < 200)
+        return 0;   /* byte[1] < 200：明确是 RTP（M=0,PT<200） */
+
+    /* ★ L1：精确 compound 匹配 */
+    size_t offset = 0;
+    int all_ok = 1;
+    while (offset + 4 <= len) {
+        uint16_t lw = (uint16_t)((buf[offset + 2] << 8) | buf[offset + 3]);
+        size_t sub_len = ((size_t)lw + 1) * 4;
+        if (sub_len < 4) {
+            all_ok = 0; break;  /* 非法 length */
+        }
+        if (offset + sub_len > len) {
+            all_ok = 0; break;  /* 子包超出 buffer */
+        }
+        offset += sub_len;
+    }
+    if (all_ok && offset == len)
+        return 1;               /* L1 精确匹配成功 */
+
+    /* ★ L2：弱验证回退。
+     * 第一个子包必须 PT ∈[200,255]（已知 pt_byte >=200），
+     * length 字段解析后子包不溢出 buffer → 判 RTCP。
+     * 真 RTP 包的 bytes[2-3] 是 sequence number（通常 > 1000），
+     * 解析成 sub_len 后会 > len → 溢出 → L2 也失败 → RTP。 */
+    uint16_t lw1 = (uint16_t)((buf[2] << 8) | buf[3]);
+    size_t sub_len1 = ((size_t)lw1 + 1) * 4;
+    if (sub_len1 >= 4 && sub_len1 <= len) {
+        /* 第一个子包合法且不溢出 → RTCP */
+        return 1;
+    }
+    return 0;   /* 弱验证也失败 → RTP */
+}
+
+static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
+                           int fd)
+{
+    uint8_t buf[RELAY_BUF];
+    /* REQ-DTLS-001：本侧是否 DTLS lane（WebRTC 混流 fd：STUN/DTLS/SRTP）。
+     * 方向无关：dtls[side] 非空即本侧是 WebRTC（A 或 B 侧均可能）。 */
+    dtls_server_t *ds =
+        (r->node && r->node->dtls[side])
+            ? (dtls_server_t *)r->node->dtls[side] : NULL;
+    const int srtp_lane = (ds != NULL);
+    /* ★DIAG 2026-10-13：DTLS ESTABLISHED 后 relay_recv_one 是否仍被触发
+     * 若 Chrome 不发任何数据，reactor 不会再 EPOLLIN 此 fd，函数根本不进入 */
+    if (srtp_lane && ds &&
+        dtls_server_state(ds) == DTLS_ST_ESTABLISHED) {
+        static int diag_entry_seen[2] = {0};
+        if (diag_entry_seen[side] < 5) {
+            llog(LOG_INFO, "relay",
+                 "★DIAG ENTRY side=%d fd=%d srtp_sess=%p",
+                 side, fd, (void *)r->srtp[side]);
+            ++diag_entry_seen[side];
+        }
+    }
+    for (;;) {
+        nsbc_sa_t src;
+        struct sockaddr_storage ss;
+        socklen_t sl = sizeof(ss);
+        ssize_t n;
+
+        if (srtp_lane) {
+            /* 先 PEEK 分型再决定谁消费——DTLS record 在 OpenSSL<1.1.1 上
+             * 必须留给 BIO_dgram 自己从 fd 读（无 BIO_CTRL_DGRAM_SET_DATA
+             * 注入通道），抢先 recvfrom 会让 SSL_accept 永远拿不到 ClientHello；
+             * STUN 则必须我们消费并立即应答（BIO 会把它当垃圾丢弃，
+             * 浏览器 ICE check 无应答 = 480 根因）。 */
+            ssize_t pn = recvfrom(fd, buf, sizeof(buf), MSG_PEEK,
+                                  (struct sockaddr *)&ss, &sl);
+            if (pn <= 0)
+                return;
+            int cls = rx_classify(buf, (size_t)pn);
+            if (cls == 1) { /* STUN：消费 + Binding Response（ICE consent） */
+                n = recvfrom(fd, buf, sizeof(buf), 0,
+                             (struct sockaddr *)&ss, &sl);
+                if (n <= 0)
+                    return;
+                src.ss = ss;
+                src.len = sl;
+                /* ★ REQ-ICE-LATCH-001：用 STUN 源地址建立 latch。
+                 * WebRTC 复用同一 UDP socket 收发 STUN/DTLS/RTP
+                 * （RFC 8445 §14.1 强制要求）—— 收到 STUN 的源地址就是
+                 * 对端收 RTP 的地址。之前只在收 RTP 时 latch，导致
+                 * "对端只发 STUN 不发 RTP（track 未启用等）" 时 latched 永为 0，
+                 * 对侧 RTP 全被 "other latch not ready" 丢弃。 */
+                if (!r->latched[side] && !r->have_peer[side]) {
+                    r->latch[side] = src;
+                    r->latched[side] = 1;
+                    __atomic_store_n(&r->d_latched[side], 1, __ATOMIC_RELEASE);
+                    llog(LOG_DEBUG, "relay", "LATCH side=%d by STUN "
+                         "from_family=%d", side, ss.ss_family);
+                }
+                char ipa[INET6_ADDRSTRLEN] = {0};
+                uint16_t port = 0;
+                if (ss.ss_family == AF_INET) {
+                    inet_ntop(AF_INET,
+                              &((struct sockaddr_in *)&ss)->sin_addr,
+                              ipa, sizeof(ipa));
+                    port = ntohs(((struct sockaddr_in *)&ss)->sin_port);
+                } else if (ss.ss_family == AF_INET6) {
+                    inet_ntop(AF_INET6,
+                              &((struct sockaddr_in6 *)&ss)->sin6_addr,
+                              ipa, sizeof(ipa));
+                    port = ntohs(((struct sockaddr_in6 *)&ss)->sin6_port);
+                }
+                llog(LOG_DEBUG, "dtls", "STUN rx side=%d fd=%d from=%s:%u len=%zd",
+                     side, fd, ipa, (unsigned)port, n);
+                int rc = dtls_ice_handle_stun(ds, buf, (size_t)n, &src);
+                llog(LOG_DEBUG, "dtls", "STUN Binding resp side=%d rc=%d", side, rc);
+                continue;
+            }
+            if (cls == 2) { /* DTLS record：喂握手 */
+                int st_before = dtls_server_state(ds);
+#if NSBC_OPENSSL_HAS_DTLS_FEED
+                n = recvfrom(fd, buf, sizeof(buf), 0,
+                             (struct sockaddr *)&ss, &sl);
+                if (n > 0)
+                    dtls_server_feed(ds, buf, (size_t)n); /* 注入+握手+导出 */
+#else
+                if (dtls_server_state(ds) == DTLS_ST_ESTABLISHED) {
+                    /* ESTABLISHED 后的残留 record（close_notify 等）：
+                     * 消费丢弃——此路径 BIO_dgram 已不再读 fd，不消费
+                     * 的话 peek 会反复命中同一包形成死循环 */
+                    recvfrom(fd, buf, sizeof(buf), 0,
+                             (struct sockaddr *)&ss, &sl);
+                } else {
+                    /* 不消费——BIO_dgram 从 fd 自读 + SSL_accept 推进 */
+                    dtls_server_on_read(ds);
+                }
+#endif
+                int st_after = dtls_server_state(ds);
+                if (st_before != DTLS_ST_ESTABLISHED && st_after == DTLS_ST_ESTABLISHED) {
+                    llog(LOG_INFO, "dtls", "DTLS ESTABLISHED side=%d fd=%d", side, fd);
+                }
+                if (dtls_server_state(ds) == DTLS_ST_ESTABLISHED &&
+                    !r->srtp[side]) {
+                    r->srtp[side] = dtls_server_take_srtp(ds);
+                    llog(LOG_DEBUG, "dtls", "SRTP relay: session attached "
+                         "side=%d", side);
+                }
+                continue;
+            }
+            /* cls==3（SRTP/RTP）或 -1：落入下方统一 recvfrom 消费 */
+            /* ★DIAG 2026-10-13：DTLS ESTABLISHED 后 WebRTC fd 流量探测
+             * 若 Chrome 不发 SRTP 回来（单通根因），此处 cls 永远不会到 3 */
+            if (srtp_lane && ds &&
+                dtls_server_state(ds) == DTLS_ST_ESTABLISHED) {
+                static int diag_post_dtls_seen[2] = {0};
+                if (diag_post_dtls_seen[side] < 5) {
+                    llog(LOG_INFO, "relay",
+                         "★DIAG POST-DTLS-RX side=%d fd=%d cls=%d pn=%zd "
+                         "srtp_sess=%p",
+                         side, fd, cls, pn, (void *)r->srtp[side]);
+                    ++diag_post_dtls_seen[side];
+                }
+            }
+        }
+
+        n = recvfrom(fd, buf, sizeof(buf), 0,
+                     (struct sockaddr *)&ss, &sl);
+        if (n <= 0)
+            return;
+        src.ss = ss;
+        src.len = sl;
+
+        if (srtp_lane && r->srtp[side]) {
+            /* SRTP → 解密后继续明文 relay 路径。
+             * RTP/RTCP 判别见文件头 is_rtcp_packet() 注释（含 M-bit 冲突处理）。 */
+            int pkt_rtcp = is_rtcp_packet(buf, (size_t)n);
+            size_t slen = (size_t)n;
+            int rc = pkt_rtcp
+                ? nsbc_srtp_unprotect_rtcp(r->srtp[side], buf, &slen)
+                : nsbc_srtp_unprotect_rtp(r->srtp[side], buf, &slen);
+            if (rc != NSBC_OK) {
+                /* ★ REQ-MEDIA-SEC-001：RTCP unprotect 失败静默 drop
+                 *
+                 * 根因：libsrtp2 的 ssrc_any_inbound 通配对 RTP OK，
+                 * 但 RTCP 仍做 SSRC 硬校验 (rc=14 ssrc_mismatch)，
+                 * 且 RTP/RTCP 共享 replay window 导致序号竞争 (rc=7).
+                 * 这些都是 RTCP 统计包（Sender/Receiver Report），
+                 * 丢失只影响 MOS/丢包率等诊断数据，不影响 RTP 媒体流。
+                 * 声音正常说明 RTP 解密完全 OK，密钥方向正确。 */
+                if (pkt_rtcp) {
+                    if ((r->drops + r->pkts) % 100 == 0) {
+                        llog(LOG_DEBUG, "relay", "SRTP RTCP unprotect "
+                             "silent-drop side=%d rc=%d n=%zd (libsrtp2 "
+                             "ssrc_any_inbound RTCP bug, non-fatal)",
+                             side, rc, n);
+                    }
+                    continue;  /* 静默丢弃 RTCP 密文，不 WARN 不计 drops */
+                }
+                /* RTP 解密失败仍然严重（密钥错或包损坏）——保持 WARN + drop + 计数 */
+                char hex[64] = {0};
+                size_t hlen = (size_t)n < 16 ? (size_t)n : 16;
+                for (size_t i = 0; i < hlen && i * 3 < sizeof(hex) - 1; ++i)
+                    snprintf(hex + i * 3, sizeof(hex) - i * 3,
+                             "%02x ", buf[i]);
+                llog(LOG_WARN, "relay", "SRTP RTP unprotect FAIL side=%d rc=%d "
+                     "n=%zd first16=[%s]",
+                     side, rc, n, hex);
+                ++r->drops;
+                continue;
+            }
+            n = (ssize_t)slen;
+            is_rtcp = pkt_rtcp;
+            if ((r->drops + r->pkts) % 100 == 0) {
+                llog(LOG_DEBUG, "relay", "SRTP unprotect OK side=%d n=%zd "
+                     "pkt_rtcp=%d", side, n, pkt_rtcp);
+            }
+        }
+        /* ★ REQ-MEDIA-SEC-005b：srtp_lane 但 srtp 会话还没建立 → 直接 drop。
+         * 之前注释说"握手未完的早到媒体当明文处理"——但浏览器发的是加密 SRTP，
+         * 不是明文 RTP！RTP/SRTP 头部结构相同（12B + PT/SSRC），rtp_parse() 会恰好
+         * 把密文解析成"合法 RTP"，转发到对端 → 对端解不开 → 全丢。
+         * DTLS record（cls=2）和 STUN（cls=1）已在上文 PEEK 分支被消费，
+         * 能走到这里的 cls==3 只有 SRTP——必须等 DTLS 握手完成才能解密转发。 */
+        if (srtp_lane && !r->srtp[side]) {
+            ++r->drops;
+            continue;
+        }
+
+        if (r->have_peer[side] && !nsbc_sa_eq_addr(&src, &r->peer[side])) {
+            llog(LOG_WARN, "relay", "DROP: peer addr mismatch side=%d "
+                 "(have_peer=%d src_fam=%d peer_fam=%d)",
+                 side, r->have_peer[side],
+                 src.ss.ss_family, r->peer[side].ss.ss_family);
+            ++r->drops;
+            continue;
+        }
+        /* === REQ-NAT-001 comedia 学习（FreeSWITCH comedia=on 等效）===
+         * NAT 场景：SDP c= 是私网地址，但 recvfrom 拿到真实公网 src。
+         * 旧逻辑：set_peer 预设 latch=SDP 地址后，latched=1 → 不再更新 → NAT 后分机 RTP 被判 mismatch DROP。
+         * 新逻辑：每次收到 RTP 都学习最新 src 覆盖 latch，允许 NAT 穿透。
+         *         Latched 首次设 1（OAM 视角 gate_open=1）；后续每次更新实际地址。
+         *         对称 NAT 场景 src 每次都变（不可能命中同一端口）——这种场景本项目依赖 STUN/ICE
+         *         （WebRTC 已覆盖），非 WebRTC 的对称 NAT 需用户侧 STUN 辅助。 */
+        if (!r->latched[side]) {
+            /* 首次：锁定 latch，标志 relay "已就绪" */
+            r->latch[side] = src;
+            r->latched[side] = 1;
+            __atomic_store_n(&r->d_latched[side], 1, __ATOMIC_RELEASE);
+            llog(LOG_DEBUG, "relay", "★ LATCH side=%d by RTP src_fam=%d latched[0]=%d latched[1]=%d",
+                 side, src.ss.ss_family, r->latched[0], r->latched[1]);
+        } else if (!nsbc_sa_eq(&src, &r->latch[side])) {
+            /* comedia：真实 RTP 源变化（NAT 穿透）→ 覆盖 latch，不丢弃
+             * 非对称 NAT：首次 RTP 即从 NAT 后真实地址到达 → 覆盖 SDP 预设私网地址
+             * 对称 NAT：src 每次都变 — 此处会反复覆盖，发回最新 src（尽力而为） */
+            llog(LOG_DEBUG, "relay", "comedia learn side=%d latch updated", side);
+            r->latch[side] = src;
+        }
+
+        int other = side ^ 1;
+        /* REQ-NAT-001 comedia：对侧是否就绪看 latched OR have_peer
+         * （have_peer 来自 SDP，可公网直达；latched 来自 comedia 学习） */
+        if (!r->latched[other] && !r->have_peer[other]) {
+            /* 对侧尚未就绪：丢弃早期突发 */
+            if ((r->drops + r->pkts) % 100 == 0) {
+                llog(LOG_DEBUG, "relay", "★ DROP other latch not ready "
+                     "side=%d other=%d latched[0]=%d latched[1]=%d have_peer[0]=%d have_peer[1]=%d",
+                     side, other,
+                     r->latched[0], r->latched[1],
+                     r->have_peer[0], r->have_peer[1]);
+            }
+            ++r->drops;
+            continue;
+        }
+
+        /* REQ-MEDIA-BUG-001：BUG_RAW_RTP + BUG_RTCP_MIRROR 原始帧投递
+         * 所有经 relay 的 RTP/RTCP 帧，在 SSRC 重写 + 转发 之前捕获。
+         * src=latch[side]（真实源地址），dst=peer/latch[other]（对端地址）。
+         * IPv4 仅（P0），IPv6 填 0；地址提取一次，RTP/RTCP 分支共用。 */
+        /* === REQ-NAT-001 comedia：对侧目标地址选择 ===
+         * 优先 latched[other]（comedia 学到的真实 RTP 源，NAT 后可达），
+         * fallback 到 have_peer[other]（SDP 预设地址，公网直达场景）。 */
+        const nsbc_sa_t *dst_hint = r->latched[other]
+                                    ? &r->latch[other]
+                                    : (r->have_peer[other]
+                                       ? &r->peer[other]
+                                       : &r->latch[other]);
+        uint32_t s_ip = 0, d_ip = 0;
+        uint16_t s_port = 0, d_port = 0;
+        if (src.ss.ss_family == AF_INET) {
+            struct sockaddr_in *sin = (struct sockaddr_in *)&src.ss;
+            s_ip = sin->sin_addr.s_addr;
+        }
+        if (dst_hint->ss.ss_family == AF_INET) {
+            struct sockaddr_in *sin = (struct sockaddr_in *)&dst_hint->ss;
+            d_ip = sin->sin_addr.s_addr;
+        }
+
+        if (!is_rtcp && r->node && r->node->call) {
+            media_bug_dispatch_rtp_raw(r->node->call, side,
+                buf, (size_t)n, s_ip, s_port, d_ip, d_port);
+        }
+
+        if (!is_rtcp) {
+            rtp_pkt_t pkt;
+            if (rtp_parse(buf, (size_t)n, &pkt) != NSBC_OK ||
+                pkt.version != 2) {
+                ++r->drops;
+                continue;
+            }
+            /* ★ REQ-VQ-001：RTP seq-gap 丢包计数——按 SSRC 分槽
+             * 多 SSRC（audio + rejected video 交替）不再互相污染。
+             * relay_cb 单线程写 primed/ssrc/last_seq（无原子），
+             * expected/lost 用 __atomic_fetch_add（OAM view 无锁 __atomic_load_n 读）。 */
+            {
+                seq_track_t *st = NULL;
+                for (int i = 0; i < SEQ_SLOTS; ++i) {
+                    if (r->seq[side][i].primed &&
+                        r->seq[side][i].ssrc == pkt.ssrc) {
+                        st = &r->seq[side][i];
+                        break;
+                    }
+                }
+                if (!st) {
+                    for (int i = 0; i < SEQ_SLOTS; ++i) {
+                        if (!r->seq[side][i].primed) {
+                            st = &r->seq[side][i];
+                            st->primed    = 1;
+                            st->ssrc      = pkt.ssrc;
+                            st->last_seq  = pkt.seq;
+                            __atomic_store_n(&st->expected, 1u, __ATOMIC_RELEASE);
+                            __atomic_store_n(&st->lost,     0u, __ATOMIC_RELEASE);
+                            break;
+                        }
+                    }
+                }
+                if (st) {
+                    int16_t diff = (int16_t)(pkt.seq - st->last_seq);
+                    if (diff > 0) {
+                        __atomic_fetch_add(&st->expected, (uint32_t)diff,
+                                           __ATOMIC_RELEASE);
+                        if (diff > 1)
+                            __atomic_fetch_add(&st->lost, (uint32_t)(diff - 1),
+                                               __ATOMIC_RELEASE);
+                        st->last_seq = pkt.seq;
+                    }
+                }
+            }
+            src_decision_t dc = ssrc_policy_on_rtp(
+                &r->pol[side], pkt.ssrc, (uint8_t)pkt.pt, nsbc_now_ms());
+            if (dc == SRC_DEC_DROP) {
+                /* ★ 诊断日志：ssrc_policy 丢弃了这个 SSRC。
+                 * 如果大量出现 pt=96-127（视频 PT 范围），说明 ssrc_policy 默认策略
+                 * 只认第一个到达的 SSRC（音频），后到的视频 SSRC 全被 drop。 */
+                static __thread int drop_log_burst = 0;
+                if (drop_log_burst < 50 || ++drop_log_burst % 1000 == 0) {
+                    llog(LOG_DEBUG, "relay",
+                         "SSRC_DROP side=%d ssrc=%08x pt=%u total_drops=%u",
+                         side, pkt.ssrc, (unsigned)pkt.pt, (unsigned)r->drops);
+                }
+                ++r->drops;
+                continue;
+            }
+            /* REQ-REC-006：raw RTP payload 录制回调
+             * 在 SSRC 重写之前喂（payload 与 SSRC 无关，保持原始）。
+             * call_key=r->node->call（b2b_call_t*，供回调反查 rec_sess_t）。
+             * cfg.rec_feed_fn 为 NULL 时跳过（未接线）。 */
+            if (r->m->cfg.rec_feed_fn && pkt.payload && pkt.payload_len) {
+                r->m->cfg.rec_feed_fn(r->m->cfg.rec_feed_ud,
+                                      r->node ? r->node->call : NULL,
+                                      pkt.payload, pkt.payload_len,
+                                      side, (int)pkt.pt);
+            }
+            /* 出向 SSRC 重写（固定头偏移 8，4 字节网络序）
+             * 之前 Bug：只改 p[3] 一个字节，导致 SSRC 变成 orig[0..2] | (new & 0xFF)。
+             *
+             * ★ REQ-MEDIA-SSRC-002 双 WebRTC 透传优化：
+             *   两侧都是 WebRTC 时，两端各自生成天然不冲突的 SSRC，Chrome 走
+             *   mid/msid 匹配 track，不依赖 SSRC 数值。此时做 SSRC 重写反而
+             *   造成 RTP 与未重写的 RTCP SR sender SSRC / SDES SSRC 不一致
+             *   → Chrome 丢弃收到的 RTP/RTCP。
+             *   mixed-mode（一端明文 SIP）才需要重写（防两端 SSRC 碰撞）。 */
+            uint32_t newssrc;
+            if (r->node && r->node->dtls[side] && r->node->dtls[other]) {
+                /* 双 WebRTC：透传原始 SSRC，不重写 */
+                newssrc = pkt.ssrc;
+            } else {
+                newssrc = smap_lookup(&r->map[side], pkt.ssrc);
+                uint32_t newssrc_net = htonl(newssrc);
+                memcpy(buf + 8, &newssrc_net, 4);
+            }
+            /* 主源学习/切换：记录入向↔出向 SSRC 对（OAM 诊断） */
+            if (dc == SRC_DEC_PRIMARY || dc == SRC_DEC_NEW_PRIMARY) {
+                __atomic_store_n(&r->d_in_ssrc[side], pkt.ssrc,
+                                 __ATOMIC_RELEASE);
+                __atomic_store_n(&r->d_out_ssrc[side], newssrc,
+                                 __ATOMIC_RELEASE);
+            }
+        } else {
+            /* RTCP：旁路只读聚合 VQ，不改变转发/丢弃决策
+             * （SSRC 校验丢弃/出向重写属 REQ-MEDIA-SEC-003 转发面，P1 补） */
+            relay_rtcp_observe(r, side, buf, (size_t)n);
+            /* REQ-MEDIA-BUG-001：BUG_RTCP_MIRROR 投递（与 RTP 分支共用 src/dst） */
+            if (r->node && r->node->call) {
+                media_bug_dispatch_rtcp(r->node->call, side,
+                    buf, (size_t)n, s_ip, s_port, d_ip, d_port);
+            }
+        }
+        /* === REQ-NAT-001 comedia：sendto 目标地址 ===
+         * 与上方 dst_hint 同逻辑：优先 comedia 学到的真实 latch。 */
+        const nsbc_sa_t *dst = r->latched[other]
+                               ? &r->latch[other]
+                               : (r->have_peer[other]
+                                  ? &r->peer[other]
+                                  : &r->latch[other]);
+        /* REQ-DTLS-001：明文 RTP → WebRTC 侧（对侧有 dtls 终结器）前加密。
+         * RTP/RTCP 按 PT 字节判（与入向对称，rtcp-mux 兼容）。
+         * RELAY_BUF=2048 对 1500B 以太网包 + AEAD tag(~30B) 余量充足。 */
+        size_t send_len = (size_t)n;
+        if (r->node && r->node->dtls[other] && r->srtp[other]) {
+            int out_rtcp = is_rtcp_packet(buf, (size_t)n);
+            size_t cap = sizeof(buf);
+            int rc = out_rtcp
+                ? nsbc_srtp_protect_rtcp(r->srtp[other], buf, &send_len, cap)
+                : nsbc_srtp_protect_rtp(r->srtp[other], buf, &send_len, cap);
+            if (rc != NSBC_OK) {
+                llog(LOG_WARN, "relay", "SRTP protect FAIL side=%d→%d rc=%d "
+                     "out_rtcp=%d send_len_before=%zu cap=%zu",
+                     side, other, rc, out_rtcp, send_len, cap);
+                ++r->drops;
+                continue;
+            }
+        }
+        /* ★ 2026-10-13 诊断：sendto 目标地址（前 5 包 INFO，后续每 100 包 DEBUG）
+         * 确认 SBC 把 SRTP 发到 Chrome ICE 候选的真实地址 */
+        {
+            static int diag_sendto_seen[2] = {0};
+            char ipa[INET6_ADDRSTRLEN] = {0};
+            uint16_t dport = 0;
+            if (dst->ss.ss_family == AF_INET) {
+                inet_ntop(AF_INET, &((struct sockaddr_in *)&dst->ss)->sin_addr,
+                          ipa, sizeof(ipa));
+                dport = ntohs(((struct sockaddr_in *)&dst->ss)->sin_port);
+            } else if (dst->ss.ss_family == AF_INET6) {
+                inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&dst->ss)->sin6_addr,
+                          ipa, sizeof(ipa));
+                dport = ntohs(((struct sockaddr_in6 *)&dst->ss)->sin6_port);
+            }
+            if (diag_sendto_seen[side] < 5) {
+                llog(LOG_INFO, "relay",
+                     "★ SENDTO side=%d→%d dst=%s:%u send_len=%zu "
+                     "latched[other]=%d have_peer[other]=%d srtp_protect=%d",
+                     side, other, ipa, (unsigned)dport, send_len,
+                     r->latched[other], r->have_peer[other],
+                     !!(r->node && r->node->dtls[other] && r->srtp[other]));
+                ++diag_sendto_seen[side];
+            } else if (r->pkts % 100 == 0) {
+                llog(LOG_DEBUG, "relay", "FWD side=%d→%d send_len=%zu "
+                     "dst=%s:%u dst_fam=%d",
+                     side, other, send_len, ipa, (unsigned)dport,
+                     dst->ss.ss_family);
+            }
+        }
+        ssize_t sret = sendto(r->fd_rtp[other], buf, send_len, MSG_NOSIGNAL,
+                              (const struct sockaddr *)&dst->ss, dst->len);
+        if (sret != (ssize_t)send_len) {
+            llog(LOG_WARN, "relay", "sendto FAIL side=%d→%d ret=%zd errno=%d "
+                 "expected=%zd dst=%s", side, other, sret, errno, send_len, "?");
+        }
+        ++r->pkts;
+        /* ★ 诊断：每 100 包打一条 INFO，同时看两个方向转发量 */
+        if (r->pkts % 100 == 0) {
+            llog(LOG_DEBUG, "relay", "★ FWD side=%d→%d pkts=%llu drops=%u "
+                 "latched[0]=%d latched[1]=%d srtp[0]=%p srtp[1]=%p",
+                 side, other,
+                 (unsigned long long)r->pkts, (unsigned)r->drops,
+                 r->latched[0], r->latched[1],
+                 (void *)r->srtp[0], (void *)r->srtp[1]);
+        }
+    }
+}
+
+/* RTCP 旁路 VQ 聚合 + SDES CNAME 绑定（REQ-MEDIA-SEC-003⑤ / REQ-OBS-010）：
+ * 只解析不干预转发。
+ * P0 单音频 m-line：取 compound 中首个带报告块的 SR(200)/RR(201) 的
+ * 第一块（fraction lost/累计丢包/到达抖动，RFC 3550 §6.4.1），并扫
+ * SDES(pt=202) 取 CNAME 与当前侧已学习主源 SSRC 匹配。
+ * jitter 为媒体时钟 tick 原值（时钟率随 payload，未解析不做 ms 换算，
+ * 严禁估算）；R-Factor/MOS 模型 P1。 */
+static void relay_rtcp_observe(rtp_relay_t *r, int side, const uint8_t *buf,
+                               size_t len)
+{
+    rtcp_iter_t it;
+    rtcp_pkt_t pk;
+    int rr_seen = 0;
+    rtcp_iter_init(&it, buf, len);
+    while (rtcp_next(&it, &pk)) {
+        /* SDES(pt=202)：CNAME 与本侧已学习入向主源 SSRC 匹配则落槽。
+         * 不匹配则跳过（可能是附加流或 BUNDLE 其他 m-line 的 SDES，
+         * P0 单音频场景无冲突，多 m-line 取首段）。 */
+        if (pk.pt == 202) {
+            uint32_t ssrc;
+            sip_tok_t cname;
+            if (rtcp_sdes_cname(&pk, &ssrc, &cname) == NSBC_OK &&
+                cname.len > 0) {
+                uint32_t learned = __atomic_load_n(
+                    &r->d_in_ssrc[side], __ATOMIC_ACQUIRE);
+                if (learned && ssrc == learned) {
+                    size_t n = cname.len < sizeof(r->d_cname[side]) - 1
+                                   ? cname.len
+                                   : sizeof(r->d_cname[side]) - 1;
+                    /* 序列计数器守护：先清 0 让 OAM 读者跳过，
+                     * memcpy 完成后置 len+1（≥1，REVISION）。
+                     * 读者 double-check 防 torn read（char 数组非原子）。 */
+                    __atomic_store_n(&r->d_have_cname[side], 0,
+                                     __ATOMIC_RELEASE);
+                    memcpy(r->d_cname[side], cname.p, n);
+                    r->d_cname[side][n] = '\0';
+                    __atomic_store_n(&r->d_have_cname[side], (int)(n + 1),
+                                     __ATOMIC_RELEASE);
+                }
+            }
+            continue;
+        }
+        if (rr_seen)
+            continue;
+        if ((pk.pt != 200 && pk.pt != 201) || pk.rc < 1)
+            continue;
+        rtcp_rb_t rb;
+        if (rtcp_rb_get(&pk, 0, &rb) != NSBC_OK)
+            continue;
+        __atomic_store_n(&r->d_have_rr[side], 1, __ATOMIC_RELEASE);
+        __atomic_store_n(&r->d_rr_frac[side], (uint32_t)rb.fraction,
+                         __ATOMIC_RELEASE);
+        __atomic_store_n(&r->d_rr_lost[side], rb.lost, __ATOMIC_RELEASE);
+        __atomic_store_n(&r->d_rr_jitter[side], rb.jitter,
+                         __ATOMIC_RELEASE);
+        rr_seen = 1;
+    }
+}
+
+static void relay_cb(int fd, uint32_t ev, void *arg)
+{
+    (void)ev;
+    rtp_relay_t *r = arg;
+    /* REQ-DTLS-001：STUN/DTLS/SRTP demux 全在 relay_recv_one 内部
+     * （peek 分型：STUN 应答、DTLS 喂握手、SRTP 解密后 relay）——
+     * 此处不做状态分流，避免 BIO_dgram 与 relay 层抢读同 fd。 */
+    for (int side = 0; side < 2; ++side) {
+        if (fd == r->fd_rtp[side]) {
+            relay_recv_one(r, side, 0, fd);
+            return;
+        }
+        if (fd == r->fd_rtcp[side]) {
+            relay_recv_one(r, side, 1, fd);
+            return;
+        }
+    }
+}
+
+static uint32_t ptr_shard(const void *c)
+{
+    return ((uintptr_t)c >> 4) & (BR_SHARDS - 1);
+}
+
+static cnode_t *entry_find(bridge_mgr_t *m, const void *c)
+{
+    br_shard_t *s = &m->sh[ptr_shard(c)];
+    for (cnode_t *p = s->head; p; p = p->next)
+        if (p->call == c)
+            return p;
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* mgr                                                                  */
+/* ------------------------------------------------------------------ */
+int bridge_mgr_create(const mb_cfg_t *cfg, bridge_mgr_t **out)
+{
+    bridge_mgr_t *m = calloc(1, sizeof(*m));
+    if (!m)
+        return NSBC_NOMEM;
+    m->cfg = *cfg;
+    if (!m->cfg.local_ip)
+        m->cfg.local_ip = "0.0.0.0";
+    for (int i = 0; i < BR_SHARDS; ++i)
+        pthread_mutex_init(&m->sh[i].lock, NULL);
+    *out = m;
+    return NSBC_OK;
+}
+
+void bridge_mgr_destroy(bridge_mgr_t *m)
+{
+    if (!m)
+        return;
+    free(m);
+}
+
+/* ------------------------------------------------------------------ */
+/* 决策                                                                 */
+/* ------------------------------------------------------------------ */
+static int is_private_v4(const char *ip)
+{
+    unsigned a = 0, b = 0;
+    if (sscanf(ip, "%u.%u", &a, &b) != 2)
+        return 0;
+    if (a == 10 || a == 127 || (a == 169 && b == 254))
+        return 1;
+    if (a == 172 && b >= 16 && b <= 31)
+        return 1;
+    if (a == 192 && b == 168)
+        return 1;
+    return 0;
+}
+
+/* 令牌转 NUL 串后判私网 */
+static int is_private_tok(const char *ip, size_t len)
+{
+    char tmp[64];
+    if (len >= sizeof(tmp))
+        len = sizeof(tmp) - 1;
+    memcpy(tmp, ip, len);
+    tmp[len] = '\0';
+    return is_private_v4(tmp);
+}
+
+static int codec_intersect(const char *off, size_t ol, const char *ans,
+                           size_t al)
+{
+    sdp_t so, sa;
+    if (sdp_parse(&so, off, ol) != NSBC_OK ||
+        sdp_parse(&sa, ans, al) != NSBC_OK)
+        return 1; /* 解析保守不判 transcode */
+    const sdp_media_t *mo = NULL, *ma = NULL;
+    for (int i = 0; i < so.nmedia; ++i)
+        if (so.media[i].type == SDP_M_AUDIO) { mo = &so.media[i]; break; }
+    for (int i = 0; i < sa.nmedia; ++i)
+        if (sa.media[i].type == SDP_M_AUDIO) { ma = &sa.media[i]; break; }
+    if (!mo || !ma)
+        return 1;
+    sdp_media_build_codecs(&so, (sdp_media_t *)mo);
+    sdp_media_build_codecs(&sa, (sdp_media_t *)ma);
+    for (int i = 0; i < ma->ncodecs; ++i) {
+        for (int j = 0; j < mo->ncodecs; ++j) {
+            if (ma->codecs[i].enc.len == mo->codecs[j].enc.len &&
+                !memcmp(ma->codecs[i].enc.p, mo->codecs[j].enc.p,
+                        ma->codecs[i].enc.len))
+                return 1;
+        }
+    }
+    return 0;
+}
+
+/* WebRTC SDP 特征：DTLS-SRTP + ICE。
+ * relay 层仅处理明文 RTP（RTP/AVP / RTP/SAVP 非加密），
+ * WebRTC 的 UDP/TLS/RTP/SAVPF / a=fingerprint / a=ice-ufrag 必须 BYPASS，
+ * 让浏览器走 P2P ICE/DTLS 直连。内网场景 NAT 穿透可用 host candidate。 */
+static int is_webrtc_sdp(const char *sdp, size_t len)
+{
+    if (!sdp || !len) return 0;
+    if (memmem(sdp, len, "UDP/TLS", 7)) return 1;
+    if (memmem(sdp, len, "a=fingerprint:", 14)) return 1;
+    if (memmem(sdp, len, "a=ice-ufrag:", 13)) return 1;
+    return 0;
+}
+
+/* ★ REQ-MEDIA-SEC-004：从 SDP 里提取 a=fingerprint:sha-256
+ * 之前用 sdp_parse → sdp_fingerprint_get，但 sdp_parse 对 CRLF 行尾
+ * 或某些浏览器 SDP 的细节会返回 FAIL，导致 peer_fp 永远没注入 →
+ * DTLS 握手走"宽松模式"（不校验证书指纹）。
+ * 这里用 memmem 直接定位 "a=fingerprint:sha-256 " 前缀，
+ * 完全绕过完整 SDP 解析器，顺手做 \r 清理 + 小写规范化。 */
+static int extract_fp_simple(const char *sdp, size_t len,
+                             char *out, size_t outsz)
+{
+    static const char pfx[] = "a=fingerprint:sha-256 ";
+    const size_t plen = sizeof(pfx) - 1;
+    const char *p = memmem(sdp, len, pfx, plen);
+    if (!p) return -1;
+    p += plen;
+    const char *end = memchr(p, '\n', (size_t)(sdp + len - p));
+    if (!end) end = sdp + len;
+    /* 回剥尾部 \r \t 空格 */
+    while (end > p && (end[-1] == '\r' || end[-1] == ' '
+                       || end[-1] == '\t'))
+        --end;
+    size_t n = (size_t)(end - p);
+    if (n == 0 || n >= outsz) return -1;
+    for (size_t i = 0; i < n; ++i)
+        out[i] = (char)tolower((unsigned char)p[i]);
+    out[n] = '\0';
+    return 0;
+}
+
+static void inject_peer_fp(dtls_server_t *ds, const char *sdp, size_t len)
+{
+    if (!ds || !sdp || len == 0) return;
+    char fp_str[NSBC_SSL_FP_SHA256_SIZE];
+    if (extract_fp_simple(sdp, len, fp_str, sizeof(fp_str)) != 0) {
+        llog(LOG_WARN, "dtls", "inject_peer_fp: fp extract FAIL fd=%d",
+             dtls_server_fd(ds));
+        return;
+    }
+    llog(LOG_INFO, "dtls", "inject_peer_fp: fd=%d fp=[%s]",
+         dtls_server_fd(ds), fp_str);
+    dtls_server_set_peer_fp(ds, fp_str);
+}
+
+int bridge_decide(bridge_mgr_t *m, const char *offer, size_t offer_len,
+                  const char *answer, size_t answer_len, mb_mode_t *mode)
+{
+    /* DTLS-SRTP (WebRTC) 腿 → 模式决策：
+     *   两侧都是 WebRTC (offer_ws && answer_ws) → 可以 BYPASS
+     *     （两端浏览器用 ICE/DTLS 建 P2P 隧道，SBC 只转发 SIP 信令；
+     *      L840-844 注释原本就写明 WebRTC "必须 BYPASS 让浏览器走 P2P
+     *      ICE/DTLS 直连"，之前手滑写成 OR 错误强制 RELAY）；
+     *   只有一侧 WebRTC (offer_ws XOR answer_ws) → 必须 SRTP_RELAY
+     *     （另一侧 MicrosIP 等软电话不支持 DTLS-SRTP，SBC 终结 WebRTC
+     *     侧 DTLS，明文侧走 RTP relay）。
+     * 关键：offer 侧是 WebRTC 但 answer 还没到（answer=NULL，bridge_offer_hook
+     * 阶段）时，此处不提前强制 SRTP_RELAY——hook 层有 b_ws 回调从 leg[1]
+     * 反查 B 腿是否也是 WebRTC，权威信息更完整。 */
+    const int offer_ws = is_webrtc_sdp(offer, offer_len);
+    const int answer_ws = answer ? is_webrtc_sdp(answer, answer_len) : 0;
+    const int answer_present = answer != NULL;
+    const int mixed_ws = answer_present && (offer_ws != answer_ws);
+    const int both_ws  = answer_present && offer_ws && answer_ws;
+
+    /* 混合腿（恰好一侧 WebRTC 且 answer 已知）→ 必须 SRTP_RELAY */
+    if (mixed_ws) {
+        *mode = MB_SRTP_RELAY;
+        return NSBC_OK;
+    }
+    /* 两侧都 WebRTC 且 answer 已知 → auto 默认 SRTP_RELAY（SBC 终结两侧 DTLS）
+     *   BYPASS 让浏览器 P2P 必须由 rule=bypass 显式指定，auto 不盲目放
+     *   （两侧浏览器同网段 NAT-free 才值得 P2P，公网场景 ICE 穿透经常失败
+     *    反而丢媒体——auto 保守锚定；rule=bypass 作为优化路径）。*/
+    if (both_ws) {
+        *mode = MB_SRTP_RELAY;
+        return NSBC_OK;
+    }
+    /* offer 是 WebRTC 但 answer 还没到 → 留给 hook 层完整决策（hook 有 b_ws 回调
+     * 从 leg[1] 反查 B 腿类型，比 bridge_decide 信息更完整） */
+    if (offer_ws && !answer_present) {
+        /* 继续往下跑 NAT/allow_bypass 决策作为初始值，hook 层稍后会修正 */
+    }
+
+    if (answer) {
+        if (!codec_intersect(offer, offer_len, answer, answer_len)) {
+            *mode = MB_TRANSCODE;
+            return NSBC_OK;
+        }
+        /* 双方地址（取首个音频 c=） */
+        sdp_t sa;
+        sip_tok_t ip = {NULL, 0};
+        if (sdp_parse(&sa, answer, answer_len) == NSBC_OK) {
+            for (int i = 0; i < sa.nmedia; ++i) {
+                const sdp_conn_t *c =
+                    sdp_media_effective_conn(&sa, &sa.media[i]);
+                if (c && c->addr.p) { ip = c->addr; break; }
+            }
+        }
+        if (m->cfg.trust_private && ip.p &&
+            is_private_tok(ip.p, ip.len)) {
+            *mode = MB_BYPASS;
+            return NSBC_OK;
+        }
+    }
+    *mode = m->cfg.allow_bypass ? MB_BYPASS : MB_RELAY;
+    return NSBC_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* SDP 重写                                                             */
+/* ------------------------------------------------------------------ */
+/* 写一行到 out buffer。溢出返回 NSBC_NOSPC，而非静默丢弃——
+ * 之前静默 return 导致 bridge_rewrite_sdp 在 buffer 紧张时输出残缺 SDP
+ * （半截属性行 + 后续行错位），上层 memcpy 出来就是脏数据。 */
+static int put_line(char *out, size_t cap, size_t *used, const char *p,
+                    size_t n)
+{
+    if (*used + n > cap)
+        return NSBC_NOSPC;
+    memcpy(out + *used, p, n);
+    *used += n;
+    return NSBC_OK;
+}
+
+/* 需剥离的 ICE/DTLS 属性行前缀（PLAIN 消毒 / WS 换凭证 共用）：
+ * PLAIN——WebRTC 特征行明文端不认识（MicroSIP 400 Bad SDP 根因）；
+ * WS——剥对端旧凭证，调用方随后注入本侧 dtls_server 的新凭证。 */
+static int attr_is_ice_dtls(const char *p, size_t llen)
+{
+    static const char *const pfx[] = {
+        "a=ice-ufrag:", "a=ice-pwd:", "a=ice-options:",
+        "a=fingerprint:", "a=setup:", "a=candidate:",
+        "a=remote-candidates:", "a=identity:",
+        /* REQ-MEDIA-SSRC-001：剥掉 SSRC 声明行
+         * relay 会重写入向 RTP 的 SSRC —— Chrome 严格按 a=ssrc: 匹配，
+         * 剥掉后走 mid/msid 匹配。 */
+        "a=ssrc:", "a=ssrc-group:", "a=ssrc-semantics:",
+        /* ★ WebRTC answer 清理：剥掉 B 侧（普通 SIP）私货属性，
+         * 避免泄漏到 A 侧（WebRTC）引发歧义或与 rtcp-mux 冲突。 */
+        "a=X-nat:", "a=rtcp:",
+        NULL,
+    };
+    for (int i = 0; pfx[i]; ++i) {
+        size_t n = strlen(pfx[i]);
+        if (llen >= n && memcmp(p, pfx[i], n) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* 剥掉 b=AS: / b=TIAS: 带通行（session 级 + media 级都可能出现）。
+ * WebRTC answer 不需要这些传统 SIP 带通声明。 */
+static int line_is_bandwidth(const char *p, size_t llen)
+{
+    static const char *const pfx[] = { "b=AS:", "b=TIAS:", NULL };
+    for (int i = 0; pfx[i]; ++i) {
+        size_t n = strlen(pfx[i]);
+        if (llen >= n && memcmp(p, pfx[i], n) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* ---- per-section ICE/DTLS 注入 ----
+ *
+ * 原始 offer/answer 里的 a=ice-* / a=fingerprint / a=setup / a=candidate
+ * 行会被 bridge_rewrite_sdp(dir=WS) 全部剥掉。调用方（offer_hook/answer_hook）
+ * 需要把 dtls_server 自己生成的凭证注入回去。
+ *
+ * 关键约束：浏览器对 BUNDLE 模式要求**每个 m= 段**（audio + video ...）
+ * 都必须有 a=fingerprint + a=setup + a=candidate。如果只在末尾追加一份，
+ * 按 RFC 4566 媒体级属性属于"紧接前面的 m= 段"——导致只有最后一个媒体段
+ * 有凭证、前面的段全空。Chrome 对 BUNDLE base（通常是 audio/mid:0）做检查时
+ * 发现没 fingerprint → setRemoteDescription 直接失败 → 480。
+ *
+ * 所以这里实现：扫描 SDP，在每个 m= 段末尾（下一个 m= 行之前或 SDP 结尾）
+ * 插入注入块，每段一份相同的。 */
+static int sdp_inject_per_section(const char *in, size_t inlen,
+                                  char *out, size_t outsz,
+                                  const char *inject, size_t inject_len,
+                                  int skip_rejected)
+{
+    if (!in || !out || !inject || inlen == 0 || inject_len == 0)
+        return NSBC_INVAL;
+    if (inlen >= outsz)
+        return NSBC_NOSPC;
+    memset(out, 0, outsz);  /* 防御：out 不能带脏数据 */
+    size_t used = 0;
+    const char *p = in;
+    const char *end = in + inlen;
+    int has_section = 0;
+    int section_rejected = 0;  /* 当前 m= 段是否被拒（port=0） */
+    while (p < end) {
+        const char *eol = memchr(p, '\n', (size_t)(end - p));
+        const char *line_end = eol ? eol : end;
+        size_t llen = (size_t)(line_end - p);
+
+        if (llen >= 2 && p[0] == 'm' && p[1] == '=') {
+            /* 新媒体段开始——先把上一段的注入块写出去（如果有且未拒绝） */
+            if (has_section && !section_rejected) {
+                if (used + inject_len >= outsz) return NSBC_NOSPC;
+                memcpy(out + used, inject, inject_len);
+                used += inject_len;
+            }
+            has_section = 1;
+            /* 检测本段是否被拒：m=<media> 0 <proto> ... */
+            section_rejected = 0;
+            if (skip_rejected) {
+                const char *mt_end = p + 2;
+                while (mt_end < line_end && *mt_end != ' ') ++mt_end;
+                const char *ps = mt_end;
+                while (ps < line_end && *ps == ' ') ++ps;
+                if (ps < line_end && *ps == '0' &&
+                    (ps[1] == ' ' || ps[1] == '\r'))
+                    section_rejected = 1;
+            }
+        }
+        /* 原样复制当前行 + 行尾 \n */
+        if (used + llen + 1 >= outsz) return NSBC_NOSPC;
+        memcpy(out + used, p, llen);
+        used += llen;
+        if (eol) { out[used] = '\n'; ++used; }
+
+        p = eol ? eol + 1 : end;
+    }
+    /* 最后一段也要注入（如果未拒绝） */
+    if (has_section && !section_rejected) {
+        if (used + inject_len >= outsz) return NSBC_NOSPC;
+        memcpy(out + used, inject, inject_len);
+        used += inject_len;
+    }
+    if (used >= outsz) return NSBC_NOSPC;
+    out[used] = '\0';
+    return (int)used;
+}
+
+/* ---- 缺失 video m-line 补全 ----
+ *
+ * 纯 SIP 终端（MicroSIP）的 offer/answer 可能只有 audio m-line（没有 m=video）。
+ * 但 WebRTC 侧（Chrome）的 RTCPeerConnection 默认创建 audio + video 两个
+ * transceivers —— setRemoteDescription 收到只有 1 段 m= 的 offer 时，Chrome
+ * 无法匹配本地 video transceiver → 报 WebRTC Error。
+ *
+ * 修复：向 WebRTC 侧（dtls[0] 或 dtls[1] 非空）发送的 SDP 里，如果没有 video
+ * m-line，补一个 rejected video m-line（port=0 + 空 PT 列表 + a=inactive）。
+ *
+ * 这个函数在 bridge_rewrite_sdp 之后调用，只做"有没有 m=video"检测 + 追加
+ * rejected video 段。追加后后续的 sdp_inject_per_section / sdp_build_webrtc_answer
+ * 会正常识别并处理 skip_rejected（不注入 ICE，只补 mid/inactive）。 */
+static int sdp_ensure_video_mline(char *buf, size_t cap, int *len,
+                                  const char *proto_line)
+{
+    const char *needle = "m=video ";
+    if (strstr(buf, needle))
+        return NSBC_OK;   /* 已经有 video m-line，什么都不做 */
+
+    /* 追加 rejected video 段——RFC 4566 要求 m= 行必须有 fmt-list，
+     * rejected 段至少放一个 PT（96 是动态 payload type），且必须带
+     * 对应的 a=rtpmap 声明（JsSIP 严格校验 fmt-list 里的每个 PT
+     * 都要有 rtpmap，即使 port=0 拒绝段也不例外）。
+     *
+     * 后续 sdp_build_webrtc_answer 会在 c= 行后补 a=mid:N + a=inactive
+     * + a=rtcp-mux（skip_rejected 路径，不注入 ICE），产出完整的拒绝段。 */
+    char extra[256];
+    int ne = snprintf(extra, sizeof(extra),
+        "m=video 0 %s 96\r\n"
+        "c=IN IP4 0.0.0.0\r\n"
+        "a=rtpmap:96 H264/90000\r\n",
+        proto_line ? proto_line : "UDP/TLS/RTP/SAVPF");
+    if (ne <= 0) return NSBC_NOSPC;
+
+    if ((size_t)*len + (size_t)ne >= cap) {
+        llog(LOG_WARN, "sdp", "ensure_video_mline overflow len=%d ne=%d cap=%zu",
+             *len, ne, cap);
+        return NSBC_NOSPC;
+    }
+    memcpy(buf + *len, extra, (size_t)ne);
+    *len += ne;
+    buf[*len] = '\0';
+    llog(LOG_DEBUG, "sdp", "ensure_video_mline: 追加 rejected m=video 0");
+    return NSBC_OK;
+}
+
+/* ---- WebRTC answer 骨架补全 ----
+ *
+ * bridge_rewrite_sdp(dir=WS) 只做了 proto/port/c= 的替换 + 剥掉 ICE/DTLS 旧属性。
+ * 但 answer 还需要 WebRTC 特有的骨架才能被 Chrome/JsSIP 接受：
+ *   a=group:BUNDLE 0 1 2 ...             ← session 级（第一 m= 之前）
+ *   每段：a=mid:<idx> + a=rtcp-mux        ← BUNDLE 强制要求
+ *   非拒绝段：追加 ice_extra（ICE/DTLS 凭证）
+ *   拒绝段（port=0）：追加 rejected_extra（a=inactive），不加 ICE
+ * 这个函数替代 answer_hook 里对 sdp_inject_per_section 的调用。 */
+static int sdp_build_webrtc_answer(
+    const char *in, size_t inlen,
+    char *out, size_t outsz,
+    const char *ice_extra, size_t ice_extra_len,
+    const char *rejected_extra, size_t rejected_extra_len,
+    int start_mid)
+{
+    if (!in || !out || inlen == 0 || inlen >= outsz) return NSBC_INVAL;
+    memset(out, 0, outsz);
+    size_t used = 0;
+    const char *p = in;
+    const char *end = in + inlen;
+    int media_idx = 0;
+    int first_mline = 1;   /* 还没遇到第一个 m= 行 */
+    int section_rejected = 0;
+    /* 先扫一遍数 m= 段数量，构建 BUNDLE 字符串——我们需要知道后面有几个才好拼 */
+    int n_mline = 0;
+    {
+        const char *sp = in;
+        while (sp < end) {
+            const char *se = memchr(sp, '\n', (size_t)(end - sp));
+            const char *se_nul = se ? se : end;
+            size_t slen = (size_t)(se_nul - sp);
+            if (slen >= 2 && sp[0] == 'm' && sp[1] == '=') ++n_mline;
+            if (!se) break;
+            sp = se + 1;
+        }
+    }
+    /* 构建 session 级 a=group:BUNDLE 字符串："a=group:BUNDLE 0 1 ... \r\n" */
+    char bundle_line[128];
+    int bpos = snprintf(bundle_line, sizeof(bundle_line), "a=group:BUNDLE");
+    for (int i = 0; i < n_mline && bpos > 0 && (size_t)bpos < sizeof(bundle_line) - 16; ++i) {
+        bpos += snprintf(bundle_line + bpos, sizeof(bundle_line) - (size_t)bpos,
+                         " %d", start_mid + i);
+    }
+    if (bpos > 0 && (size_t)bpos < sizeof(bundle_line) - 4)
+        bpos += snprintf(bundle_line + bpos, sizeof(bundle_line) - (size_t)bpos, "\r\n");
+
+    while (p < end) {
+        const char *eol = memchr(p, '\n', (size_t)(end - p));
+        const char *line_end = eol ? eol : end;
+        size_t llen = (size_t)(line_end - p);
+        int fix_rejected_video_pt = 0;  /* ★ 提到外层作用域——在 m= 块内设置，块外复制时使用 */
+
+        if (llen >= 2 && p[0] == 'm' && p[1] == '=') {
+            /* 新媒体段 —— 先处理上一段的尾巴 */
+            if (!first_mline) {
+                /* 上一段（非拒绝）：补 mid/rtcp-mux + ICE */
+                if (!section_rejected) {
+                    char mid_line[64], mux_line[32];
+                    int ml = snprintf(mid_line, sizeof(mid_line),
+                                      "a=mid:%d\r\n", start_mid + media_idx - 1);
+                    int rl = snprintf(mux_line, sizeof(mux_line), "a=rtcp-mux\r\n");
+                    if (ml > 0 && used + (size_t)ml < outsz) {
+                        memcpy(out + used, mid_line, (size_t)ml); used += (size_t)ml;
+                    }
+                    if (rl > 0 && used + (size_t)rl < outsz) {
+                        memcpy(out + used, mux_line, (size_t)rl); used += (size_t)rl;
+                    }
+                    /* ICE/DTLS 凭证（如果有） */
+                    if (ice_extra && ice_extra_len > 0 &&
+                        used + ice_extra_len < outsz) {
+                        memcpy(out + used, ice_extra, ice_extra_len);
+                        used += ice_extra_len;
+                    }
+                } else {
+                    /* 上一段被拒：补 a=mid + rejected_extra（通常是 a=inactive）。
+                     * 不补 ICE（rejected 段不参与 DTLS）、不补 rtcp-mux
+                     * （没有实际 RTP 流，rtcp-mux 无意义）。
+                     * 关键：a=mid 必须有，BUNDLE 组里列了这个 mid，
+                     * Chrome 需要 a=mid 来匹配 transceiver → direction=inactive。 */
+                    char mid_line[64];
+                    int ml = snprintf(mid_line, sizeof(mid_line),
+                                      "a=mid:%d\r\n", start_mid + media_idx - 1);
+                    if (ml > 0 && used + (size_t)ml < outsz) {
+                        memcpy(out + used, mid_line, (size_t)ml); used += (size_t)ml;
+                    }
+                    if (rejected_extra && rejected_extra_len > 0 &&
+                        used + rejected_extra_len < outsz) {
+                        memcpy(out + used, rejected_extra, rejected_extra_len);
+                        used += rejected_extra_len;
+                    }
+                }
+            }
+            first_mline = 0;
+            /* 检测本段是否被拒：m=<media> 0 <proto> ... */
+            section_rejected = 0;
+            const char *mt_end = p + 2;
+            while (mt_end < line_end && *mt_end != ' ') ++mt_end;
+            const char *ps = mt_end;
+            while (ps < line_end && *ps == ' ') ++ps;
+            if (ps < line_end && *ps == '0' &&
+                (ps[1] == ' ' || ps[1] == '\r' || ps[1] == '\n'))
+                section_rejected = 1;
+
+            /* ★ REQ-MEDIA-VIDEO-002：rejected video m-line 必须带合法 PT 列表。
+             * bridge_rewrite_sdp 对 port=0 清空了 tail_len（避免 PCMU PT=0），
+             * 结果变成 m=video 0 UDP/TLS/RTP/SAVPF（无 PT）→ RFC 4566 非法。
+             * 而且就算保留了 B 的 PT=0（PCMU 音频），video 段也不能用音频 PT。
+             * 所以在复制 m= 行之前，对 rejected video 段整行替换为合法视频 PT 列表。
+             * port=0 + a=inactive 已经表达拒绝语义，Chrome 不会真的解码。 */
+            if (section_rejected && memcmp(p, "m=video ", 8) == 0)
+                fix_rejected_video_pt = 1;
+
+            /* 注入 session 级 BUNDLE（在第一个 m= 行之前） + a=sendrecv 强制双向
+             * REQ-MEDIA-DIR-001：SIP PBX 的原始 offer 方向可能是 recvonly（"我只收"），
+             * Chrome 作为 answerer 会被迫选 sendonly（只发不收）→ SBC 转过去的 SRTP
+             * Chrome 不播放，形成单通。这里强制 a=sendrecv，B2BUA 必须双向音频。 */
+            if (media_idx == 0) {
+                char dir_line[32];
+                int dl = snprintf(dir_line, sizeof(dir_line), "a=sendrecv\r\n");
+                if (dl > 0 && used + (size_t)dl < outsz) {
+                    memcpy(out + used, dir_line, (size_t)dl); used += (size_t)dl;
+                }
+                if (bpos > 0 && (size_t)bpos < outsz - used) {
+                    memcpy(out + used, bundle_line, (size_t)bpos);
+                    used += (size_t)bpos;
+                }
+            }
+            ++media_idx;
+        }
+        /* ★ 复制当前行——如果是 rejected video m-line 且 PT 需要修复，
+         * 输出带合法 PT 列表的新行；否则原样复制。 */
+        {
+            static const char *VIDEO_REJECT_MLINE =
+                "m=video 0 UDP/TLS/RTP/SAVPF "
+                "102 103 104 107 108 109 114 115 116 117 39 40 98 99 100 101 118 119";
+            const char *to_copy;
+            size_t to_copy_len;
+            if (fix_rejected_video_pt) {
+                /* 新行必须包含行尾 \r\n 或 \n——但我们要先把原行的 \r\n 跳过去，
+                 * 因为下面 memcpy 会覆盖。实际上这里更简单：输出新的完整 m= 行
+                 * 带 \r\n，不复制原行。 */
+                to_copy = VIDEO_REJECT_MLINE;
+                to_copy_len = strlen(VIDEO_REJECT_MLINE);
+            } else {
+                to_copy = p;
+                to_copy_len = llen;
+            }
+            if (used + to_copy_len + 1 >= outsz) return NSBC_NOSPC;
+            memcpy(out + used, to_copy, to_copy_len);
+            used += to_copy_len;
+            if (fix_rejected_video_pt) {
+                /* 手动加 \r\n（原行尾不管，后面 memmove 跳过它） */
+                if (used + 2 >= outsz) return NSBC_NOSPC;
+                out[used++] = '\r';
+                out[used++] = '\n';
+            } else {
+                if (eol) { out[used] = '\n'; ++used; }
+            }
+        }
+
+        p = eol ? eol + 1 : end;
+    }
+    /* 最后一段尾巴 */
+    if (!first_mline) {
+        if (!section_rejected) {
+            char mid_line[64], mux_line[32];
+            int ml = snprintf(mid_line, sizeof(mid_line),
+                              "a=mid:%d\r\n", start_mid + media_idx - 1);
+            int rl = snprintf(mux_line, sizeof(mux_line), "a=rtcp-mux\r\n");
+            if (ml > 0 && used + (size_t)ml < outsz) {
+                memcpy(out + used, mid_line, (size_t)ml); used += (size_t)ml;
+            }
+            if (rl > 0 && used + (size_t)rl < outsz) {
+                memcpy(out + used, mux_line, (size_t)rl); used += (size_t)rl;
+            }
+            if (ice_extra && ice_extra_len > 0 && used + ice_extra_len < outsz) {
+                memcpy(out + used, ice_extra, ice_extra_len);
+                used += ice_extra_len;
+            }
+        } else {
+            /* 最后一段被拒：同样补 a=mid + rejected_extra */
+            char mid_line[64];
+            int ml = snprintf(mid_line, sizeof(mid_line),
+                              "a=mid:%d\r\n", start_mid + media_idx - 1);
+            if (ml > 0 && used + (size_t)ml < outsz) {
+                memcpy(out + used, mid_line, (size_t)ml); used += (size_t)ml;
+            }
+            if (rejected_extra && rejected_extra_len > 0 &&
+                used + rejected_extra_len < outsz) {
+                memcpy(out + used, rejected_extra, rejected_extra_len);
+                used += rejected_extra_len;
+            }
+        }
+    }
+    if (used >= outsz) return NSBC_NOSPC;
+    out[used] = '\0';
+    return (int)used;
+}
+
+int bridge_rewrite_sdp(const char *in, size_t in_len, char *out,
+                       size_t outsz, const char *ip, uint16_t rtp_port,
+                       mb_sdp_dir_t dir)
+{
+    size_t used = 0;
+    const char *p = in;
+    const char *end = in + in_len;
+    uint16_t media_port = rtp_port;
+    int media_idx = 0;
+    while (p < end) {
+        const char *eol = memchr(p, '\n', (size_t)(end - p));
+        const char *line_end = eol ? eol : end;
+        size_t llen = (size_t)(line_end - p);
+        const char *outp = p;
+        size_t outlen = llen;
+        char tmp[256];
+
+        if (dir != MB_SDP_ASIS && llen >= 2 && p[0] == 'a' && p[1] == '=' &&
+            attr_is_ice_dtls(p, llen)) {
+            /* 剥离该行（连同行尾 \n） */
+            p = eol ? eol + 1 : end;
+            continue;
+        }
+        /* ★ 剥 b=AS: / b=TIAS: — WebRTC answer 不需要传统 SIP 带通声明 */
+        if (dir != MB_SDP_ASIS && llen >= 2 && p[0] == 'b' && p[1] == '=' &&
+            line_is_bandwidth(p, llen)) {
+            p = eol ? eol + 1 : end;
+            continue;
+        }
+        if (media_port != 0 && llen >= 2 && p[0] == 'c' && p[1] == '=') {
+            /* c=IN IP4 1.2.3.4 — session 级和媒体级 IP 全改写为 SBC 本地 IP。
+             * media_port==0（BYPASS 透传约定）不改 c=——直连必须用原始地址。 */
+            int n = snprintf(tmp, sizeof(tmp), "c=IN IP4 %s", ip);
+            if (n > 0) {
+                outp = tmp;
+                outlen = (size_t)n;
+            }
+        } else if (llen >= 2 && p[0] == 'm' && p[1] == '=') {
+            /* m=<media> <port> <proto> <fmt-list>
+             * 三步解析：media type → 端口数字 → proto token，剩余 tail=fmt-list。
+             * 多空格容错（浏览器有时会加额外空格）。 */
+            const char *mt = p + 2;       /* media type start */
+            const char *mt_end = mt;      /* media type end (第一个空格) */
+            while (mt_end < line_end && *mt_end != ' ') ++mt_end;
+            const char *sp1 = mt_end;     /* 第一个空格 */
+            /* 跳过所有空格到端口 */
+            while (sp1 < line_end && *sp1 == ' ') ++sp1;
+            const char *port_start = sp1;
+            const char *port_end = port_start;
+            while (port_end < line_end && *port_end >= '0' && *port_end <= '9')
+                ++port_end;
+            if (port_end > port_start) {
+                /* media_port==0（BYPASS）：保留 m= 原始端口透传。
+                 * RFC 3264：m=<media> 0 是"该流被拒"语义，改写模式下必须保留 0——
+                 * 之前 WS/PLAIN 强制改成 media_port，导致 B 拒视频（port=0）
+                 * 被我们改成 59998，A 侧以为视频是活的但实际没人收。
+                 * BYPASS 模式透传原始端口（包括 0），直连场景需完整透传。 */
+                uint32_t orig_port = 0;
+                for (const char *q = port_start; q < port_end; ++q)
+                    orig_port = orig_port * 10u + (uint32_t)(*q - '0');
+                uint16_t this_port;
+                if (orig_port == 0) {
+                    /* ★ RFC 3264：m=<media> 0 是"该流被拒"语义，任何改写模式下
+                     * 都必须保留 0。之前 WS/PLAIN 强制改成 media_port，导致 B 拒视频
+                     * （port=0）被我们改成 59998，A 侧以为视频是活的但实际没人收。 */
+                    this_port = 0;
+                } else if (!media_port) {
+                    this_port = (uint16_t)orig_port;  /* BYPASS 透传 */
+                } else if (dir == MB_SDP_ASIS) {
+                    /* 纯 relay（非 DTLS 终结）：每段独立端口（audio=port,
+                     * video=port+2 ...），relay 为每段分配了独立 fd */
+                    this_port = (uint16_t)(media_port
+                                + (uint16_t)(media_idx * 2));
+                } else {
+                    /* SRTP_RELAY（WS/PLAIN）：所有媒体共用 relay 的一对 socket
+                     * （BUNDLE + rtcp-mux 下 audio/video 走同一 transport）。
+                     * 不按 media_idx 递增——否则浏览器把 video 发到 port+2，
+                     * 但 relay 只在 port 上 listen，video 就丢了。 */
+                    this_port = media_port;
+                }
+                /* 跳过端口后空格到 proto */
+                const char *ps = port_end;
+                while (ps < line_end && *ps == ' ') ++ps;
+                const char *pe = ps;
+                while (pe < line_end && *pe != ' ') ++pe;
+                /* proto 替换/透传：ps..pe 是原 proto token，pe..line_end 是 tail */
+                const char *proto_token;
+                if (dir != MB_SDP_ASIS && pe > ps) {
+                    proto_token = (dir == MB_SDP_WS)
+                                     ? "UDP/TLS/RTP/SAVPF" : "RTP/AVP";
+                } else if (pe > ps) {
+                    proto_token = ps; /* 透传原 proto */
+                } else {
+                    proto_token = "RTP/AVP"; /* 无 proto token 兜底 */
+                }
+                size_t proto_len = (proto_token == ps)
+                                       ? (size_t)(pe - ps)
+                                       : strlen(proto_token);
+                size_t tail_len;
+                if (orig_port == 0) {
+                    /* ★ 拒绝的 m-line（port=0）清空 PT/fmt 列表。
+                     * B 侧 PJSIP 拒绝 video 时写的是 m=video 0 RTP/AVP 0，
+                     * PT=0 是 PCMU 音频 —— 改写为 UDP/TLS/RTP/SAVPF 后，
+                     * video m-line 带 PCMU PT 且无 rtpmap → JsSIP 直接 Bad Media。
+                     * RFC 3264 §8.2：port=0 的拒绝流 fmt-list 可以为空。 */
+                    tail_len = 0;
+                } else {
+                    tail_len = (size_t)(line_end - pe);
+                }
+                /* 组装："m=" + media + " " + newport + " " + proto + " " + fmt-list */
+                int nh = snprintf(tmp, sizeof(tmp),
+                                  "m=%.*s %u %.*s",
+                                  (int)(mt_end - mt), mt,
+                                  (unsigned)this_port,
+                                  (int)proto_len, proto_token);
+                if (nh > 0 && (size_t)nh + tail_len + 1 < sizeof(tmp)) {
+                    memcpy(tmp + nh, pe, tail_len);
+                    tmp[nh + tail_len] = '\0';
+                    outp = tmp;
+                    outlen = (size_t)nh + tail_len;
+                    if (used + outlen > outsz) break;
+                    if (put_line(out, outsz, &used, outp, outlen) != NSBC_OK) {
+                        out[0] = '\0';
+                        return NSBC_NOSPC;
+                    }
+                    if (eol) {
+                        if (put_line(out, outsz, &used, eol, 1) != NSBC_OK) {
+                            out[0] = '\0';
+                            return NSBC_NOSPC;
+                        }
+                    }
+                    p = eol ? eol + 1 : end;
+                    ++media_idx;
+                    continue;
+                }
+            }
+        }
+        if (put_line(out, outsz, &used, outp, outlen) != NSBC_OK) {
+            out[0] = '\0';
+            return NSBC_NOSPC;
+        }
+        if (eol) {
+            if (put_line(out, outsz, &used, eol, 1) != NSBC_OK) {
+                out[0] = '\0';
+                return NSBC_NOSPC;
+            }
+        }
+        p = eol ? eol + 1 : end;
+    }
+    if (used >= outsz) {
+        out[0] = '\0';
+        return NSBC_NOSPC;
+    }
+    out[used] = '\0';
+    return (int)used;
+}
+
+/* ------------------------------------------------------------------ */
+/* relay 生命周期                                                       */
+/* ------------------------------------------------------------------ */
+int rtp_relay_start(bridge_mgr_t *m, rtp_relay_t **out,
+                    relay_ports_t *ports,
+                    uint16_t range_lo, uint16_t range_hi)
+{
+    rtp_relay_t *r = calloc(1, sizeof(*r));
+    if (!r)
+        return NSBC_NOMEM;
+    r->m = m;
+    for (int i = 0; i < 2; ++i) {
+        r->fd_rtp[i] = r->fd_rtcp[i] = -1;
+        ssrc_policy_cfg_t pc = {0};
+        ssrc_policy_init(&r->pol[i], &pc);
+    }
+    uint16_t r0 = 0, c0 = 0, r1 = 0, c1 = 0;
+    if (ptable_alloc_pair_range(m->cfg.ptable, m->cfg.local_ip, r,
+                                range_lo, range_hi, &r0, &c0) != NSBC_OK) {
+        free(r);
+        return NSBC_NOSPC;
+    }
+    if (ptable_alloc_pair_range(m->cfg.ptable, m->cfg.local_ip, r,
+                                range_lo, range_hi, &r1, &c1) != NSBC_OK) {
+        ptable_release_pair(m->cfg.ptable, m->cfg.local_ip, r0);
+        free(r);
+        return NSBC_NOSPC;
+    }
+    r->rtp_port[0] = r0;
+    r->rtp_port[1] = r1;
+    /* P0 relay 纯 IPv4：dualstack=0 避免 v4-mapped family 不匹配
+     * （recvfrom 返回 sockaddr_in6 但 peer 为 sockaddr_in → nsbc_sa_eq_addr
+     * family 比较直接失败，所有 RTP 被 drop）。 */
+    net_udp_cfg_t uc = {0, 0, 0, 0, 0};
+    r->fd_rtp[0] = net_udp_open(m->cfg.local_ip, r0, &uc);
+    r->fd_rtcp[0] = net_udp_open(m->cfg.local_ip, c0, &uc);
+    r->fd_rtp[1] = net_udp_open(m->cfg.local_ip, r1, &uc);
+    r->fd_rtcp[1] = net_udp_open(m->cfg.local_ip, c1, &uc);
+    if (r->fd_rtp[0] < 0 || r->fd_rtp[1] < 0) {
+        llog(LOG_WARN, "media",
+             "relay_start: UDP open FAIL rtp0=%d rtp1=%d",
+             r->fd_rtp[0], r->fd_rtp[1]);
+        rtp_relay_stop(r);
+        return NSBC_ERR;
+    }
+    llog(LOG_DEBUG, "media",
+         "relay_start: OK r0=%d r1=%d fd0=%d fd1=%d local_ip=%s (defer arm)",
+         r0, r1, r->fd_rtp[0], r->fd_rtp[1],
+         m->cfg.local_ip ? m->cfg.local_ip : "(null)");
+    /* ★ RACE-FIX: 延迟 reactor_add — 先构造 relay（open fd + alloc port），
+     * 但不注册 reactor。offer_hook/answer_hook 在 dtls_server_create + admit_ssrc
+     * 等所有初始化完成后再调 rtp_relay_arm 一次性注册。
+     * 之前 relay_start 里先 reactor_add，reactor 线程立刻能收 STUN record
+     * 触发 relay_cb，但此时 e->dtls[] / r->pol[] 还没初始化好 → data race
+     * → SRTP 密文被当明文转发/SSRC 预登记半写 → 概率性单向视频。 */
+    r->armed = 0;
+    ports->a_rtp = r0; /* 对 A 广告（answer_hook 改写 answer 时用） */
+    ports->a_rtcp = c0;
+    ports->b_rtp = r1; /* 对 B 广告（offer_hook 改写 offer 时用） */
+    ports->b_rtcp = c1;
+    *out = r;
+    return NSBC_OK;
+}
+
+/* ★ RACE-FIX: 延迟 arm — 所有 dtls 创建 + admit_ssrc 完成后才注册 reactor fd。 */
+static void rtp_relay_arm(bridge_mgr_t *m, rtp_relay_t *r)
+{
+    if (!m || !m->cfg.re || !r || r->armed) return;
+    reactor_add(m->cfg.re, r->fd_rtp[0], EPOLLIN, relay_cb, r);
+    reactor_add(m->cfg.re, r->fd_rtp[1], EPOLLIN, relay_cb, r);
+    if (r->fd_rtcp[0] >= 0)
+        reactor_add(m->cfg.re, r->fd_rtcp[0], EPOLLIN, relay_cb, r);
+    if (r->fd_rtcp[1] >= 0)
+        reactor_add(m->cfg.re, r->fd_rtcp[1], EPOLLIN, relay_cb, r);
+    r->armed = 1;
+    llog(LOG_DEBUG, "media", "relay_arm: registered fd0=%d fd1=%d",
+         r->fd_rtp[0], r->fd_rtp[1]);
+}
+
+void rtp_relay_stop(rtp_relay_t *r)
+{
+    if (!r)
+        return;
+    bridge_mgr_t *m = r->m;
+    /* REQ-DTLS-001：释放 SRTP 会话 */
+    for (int i = 0; i < 2; ++i) {
+        if (r->srtp[i]) {
+            nsbc_srtp_session_destroy(r->srtp[i]);
+            r->srtp[i] = NULL;
+        }
+    }
+    /* cnode_t 持有的 dtls_server（按侧）——relay_stop 释放前先拆关联；
+     * cnode 本身由 bridge_release_call 释放（dtls_server_destroy 在这里） */
+    if (r->node) {
+        for (int i = 0; i < 2; ++i) {
+            if (r->node->dtls[i]) {
+                dtls_server_destroy((dtls_server_t *)r->node->dtls[i]);
+                r->node->dtls[i] = NULL;
+            }
+        }
+    }
+    for (int i = 0; i < 2; ++i) {
+        if (r->fd_rtp[i] >= 0) {
+            if (m->cfg.re)
+                reactor_del(m->cfg.re, r->fd_rtp[i]);
+            close(r->fd_rtp[i]);
+        }
+        if (r->fd_rtcp[i] >= 0) {
+            if (m->cfg.re)
+                reactor_del(m->cfg.re, r->fd_rtcp[i]);
+            close(r->fd_rtcp[i]);
+        }
+        if (r->rtp_port[i])
+            ptable_release_pair(m->cfg.ptable, m->cfg.local_ip,
+                                r->rtp_port[i]);
+    }
+    free(r);
+}
+
+void rtp_relay_set_peer_a(rtp_relay_t *r, const nsbc_sa_t *sa)
+{
+    /* A 的报文收在 fd_rtp[0]：answer 对 A 广告 a_rtp(r0)，
+     * A 按 SDP 发往 r0 → relay 侧 0 收到（上轮端口方向修正后 peer
+     * 设置必须同步，否则两侧包全被 peer 检查丢弃）。 */
+    r->peer[0] = *sa;
+    r->latch[0] = *sa;
+    r->have_peer[0] = 1;
+    __atomic_store_n(&r->d_latched[0], 1, __ATOMIC_RELEASE);
+}
+void rtp_relay_set_peer_b(rtp_relay_t *r, const nsbc_sa_t *sa)
+{
+    /* B 的报文收在 fd_rtp[1]：offer 对 B 广告 b_rtp(r1)。 */
+    r->peer[1] = *sa;
+    r->latch[1] = *sa;
+    r->have_peer[1] = 1;
+    __atomic_store_n(&r->d_latched[1], 1, __ATOMIC_RELEASE);
+}
+
+uint64_t rtp_relay_pkts(const rtp_relay_t *r)
+{
+    return r ? r->pkts : 0;
+}
+uint64_t rtp_relay_drops(const rtp_relay_t *r)
+{
+    return r ? r->drops : 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* b2bua 挂接                                                           */
+/* ------------------------------------------------------------------ */
+static void parse_media_addr(const char *sdp, size_t len, char *ip,
+                             size_t ipsz, uint16_t *port)
+{
+    sdp_t s;
+    memset(ip, 0, ipsz);
+    *port = 0;
+    int rc = sdp_parse(&s, sdp, len);
+    if (rc != NSBC_OK)
+        return;
+    for (int i = 0; i < s.nmedia; ++i) {
+        const sdp_conn_t *c = sdp_media_effective_conn(&s, &s.media[i]);
+        if (c && c->addr.p) {
+            size_t n = c->addr.len < ipsz - 1 ? c->addr.len : ipsz - 1;
+            memcpy(ip, c->addr.p, n);
+            ip[n] = '\0';
+            *port = (uint16_t)s.media[i].port;
+            return;
+        }
+    }
+}
+
+static cnode_t *entry_get(bridge_mgr_t *m, void *call)
+{
+    br_shard_t *s = &m->sh[ptr_shard(call)];
+    pthread_mutex_lock(&s->lock);
+    cnode_t *e = entry_find(m, call);
+    if (e) {
+        pthread_mutex_unlock(&s->lock);
+        return e;
+    }
+    e = calloc(1, sizeof(*e));
+    if (!e) {
+        pthread_mutex_unlock(&s->lock);
+        return NULL;
+    }
+    e->call = call;
+    e->mode = MB_RELAY;
+    e->next = s->head;
+    s->head = e;
+    pthread_mutex_unlock(&s->lock);
+    return e;
+}
+
+int bridge_offer_hook(void *call, const char *in, size_t inlen,
+                      char *out, size_t outsz, void *ud)
+{
+    bridge_mgr_t *m = ud;
+    mb_mode_t mode;
+    bridge_decide(m, in, inlen, NULL, 0, &mode);
+    cnode_t *e = entry_get(m, call);
+    if (!e) {
+        llog(LOG_WARN, "media", "offer_hook: entry_get NOMEM call=%p", call);
+        return NSBC_NOMEM;
+    }
+
+    /* ★ REQ-DTLS-001 方向感知 + REQ-MEDIA-DP-001 rule override
+     * a_ws —— offer SDP 带 WebRTC 特征 → A 腿是浏览器；
+     * b_ws —— call_b_is_ws 回调从 leg[1] 反查 B 腿注册类型。
+     * 三层决策，依次应用：
+     *   ① 腿组合硬约束（webRTC 腿不能走明文 RELAY）：
+     *      mixed_ws → 强制 SRTP_RELAY，rule=bypass 无效（打 WARN）
+     *      both_ws + mode=RELAY（明文 relay） → 强制 SRTP_RELAY
+     *        （明文 relay 无法终结 DTLS，浏览器 SDP 端口/媒体类型对不上会 488）
+     *      both_ws + mode=BYPASS + rule=auto → 强制 SRTP_RELAY
+     *        （auto 保守锚定，公网 ICE 穿透经常失败丢媒体；
+     *         rule=bypass 时才放开让浏览器 P2P）
+     *   ② rule override（rule=auto(0) 时不动）：
+     *      rule=bypass → 强制 BYPASS（both_ws 时让浏览器 P2P，明文腿时直连）
+     *      rule=relay → 强制 SRTP_RELAY（both_ws）或 RELAY（明文腿）
+     */
+    const int a_ws = is_webrtc_sdp(in, inlen);
+    int b_ws = 0;
+    if (m->cfg.call_b_is_ws)
+        b_ws = m->cfg.call_b_is_ws(m->cfg.call_b_is_ws_ud, call);
+    const int mixed_ws = (a_ws != b_ws);   /* 恰好一侧 WebRTC */
+    const int both_ws  = (a_ws && b_ws);   /* 两侧都是 WebRTC */
+
+    uint8_t rule_mm = 0;  /* 默认 auto */
+    if (m->cfg.call_media_mode)
+        rule_mm = m->cfg.call_media_mode(m->cfg.call_media_mode_ud, call);
+
+    /* ① 硬约束 */
+    if (mixed_ws) {
+        if (rule_mm == 1)
+            llog(LOG_WARN, "media", "offer_hook: rule=bypass but mixed-leg WebRTC (ignored, forcing SRTP_RELAY)");
+        if (mode != MB_SRTP_RELAY) {
+            mode = MB_SRTP_RELAY;
+            llog(LOG_INFO, "media", "offer_hook: mixed WebRTC leg → force SRTP_RELAY");
+        }
+    }
+    if (both_ws && rule_mm == 0) {
+        /* auto 模式下 both_ws 强制 SRTP_RELAY——保守锚定，让 SBC 终结两侧 DTLS；
+         * 只有 rule=bypass 才放开 P2P（rule=relay 也走 SRTP_RELAY，下方 override 处理） */
+        if (mode != MB_SRTP_RELAY) {
+            llog(LOG_INFO, "media", "offer_hook: both WebRTC auto → SRTP_RELAY (was %d)", mode);
+            mode = MB_SRTP_RELAY;
+        }
+    }
+
+    /* ② rule override（rule=auto(0) 时跳过） */
+    if (rule_mm == 1) {  /* rule=bypass */
+        if (mixed_ws) {
+            /* 混合腿 rule=bypass 已在上面打 WARN，此处不动 mode（已被强制 SRTP_RELAY） */
+        } else {
+            llog(LOG_INFO, "media", "offer_hook: rule→force BYPASS%s", both_ws ? " (WebRTC↔WebRTC P2P)" : "");
+            mode = MB_BYPASS;
+        }
+    } else if (rule_mm == 2) {  /* rule=relay */
+        llog(LOG_INFO, "media", "offer_hook: rule→force RELAY%s", both_ws ? " (WebRTC↔WebRTC DTLS 终结)" : "");
+        mode = both_ws ? MB_SRTP_RELAY : MB_RELAY;
+    }
+
+    e->mode = mode;
+    llog(LOG_DEBUG, "media", "offer_hook: call=%p mode=%d a_ws=%d b_ws=%d "
+         "local_ip=%s", call, mode, a_ws, b_ws,
+         m->cfg.local_ip ? m->cfg.local_ip : "(null)");
+
+    /* A 的媒体地址（relay 对端）；A=WebRTC 时见下方 set_peer 注释 */
+    parse_media_addr(in, inlen, e->a_ip, sizeof(e->a_ip), &e->a_port);
+
+    if (mode == MB_BYPASS) {
+        if (inlen >= outsz)
+            return NSBC_NOSPC;
+        memcpy(out, in, inlen);
+        out[inlen] = '\0';
+        return (int)inlen;
+    }
+    /* REQ-SIP-PROFILE-001：per-call RTP 端口段——组合根按 call_key 归属
+     * profile 提供（回调内解引用，本层仅取值）；未注册/无归属 → (0,0)
+     * 表默认段。段内耗尽回落表默认段（隔离失败不拆呼叫，仅失去隔离）。 */
+    uint16_t rlo = 0, rhi = 0;
+    if (m->cfg.call_port_range)
+        m->cfg.call_port_range(m->cfg.call_port_range_ud, call, &rlo, &rhi);
+
+    relay_ports_t ports;
+    if (rtp_relay_start(m, &e->relay, &ports, rlo, rhi) != NSBC_OK &&
+        (rlo != 0 || rhi != 0)) {
+        llog(LOG_WARN, "media",
+             "offer_hook: profile port range %u-%u exhausted, "
+             "fallback to default range", rlo, rhi);
+        if (rtp_relay_start(m, &e->relay, &ports, 0, 0) != NSBC_OK) {
+            llog(LOG_WARN, "media", "offer_hook: relay_start FAIL");
+            return NSBC_NOSPC;
+        }
+    }
+    if (!e->relay) {
+        llog(LOG_WARN, "media", "offer_hook: relay_start FAIL");
+        return NSBC_NOSPC;
+    }
+    e->relay->node = e;
+    llog(LOG_DEBUG, "media", "offer_hook: relay_start OK rtp0=%d rtp1=%d",
+         ports.a_rtp, ports.b_rtp);
+    /* ★ REQ-MEDIA-SSRC-003③：offer SDP 的 SSRC 预登记到 side=0（offer 来自 A 侧）。
+     * 必须在 bridge_rewrite_sdp 之前（rewrite 剥 a=ssrc: 行）。 */
+    admit_ssrc_from_sdp(e->relay, 0, in, inlen);
+    if (e->a_ip[0] && !a_ws) {
+        /* A=WebRTC 时不设固定 peer：ICE 实际源地址/端口与 SDP c=/m=
+         * 可能不同（浏览器任选候选），该侧纯 latch 首包学习。 */
+        nsbc_sa_t sa;
+        if (nsbc_sa_from(&sa, e->a_ip, e->a_port, AF_UNSPEC) == NSBC_OK)
+            rtp_relay_set_peer_a(e->relay, &sa);
+    }
+    /* B 侧 INVITE 重写：offer SDP 告诉 B 把 RTP 发到 SBC 的 B 侧 relay 端口
+     * （b_rtp=fd_rtp[1]）。方向决定改写形态——最终根据 mode+dtls 结果选：
+     *   MB_BYPASS  → ASIS：透传原始 SDP（不改地址/proto）
+     *   B=WebRTC   → WS：proto→SAVPF，剥 A 旧凭证后下方注入本侧新凭证；
+     *   A=WebRTC   → PLAIN：消毒（proto→RTP/AVP + 剥 ICE/DTLS）给明文端；
+     *   双明文     → ASIS：仅改地址端口。 */
+
+    /* REQ-DTLS-001：SRTP_RELAY 模式 → 创建 DTLS-SRTP 终结器在 WebRTC 侧 fd。
+     * B 侧（WebRTC）收到的是 offer（它是 Answerer），dtls_server 作为 DTLS Server
+     * 等它发起 Client Hello。fd=fd_rtp[1]，reactor 已注册 relay_cb——需改 demux。
+     * 注：dtls 创建在 rewrite 之前，因为降级 BYPASS 时需要释放 relay 并改走
+     * ASIS 透传——此时 relay 已释放，不能再用 relay 端口改写 SDP。 */
+    if (mode == MB_SRTP_RELAY && m->cfg.re) {
+        dtls_cfg_t dc = {
+            .srtp_profile_id = 0x0007, /* SRTP_AEAD_AES_128_GCM */
+        };
+        int any_dtls_ok = 0;
+        if (a_ws && !e->dtls[0]) {
+            dtls_server_t *ds = NULL;
+            if (dtls_server_create(e->relay->fd_rtp[0], DTLS_ROLE_SERVER,
+                                   &dc, &ds) == NSBC_OK) {
+                e->dtls[0] = ds; any_dtls_ok = 1;
+                llog(LOG_DEBUG, "dtls", "SRTP_RELAY: dtls[0] on fd=%d "
+                     "(A=WebRTC, 凭证由 answer_hook 注入)",
+                     e->relay->fd_rtp[0]);
+                /* A 的 fingerprint 就在 offer SDP 里，立即提取注入 */
+                inject_peer_fp(ds, in, inlen);
+            } else {
+                llog(LOG_WARN, "dtls", "dtls_server_create FAIL on fd=%d "
+                     "(A leg) — DTLS-SRTP 不可用，降级 BYPASS",
+                     e->relay->fd_rtp[0]);
+            }
+        }
+        if (b_ws && !e->dtls[1]) {
+            dtls_server_t *ds = NULL;
+            if (dtls_server_create(e->relay->fd_rtp[1], DTLS_ROLE_SERVER,
+                                   &dc, &ds) == NSBC_OK) {
+                e->dtls[1] = ds; any_dtls_ok = 1;
+            } else {
+                llog(LOG_WARN, "dtls", "dtls_server_create FAIL on fd=%d "
+                     "(B leg) — DTLS-SRTP 不可用，降级 BYPASS",
+                     e->relay->fd_rtp[1]);
+            }
+        }
+        if (!any_dtls_ok && (a_ws || b_ws)) {
+            /* 两侧 dtls 全失败——DTLS-SRTP 不可用，降级 BYPASS（两端 LAN
+             * 直连）。释放 relay，让 SDP 走 ASIS 透传。 */
+            llog(LOG_WARN, "media", "DTLS-SRTP 全失败 (OpenSSL <1.1.0?) "
+                 "— 降级 BYPASS 让两端直连");
+            if (e->relay) {
+                rtp_relay_stop(e->relay);
+                e->relay = NULL;
+            }
+            e->mode = MB_BYPASS;
+        }
+    }
+    /* ★ RACE-FIX: dtls 创建 + node 赋值 + admit_ssrc 全部完成后，
+     * 最后一次性注册 reactor fd。之前 relay_start 里先 reactor_add
+     * 再逐步设 dtls[] → reactor 线程收到 STUN record 时 dtls 还没好
+     * → srtp_lane=0 → SRTP 密文被当明文转发 → 概率性单向视频。 */
+    if (e->relay)
+        rtp_relay_arm(m, e->relay);
+
+    /* ---- SDP 改写 ----
+     * dir 选择——BYPASS 和 SRTP_RELAY 用同一套逻辑（都要按接收端类型
+     * 改 proto + 消毒/注入 ICE/DTLS 属性），区别只在端口：
+     *   BYPASS     → 端口不改（两端 LAN 直连，用 SDP 原始 c=/m=）
+     *   SRTP_RELAY → 端口改 relay 端口（SBC 媒体中继）
+     *   双明文     → ASIS（不改 proto，只改端口） */
+    mb_sdp_dir_t dir;
+    uint16_t rewrite_port = ports.b_rtp;
+    const int is_bypass = (mode == MB_BYPASS || e->mode == MB_BYPASS);
+    if (is_bypass) {
+        /* BYPASS = 两端 LAN 直连 = SDP 必须完整透传！
+         * 不能改 proto（保留 SAVPF）、不能剥 ICE/DTLS、不能改端口。
+         * 否则浏览器收到残缺 SDP → createAnswer 报 "transport is missing"。 */
+        dir = MB_SDP_ASIS;
+        rewrite_port = 0;
+    } else {
+        /* SRTP_RELAY：按接收端类型选 dir（DTLS-SRTP 终结器决定了消毒/注入策略） */
+        dir = b_ws ? MB_SDP_WS : (a_ws ? MB_SDP_PLAIN : MB_SDP_ASIS);
+    }
+    int n = bridge_rewrite_sdp(in, inlen, out, outsz, m->cfg.local_ip,
+                               rewrite_port, dir);
+    if (n < 0) return NSBC_NOSPC;
+
+    /* ★ 向 WebRTC 侧（dtls[1] 非空 = B 侧 WebRTC）发送的 SDP，如果源 offer
+     * 只有 audio 一段没有 video，Chrome 收到后 setRemoteDescription 无法
+     * 匹配本地 video transceiver → 报 WebRTC Error。补一个 rejected video
+     * m-line（port=0）。 */
+    if (e->dtls[1]) {
+        sdp_ensure_video_mline(out, outsz, &n, "UDP/TLS/RTP/SAVPF");
+    }
+
+    /* ICE/DTLS 凭证注入（仅在 SRTP_RELAY + B=WebRTC 时执行；降级 BYPASS 时
+     * e->dtls[1] 为 NULL 自动跳过）。
+     * 关键：必须 per-section 注入——每个 m= 段（audio + video ...）都要有
+     * 一套相同的 a=ice-ufrag/pwd/fingerprint/setup/candidate。只追加到末尾
+     * 会被 RFC 4566 归入最后一个媒体段，前面的段全空→Chrome 检查 BUNDLE
+     * base(audio) 时找不到 fingerprint → setRemoteDescription 失败 → 480。 */
+    if (e->dtls[1]) {
+            const dtls_cfg_t *dcp =
+                dtls_server_cfg((const dtls_server_t *)e->dtls[1]);
+            char ice_extra[352];
+            int ne = snprintf(ice_extra, sizeof(ice_extra),
+                     "a=ice-ufrag:%s\r\n"
+                     "a=ice-pwd:%s\r\n"
+                     "a=ice-lite\r\n"
+                     "a=fingerprint:sha-256 %s\r\n"
+                     "a=setup:actpass\r\n"
+                     "a=candidate:1 1 udp 2113937151 %s %u typ host\r\n",
+                     dcp->ice_ufrag, dcp->ice_pwd, dcp->fp_sha256,
+                     m->cfg.local_ip ? m->cfg.local_ip : "0.0.0.0",
+                     (unsigned)ports.b_rtp);
+            if (ne <= 0 || (size_t)ne >= sizeof(ice_extra)) {
+                llog(LOG_WARN, "dtls", "offer ice_extra truncated ne=%d", ne);
+            } else {
+                char tmp[8192];
+                /* ★ 和 answer_hook 对称的 guard：
+                 * 混合模式（dtls[1] 存在但 dtls[0] 不存在，即 B=WebRTC, A=普通SIP）
+                 *   → 用 sdp_build_webrtc_answer 补 BUNDLE/mid/rtcp-mux 骨架 + 注入 ICE
+                 * 双 WebRTC（dtls[0] && dtls[1]）
+                 *   → 只注入 ICE，B 自己带骨架 */
+                int n2;
+                if (!e->dtls[0]) {
+                    const char *rejected_fmt = "a=inactive\r\n";
+                    n2 = sdp_build_webrtc_answer(
+                        out, (size_t)n, tmp, sizeof(tmp),
+                        ice_extra, (size_t)ne,
+                        rejected_fmt, strlen(rejected_fmt),
+                        0 /* start_mid */);
+                } else {
+                    n2 = sdp_inject_per_section(out, (size_t)n, tmp, sizeof(tmp),
+                                                ice_extra, (size_t)ne, 1);
+                }
+                if (n2 > 0) {
+                    if ((size_t)n2 >= outsz) {
+                        llog(LOG_WARN, "dtls", "offer inject outsz overflow n2=%d outsz=%zu", n2, outsz);
+                        return NSBC_NOSPC;
+                    }
+                    memcpy(out, tmp, (size_t)n2);
+                    n = n2;
+                    out[n] = '\0';
+                }
+            }
+            llog(LOG_DEBUG, "dtls", "SRTP_RELAY: offer 注入 B 侧 ICE 凭证 "
+                 "fd=%d ice_ufrag=%s fp=%s",
+                 e->relay->fd_rtp[1], dcp->ice_ufrag, dcp->fp_sha256);
+    }
+    /* ★ 诊断：原始 A 的 offer + 最终 offer（改写后） */
+    {
+        const char *lp = in;
+        for (int li = 0; lp && lp < in + inlen; ++li) {
+            const char *le = memchr(lp, '\n', (size_t)(in + inlen - lp));
+            size_t ll = le ? (size_t)(le - lp) : strlen(lp);
+            llog(LOG_DEBUG, "dtls", "★A_OFFER_RAW[%d]: %.*s", li, (int)ll, lp);
+            lp = le ? le + 1 : NULL;
+        }
+    }
+    {
+        FILE *f = fopen("/tmp/nsbc_offer.sdp", "wb");
+        if (f) { fwrite(out, 1, (size_t)n, f); fclose(f); }
+        /* ★★ 日志也打印完整 SDP（每一行单独 INFO，grep "★OFFER" 即可） */
+        {
+            const char *lp = out;
+            for (int li = 0; lp && lp < out + n; ++li) {
+                const char *le = memchr(lp, '\n', (size_t)(out + n - lp));
+                size_t ll = le ? (size_t)(le - lp) : strlen(lp);
+                llog(LOG_DEBUG, "dtls", "★OFFER_OUT[%d]: %.*s", li, (int)ll, lp);
+                lp = le ? le + 1 : NULL;
+            }
+        }
+        /* 专项诊断：video m-line 检查 */
+        {
+            const char *vid = memmem(out, (size_t)n, "m=video", 7);
+            if (vid) {
+                const char *eol = memchr(vid, '\n', (size_t)(out + n - vid));
+                size_t vlen = eol ? (size_t)(eol - vid) : 80;
+                llog(LOG_DEBUG, "dtls", "★ OFFER VIDEO LINE: %.*s", (int)vlen, vid);
+            } else {
+                llog(LOG_WARN, "dtls", "★ OFFER MISSING m=video!");
+            }
+        }
+    }
+    return n;
+}
+
+int bridge_answer_hook(void *call, const char *in, size_t inlen,
+                       char *out, size_t outsz, void *ud)
+{
+    bridge_mgr_t *m = ud;
+    cnode_t *e = NULL;
+    {
+        br_shard_t *s = &m->sh[ptr_shard(call)];
+        pthread_mutex_lock(&s->lock);
+        e = entry_find(m, call);
+        pthread_mutex_unlock(&s->lock);
+    }
+    if (!e || !e->relay) {
+        if (inlen >= outsz)
+            return NSBC_NOSPC;
+        memcpy(out, in, inlen);
+        out[inlen] = '\0';
+        return (int)inlen;
+    }
+    mb_mode_t mode;
+    if (bridge_decide(m, NULL, 0, in, inlen, &mode) == NSBC_OK &&
+        mode == MB_TRANSCODE) {
+        llog(LOG_WARN, "media", "transcode required but P0 unsupported");
+        memcpy(out, in, inlen < outsz ? inlen : outsz - 1);
+        out[inlen < outsz ? inlen : outsz - 1] = '\0';
+        return NSBC_NOTSUP;
+    }
+    relay_ports_t ports;
+    ports.a_rtp = ports.b_rtp = 0; /* 已分配：取 fd 实际端口 */
+    /* B 对端地址 */
+    char ip[64];
+    uint16_t port = 0;
+    parse_media_addr(in, inlen, ip, sizeof(ip), &port);
+    if (ip[0] && !e->dtls[1]) {
+        /* B=WebRTC（dtls[1] 非空）时不设固定 peer：ICE 实际源地址/端口
+         * 与 SDP c=/m= 可能不同（浏览器任选候选），该侧纯 latch 首包
+         * 学习——与 offer_hook 的 set_peer_a(!a_ws) 同口径。 */
+        nsbc_sa_t sa;
+        int rc = nsbc_sa_from(&sa, ip, port, AF_UNSPEC);
+        if (rc == NSBC_OK)
+            rtp_relay_set_peer_b(e->relay, &sa);
+    }
+    /* 对 A 广告 a_rtp（从 relay A 侧 fd 取——answer SDP 告诉 A 把 RTP 发到
+     * relay 的 A 侧端口；原代码错取 fd_rtp[1]=B 侧，导致 A 发错端口收不到） */
+    struct sockaddr_storage ss;
+    socklen_t sl = sizeof(ss);
+    if (getsockname(e->relay->fd_rtp[0], (struct sockaddr *)&ss, &sl) == 0) {
+        nsbc_sa_t a;
+        a.ss = ss;
+        a.len = sl;
+        ports.a_rtp = nsbc_sa_port(&a);
+    }
+    /* ★ REQ-MEDIA-SSRC-003③：answer SDP 的 SSRC 预登记到 side=1（answer 来自 B 侧）。
+     * 必须在 bridge_rewrite_sdp 之前（rewrite 剥 a=ssrc: 行）。 */
+    admit_ssrc_from_sdp(e->relay, 1, in, inlen);
+    /* answer 改写方向（与 offer 对称、反着来）：
+     *   BYPASS     → ASIS：完整透传（两端 LAN 直连）；
+     *   A=WebRTC（dtls[0] 非空）→ WS：proto→SAVPF + 下方注入 A 侧新凭证；
+     *   B=WebRTC（dtls[1] 非空）→ PLAIN：消毒（proto→RTP/AVP + 剥 ICE/DTLS）；
+     *   双明文 → ASIS：仅改地址端口（a_rtp=fd_rtp[0] 侧）。 */
+    mb_sdp_dir_t adir;
+    uint16_t a_rewrite_port = ports.a_rtp;
+    {
+        mb_mode_t fmode;
+        bridge_decide(m, NULL, 0, in, inlen, &fmode);
+        /* ★ 关键 guard：只要 offer_hook 已经决定了 SRTP_RELAY（dtls[0] 或 dtls[1]
+         * 已创建），answer_hook 就绝对不能降级 BYPASS。
+         * 根因：MicroSIP 内网普通 SIP answer → bridge_decide(answer-only) 会因
+         * trust_private + 内网 IP 返回 MB_BYPASS，导致 adir=ASIS + port=0 透传
+         * B 的原始 RTP/AVP SDP，然后叠加 SBC 的 ICE/DTLS → 四不像被 JsSIP 拒绝。
+         * offer_hook 已有对称 guard（line 1325-1329），answer_hook 之前缺。 */
+        const int web_rtc_any = (e->dtls[0] || e->dtls[1]);
+        const int a_bypass = !web_rtc_any &&
+            (fmode == MB_BYPASS || e->mode == MB_BYPASS
+             || (!e->dtls[0] && !e->dtls[1]
+                 && (bridge_decide(m, NULL, 0, NULL, 0, &fmode),
+                     fmode == MB_BYPASS)));
+        if (a_bypass) {
+            adir = MB_SDP_ASIS;
+            a_rewrite_port = 0;
+        } else {
+            adir = e->dtls[0] ? MB_SDP_WS
+                 : (e->dtls[1] ? MB_SDP_PLAIN : MB_SDP_ASIS);
+        }
+    }
+    int n = bridge_rewrite_sdp(in, inlen, out, outsz, m->cfg.local_ip,
+                               a_rewrite_port, adir);
+    if (n < 0) return NSBC_NOSPC;
+
+    /* ★ answer 方向同理：A=WebRTC（dtls[0] 非空）时，B 侧普通 SIP answer
+     * 可能只有 audio，补 rejected video m-line 让 Chrome 能正常协商。 */
+    if (e->dtls[0]) {
+        sdp_ensure_video_mline(out, outsz, &n, "UDP/TLS/RTP/SAVPF");
+    }
+
+    /* A=WebRTC：answer 注入 A 侧（fd_rtp[0]）ICE 凭证 + host candidate。
+     * setup:passive——浏览器是 Offerer（其 offer 带 setup:actpass），
+     * answer 回 passive 则浏览器转 DTLS Client 发起握手，NSBC 恒 Server。
+     * 凭证取自 dtls_server 实例（create 内部生成，调用方栈上的 dc 是空壳，
+     * 与 offer_hook 注释同理）。
+     * 同样必须 per-section 注入——每个 m= 段都要有一套相同的凭证。 */
+    if (e->dtls[0]) {
+        const dtls_cfg_t *dcp =
+            dtls_server_cfg((const dtls_server_t *)e->dtls[0]);
+        char ice_extra[352];
+        int ne = snprintf(ice_extra, sizeof(ice_extra),
+                 "a=ice-ufrag:%s\r\n"
+                 "a=ice-pwd:%s\r\n"
+                 "a=ice-lite\r\n"
+                 "a=fingerprint:sha-256 %s\r\n"
+                 "a=setup:passive\r\n"
+                 "a=candidate:1 1 udp 2113937151 %s %u typ host\r\n",
+                 dcp->ice_ufrag, dcp->ice_pwd, dcp->fp_sha256,
+                 m->cfg.local_ip ? m->cfg.local_ip : "0.0.0.0",
+                 (unsigned)ports.a_rtp);
+        if (ne <= 0 || (size_t)ne >= sizeof(ice_extra)) {
+            llog(LOG_WARN, "dtls", "answer ice_extra truncated ne=%d", ne);
+        } else {
+            char tmp[8192];
+            /* ★ 关键 guard：只在混合模式（A=WebRTC, B=普通 SIP）下补全 answer 骨架。
+             * 纯 WebRTC↔WebRTC 时 B 的 answer 已有 BUNDLE/mid/rtcp-mux，
+             * 用 sdp_inject_per_section 只注入 ICE 凭证即可，重复注入会被拒。 */
+            int n2;
+            if (!e->dtls[1]) {
+                /* 混合模式：B 侧是普通 SIP，answer 是 B 生成的传统 SIP SDP，
+                 * 需要补全 WebRTC 骨架才能被 Chrome/JsSIP 接受 */
+                const char *rejected_fmt = "a=inactive\r\n";
+                n2 = sdp_build_webrtc_answer(
+                    out, (size_t)n, tmp, sizeof(tmp),
+                    ice_extra, (size_t)ne,
+                    rejected_fmt, strlen(rejected_fmt),
+                    0 /* start_mid */);
+            } else {
+                /* 双 WebRTC：B 的 answer 已有 BUNDLE/mid/rtcp-mux，只注入 ICE */
+                n2 = sdp_inject_per_section(out, (size_t)n, tmp, sizeof(tmp),
+                                            ice_extra, (size_t)ne, 1);
+            }
+            if (n2 > 0) {
+                if ((size_t)n2 >= outsz) {
+                    llog(LOG_WARN, "dtls", "answer inject outsz overflow n2=%d outsz=%zu", n2, outsz);
+                    return NSBC_NOSPC;
+                }
+                memcpy(out, tmp, (size_t)n2);
+                n = n2;
+                out[n] = '\0';
+            }
+        }
+        llog(LOG_DEBUG, "dtls", "SRTP_RELAY: answer 注入 A 侧 ICE 凭证 "
+             "fd=%d ice_ufrag=%s fp=%s",
+             e->relay->fd_rtp[0], dcp->ice_ufrag, dcp->fp_sha256);
+    }
+    /* B=WebRTC：answer SDP 来自 B（此时 answer_hook 的 in 就是 B 的 answer），
+     * 提取 B 的 fingerprint 注入 dtls[1]，完成后握手自动校验。
+     * 注意：dtls[1] 早在 offer_hook 就已创建，当时 B 的 answer SDP 还没来，
+     * 所以 B 的 fingerprint 必须推迟到这里才注入——这就是 dtls_server_set_peer_fp
+     * 存在的唯一理由。 */
+    if (e->dtls[1]) {
+        inject_peer_fp(e->dtls[1], in, inlen);
+    }
+    /* ★ 诊断：①原始 B 的 answer（改写前）②最终 answer（改写后） */
+    {
+        const char *lp = in;
+        for (int li = 0; lp && lp < in + inlen; ++li) {
+            const char *le = memchr(lp, '\n', (size_t)(in + inlen - lp));
+            size_t ll = le ? (size_t)(le - lp) : strlen(lp);
+            llog(LOG_INFO, "dtls", "★B_ANSWER_RAW[%d]: %.*s", li, (int)ll, lp);
+            lp = le ? le + 1 : NULL;
+        }
+    }
+    {
+        const char *lp = out;
+        for (int li = 0; lp && lp < out + n; ++li) {
+            const char *le = memchr(lp, '\n', (size_t)(out + n - lp));
+            size_t ll = le ? (size_t)(le - lp) : strlen(lp);
+            llog(LOG_INFO, "dtls", "★ANSWER_OUT[%d]: %.*s", li, (int)ll, lp);
+            lp = le ? le + 1 : NULL;
+        }
+    }
+    return n;
+}
+
+void bridge_release_call(bridge_mgr_t *m, void *call)
+{
+    br_shard_t *s = &m->sh[ptr_shard(call)];
+    pthread_mutex_lock(&s->lock);
+    cnode_t **pp = &s->head;
+    while (*pp) {
+        if ((*pp)->call == call) {
+            cnode_t *e = *pp;
+            *pp = e->next;
+            pthread_mutex_unlock(&s->lock);
+            if (e->relay)
+                rtp_relay_stop(e->relay);
+            free(e);
+            return;
+        }
+        pp = &(*pp)->next;
+    }
+    pthread_mutex_unlock(&s->lock);
+}
+
+/* ------------------------------------------------------------------ */
+/* 最终模式确认 + OAM 只读视图（REQ-MEDIA-SEC-003⑤/REQ-OBS-010）         */
+/* ------------------------------------------------------------------ */
+int bridge_confirm(bridge_mgr_t *m, void *call, const char *offer,
+                   size_t offer_len, const char *answer, size_t answer_len)
+{
+    if (!m || !call || !offer || !offer_len || !answer || !answer_len)
+        return NSBC_INVAL;
+    /* bridge_decide 全路径返回 NSBC_OK（与 offer/answer hook 同口径，
+     * 不检查返回值）；初值兜底，决策结果必被其写入。 */
+    mb_mode_t final_mode = MB_BYPASS;
+    bridge_decide(m, offer, offer_len, answer, answer_len, &final_mode);
+    br_shard_t *s = &m->sh[ptr_shard(call)];
+    pthread_mutex_lock(&s->lock);
+    cnode_t *e = entry_find(m, call);
+    if (!e) {
+        pthread_mutex_unlock(&s->lock);
+        return NSBC_NOENT;
+    }
+    if (e->relay) {
+        /* 媒体面已锚定：不降级 bypass；transcode 仅落账供诊断
+         * （执行引擎 P1，不改变转发路径）。 */
+        if (final_mode == MB_TRANSCODE && e->mode != MB_TRANSCODE) {
+            e->mode = MB_TRANSCODE;
+            llog(LOG_WARN, "media",
+                 "call %p codec mismatch: transcode required but unsupported",
+                 call);
+        }
+    } else {
+        e->mode = MB_BYPASS; /* 无 relay 实例：实际路径即透传 */
+    }
+    pthread_mutex_unlock(&s->lock);
+    return NSBC_OK;
+}
+
+int bridge_call_view(bridge_mgr_t *m, void *call, mb_view_t *v)
+{
+    if (!m || !call || !v)
+        return NSBC_INVAL;
+    memset(v, 0, sizeof(*v));
+    br_shard_t *s = &m->sh[ptr_shard(call)];
+    pthread_mutex_lock(&s->lock);
+    cnode_t *e = entry_find(m, call);
+    if (!e) {
+        pthread_mutex_unlock(&s->lock);
+        return NSBC_NOENT;
+    }
+    v->valid = 1;
+    v->mode = e->mode;
+    rtp_relay_t *r = e->relay;
+    if (!r) {
+        /* bypass：设备不过媒体，gate 恒 OPEN，SSRC/VQ 无值（禁估算） */
+        v->gate_open[0] = v->gate_open[1] = 1;
+        pthread_mutex_unlock(&s->lock);
+        return NSBC_OK;
+    }
+    /* 持 shard 锁读：与 release 的 free(relay) 互斥；原子槽由媒体线程
+     * 并发写，OAM 低频读不阻塞转发路径（relay_cb 不持本锁）。 */
+    for (int i = 0; i < 2; ++i) {
+        v->gate_open[i] =
+            __atomic_load_n(&r->d_latched[i], __ATOMIC_ACQUIRE);
+        uint32_t sin =
+            __atomic_load_n(&r->d_in_ssrc[i], __ATOMIC_ACQUIRE);
+        if (sin) {
+            v->ssrc_in[i] = sin;
+            v->have_ssrc_in[i] = 1;
+        }
+        uint32_t sout =
+            __atomic_load_n(&r->d_out_ssrc[i], __ATOMIC_ACQUIRE);
+        if (sout) {
+            v->ssrc_out[i] = sout;
+            v->have_ssrc_out[i] = 1;
+        }
+        if (__atomic_load_n(&r->d_have_rr[i], __ATOMIC_ACQUIRE)) {
+            v->have_rr[i] = 1;
+            v->rr_fraction[i] = (uint8_t)__atomic_load_n(
+                &r->d_rr_frac[i], __ATOMIC_ACQUIRE);
+            v->rr_lost[i] =
+                __atomic_load_n(&r->d_rr_lost[i], __ATOMIC_ACQUIRE);
+            v->rr_jitter[i] =
+                __atomic_load_n(&r->d_rr_jitter[i], __ATOMIC_ACQUIRE);
+        }
+        /* ★ REQ-VQ-001：RTP seq-gap 本地丢包推断——按 SSRC 分槽累加
+         * 之前单槽 d_rtp_expected/d_rtp_lost 被 audio+video 交替污染成假数据。 */
+        {
+            uint32_t te = 0, tl = 0;
+            for (int s = 0; s < SEQ_SLOTS; ++s) {
+                if (r->seq[i][s].primed) {
+                    te += __atomic_load_n(&r->seq[i][s].expected, __ATOMIC_ACQUIRE);
+                    tl += __atomic_load_n(&r->seq[i][s].lost,     __ATOMIC_ACQUIRE);
+                }
+            }
+            v->rtp_expected[i] = te;
+            v->rtp_lost[i]     = tl;
+        }
+        /* REQ-MEDIA-SEC-003⑤ P0：CNAME 绑定 + 安全计数。
+         * d_have_cname 序列计数器：0=未写，≥1=写完且值为 len+1。
+         * char 数组非原子，OAM 低频读 double-check 防 torn read（媒体线程
+         * 写：先清 0→memcpy→store len+1；读者：load→memcpy→reload 若一致则
+         * 安全，否则最多重试 4 次放弃）。 */
+        for (int retry = 0; retry < 4; ++retry) {
+            int seq = __atomic_load_n(&r->d_have_cname[i],
+                                      __ATOMIC_ACQUIRE);
+            if (seq <= 0)
+                break;
+            size_t len = (size_t)(seq - 1);
+            if (len >= sizeof(v->cname[i]))
+                len = sizeof(v->cname[i]) - 1;
+            memcpy(v->cname[i], r->d_cname[i], len);
+            v->cname[i][len] = '\0';
+            if (__atomic_load_n(&r->d_have_cname[i],
+                                __ATOMIC_ACQUIRE) == seq) {
+                v->have_cname[i] = 1;
+                break;
+            }
+        }
+        v->ssrc_inject_drops[i] = ssrc_policy_inject_drops(&r->pol[i]);
+        v->ssrc_collision_drops[i] =
+            ssrc_policy_collision_drops(&r->pol[i]);
+    }
+    pthread_mutex_unlock(&s->lock);
+    return NSBC_OK;
+}
+
+/* ---- OAM 活跃会话遍历 ---- */
+
+int bridge_foreach_call(bridge_mgr_t *m, bridge_iter_cb cb, void *ud)
+{
+    int si, rc = NSBC_OK;
+    if (!m || !cb) return NSBC_INVAL;
+    for (si = 0; si < BR_SHARDS && rc == NSBC_OK; ++si) {
+        pthread_mutex_lock(&m->sh[si].lock);
+        cnode_t *e = m->sh[si].head;
+        while (e && rc == NSBC_OK) {
+            rtp_relay_t *r = e->relay;
+            uint16_t a_rtp = 0, b_rtp = 0;
+            uint64_t pkts = 0, drops = 0;
+            if (r) {
+                /* relay->rtp_port[0]=朝A(fd_rtp[0])、[1]=朝B(fd_rtp[1])——
+                 * 与 relay_start 的 ports->a_rtp=r0/b_rtp=r1 同口径 */
+                a_rtp = r->rtp_port[0];
+                b_rtp = r->rtp_port[1];
+                pkts  = r->pkts;
+                drops = r->drops;
+            }
+            rc = cb(e->call, e->mode, a_rtp, b_rtp, pkts, drops, ud);
+            e = e->next;
+        }
+        pthread_mutex_unlock(&m->sh[si].lock);
+    }
+    return rc;
+}
+
+int bridge_active_count(bridge_mgr_t *m)
+{
+    int si, n = 0;
+    if (!m) return 0;
+    for (si = 0; si < BR_SHARDS; ++si) {
+        pthread_mutex_lock(&m->sh[si].lock);
+        cnode_t *e = m->sh[si].head;
+        while (e) { ++n; e = e->next; }
+        pthread_mutex_unlock(&m->sh[si].lock);
+    }
+    return n;
+}

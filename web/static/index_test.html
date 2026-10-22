@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Test</title><script src="vendor/vue.global.prod.js"></script></head>
+<body><div id="app" v-cloak>
+  <div v-if="!token">LOGIN: <button @click="token='yes'">Login</button></div>
+  <div v-else>MAIN: hello {{ token }}</div>
+</div>
+<script>
+const { createApp, reactive } = Vue;
+createApp({
+  setup() {
+    const state = reactive({ token: null });
+    return { token: state.token };
+  }
+}).mount('#app');
+</script>
+</body></html>

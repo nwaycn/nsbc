@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>WebRTC 页面单元测试</title>
+<script src="vendor/vue.global.prod.js"></script>
+<style>
+body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; background:#f3f4f6; margin:0; padding:20px; }
+h1 { font-size:18px; color:#111827; margin-bottom:4px; }
+.sub { font-size:12px; color:#6b7280; margin-bottom:20px; }
+.summary { display:flex; gap:12px; margin-bottom:20px; }
+.summary .box { flex:1; padding:12px 16px; border-radius:8px; font-weight:600; font-size:14px; }
+.box.total { background:#e0e7ff; color:#3730a3; }
+.box.pass { background:#d1fae5; color:#065f46; }
+.box.fail { background:#fee2e2; color:#991b1b; }
+.box.skip { background:#fef3c7; color:#92400e; }
+.test-group { background:#fff; border:1px solid #e5e7eb; border-radius:8px; padding:16px; margin-bottom:16px; }
+.test-group h2 { font-size:14px; margin:0 0 10px 0; color:#374151; display:flex; align-items:center; gap:8px; }
+.test-group h2 .badge { font-size:11px; padding:1px 8px; border-radius:10px; background:#e5e7eb; color:#6b7280; }
+.test-group h2 .badge.ok { background:#d1fae5; color:#065f46; }
+.test-group h2 .badge.fail { background:#fee2e2; color:#991b1b; }
+.test-group h2 .badge.skip { background:#fef3c7; color:#92400e; }
+ul.cases { list-style:none; margin:0; padding:0; }
+ul.cases li { padding:8px 10px; border-left:3px solid #e5e7eb; font-size:13px; display:flex; justify-content:space-between; gap:10px; }
+ul.cases li.pass { border-color:#10b981; background:#f0fdf4; }
+ul.cases li.fail { border-color:#ef4444; background:#fef2f2; }
+ul.cases li.skip { border-color:#f59e0b; background:#fffbeb; }
+ul.cases li .name { flex:1; color:#374151; }
+ul.cases li .msg { font-family:monospace; font-size:12px; color:#ef4444; white-space:pre-wrap; max-width:55%; text-align:right; }
+.controls { margin-bottom:16px; display:flex; gap:8px; align-items:center; }
+.controls button { padding:6px 14px; font-size:13px; background:#2563eb; color:#fff; border:none; border-radius:6px; cursor:pointer; }
+.controls button:hover { background:#1d4ed8; }
+.controls .wait { font-size:12px; color:#6b7280; }
+</style>
+</head>
+<body>
+
+<h1>🔬 NSBC WebRTC 页面单元测试</h1>
+<div class="sub">浏览器内测试，无需 npm。点击"运行全部测试"看结果。</div>
+
+<div class="controls">
+  <button id="run-all">▶ 运行全部测试</button>
+  <span class="wait" id="wait-info">等待加载...</span>
+</div>
+
+<div class="summary">
+  <div class="box total">总计 <span id="total">—</span></div>
+  <div class="box pass">✅ 通过 <span id="pass">—</span></div>
+  <div class="box fail">❌ 失败 <span id="fail">—</span></div>
+  <div class="box skip">⏭ 跳过 <span id="skip">—</span></div>
+</div>
+
+<div id="results"></div>
+
+<!-- Mock 层 -->
+<script>
+/* global RTCPeerConnection, AudioContext */
+(function () {
+  function makeTrack(kind) {
+    return { kind, label: 'mock-' + kind, _stopped: false, stop() { this._stopped = true; }, getSettings() { return { kind, label: this.label }; } };
+  }
+  function makeStream(kind) {
+    const track = makeTrack(kind);
+    return { _tracks: [track],
+      getAudioTracks() { return kind === 'audio' ? [track] : []; },
+      getVideoTracks() { return kind === 'video' ? [track] : []; },
+      getTracks() { return [track]; },
+      addTrack(x) { if (x) this._tracks.push(x); },
+    };
+  }
+  const RS = window.MediaStream;
+  window.MediaStream = function (t) {
+    t = t ? t.slice() : [];
+    return { _tracks: t,
+      getAudioTracks() { return t.filter(x => x && x.kind === 'audio'); },
+      getVideoTracks() { return t.filter(x => x && x.kind === 'video'); },
+      getTracks() { return t.slice(); },
+      addTrack(x) { if (x) this._tracks.push(x); },
+    };
+  };
+  try { Object.assign(window.MediaStream, RS); } catch(_) {}
+
+  const ms = { succeed: true, callLog: [] };
+  navigator.mediaDevices = { getUserMedia(c) {
+    ms.callLog.push(c);
+    if (!ms.succeed) return Promise.reject(new Error('Permission denied (mock)'));
+    return Promise.resolve(makeStream(c.video ? 'video' : 'audio'));
+  }};
+  window.__mockState = ms;
+
+  function makePC() {
+    return { iceServers: [], localDescription: null, remoteDescription: null,
+      connectionState: 'new', iceConnectionState: 'new', _closed: false,
+      _slc: [], _src: [], _atc: [],
+      _rcvrs: [{ track: { kind: 'audio' } }, { track: { kind: 'video' } }],
+      getReceivers() { return this._rcvrs; },
+      addTrack(t, s) { this._atc.push({ t, s }); },
+      setLocalDescription(d) { this._slc.push(d); this.localDescription = d; return Promise.resolve(); },
+      setRemoteDescription(d) { this._src.push(d); this.remoteDescription = d; return Promise.resolve(); },
+      createOffer() { return Promise.resolve({ type: 'offer', sdp: 'v=0\r\n...' }); },
+      createAnswer() { return Promise.resolve({ type: 'answer', sdp: 'v=0\r\n...' }); },
+      addIceCandidate() { return Promise.resolve(); },
+      createDataChannel(label) {
+        return { label, onopen: null, onmessage: null, onclose: null, _sent: [],
+                 send(d) { this._sent.push(d); }, close() {} };
+      },
+      close() { this._closed = true; this.connectionState = 'closed'; },
+      getStats() {
+        const m = new Map();
+        m.set('p', { type: 'candidate-pair', selected: true, localCandidateId: 'L1-L1-L1-L1-L1-L1-L1-L1-L1-L1-L1-L1-L1-L1-L1-L1', remoteCandidateId: 'R1' });
+        m.set('i', { type: 'inbound-rtp', packetsLost: 5, bytesReceived: 10240, jitter: 15.5 });
+        m.set('o', { type: 'outbound-rtp', bytesSent: 20480 });
+        m.set('r', { type: 'remote-inbound-rtp', roundTripTime: 0.123 });
+        return m;
+      },
+      ontrack: null, onicecandidate: null, onconnectionstatechange: null, ondatachannel: null,
+    };
+  }
+  window.RTCPeerConnection = makePC;
+  window.__makeFakePC = makePC;
+
+  window.AudioContext = function () {
+    return { createAnalyser() {
+        return { fftSize: 256, frequencyBinCount: 128,
+                 getByteTimeDomainData(a) { for (let i = 0; i < a.length; i++) a[i] = 128; }, connect() {} };
+      },
+      createMediaStreamSource() { return { connect() {} }; },
+      close() { this._closed = true; }, _closed: false,
+    };
+  };
+  window.webkitAudioContext = window.AudioContext;
+
+  // 拦截 srcObject setter：浏览器对 mock MediaStream 做类型检查会拒绝赋值
+  // 同时 patch HTMLMediaElement / HTMLVideoElement / HTMLAudioElement（某些浏览器在子类上 own prop）
+  var _patchSrcObj = function(proto) {
+    try { Object.defineProperty(proto, 'srcObject', {
+      set: function() { /* no-op */ },
+      get: function() { return null; },
+      configurable: true
+    }); } catch(_) {}
+  };
+  _patchSrcObj(HTMLMediaElement.prototype);
+  if (window.HTMLVideoElement) _patchSrcObj(HTMLVideoElement.prototype);
+  if (window.HTMLAudioElement)  _patchSrcObj(HTMLAudioElement.prototype);
+})();
+</script>
+
+<script>
+/* global window */
+window.__testComponents = {};
+const app = { component(name, def) { window.__testComponents[name] = def; return this; } };
+</script>
+<script src="js/pages-webrtc.js?v=20261018b"></script>
+
+<!-- 测试引擎：无 async/await，全部 Promise -->
+<script>
+/* global Vue, window, document */
+
+// --- 断言 ---
+function assert(cond, msg) { if (!cond) throw new Error(msg || 'assertion failed'); }
+function eq(a, b, msg) {
+  if (a !== b) throw new Error((msg || '') + ' expected ' + JSON.stringify(b) + ' got ' + JSON.stringify(a));
+}
+function ok(v, msg) { if (!v) throw new Error(msg || 'expected truthy'); }
+
+// --- mount / unmount ---
+function cloneDef(def) {
+  return { template: def.template, data: def.data, computed: def.computed,
+           methods: def.methods, beforeUnmount: def.beforeUnmount };
+}
+function mount() {
+  const c = document.createElement('div');
+  c.style.cssText = 'position:absolute;left:-10000px;';
+  document.body.appendChild(c);
+  const ta = Vue.createApp(cloneDef(window.__testComponents['webrtc-page']));
+  const vm = ta.mount(c);
+  return { vm, c, ta };
+}
+function cleanup(m) {
+  try { m.ta.unmount(); } catch(_) {}
+  try { m.c.remove(); } catch(_) {}
+}
+
+// --- 串行运行 case/group（用 Promise 链代替 async/await）---
+const RESULTS = { total: 0, pass: 0, fail: 0, skip: 0, groups: [] };
+
+function runCase(name, fn) {
+  return new Promise(function(resolve) {
+    try {
+      var r = fn();
+      if (r && typeof r.then === 'function') {
+        r.then(function() { resolve({ name: name, status: 'pass' }); })
+         .catch(function(e) { resolve({ name: name, status: 'fail', msg: (e.message + '').slice(0, 500) }); });
+      } else {
+        resolve({ name: name, status: 'pass' });
+      }
+    } catch(e) {
+      if (e && e.__skip) resolve({ name: name, status: 'skip', msg: e.message });
+      else resolve({ name: name, status: 'fail', msg: (e.message + '').slice(0, 500) });
+    }
+  });
+}
+
+function runGroup(title, cases, groupIndex) {
+  var group = { title: title, cases: [] };
+  RESULTS.groups.push(group);
+  var promise = Promise.resolve();
+  cases.forEach(function(c) {
+    promise = promise.then(function() {
+      return runCase(c.name, c.fn).then(function(r) {
+        group.cases.push(r);
+        RESULTS.total++;
+        RESULTS[r.status]++;
+      });
+    });
+  });
+  return promise;
+}
+
+// --- render（字符串拼接，不用模板）---
+function render() {
+  document.getElementById('total').textContent = RESULTS.total;
+  document.getElementById('pass').textContent  = RESULTS.pass;
+  document.getElementById('fail').textContent  = RESULTS.fail;
+  document.getElementById('skip').textContent  = RESULTS.skip;
+  var box = document.getElementById('results');
+  var html = '';
+  for (var gi = 0; gi < RESULTS.groups.length; gi++) {
+    var g = RESULTS.groups[gi];
+    var okC = 0, failC = 0, skipC = 0;
+    for (var ci = 0; ci < g.cases.length; ci++) {
+      if (g.cases[ci].status === 'pass') okC++;
+      else if (g.cases[ci].status === 'fail') failC++;
+      else skipC++;
+    }
+    var badgeCls = failC > 0 ? 'fail' : (skipC === g.cases.length ? 'skip' : 'ok');
+    html += '<div class="test-group"><h2>' + g.title
+      + ' <span class="badge ' + badgeCls + '">' + okC + '/' + g.cases.length + '</span></h2><ul class="cases">';
+    for (var ci2 = 0; ci2 < g.cases.length; ci2++) {
+      var cs = g.cases[ci2];
+      var ic = cs.status === 'pass' ? '✅' : cs.status === 'fail' ? '❌' : '⏭';
+      html += '<li class="' + cs.status + '"><span class="name">' + ic + ' ' + cs.name
+        + '</span><span class="msg">' + (cs.msg || '') + '</span></li>';
+    }
+    html += '</ul></div>';
+  }
+  box.innerHTML = html;
+}
+
+// =========================================
+// 所有测试用例（fn 返回函数或 Promise）
+// =========================================
+
+function runAll() {
+  RESULTS.total = RESULTS.pass = RESULTS.fail = RESULTS.skip = 0;
+  RESULTS.groups = [];
+  render();
+
+  // Group 1: pushLog
+  var g1 = runGroup('pushLog / dcLogs', [
+    { name: '非 me → incoming=true', fn: function() {
+        var m = mount(); m.vm.dcLogs = []; m.vm.pushLog('A', 'hello');
+        eq(m.vm.dcLogs.length, 1); eq(m.vm.dcLogs[0].incoming, true); cleanup(m); } },
+    { name: 'me → incoming=false', fn: function() {
+        var m = mount(); m.vm.dcLogs = []; m.vm.pushLog('me', 'self');
+        eq(m.vm.dcLogs[0].incoming, false); cleanup(m); } },
+    { name: '超过 50 条 → cap 到 50', fn: function() {
+        var m = mount(); m.vm.dcLogs = [];
+        for (var i = 0; i < 55; i++) m.vm.pushLog('me', 'msg-' + i);
+        eq(m.vm.dcLogs.length, 50);
+        ok(m.vm.dcLogs[0].text.indexOf('msg-54') >= 0, 'index 0 = 最新 msg-54');
+        ok(m.vm.dcLogs[49].text.indexOf('msg-5') >= 0, 'index 49 = 最旧保留 msg-5');
+        cleanup(m); } },
+    { name: 'unshift 最新在 index 0', fn: function() {
+        var m = mount(); m.vm.dcLogs = [];
+        m.vm.pushLog('me', 'first'); m.vm.pushLog('me', 'second');
+        ok(m.vm.dcLogs[0].text.indexOf('second') >= 0);
+        ok(m.vm.dcLogs[1].text.indexOf('first') >= 0);
+        cleanup(m); } },
+  ]);
+
+  // Group 2: dcSend
+  var g2 = runGroup('dcSend', [
+    { name: '空字符串 → 不发送', fn: function() {
+        var m = mount(); var called = false;
+        m.vm.dcB = { send: function() { called = true; } }; m.vm.dcMsg = '';
+        m.vm.dcSend(); eq(called, false); cleanup(m); } },
+    { name: '纯空格 → 不发送', fn: function() {
+        var m = mount(); var called = false;
+        m.vm.dcB = { send: function() { called = true; } }; m.vm.dcMsg = '   ';
+        m.vm.dcSend(); eq(called, false); cleanup(m); } },
+    { name: '正常消息 → dcB+dcA 都 send', fn: function() {
+        var m = mount(); var sent = [];
+        m.vm.dcB = { send: function(d) { sent.push('B:' + d); } };
+        m.vm.dcA = { send: function(d) { sent.push('A:' + d); } };
+        m.vm.dcMsg = 'hello'; m.vm.dcLogs = []; m.vm.dcSend();
+        ok(sent.indexOf('B:hello') >= 0); ok(sent.indexOf('A:hello') >= 0);
+        eq(m.vm.dcMsg, ''); cleanup(m); } },
+    { name: 'dcB=null → 只 dcA 发送', fn: function() {
+        var m = mount(); var sent = [];
+        m.vm.dcB = null;
+        m.vm.dcA = { send: function(d) { sent.push('A:' + d); } };
+        m.vm.dcMsg = 'hi'; m.vm.dcSend();
+        eq(sent.length, 1); ok(sent[0].indexOf('A:') === 0); cleanup(m); } },
+  ]);
+
+  // Group 3: stopMedia
+  var g3 = runGroup('stopMedia', [
+    { name: '清理 localStream + flags', fn: function() {
+        var m = mount();
+        m.vm.localStream = { getTracks: function() { return [{ stop: function() {} }]; } };
+        m.vm.audioOn = true; m.vm.videoOn = true; m.vm.waveTimer = 99;
+        m.vm.stopMedia();
+        eq(m.vm.localStream, null); eq(m.vm.audioOn, false);
+        eq(m.vm.videoOn, false); eq(m.vm.waveTimer, null); cleanup(m); } },
+    { name: 'localStream=null 不崩溃', fn: function() {
+        var m = mount(); m.vm.localStream = null;
+        m.vm.stopMedia(); eq(m.vm.audioOn, false); cleanup(m); } },
+  ]);
+
+  // Group 4: stopLoopback
+  var g4 = runGroup('stopLoopback', [
+    { name: '关闭 pcA/pcB + 清空 dc + 重置所有状态', fn: function() {
+        var m = mount();
+        var pcA = window.__makeFakePC(); var pcB = window.__makeFakePC();
+        m.vm.pcA = pcA; m.vm.pcB = pcB;
+        m.vm.dcA = { close: function() {} }; m.vm.dcB = { close: function() {} };
+        m.vm.pcOn = true; m.vm.dcOpen = true; m.vm.stats = { iceState: 'connected' };
+        m.vm.stopLoopback();
+        eq(m.vm.pcA, null); eq(m.vm.pcB, null); eq(m.vm.dcA, null); eq(m.vm.dcB, null);
+        eq(m.vm.pcOn, false); eq(m.vm.dcOpen, false);
+        eq(m.vm.pcState, '未建立'); eq(Object.keys(m.vm.stats).length, 0);
+        eq(pcA._closed, true); eq(pcB._closed, true); cleanup(m); } },
+    { name: '全部 null 不崩溃', fn: function() {
+        var m = mount();
+        m.vm.pcA = m.vm.pcB = m.vm.dcA = m.vm.dcB = null;
+        m.vm.stopLoopback(); eq(m.vm.pcState, '未建立'); cleanup(m); } },
+  ]);
+
+  // Group 5: attachLocalStream
+  var g5 = runGroup('attachLocalStream', [
+    { name: 'audioOnly=true → 合并 audio tracks', fn: function() {
+        var m = mount();
+        var fake = {
+          getAudioTracks: function() { return [{ kind: 'audio', stop: function() {}, getSettings: function(){return {kind:'audio'};} }]; },
+          getVideoTracks: function() { return []; },
+          getTracks: function() { return [{ kind: 'audio' }]; },
+          addTrack: function() {},
+        };
+        m.vm.localStream = null; m.vm.attachLocalStream(fake, true);
+        ok(m.vm.localStream); cleanup(m); } },
+    { name: 'audioOnly=false → 合并 video tracks', fn: function() {
+        var m = mount();
+        var fake = {
+          getAudioTracks: function() { return []; },
+          getVideoTracks: function() { return [{ kind: 'video', stop: function() {}, getSettings: function(){return {kind:'video'};} }]; },
+          getTracks: function() { return [{ kind: 'video' }]; },
+          addTrack: function() {},
+        };
+        m.vm.localStream = null; m.vm.attachLocalStream(fake, false);
+        ok(m.vm.localStream); cleanup(m); } },
+  ]);
+
+  // Group 6: refreshStats（异步：fn 返回 Promise）
+  var g6 = runGroup('refreshStats', [
+    { name: 'pcA=null → 直接 return', fn: function() {
+        var m = mount(); m.vm.pcA = null;
+        return Promise.resolve(m.vm.refreshStats()).then(function() { cleanup(m); }); } },
+    { name: '正常 → stats 各字段被填充', fn: function() {
+        var m = mount();
+        var pc = window.__makeFakePC();
+        pc.iceConnectionState = 'connected'; pc.connectionState = 'connected';
+        m.vm.pcA = pc;
+        return Promise.resolve(m.vm.refreshStats()).then(function() {
+          eq(m.vm.stats.iceState, 'connected'); eq(m.vm.stats.connState, 'connected');
+          ok(m.vm.stats.candidatePair.indexOf('L1') >= 0);
+          ok(m.vm.stats.videoSendBw.indexOf('KB') >= 0);
+          ok(m.vm.stats.videoRecvBw.indexOf('KB') >= 0);
+          eq(m.vm.stats.lost, 5);
+          ok(m.vm.stats.rtt.indexOf('123') >= 0 || m.vm.stats.rtt.indexOf('ms') >= 0);
+          ok(m.vm.stats.jitter.indexOf('ms') >= 0);
+          cleanup(m);
+        }); } },
+    { name: '超长 candidatePair → 截断', fn: function() {
+        var m = mount(); m.vm.pcA = window.__makeFakePC();
+        return Promise.resolve(m.vm.refreshStats()).then(function() {
+          ok(m.vm.stats.candidatePair.length <= 41);
+          if (m.vm.stats.candidatePair.length > 40) ok(m.vm.stats.candidatePair.slice(-1) === '…');
+          cleanup(m);
+        }); } },
+  ]);
+
+  // Group 7: startAudio/startVideo
+  var g7 = runGroup('startAudio / startVideo', [
+    { name: 'startAudio 成功 → audioOn=true', fn: function() {
+        var m = mount();
+        window.__mockState.succeed = true; window.__mockState.callLog = [];
+        return Promise.resolve(m.vm.startAudio()).then(function() {
+          eq(m.vm.audioOn, true); eq(m.vm.videoOn, false); eq(m.vm.error, '');
+          ok(window.__mockState.callLog.some(function(c){ return c.audio === true; }));
+          cleanup(m);
+        }); } },
+    { name: 'startVideo 成功 → videoOn=true', fn: function() {
+        var m = mount();
+        window.__mockState.succeed = true; window.__mockState.callLog = [];
+        return Promise.resolve(m.vm.startVideo()).then(function() {
+          eq(m.vm.videoOn, true); eq(m.vm.audioOn, false);
+          ok(window.__mockState.callLog.some(function(c){ return c.video === true; }));
+          cleanup(m);
+        }); } },
+    { name: 'getUserMedia 失败 → error 填充', fn: function() {
+        var m = mount();
+        window.__mockState.succeed = false;
+        return Promise.resolve(m.vm.startAudio()).then(function() {
+          eq(m.vm.audioOn, false);
+          ok(m.vm.error.indexOf('麦克风失败') >= 0); ok(m.vm.error.indexOf('mock') >= 0);
+          window.__mockState.succeed = true; cleanup(m);
+        }); } },
+  ]);
+
+  // Group 8: startLoopback
+  var g8 = runGroup('startLoopback', [
+    { name: '无 localStream → 自动 startAudio', fn: function() {
+        var m = mount(); var audioCalled = false;
+        m.vm.startAudio = function() {
+          audioCalled = true;
+          var track = { kind: 'audio', stop: function() {}, getSettings: function(){return{kind:'audio'};} };
+          m.vm.localStream = { _tracks: [track], getTracks: function() { return [track]; }, addTrack: function() {} };
+          m.vm.audioOn = true;
+          return Promise.resolve();
+        };
+        m.vm.localStream = null;
+        return Promise.resolve(m.vm.startLoopback()).then(function() {
+          ok(audioCalled); ok(m.vm.pcA && m.vm.pcB); eq(m.vm.pcOn, true);
+          m.vm.stopLoopback(); cleanup(m);
+        }); } },
+    { name: '成功 → pcA.addTrack 被调', fn: function() {
+        var m = mount();
+        var track = { kind: 'audio', stop: function() {}, getSettings: function(){return{kind:'audio'};} };
+        m.vm.localStream = { _tracks: [track], getTracks: function() { return [track]; }, addTrack: function() {} };
+        return Promise.resolve(m.vm.startLoopback()).then(function() {
+          ok(m.vm.pcA._atc.length >= 1);
+          ok(m.vm.dcB && m.vm.dcB.label === 'nsbc-test');
+          m.vm.stopLoopback(); cleanup(m);
+        }); } },
+    { name: '成功 → SDP offer/answer 完整链', fn: function() {
+        var m = mount();
+        var track = { kind: 'audio', stop: function() {}, getSettings: function(){return{kind:'audio'};} };
+        m.vm.localStream = { _tracks: [track], getTracks: function() { return [track]; }, addTrack: function() {} };
+        return Promise.resolve(m.vm.startLoopback()).then(function() {
+          ok(m.vm.pcA._slc.length >= 1); ok(m.vm.pcB._src.length >= 1);
+          ok(m.vm.pcB._slc.length >= 1); ok(m.vm.pcA._src.length >= 1);
+          m.vm.stopLoopback(); cleanup(m);
+        }); } },
+    { name: '异常 → error 填充 + 状态清理', fn: function() {
+        var m = mount();
+        var track = { kind: 'audio', stop: function() {}, getSettings: function(){return{kind:'audio'};} };
+        m.vm.localStream = { _tracks: [track], getTracks: function() { return [track]; }, addTrack: function() {} };
+        var orig = window.RTCPeerConnection;
+        window.RTCPeerConnection = function() {
+          var pc = orig(); var first = true;
+          pc.createOffer = function() {
+            if (first) { first = false; return Promise.reject(new Error('SDP fail')); }
+            return orig().createOffer();
+          };
+          return pc;
+        };
+        return Promise.resolve(m.vm.startLoopback()).then(function() {
+          window.RTCPeerConnection = orig;
+          ok(m.vm.error.indexOf('Loopback 失败') >= 0); ok(m.vm.error.indexOf('SDP') >= 0);
+          eq(m.vm.pcOn, false); cleanup(m);
+        }); } },
+  ]);
+
+  // Group 9: beforeUnmount（unmount 后等微任务完成再断言）
+  var g9 = runGroup('beforeUnmount', [
+    { name: 'unmount 时 stopMedia + stopLoopback 被调', fn: function() {
+        var m = mount();
+        m.vm.localStream = { _tracks: [{ kind: 'audio', _stopped: false, stop: function(){ this._stopped = true; } }], getTracks: function() { return this._tracks; } };
+        m.vm.audioOn = true;
+        var pc = window.__makeFakePC(); m.vm.pcA = pc; m.vm.pcOn = true;
+        cleanup(m);
+        return new Promise(function(resolve) {
+          setTimeout(function() {
+            try {
+              eq(m.vm.localStream, null, 'stopMedia cleared localStream');
+              eq(m.vm.pcA, null, 'stopLoopback cleared pcA');
+              eq(pc._closed, true, 'pc.close() called');
+            } catch(e) { throw e; }
+            resolve();
+          }, 20);
+        }); } },
+  ]);
+
+  // 等所有 group 完成后渲染
+  Promise.all([g1, g2, g3, g4, g5, g6, g7, g8, g9]).then(function() {
+    render();
+    document.getElementById('wait-info').textContent =
+      '✅ 完成 ' + RESULTS.total + ' 个 — ' + RESULTS.pass + ' 通过 / ' + RESULTS.fail + ' 失败 / ' + RESULTS.skip + ' 跳过';
+  });
+}
+
+document.getElementById('run-all').addEventListener('click', runAll);
+window.__runTests = runAll;
+window.addEventListener('load', function() { setTimeout(runAll, 400); });
+</script>
+
+</body>
+</html>

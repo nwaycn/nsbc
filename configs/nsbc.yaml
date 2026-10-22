@@ -1,0 +1,136 @@
+# NSBC 核心默认配置（nsbcd 2.5.5，键集合见 cfg_schema.c / REQ-CFG-004）
+# 热加载边界（REQ-OAM-003）：仅标注 [热] 的键支持运行时热加载；
+# 其余键变更需重启或 Graceful Restart；敏感值支持 enc:/file: 前缀。
+
+# REQ-CFG-006：配置 schema 版本（与文档版本无关，勿手工修改；
+# 跨版本升级走：nsbcd config migrate -c <file> --from <旧> --to <新>）
+config_version: "1.0"
+
+log:
+  level: info            # [热] emerg..debug
+  path: /var/log/nsbc/nsbc.log
+  audit_path: /var/log/nsbc/audit.log
+  ring_slots: 512
+
+# REQ-ARCH-010：模块动态启停（类似 FreeSWITCH modules.conf 的运行时子集）。
+# 注：REQUIRED 模块（signaling / dbal / oam / endpoints / agent_pool / queue）
+#     禁止 disable → 启动时 fail-fast。enable 白名单与 disable 黑名单同时
+#     填写时 enable 优先：白名单里没的非 REQUIRED 模块自动被 disable。
+# 独立 modules.conf 文件（FreeSWITCH 风格）P1 实现，当前版本内嵌段生效。
+# modules:
+#   enable:                   # 白名单：填了 = 只有这些能 enable（REQUIRED 强制）
+#     - signaling
+#     - oam
+#     - dbal
+#     - endpoints
+#     - agent_pool
+#     - queue
+#   disable:                  # 黑名单：填了 = 这些不加载
+#     - hello                 # examples walkthrough
+#     - asr_tts
+#     - presence
+#     - cachedb
+#     - outreg                # 无外呼需求
+#     - recording             # 无录音需求
+
+core:
+  workers: 0             # 0=按 CPU
+  worker_queue: 4096
+  max_calls: 8192        # P0：100000 超出 slab 内存上限
+  timer_tick_ms: 100
+  drain_max_ms: 30000    # [热]
+  deploy_profile: standalone-sbc  # standalone-sbc | pbx | fusion
+
+mem:
+  signal_mb: 256
+  packet_mb: 1024
+  media_mb: 512
+  transcode_mb: 256
+  record_mb: 256
+  hugepage: false
+  guard_band: false
+
+net:
+  reuseport: true
+  rcvbuf_kb: 4096        # [热]
+  sndbuf_kb: 4096        # [热]
+  sip_listen_ip: 0.0.0.0
+  sip_udp_port: 5060
+  sip_tcp_port: 5060
+  sip_tls_port: 5061
+  sip_max_msg: 16384
+  tcp_conn_max: 100000   # [热]
+  tls_enabled: false
+  tls_cert: /etc/nsbc/tls/cert.pem
+  tls_key: "file:/etc/nsbc/tls/key.pem"
+  tls_min_version: "1.2"
+  dns_ttl_s: 60          # [热]
+
+sip:
+  t1_ms: 500             # [热]
+  t2_ms: 4000            # [热]
+  t4_ms: 5000            # [热]
+  timer_d_ms: 32000      # [热]
+  udp_cl_strict: true    # [热]
+  user_agent: NSBC/2.5   # [热]
+  enable_udp: true
+  enable_tcp: true
+  realm: nsbc.local
+  extern_ip: 10.0.0.120
+  digest_secret: test
+
+dialplan:
+  rules: "alice:0:alice|bob:0:bob|^[0-9]+$:0:$0"   # P0 分机映射
+
+rtp:
+  port_start: 10000
+  port_end: 59999
+  latching: true
+  dscp: 46               # [热]
+  ssrc_grace_ms: 500     # [热]
+  rtcp_interval_ms: 5000 # [热]
+
+media:
+  default_mode: relay    # [热] bypass | relay | transcode
+  allow_bypass: false    # [热]
+  trust_private: true    # [热]
+
+registrar:
+  min_expires: 60        # [热]
+  default_expires: 3600  # [热]
+  max_expires: 3600      # [热]
+  max_contacts: 10       # [热]
+  rps_global: 2000       # [热]
+  rps_per_ip: 100        # [热]
+  rps_per_aor: 10        # [热]
+
+db:
+  driver: sqlite         # sqlite | mysql | postgres | none
+  dsn: "file:/var/lib/nsbc/nsbc.db"
+  pool_size: 8
+  group_commit_ms: 10    # [热]
+  group_commit_rows: 100 # [热]
+
+oam:
+  metrics_enabled: true  # [热]
+  metrics_bind: 127.0.0.1:9100   # [热] 唯一"先开后关"迁移例外
+  control_sock: "unix:/var/run/nsbc/control.sock"
+
+ha:
+  enabled: false
+  peer: ""               # host:port，如 10.0.0.2:5070
+  heartbeat_ms: 500      # [热]
+  failover_ms: 3000      # [热]
+
+# REQ-MEDIA-HEP-001：HEP3 实时推流（→ Homer/SIPCAPTURE）
+# capture_id=0 或 server="" 时模块自动 skip，不阻塞启动
+hep:
+  server: 127.0.0.1
+  port: 9060
+  capture_id: 1000
+  ring_size: 8192
+  socket_pool: 4
+
+web:
+  enabled: false         # Rust 边车（第 14 章）独立进程
+  bind: 127.0.0.1:8443

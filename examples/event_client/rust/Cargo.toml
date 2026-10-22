@@ -1,0 +1,8 @@
+[package]
+name = "nsbc-event-client"
+version = "0.1.0"
+edition = "2021"
+
+# 零第三方依赖：UnixStream + BufRead + 手写解析；CDR body 不做 JSON parse
+# 如果想解析 CDR JSON，加 serde_json = "1" 到 [dependencies]
+[dependencies]

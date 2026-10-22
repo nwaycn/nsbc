@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>宁卫SBC WebRTC 视频通话</title>
+<script src="js/jssip-3.10.0.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: -apple-system, Segoe UI, 'PingFang SC', sans-serif;
+         background: linear-gradient(135deg, #0f172a 0%, #1e3a5f 100%);
+         min-height: 100vh; color: #e2e8f0; }
+  .wrap { max-width: 1200px; margin: 0 auto; padding: 20px; }
+  h1 { font-size: 22px; margin: 0 0 16px 0; }
+  h1 .tag { font-size: 11px; background:#2563eb; padding:2px 8px; border-radius:10px; margin-left:8px; }
+  .grid { display:grid; grid-template-columns: 1fr 1fr; gap:16px; margin-bottom:16px; }
+  .card { background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1);
+          border-radius:12px; padding:16px; backdrop-filter: blur(10px); }
+  .card h3 { margin:0 0 12px 0; font-size:14px; color:#94a3b8; font-weight:500; text-transform:uppercase; letter-spacing:1px; }
+  .row { display:flex; gap:12px; align-items:center; margin-bottom:10px; }
+  .row label { width:90px; font-size:13px; color:#cbd5e1; flex-shrink:0; }
+  .row input { flex:1; background:rgba(0,0,0,0.3); border:1px solid rgba(255,255,255,0.15);
+               border-radius:8px; padding:8px 12px; color:#e2e8f0; font-size:14px; outline:none; }
+  .row input:focus { border-color:#3b82f6; }
+  .row input[disabled] { opacity:0.5; cursor:not-allowed; }
+  .btn { padding:8px 18px; border-radius:8px; border:none; font-size:13px; font-weight:500;
+         cursor:pointer; transition: all .15s; }
+  .btn:disabled { opacity:0.4; cursor:not-allowed; }
+  .btn-blue { background:#3b82f6; color:#fff; }  .btn-blue:hover:not(:disabled){ background:#2563eb; }
+  .btn-green{ background:#10b981; color:#fff; }  .btn-green:hover:not(:disabled){ background:#059669; }
+  .btn-red  { background:#ef4444; color:#fff; }  .btn-red:hover:not(:disabled){ background:#dc2626; }
+  .btn-gray { background:#475569; color:#fff; }  .btn-gray:hover:not(:disabled){ background:#334155; }
+  .status { font-size:13px; }
+  .status.ok { color:#4ade80; } .status.err { color:#f87171; }
+  .videos { display:grid; grid-template-columns: 1fr 1fr; gap:12px; }
+  .video-box { position:relative; aspect-ratio: 4/3; background:#000; border-radius:10px; overflow:hidden; border:1px solid rgba(255,255,255,0.1); }
+  .video-box video { width:100%; height:100%; object-fit:cover; }
+  .video-box .lbl { position:absolute; bottom:8px; left:8px; font-size:11px;
+                    background:rgba(0,0,0,0.6); padding:2px 8px; border-radius:4px; color:#94a3b8; }
+  .video-box .dot { display:inline-block; width:6px; height:6px; border-radius:50%; margin-right:4px; }
+  .video-box .dot.on { background:#4ade80; box-shadow:0 0 6px #4ade80; }
+  .video-box .dot.off { background:#64748b; }
+  .incoming { background:rgba(234,179,8,0.1); border:1px solid #eab308; border-radius:10px;
+              padding:12px 16px; display:none; align-items:center; justify-content:space-between; }
+  .incoming.show { display:flex; }
+  .incoming .from { font-weight:600; color:#fbbf24; }
+  .dc-area { display:flex; gap:8px; margin-bottom:8px; }
+  .dc-area input { flex:1; }
+  .dc-log { height:160px; overflow-y:auto; background:rgba(0,0,0,0.3); border-radius:8px;
+            padding:8px; font-family: 'JetBrains Mono', monospace; font-size:12px; }
+  .dc-log .in  { color:#60a5fa; }
+  .dc-log .out { color:#a78bfa; }
+  .dc-log .sys { color:#64748b; }
+  .sip-log { height:200px; overflow-y:auto; background:#0a0f1a; border-radius:8px; padding:10px;
+             font-family: 'JetBrains Mono', monospace; font-size:12px; line-height:1.6; }
+  .sip-log .ts { color:#475569; }
+  .sip-log .ok { color:#4ade80; }
+  .sip-log .err { color:#f87171; }
+  .sip-log .info { color:#93c5fd; }
+  .sip-log .warn { color:#fbbf24; }
+  .sip-log .tx { color:#f472b6; }
+  .sip-log .rx { color:#34d399; }
+  .controls { display:flex; gap:8px; margin-top:10px; }
+  .toolbar { display:flex; gap:6px; flex-wrap:wrap; }
+  .toolbar button { padding:4px 12px; font-size:12px; }
+
+  .ring { animation: ring 0.6s ease-in-out infinite; }
+  @keyframes ring { 0%,100%{ transform:rotate(-3deg);} 50%{ transform:rotate(3deg);} }
+
+  /* ---- 拨号盘 ---- */
+  .dialpad { display:grid; grid-template-columns: repeat(3, 1fr); gap:8px; margin-top:8px; }
+  .dialpad button { padding:14px 0; font-size:18px; font-weight:600;
+                    background:rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.15);
+                    border-radius:10px; color:#e2e8f0; cursor:pointer; transition: all .1s; }
+  .dialpad button:hover { background:rgba(59,130,246,0.3); border-color:#3b82f6; }
+  .dialpad button:active { transform:scale(0.95); background:rgba(59,130,246,0.5); }
+  .dialpad button.wide { grid-column: span 2; font-size:14px; background:rgba(239,68,68,0.15); border-color:#ef4444; }
+  .dialpad button.wide:hover { background:rgba(239,68,68,0.3); }
+
+  /* ---- DTMF 显示 ---- */
+  #dtmfDisplay { min-height:24px; padding:4px 8px; margin-top:4px;
+                  background:rgba(0,0,0,0.3); border-radius:6px; font-size:14px;
+                  font-family:'JetBrains Mono', monospace; color:#fbbf24;
+                  transition: all .1s; }
+  #dtmfDisplay.flash { background:rgba(251,191,36,0.3); transform:scale(1.02); }
+
+  /* ---- Hold 按钮激活态 ---- */
+  .btn-held { background:#f59e0b !important; color:#000 !important; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>宁卫SBC WebRTC 视频通话 <span class="tag">独立页面 · JsSIP + WSS</span></h1>
+
+  <div class="grid">
+
+    <div class="card">
+      <h3>SIP 账号</h3>
+      <div class="row"><label>WSS 服务器</label><input id="wss" value="" placeholder="自动从 URL 推导"></div>
+      <div class="row"><label>STUN</label><input id="stun" value="" placeholder="自动从 URL 推导"></div>
+      <div class="row"><label>分机号</label><input id="user" value="1000"></div>
+      <div class="row"><label>密码</label><input id="pass" type="password" value=""></div>
+      <div class="row"><label>Realm / 租户</label><input id="realm" value="nsbc.local" placeholder="SIP 域，如 nsbc.local / acme.com"></div>
+      <div class="row">
+        <button class="btn btn-green" id="btnReg" onclick="doRegister()">▶ Register</button>
+        <button class="btn btn-red"   id="btnUnreg" onclick="doUnregister()" disabled>Unregister</button>
+        <span class="status" id="regStatus">未注册</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>视频</h3>
+      <div class="videos">
+        <div class="video-box">
+          <video id="localVideo" autoplay muted playsinline></video>
+          <div class="lbl"><span class="dot off" id="localDot"></span>本地</div>
+        </div>
+        <div class="video-box">
+          <video id="remoteVideo" autoplay playsinline></video>
+          <div class="lbl"><span class="dot off" id="remoteDot"></span>远端</div>
+        </div>
+      </div>
+      <div class="toolbar">
+        <button class="btn btn-gray" onclick="muteAudio()" id="btnMute">🔊 Mute</button>
+        <button class="btn btn-gray" onclick="stopVideo()" id="btnStopVid">📷 Stop Video</button>
+        <button class="btn btn-gray" onclick="doHold()" id="btnHold">⏸ Hold</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="incoming" id="incoming">
+    <div>📞 来电: <span class="from" id="inFrom">—</span> <span class="ring">🔔</span></div>
+    <div>
+      <button class="btn btn-green" onclick="doAccept()" style="margin-right:6px">Accept</button>
+      <button class="btn btn-red"   onclick="doReject()">Reject</button>
+    </div>
+  </div>
+
+  <div class="grid" style="margin-top:16px">
+
+    <div class="card">
+      <h3>拨号 / 通话</h3>
+      <div class="row">
+        <label>被叫</label>
+        <input id="target" value="1001">
+        <button class="btn btn-green" id="btnCall" onclick="doCall()" disabled>📞 Call</button>
+        <button class="btn btn-red"   id="btnHang" onclick="doHangup()" disabled>✕ Hangup</button>
+      </div>
+      <div class="row" style="margin-bottom:4px">
+        <span class="status" id="callStatus">空闲</span>
+      </div>
+      <div id="dtmfDisplay"></div>
+      <div class="dialpad">
+        <button onclick="doDialKey('1')">1</button>
+        <button onclick="doDialKey('2')">2</button>
+        <button onclick="doDialKey('3')">3</button>
+        <button onclick="doDialKey('4')">4</button>
+        <button onclick="doDialKey('5')">5</button>
+        <button onclick="doDialKey('6')">6</button>
+        <button onclick="doDialKey('7')">7</button>
+        <button onclick="doDialKey('8')">8</button>
+        <button onclick="doDialKey('9')">9</button>
+        <button onclick="doDialKey('*')">*</button>
+        <button onclick="doDialKey('0')">0</button>
+        <button onclick="doDialKey('#')">#</button>
+        <button class="btn btn-gray" style="font-size:13px;padding:6px" onclick="doDialKey('⌫')">⌫ 删除</button>
+        <button class="btn btn-gray wide" onclick="doDialKey('C')">C 清空</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>DataChannel</h3>
+      <div class="dc-area">
+        <input id="dcMsg" placeholder="输入消息，回车发送..." disabled onkeydown="if(event.key==='Enter') dcSend()">
+        <button class="btn btn-blue" onclick="dcSend()" id="btnDc" disabled>Send</button>
+      </div>
+      <div class="dc-log" id="dcLog"><div class="sys">等待 DataChannel open...</div></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <h3>SIP 实时日志</h3>
+    <div class="sip-log" id="sipLog"></div>
+  </div>
+
+</div>
+<script src="js/nsbc-phone.js?v=20261018b"></script>
+</body>
+</html>

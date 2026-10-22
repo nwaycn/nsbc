@@ -1,0 +1,163 @@
+# ============================================================
+# NSBC 统一配置文件（nsbcd + nsbc-web 共享）
+# ============================================================
+#
+# 【部署约定】
+#   这个 YAML 文件放在 <部署根>/conf/nsbc.yaml
+#   所有相对路径都**相对于本文件所在目录（conf/）**解析
+#   所以 "../tls/cert.pem" 实际指向 <部署根>/tls/cert.pem
+#   整个部署目录可直接 mv 到任意位置，YAML 一个字不用改
+#
+# 【部署目录结构】
+#   /home/nway/nsbc/                    ← 部署根（示例路径，可搬）
+#   ├── nsbcd
+#   ├── conf/nsbc.yaml                  ← ← 本文件就在这里
+#   ├── web/nsbc-web + static/
+#   ├── tls/cert.pem + key.pem          ← auto_generate 自动生成
+#   ├── logs/                           ← mkdir_p 自动创建
+#   ├── run/                            ← UDS socket 目录
+#   └── data/snapshots/
+#
+# 【启动顺序】先起 Web（auto_generate 创建证书），再起 nsbcd
+#   cd /home/nway/nsbc/web && ./nsbc-web &
+#   sleep 2
+#   cd /home/nway/nsbc && ./nsbcd &
+#
+# 【两边搜索配置的顺序】
+#   nsbcd (C)  : -c > <exe>/conf/nsbc.yaml → /etc/nsbc/nsbc.yaml
+#   nsbc-web  : -c > <exe>/../conf/nsbc.yaml → <exe>/conf/nsbc.yaml → ./conf/ → /etc/nsbc/nsbc.yaml
+#   → 都能找到这份 conf/nsbc.yaml
+#
+# 【nsbcd 和 nsbc-web 忽略的键】
+#   nsbcd 读：log.*, net.*, oam.*, sip.*, registrar.*, system.*
+#             → 忽略 web.*, auth.*, db.*, audit.*
+#   nsbc-web 读：web.*, auth.*, db.*, core.*, audit.*
+#             → 忽略 net.*, oam.*, registrar.*, system.*
+#
+# ============================================================
+
+config_version: "1.0"
+
+# ---- 共用 core section ----
+core:
+  # nsbcd 读取（B2B 内存上限等）
+  workers: 0            # 0 = 按 CPU 核数
+  max_calls: 2000      # 10K 保守值，按需调大
+  timer_tick_ms: 100
+
+  # UDS socket 已在 C/Web 代码中硬编码为 /var/run/nsbc/，
+  # 本配置项忽略（保留仅供 nsbc_cli 等工具读取解析）
+  control_sock: "unix:/var/run/nsbc/control.sock"
+  data_sock:    "/var/run/nsbc/data.sock"
+
+# ---- nsbcd 专用 ----
+log:
+  level: info
+  path:       "../logs/nsbcd.log"       # 相对 conf/ → ../logs/
+  audit_path: "../logs/audit.jsonl"
+
+net:
+  sip_udp_port: 5060
+  sip_tcp_port: 5060
+  sip_tls_port: 5061
+  # SIP TLS — 和 web.tls 共用 ../tls/ 下的证书文件
+  # nsbc-web 启动时 auto_generate 创建证书 + 后台每小时自动续期
+  # nsbcd 只读证书文件，不参与续期逻辑
+  tls_enabled: true
+  tls_cert: "../tls/cert.pem"           # 相对 conf/ → ../tls/
+  tls_key:  "../tls/key.pem"
+  tls_min_version: "1.2"
+
+sip:
+  bind: "0.0.0.0:5060"
+  ws:
+    enabled: true
+    port: 5062       # 改你想要的
+    tls: true
+
+oam:
+  control_sock: "unix:/var/run/nsbc/control.sock"   # 已硬编码，配置忽略
+  metrics_enabled: true
+  metrics_bind: "127.0.0.1:9100"
+
+registrar:
+  # SIP REGISTER 鉴权密钥；留空=用 digest_secret 默认值
+  # digest_secret: "file:../tls/key.pem"
+  min_expires: 60
+  default_expires: 3600
+  max_expires: 3600
+
+# ---- 通话录音（REQ-REC-001~004，P1 真实现）----
+recording:
+  enabled: true                         # 关掉改 false → 不录音
+  path: "./recordings"                 # 相对 conf/ → 部署根/recordings
+  policy: "dialplan"                    # always / dialplan / manual / never
+  mode: "mixed"                         # mixed / separate / single
+  format: "wav"                         # wav / opus / g711
+  max_concurrent: 128                   # 同时在录会话上限
+
+system:
+  config_snapshot_dir: "../data/snapshots"
+
+# ---- nsbc-web 专用 ----
+web:
+  enabled: true
+  bind: "0.0.0.0:8443"
+  tls:
+    # ---- 基础 ----
+    enabled: true                        # 关掉改 false → 纯 HTTP
+
+    # 证书文件（nsbcd SIP TLS 也共用这两份，改路径两边一起变）
+    cert_path: "../tls/cert.pem"
+    key_path:  "../tls/key.pem"
+
+    # ---- 证书来源（三选一，按优先级自动判断）----
+    # 1) cert_path + key_path 都存在 → 直接用（不续期，用户自己管）
+    # 2) public: true               → 公网 ACME Let's Encrypt（需 certmagic 依赖；当前 fallback 自签）
+    # 3) auto_generate: true        → 内网自签 + 后台自动续（默认）
+    auto_generate: false
+
+    # ---- 内网自签模式 ----
+    validity_days: 2                     # 极短有效期（安全优先），后台自动续
+    san: "10.0.0.120"                    # 逗号分隔；空=自动填 bind IP + localhost
+                                         # 公网模式会追加 domain 到 SAN 列表
+    # 续期循环参数（每 check_interval_secs 检查一次）
+    check_interval_secs: 3600            # 默认 1h 查一次
+    renew_threshold_hours: 24            # 剩 24h 以内就重签（2 天有效 → 1 天续）
+
+    # ---- 公网 ACME 模式（certmagic TLS-ALPN-01 — experimental ✅）----
+    # 启用步骤：
+    #   1) 在有网络机器上跑：cargo fetch --features acme && cargo vendor
+    #   2) cargo build --features acme --release
+    #   3) 下面 4 行改值，certmagic 自动向 Let's Encrypt 申请 + 后台续期
+    # 关键：TLS-ALPN-01 只用 443/8443 端口，**不需要额外 port 80**！
+    # 公网环境要求：
+    #   - domain 必须 DNS A 记录指向这台服务器的公网 IP
+    #   - 8443 端口对外可达（certmagic 在 TLS 握手里处理 ACME 挑战）
+    #   - staging=true 首次上线用 staging（避免生产 5/week/domain rate limit）
+    public: true                        # ← 改为 true 启用公网 ACME
+    domain: "nsbc.opensips.net.cn"           # ← 真实域名，Let's Encrypt 用它签
+    acme_email: "1354608370@qq.com"        # ← 到期/吊销通知（可空但强烈建议填）
+    acme_cache_dir: "../acme-cache"      # ← 账户+证书缓存（避免重启重新申请）
+    acme_staging: false                   # ← 测试用 true，生产 false
+
+auth:
+  # JWT 签名密钥（≥32 字节；生产必须换随机值！）
+  # openssl rand -hex 32 → 64 字符 hex
+  jwt_secret: "9b3dfd84a988ac85f1f21d42d50a046314932b49d738bb0e3fc3dd570d07f7bf99a8d042ddda65fb12285573ceed0832"
+
+  # 默认账号口令（仅 web_users 表为空时生效；生产必须显式改 DB）
+  # 优先级：NSBC_DEFAULT_ADMIN_PW env > 此处 cfg > 硬编码 "Admin123"
+  # 改了此处后需删 DB 或设 NSBC_RESET_ADMIN=1 重启 web 才生效
+  # default_admin_pw: "Admin123"
+  # default_dev_pw:   "Admin123"
+
+db:
+  # 推荐 SQLite（零依赖）：
+  dsn: "sqlite:///../db/web.db"
+  # PostgreSQL：
+  # dsn: "postgres://postgres:Nway2017@127.0.0.1:5432/nsbcdb"
+  # 环境变量 NSBC_DB_DSN 覆盖本值
+
+audit:
+  file: "../logs/audit.jsonl"
