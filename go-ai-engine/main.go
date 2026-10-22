@@ -1,28 +1,29 @@
 /**
- * NSBC AI 对话引擎 — Go 实现（HTTP 版 · v3）
+ * NSBC AI dialogue engine — Go implementation (HTTP · v3)
  *
- * 架构硬约束：所有外部交互必须经 nsbc-web（Rust 边车），Go 引擎不碰 UDS。
+ * Architectural hard constraint: all external interaction must go through nsbc-web
+ * (the Rust sidecar); the Go engine never touches UDS directly.
  *
- * 编译：go mod init aiengine && go mod tidy && go build -o aiengine .
- * 运行：./aiengine                    (默认连 http://127.0.0.1:8080)
- *     NSBC_WEB_URL=http://10.0.0.1:9000 ./aiengine   (自定义)
+ * Build: go mod init aiengine && go mod tidy && go build -o aiengine .
+ * Run:  ./aiengine                    (default connects to http://127.0.0.1:8080)
+ *       NSBC_WEB_URL=http://10.0.0.1:9000 ./aiengine   (custom)
  *
- * 交互协议（nsbc-web → Go）：
- *   SSE  GET  /api/v1/vad/stream              → VAD_EVENT 实时事件流
+ * Interaction protocol (nsbc-web → Go):
+ *   SSE  GET  /api/v1/vad/stream              → VAD_EVENT realtime stream
  *   POST /api/v1/calls/:id/mute              → uuid_mute on/off [leg]
  *   POST /api/v1/calls/:id/broadcast         → uuid_broadcast <wav_path>
  *   POST /api/v1/calls/:id/vad-start         → uuid_vad_start <threshold>
  *   POST /api/v1/calls/:id/vad-stop          → uuid_vad_stop
  *   POST /api/v1/originate                   → originate {vars}url
- *   GET  /api/v1/calls                       → show calls（取 call-id）
+ *   GET  /api/v1/calls                       → show calls (pick up call-id)
  *
- * AI barge-in 核心循环：
- *   1. POST /originate → B 腿振铃 → 用户手动接听
- *   2. POST /vad-start 启动 VAD
- *   3. SSE 收 VAD_EVENT state=SPEECH → POST /mute on leg=1 → ASR → LLM → TTS → POST /broadcast → POST /mute off
- *   4. SSE 收 VAD_EVENT state=SILENCE → （清理）
+ * AI barge-in core loop:
+ *   1. POST /originate → B leg rings → user manually answers
+ *   2. POST /vad-start to start VAD
+ *   3. SSE receives VAD_EVENT state=SPEECH → POST /mute on leg=1 → ASR → LLM → TTS → POST /broadcast → POST /mute off
+ *   4. SSE receives VAD_EVENT state=SILENCE → (cleanup)
  *
- * ASR / LLM / TTS：空函数占位（接入真实服务时替换）。
+ * ASR / LLM / TTS: stub placeholders — replace when wiring in real services.
  */
 
 package main
@@ -47,11 +48,11 @@ import (
 )
 
 // =====================================================================
-// 配置
+// Config
 // =====================================================================
 
 type Config struct {
-	NSBCWebURL string // nsbc-web 地址（带 /api/v1 前缀）
+	NSBCWebURL string // nsbc-web base URL (with /api/v1 prefix)
 	Realm      string
 	Timeout    time.Duration
 }
@@ -61,7 +62,7 @@ func loadConfig() Config {
 	if base == "" {
 		base = "http://127.0.0.1:8080"
 	}
-	// 确保结尾没有 /
+	// Ensure no trailing slash
 	base = strings.TrimRight(base, "/")
 	return Config{
 		NSBCWebURL: base + "/api/v1",
@@ -78,34 +79,34 @@ func getenv(key, def string) string {
 }
 
 // =====================================================================
-// VAD_EVENT 事件（精确匹配 C 侧 vad_engine.c snprintf）
+// VAD_EVENT event (matches C-side vad_engine.c snprintf output)
 // =====================================================================
 
-// nsbc-web SSE payload 里直接是 {"event":"VAD_EVENT","call_key":"0x7f...",...}
+// nsbc-web SSE payload is directly {"event":"VAD_EVENT","call_key":"0x7f...",...}
 type VadEvent struct {
 	Event   string `json:"event"`    // "VAD_EVENT"
 	CallKey string `json:"call_key"` // "0x7f..."
-	Leg     int    `json:"leg"`      // 0=用户侧 1=AI侧
+	Leg     int    `json:"leg"`      // 0=user side  1=AI side
 	State   string `json:"state"`    // "SPEECH" | "SILENCE"
 	RMS     uint16 `json:"rms"`
 	TsNs    int64  `json:"ts_ns"`
 }
 
 // =====================================================================
-// CallSession — 追踪单个通话
+// CallSession — tracks a single call
 // =====================================================================
 
 type CallSession struct {
-	CallKey  string    // C 指针地址（VAD_EVENT 里唯一标识）
-	CallID   string    // SIP Call-ID（HTTP 命令需要）
+	CallKey  string    // C pointer address (unique identifier inside VAD_EVENT)
+	CallID   string    // SIP Call-ID (HTTP commands require this)
 	State    string    // "IDLE"/"CONFIRMED"/"SPEAKING"/"TERMINATED"
-	AIMuted  bool      // AI 侧当前是否被静音
+	AIMuted  bool      // whether the AI side is currently muted
 	LastSeen time.Time
 	mu       sync.Mutex
 }
 
 // =====================================================================
-// NSBCWebClient — nsbc-web HTTP API 客户端
+// NSBCWebClient — nsbc-web HTTP API client
 // =====================================================================
 
 type NSBCWebClient struct {
@@ -125,9 +126,9 @@ func (c *NSBCWebClient) path(parts ...string) string {
 	return c.cfg.NSBCWebURL + strings.Join(parts, "")
 }
 
-// ------ SSE 事件订阅 ------
+// ------ SSE subscribe ------
 
-// SubscribeVAD 订阅 /vad/stream SSE，返回事件 channel
+// SubscribeVAD subscribes to /vad/stream SSE, returns event channel
 func (c *NSBCWebClient) SubscribeVAD(ctx context.Context) (<-chan VadEvent, error) {
 	resp, err := c.http.Get(c.path("/vad/stream"))
 	if err != nil {
@@ -137,7 +138,7 @@ func (c *NSBCWebClient) SubscribeVAD(ctx context.Context) (<-chan VadEvent, erro
 		return nil, fmt.Errorf("GET /vad/stream: status %d", resp.StatusCode)
 	}
 
-	ch := make(chan VadEvent, 64) // 缓冲防止慢消费者丢事件
+	ch := make(chan VadEvent, 64) // buffered to avoid dropping on slow consumer
 	go func() {
 		defer close(ch)
 		defer resp.Body.Close()
@@ -155,26 +156,26 @@ func (c *NSBCWebClient) SubscribeVAD(ctx context.Context) (<-chan VadEvent, erro
 			}
 			line := scanner.Text()
 
-			// SSE 协议：event: xxx / data: xxx / 空行分隔事件
+			// SSE protocol: event: xxx / data: xxx / blank line separates events
 			switch {
 			case strings.HasPrefix(line, "event:"):
-				// 忽略 event 类型，我们只关心 data
+				// ignore event type — we only care about data
 			case strings.HasPrefix(line, "data:"):
 				curData.WriteString(strings.TrimPrefix(line, "data:"))
 			case line == "":
-				// 空行 = 一个事件结束
+				// blank line = one event is complete
 				if curData.Len() > 0 {
 					data := curData.String()
 					curData.Reset()
-					// nsbc-web 推的是完整 JSON payload（已经剥掉了外层 kind）
+					// nsbc-web pushes the full JSON payload (outer kind wrapper already stripped)
 					var ev VadEvent
 					if err := json.Unmarshal([]byte(data), &ev); err == nil {
 						select {
 						case ch <- ev:
-						default: // channel 满则丢（barge-in 不怕丢中间帧）
+						default: // channel full → drop (barge-in tolerates missing intermediate frames)
 						}
 					} else {
-						// 可能是 {"kind":"lag"} — 跳过
+						// could be {"kind":"lag"} — skip
 					}
 				}
 			}
@@ -184,7 +185,7 @@ func (c *NSBCWebClient) SubscribeVAD(ctx context.Context) (<-chan VadEvent, erro
 	return ch, nil
 }
 
-// ------ POST 命令 ------
+// ------ POST commands ------
 
 func (c *NSBCWebClient) postJSON(ctx context.Context, urlPath string, body any) (*http.Response, error) {
 	var reader io.Reader
@@ -205,7 +206,7 @@ func (c *NSBCWebClient) postJSON(ctx context.Context, urlPath string, body any) 
 
 // Originate — POST /originate
 func (c *NSBCWebClient) Originate(ctx context.Context, caller, callee string) (string, error) {
-	// nsbc-web 的 /originate 直接接收 call_url（完整 FS brace vars 格式）
+	// nsbc-web's /originate takes the call_url directly (complete FS brace-vars format)
 	callURL := fmt.Sprintf("{realm=%s,origination_caller_id_number=%s,originate_timeout=20}user/%s",
 		c.cfg.Realm, caller, callee)
 	resp, err := c.postJSON(ctx, "/originate", map[string]string{"call_url": callURL})
@@ -279,7 +280,7 @@ func (c *NSBCWebClient) UUIDVADStop(ctx context.Context, callID string) error {
 	return nil
 }
 
-// ListCalls — GET /calls 拿 call_key → call_id 映射
+// ListCalls — GET /calls to pull call_key → call_id mapping
 var callIDRegex = regexp.MustCompile(`([A-Za-z0-9]+(?:-[A-Za-z0-9]+)*@[A-Za-z0-9.:-]+)`)
 
 func (c *NSBCWebClient) resolveCallID(ctx context.Context, callKey string) string {
@@ -311,7 +312,7 @@ func (c *NSBCWebClient) resolveCallID(ctx context.Context, callKey string) strin
 }
 
 // =====================================================================
-// AI 引擎主循环
+// AI engine main loop
 // =====================================================================
 
 type AIEngine struct {
@@ -325,33 +326,33 @@ func NewAIEngine(cfg Config) *AIEngine {
 }
 
 func (e *AIEngine) Run(ctx context.Context) {
-	// 1) 订阅 VAD_EVENT SSE
+	// 1) Subscribe to VAD_EVENT SSE
 	vadCh, err := e.http.SubscribeVAD(ctx)
 	if err != nil {
-		log.Fatalf("[engine] 连 /vad/stream 失败: %v", err)
+		log.Fatalf("[engine] subscribe /vad/stream failed: %v", err)
 	}
-	log.Println("[engine] ✅ 已订阅 /vad/stream SSE")
+	log.Println("[engine] ✅ subscribed to /vad/stream SSE")
 
-	// 2) 启动 session 清理
+	// 2) Start session cleanup
 	go e.cleanupLoop(ctx)
 
-	// 3) 演示：3 秒后 originate 测试电话
+	// 3) Demo: originate a test call 3s after startup
 	go func() {
 		time.Sleep(3 * time.Second)
-		log.Println("[engine] originate 测试: 1000 → 1001")
+		log.Println("[engine] originate demo: 1000 → 1001")
 		resp, err := e.http.Originate(ctx, "1000", "1001")
 		if err != nil {
-			log.Printf("[engine] ❌ originate 失败: %v", err)
+			log.Printf("[engine] ❌ originate failed: %v", err)
 		} else {
 			log.Printf("[engine] ✅ originate → %s", resp)
-			log.Println("[engine] ⚠️  请手动接听分机 1001！接听后对着分机 1000 说话测试 barge-in")
-			// 提示：接听后需要先 POST /vad-start 才能收到 VAD_EVENT
-			// 但我们第一次收到 SPEECH 时自动调 vad-start（lazy init）
+			log.Println("[engine] ⚠️  Please manually answer extension 1001! After answering, speak into 1000 to test barge-in")
+			// Tip: post-answer we need to POST /vad-start before we receive VAD_EVENT.
+			// We auto-call vad-start lazily on the first SPEECH.
 		}
 	}()
 
-	// 4) 主循环：处理 VAD_EVENT
-	log.Println("[engine] 🎯 等待 VAD_EVENT...")
+	// 4) Main loop: process VAD_EVENT
+	log.Println("[engine] 🎯 waiting for VAD_EVENT...")
 	for {
 		select {
 		case <-ctx.Done():
@@ -362,7 +363,7 @@ func (e *AIEngine) Run(ctx context.Context) {
 				log.Println("[engine] SSE channel closed, reconnecting...")
 				ch, err := e.http.SubscribeVAD(ctx)
 				if err != nil {
-					log.Printf("[engine] reconnect 失败: %v", err)
+					log.Printf("[engine] reconnect failed: %v", err)
 					time.Sleep(2 * time.Second)
 					continue
 				}
@@ -375,7 +376,7 @@ func (e *AIEngine) Run(ctx context.Context) {
 }
 
 func (e *AIEngine) handleVAD(ctx context.Context, ev *VadEvent) {
-	// 只处理 A 腿（用户说话侧）
+	// Only handle leg A (user-speaking side)
 	if ev.Leg != 0 {
 		return
 	}
@@ -385,20 +386,20 @@ func (e *AIEngine) handleVAD(ctx context.Context, ev *VadEvent) {
 	sess.LastSeen = time.Now()
 	sess.mu.Unlock()
 
-	// 第一次见这个 call_key 且是 SPEECH？先自动 vad-start（lazy init）
+	// First time seeing this call_key and it's SPEECH? auto vad-start lazily
 	if sess.State == "IDLE" {
 		callID := e.http.resolveCallID(ctx, ev.CallKey)
 		if callID != "" {
-			log.Printf("[engine] 🆕 新通话 call_key=%s → call_id=%s → vad-start", ev.CallKey, callID)
+			log.Printf("[engine] 🆕 new call call_key=%s → call_id=%s → vad-start", ev.CallKey, callID)
 			if err := e.http.UUIDVADStart(ctx, callID, 800); err != nil {
-				log.Printf("[engine] ❌ vad-start 失败: %v", err)
+				log.Printf("[engine] ❌ vad-start failed: %v", err)
 			} else {
 				sess.mu.Lock()
 				sess.State = "CONFIRMED"
 				sess.mu.Unlock()
 			}
 		} else {
-			log.Printf("[engine] ⚠️  无法解析 call_id，跳过 vad-start")
+			log.Printf("[engine] ⚠️  cannot resolve call_id, skipping vad-start")
 		}
 	}
 
@@ -417,7 +418,7 @@ func (e *AIEngine) handleVAD(ctx context.Context, ev *VadEvent) {
 
 		if needMute {
 			if err := e.http.UUIDMute(ctx, callID, true, 1); err != nil {
-				log.Printf("[barge-in] ❌ mute on 失败: %v", err)
+				log.Printf("[barge-in] ❌ mute on failed: %v", err)
 			} else {
 				log.Println("[barge-in] ✅ mute on leg=1")
 				sess.mu.Lock()
@@ -426,7 +427,7 @@ func (e *AIEngine) handleVAD(ctx context.Context, ev *VadEvent) {
 			}
 		}
 
-		// ===== AI 对话循环 =====
+		// ===== AI dialogue loop =====
 		text := asrRecognize(ctx, ev)
 		if text == "" {
 			return
@@ -439,15 +440,15 @@ func (e *AIEngine) handleVAD(ctx context.Context, ev *VadEvent) {
 			return
 		}
 
-		// 恢复静音 → 播放 TTS
+		// Unmute → play TTS
 		sess.mu.Lock()
 		sess.AIMuted = false
 		sess.mu.Unlock()
 		if err := e.http.UUIDMute(ctx, callID, false, 1); err != nil {
-			log.Printf("[barge-in] ⚠️  mute off 失败: %v", err)
+			log.Printf("[barge-in] ⚠️  mute off failed: %v", err)
 		}
 		if err := e.http.UUIDBroadcast(ctx, callID, ttsFile); err != nil {
-			log.Printf("[barge-in] ❌ broadcast 失败: %v", err)
+			log.Printf("[barge-in] ❌ broadcast failed: %v", err)
 		} else {
 			log.Printf("[barge-in] 🔊 broadcast %s", ttsFile)
 		}
@@ -458,7 +459,7 @@ func (e *AIEngine) handleVAD(ctx context.Context, ev *VadEvent) {
 		if sess.AIMuted {
 			sess.mu.Unlock()
 			if err := e.http.UUIDMute(ctx, callID, false, 1); err != nil {
-				log.Printf("[vad] ⚠️  mute off 失败: %v", err)
+				log.Printf("[vad] ⚠️  mute off failed: %v", err)
 			} else {
 				log.Println("[vad] ✅ mute off leg=1")
 			}
@@ -492,7 +493,7 @@ func (e *AIEngine) cleanupLoop(ctx context.Context) {
 				s.mu.Lock()
 				if now.Sub(s.LastSeen) > 60*time.Second {
 					s.mu.Unlock()
-					log.Printf("[session] 🗑️  清理超时 call_key=%s", key)
+					log.Printf("[session] 🗑️  cleanup stale call_key=%s", key)
 					e.sess.Delete(key)
 				} else {
 					s.mu.Unlock()
@@ -504,24 +505,24 @@ func (e *AIEngine) cleanupLoop(ctx context.Context) {
 }
 
 // =====================================================================
-// ASR / LLM / TTS — 空函数占位
+// ASR / LLM / TTS — stub placeholders
 // =====================================================================
 
 func asrRecognize(ctx context.Context, ev *VadEvent) string {
-	// TODO: 接真实 ASR（hep_sink UDP 推音频 → ASR Server → HTTP/WS 返回）
+	// TODO: wire up real ASR (hep_sink UDP pushes audio → ASR server → HTTP/WS returns)
 	_ = ctx
 	_ = ev
-	return "你好，我想查询一下账户余额"
+	return "Hello, I'd like to check my account balance"
 }
 
 func llmGenerate(ctx context.Context, userText string) string {
-	// TODO: 接 LLM（OpenAI/DeepSeek/Ollama 等）
+	// TODO: wire up LLM (OpenAI/DeepSeek/Ollama, etc.)
 	_ = ctx
-	return "好的，请稍等，正在为您查询账户余额。"
+	return "Alright, please hold — I'm looking up your account balance."
 }
 
 func ttsSynthesize(ctx context.Context, text string) string {
-	// TODO: 接 TTS（CosyVoice/edge-tts 等），返回 WAV 路径
+	// TODO: wire up TTS (CosyVoice/edge-tts, etc.), return WAV path
 	_ = ctx
 	_ = text
 	return "/tmp/tts-response.wav"

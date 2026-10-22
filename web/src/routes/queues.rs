@@ -1,4 +1,4 @@
-//! 分机队列 REST。6 端点。
+//! Extension queue REST. Six endpoints.
 
 use std::sync::Arc;
 
@@ -103,7 +103,7 @@ pub async fn reload<C: CoreApi + Clone + Send + Sync>(
     State(st): State<Arc<AppState<C>>>,
 ) -> Result<impl IntoResponse, ApiError> {
     st.db.pool().ok_or(ApiError::DbUnavailable)?;
-    // list_enabled_queues 返回 (Queue, tenant_name) tuple — 手动构造 QueueSyncDto
+    // list_enabled_queues returns a (Queue, tenant_name) tuple — build QueueSyncDto manually
     let rows = st.db.list_enabled_queues().await
         .map_err(|e| ApiError::Db(e.to_string()))?;
     let dtos: Vec<serde_json::Value> = rows.into_iter().map(|(q, tenant_name)| {

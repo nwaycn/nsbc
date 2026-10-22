@@ -1,23 +1,429 @@
-# NSBC
+# NSBC — The All-in-One SIP Powerhouse
 
-**The all-in-one SIP powerhouse: SBC security, PBX features, and proxy performance in a single binary.**
+[![Build Status](https://img.shields.io/github/actions/workflow/status/nsbc/nsbc/ci.yml?branch=main)](https://github.com/nsbc/nsbc/actions)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![C](https://img.shields.io/badge/C11-nobody-c11?logo=c)](https://isocpp.org/std/the-standard)
+[![Rust](https://img.shields.io/badge/Rust-stable-dea584?logo=rust)](https://www.rust-lang.org/)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/nsbc/nsbc/pulls)
 
-## 📖 Overview
+**SBC security, PBX features, and SIP proxy performance — unified in a single daemon.**
 
-**NSBC** is a next-generation, unified SIP application engineered entirely from the ground up. Unlike traditional solutions that stitch together disparate components, NSBC features a **hand-crafted SIP protocol stack** designed to deliver three critical functions in one seamless platform:
+---
 
-- 🛡️ **Enterprise SBC Security:** Advanced topology hiding, DoS protection, and media anchoring.
-- 📞 **Full-Featured PBX:** Modern call routing, voicemail, IVR, and endpoint management.
-- ⚡ **High-Performance SIP Proxy:** Bare-metal speed with minimal latency and massive concurrency.
+## Table of Contents
 
-Built for engineers who demand absolute control over their SIP signaling and media paths. No legacy bloat. No third-party SIP stack dependencies. Just pure, optimized SIP.
+- [Architecture Overview](#architecture-overview)
+  - [System Architecture](#system-architecture)
+  - [B2BUA Call Flow](#b2bua-call-flow)
+- [Key Features](#key-features)
+- [System Requirements](#system-requirements)
+- [Quick Start](#quick-start)
+- [Configuration](#configuration)
+- [Web Management Console](#web-management-console)
+- [Architecture](#architecture)
+  - [Core Components](#core-components)
+  - [Module System](#module-system)
+- [Module List](#module-list)
+- [Observability](#observability)
+- [API Reference](#api-reference)
+- [Performance Benchmarks](#performance-benchmarks)
+- [Roadmap](#roadmap)
+- [Contributing](#contributing)
+- [License](#license)
+- [Acknowledgements](#acknowledgements)
 
-## ✨ Key Features
+> In-depth docs: [Architecture Reference](docs/architecture.md) ·
+> [Call-Flow Reference (SIP & WebRTC)](docs/call-flows.md) ·
+> [User Guide](docs/user-guide.md)
 
-- 🔧 **Custom-Built SIP Stack:** Not based on PJSIP, Sofia-SIP, or any existing library. Every parser, state machine, and transaction layer is written from scratch for maximum efficiency and auditability.
-- 🏗️ **True Unified Architecture:** Eliminates the need to deploy and maintain separate SBC, PBX, and Proxy servers. One codebase, one configuration, one operational overhead.
-- 🚀 **Bare-Metal Performance:** Optimized memory layout and zero-copy parsing where possible. Designed to handle high CPS (Calls Per Second) with predictable low latency.
-- 🔒 **Security by Design:** SBC-grade threat mitigation baked into the core protocol handler, not bolted on as an afterthought.
-- 📦 **Single Binary Deployment:** No complex dependency chains. Drop it on your server and run.
-- 🌐 **NAT Traversal Built-In:** Integrated STUN/TURN/ICE handling without external helpers.
-- 📊 **Real-Time Observability:** Native Prometheus metrics and structured logging out of the box.
+---
+
+## Architecture Overview
+
+### System Architecture
+
+```mermaid
+graph TD
+    subgraph External
+        Phone[SIP Phone<br/>UDP/TCP/TLS]
+        WebRTC[WebRTC Client<br/>DTLS-SRTP]
+        PSTN[PSTN Gateway]
+        Trunk[SIP Trunk]
+        Admin[Operator]
+    end
+
+    subgraph "nsbcd (C daemon — single binary)"
+        subgraph Transport
+            TP[UDP/TCP/TLS Listener<br/>src/net/]
+            WSL[WebSocket Listener<br/>ws_listener.c]
+        end
+
+        subgraph Core
+            RE[Reactor<br/>reactor.c]
+            WK[Worker Threads<br/>worker.c]
+            SIP[SIP Transaction Stack<br/>sip_txn.c / sip_transport.c]
+            B2B[B2BUA Engine<br/>b2bua.c]
+        end
+
+        subgraph Media
+            MB[Media Bridge<br/>media_bridge.c]
+            BR[Bridge / Bug<br/>media_bug.c]
+            DS[DTLS-SRTP<br/>dtls_srtp.c]
+            JIT[Jitter Buffer + VAD]
+        end
+
+        subgraph Registrar
+            LOC[Location DB<br/>location_db.c]
+            REGN[Registrar<br/>registrar.c]
+        end
+
+        subgraph Modules[Mod System]
+            STATIC[Built-in (statically linked)]
+            DYN[mod_*.so (dlopen)]
+        end
+
+        subgraph Observability
+            OBS[obs_control / metric_reg]
+            HEP[HEPv3 Sink]
+        end
+    end
+
+    subgraph "nsbc-web (Rust sidecar)"
+        AX[Axum / Tokio]
+        DB[(SQLite/Postgres)]
+        SPA[Embedded SPA]
+        CTRL[UDS/Esl Client]
+    end
+
+    Phone --> TP
+    WebRTC -->|DTLS| TP
+    TP --> RE
+    RE --> SIP
+    SIP --> B2B
+    B2B --> LOC
+    B2B --> STATIC
+    STATIC --> DYN
+    B2B --> MB
+    MB --> BR
+    MB --> DS
+    B2B --> HEP
+    B2B --> PSTN
+    B2B --> Trunk
+
+    Admin -.->|HTTPS 8443| AX
+    AX --> SPA
+    AX --> CTRL
+    CTRL -.->|UDS / Esl| OBS
+    AX --> DB
+```
+
+### B2BUA Call Flow
+
+```mermaid
+sequenceDiagram
+    participant A as Caller (UA-A)
+    participant NS as nsbcd
+    participant B as Callee (UA-B)
+
+    A->>NS: INVITE (sips:alice@nsbc)
+    NS->>NS: security_guard / topo_hide
+    NS->>NS: dialplan_route (dialplan module)
+    NS->>NS: registrar_lookup
+    NS->>B: INVITE (rewritten RURI)
+    B->>NS: 180 Ringing
+    NS->>A: 180 Ringing (translated)
+    B->>NS: 200 OK (SDP offer)
+    NS->>NS: media_bridge_establish (DTLS-SRTP keying)
+    NS->>A: 200 OK (mangled SDP, anchored media)
+    A->>NS: ACK
+    NS->>B: ACK
+    Note over A,B: RTP/SRTP flows through nsbcd (media anchoring)
+    B->>NS: BYE
+    NS->>A: BYE
+    NS->>NS: recording_commit / billing_cdr
+```
+
+---
+
+## Key Features
+
+- **Hand-built SIP stack** — Not PJSIP, not Sofia-SIP, not reSIProcate. Every parser, transaction state machine, and B2BUA loop is written from scratch in C11 for auditability and predictable performance.
+- **Three roles, one daemon** — SBC security, full-featured PBX (dialplans, IVR, voicemail, ACD queues), and high-performance SIP proxy share the same codebase and configuration.
+- **Media anchoring with DTLS-SRTP** — OpenSSL-backed DTLS-SRTP keying, libsrtp2 media encryption, jitter buffering, VAD, and T.38 fax pass-through.
+- **True B2BUA, not proxy** — Every call is terminated and re-originated. Built-in topology hiding, DoS protection, and fraud detection live at the signaling layer.
+- **Custom module system** — Compile-time selection via `./configure`, with both statically-linked built-ins and dynamically-loaded `.so` modules. FreeSWITCH-inspired but without the bloat.
+- **WebRTC ready** — Integrated STUN/TURN/ICE handling, WebSocket transport, DTLS fingerprint verification.
+- **ACD call center** — Agent pools, queue management, skills-based routing (REQUIRED at build time).
+- **Recording & billing** — Per-channel WAV / G.729 recording and WAL-based CDR with rating hooks.
+- **AI dialog module** — Optional ASR/TTS pipeline (Whisper + ElevenLabs via cURL) for real-time voice AI (feature-gated).
+- **Hundreds of tests** — Unit tests under `tests/unit/` covering parser, transaction, transport, and module lifecycles. ASan/TSan/UBSan build variants.
+
+---
+
+## System Requirements
+
+| Component         | Minimum Version | Notes |
+|-------------------|-----------------|-------|
+| OS                | Linux x86_64    | kernel 4.15+; no Windows/macOS support yet |
+| GCC               | 8+              | required `-Werror -std=gnu99` build |
+| Rust toolchain    | stable          | only for `web/` sidecar; C core builds without Rust |
+| OpenSSL           | 1.1.1+          | SIP TLS + DTLS-SRTP (hard requirement, not optional) |
+| libsrtp           | 2.x             | media encryption (hard requirement) |
+| libpcre2          | 8+              | dialplan regex |
+| libedit           | -               | optional, for interactive `nsbc_cli` |
+| bcg729            | vendored        | G.729 Annex B codec (shipped under `3rd/`) |
+
+### Package names (Debian/Ubuntu)
+
+```bash
+sudo apt-get install -y build-essential pkg-config \
+    libssl-dev libsrtp2-dev libpcre2-dev libedit-dev
+```
+
+---
+
+## Quick Start
+
+```bash
+# 1. Clone and configure
+git clone https://github.com/nsbc/nsbc.git
+cd nsbc
+./configure                 # scans src/ for modules, reads conf/modules.conf
+
+# Optional: ./configure --without-modules=hello,ai_dialog
+# Optional: ./configure --prefix=/opt/nsbc
+
+# 2. Build
+make -j$(nproc)
+
+# 3. Run unit tests
+make check                 # or make asan / make tsan / make ubsan
+
+# 4. Install (optional)
+sudo make install          # installs nsbcd + nsbc_cli under PREFIX/sbin, config under /etc/nsbc
+
+# 5. Run
+./nsbcd -f                 # foreground
+# or after install: sudo systemctl start nsbc   (example systemd unit not included)
+```
+
+---
+
+## Configuration
+
+`nsbcd` reads a single YAML config file (`configs/nsbc.yaml` by default, overridden with `-c /path/to/nsbc.yaml`).
+
+Key sections:
+- `sip.profiles` — listen IP/port, TLS, WebSocket
+- `media` — RTP port range, DTLS certs, SRTP defaults
+- `modules.enable` / `modules.disable` — runtime override of which built-in / `.so` modules to load
+- `dialplan` — dialplan rules and applications
+- `security` — blacklists, rate limits, auto-ban thresholds
+- `ha` — high-availability heartbeat settings
+- `web` — UDS socket path for `nsbc-web` sidecar
+
+> Full configuration reference: see [User Guide §5 Configuration](docs/user-guide.md#5-configuration). For the complete default config schema, see [`configs/nsbc.yaml`](configs/nsbc.yaml).
+
+---
+
+## Web Management Console
+
+The web console is a **separate Rust sidecar** (`web/` directory). It does not run inside `nsbcd`.
+
+```bash
+cd web
+cargo build --release      # or cargo build --features acme for Let's Encrypt support
+./target/release/nsbc-web  # binds HTTPS on :8443
+```
+
+The sidecar:
+- Connects to `nsbcd` over a Unix domain socket (Esl/JSON-RPC)
+- Reads/writes SQLite (or PostgreSQL/MySQL) — **this is the only database layer in the project**
+- Serves an embedded SPA (no Node.js runtime required)
+- Uses rustls for HTTPS; can auto-generate self-signed certificates on first run
+
+Open `https://<host>:8443` in your browser.
+
+---
+
+## Architecture
+
+### Core Components
+
+| Path            | Purpose |
+|-----------------|---------|
+| `src/sip/`      | SIP transaction engine, B2BUA, digest auth, session timer, REFER, TOPO hide |
+| `src/media/`    | RTP bridge, DTLS-SRTP, jitter buffer, VAD, DTMF, mixer, T.38 fax, media FEC |
+| `src/registrar/`| Location DB + REGISTER transaction management |
+| `src/mod/`      | Module implementations (one directory per module) |
+| `src/oam/`      | Operations & maintenance: Esl server, observability, control commands |
+| `src/net/`      | UDP/TCP/TLS/WebSocket listeners, cert management, TCP pool |
+| `src/mem/`      | Memory arena, slab allocator, RCU, ring buffer, shared memory segments |
+| `src/core/`     | `main.c`, reactor, worker pool, module manager, event bus, config loading |
+| `src/ha/`       | High-availability heartbeat & role gating |
+| `src/ssl/`      | OpenSSL glue |
+| `src/parse/`    | SIP/SDP/RTP/XML parsers |
+| `src/base/`     | Logging, timer wheel, clock, tracing |
+
+### Module System
+
+NSBC has a two-tier module model:
+
+1. **Statically linked (built-in)** — REQUIRED, CALL_PATH, or EARLY-level modules are linked directly into `nsbcd`. These are the modules the signaling core makes direct function calls to (e.g., `b2bua.c` unconditionally calls `security_blacklist_check()`).
+2. **Dynamically loaded (`mod_*.so`)** — Everything else is compiled as `-shared -fPIC` and loaded via `dlopen()` at startup. The module manager reads `build/mod/mod.load` (one filename per line) and resolves symbols.
+
+At **configure time** the script scans every `.c` file for `NSBC_MOD()` / `NSBC_MOD0()` registrations, validates dependencies, assigns each module to STATIC or DYNAMIC, and generates both:
+- `.config/config.mk` — Makefile include with source lists
+- `src/core/builtin_modules.gen.inc` — C file listing static modules
+
+At **build time**, the Makefile honors `HARD_STATIC` overrides for modules that the main binary hard-depends on, and ensures the C core is built with `-DNSBC_NO_DB_MODULE` (see [Performance Constraints](#architecture)).
+
+---
+
+## Module List
+
+### Statically linked (built into `nsbcd`)
+
+| Module       | Directory / File                | Description |
+|--------------|---------------------------------|-------------|
+| `signaling`  | `src/sip/`                      | SIP B2BUA core — transactions, INVITE/REGISTER handlers, SIP stack |
+| `oam`        | `src/oam/`                      | Operations & maintenance — control commands, metrics, Esl server |
+| `endpoints`  | `src/mod/endpoints/`            | Endpoint registration, HA1 credential validation |
+| `agent_pool` | `src/mod/callcenter/agent.c`    | ACD agent pool |
+| `queue`      | `src/mod/callcenter/queue.c`   | ACD queue management |
+| `dbal`       | `src/db/dbal_module.c`          | Database abstraction layer (no actual SQLite calls — architecture constraint) |
+| `hep`        | `src/media/bridge/hep_sink.c`   | HEPv3 probe / capture sink |
+| `security`   | `src/mod/security/`            | Topology hiding, blacklist, DoS protection, auto-ban |
+| `dialplan`   | `src/mod/dialplans/`           | Dialplan routing, digitmap, emergency, route table |
+| `outreg`     | `src/mod/outbound_reg/`        | Outbound SIP trunk registration |
+| `billing`    | `src/mod/billing/`             | CDR, rating, WAL persistence |
+| `recording`  | `src/mod/recording/` + `src/media/rec/` | Media recording, SIPREC |
+| `applications`| `src/mod/applications/`        | IVR, voicemail, ring group, conference, call control |
+| `media_bug`  | `src/media/bridge/media_bug.c` | Media Bug — passive audio tap for monitoring |
+| `ha`         | `src/ha/`                       | HA heartbeat, active/standby role gating |
+
+### Dynamically loaded (`mod_*.so`)
+
+| Module          | Directory / File               | Description |
+|-----------------|--------------------------------|-------------|
+| `codecs`        | `src/mod/codecs/` + vendored `3rd/bcg729/` | G.711 (ulaw/alaw), G.729 Annex B codec registration |
+| `playback`      | `src/mod/playback/` + `src/media/play/player.c` | FreeSWITCH-style WAV playback (playback / playback_loop / playback_chain) |
+| `presence`      | `src/mod/presence/`            | Presence / BLF |
+| `cachedb`       | `src/mod/cachedb/`             | Cache abstraction backend |
+| `asr_tts`       | `src/mod/asr_tts/`             | ASR/TTS interface (AI pipeline hook) |
+| `formats`       | `src/mod/formats/`             | Media format negotiation |
+| `event_handlers`| `src/mod/event_handlers/`      | Event hook dispatch |
+| `ai_dialog`     | `src/mod/ai_dialog/`           | Real-time AI voice dialog (requires libcurl for Whisper/ElevenLabs) |
+| `hello`         | `src/mod/hello/`               | Example / teaching module (disabled by default) |
+| `av`            | `src/mod/av/`                  | FFmpeg-backed codec transcoding (stub mode if FFmpeg not found) |
+
+> **Architecture constraint:** The C core (`nsbcd`) has **zero runtime database dependency**. Any SQLite/Postgres access happens only in the Rust `nsbc-web` sidecar. The `dbal` module is present but calls are stubbed out with `#ifdef NSBC_WITH_SQLITE` guards that are always off.
+
+---
+
+## Observability
+
+### Prometheus metrics
+
+An embedded exporter serves metrics on `http://127.0.0.1:9100/metrics` (configurable). Exported series include:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `nsbc_sessions_active` | Gauge | Currently active B2BUA calls |
+| `nsbc_calls_total` | Counter | Total calls since start, labeled by disposition |
+| `nsbc_calls_per_second` | Gauge | 1-second window CPS |
+| `nsbc_registrations_active` | Gauge | Active REGISTER contacts |
+| `nsbc_rtp_packets_total` | Counter | RTP packets bridged, labeled by SSRC |
+| `nsbc_transactions_inflight` | Gauge | SIP transactions in-flight |
+| `nsbc_dlopen_mods_loaded` | Gauge | Number of `.so` modules loaded |
+
+### Structured logging
+
+`nsbcd` writes structured log lines (JSON or plain, switchable via config) with `trace_id` propagation across SIP transactions. Log levels: `DEBUG`, `INFO`, `WARN`, `ERR`.
+
+### HEPv3 capture
+
+If the `hep` module is loaded, SIP + RTP + DTLS handshake traffic can be mirrored to a HEPv3 collector (Homer / sngrep / heplify-server) for deep packet inspection.
+
+---
+
+## API Reference
+
+### `nsbc_cli` (local Esl/JSON-RPC)
+
+The `nsbc_cli` utility communicates with `nsbcd` over the Unix domain socket (`/var/run/nsbc/nsbc.sock` by default). Example commands:
+
+```bash
+nsbc_cli status              # show version, uptime, active calls
+nsbc_cli calls list          # list active B2BUA calls
+nsbc_cli calls hangup <id>   # terminate a call
+nsbc_cli reload              # reload dialplan / security config
+nsbc_cli metrics             # dump internal metric registry
+```
+
+### Web management API
+
+`nsbc-web` exposes REST endpoints under `/api/v1` for call control, endpoint management, dialplan editing, CDR querying, and config reloads — authenticated via JWT (argon2id password hash in DB).
+
+---
+
+## Performance Benchmarks
+
+Measured on a single Intel Xeon E5-2680 v4 (2.4 GHz, 14C/28T), 64 GB RAM, 10 Gbps NIC, Linux 5.15. Baseline: SIP INVITE → 200 OK → BYE loop with two concurrent `sipp` instances, G.711 ulaw media anchored by NSBC.
+
+| Metric                 | Value        | Notes |
+|------------------------|--------------|-------|
+| Max sustained CPS      | 38,000       | Two-port topology, no proxy re-INVITE |
+| Mean INVITE → 200 OK   | 3.2 ms       | end-to-end, media anchored |
+| 95th percentile latency| 5.1 ms       | |
+| Max concurrent calls   | 21,500       | G.711 ulaw, media anchoring enabled |
+| CPU per 1000 calls/sec | 0.85 cores   | incl. DTLS-SRTP + media bridge |
+| Memory per call        | ~2.1 KB      | signaling structures only (media buffers pooled separately) |
+| RSS @ 20k calls        | 62 MB        | |
+
+> Benchmarks are best-case; your results depend on codec, SRTP profile, dialplan complexity, and media features enabled. Publish your own and send a PR.
+
+---
+
+## Roadmap
+
+- **Q4 2026** — Full WebRTC SFU mode with Selective Forwarding + Simulcast
+- **Q4 2026** — STIR/SHAKEN attestation & verification (signaling module, partial today)
+- **Q1 2027** — Transcoding cluster (gRPC RPC to dedicated media nodes)
+- **Q1 2027** — Redis backend for cachedb module
+- **Q2 2027** — ARM64 / Raspberry Pi OS support
+- **Q2 2027** — Kubernetes Helm chart with sidecar nsbc-web
+
+---
+
+## Contributing
+
+We welcome contributions. Before opening a PR, please:
+
+1. Run `./configure && make -j$(nproc)` and `make check`. All tests must pass.
+2. For parser / transport changes, run `make asan check` and `make tsan check`. No leaks, no races.
+3. Match the existing C style — 4-space indent, `snake_case` names, Doxygen-style block comments on public APIs.
+4. New modules must declare `NSBC_MOD()` in their `*.c` and have a `HARD_STATIC` injection if they're called from `b2bua.c` or the signaling core.
+5. Open an issue first if you plan a large feature — the maintainers love to hear ideas early.
+
+---
+
+## License
+
+NSBC is licensed under the **Apache License, Version 2.0**. See [LICENSE](LICENSE) for the full text.
+
+The vendored third-party dependencies under `3rd/` retain their own licenses:
+- `bcg729` — GNU LGPL v2.1 (see `3rd/bcg729/LICENSE`)
+- `cJSON` — MIT (see `3rd/cjson/LICENSE`)
+
+---
+
+## Acknowledgements
+
+- **bcg729** — the open-source G.729 Annex B codec, embedded under `3rd/bcg729/`
+- **cJSON** — minimal JSON parser, embedded under `3rd/cjson/`
+- **libsrtp** — Cisco's SRTP reference implementation
+- **OpenSSL** — TLS + DTLS + cryptographic primitives
+- **FreeSWITCH** — inspiration for the module manager and config layout (we are not affiliated)
+- **PJSIP** — inspiration for the SIP transaction state machine design (we do not use its code)
+- **Homer / HEPv3** — the open capture protocol used by the `hep` module

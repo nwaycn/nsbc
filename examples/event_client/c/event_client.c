@@ -1,18 +1,18 @@
-/* NSBC 实时事件/CDR 订阅客户端 (Unix Domain Socket / C)
+/* NSBC realtime event/CDR subscription client (Unix Domain Socket / C)
  *
- * 纯 POSIX，无第三方依赖。GCC 4.8+ / Clang / MSYS2 都能编。
+ * Pure POSIX, no third-party deps. Builds with GCC 4.8+ / Clang / MSYS2.
  *
- * 编译:
+ * Build:
  *   gcc -std=gnu99 -O2 -Wall -Wextra -o event_client event_client.c
  *   clang -O2 -Wall -o event_client event_client.c
  *
- * 用法:
- *   ./event_client                              # 默认 /tmp/nsbc-e2e/control.sock
+ * Usage:
+ *   ./event_client                              # default /tmp/nsbc-e2e/control.sock
  *   ./event_client /var/run/nsbc/control.sock
  *   ./event_client --topics events,cdr,log
  *   ./event_client --pull-only
  *
- * 帧格式 (服务端统一):
+ * Frame format (server-side unified):
  *   events: YYYY-MM-DDTHH:MM:SS.mmm CALL_INCOMING  k=v k=v ...\n
  *   events: YYYY-MM-DDTHH:MM:SS.mmm CALL_ANSWERED  k=v k=v ...\n
  *   events: YYYY-MM-DDTHH:MM:SS.mmm CALL_END       k=v k=v ...\n
@@ -56,13 +56,13 @@ static const char *domain_color(const char *d)
     return "\x1b[37m";
 }
 
-/* 解析帧: "YYYY-MM-DDTHH:MM:SS.mmm DOMAIN body"
- * 返回 1=是推送帧；0=非推送帧 */
+/* Parse frame: "YYYY-MM-DDTHH:MM:SS.mmm DOMAIN body"
+ * Returns 1=push frame; 0=non-push frame */
 static int parse_frame(const char *line, char *ts_out, char *domain_out, char *body_out, size_t body_cap)
 {
     if (!line || strlen(line) < TS_LEN + 2) return 0;
 
-    /* 检查时间戳前缀 (宽松: 只要求含 T 和 .) */
+    /* Check timestamp prefix (lenient: only require 'T' and '.' present) */
     const char *p = line;
     int valid_ts = 1;
     for (int i = 0; i < TS_LEN; ++i, ++p) {
@@ -71,11 +71,11 @@ static int parse_frame(const char *line, char *ts_out, char *domain_out, char *b
     if (!valid_ts) return 0;
     if (*p != ' ') return 0; ++p;
 
-    /* 拷贝时间戳 */
+    /* Copy timestamp */
     memcpy(ts_out, line, TS_LEN);
     ts_out[TS_LEN] = '\0';
 
-    /* 切 DOMAIN (直到下一个空格或 \n) */
+    /* Split DOMAIN (until next space or \n) */
     const char *dstart = p;
     while (*p && *p != ' ' && *p != '\n' && *p != '\r') ++p;
     size_t dlen = (size_t)(p - dstart);
@@ -83,7 +83,7 @@ static int parse_frame(const char *line, char *ts_out, char *domain_out, char *b
     memcpy(domain_out, dstart, dlen);
     domain_out[dlen] = '\0';
 
-    /* 跳过空格 */
+    /* Skip space */
     if (*p == ' ') ++p;
 
     /* body */
@@ -100,7 +100,7 @@ static void print_frame(const char *line)
 {
     char ts[TS_LEN + 1], domain[64], body[FRAME_LEN];
     if (!parse_frame(line, ts, domain, body, sizeof(body))) {
-        /* 非推送帧 — banner/OK/ERR/提示符 */
+        /* Non-push frame — banner/OK/ERR/prompt */
         if (strncmp(line, BANNER, strlen(BANNER)) == 0 ||
             strncmp(line, "OK ", 3) == 0 ||
             strncmp(line, "ERR ", 4) == 0 ||
@@ -110,7 +110,7 @@ static void print_frame(const char *line)
         return;
     }
 
-    /* 缩短时间戳: 15:04:05.000 */
+    /* Shorten timestamp: 15:04:05.000 */
     const char *ts_short = (strlen(ts) >= 12) ? ts + 11 : ts;
 
     const char *c = domain_color(domain);
@@ -122,7 +122,7 @@ static void print_frame(const char *line)
     fflush(stdout);
 }
 
-/* 收直到看到 PROMPT 或超时。用 SO_RCVTIMEO。 */
+/* Receive until PROMPT seen or timeout. Uses SO_RCVTIMEO. */
 static int recv_until_prompt(int fd, int timeout_ms, char *out, size_t out_cap)
 {
     struct timeval tv = { timeout_ms / 1000, (timeout_ms % 1000) * 1000 };
@@ -132,14 +132,14 @@ static int recv_until_prompt(int fd, int timeout_ms, char *out, size_t out_cap)
     char buf[BUF_SIZE];
     while (used + 1 < out_cap) {
         ssize_t n = recv(fd, buf, sizeof(buf), 0);
-        if (n <= 0) break;  /* EOF / 超时 / 错误 */
+        if (n <= 0) break;  /* EOF / timeout / error */
         if ((size_t)n >= out_cap - used) n = (ssize_t)(out_cap - used - 1);
         memcpy(out + used, buf, (size_t)n);
         used += (size_t)n;
         out[used] = '\0';
         if (strstr(out, PROMPT)) break;
     }
-    /* 恢复无限等待 */
+    /* Restore infinite wait */
     tv.tv_sec = 0; tv.tv_usec = 0;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     return (int)used;
@@ -195,10 +195,10 @@ int main(int argc, char **argv)
     printf("\x1b[2m[connected to %s]%s\n", uds_path, RESET);
     fflush(stdout);
 
-    /* 收 banner + 提示符 (短超时 2s) */
+    /* Receive banner + prompt (short 2s timeout) */
     char tmp[4096];
     recv_until_prompt(fd, 2000, tmp, sizeof(tmp));
-    /* 打印 banner 行 */
+    /* Print banner line */
     char *saveptr = NULL;
     for (char *ln = strtok_r(tmp, "\n", &saveptr); ln; ln = strtok_r(NULL, "\n", &saveptr)) {
         if (!strncmp(ln, BANNER, strlen(BANNER))) {
@@ -216,7 +216,7 @@ int main(int argc, char **argv)
         recv_until_prompt(fd, 2000, tmp, sizeof(tmp));
         saveptr = NULL;
         for (char *ln = strtok_r(tmp, "\n", &saveptr); ln; ln = strtok_r(NULL, "\n", &saveptr)) {
-            /* 去掉可能的 nsbc> 后缀 */
+            /* Strip possible trailing nsbc> */
             size_t llen = strlen(ln);
             if (llen > strlen(PROMPT) && !strcmp(ln + llen - strlen(PROMPT), PROMPT)) {
                 ln[llen - strlen(PROMPT)] = '\0';
@@ -229,7 +229,7 @@ int main(int argc, char **argv)
         fflush(stdout);
     }
 
-    /* 主循环: 阻塞 read + 累积行缓冲 + 遇 \n 解析 */
+    /* Main loop: blocking read + cumulative line buffer + parse on \n */
     char line_buf[FRAME_LEN];
     size_t line_used = 0;
     char net_buf[BUF_SIZE];

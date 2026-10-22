@@ -1,13 +1,15 @@
-//! NSBC Web 管理系统边车（REQ-WEB-001~021，P0 骨架）
+//! NSBC Web management sidecar (REQ-WEB-001~021, P0 skeleton)
 //!
-//! 隔离原则（REQ-WEB-001/013）：独立进程/独立账户/独立依赖树，
-//! 仅经 REST API（REQ-OAM-001）与实时控制协议（REQ-OAM-004）访问核心；
-//! 故障、抖动、发布不影响呼叫面。核心侧对所有客户端统一限流/鉴权/审计，
-//! 边车不做权限旁路（REQ-WEB-020）。
+//! Isolation principle (REQ-WEB-001/013): separate process / separate account /
+//! separate dependency tree; access to the core is only through the REST API
+//! (REQ-OAM-001) and the real-time control protocol (REQ-OAM-004). Faults,
+//! jitter and releases do not affect the call plane. The core applies unified
+//! rate-limiting / auth / audit for all clients; the sidecar never bypasses
+//! permissions (REQ-WEB-020).
 //!
-//! 安全基线：#![deny(unsafe_code)]（REQ-WEB-011）；
-//! API 版本发现越界 fail-closed（REQ-WEB-020）；RBAC L0/L1/L2
-//! 与核心命令注册表同口径（REQ-WEB-008 / REQ-OAM-008）。
+//! Security baseline: #![deny(unsafe_code)] (REQ-WEB-011); API version discovery
+//! cross-boundary fail-closed (REQ-WEB-020); RBAC L0/L1/L2 is aligned with the
+//! core command registry (REQ-WEB-008 / REQ-OAM-008).
 #![deny(unsafe_code)]
 
 mod auth;
@@ -43,14 +45,15 @@ use auth::AuthSvc;
 use middleware::{apiversion, ratelimit, rbac};
 use coreclient::{CoreApi, RealCore};
 
-/// 本地短格式时间戳（"HH:MM:SS.mmm"），用于 JSON 日志。
+/// Local short-format timestamp ("HH:MM:SS.mmm") for JSON logs.
 struct LocalShortTimer;
 
 impl FormatTime for LocalShortTimer {
     fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
-        // 只用 now_utc()——避免 local-offset feature 引入的 vendor 缺失依赖
+        // Only use now_utc() — avoids the local-offset feature pulling in a missing vendor dep
         let now = time::OffsetDateTime::now_utc();
-        // 短格式：MMDD HH:MM:SS.mmm UTC（17 字符，兼顾日期与可读性；UTC 明确时区）
+        // Short format: MMDD HH:MM:SS.mmm UTC (17 chars, balances date with readability;
+        // UTC makes timezone unambiguous)
         let mo = now.month() as u8;
         let d  = now.day();
         let h  = now.hour();
@@ -61,7 +64,7 @@ impl FormatTime for LocalShortTimer {
     }
 }
 
-/// Writer wrapper：把 tracing-subscriber json 层硬编码的 "timestamp" 字段重命名为 "tm"。
+/// Writer wrapper: rename tracing-subscriber's JSON layer hard-coded "timestamp" field to "tm".
 struct TsRenamingWriter(std::io::Stderr);
 
 impl std::io::Write for TsRenamingWriter {
@@ -84,7 +87,7 @@ impl std::io::Write for TsRenamingWriter {
     fn flush(&mut self) -> std::io::Result<()> { self.0.flush() }
 }
 
-/// File version：timestamp → tm，写文件。
+/// File version: timestamp → tm, writes to a file.
 struct TsRenamingFile(Arc<std::sync::Mutex<std::fs::File>>);
 
 impl std::io::Write for TsRenamingFile {
@@ -108,9 +111,9 @@ impl std::io::Write for TsRenamingFile {
 }
 
 
-/// 客户端（REQ-WEB-013 唯一通道），测试为 mock，不做 dyn 分发与全局单例。
-/// 认证域（账号/JWT/会话状态）见 [`AuthSvc`]（REQ-WEB-008）。
-/// 持久化域（CDR/audit/config_history）见 [`Db`]（REQ-WEB-013 可选）。
+/// Client (REQ-WEB-013, the sole channel); tests use a mock, no dyn dispatch or global
+/// singletons. Auth domain (accounts/JWT/session state) is in [`AuthSvc`] (REQ-WEB-008).
+/// Persistence domain (CDR/audit/config_history) is in [`Db`] (optional, REQ-WEB-013).
 #[derive(Clone)]
 pub struct AppState<C: CoreApi + Clone> {
     pub core:          C,
@@ -119,29 +122,34 @@ pub struct AppState<C: CoreApi + Clone> {
     pub api_major:     u32,
     pub bind:          SocketAddr,
     pub recording_root: std::path::PathBuf,
-    /// C→Web data.sock 通道已建立（UDS 连上后置 true，用来让 poller 跳过轮询）。
-    /// 两个任务（uds_server accept loop + poller interval loop）跨 tokio task，
-    /// 用 AtomicBool 做无锁协调。
+    /// C→Web data.sock channel established (set true on UDS connect to let poller skip
+    /// polling). Two tasks (uds_server accept loop + poller interval loop) live across
+    /// tokio tasks; AtomicBool provides lock-free coordination.
     pub data_pushed:   Arc<AtomicBool>,
-    /// SESSION 实时事件广播（nsbc-esl-web §8#1）：C→Web data.sock 推送的会话
-    /// 事件经此通道 fan-out 给所有 `/calls/stream`（SSE）订阅者，前端由此替代
-    /// 5s 轮询实现实时刷新。慢消费者由 broadcast 环形缓冲（cap 256）处理，
-    /// 落后即记 lagged，不阻塞 UDS dispatch 热路径（无反压，符合项目约束）。
+    /// SESSION real-time event broadcast (nsbc-esl-web §8#1): SESSION events pushed via
+    /// C→Web data.sock are fan-out'd through this channel to all `/calls/stream` (SSE)
+    /// subscribers — front-end uses this to replace 5-second polling with real-time
+    /// refresh. Slow consumers are handled by the broadcast ring buffer (cap 256);
+    /// lagging is recorded as lagged, the UDS dispatch hot path never blocks (no back-
+    /// pressure, matching project constraints).
     pub calls_tx:      tokio::sync::broadcast::Sender<String>,
-    /// VAD_EVENT 实时广播（REQ-AI-BARGEIN-001）：C 核心 vad_engine 推的
-    /// {"kind":"vad_event","payload":{event:"VAD_EVENT",...}} 经此通道 fan-out
-    /// 给 ai_agent 模块做 barge-in 决策。缓冲更大（cap 1024）因为 VAD 帧频率高。
+    /// VAD_EVENT real-time broadcast (REQ-AI-BARGEIN-001): {"kind":"vad_event",
+    /// "payload":{event:"VAD_EVENT",...}} pushed by the C core's vad_engine is fan-out'd
+    /// through this channel to the ai_agent module for barge-in decisions. Larger
+    /// buffer (cap 1024) because VAD frames are high-frequency.
     pub vad_tx:        tokio::sync::broadcast::Sender<String>,
 }
 
 pub const API_MAJOR: u32 = 1;
 
-/// /api/v1 业务路由（鉴权/版本治理分层在 main 装配，REQ-WEB-009/012/013）。
-/// login/refresh 为公开端点（无 rbac）；logout 与其余端点受 rbac 保护。
+/// /api/v1 business routes (auth/version governance layered at main assembly,
+/// REQ-WEB-009/012/013). login/refresh are public endpoints (no rbac); logout and
+/// the rest are rbac-protected.
 ///
-/// rbac 中间件需要读取 [`AppState`]（JWT/会话表），而 axum 的
-/// `from_fn` 不注入 State，必须在装配期用 `from_fn_with_state`
-/// 给出状态，故本函数直接消费 state 并返回已定型的 `Router<()>`。
+/// The rbac middleware needs to read [`AppState`] (JWT/session table), and axum's
+/// `from_fn` does not inject State — we must give it with `from_fn_with_state` at
+/// assembly time, so this function directly consumes state and returns a finished
+/// `Router<()>`.
 fn api_router<C: CoreApi + Clone + 'static>(st: Arc<AppState<C>>) -> Router {
     let protected = Router::new()
         .merge(routes::system::router())
@@ -178,11 +186,13 @@ fn api_router<C: CoreApi + Clone + 'static>(st: Arc<AppState<C>>) -> Router {
         .with_state(st)
 }
 
-/// 完整应用：/api/v1 业务面 + 不带鉴权的 /health 探活 + 安全响应头。
+/// Full application: /api/v1 business surface + unauthenticated /health probe +
+/// security response headers.
 fn app_router<C: CoreApi + Clone + 'static>(state: Arc<AppState<C>>) -> Router {
-    // 安全响应头层（OWASP 基础基线，兼容 Vue 3 编译期模板 eval）。
-    // Vue 3 global build 用 new Function() 做模板编译 → script-src 必须 'unsafe-eval'。
-    // Cross-Origin-Opener-Policy 仅 HTTPS 生效，HTTP 上 Chrome 直接忽略并报警告 → 移除。
+    // Security response headers layer (OWASP baseline, compatible with Vue 3 compile-time
+    // template eval). Vue 3 global build uses new Function() for template compilation →
+    // script-src must be 'unsafe-eval'. Cross-Origin-Opener-Policy only takes effect on
+    // HTTPS; on HTTP Chrome silently ignores and warns → removed.
     let csp = "default-src 'self'; \
         script-src 'self' 'unsafe-inline' 'unsafe-eval'; \
         style-src 'self' 'unsafe-inline'; \
@@ -200,7 +210,7 @@ fn app_router<C: CoreApi + Clone + 'static>(state: Arc<AppState<C>>) -> Router {
         .merge(routes::recordings::public_file_router(state.clone()))
         .merge(static_files::router());
 
-    // 逐层添加安全头（SetResponseHeaderLayer 覆盖重复设置）
+    // Add security headers layer by layer (SetResponseHeaderLayer overwrites duplicates)
     app.layer(SetResponseHeaderLayer::if_not_present(
         HeaderName::from_static("content-security-policy"),
         HeaderValue::from_static(csp),
@@ -223,35 +233,35 @@ fn app_router<C: CoreApi + Clone + 'static>(state: Arc<AppState<C>>) -> Router {
     ))
 }
 
-/// Phase 4 DB DSN 引导（2026-10-15 增量）：
-/// 优先级链：NSBC_DB_DSN env > cfg.db.dsn > 交互式引导 > SQLite 默认
+/// Phase 4 DB DSN bootstrap (2026-10-15 incremental):
+/// Precedence chain: NSBC_DB_DSN env > cfg.db.dsn > interactive wizard > SQLite default
 fn resolve_db_dsn(cfg: &config::DbSection) -> String {
-    // 1. env override 最高优先
+    // 1. env override takes highest priority
     if let Ok(v) = std::env::var("NSBC_DB_DSN") {
         tracing::info!("🔧 db: NSBC_DB_DSN env override → {:?}", v);
         return v;
     }
-    // 2. cfg 文件显式配置
+    // 2. explicit config in cfg file
     if !cfg.dsn.is_empty() {
         tracing::info!("🔧 db: cfg.dsn → {:?}", cfg.dsn);
         return cfg.dsn.clone();
     }
 
-    // 3. 交互式引导（TTY 可用时）
+    // 3. Interactive wizard (when TTY is available)
     let is_tty = std::io::stdin().is_terminal();
 
     if is_tty {
-        tracing::warn!("db.dsn 未配置，进入交互式引导…");
+        tracing::warn!("db.dsn not configured, entering interactive wizard…");
         println!();
         println!("╔══════════════════════════════════════╗");
-        println!("║  NSBC Web DB 初始化引导（Phase 4）   ║");
+        println!("║  NSBC Web DB Initialization Wizard (Phase 4) ║");
         println!("╠══════════════════════════════════════╣");
-        println!("║  1) SQLite  (轻量单机，推荐 PoC)      ║");
-        println!("║  2) MySQL   (生产级)                 ║");
-        println!("║  3) PostgreSQL (生产级)              ║");
-        println!("║  4) 跳过（仅内存）                   ║");
+        println!("║  1) SQLite  (lightweight single-node, recommended for PoC) ║");
+        println!("║  2) MySQL   (production-grade)                 ║");
+        println!("║  3) PostgreSQL (production-grade)              ║");
+        println!("║  4) Skip (in-memory only)                      ║");
         println!("╚══════════════════════════════════════╝");
-        print!("请选择 [1/2/3/4] 默认(1): ");
+        print!("Select [1/2/3/4] default(1): ");
         std::io::stdout().flush().ok();
 
         let mut choice = String::new();
@@ -260,27 +270,27 @@ fn resolve_db_dsn(cfg: &config::DbSection) -> String {
 
         match choice {
             "2" => {
-                print!("MySQL 主机 [127.0.0.1]: "); std::io::stdout().flush().ok();
+                print!("MySQL host [127.0.0.1]: "); std::io::stdout().flush().ok();
                 let mut host = String::new();
                 std::io::stdin().read_line(&mut host).ok();
                 let host = host.trim_or("127.0.0.1");
 
-                print!("MySQL 端口 [3306]: "); std::io::stdout().flush().ok();
+                print!("MySQL port [3306]: "); std::io::stdout().flush().ok();
                 let mut port = String::new();
                 std::io::stdin().read_line(&mut port).ok();
                 let port = port.trim_or("3306");
 
-                print!("MySQL 用户 [nsbc]: "); std::io::stdout().flush().ok();
+                print!("MySQL user [nsbc]: "); std::io::stdout().flush().ok();
                 let mut user = String::new();
                 std::io::stdin().read_line(&mut user).ok();
                 let user = user.trim_or("nsbc");
 
-                print!("MySQL 密码: "); std::io::stdout().flush().ok();
+                print!("MySQL password: "); std::io::stdout().flush().ok();
                 let mut pass = String::new();
                 std::io::stdin().read_line(&mut pass).ok();
                 let pass = pass.trim();
 
-                print!("MySQL 数据库 [nsbc]: "); std::io::stdout().flush().ok();
+                print!("MySQL database [nsbc]: "); std::io::stdout().flush().ok();
                 let mut dbname = String::new();
                 std::io::stdin().read_line(&mut dbname).ok();
                 let dbname = dbname.trim_or("nsbc");
@@ -291,27 +301,27 @@ fn resolve_db_dsn(cfg: &config::DbSection) -> String {
                 return dsn;
             }
             "3" => {
-                print!("PostgreSQL 主机 [127.0.0.1]: "); std::io::stdout().flush().ok();
+                print!("PostgreSQL host [127.0.0.1]: "); std::io::stdout().flush().ok();
                 let mut host = String::new();
                 std::io::stdin().read_line(&mut host).ok();
                 let host = host.trim_or("127.0.0.1");
 
-                print!("PostgreSQL 端口 [5432]: "); std::io::stdout().flush().ok();
+                print!("PostgreSQL port [5432]: "); std::io::stdout().flush().ok();
                 let mut port = String::new();
                 std::io::stdin().read_line(&mut port).ok();
                 let port = port.trim_or("5432");
 
-                print!("PostgreSQL 用户 [nsbc]: "); std::io::stdout().flush().ok();
+                print!("PostgreSQL user [nsbc]: "); std::io::stdout().flush().ok();
                 let mut user = String::new();
                 std::io::stdin().read_line(&mut user).ok();
                 let user = user.trim_or("nsbc");
 
-                print!("PostgreSQL 密码: "); std::io::stdout().flush().ok();
+                print!("PostgreSQL password: "); std::io::stdout().flush().ok();
                 let mut pass = String::new();
                 std::io::stdin().read_line(&mut pass).ok();
                 let pass = pass.trim();
 
-                print!("PostgreSQL 数据库 [nsbc]: "); std::io::stdout().flush().ok();
+                print!("PostgreSQL database [nsbc]: "); std::io::stdout().flush().ok();
                 let mut dbname = String::new();
                 std::io::stdin().read_line(&mut dbname).ok();
                 let dbname = dbname.trim_or("nsbc");
@@ -322,24 +332,24 @@ fn resolve_db_dsn(cfg: &config::DbSection) -> String {
                 return dsn;
             }
             "4" => {
-                tracing::info!("🔧 db: 引导跳过 — 持久化禁用");
+                tracing::info!("🔧 db: wizard skipped — persistence disabled");
                 return String::new();
             }
-            _ => { /* 默认 SQLite，走下面 */ }
+            _ => { /* default SQLite, handled below */ }
         }
     }
 
-    // 4. SQLite 默认（TTY 不可选 或 用户选 1 或 直接回车）
+    // 4. SQLite default (TTY not available OR user picked 1 OR just hit Enter)
     let db_path = std::path::PathBuf::from("data/web.db");
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
     let dsn = format!("sqlite:{}", db_path.display());
-    tracing::info!("🔧 db: SQLite 默认 → {:?}", dsn);
+    tracing::info!("🔧 db: SQLite default → {:?}", dsn);
     dsn
 }
 
-/// 扩展 trait：Option<String> 上的 trim_or 默认值填充
+/// Extension trait: trim_or default value filling on Option<String>
 trait TrimOr {
     fn trim_or<'a>(&'a self, default: &'a str) -> &'a str;
 }
@@ -352,18 +362,19 @@ impl TrimOr for String {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // rustls 0.23 必须在任何 TLS 操作前显式安装 CryptoProvider
-    // certon(可能拉 aws-lc-rs) + 我们(ring) 双 provider 并存会导致 rustls 无法自动决策 → panic
-    // 统一用 ring（与 Cargo.toml 的 ring 0.17 / rcgen(ring) / rustls(ring) 一致）
+    // rustls 0.23 requires explicit CryptoProvider install before any TLS operation
+    // certon (may pull aws-lc-rs) + us (ring) dual provider together causes rustls to
+    // fail auto-selection → panic. Use ring uniformly (matches Cargo.toml ring 0.17 /
+    // rcgen(ring) / rustls(ring))
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    // 子命令优先（hash-password 不加载任何 Web 域）
+    // Sub-commands first (hash-password does not load any Web domain)
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("hash-password") {
-        run_hash_password(&args[2..]); // 返回 !
+        run_hash_password(&args[2..]); // returns !
     }
 
-    // 解析 -c/--config 参数
+    // Parse -c/--config argument
     let mut config_path: Option<&str> = None;
     let mut i = 1;
     while i < args.len() {
@@ -384,7 +395,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 日志：二进制所在目录下 logs/nsbc-web.log（硬编码，不分发配置）
+    // Logging: logs/nsbc-web.log under binary directory (hard-coded, not configurable)
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
@@ -418,11 +429,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 加载配置（env > file > defaults）
+    // Load configuration (env > file > defaults)
     let cfg = config::WebConfig::load(config_path)?;
     let bind: SocketAddr = cfg.bind_addr()?;
 
-    // TLS 证书：auto-generate 自签 / 显式 PEM / 公网 ACME（certmagic）
+    // TLS certificates: auto-generate self-signed / explicit PEM / public ACME (certmagic)
     let tls_source = if cfg.web.tls.enabled {
         match tls::init(&cfg.web.tls, bind).await {
             Ok(src) => {
@@ -460,21 +471,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // 核心控制通道：用 cfg.core.control_sock 替换硬编码 from_env
+    // Core control channel: use cfg.core.control_sock instead of hard-coded from_env
     let core = RealCore::from_config(&cfg.core);
     tracing::info!(?core, "core control client initialized");
 
-    // 认证域：用 cfg.auth 替换 from_env（含默认账号注入）
+    // Auth domain: use cfg.auth instead of from_env (includes default account injection)
     let auth = Arc::new(AuthSvc::from_config(&cfg.auth)?);
 
-    // ---------- Phase 4 Web DB 引导（2026-10-15 增量） ----------
-    // dsn 优先级：NSBC_DB_DSN env > cfg.db.dsn > 交互式引导 > SQLite 默认
+    // ---------- Phase 4 Web DB bootstrap (2026-10-15 incremental) ----------
+    // dsn precedence: NSBC_DB_DSN env > cfg.db.dsn > interactive wizard > SQLite default
     let dsn = resolve_db_dsn(&cfg.db);
     let db = db::Db::from_dsn(&dsn).await;
 
-    // 启动期 seed：确保 web_users 表有默认 admin 用户（幂等，已存在则跳过）。
-    // 密码哈希由 auth::accounts::hash_password_argon2id 生成（argon2id，生产参数）。
-    // 优先级：NSBC_DEFAULT_ADMIN_PW env → cfg.auth.default_admin_pw → "Admin123"
+    // Startup seed: ensure web_users table has a default admin user (idempotent, skip if
+    // already present). Password hash generated by auth::accounts::hash_password_argon2id
+    // (argon2id, production parameters).
+    // Precedence: NSBC_DEFAULT_ADMIN_PW env → cfg.auth.default_admin_pw → "Admin123"
     {
         use auth::accounts::hash_password_argon2id;
         let admin_pw = std::env::var("NSBC_DEFAULT_ADMIN_PW")
@@ -508,19 +520,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         vad_tx:   tokio::sync::broadcast::channel(1024).0,
     });
 
-    // CDR 后台 poller：每 15s 拉一次核心侧 cdr.recent → 写 DB。
+    // CDR background poller: fetch core-side cdr.recent every 15s → write DB.
     poller::spawn(state.clone(), 15, 100);
 
-    // AI Agent barge-in 后台任务（REQ-AI-BARGEIN-001 P0）：
-    // 订阅 C 核心 vad_engine 推的 VAD_EVENT，用户说话时自动静音 AI 侧。
+    // AI Agent barge-in background task (REQ-AI-BARGEIN-001 P0):
+    // Subscribe to VAD_EVENT pushed by C core's vad_engine; auto-mute AI side when user speaks.
     ai_agent::spawn(state.clone());
 
-    // HA：每 60s 向本机 nsbcd 全量重推配置（备机不经手 CRUD，
-    // 靠这个保持核心内存表新鲜；幂等，单机部署同样无害）。
+    // HA: every 60s full re-push config to local nsbcd (standby node does not handle CRUD,
+    // relies on this to keep core in-memory tables fresh; idempotent, single-node deployments
+    // are also harmless).
     sync::spawn_periodic_push(state.clone());
 
-    // UDS Data Service：C→Web write-through（CDR/注册/运行时状态实时入库）
-    // 剥 "unix:" 前缀 — UnixListener::bind 需要纯文件路径
+    // UDS Data Service: C→Web write-through (CDR/registrations/runtime state written into DB
+    // in real time). Strip "unix:" prefix — UnixListener::bind needs a plain file path
     let uds_path = std::path::PathBuf::from(
         cfg.core.data_sock
             .strip_prefix("unix:")
@@ -539,18 +552,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = TcpListener::bind(bind).await?;
 
-    // ---- accept loop（TlsSource 三分支）----
+    // ---- accept loop (three TlsSource branches) ----
     match tls_source {
         Some(tls::TlsSource::Internal { holder, .. }) => {
             tracing::info!(
                 "nsbc-web listening on https://{}/api/v1 (internal TLS + hot-renew)",
                 bind
             );
-            let mut shutdown_rx = Box::pin(shutdown_signal());
+            // Per-iteration fresh ctrl_c() future — tokio 1.54+ makes it a hard panic if the
+            // SAME signal future / JoinHandle gets polled twice after completion. Creating a
+            // brand-new CtrlC per loop keeps each poll isolated.
             loop {
                 tokio::select! {
                     biased;
-                    _ = &mut shutdown_rx => break,
+                    _ = tokio::signal::ctrl_c() => break,
                     accept_result = listener.accept() => {
                         let (stream, peer) = match accept_result {
                             Ok(v) => v,
@@ -575,13 +590,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "nsbc-web listening on https://{}/api/v1 (certon TLS-ALPN-01 — dynamic ResolvesServerCert)",
                 bind
             );
-            // TlsAcceptor::from 内部已经 wrap Arc，clone 是 O(1)
+            // TlsAcceptor::from already wraps Arc internally; clone is O(1)
             let acceptor = Arc::new(TlsAcceptor::from(rustls_config));
-            let mut shutdown_rx = Box::pin(shutdown_signal());
+            // Same per-iteration fresh ctrl_c() as the Internal branch — avoids the
+            // tokio 1.54+ JoinHandle double-poll panic.
             loop {
                 tokio::select! {
                     biased;
-                    _ = &mut shutdown_rx => break,
+                    _ = tokio::signal::ctrl_c() => break,
                     accept_result = listener.accept() => {
                         let (stream, peer) = match accept_result {
                             Ok(v) => v,
@@ -638,7 +654,7 @@ async fn handle_tls_stream(
         .await;
 }
 
-/// `hash-password` 子命令实现（同步，一次性 CLI；失败 exit(1)）。
+/// `hash-password` subcommand implementation (synchronous, one-shot CLI; exits 1 on failure).
 fn run_hash_password(args: &[String]) -> ! {
     let usage = "usage: nsbc-web hash-password <username> <L0|L1|L2>\n\
                  password is read from stdin (one line, trimmed trailing CR/LF)";
@@ -691,7 +707,8 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    //! 全链路（JWT 登录会话 + 版本治理 + RBAC + 路由 + mock 核心）冒烟。
+    //! Full-link (JWT login sessions + version governance + RBAC + routes + mock core)
+    //! smoke tests.
     use std::collections::BTreeMap;
     use std::net::SocketAddr;
     use std::sync::Arc;
@@ -710,12 +727,13 @@ mod tests {
 
     const API_HDR: HeaderName = HeaderName::from_static("x-nsbc-api-version");
 
-    /// 测试用 argon2id PHC（低代价参数，验证算法路径与生产一致）。
+    /// Test argon2id PHC (low-cost parameters; verify algorithm path is identical to prod).
     fn phc(password: &str) -> String {
         let mut raw = [0u8; 16];
         getrandom::getrandom(&mut raw).unwrap();
         let salt = SaltString::encode_b64(&raw).unwrap();
-        // m=4MiB/t=1/p=1：低于生产建议但足以覆盖 argon2id 校验路径。
+        // m=4MiB/t=1/p=1: below production recommendation but enough to cover argon2id
+        // verification path.
         let arg = Argon2::new(
             Algorithm::Argon2id,
             Version::V0x13,
@@ -725,12 +743,12 @@ mod tests {
     }
 
     fn app() -> (axum::Router, Arc<AppState<MockCore>>) {
-        // 两个本地账号：u0=L0 只读、u1=L1 操作。
+        // Two local accounts: u0=L0 read-only, u1=L1 operation.
         let accounts = format!("L0:u0:{};L1:u1:{}", phc("pw0"), phc("pw1"));
         app_with(Arc::new(AuthSvc::for_test(&accounts)))
     }
 
-    /// 用自定义 AuthSvc（锁定/限流阈值、审计文件）装配全链路 app。
+    /// Assemble a full-link app with custom AuthSvc (lock/rate-limit thresholds, audit file).
     fn app_with(auth: Arc<AuthSvc>) -> (axum::Router, Arc<AppState<MockCore>>) {
         let canned = BTreeMap::from([
             ("show calls".to_string(), Ok("active=1 total=2 failed=0\n".into())),
@@ -758,7 +776,7 @@ ssrc_out=UNAVAILABLE vq=UNAVAILABLE\n".into()),
                     db.dsn: ****\n"
                     .into()),
             ),
-            // hangup：c1 成功；其余 id 不存在 → 核心 404 语义
+            // hangup: c1 succeeds; other ids not present → core 404 semantics
             ("hangup".to_string(), Ok("OK hungup c1\n".into())),
             (
                 "hangup:gone".to_string(),
@@ -783,7 +801,8 @@ ssrc_out=UNAVAILABLE vq=UNAVAILABLE\n".into()),
         (app_router(st.clone()), st)
     }
 
-    /// 发请求：默认带版本头；bearer/JSON 体可选。返回（状态码，响应体）。
+    /// Send request: default carries version header; bearer/JSON body optional.
+    /// Returns (status code, response body).
     async fn call(
         app: &axum::Router,
         method: Method,
@@ -836,17 +855,17 @@ ssrc_out=UNAVAILABLE vq=UNAVAILABLE\n".into()),
     async fn login_jwt_session_rbac_and_core_proxy() {
         let (app, st) = app();
 
-        // /health 无鉴权无版本头
+        // /health: no auth, no version header
         assert_eq!(call(&app, Method::GET, "/health", None, None, false).await.0, StatusCode::OK);
 
-        // 登录面也受版本治理：缺版本头 → 400
+        // Login endpoint also subject to version governance: missing version header → 400
         assert_eq!(
             call(&app, Method::POST, "/api/v1/auth/login", None, Some("{}"), false)
                 .await
                 .0,
             StatusCode::BAD_REQUEST
         );
-        // 错误口令 → 统一 401（不区分用户是否存在）
+        // Wrong password → unified 401 (no leak whether user exists)
         let (s, _) = login(&app, "u0", "wrong").await;
         assert_eq!(s, StatusCode::UNAUTHORIZED);
         let (s, b) = call(
@@ -854,20 +873,20 @@ ssrc_out=UNAVAILABLE vq=UNAVAILABLE\n".into()),
             Some(r#"{"username":"ghost","password":"pw0"}"#), true).await;
         assert_eq!(s, StatusCode::UNAUTHORIZED);
         assert!(b.contains("INVALID_CREDENTIALS"), "body={b}");
-        // 用户名越白名单 → 400
+        // Username outside whitelist → 400
         let (s, _) = call(
             &app, Method::POST, "/api/v1/auth/login", None,
             Some(r#"{"username":"bad name!","password":"x"}"#), true).await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
 
-        // L0 登录成功，取得 access/refresh
+        // L0 login success, get access/refresh
         let (s, v0) = login(&app, "u0", "pw0").await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(v0["token_type"], "Bearer");
         assert_eq!(v0["expires_in"], 900);
         let (a0, _r0) = tokens(&v0);
 
-        // 无令牌 / 乱码令牌 → 401
+        // No token / garbage token → 401
         assert_eq!(
             call(&app, Method::GET, "/api/v1/calls", None, None, true).await.0,
             StatusCode::UNAUTHORIZED
@@ -876,17 +895,17 @@ ssrc_out=UNAVAILABLE vq=UNAVAILABLE\n".into()),
             call(&app, Method::GET, "/api/v1/calls", Some("garbage"), None, true).await.0,
             StatusCode::UNAUTHORIZED
         );
-        // 版本不匹配仍 fail-closed（带令牌也要过版本层）
+        // Version mismatch still fail-closed (version layer checked even with token)
         assert_eq!(
             call(&app, Method::GET, "/api/v1/calls", Some(&a0), None, false).await.0,
             StatusCode::BAD_REQUEST
         );
-        // L0 只读 → 200 真实核心数据；L0 挂断 → 403
+        // L0 read-only → 200 real core data; L0 hangup → 403
         assert_eq!(
             call(&app, Method::GET, "/api/v1/calls", Some(&a0), None, true).await.0,
             StatusCode::OK
         );
-        // 话务明细同为 L0 只读（rbac 对 Call-ID 末段的特判）
+        // Call detail is also L0 read-only (rbac special-case for the last segment of Call-ID)
         assert_eq!(
             call(&app, Method::GET, "/api/v1/channels", Some(&a0), None, true).await.0,
             StatusCode::OK
@@ -895,14 +914,14 @@ ssrc_out=UNAVAILABLE vq=UNAVAILABLE\n".into()),
             call(&app, Method::GET, "/api/v1/calls/c1", Some(&a0), None, true).await.0,
             StatusCode::OK
         );
-        // 配置生效值查询同为 L0 只读（rbac config/ 单段特判）
+        // Config effective-value query is also L0 read-only (rbac config/ single-segment special-case)
         assert_eq!(
             call(&app, Method::GET, "/api/v1/config/log.level", Some(&a0), None, true)
                 .await
                 .0,
             StatusCode::OK
         );
-        // 全量脱敏导出同为 L0 只读
+        // Full redacted export is also L0 read-only
         assert_eq!(
             call(&app, Method::GET, "/api/v1/config", Some(&a0), None, true)
                 .await
@@ -914,7 +933,7 @@ ssrc_out=UNAVAILABLE vq=UNAVAILABLE\n".into()),
             StatusCode::FORBIDDEN
         );
 
-        // L1 登录 → hangup 200 / notfound 404
+        // L1 login → hangup 200 / notfound 404
         let (s, v1) = login(&app, "u1", "pw1").await;
         assert_eq!(s, StatusCode::OK);
         let (a1, _r1) = tokens(&v1);
@@ -927,7 +946,7 @@ ssrc_out=UNAVAILABLE vq=UNAVAILABLE\n".into()),
             StatusCode::NOT_FOUND
         );
 
-        // 过期 access → 401 TOKEN_EXPIRED
+        // Expired access → 401 TOKEN_EXPIRED
         let now = crate::auth::tokens::now_secs();
         let ((old_access, _), _) = st.auth.tokens.issue_pair("u1", 1, now - 10_000);
         let (s, b) =
@@ -935,7 +954,7 @@ ssrc_out=UNAVAILABLE vq=UNAVAILABLE\n".into()),
         assert_eq!(s, StatusCode::UNAUTHORIZED);
         assert!(b.contains("TOKEN_EXPIRED"), "body={b}");
 
-        // 核心不可达（未罐装命令）→ 502，不 500
+        // Core unreachable (uncanned command) → 502, not 500
         assert_eq!(
             call(&app, Method::GET, "/api/v1/registrations", Some(&a0), None, true).await.0,
             StatusCode::BAD_GATEWAY
@@ -948,13 +967,13 @@ ssrc_out=UNAVAILABLE vq=UNAVAILABLE\n".into()),
 
         let (_, v) = login(&app, "u1", "pw1").await;
         let (a1, r1) = tokens(&v);
-        // access 直接可用
+        // access token is usable directly
         assert_eq!(
             call(&app, Method::GET, "/api/v1/calls", Some(&a1), None, true).await.0,
             StatusCode::OK
         );
 
-        // 刷新：成功轮转，返回新令牌对
+        // Refresh: successful rotation, returns new token pair
         let (s, body) = call(
             &app, Method::POST, "/api/v1/auth/refresh", None,
             Some(&format!(r#"{{"refresh_token":"{r1}"}}"#)), true).await;
@@ -962,48 +981,49 @@ ssrc_out=UNAVAILABLE vq=UNAVAILABLE\n".into()),
         let v2: Value = serde_json::from_str(&body).unwrap();
         let (a2, r2) = tokens(&v2);
         assert_ne!(a1, a2);
-        // 旧 refresh 单次使用：再出示 → 401 TOKEN_REPLAY
+        // Old refresh is single-use: present again → 401 TOKEN_REPLAY
         let (s, b) = call(
             &app, Method::POST, "/api/v1/auth/refresh", None,
             Some(&format!(r#"{{"refresh_token":"{r1}"}}"#)), true).await;
         assert_eq!(s, StatusCode::UNAUTHORIZED);
         assert!(b.contains("TOKEN_REPLAY"), "body={b}");
-        // 新 access/refresh 可用
+        // New access/refresh work
         assert_eq!(
             call(&app, Method::GET, "/api/v1/calls", Some(&a2), None, true).await.0,
             StatusCode::OK
         );
 
-        // 登出：吊销当前 access + refresh
+        // Logout: revoke current access (up to its exp) + optional refresh
         let (s, _) = call(
             &app, Method::POST, "/api/v1/auth/logout", Some(&a2),
             Some(&format!(r#"{{"refresh_token":"{r2}"}}"#)), true).await;
         assert_eq!(s, StatusCode::OK);
-        // access 即时失效（不必等 15min）
+        // access becomes invalid immediately (don't have to wait 15min)
         assert_eq!(
             call(&app, Method::GET, "/api/v1/calls", Some(&a2), None, true).await.0,
             StatusCode::UNAUTHORIZED
         );
-        // refresh 已注销 → 401
+        // refresh already logged out → 401
         let (s, _) = call(
             &app, Method::POST, "/api/v1/auth/refresh", None,
             Some(&format!(r#"{{"refresh_token":"{r2}"}}"#)), true).await;
         assert_eq!(s, StatusCode::UNAUTHORIZED);
 
-        // 登出幂等：无令牌登出 → 401（受保护端点）；空体不影响
+        // Logout is idempotent: logout with no token → 401 (protected endpoint);
+        // empty body does not affect it
         let (s, _) = call(
             &app, Method::POST, "/api/v1/auth/logout", Some(&a2),
             Some("{}"), true).await;
         assert_eq!(s, StatusCode::UNAUTHORIZED);
 
-        // 拿 refresh 当 access 用 → 类型混用 401
+        // Refresh used as access → type mix-up 401
         let (_, v3) = login(&app, "u0", "pw0").await;
         let (_, r3) = tokens(&v3);
         assert_eq!(
             call(&app, Method::GET, "/api/v1/calls", Some(&r3), None, true).await.0,
             StatusCode::UNAUTHORIZED
         );
-        // r3 未被消费，仍可正常刷新
+        // r3 not consumed, still refreshes normally
         let (s, _) = call(
             &app, Method::POST, "/api/v1/auth/refresh", None,
             Some(&format!(r#"{{"refresh_token":"{r3}"}}"#)), true).await;
@@ -1015,7 +1035,7 @@ ssrc_out=UNAVAILABLE vq=UNAVAILABLE\n".into()),
         use crate::auth::audit::AuditLog;
         use crate::auth::limiter::Limits;
 
-        // 审计落临时文件，验证全链路事件。
+        // Audit goes to a temp file, verify full-link events.
         let apath = std::env::temp_dir().join(format!(
             "nsbc_w3b_audit_{}_{}.jsonl",
             std::process::id(),
@@ -1024,7 +1044,7 @@ ssrc_out=UNAVAILABLE vq=UNAVAILABLE\n".into()),
         ));
         let audit = AuditLog::open(apath.to_str().unwrap()).unwrap();
         let accounts = format!("L0:u0:{};L1:u1:{}", phc("pw0"), phc("pw1"));
-        // login 桶 6/min、锁定阈值 3，便于在小序列内同时覆盖。
+        // login bucket 6/min, lock threshold 3; pick values that hit both within a small sequence.
         let limits = Limits {
             lock_threshold: 3,
             rl_login: 6,
@@ -1032,26 +1052,27 @@ ssrc_out=UNAVAILABLE vq=UNAVAILABLE\n".into()),
         };
         let (app, _st) = app_with(Arc::new(AuthSvc::build(&accounts, limits, audit)));
 
-        // 1) REQ-WEB-009 拒绝未知字段 → 422（消耗 1 次 login 配额）
+        // 1) REQ-WEB-009: reject unknown fields → 422 (consumes one login quota)
         let (s, _) = call(
             &app, Method::POST, "/api/v1/auth/login", None,
             Some(r#"{"username":"u0","password":"pw0","bogus":1}"#), true).await;
         assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
 
-        // 2) 连续 3 次错口令：均 401；第 3 次触发锁定（当次仍 401）
+        // 2) 3 consecutive wrong passwords: all 401; 3rd triggers lockout (still 401 on that attempt)
         for _ in 0..3 {
             let (s, b) = login(&app, "u0", "wrong").await;
             assert_eq!(s, StatusCode::UNAUTHORIZED);
             assert_eq!(b["error"]["code"], "INVALID_CREDENTIALS");
         }
-        // 3) 锁定后即使口令正确也 423（且不做 argon2 校验）
+        // 3) Even correct password returns 423 after lockout (no argon2 verification performed)
         let (s, b) = login(&app, "u0", "pw0").await;
         assert_eq!(s, StatusCode::LOCKED);
         assert_eq!(b["error"]["code"], "ACCOUNT_LOCKED");
-        // 4) 锁定按用户名：u1 不受影响（本次为第 6 次 login 请求，恰好用满配额）
+        // 4) Lockout is per-username: u1 is unaffected (this is the 6th login request total,
+        // exactly fills the quota)
         let (s, _) = login(&app, "u1", "pw1").await;
         assert_eq!(s, StatusCode::OK);
-        // 5) 第 7 次 login → 429 且带 Retry-After
+        // 5) 7th login → 429 with Retry-After
         let req = Request::builder()
             .method(Method::POST)
             .uri("/api/v1/auth/login")
@@ -1063,8 +1084,8 @@ ssrc_out=UNAVAILABLE vq=UNAVAILABLE\n".into()),
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(resp.headers().get("retry-after").is_some());
 
-        // 审计文件：至少包含 login_failed / account_locked / login_locked /
-        // login_success 四类事件，且固定字段齐全。
+        // Audit file: must contain at least login_failed / account_locked / login_locked /
+        // login_success event types, with required fields present.
         let text = std::fs::read_to_string(&apath).unwrap();
         for ev in ["login_failed", "account_locked", "login_locked", "login_success"] {
             assert!(text.contains(&format!("\"event\":\"{ev}\"")), "missing {ev}: {text}");

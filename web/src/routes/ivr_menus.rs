@@ -1,4 +1,4 @@
-//! IVR 菜单 REST。6 端点。
+//! IVR menu REST. Six endpoints.
 
 use std::sync::Arc;
 

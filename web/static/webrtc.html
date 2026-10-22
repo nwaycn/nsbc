@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>宁卫SBC WebRTC 视频通话</title>
+<title>NWSBC WebRTC Video Call</title>
 <script src="js/jssip-3.10.0.min.js"></script>
 <style>
   * { box-sizing: border-box; }
@@ -91,34 +91,34 @@
 <body>
 <div class="wrap">
 
-  <h1>宁卫SBC WebRTC 视频通话 <span class="tag">独立页面 · JsSIP + WSS</span></h1>
+  <h1>NWSBC WebRTC Video Call <span class="tag">Standalone page - JsSIP + WSS</span></h1>
 
   <div class="grid">
 
     <div class="card">
-      <h3>SIP 账号</h3>
-      <div class="row"><label>WSS 服务器</label><input id="wss" value="" placeholder="自动从 URL 推导"></div>
-      <div class="row"><label>STUN</label><input id="stun" value="" placeholder="自动从 URL 推导"></div>
-      <div class="row"><label>分机号</label><input id="user" value="1000"></div>
-      <div class="row"><label>密码</label><input id="pass" type="password" value=""></div>
-      <div class="row"><label>Realm / 租户</label><input id="realm" value="nsbc.local" placeholder="SIP 域，如 nsbc.local / acme.com"></div>
+      <h3>SIP Account</h3>
+      <div class="row"><label>WSS Server</label><input id="wss" value="" placeholder="Auto derive from URL"></div>
+      <div class="row"><label>STUN Server</label><input id="stun" value="" placeholder="Auto derive from URL"></div>
+      <div class="row"><label>Extension</label><input id="user" value="1000"></div>
+      <div class="row"><label>Password</label><input id="pass" type="password" value=""></div>
+      <div class="row"><label>Realm / Tenant</label><input id="realm" value="nsbc.local" placeholder="SIP domain, e.g. nsbc.local / acme.com"></div>
       <div class="row">
         <button class="btn btn-green" id="btnReg" onclick="doRegister()">▶ Register</button>
         <button class="btn btn-red"   id="btnUnreg" onclick="doUnregister()" disabled>Unregister</button>
-        <span class="status" id="regStatus">未注册</span>
+        <span class="status" id="regStatus">Not registered</span>
       </div>
     </div>
 
     <div class="card">
-      <h3>视频</h3>
+      <h3>Video</h3>
       <div class="videos">
         <div class="video-box">
           <video id="localVideo" autoplay muted playsinline></video>
-          <div class="lbl"><span class="dot off" id="localDot"></span>本地</div>
+          <div class="lbl"><span class="dot off" id="localDot"></span>Local</div>
         </div>
         <div class="video-box">
           <video id="remoteVideo" autoplay playsinline></video>
-          <div class="lbl"><span class="dot off" id="remoteDot"></span>远端</div>
+          <div class="lbl"><span class="dot off" id="remoteDot"></span>Remote</div>
         </div>
       </div>
       <div class="toolbar">
@@ -130,7 +130,7 @@
   </div>
 
   <div class="incoming" id="incoming">
-    <div>📞 来电: <span class="from" id="inFrom">—</span> <span class="ring">🔔</span></div>
+    <div>📞 Incoming: <span class="from" id="inFrom">—</span> <span class="ring">🔔</span></div>
     <div>
       <button class="btn btn-green" onclick="doAccept()" style="margin-right:6px">Accept</button>
       <button class="btn btn-red"   onclick="doReject()">Reject</button>
@@ -140,15 +140,15 @@
   <div class="grid" style="margin-top:16px">
 
     <div class="card">
-      <h3>拨号 / 通话</h3>
+      <h3>Dial / Call</h3>
       <div class="row">
-        <label>被叫</label>
+        <label>Callee</label>
         <input id="target" value="1001">
         <button class="btn btn-green" id="btnCall" onclick="doCall()" disabled>📞 Call</button>
         <button class="btn btn-red"   id="btnHang" onclick="doHangup()" disabled>✕ Hangup</button>
       </div>
       <div class="row" style="margin-bottom:4px">
-        <span class="status" id="callStatus">空闲</span>
+        <span class="status" id="callStatus">Idle</span>
       </div>
       <div id="dtmfDisplay"></div>
       <div class="dialpad">
@@ -164,23 +164,23 @@
         <button onclick="doDialKey('*')">*</button>
         <button onclick="doDialKey('0')">0</button>
         <button onclick="doDialKey('#')">#</button>
-        <button class="btn btn-gray" style="font-size:13px;padding:6px" onclick="doDialKey('⌫')">⌫ 删除</button>
-        <button class="btn btn-gray wide" onclick="doDialKey('C')">C 清空</button>
+        <button class="btn btn-gray" style="font-size:13px;padding:6px" onclick="doDialKey('⌫')">⌫ Del</button>
+        <button class="btn btn-gray wide" onclick="doDialKey('C')">C Clear</button>
       </div>
     </div>
 
     <div class="card">
       <h3>DataChannel</h3>
       <div class="dc-area">
-        <input id="dcMsg" placeholder="输入消息，回车发送..." disabled onkeydown="if(event.key==='Enter') dcSend()">
+        <input id="dcMsg" placeholder="Type message, Enter to send..." disabled onkeydown="if(event.key==='Enter') dcSend()">
         <button class="btn btn-blue" onclick="dcSend()" id="btnDc" disabled>Send</button>
       </div>
-      <div class="dc-log" id="dcLog"><div class="sys">等待 DataChannel open...</div></div>
+      <div class="dc-log" id="dcLog"><div class="sys">Waiting for DataChannel open...</div></div>
     </div>
   </div>
 
   <div class="card" style="margin-top:16px">
-    <h3>SIP 实时日志</h3>
+    <h3>SIP Live Log</h3>
     <div class="sip-log" id="sipLog"></div>
   </div>
 

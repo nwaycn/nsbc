@@ -1,9 +1,10 @@
-//! CDR 历史查询（REQ-WEB-004 扩展 / REQ-WEB-013 持久化层）。
+//! CDR history query (REQ-WEB-004 extension / REQ-WEB-013 persistence layer).
 //!
-//! 依赖 NSBC_DB_DSN 环境变量配置的数据库连接池。未配置或初始化失败时
-//! 所有端点返回 503 Service Unavailable，前端显示"未配置持久化"提示。
+//! Depends on the database pool configured via the NSBC_DB_DSN env var. When not
+//! configured or initialization fails, all endpoints return 503 Service Unavailable,
+//! and the front-end shows a "persistence not configured" prompt.
 //!
-//! GET /cdrs — 分页查询，支持 caller/callee/时间窗过滤（L0 只读）
+//! GET /cdrs — paginated query with caller/callee/time window filters (L0 read-only)
 
 use std::sync::Arc;
 
@@ -38,9 +39,9 @@ pub struct CdrQueryParams {
 }
 fn default_limit() -> Option<u32> { Some(20) }
 
-/// GET /api/v1/cdrs — 分页 CDR 历史（L0 只读）。
+/// GET /api/v1/cdrs — paginated CDR history (L0 read-only).
 ///
-/// 响应格式：`{ items: [...], total: N }`；DB 未配置时返回 503。
+/// Response format: `{ items: [...], total: N }`; returns 503 when DB is not configured.
 async fn list_cdrs<C: CoreApi + Clone + 'static>(
     State(st): State<Arc<AppState<C>>>,
     Query(p): Query<CdrQueryParams>,

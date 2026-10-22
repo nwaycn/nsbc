@@ -1,15 +1,27 @@
-<!DOCTYPE html>
-<html lang="zh-CN">
+﻿<!DOCTYPE html>
+<html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>NSBC 管理台</title>
+  <title>NSBC Management Console</title>
   <script src="vendor/tailwindcss.js"></script>
   <link rel="stylesheet" href="vendor/fontawesome.css">
   <link rel="stylesheet" href="vendor/element-plus.css">
   <script src="vendor/vue.global.prod.js"></script>
   <script src="vendor/element-plus.js"></script>
   <script src="vendor/element-plus-icons.js"></script>
+  <script>
+    // i18n bootstrap — pick dictionary by saved preference or browser language.
+    // Must run before i18n.js / app-core.js (menu labels call t() at load time).
+    (function () {
+      var saved = null;
+      try { saved = localStorage.getItem('nsbc_lang'); } catch (e) {}
+      var lang = saved || ((navigator.language || '').indexOf('zh') === 0 ? 'zh' : 'en');
+      window.NSBC_LANG = lang;
+      if (lang === 'zh') document.write('<script src="js/lang-zh.js"><\/script>');
+    })();
+  </script>
+  <script src="js/i18n.js"></script>
   <style>
     [v-cloak] { display: none; }
     /* ===== 企业应用风格 ===== */
@@ -56,34 +68,34 @@
           <i class="fa-solid fa-server text-white text-lg"></i>
         </div>
         <div>
-          <h1 class="text-xl font-bold text-slate-800">宁卫SBC 管理台</h1>
-          <p class="text-xs text-slate-500">Nway Session Border Controller</p>
+          <h1 class="text-xl font-bold text-slate-800">{{ t('NSBC Console') }}</h1>
+          <p class="text-xs text-slate-500">{{ t('Session Border Controller') }}</p>
         </div>
       </div>
       <div class="space-y-4">
         <div class="flex items-center gap-3">
-          <label class="field-label w-16 flex-shrink-0 text-right mb-0">用户名</label>
+          <label class="field-label w-16 flex-shrink-0 text-right mb-0">{{ t('Username') }}</label>
           <input v-model="loginForm.username" class="field-input flex-1" placeholder="admin" autocomplete="username" @keyup.enter.prevent="login">
         </div>
         <div class="flex items-center gap-3">
-          <label class="field-label w-16 flex-shrink-0 text-right mb-0">密码</label>
+          <label class="field-label w-16 flex-shrink-0 text-right mb-0">{{ t('Password') }}</label>
           <input v-model="loginForm.password" type="password" class="field-input flex-1" placeholder="••••••••" autocomplete="current-password" @keyup.enter.prevent="login">
         </div>
         <div class="flex items-center gap-3">
-          <label class="field-label w-16 flex-shrink-0 text-right mb-0">验证码</label>
+          <label class="field-label w-16 flex-shrink-0 text-right mb-0">{{ t('Captcha') }}</label>
           <div class="flex items-center gap-2">
-            <input v-model="loginForm.captcha_code" class="field-input w-24" placeholder="验证码" maxlength="6" @keyup.enter.prevent="login">
+            <input v-model="loginForm.captcha_code" class="field-input w-24" :placeholder="t('Captcha')" maxlength="6" @keyup.enter.prevent="login">
             <div class="flex-shrink-0 relative">
               <div v-if="captchaSvg" v-html="captchaSvg"
                 class="h-9 w-24 border border-gray-300 rounded cursor-pointer overflow-hidden bg-white"
-                @click="refreshCaptcha" title="点击刷新验证码"></div>
+                @click="refreshCaptcha" :title="t('Click to refresh captcha')"></div>
               <div v-else class="h-9 w-24 border border-gray-300 rounded bg-gray-100 flex items-center justify-center text-xs text-gray-400">
-                <i class="fa-solid fa-spinner fa-spin mr-1"></i>加载
+                <i class="fa-solid fa-spinner fa-spin mr-1"></i>{{ t('Loading...') }}
               </div>
             </div>
             <button @click="refreshCaptcha" type="button"
               class="flex-shrink-0 p-2 border border-gray-300 rounded hover:bg-gray-50 text-gray-500 hover:text-blue-600"
-              title="刷新验证码">
+              :title="t('Refresh captcha')">
               <i class="fa-solid fa-rotate-right"></i>
             </button>
           </div>
@@ -91,12 +103,17 @@
         <button @click="login" :disabled="auth.loading"
           class="btn btn-primary w-full py-2.5 disabled:opacity-50 mt-2 shadow-md shadow-blue-500/20">
           <i class="fa-solid fa-right-to-bracket mr-2"></i>
-          {{ auth.loading ? '登录中…' : '登 录' }}
+          {{ auth.loading ? t('Signing in...') : t('Sign in') }}
         </button>
         <p v-if="auth.error" class="text-red-600 text-sm text-center bg-red-50 border border-red-100 rounded py-2 px-3 mt-2">{{ auth.error }}</p>
       </div>
-      <div class="mt-6 pt-4 border-t border-gray-100 text-center text-xs text-gray-400">
-        NSBC v2.5.5 · 安全登录 · IP {{ clientIp }}
+      <div class="mt-6 pt-4 border-t border-gray-100 text-xs text-gray-400 flex items-center justify-between">
+        <span>{{ t('NSBC v2.5.5 · Secure Login · IP') }} {{ clientIp }}</span>
+        <span class="flex items-center gap-1">
+          <button @click="setLang('en')" :class="getLang() === 'en' ? 'text-blue-600 font-semibold' : 'text-gray-400 hover:text-gray-600'" class="transition-colors">EN</button>
+          <span class="text-gray-300">|</span>
+          <button @click="setLang('zh')" :class="getLang() === 'zh' ? 'text-blue-600 font-semibold' : 'text-gray-400 hover:text-gray-600'" class="transition-colors">中文</button>
+        </span>
       </div>
     </div>
   </div>
@@ -108,7 +125,7 @@
         <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center shadow-lg">
           <i class="fa-solid fa-server text-white text-sm"></i>
         </div>
-        <span class="font-semibold text-white text-sm">NSBC 管理台</span>
+        <span class="font-semibold text-white text-sm">{{ t('NSBC Console') }}</span>
       </div>
       <nav class="flex-1 p-2 space-y-0.5 text-sm overflow-auto">
         <a v-for="m in menuItems" :key="m.path"
@@ -122,13 +139,13 @@
       <div class="p-3 border-t border-slate-700 text-xs text-slate-400">
         <div class="flex items-center gap-2 mb-1">
           <i class="fa-solid fa-building text-blue-400"></i>
-          <span class="text-slate-300">当前租户</span>
+          <span class="text-slate-300">{{ t('Current Tenant') }}</span>
         </div>
         <el-select v-model="tenantId" size="small" style="width:100%"
-          placeholder="加载中..." :loading="tenantLoading"
+          :placeholder="t('Loading...')" :loading="tenantLoading"
           @change="changeTenant">
-          <el-option v-for="t in tenantOptions" :key="t.value" :value="t.value"
-            :label="t.label"></el-option>
+          <el-option v-for="to in tenantOptions" :key="to.value" :value="to.value"
+            :label="to.label"></el-option>
         </el-select>
       </div>
       <div class="p-3 border-t border-slate-700 text-xs text-slate-400">
@@ -140,9 +157,16 @@
             {{ auth.role }}
           </span>
         </div>
-        <a href="#/login" @click.prevent="logout" class="hover:text-red-400 transition-colors">
-          <i class="fa-solid fa-right-from-bracket mr-1"></i>登出
-        </a>
+        <div class="flex items-center justify-between">
+          <a href="#/login" @click.prevent="logout" class="hover:text-red-400 transition-colors">
+            <i class="fa-solid fa-right-from-bracket mr-1"></i>{{ t('Logout') }}
+          </a>
+          <span class="flex items-center gap-1">
+            <button @click="setLang('en')" :class="getLang() === 'en' ? 'text-blue-400 font-semibold' : 'text-slate-500 hover:text-slate-300'" class="transition-colors">EN</button>
+            <span class="text-slate-600">|</span>
+            <button @click="setLang('zh')" :class="getLang() === 'zh' ? 'text-blue-400 font-semibold' : 'text-slate-500 hover:text-slate-300'" class="transition-colors">中文</button>
+          </span>
+        </div>
       </div>
     </aside>
 
@@ -175,29 +199,32 @@
       <webrtc-page      v-else-if="route === '/webrtc'"></webrtc-page>
       <div v-else class="text-center text-gray-500 py-20">
         <i class="fa-solid fa-hand-point-right text-4xl mb-4"></i>
-        <p>从左侧选择菜单项开始</p>
+        <p>{{ t('Select a module from the sidebar to start') }}</p>
       </div>
     </main>
   </div>
 </div>
 
 <!-- 应用核心（API、编辑器、工厂、App 创建） -->
-<script src="js/app-core.js?v=20261019a"></script>
+<script src="js/app-core.js?v=20261022a"></script>
 <!-- CRUD 实体页面（extensions/gateways/trunks 等） -->
-<script src="js/pages-crud.js"></script>
+<script src="js/pages-crud.js?v=20261022a"></script>
 <!-- 实时监控面板（realtime/channels/cdrs 等） -->
-<script src="js/pages-live.js?v=20261019a"></script>
-<script src="js/pages-security.js?v=20261018d"></script>
+<script src="js/pages-live.js?v=20261022a"></script>
+<script src="js/pages-security.js?v=20261022a"></script>
 <!-- JsSIP 3.10.0 UMD — WebRTC 共享电话层（addTrack patch + SDP 工具 + Hold/DTMF） -->
 <script src="js/jssip-3.10.0.min.js"></script>
 <script src="js/nsbc-phone.js?v=20261018b"></script>
 <!-- WebRTC 真实互通页面（Vue 组件 + JsSIP UA + WSS + STUN） -->
-<script src="js/pages-webrtc.js?v=20261018b"></script>
+<script src="js/pages-webrtc.js?v=20261022a"></script>
 
 <!-- 最后：注册 Element Plus + 图标，挂载 App -->
 <script>
 /* global app, ElementPlus, ElementPlusIconsVue */
 app.use(ElementPlus);
+app.config.globalProperties.t = window.t;
+app.config.globalProperties.getLang = window.getLang;
+app.config.globalProperties.setLang = window.setLang;
 if (window.ElementPlusIconsVue) {
   for (const [key, component] of Object.entries(window.ElementPlusIconsVue)) {
     app.component(key, component);

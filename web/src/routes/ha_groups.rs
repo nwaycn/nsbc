@@ -1,4 +1,4 @@
-//! 高可用组 REST。6 端点：list/get/create/update/delete/reload。
+//! High-availability group REST. Six endpoints: list/get/create/update/delete/reload.
 
 use std::sync::Arc;
 

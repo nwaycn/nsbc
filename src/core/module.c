@@ -200,7 +200,7 @@ int modmgr_load(nsbc_modmgr_t *m, const char *so_path)
     char *ext = strrchr(modname, '.');
     if (ext) *ext = '\0';
     if (!modname[0]) {
-        llog(LOG_ERR, "mod", "dlopen %s: 无法提取模块名", so_path);
+        llog(LOG_ERR, "mod", "dlopen %s: unable to extract module name", so_path);
         return NSBC_INVAL;
     }
 
@@ -259,7 +259,7 @@ int modmgr_load_all(nsbc_modmgr_t *m, const char *list_path)
 
     FILE *f = fopen(list_path, "r");
     if (!f) {
-        llog(LOG_WARN, "mod", "mod.load not found: %s (0 个动态模块)", list_path);
+        llog(LOG_WARN, "mod", "mod.load not found: %s (0 dynamic modules)", list_path);
         return NSBC_NOENT; /* 不是错误——可以没有动态模块 */
     }
 

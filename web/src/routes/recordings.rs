@@ -1,17 +1,18 @@
-//! 录音相关路由：
-//!   GET /api/v1/recordings        — 分页列表（受 RBAC 保护，L0 只读）
-//!   GET /recordings/*path         — 公开文件下载（HTML5 <audio> 无法带 JWT）
+//! Recording-related routes:
+//!   GET /api/v1/recordings        — paginated list (protected by RBAC, L0 read-only)
+//!   GET /recordings/*path         — public file download (HTML5 <audio> cannot carry JWT)
 //!
-//! 文件下载路由安全：
-//!   1) 根目录由配置 `recording.path` 决定（默认 `/var/lib/nsbc/recordings`）
-//!   2) URL 中的 `*path` 会去掉所有 `..` 组件，防止目录穿越
-//!   3) canonicalize 后必须仍在根目录内，否则 403
-//!   4) 非 .wav / .g711a / .pcm 后缀直接 403（只允许录音文件）
-//!   5) CSP 需允许 audio 加载（img-src 已覆盖 data:；audio-src 默认继承 default-src）
+//! File download route security:
+//!   1) Root directory decided by config `recording.path` (default `/var/lib/nsbc/recordings`)
+//!   2) `..` components are stripped from the URL `*path` to prevent directory traversal
+//!   3) After canonicalization, the path must still be within the root directory or 403
+//!   4) Non .wav / .g711a / .pcm extensions directly return 403 (only allow recording files)
+//!   5) CSP must allow audio loading (img-src already covers data:; audio-src inherits
+//!      default-src by default)
 //!
-//! 录音文件命名：nsbcd recording_stop 时输出到 cfg recording.path 下，
-//! 路径格式由 `rec_path_template` 决定（默认 {caller}-{callee}-{callid}.wav
-//! 或 yyyymmdd/callid_mix_seq.wav），CDR metadata.rec_path 存的就是这个相对路径。
+//! Recording file naming: nsbcd recording_stop writes to cfg recording.path;
+//! path format decided by `rec_path_template` (default {caller}-{callee}-{callid}.wav
+//! or yyyymmdd/callid_mix_seq.wav); CDR metadata.rec_path stores exactly this relative path.
 use tracing;
 
 use std::path::{Path, PathBuf};
@@ -31,7 +32,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::{AppState, CoreApi};
 
 // ============================================================
-// 受 RBAC 保护的录音列表
+// RBAC-protected recording list
 // ============================================================
 
 pub fn router<C>() -> Router<Arc<AppState<C>>>
@@ -52,15 +53,15 @@ pub struct RecordingQueryParams {
     pub offset: Option<u32>,
 }
 
-/// GET /api/v1/recordings — 分页录音列表（L0 只读）。
+/// GET /api/v1/recordings — paginated recording list (L0 read-only).
 ///
-/// 查询参数（全可选）：
-///   `caller` / `callee`  — 模糊匹配（LIKE %X%）
-///   `from` / `to`        — start_time ISO 字符串（>= 和 <=）
-///   `limit`              — 1-500，默认 50
-///   `offset`             — 默认 0
+/// Query params (all optional):
+///   `caller` / `callee`  — fuzzy match (LIKE %X%)
+///   `from` / `to`        — start_time ISO string (>= and <=)
+///   `limit`              — 1-500, default 50
+///   `offset`             — default 0
 ///
-/// 响应：`{ items: RecordingRow[], total: N }`；DB 未配置 → 503。
+/// Response: `{ items: RecordingRow[], total: N }`; DB not configured → 503.
 async fn list_recordings<C: CoreApi + Clone + 'static>(
     State(st): State<Arc<AppState<C>>>,
     Query(p): Query<RecordingQueryParams>,
@@ -88,11 +89,11 @@ async fn list_recordings<C: CoreApi + Clone + 'static>(
 }
 
 // ============================================================
-// 公开文件下载（不走 RBAC）
+// Public file download (no RBAC)
 // ============================================================
 
-/// 公开路由（挂在 app_router 外层，不带 /api/v1 前缀，不带 RBAC 层）。
-/// 注意：走 `.with_state(state)` 得到 `Router<()>`，与 api_router 同模式。
+/// Public route (mounted outside app_router, no /api/v1 prefix, no RBAC layer).
+/// Note: `.with_state(state)` yields `Router<()>`, same pattern as api_router.
 pub fn public_file_router<C>(state: Arc<AppState<C>>) -> Router<()>
 where
     C: CoreApi + Clone + 'static,
@@ -102,7 +103,7 @@ where
         .with_state(state)
 }
 
-/// 只允许的录音文件后缀（白名单，防任意文件下载）。
+/// Allowed recording file extensions only (whitelist, prevent arbitrary file download).
 const ALLOWED_EXTS: &[&str] = &["wav", "g711a", "g711u", "pcm", "raw"];
 
 async fn download_recording<C: CoreApi + Clone + 'static>(
@@ -112,7 +113,8 @@ async fn download_recording<C: CoreApi + Clone + 'static>(
 ) -> Response {
     let root = st.recording_root.clone();
 
-    // 0) 先检查 root 目录是否存在（提前报清楚错误，不要到后面 canonicalize 文件才 404）
+    // 0) Pre-check the root directory exists (fail early with a clear error, don't wait
+    //    for a later canonicalize on a file that's not there)
     if !root.exists() || !root.is_dir() {
         return (
             StatusCode::NOT_FOUND,
@@ -125,7 +127,7 @@ async fn download_recording<C: CoreApi + Clone + 'static>(
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "recording root resolve failed").into_response(),
     };
 
-    // 1) 白名单后缀检查
+    // 1) Whitelist extension check
     let p = Path::new(&rel);
     let ext_ok = p.extension()
         .and_then(|e| e.to_str())
@@ -135,7 +137,7 @@ async fn download_recording<C: CoreApi + Clone + 'static>(
         return (StatusCode::FORBIDDEN, "forbidden extension").into_response();
     }
 
-    // 2) 防目录穿越：去掉所有 ".." 和 "."
+    // 2) Directory-traversal defense: strip all ".." and "."
     let safe_rel: String = rel
         .split('/')
         .filter(|seg| !seg.is_empty() && *seg != ".." && *seg != ".")
@@ -145,9 +147,10 @@ async fn download_recording<C: CoreApi + Clone + 'static>(
         return (StatusCode::BAD_REQUEST, "empty path").into_response();
     }
 
-    // 保险层：老版本 nsbcd 写 CDR rec_path 时会带 base_dir 前缀
-    // （如 "../recordings/20261011/xxx.wav" → 浏览器解析成 recordings/20261011/xxx.wav）
-    // 如果 safe_rel 第一段碰巧等于 root 的目录名，剥掉它
+    // Insurance layer: older nsbcd versions wrote CDR rec_path with a base_dir prefix
+    // (e.g. "../recordings/20261011/xxx.wav" → browser parses it as
+    // recordings/20261011/xxx.wav). If safe_rel's first segment happens to match the
+    // root's directory name, strip it.
     let safe_rel = {
         let bn = root_canon.file_name().and_then(|n| n.to_str().map(|s| s.to_string()));
         if let Some(bn) = bn {
@@ -172,7 +175,7 @@ async fn download_recording<C: CoreApi + Clone + 'static>(
 
     let full: PathBuf = root.join(&safe_rel);
 
-    // 3) canonicalize 后必须仍在 root 内
+    // 3) After canonicalization the path must still be within root
     tracing::info!(
         "recordings req: safe_rel={}, full={}, root={}",
         safe_rel, full.display(), root.display()
@@ -185,7 +188,7 @@ async fn download_recording<C: CoreApi + Clone + 'static>(
         return (StatusCode::FORBIDDEN, "path traversal blocked").into_response();
     }
 
-    // 4) 读文件 + Content-Type
+    // 4) Read file + Content-Type
     let data = match tokio::fs::read(&canon).await {
         Ok(d) => d,
         Err(_) => return (StatusCode::NOT_FOUND, "not found").into_response(),
@@ -197,7 +200,7 @@ async fn download_recording<C: CoreApi + Clone + 'static>(
         _             => "application/octet-stream",
     };
 
-    // 5) Range 请求支持（简单实现：只处理 bytes=start- 格式）
+    // 5) Range request support (simple implementation: only handles bytes=start- format)
     if let Some(range) = headers.get(header::RANGE) {
         if let Ok(s) = range.to_str() {
             if let Some(start_str) = s.strip_prefix("bytes=").and_then(|v| v.split('-').next()) {

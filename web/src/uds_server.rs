@@ -1,17 +1,18 @@
-//! NSBC UDS Data Service — C 核心→Web 方向 UDS Server（REQ-DATA-SVC-002 P0，统一帧协议）。
+//! NSBC UDS Data Service — C core→Web direction UDS Server (REQ-DATA-SVC-002 P0, unified
+//! frame protocol).
 //!
-//! 帧格式（与 src/include/uds_client.h 完全对齐）：
-//!   偏移  长度  字段
-//!     0     1    magic         固定 0x01
-//!     1     1    frame_type    0x1=HELLO  0x2=HELLO_ACK  0x3=CMD_REQ  0x4=CMD_RSP
-//!                              0x5=PUSH    0x6=ACK         0x7=HB       0xF=ERR
-//!     2     4    total_len     大端 NBO，整帧字节数（含 12B 固定头）
-//!     6     4    ticket        大端 NBO，REQ→RSP 配对；PUSH/HELLO/HB 用 0
-//!    10     1    flags         bit0=more_fragment  bit1=compressed  bit2-7=0
-//!    11     1    rsvd          置 0
-//!    12     N    payload       NBO JSON
+//! Frame format (fully aligned with src/include/uds_client.h):
+//!   Offset  Length  Field
+//!     0       1    magic         fixed 0x01
+//!     1       1    frame_type    0x1=HELLO  0x2=HELLO_ACK  0x3=CMD_REQ  0x4=CMD_RSP
+//!                                0x5=PUSH    0x6=ACK         0x7=HB        0xF=ERR
+//!     2       4    total_len     big-endian NBO, whole-frame byte count (incl. 12B fixed hdr)
+//!     6       4    ticket        big-endian NBO, REQ→RSP pairing; 0 for PUSH/HELLO/HB
+//!    10       1    flags         bit0=more_fragment  bit1=compressed  bit2-7=0
+//!    11       1    rsvd          set to 0
+//!    12       N    payload       NBO JSON
 //!
-//! 固定头 = 12 字节。payload_len = total_len - 12。
+//! Fixed header = 12 bytes. payload_len = total_len - 12.
 //! DATA_PUSH payload: {"kind":"cdr","payload":{...}}
 //!                    {"kind":"register","payload":{...}}
 //!                    {"kind":"runtime","payload":{...}}
@@ -19,7 +20,8 @@
 //! CMD_REQ  payload: {"cmd":"ext.ha1","user":"1000","realm":"nsbc.local"}
 //!           → CMD_RSP {"ok":true,"ha1":..,"clip":..,"clir":..,"max_contacts":..}
 //!                    {"ok":false,"reason":"not_found|disabled|db_error|unknown_cmd"}
-//! HELLO（核心启动/重连）→ HELLO_ACK + 触发 [`crate::sync`] 全量配置推送。
+//! HELLO (core start/reconnect) → HELLO_ACK + trigger full config push via
+//! [`crate::sync`].
 
 use std::sync::Arc;
 
@@ -87,9 +89,10 @@ pub fn start<C: crate::coreclient::CoreApi + Clone + Send + Sync + 'static>(
 
 // --- Unix-only ---
 
-/// 连接级循环：decode 帧 → dispatch → 回 ACK，持续读到 EOF/错误。
-/// 任何早退（EOF / 错误 / 格式异常）都会走 finally 块把 data_pushed 置 false，
-/// 让 poller 恢复轮询兜底（REQ-DATA-002）。
+/// Per-connection loop: decode frame → dispatch → send ACK; keep reading until EOF/error.
+/// Any early exit (EOF / error / format anomaly) goes through a finally-style block that
+/// sets data_pushed back to false, so the poller resumes polling as a fallback
+/// (REQ-DATA-002).
 #[cfg(unix)]
 async fn handle_conn<C: crate::coreclient::CoreApi + Clone + Send + Sync + 'static>(
     stream: &mut tokio::net::UnixStream,
@@ -166,16 +169,17 @@ async fn handle_conn<C: crate::coreclient::CoreApi + Clone + Send + Sync + 'stat
         }
     }.await;
 
-    // REQ-DATA-002：UDS 断链 → data_pushed 置回 false，poller 恢复轮询兜底。
-    // 多连接场景：任一 handle_conn 退出都置 false——只要有一个活着，下一个 accept
-    // 就会重新置 true；短暂 false 只会让 poller 多跑几轮，不影响正确性。
+    // REQ-DATA-002: UDS link drops → data_pushed back to false, poller resumes.
+    // Multi-connection scenario: any handle_conn exit sets false — as long as one is
+    // alive the next accept will set it back true; a brief false only causes a few
+    // extra poller rounds, no correctness impact.
     state.data_pushed.store(false, Ordering::Relaxed);
     tracing::debug!(result_ok = result.is_ok(), "UDS client disconnected, poller re-enabled");
 
     result
 }
 
-/// 组帧：12B 固定头（type + ticket）+ payload。
+/// Frame builder: 12B fixed header (type + ticket) + payload.
 fn build_frame(frame_type: u8, ticket: u32, payload: &str) -> Vec<u8> {
     let total_len = (FRAME_HDR_LEN + payload.len()) as u32;
     let mut out = Vec::with_capacity(total_len as usize);
@@ -203,7 +207,7 @@ fn bad_frame_ack(ticket: u32, msg: &[u8]) -> Vec<u8> {
     out
 }
 
-/// DATA_PUSH / CMD_REQ payload 分发。payload = {"kind":"...", "payload":...}
+/// DATA_PUSH / CMD_REQ payload dispatch. payload = {"kind":"...", "payload":...}
 async fn dispatch_push<C: crate::coreclient::CoreApi + Clone + Send + Sync + 'static>(
     payload: &str,
     state: &Arc<AppState<C>>,
@@ -226,21 +230,23 @@ async fn dispatch_push<C: crate::coreclient::CoreApi + Clone + Send + Sync + 'st
         "session" => {
             let r = dispatch_session_push(&state.db, &body).await;
             if r.is_ok() {
-                // nsbc-esl-web §8#1：SESSION 事件 fan-out 给 /calls/stream（SSE）
-                // 订阅者。send 仅在无订阅者时返回 Err（忽略）；环形缓冲满则丢最旧，
-                // 绝不阻塞——保持 UDS dispatch 热路径无反压（项目硬约束）。
+                // nsbc-esl-web §8#1: SESSION event fan-out to /calls/stream (SSE)
+                // subscribers. send returns Err only when no subscribers (ignored);
+                // if the ring buffer is full we drop the oldest — we NEVER block —
+                // keeping UDS dispatch hot path back-pressure free (project hard constraint).
                 let evt = serde_json::json!({"kind": "session", "payload": body}).to_string();
                 let _ = state.calls_tx.send(evt);
             }
             r
         }
         "vad_event" => {
-            // REQ-AI-BARGEIN-001：VAD 状态变化（SILENCE↔SPEECH）fan-out 给 ai_agent
-            // 模块做 barge-in 决策。payload = {event:"VAD_EVENT",call_key:"0x...",
-            // leg:0|1, state:"SPEECH|SILENCE", rms:N, ts_ns:N}。
+            // REQ-AI-BARGEIN-001: VAD state change (SILENCE↔SPEECH) fan-out to ai_agent
+            // module for barge-in decision. payload = {event:"VAD_EVENT",call_key:"0x...",
+            // leg:0|1, state:"SPEECH|SILENCE", rms:N, ts_ns:N}.
             let evt = serde_json::json!({"kind": "vad_event", "payload": body}).to_string();
             let _ = state.vad_tx.send(evt);
-            // VAD 事件不写 DB（高频、瞬时状态，CDR 已盖最终结果），直接返回 Ok
+            // VAD events don't write to DB (high-frequency, transient state; CDR covers
+            // the final result), return Ok directly
             Ok(())
         },
         "" => return Err("missing kind".into()),
@@ -253,13 +259,13 @@ async fn dispatch_push<C: crate::coreclient::CoreApi + Clone + Send + Sync + 'st
     }
 }
 
-/// CMD_REQ payload 分发：C 核心实时查询（REQ-DATA-SVC-003 混合式兜底）。
+/// CMD_REQ payload dispatch: C core real-time query (REQ-DATA-SVC-003 hybrid fallback).
 ///
-/// payload = {"cmd":"ext.ha1","user":"1000","realm":"nsbc.local"}，
-/// 用于 REGISTER 认证时 C 侧内存表未命中 → 经 UDS 查 Web DB。
-/// 回复永远 Ok(body)（错误编码进 reason），Err 仅限 JSON 解析失败。
-/// reason 语义（与 C 侧负缓存 TTL 约定）：
-///   not_found / disabled → 负缓存 30s；db_error → 负缓存 3s
+/// payload = {"cmd":"ext.ha1","user":"1000","realm":"nsbc.local"},
+/// used when REGISTER auth misses in C-side in-memory table → query Web DB via UDS.
+/// Reply is always Ok(body) (errors encoded in reason); Err only for JSON parse failure.
+/// Reason semantics (agreed with C-side negative-cache TTL):
+///   not_found / disabled → negative cache 30s; db_error → negative cache 3s
 async fn dispatch_cmd_req<C: crate::coreclient::CoreApi + Clone + Send + Sync + 'static>(
     payload: &str,
     state: &Arc<AppState<C>>,
@@ -317,7 +323,8 @@ async fn write_cdr(db: &crate::db::Db, v: &serde_json::Value) -> Result<(), Stri
     let req = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
     let ms = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
     let num = |k: &str| v.get(k).and_then(|x| x.as_i64()).unwrap_or(0) as u32;
-    // codec / IP 扩展字段（C 侧 CDR END 完整填充；早期 START/ANSWER 事件可能空）
+    // codec / IP extension fields (C-side CDR END fills fully; early START/ANSWER events
+    // may be empty)
     let from_ip   = opt_str(v, "from_ip");
     let codec_a   = opt_str(v, "codec_a");
     let codec_b   = opt_str(v, "codec_b");
@@ -359,7 +366,7 @@ async fn upsert_registration(db: &crate::db::Db, v: &serde_json::Value) -> Resul
     let instance_id = v.get("instance_id").and_then(|x| x.as_str()).unwrap_or("");
     let agent = opt_str(v, "agent");
     let expires_sec = v.get("expires_sec").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-    // NAT 元数据（REQ-NAT-001）：C 侧 registrar.c 推送
+    // NAT metadata (REQ-NAT-001): pushed by C-side registrar.c
     let received_ip    = opt_str(v, "received_ip");
     let received_port  = v.get("received_port").and_then(|x| x.as_i64());
     let nat_detected   = v.get("nat_detected").and_then(|x| x.as_i64());
@@ -406,30 +413,33 @@ async fn insert_audit(db: &crate::db::Db, v: &serde_json::Value) -> Result<(), S
         .map_err(|e| e.to_string())
 }
 
-/// session.write：C 侧 data.sock 推送的 SESSION 事件 → calls 表 UPSERT。
-/// payload 字段：call_id(必填) / event / state / from / to / cause / dir
+/// session.write: SESSION events pushed by C-side data.sock → UPSERT into calls table.
+/// payload fields: call_id (required) / event / state / from / to / cause / dir
 ///
-/// 空串保护（REQUIRE-DATA-001）：C 侧有些事件（record_start/stop、dtmf、originate
-/// 路早期版本）payload 缺 state/event/dir 字段，若直接把空串传给 upsert_call 会
-/// 把 calls 表已有 state/event 硬覆盖成空（from/to 已有空串保护但 state/event
-/// 没有）。此处统一：空串字段 → 不更新，沿用 calls 表已有值。dir 默认 inbound
-/// 仍保留（originate 路 payload 总是显式给 "outbound"，入向总是显式 "inbound"，
-/// 默认值仅兜底）。
+/// Empty-string protection (REQUIRE-DATA-001): some C-side events (record_start/stop,
+/// dtmf, early originate path) have payload missing state/event/dir fields. Passing
+/// empty strings directly into upsert_call would hard-overwrite existing state/event
+/// in the calls table with empty values (from/to already have empty-string protection,
+/// state/event did not). Uniformly here: empty-string fields → don't update, keep
+/// existing calls table values. dir default inbound is still retained (originate path
+/// payload always explicitly sends "outbound"; inbound always explicitly sends "inbound";
+/// default value is only a fallback).
 async fn dispatch_session_push(db: &crate::db::Db, v: &serde_json::Value) -> Result<(), String> {
     let call_id = v.get("call_id").and_then(|x| x.as_str()).unwrap_or("");
     if call_id.is_empty() {
         return Err("missing call_id".into());
     }
-    // 空串 → 特殊哨兵 "''"（SQL CASE 里匹配空串），非空 → 原值
+    // Empty string → special sentinel "''" (matched in SQL CASE for empty string),
+    // non-empty → original value
     let event = opt_str(v, "event").unwrap_or_default();
     let state = opt_str(v, "state").unwrap_or_default();
     let from  = opt_str(v, "from").unwrap_or_default();
     let to    = opt_str(v, "to").unwrap_or_default();
     let cause = v.get("cause").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
     let dir   = opt_str(v, "dir").unwrap_or_else(|| "inbound".to_string());
-    // REQ-CDR-002 扩展字段：from_ip / codec_a / codec_b / a_peer_ip / b_peer_ip
-    // C 侧 CDR END 链路（signaling.c + cdr_event_to_json）完整填充；
-    // START/ANSWER 早期事件可能为 empty string → SQL CASE WHEN 保留已有值。
+    // REQ-CDR-002 extension fields: from_ip / codec_a / codec_b / a_peer_ip / b_peer_ip
+    // C-side CDR END chain (signaling.c + cdr_event_to_json) fills completely; early
+    // START/ANSWER events may be empty → SQL CASE WHEN keeps existing values.
     let from_ip   = opt_str(v, "from_ip").unwrap_or_default();
     let codec_a   = opt_str(v, "codec_a").unwrap_or_default();
     let codec_b   = opt_str(v, "codec_b").unwrap_or_default();

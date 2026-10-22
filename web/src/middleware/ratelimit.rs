@@ -1,12 +1,12 @@
-//! per-IP 接口限流中间件（REQ-WEB-009）。
+﻿//! Per-IP interface rate-limiting middleware (REQ-WEB-009).
 //!
-//! 挂在版本治理之后、rbac/业务之前（版本头非法的请求 400，不消耗配额）。
-//! 三桶：/auth/login、/auth/refresh、其余 /api（命令执行面），阈值见
-//! [`crate::auth::limiter::Limits`]；超限 429 + Retry-After，审计+告警。
+//! Mounted after version governance, before RBAC/business (requests with invalid version header get 400 and do not consume quota).
+//! Three buckets: /auth/login, /auth/refresh, and the rest of /api (command execution surface); thresholds in
+//! [`crate::auth::limiter::Limits`]; exceeding limits returns 429 + Retry-After, with audit + alerting.
 //!
-//! 来源 IP 取 ConnectInfo（生产 serve 以 into_make_service_with_connect_info
-//! 装配）；UA 经 PeerCtx 一并注入，供下游审计复用。无 ConnectInfo
-//! （oneshot 测试/非 TCP 接入）时 ip="-"，同样计入独立桶（不免限）。
+//! Source IP taken from ConnectInfo (production serve is mounted with into_make_service_with_connect_info
+//! assembly); UA is also injected via PeerCtx for downstream audit reuse. When ConnectInfo is absent
+//! (oneshot tests / non-TCP access), ip="-", still counts against its own bucket (no exemption).
 
 use std::sync::Arc;
 
@@ -59,7 +59,7 @@ pub async fn enforce<C: CoreApi + Clone + 'static>(
         );
         return Err(ApiError::RateLimited { retry_after });
     }
-    // 通过后 PeerCtx 供 rbac/handler 审计复用，客户端无法伪造。
+    // PeerCtx is reused by rbac/handler for audit after passing; client cannot forge it.
     req.extensions_mut().insert(peer);
     Ok(next.run(req).await)
 }

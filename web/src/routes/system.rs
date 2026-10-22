@@ -1,4 +1,5 @@
-//! 系统接口：版本发现、健康检查、综合状态（REQ-WEB-004/015，+ REQ-CCMD-001 status）。
+//! System interface: version discovery, health check, aggregated status
+//! (REQ-WEB-004/015, + REQ-CCMD-001 status).
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -19,8 +20,8 @@ where
         .route("/status", get(status::<C>))
 }
 
-/// GET /api/v1/version：边车版本 + 核心实时版本（控制口 `version`）、
-/// 支持的 API 主版本。核心不可达按 REQ-WEB-014 映射 502/504。
+/// GET /api/v1/version: sidecar version + core real-time version (control socket
+/// `version`) and supported API major. Core unreachable maps to 502/504 per REQ-WEB-014.
 async fn version<C: CoreApi + Clone + 'static>(
     State(st): State<Arc<AppState<C>>>,
 ) -> ApiResult<Json<serde_json::Value>> {
@@ -32,15 +33,15 @@ async fn version<C: CoreApi + Clone + 'static>(
     })))
 }
 
-/// GET /api/v1/status —— REQ-CCMD-001 L1 综合状态快照：
-/// 活动/累计/失败呼叫、注册数、SIP Profile 数、启动后运行时长 ms。
+/// GET /api/v1/status — REQ-CCMD-001 L1 aggregated status snapshot:
+/// active/total/failed calls, registration count, SIP Profile count, uptime ms.
 async fn status<C: CoreApi + Clone + 'static>(
     State(st): State<Arc<AppState<C>>>,
 ) -> ApiResult<Json<StatusInfo>> {
     Ok(Json(st.core.status().await?))
 }
 
-/// GET /health：不带鉴权，供本机/容器探活（不暴露业务信息）。
+/// GET /health: no auth, for host/container liveness probing (no business info exposed).
 pub async fn health() -> &'static str {
     "OK\n"
 }

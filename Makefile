@@ -1,52 +1,52 @@
-# NSBC 核心守护进程构建（REQ-ENV/LANG：Linux x86_64，GCC 4.8 兼容）
+# NSBC core daemon build (REQ-ENV/LANG: Linux x86_64, GCC 4.8 compatible)
 # =====================================================================
-# FreeSWITCH 风格双控：
-#   编译时  ./configure [--with-modules=a,b,c] [--without-modules=x,y,z]
-#           读 conf/modules.conf → 分 STATIC/DYNAMIC 两组
-#           生成 .config/config.mk + src/core/builtin_modules.gen.inc + build/mod/mod.load
-#   运行时  nsbc.yaml modules.enable / modules.disable 段
+# FreeSWITCH-style dual control:
+#   build-time  ./configure [--with-modules=a,b,c] [--without-modules=x,y,z]
+#           reads conf/modules.conf -> splits into STATIC/DYNAMIC groups
+#           generates .config/config.mk + src/core/builtin_modules.gen.inc + build/mod/mod.load
+#   runtime  nsbc.yaml modules.enable / modules.disable section
 # =====================================================================
 #
-#   ./configure                    # 读本文件默认 modules.conf + make
-#   make                           # 编译 nsbcd + 选中的 .so
-#   make check                     # 构建并运行单元测试
-#   make install                   # 安装 nsbcd + .so + conf
-#   make clean                     # 清 build/（含 .so）
+#   ./configure                    # read default modules.conf + make
+#   make                           # build nsbcd + selected .so
+#   make check                     # build and run unit tests
+#   make install                   # install nsbcd + .so + conf
+#   make clean                     # clean build/ (including .so)
 #
-# 可选开关（./configure 或环境变量传）：
-#   NSBC_WITH_OPENSSL=1   SIP TLS + DTLS-SRTP（-lssl -lcrypto）
-#   NSBC_WITH_SRTP=1      libsrtp2 媒体加密（-lsrtp2）
-#   NSBC_WITH_SQLITE=1    SQLite WAL（-lsqlite3）
-#   NSBC_WITH_BCG729=1    G.729 Annex B（bcg729 vendored 源码）
-#   NSBC_WITH_DLOPEN=1    动态模块加载（默认开，关闭后不编 mod_*.so）
-#   NSBC_WITH_CURL=1      cURL —— ai_dialog 真 ASR/TTS（Whisper + ElevenLabs），pkg-config 找
-#                         不装 libcurl 时可设 0 走 mock 模式注入静音帧
+# Optional flags (passed via ./configure or env vars):
+#   NSBC_WITH_OPENSSL=1   SIP TLS + DTLS-SRTP (-lssl -lcrypto)
+#   NSBC_WITH_SRTP=1      libsrtp2 media encryption (-lsrtp2)
+#   NSBC_WITH_SQLITE=1    SQLite WAL (-lsqlite3)
+#   NSBC_WITH_BCG729=1    G.729 Annex B (bcg729 vendored source)
+#   NSBC_WITH_DLOPEN=1    dynamic module loading (default on, off skips building mod_*.so)
+#   NSBC_WITH_CURL=1      cURL —— real ASR/TTS for ai_dialog (Whisper + ElevenLabs), pkg-config lookup
+#                         when libcurl not installed, set 0 for mock mode injecting silent frames
 
 CC      ?= gcc
 BUILD   ?= build
 CONFIG_DIR ?= .
 NPROC   ?= $(shell nproc 2>/dev/null || echo 2)
 
-# 默认启用（./configure 也会覆盖）
+# enabled by default (./configure also overrides)
 NSBC_WITH_OPENSSL ?= 1
 NSBC_WITH_SRTP    ?= 1
 NSBC_WITH_BCG729  ?= 1
 NSBC_WITH_DLOPEN  ?= 1
-NSBC_WITH_CURL    ?= 0   # 默认关：生产 ASR/TTS 需要 libcurl（远程机要 pkg-config libcurl）
-NSBC_WITH_SQLITE  ?= 0   # 架构硬约束：C 核心 nsbcd 不访问数据库；SQLite 在 Rust Web 边车侧
-                         # 设 0 时 dbal/cdr_wal 里的 sqlite3 代码被 #ifdef NSBC_WITH_SQLITE 跳过
-                         # 设 1 时必须同时确保系统有 libsqlite3-dev 且 LDLIBS 有 -lsqlite3
+NSBC_WITH_CURL    ?= 0   # off by default: production ASR/TTS needs libcurl (remote machine needs pkg-config libcurl)
+NSBC_WITH_SQLITE  ?= 0   # architectural hard constraint: C core nsbcd does not access DB; SQLite is on Rust Web side
+                         # when set to 0, sqlite3 code in dbal/cdr_wal is skipped by #ifdef NSBC_WITH_SQLITE
+                         # when set to 1, system must have libsqlite3-dev and LDLIBS must include -lsqlite3
 
 # =====================================================================
-# configure 产物优先覆盖（-include 允许文件不存在 → fallback 下面手工默认值）
+# configure artifacts take precedence (-include allows missing file -> fallback to defaults below)
 # =====================================================================
-# config.mk 放在 .config/（项目根），make clean 只删 build/ 不动它。
-# 过期 gen.inc 防御：如果 builtin_modules.gen.inc 存在但 config.mk 不存在
-# （说明 configure 产物不同步），自动删除 gen.inc 让 builtin.c 走手写 fallback。
-# 否则 __has_include 会 pick 到陈旧 gen.inc，导致 STATIC 模块（如 oam）不注册。
+# config.mk lives in .config/ (project root); make clean only deletes build/ not .config/.
+# stale gen.inc defense: if builtin_modules.gen.inc exists but config.mk is missing
+# (configure artifacts out of sync), auto-delete gen.inc so builtin.c falls back to handwritten.
+# Otherwise __has_include picks up the stale gen.inc, causing STATIC modules (like oam) not to register.
 CONFIG_MK := $(CONFIG_DIR)/config.mk
 ifeq ($(wildcard src/core/builtin_modules.gen.inc),)
-    # gen.inc 不存在 → builtin.c 走手写 fallback，OK
+    # gen.inc doesn't exist -> builtin.c uses handwritten fallback, OK
 else ifeq ($(wildcard $(CONFIG_MK)),)
     $(warning [Makefile] src/core/builtin_modules.gen.inc exists but $(CONFIG_MK) missing — stale configure output, deleting gen.inc)
     $(shell rm -f src/core/builtin_modules.gen.inc)
@@ -55,31 +55,31 @@ endif
 -include $(CONFIG_MK)
 
 # =====================================================================
-# 架构硬约束（最高优先级 —— 用 override 关键字，config.mk 无法覆盖）
+# Architectural hard constraints (highest priority — use override keyword, config.mk cannot override)
 # =====================================================================
-override NSBC_WITH_SQLITE   := 0   # C 核心不碰 DB（Rust Web 边车侧）
-override NSBC_WITH_OPENSSL  := 1   # WebRTC / DTLS-SRTP 硬依赖，必须开
-override NSBC_WITH_SRTP     := 1   # DTLS-SRTP 媒体加密，配套 OpenSSL 必开
+override NSBC_WITH_SQLITE   := 0   # C core does not touch DB (Rust Web sidecar)
+override NSBC_WITH_OPENSSL  := 1   # WebRTC / DTLS-SRTP hard dep, must be enabled
+override NSBC_WITH_SRTP     := 1   # DTLS-SRTP media encryption, pairing OpenSSL must be enabled
 
-# CPPFLAGS：过滤掉 config.mk 里的 sqlite3 宏，然后强制追加：
-#   - NSBC 根头文件路径（config.mk 不能覆盖）
-#   - -DNSBC_WITH_OPENSSL -DNSBC_WITH_SRTP —— 直接在 override 层打进去，
-#     不依赖后面的 ifeq ($(NSBC_WITH_OPENSSL),1) 条件块是否触发
+# CPPFLAGS: filter out sqlite3 macros from config.mk, then force append:
+#   - NSBC root header path (config.mk cannot override)
+#   - -DNSBC_WITH_OPENSSL -DNSBC_WITH_SRTP —— baked directly in override layer,
+#     do not depend on whether later ifeq ($(NSBC_WITH_OPENSSL),1) conditional block triggers
 override CPPFLAGS := $(strip $(filter-out -DNSBC_WITH_SQLITE,$(CPPFLAGS)))
 override CPPFLAGS += -I src/include -I3rd/include
 override CPPFLAGS += -I3rd/bcg729/include -I3rd/bcg729/src
 override CPPFLAGS += -DHAVE_BCG729
 override CPPFLAGS += -DNSBC_WITH_OPENSSL -DNSBC_WITH_SRTP
-override CPPFLAGS += -DNSBC_NO_DB_MODULE   # 架构硬约束：C 核心不碰 DB
+override CPPFLAGS += -DNSBC_NO_DB_MODULE   # architectural hard constraint: C core does not touch DB
 
-# 链接库：override 层确保基础库齐全，不重算吃掉 L160 原有的库
+# linker libs: override layer ensures base libs are complete, don't recompute to preserve existing libs in L160
 override LDLIBS += -lm -lpcre2-8 -lpthread -lrt
-# 过滤 sqlite3 相关（架构硬约束），但不影响其他库
+# filter out sqlite3-related (architectural hard constraint), but leave other libs untouched
 override LDLIBS := $(strip $(filter-out -lsqlite3 $(SQLITE_LDLIBS),$(LDLIBS)))
 override LDLIBS += -lssl -lcrypto
 override LDLIBS += $(shell pkg-config --libs libsrtp2 2>/dev/null || echo -lsrtp2)
 
-# ---- 诊断输出（让用户看到 config.mk 是否加载、关键变量最终值）----
+# ---- diagnostic output (let user see if config.mk loaded, and final values of key vars) ----
 $(info ============== NSBC Makefile Config Dump ==============)
 $(info CONFIG_MK       = $(CONFIG_MK))
 $(info HAS_CONFIG_MK   = $(if $(wildcard $(CONFIG_MK)),YES,NO))
@@ -92,26 +92,26 @@ $(info LDFLAGS         = $(LDFLAGS))
 $(info ========================================================)
 
 
-# config.mk 由 ./configure 生成，包含 POST_BUILD_COPY 等变量
-# 没跑 configure 时 ?= 兜底：默认复制 build/mod → ./mod
+# config.mk generated by ./configure, contains POST_BUILD_COPY etc.
+# ?= fallback when configure not run: default copies build/mod -> ./mod
 POST_BUILD_COPY ?= rm -rf ./mod && if [ -d build/mod ]; then cp -a build/mod ./mod; fi
 
 SRC_DIRS := $(shell find src -type d)
 
-# ---- Makefile 默认 SRCS（没跑 configure 时用这组）----
-# configure 会直接设 STATIC_MOD_SRCS 覆盖下面 ?= 行
-# 排除原则：
-#   src/db/*           — 架构硬约束：C 核心不碰 DB（即使 NSBC_WITH_SQLITE=0 也排除，保险）
-#   src/media/rec/*     — 媒体录制编码（可选）
-#   src/mod/*           — 动态模块候选（STATIC 模块清单在 SRCS_MOD_STATIC 里手工指定）
-#   src/media/codec/g*  — codec 实现文件（g711/g729）：g711 硬链给 recorder 用（在 SRCS_BASE 里单独加），
-#                         g729 归 mod_codecs.so 动态模块；media_codec.c（注册中心 + transcode 引擎）
-#                         必须保留（core/moat_bridge/obs_control 硬依赖 codec_registry_*/transcode_*）
+# ---- Makefile default SRCS (used when configure not run) ----
+# configure directly sets STATIC_MOD_SRCS to override the ?= line below
+# exclusion rules:
+#   src/db/*           — architectural hard constraint: C core does not touch DB (exclude even if NSBC_WITH_SQLITE=0, safe)
+#   src/media/rec/*     — media recording encoding (optional)
+#   src/mod/*           — dynamic module candidates (STATIC module list specified manually in SRCS_MOD_STATIC)
+#   src/media/codec/g*  — codec impl files (g711/g729): g711 hard-linked for recorder (added separately in SRCS_BASE),
+#                         g729 goes to mod_codecs.so dynamic module; media_codec.c (registry + transcode engine)
+#                         must be kept (core/moat_bridge/obs_control hard-depend on codec_registry_*/transcode_*)
 SRCS_CORE ?= $(shell find src -name '*.c' ! -name 'nsbc_cli.c' \
               ! -path 'src/mod/*' ! -path 'src/media/rec/*' \
               ! -path 'src/db/*' ! -path 'src/media/codec/g*.c')
-# 默认手工选的 STATIC 模块（没 configure 时的 fallback）
-# 注意：故意不含 src/mod/codecs/*——codecs 走 DYNAMIC 模块链，g711.c 单独硬链进主二进制
+# default hand-picked STATIC modules (fallback when no configure)
+# note: intentionally excludes src/mod/codecs/*——codecs go DYNAMIC, g711.c hard-linked separately into main binary
 SRCS_MOD_STATIC ?= $(shell (find src/mod/endpoints src/mod/outbound_reg -name '*.c'; \
                            find src/mod/dialplans -name '*.c'; \
                            find src/mod/billing -name '*.c'; \
@@ -119,39 +119,39 @@ SRCS_MOD_STATIC ?= $(shell (find src/mod/endpoints src/mod/outbound_reg -name '*
                            find src/mod/callcenter -name '*.c'; \
                            find src/media/rec -name '*.c') | sort | uniq)
 
-# STATIC_MOD_SRCS 来自 configure 的 config.mk；没 configure 时用 SRCS_MOD_STATIC
+# STATIC_MOD_SRCS comes from configure's config.mk; use SRCS_MOD_STATIC when no configure
 STATIC_MOD_SRCS ?= $(SRCS_MOD_STATIC)
 
-# ---- SRCS_BASE 最终集合并防御性清洗 ----
-# config.mk 可能硬编码源文件列表（绕过 ?= 默认值），所以必须在最终合成后用 filter-out 兜底：
-#   1) src/db/dbal.c            —— C 核心不碰 DB（架构硬约束），sqlite3 全路径且无调用方
-#   2) src/db/dbal_module.c     —— 同上（config.mk 可能把 dbal 当作模块加进来）
-#   3) src/mod/codecs/*.c      —— codec 实现文件走 DYNAMIC 模块链，硬进会 multiple definition
-#   4) src/media/codec/g*.c    —— 同上（g711 单独硬链，g729 走 DYNAMIC）
-# ⚠️ 注意：src/mod/billing/cdr_wal.c 必须**保留**——billing.c 无条件调用 cdr_wal_*
-# 函数（cdr_wal_create/append/destroy/replay），billing 是 STATIC 模块链接依赖。
-# cdr_wal.c 里的 sqlite3 代码全在 #ifdef NSBC_WITH_SQLITE 内，只要 override 设 NSBC_WITH_SQLITE=0
-# 预处理器就会剪掉 sqlite3 分支，剩纯文本 WAL 后端，完全不碰 DB。
+# ---- SRCS_BASE final assembly with defensive cleanup ----
+# config.mk may hardcode source lists (bypassing ?= defaults), so filter-out must be applied after final synthesis:
+#   1) src/db/dbal.c            —— C core does not touch DB (architectural constraint), sqlite3 full path with no callers
+#   2) src/db/dbal_module.c     —— same as above (config.mk may include dbal as a module)
+#   3) src/mod/codecs/*.c      —— codec impl files go DYNAMIC module chain, hard-link causes multiple definition
+#   4) src/media/codec/g*.c    —— same as above (g711 hard-linked separately, g729 goes DYNAMIC)
+# ⚠️ note: src/mod/billing/cdr_wal.c must be KEPT —— billing.c unconditionally calls cdr_wal_*
+# functions (cdr_wal_create/append/destroy/replay), billing is a STATIC module link dep.
+# sqlite3 code in cdr_wal.c is all inside #ifdef NSBC_WITH_SQLITE, as long as override sets NSBC_WITH_SQLITE=0
+# the preprocessor strips the sqlite3 branch, leaving pure-text WAL backend, does not touch DB at all.
 STATIC_MOD_SRCS := $(filter-out src/db/%.c src/mod/codecs/%.c src/media/codec/g%.c,$(STATIC_MOD_SRCS))
 SRCS_CORE := $(filter-out src/db/%.c src/media/codec/g%.c,$(SRCS_CORE))
 
-# recorder.c（主二进制）硬依赖 g711_ulaw_decode / g711_alaw_decode，
-# 但 configure 把 codecs 归 DYNAMIC，g711.c 只进 mod_codecs.so —— 主二进制链接会丢符号。
-# 这里强制把 g711.c 编进 nsbcd，与 configure 分层解耦。
-# 取实际存在的那份（可能在 src/media/codec/g711.c 或 src/mod/codecs/g711.c，
-# 也可能两份都在——$(firstword $(wildcard ...)) 取第一份）。
+# recorder.c (main binary) hard-depends on g711_ulaw_decode / g711_alaw_decode,
+# but configure puts codecs in DYNAMIC, g711.c only goes into mod_codecs.so —— main binary link loses symbols.
+# Force g711.c to be compiled into nsbcd, decoupled from configure layering.
+# Pick whichever actually exists (may be src/media/codec/g711.c or src/mod/codecs/g711.c,
+# maybe both —— $(firstword $(wildcard ...)) picks the first).
 G711_SRC := $(firstword $(wildcard src/media/codec/g711.c) $(wildcard src/mod/codecs/g711.c))
 SRCS_BASE := $(sort $(SRCS_CORE) \
                     $(STATIC_MOD_SRCS) \
                     $(if $(G711_SRC),$(G711_SRC)) \
                     3rd/cjson/cJSON.c)
 
-# ---- 最终兜底：SRCS_BASE 再硬排除一次 ----
-# 即使上面 filter-out 没拦住（config.mk 直接设 SRCS_BASE），这里也必排 db/
-# cdr_wal.c **故意保留**——billing STATIC 模块依赖它
+# ---- final fallback: filter out from SRCS_BASE again ----
+# even if filter-out above missed them (config.mk directly sets SRCS_BASE), also exclude db/ here
+# cdr_wal.c INTENTIONALLY kept —— billing STATIC module depends on it
 SRCS_BASE := $(filter-out src/db/%.c,$(SRCS_BASE))
 
-# vendored bcg729 —— 编进 mod_codecs.so，不再编进 nsbcd
+# vendored bcg729 —— compile into mod_codecs.so, no longer into nsbcd
 BCG729_SRCS := $(wildcard 3rd/bcg729/src/*.c)
 SRCS := $(SRCS_BASE)
 
@@ -171,7 +171,7 @@ endif
 CPPFLAGS += -I src/include -I3rd/include
 LDLIBS  += -lpthread -lrt -lm -lpcre2-8
 
-# 动态模块加载：主二进制需要 -export-dynamic 让 .so 引用 nsbc 全局符号
+# dynamic module loading: main binary needs -export-dynamic for .so to reference nsbc global symbols
 ifeq ($(NSBC_WITH_DLOPEN),1)
 CPPFLAGS += -DNSBC_WITH_DLOPEN
 LDLIBS   += -ldl
@@ -194,7 +194,7 @@ endif
 endif
 ifeq ($(NSBC_WITH_SQLITE),1)
 CPPFLAGS += -DNSBC_WITH_SQLITE
-# config.mk 里 SQLITE_LDLIBS 来自 pkg-config（更精确），fallback 到硬编码 -lsqlite3
+# SQLITE_LDLIBS in config.mk comes from pkg-config (more precise), fallback to hardcoded -lsqlite3
 LDLIBS   += $(if $(SQLITE_LDLIBS),$(SQLITE_LDLIBS),-lsqlite3)
 endif
 ifeq ($(NSBC_WITH_BCG729),1)
@@ -202,7 +202,7 @@ CPPFLAGS += -DHAVE_BCG729 -I3rd/bcg729/include -I3rd/bcg729/src
 $(BUILD)/3rd/bcg729/src/%.o: CFLAGS += -Wno-error -Wno-unused-parameter -Wno-maybe-uninitialized
 endif
 
-# sanitizer 变体
+# sanitizer variants
 ifeq ($(SANITIZE),asan)
 CFLAGS  += -fsanitize=address -fno-omit-frame-pointer
 LDFLAGS += -fsanitize=address
@@ -224,7 +224,7 @@ CLI_SRC := src/tools/nsbc_cli.c
 CLI_OBJ := $(BUILD)/src/tools/nsbc_cli.o
 CLI_TARGET := $(BUILD)/nsbc_cli
 
-# 动态模块 .so 目标（DYNAMIC_MODS 来自 configure 的 config.mk）
+# dynamic module .so targets (DYNAMIC_MODS comes from configure's config.mk)
 ifeq ($(NSBC_WITH_DLOPEN),1)
 DYNAMIC_SOS := $(patsubst %,$(BUILD)/mod/mod_%.so,$(DYNAMIC_MODS))
 endif
@@ -244,13 +244,13 @@ endif
 all: $(TARGET) $(CLI_TARGET) $(DYNAMIC_SOS)
 
 # ================================================================
-# 动态模块构建规则：每个 mod_xxx.so 独立 -shared -fPIC 编译
-# configure 生成的 MOD_SRC_xxx 变量指定源码路径（默认 fallback 用 find）
-# $* stem 是 mod_billing → 去掉前缀 mod_ 变成 billing 拼 MOD_SRC_ 变量名
+# dynamic module build rule: each mod_xxx.so independently built with -shared -fPIC
+# MOD_SRC_xxx variables from configure specify source paths (falls back to find by default)
+# $* stem is mod_billing -> strip prefix mod_ -> billing to build MOD_SRC_ variable name
 #
-# 只有 ai_dialog 模块需要 cURL —— 按 MOD_STEM 判断：
-#   是 ai_dialog 且 NSBC_WITH_CURL=1 → pkg-config libcurl + -DHAVE_REAL_ASR_TTS
-#   其他模块不加 curl 头 / -lcurl（避免所有 .so 都依赖 libcurl.so）
+# only ai_dialog module needs cURL —— match by MOD_STEM:
+#   is ai_dialog and NSBC_WITH_CURL=1 -> pkg-config libcurl + -DHAVE_REAL_ASR_TTS
+#   other modules don't get curl headers / -lcurl (avoid all .so depending on libcurl.so)
 # ================================================================
 ifeq ($(NSBC_WITH_DLOPEN),1)
 MOD_STEM = $(subst mod_,,$*)
@@ -263,8 +263,8 @@ AI_DIALOG_LDLIBS   :=
 AI_DIALOG_CPPFLAGS :=
 endif
 
-# 只给 ai_dialog 模块加 curl flag
-# 只给 codecs 模块加 bcg729 兼容 flag（第三方代码有 warning）
+# only ai_dialog module gets curl flag
+# only codecs module gets bcg729 compatibility flag (third-party code has warnings)
 $(BUILD)/mod/%.so:
 	@mkdir -p $(dir $@)
 	@echo "  MOD $@"

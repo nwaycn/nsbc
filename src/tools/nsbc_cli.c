@@ -462,7 +462,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "connect failed: %s\n", strerror(errno));
         return 1;
     }
-    fprintf(stderr, "[nsbc_cli] connected (Tab 补全 · ↑↓ 历史)\n");
+    fprintf(stderr, "[nsbc_cli] connected (Tab completion · ↑↓ history)\n");
 
     if (cli_exec) {
         int rc = run_once(fd, cli_exec);

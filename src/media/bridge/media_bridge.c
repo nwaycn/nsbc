@@ -1637,7 +1637,7 @@ static int sdp_ensure_video_mline(char *buf, size_t cap, int *len,
     memcpy(buf + *len, extra, (size_t)ne);
     *len += ne;
     buf[*len] = '\0';
-    llog(LOG_DEBUG, "sdp", "ensure_video_mline: 追加 rejected m=video 0");
+    llog(LOG_DEBUG, "sdp", "ensure_video_mline: appending rejected m=video 0");
     return NSBC_OK;
 }
 
@@ -2445,7 +2445,7 @@ int bridge_offer_hook(void *call, const char *in, size_t inlen,
             mode = MB_BYPASS;
         }
     } else if (rule_mm == 2) {  /* rule=relay */
-        llog(LOG_INFO, "media", "offer_hook: rule→force RELAY%s", both_ws ? " (WebRTC↔WebRTC DTLS 终结)" : "");
+        llog(LOG_INFO, "media", "offer_hook: rule→force RELAY%s", both_ws ? " (WebRTC↔WebRTC DTLS termination)" : "");
         mode = both_ws ? MB_SRTP_RELAY : MB_RELAY;
     }
 
@@ -2662,7 +2662,7 @@ int bridge_offer_hook(void *call, const char *in, size_t inlen,
                     out[n] = '\0';
                 }
             }
-            llog(LOG_DEBUG, "dtls", "SRTP_RELAY: offer 注入 B 侧 ICE 凭证 "
+            llog(LOG_DEBUG, "dtls", "SRTP_RELAY: offer inject B-side ICE credentials "
                  "fd=%d ice_ufrag=%s fp=%s",
                  e->relay->fd_rtp[1], dcp->ice_ufrag, dcp->fp_sha256);
     }
@@ -2897,7 +2897,7 @@ int bridge_answer_hook(void *call, const char *in, size_t inlen,
                 out[n] = '\0';
             }
         }
-        llog(LOG_DEBUG, "dtls", "SRTP_RELAY: answer 注入 A 侧 ICE 凭证 "
+        llog(LOG_DEBUG, "dtls", "SRTP_RELAY: answer inject A-side ICE credentials "
              "fd=%d ice_ufrag=%s fp=%s",
              e->relay->fd_rtp[0], dcp->ice_ufrag, dcp->fp_sha256);
     }

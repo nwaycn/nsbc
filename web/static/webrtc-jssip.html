@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>NSBC WebRTC 视频通话</title>
+<title>NSBC WebRTC Video通话</title>
 <script src="js/jssip-3.10.0.min.js"></script>
 <style>
   * { box-sizing: border-box; }
@@ -71,34 +71,34 @@
 <body>
 <div class="wrap">
 
-  <h1>NSBC WebRTC 视频通话 <span class="tag">独立页面 · JsSIP + WSS</span></h1>
+  <h1>NSBC WebRTC Video通话 <span class="tag">Standalone page - JsSIP + WSS</span></h1>
 
   <div class="grid">
 
     <div class="card">
-      <h3>SIP 账号</h3>
-      <div class="row"><label>WSS 服务器</label><input id="wss" value="" placeholder="自动从 URL 推导"></div>
-      <div class="row"><label>STUN</label><input id="stun" value="" placeholder="自动从 URL 推导"></div>
-      <div class="row"><label>分机号</label><input id="user" value="1000"></div>
-      <div class="row"><label>密码</label><input id="pass" type="password" value=""></div>
-      <div class="row"><label>Realm / 租户</label><input id="realm" value="nsbc.local" placeholder="nsbc.local · SIP 域 / 租户名"></div>
+      <h3>SIP Account</h3>
+      <div class="row"><label>WSS Server</label><input id="wss" value="" placeholder="Auto derive from URL"></div>
+      <div class="row"><label>STUN Server</label><input id="stun" value="" placeholder="Auto derive from URL"></div>
+      <div class="row"><label>Extension</label><input id="user" value="1000"></div>
+      <div class="row"><label>Password</label><input id="pass" type="password" value=""></div>
+      <div class="row"><label>Realm / Tenant</label><input id="realm" value="nsbc.local" placeholder="nsbc.local · SIP 域 / 租户名"></div>
       <div class="row">
         <button class="btn btn-green" id="btnReg" onclick="doRegister()">▶ Register</button>
         <button class="btn btn-red"   id="btnUnreg" onclick="doUnregister()" disabled>Unregister</button>
-        <span class="status" id="regStatus">未注册</span>
+        <span class="status" id="regStatus">Not registered</span>
       </div>
     </div>
 
     <div class="card">
-      <h3>视频</h3>
+      <h3>Video</h3>
       <div class="videos">
         <div class="video-box">
           <video id="localVideo" autoplay muted playsinline></video>
-          <div class="lbl"><span class="dot off" id="localDot"></span>本地</div>
+          <div class="lbl"><span class="dot off" id="localDot"></span>Local</div>
         </div>
         <div class="video-box">
           <video id="remoteVideo" autoplay playsinline></video>
-          <div class="lbl"><span class="dot off" id="remoteDot"></span>远端</div>
+          <div class="lbl"><span class="dot off" id="remoteDot"></span>Remote</div>
         </div>
       </div>
       <div class="toolbar">
@@ -109,7 +109,7 @@
   </div>
 
   <div class="incoming" id="incoming">
-    <div>📞 来电: <span class="from" id="inFrom">—</span> <span class="ring">🔔</span></div>
+    <div>📞 Incoming: <span class="from" id="inFrom">—</span> <span class="ring">🔔</span></div>
     <div>
       <button class="btn btn-green" onclick="doAccept()" style="margin-right:6px">Accept</button>
       <button class="btn btn-red"   onclick="doReject()">Reject</button>
@@ -120,26 +120,26 @@
 
     <div class="card">
       <h3>呼叫</h3>
-      <div class="row"><label>被叫</label><input id="target" value="1001"></div>
+      <div class="row"><label>Callee</label><input id="target" value="1001"></div>
       <div class="row">
         <button class="btn btn-green" id="btnCall" onclick="doCall()" disabled>📞 Call</button>
         <button class="btn btn-red"   id="btnHang" onclick="doHangup()" disabled>✕ Hangup</button>
-        <span class="status" id="callStatus">空闲</span>
+        <span class="status" id="callStatus">Idle</span>
       </div>
     </div>
 
     <div class="card">
       <h3>DataChannel</h3>
       <div class="dc-area">
-        <input id="dcMsg" placeholder="输入消息，回车发送..." disabled onkeydown="if(event.key==='Enter') dcSend()">
+        <input id="dcMsg" placeholder="Type message, Enter to send..." disabled onkeydown="if(event.key==='Enter') dcSend()">
         <button class="btn btn-blue" onclick="dcSend()" id="btnDc" disabled>Send</button>
       </div>
-      <div class="dc-log" id="dcLog"><div class="sys">等待 DataChannel open...</div></div>
+      <div class="dc-log" id="dcLog"><div class="sys">Waiting for DataChannel open...</div></div>
     </div>
   </div>
 
   <div class="card" style="margin-top:16px">
-    <h3>SIP 实时日志</h3>
+    <h3>SIP Live Log</h3>
     <div class="sip-log" id="sipLog"></div>
   </div>
 
@@ -158,7 +158,7 @@ let localStream = null;
 let remoteStream = null;
 let dc = null, dcOpen = false;
 let isHangingUp = false;
-// ===== Realm / 租户动态化 =====
+// ===== Realm / Tenant动态化 =====
 function getSipDomain() {
   const dom = document.getElementById('realm');
   if (dom && dom.value && dom.value.trim()) {
@@ -380,10 +380,10 @@ function onSipMessage(e) {
 
 // ============ SDP 过滤事件 ============
 // JsSIP 的 sdp 事件参数: { sdp, originator: 'local'|'remote', type: 'offer'|'answer' }
-// 只过滤本地生成的（我们发给对端的）。远端收到的 SDP 保持原样——对端的 codec 选择不应被干预。
+// 只过滤Local生成的（我们发给对端的）。Remote收到的 SDP 保持原样——对端的 codec 选择不应被干预。
 function handleSdpEvent(e) {
   if (!e || !e.sdp) return;
-  // ★ 诊断：无论本地还是远端，把所有 m= 行的端口打出来，一眼看出 video 是不是 9
+  // ★ 诊断：无论Local还是Remote，把所有 m= 行的端口打出来，一眼看出 video 是不是 9
   const mlines = e.sdp.split(/\r\n/).filter(l => l.startsWith('m='));
   const mports = mlines.map(l => {
     const m = l.match(/^m=(\w+) (\d+)/);
@@ -392,7 +392,7 @@ function handleSdpEvent(e) {
   log('info', `📨 SDP ${e.originator}/${e.type} ports: [${mports}] (${mlines.length} media)`);
 
   if (e.originator !== 'local') {
-    // 远端收到的 —— 只打日志，不过滤
+    // Remote收到的 —— 只打日志，不过滤
     return;
   }
   try {
@@ -458,7 +458,7 @@ function attachPC(pc, session) {
   if (!pc) return;
   window.__pc = pc;
 
-  // ---- 远端流 ----
+  // ---- Remote流 ----
   if (!remoteStream) remoteStream = new MediaStream();
   pc.ontrack = (e) => {
     log('ok', `🎬 ONTRACK: ${e.track.kind} label=${e.track.label} enabled=${e.track.enabled}`);
@@ -482,7 +482,7 @@ function attachPC(pc, session) {
     $('remoteDot').className = 'dot on';
   };
 
-  // ---- DataChannel 接收端（来电侧）----
+  // ---- DataChannel 接收端（Incoming侧）----
   pc.ondatachannel = (e) => {
     log('info', `📥 DC inbound: ${e.channel.label}`);
     dc = e.channel;
@@ -512,7 +512,7 @@ function attachPC(pc, session) {
   dumpMediaStats(pc, 'entry');
 }
 
-// 兜底：从 receivers 补绑远端 track（万一 ontrack 没触发）
+// 兜底：从 receivers 补绑Remote track（万一 ontrack 没触发）
 // ★ 注意：不在这里设 srcObject——srcObject 由 ontrack 里的 300ms 定时器一次性处理，
 // 这里 addTrack 可能在定时器之后触发，会让 Chrome 重新 load stream 打断 play()。
 // 这里只做 addTrack 兜底 + UI dot 更新，不碰 video 元素。
@@ -544,7 +544,7 @@ function bindRemoteTracks(pc) {
   }
 }
 
-// 从 PC 的 senders 重建本地流（JsSIP 内部的 getUserMedia stream 拿不到引用）
+// 从 PC 的 senders 重建Local流（JsSIP 内部的 getUserMedia stream 拿不到引用）
 function setupLocalPreview(pc) {
   if (!pc) return;
   const senders = pc.getSenders();
@@ -557,7 +557,7 @@ function setupLocalPreview(pc) {
   if (localStream.getTracks().length > 0) {
     $('localVideo').srcObject = localStream;
     $('localDot').className = 'dot on';
-    log('ok', `📺 本地流 OK (${localStream.getTracks().length} tracks)`);
+    log('ok', `📺 Local流 OK (${localStream.getTracks().length} tracks)`);
   }
   const sndDescr = senders.map(s => s.track ? `${s.track.kind}[${s.track.label||'?'}]` : 'null').join(',');
   log('info', `📤 SENDERS(${senders.length}): ${sndDescr}`);
@@ -598,7 +598,7 @@ function makeSessionHandlers(isCallee) {
       const pc = data.peerconnection;
       log('info', `🔗 peerconnection event (callee=${isCallee})`);
 
-      // ★ 关键修复：在 JsSIP 调 createOffer 之前，手动把本地 track 加进 PC。
+      // ★ 关键修复：在 JsSIP 调 createOffer 之前，手动把Local track 加进 PC。
       // 否则 JsSIP 会在 createOffer 之后才 addTrack，导致 Chrome 生成 m=video 端口 9（拒绝），
       // 之后无论怎么改 SDP 端口，PC 自己都不认，RTP 也不会流动。
       if (localStream) {
@@ -658,9 +658,9 @@ function onSessionConfirmed(session, isCallee) {
   }
 }
 
-// ③ 其他事件绑定（来电路径 & 呼出兜底）
+// ③ 其他事件绑定（Incoming路径 & 呼出兜底）
 // skipPeerConn=true 时跳过 peerconnection 绑定（呼出路径由 eventHandlers 提前处理）
-// skipPeerConn=false 时正常绑定（来电路径 PC 尚未创建，session.on 注册来得及）
+// skipPeerConn=false 时正常绑定（Incoming路径 PC 尚未创建，session.on 注册来得及）
 function bindSessionNonPC(session, isCallee, skipPeerConn) {
   if (!skipPeerConn) {
     session.on('peerconnection', makeSessionHandlers(isCallee).peerconnection);
@@ -678,8 +678,8 @@ function bindSessionNonPC(session, isCallee, skipPeerConn) {
   session.on('ended', (e) => {
     const org = e && e.originator;   // 'local' | 'remote' | undefined
     log('info', `📴 ended (originator=${org})`);
-    // 根据 originator 判断本地/对端挂断，不再一律显示"对端挂断"
-    onCallEnd(org === 'remote' ? '对端挂断' : '本地挂断');
+    // 根据 originator 判断Local/对端挂断，不再一律显示"对端挂断"
+    onCallEnd(org === 'remote' ? '对端挂断' : 'Local挂断');
   });
   session.on('failed', (e) => { log('err', `❌ failed: ${e.cause || ''}`); onCallEnd('失败: ' + (e.cause || '')); });
   session.on('getusermediafailed', (e) => log('err', '❌ getUserMedia FAIL: ' + (e.error?.message || e.error)));
@@ -689,7 +689,7 @@ function bindSessionNonPC(session, isCallee, skipPeerConn) {
   session.on('peerconnection:setremotedescriptionfailed', (e) => log('err', '❌ setRemoteDesc FAIL: ' + (e.error?.message || e.error)));
 }
 
-// ============ 自动推导 WSS / STUN ============
+// ============ 自动推导 WSS / STUN Server ============
 (function autoDeriveServers() {
   const host = window.location.hostname;
   const wssEl = document.getElementById('wss');
@@ -741,7 +741,7 @@ async function doRegister() {
       log('ok', `REGISTERED as ${user}`);
     });
     ua.on('unregistered', () => {
-      $('regStatus').textContent = '未注册'; $('regStatus').className = 'status';
+      $('regStatus').textContent = 'Not registered'; $('regStatus').className = 'status';
       $('btnUnreg').disabled = true; $('btnCall').disabled = true;
       log('info', 'UNREGISTERED');
     });
@@ -755,13 +755,13 @@ async function doRegister() {
     // ---- SIP 报文日志 ----
     ua.on('sip', onSipMessage);
 
-    // ---- 来电/呼出（统一入口） ----
+    // ---- Incoming/呼出（统一入口） ----
     ua.on('newRTCSession', (e) => {
       const session = e.session;
       const from = session.remote_identity?.uri?.toString() || '?';
 
       if (e.originator === 'remote') {
-        // 来电：newRTCSession 时 PC 还没建 → session.on('peerconnection') 注册来得及
+        // Incoming：newRTCSession 时 PC 还没建 → session.on('peerconnection') 注册来得及
         log('warn', `📞 INCOMING from ${from}`);
         pendingSession = session;
         $('inFrom').textContent = from;
@@ -797,7 +797,7 @@ async function doUnregister() {
 async function doCall() {
   if (!ua) return;
   let target = $('target').value.trim();
-  if (!target) { log('err', '被叫为空'); return; }
+  if (!target) { log('err', 'Callee为空'); return; }
   if (!target.startsWith('sip:')) target = 'sip:' + target;
   if (!target.includes('@')) target = target + '@' + getSipDomain();
 
@@ -816,7 +816,7 @@ async function doCall() {
       await ensureVideoReady(localStream);   // ★ 等 video track unmute 再继续
       $('localVideo').srcObject = localStream;
       $('localDot').className = 'dot on';
-      log('ok', `📺 本地流就绪 (${localStream.getTracks().length} tracks)`);
+      log('ok', `📺 Local流就绪 (${localStream.getTracks().length} tracks)`);
     }
   } catch(e) {
     log('err', '❌ getUserMedia FAIL: ' + e.message);
@@ -855,7 +855,7 @@ async function doAccept() {
       await ensureVideoReady(localStream);   // ★ 等 video track unmute 再继续
       $('localVideo').srcObject = localStream;
       $('localDot').className = 'dot on';
-      log('ok', `📺 本地流就绪 (${localStream.getTracks().length} tracks)`);
+      log('ok', `📺 Local流就绪 (${localStream.getTracks().length} tracks)`);
     }
   } catch(e) {
     log('err', '❌ getUserMedia FAIL: ' + e.message);
@@ -901,13 +901,13 @@ async function doHangup() {
   } catch(e) {
     log('err', 'HANGUP FAIL: ' + (e.message || e));
   }
-  onCallEnd('本地挂断');
+  onCallEnd('Local挂断');
   isHangingUp = false;
 }
 
 function onCallEnd(reason) {
   log('info', 'CALL END: ' + reason);
-  $('callStatus').textContent = '空闲';
+  $('callStatus').textContent = 'Idle';
   $('btnCall').disabled = !ua; $('btnHang').disabled = true;
   closePC(); stopMedia();
   currentSession = null; pendingSession = null;

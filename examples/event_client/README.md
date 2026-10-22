@@ -1,23 +1,27 @@
-# NSBC Event/CDR 实时订阅客户端（多语言）
+# NSBC Event/CDR Realtime Subscription Client (Multi-language)
 
-本目录包含 NSBC control socket（Unix Domain Socket）实时事件/CDR 订阅客户端的 **四种语言实现**，功能完全等价：
+This directory contains **four language implementations** of the NSBC control socket
+(Unix Domain Socket) realtime event/CDR subscription client; all four behave
+identically:
 
-| 语言 | 目录 | 依赖 | 编译/运行 |
+| Language | Directory | Dependencies | Compile / Run |
 |---|---|---|---|
-| **Python** | `python/` | 仅 stdlib | `python3 event_client.py` |
-| **Go** | `go/` | 仅 stdlib | `go run main.go` 或 `go build -o event_client .` |
-| **Rust** | `rust/` | 仅 stdlib | `cargo run --release --` |
-| **C** | `c/` | 仅 POSIX | `gcc -O2 -Wall -o event_client event_client.c && ./event_client` |
+| **Python** | `python/` | stdlib only | `python3 event_client.py` |
+| **Go** | `go/` | stdlib only | `go run main.go` or `go build -o event_client .` |
+| **Rust** | `rust/` | stdlib only | `cargo run --release --` |
+| **C** | `c/` | POSIX only | `gcc -O2 -Wall -o event_client event_client.c && ./event_client` |
 
-默认连接 `/tmp/nsbc-e2e/control.sock`，用 `--topics` 或位置参数覆盖。
+Default socket path is `/tmp/nsbc-e2e/control.sock`; override with `--topics` or a
+positional argument.
 
 ---
 
-## 协议（服务端帧格式）
+## Protocol (server frame format)
 
-nsbcd 经 `obs_sub` 推送的所有帧都是 **以 `\n` 结尾的单行文本**，客户端按 `readline` 收即可。
+All frames pushed by nsbcd through `obs_sub` are **single-line text terminated by
+`\n`** — clients just `readline`.
 
-### Events 帧（`sub events`）
+### Event frames (`sub events`)
 
 ```
 YYYY-MM-DDTHH:MM:SS.mmm CALL_INCOMING  call_id=... orig=1001 to=1002 src_ip=10.0.0.50 trunk=
@@ -26,107 +30,109 @@ YYYY-MM-DDTHH:MM:SS.mmm CALL_END       call_id=... orig=1001 to=1002 trunk= disp
 YYYY-MM-DDTHH:MM:SS.mmm REGISTER       ...
 ```
 
-格式: `ISO8601时间戳 域(DOMAIN) k=v k=v ...\n`
+Format: `ISO8601-timestamp  DOMAIN  k=v k=v ...\n`
 
-### CDR 帧（`sub cdr`）
+### CDR frames (`sub cdr`)
 
 ```
 YYYY-MM-DDTHH:MM:SS.mmm CDR {"call_id":"...","from":"1001","to":"1002","phase":"end",
                              "disposition":"ANSWERED","duration_s":120,"billsec":116,...}
 ```
 
-格式: `ISO8601时间戳 CDR <JSON>\n`
+Format: `ISO8601-timestamp CDR <JSON>\n`
 
-JSON 契约与 Web 侧 REST 返回完全对齐（见 [signaling.c](../../../src/core/signaling.c#L892) 的 `cdr_event_to_json`）。
+The JSON contract matches the Web REST response exactly (see `cdr_event_to_json` in
+[signaling.c](../../../src/core/signaling.c#L892)).
 
-### Log / Metrics 帧（`sub log` / `sub metrics`）
+### Log / Metrics frames (`sub log` / `sub metrics`)
 
-- `log`: 直接透传 log ring buffer 的日志行
-- `metrics`: Prometheus exposition 周期帧（默认 5s）
+- `log`: direct passthrough of the log ring buffer line
+- `metrics`: periodic Prometheus exposition (default 5s)
 
-### 命令协议
+### Command protocol
 
-客户端连上后，nsbcd 先发 banner + 提示符：
+After the client connects, nsbcd sends a banner + prompt:
 
 ```
 NSBC 2.6.0 control interface (try 'help')
 nsbc> 
 ```
 
-命令以 `\n` 结尾，提示符 `nsbc> ` 表示命令执行完毕。
+Commands are terminated by `\n`; the prompt `nsbc> ` indicates the command has finished.
 
-实时订阅命令：
+Realtime subscribe commands:
 
-| 命令 | 说明 |
+| Command | Description |
 |---|---|
-| `sub <topics>` | 订阅 topics（逗号分隔：events,cdr,log,metrics） |
-| `unsub [topics]` | 取消订阅（无参取消全部） |
-| `sub.stat` | 查看本连接订阅状态 |
+| `sub <topics>` | Subscribe to topics (comma-separated: events,cdr,log,metrics) |
+| `unsub [topics]` | Unsubscribe (no arg = unsubscribe all) |
+| `sub.stat` | Inspect subscription state for this connection |
 
-常用拉取命令（`pull-only` 模式下可用）：
+Common pull commands (available in `pull-only` mode):
 
-| 命令 | 说明 |
+| Command | Description |
 |---|---|
-| `events [N]` | 拉最近 N 条 events（默认 20） |
-| `show calls` | 活动呼叫表 |
-| `cdr.recent [N]` | 拉最近 N 条已完成 CDR（默认 500） |
-| `show cdr` | CDR sink 聚合计数器 |
+| `events [N]` | Pull the most recent N events (default 20) |
+| `show calls` | Active call table |
+| `cdr.recent [N]` | Pull the most recent N completed CDRs (default 500) |
+| `show cdr` | CDR sink aggregate counters |
 
 ---
 
-## 性能设计（服务端）
+## Server-side performance design
 
-| 项 | 策略 |
+| Item | Strategy |
 |---|---|
-| **呼叫线程零反压** | `obs_sub_publish` 锁内 memcpy 帧入订阅者独立帧环（每订阅者 `OBS_SUB_RING=16`），满丢最旧帧，**绝不阻塞** |
-| **慢消费者** | 每连接独立帧环；`obs_sub_publish` 立刻 `try flush`（非阻塞 `send`，`EAGAIN` 归帧环） |
-| **帧截断** | 单帧 `OBS_FRAME_MAX=2048` 字节截断，避免超大 JSON 撑爆 |
-| **订阅上限** | `OBS_SUBSCRIBER_MAX=256` 个并发订阅者 |
-| **拉取式** | `obs_event` 同时写环形缓冲 `OBS_EVENT_RING=1024`，支持 `events N` 拉取 |
+| **Zero back-pressure on call thread** | `obs_sub_publish` memcpy frames into each subscriber's independent frame ring (`OBS_SUB_RING=16` per subscriber) inside the lock, drop oldest on full — **never block** |
+| **Slow consumer** | Per-connection independent frame ring; `obs_sub_publish` does an immediate `try flush` (non-blocking `send`, `EAGAIN` → frame ring) |
+| **Frame truncation** | Single frame capped at `OBS_FRAME_MAX=2048` bytes — avoids huge JSON blowing buffers |
+| **Subscriber cap** | `OBS_SUBSCRIBER_MAX=256` concurrent subscribers |
+| **Pull mode** | `obs_event` also writes a ring buffer (`OBS_EVENT_RING=1024`) to support `events N` pull |
 
-### 锁序（无死锁）
+### Lock order (deadlock-free)
 
 ```
 call_lock (b2bua shard)
   → obs_event: g_ev.lock → obs_sub_hub.lock
-s->lock (cdr sink) —先 unlock 再 publish—
+s->lock (cdr sink) — unlock before publish —
   → obs_sub_hub.lock
 ```
 
-send_fn 回调只做 `send()`，不递归进 b2b/cdr 代码——锁序单向，安全。
+The send_fn callback only does `send()`, never recurses into b2b/cdr code — lock order
+is one-directional and safe.
 
 ---
 
-## 运行步骤
+## Running steps
 
 ```bash
-# 1. 起 nsbcd
+# 1. start nsbcd
 nsbcd -c /tmp/nsbc-e2e/nsbc.yaml
 
-# 2. 任选一种客户端（同机或跨机用 TCP 转发 UDS 即可）
+# 2. pick any client (on the same machine or forward UDS over TCP across hosts)
 cd examples/event_client/python   && python3 event_client.py
 cd examples/event_client/go       && go run main.go
 cd examples/event_client/rust     && cargo run --release --
 cd examples/event_client/c        && gcc -O2 -o event_client event_client.c && ./event_client
 
-# 3. 软电话注册到 nsbcd 并拨打电话
-#    alice (10.0.0.50) → 拨 bob
-#    客户端应看到 CALL_INCOMING → CALL_ANSWERED → CDR → CALL_END
+# 3. register a soft phone with nsbcd and place a call
+#    alice (10.0.0.50) → dial bob
+#    client should see CALL_INCOMING → CALL_ANSWERED → CDR → CALL_END
 ```
 
 ---
 
-## 与 FreeSWITCH event_socket 对比
+## Comparison with FreeSWITCH event_socket
 
-| 项 | FreeSWITCH | NSBC |
+| Item | FreeSWITCH | NSBC |
 |---|---|---|
-| 传输 | TCP（可选 TLS） | **Unix Domain Socket**（P0）；TCP 后续 |
-| 鉴权 | `auth <password>` | 文件权限 0600（root-only socket）；TCP 后续加令牌 |
-| 订阅命令 | `event plain ALL` | `sub events,cdr` |
-| 推送帧格式 | `Content-Type: ... \n\nBODY` | 单行 `YYYY..SS.mmm DOMAIN body\n` |
-| 慢消费者策略 | 反压（阻塞呼叫线程） | **帧环丢旧，绝不反压** |
-| 事件域 | CHANNEL_CREATE/BEGIN/ANSWER/HANGUP/HANGUP_COMPLETE + 200+ | **最小集** CALL_INCOMING/ANSWERED/END + REGISTER |
-| CDR | 单独 CDR socket 或 `cdr_csv` | **同通道** `sub cdr`，带 ISO8601 时间戳头 |
+| Transport | TCP (TLS optional) | **Unix Domain Socket** (P0); TCP later |
+| Auth | `auth <password>` | File permissions 0600 (root-only socket); TCP later adds token |
+| Subscribe command | `event plain ALL` | `sub events,cdr` |
+| Push frame format | `Content-Type: ... \n\nBODY` | Single-line `YYYY..SS.mmm DOMAIN body\n` |
+| Slow-consumer policy | Back-pressure (blocks call thread) | **Drop-oldest frame ring, never back-pressure** |
+| Event set | CHANNEL_CREATE/BEGIN/ANSWER/HANGUP/HANGUP_COMPLETE + 200+ | **Minimal set** CALL_INCOMING/ANSWERED/END + REGISTER |
+| CDR | Separate CDR socket or `cdr_csv` | **Same channel** `sub cdr`, with ISO8601 timestamp header |
 
-NSBC 刻意保持最小事件集——实际运营场景 99% 只需要呼叫生命周期三件事 + CDR 最终话单。
-
+NSBC intentionally keeps the event set minimal — 99% of real operations only need the
+three call-lifecycle events + final CDR record.

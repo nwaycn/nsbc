@@ -1,11 +1,14 @@
-//! 数据库持久化层（REQ-WEB-013）。
+//! Database persistence layer (REQ-WEB-013).
 //!
-//! - 从 `NSBC_DB_DSN` 环境变量初始化 sqlx 连接池；支持 sqlite / postgres / mysql 三后端。
-//! - 启动期自动执行 DDL（`CREATE TABLE IF NOT EXISTS` + 索引），幂等，可重复执行。
-//! - 所有写入均为追加（INSERT），CDR/audit_log 永不 UPDATE/DELETE。
-//! - 连接池失败不阻断主业务（核心 UDS 控制通道不受 DB 影响）。
+//! - Initializes sqlx connection pool from the `NSBC_DB_DSN` env var; supports three
+//!   backends: sqlite / postgres / mysql.
+//! - Automatically runs DDL at startup (`CREATE TABLE IF NOT EXISTS` + indexes), idempotent
+//!   and safe to re-run.
+//! - All writes are append-only (INSERT); CDR/audit_log are never UPDATE/DELETE.
+//! - Connection pool failure does not block main business (core UDS control channel
+//!   is independent of DB).
 //!
-//! sqlite DSN:  `sqlite://./nsbc-web.db`（或 `sqlite::memory:` 用于测试）
+//! sqlite DSN:  `sqlite://./nsbc-web.db` (or `sqlite::memory:` for tests)
 //! pg DSN:      `postgres://user:pass@host:5432/nsbc`
 //! mysql DSN:   `mysql://user:pass@host:3306/nsbc`
 
@@ -16,8 +19,8 @@ use md5::{Md5, Digest};
 use sqlx::{Any, Pool, Row};
 use tracing::{info, warn};
 
-// sqlx Any driver 把 SQLite INTEGER 读为 i64，但业务需要 bool。
-// 解决方案：FromRow struct 用 i64 存储，serde 输出自动转 bool。
+// sqlx Any driver reads SQLite INTEGER as i64, but the business layer needs bool.
+// Solution: the FromRow struct stores as i64; serde output auto-converts to bool.
 mod bool_i64 {
     use serde::ser::Serializer;
     pub fn serialize<S: Serializer>(v: &i64, s: S) -> Result<S::Ok, S::Error> {
@@ -32,10 +35,10 @@ fn scheme(dsn: &str) -> &str {
     else { "?" }
 }
 
-/// 从 sqlite DSN 提取完整 db 文件路径（绝对或相对）。
-/// 规则（与 resolve_dsn_path 一致）：
-///   "sqlite:" 后总斜杠 ≥ 3 → 绝对路径（补回前导 /）
-///   "sqlite:" 后总斜杠 < 3 → 相对路径
+/// Extract the full DB file path from a sqlite DSN (absolute or relative).
+/// Rules (aligned with resolve_dsn_path):
+///   total slashes after "sqlite:" >= 3 → absolute path (re-prepend leading /)
+///   total slashes after "sqlite:" < 3 → relative path
 fn sqlite_file_path(dsn: &str) -> Option<std::path::PathBuf> {
     if dsn.contains(":memory:") { return None; }
 
@@ -44,7 +47,7 @@ fn sqlite_file_path(dsn: &str) -> Option<std::path::PathBuf> {
     let path_part = rest.trim_start_matches('/');
     if path_part.is_empty() { return None; }
 
-    // 总斜杠 ≥ 3 → 绝对路径（补前导 /）
+    // total slashes >= 3 → absolute path (prepend leading /)
     let file_path = if leading_slashes >= 3 {
         format!("/{}", path_part)
     } else {
@@ -62,13 +65,14 @@ fn sqlite_parent_dir(dsn: &str) -> Option<std::path::PathBuf> {
     parent
 }
 
-/// SIP Digest HA1 = md5(username:realm:password) — 全模块通用
+/// SIP Digest HA1 = md5(username:realm:password) — used throughout the module
 pub fn ha1_of(username: &str, realm: &str, password: &str) -> String {
     let h = Md5::digest(format!("{username}:{realm}:{password}").as_bytes());
     h.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Web 边车持久化池；None 表示未配置 NSBC_DB_DSN（CDR/audit 降级为 503）。
+/// Web sidecar persistence pool; None means NSBC_DB_DSN was not configured
+/// (CDR/audit degrade to 503).
 #[derive(Clone)]
 pub struct Db {
     pool: Option<Arc<Pool<Any>>>,
@@ -78,13 +82,13 @@ pub struct Db {
 impl Db {
     pub fn new() -> Self { Db { pool: None, backend: None } }
 
-    /// 从环境变量初始化。失败返回 `Db(None)` 并记录日志，不阻断主业务启动。
+    /// Initialize from env var. On failure returns `Db(None)` and logs, does not block main startup.
     pub async fn from_env() -> Self {
         let dsn = env::var("NSBC_DB_DSN").unwrap_or_default();
         Self::from_dsn(&dsn).await
     }
 
-    /// 从 WebConfig::DbSection 初始化（dsn 空或连接失败均降级）。
+    /// Initialize from WebConfig::DbSection (both empty dsn and connection failure degrade).
     pub async fn from_config(cfg: &super::config::DbSection) -> Self {
         let dsn = if let Ok(v) = env::var("NSBC_DB_DSN") {
             tracing::info!("🔧 [db::from_config] NSBC_DB_DSN env override active: {:?}", v);
@@ -104,8 +108,8 @@ impl Db {
         }
         let backend = scheme(dsn).to_string();
 
-        // SQLite：父目录不存在会导致 code 14 (unable to open database file)
-        // sqlx 只会自动创建 db 文件，不会自动 mkdir parent dir
+        // SQLite: missing parent dir would give code 14 (unable to open database file);
+        // sqlx auto-creates the DB file but does NOT auto-mkdir the parent directory.
         if backend == "sqlite" {
             if let Some(dir) = sqlite_parent_dir(dsn) {
                 if !dir.as_os_str().is_empty() {
@@ -117,11 +121,13 @@ impl Db {
                 }
             }
 
-            // 🔍 写入探针：sqlx 连接前直接写一次 db 文件，把 errno 打出来。
-            // code 14 除路径错误外最常见根因是目录无写权限 / SELinux 拦截；
-            // create_dir_all 在目录已存在时不检查写权限，"dir ensured" 不能证明可写。
+            // 🔍 Write probe: directly write the DB file once before connecting via sqlx
+            // to surface the errno clearly. Besides path errors, the most common root
+            // cause of code 14 is directory unwritable / SELinux intercept;
+            // create_dir_all does NOT check write permissions when the dir already exists,
+            // so "dir ensured" does not prove writable.
             if let Some(fp) = sqlite_file_path(dsn) {
-                // 进程上下文：uid + cwd（权限诊断第一手信息）
+                // Process context: uid + cwd (first-hand info for permission diagnosis)
                 let uid_line = std::fs::read_to_string("/proc/self/status").ok()
                     .and_then(|s| s.lines().find(|l| l.starts_with("Uid:"))
                               .map(|l| l.trim().to_string()));
@@ -129,7 +135,7 @@ impl Db {
                 info!(uid = ?uid_line, cwd = ?cwd.as_ref().map(|c| c.display().to_string()),
                       "🔍 [probe] process context");
 
-                // 文件现状
+                // Current file state
                 match std::fs::metadata(&fp) {
                     Ok(m) => info!(file = %fp.display(), exists = true,
                                    is_file = m.is_file(), len = m.len(),
@@ -138,23 +144,24 @@ impl Db {
                                     "🔍 [probe] db file metadata"),
                 }
 
-                // 实际写入（create+append；文件不存在则创建，等同 SQLite 建库动作）
+                // Actual write (create+append; creates file if missing, equivalent to SQLite DB creation)
                 match std::fs::OpenOptions::new().create(true).append(true).open(&fp) {
                     Ok(_) => info!(file = %fp.display(),
-                                   "🔍 [probe] db file WRITABLE — filesystem OK, code 14 来自 sqlx 层"),
+                                   "🔍 [probe] db file WRITABLE — filesystem OK, code 14 came from the sqlx layer"),
                     Err(e) => warn!(file = %fp.display(), error = %e,
                                     os_error = e.raw_os_error().unwrap_or(-1),
-                                    "🔍 [probe] db file NOT WRITABLE — 权限/SELinux 问题 \
-                                     (13=EACCES 权限不足; 1=EPERM; 30=EROFS 只读盘)"),
+                                    "🔍 [probe] db file NOT WRITABLE — permission / SELinux issue \
+                                     (13=EACCES permission denied; 1=EPERM; 30=EROFS read-only fs)"),
                 }
             }
         }
 
-        // 先直接连一次；如果是"库不存在"的错误，自动 CREATE DATABASE 后重试
+        // Try connecting once first; if it's a "database does not exist" error, auto-CREATE DATABASE
+        // then retry
         let pool_opt: Option<Pool<Any>> = match connect_and_migrate(dsn).await {
             Ok(p) => Some(p),
             Err(e) => {
-                // 只有 Postgres/MySQL 才需要 CREATE DATABASE（SQLite 文件不存在会自动创建）
+                // Only Postgres/MySQL need CREATE DATABASE (SQLite auto-creates missing files)
                 let needs_create = matches!(backend.as_str(), "postgres" | "mysql")
                     && db_missing(&e);
                 if needs_create {
@@ -183,10 +190,10 @@ impl Db {
         }
     }
 
-    /// 取底层池引用。未配置时返回 None。
+    /// Get the underlying pool reference. Returns None when not configured.
     pub fn pool(&self) -> Option<&Pool<Any>> { self.pool.as_ref().map(|a| a.as_ref()) }
 
-    /// 后端类型名：sqlite / postgres / mysql / none。
+    /// Backend type name: sqlite / postgres / mysql / none.
     pub fn backend(&self) -> &'static str {
         match self.backend.as_deref() {
             Some("sqlite") => "sqlite",
@@ -196,9 +203,10 @@ impl Db {
         }
     }
 
-    /// 从 web_users 表查询 Web 管理用户。
-    /// 未配置 DB（pool=None）或用户不存在 → 返回 None。
-    /// DB 查询失败 → 打 warn 日志并返回 None（不阻断登录流程，由上层 fallback）。
+    /// Query a Web admin user from the web_users table.
+    /// Returns None when DB is not configured (pool=None) or user not found.
+    /// On DB query failure → logs a warn and returns None (does not block login;
+    /// the caller handles fallback).
     pub async fn get_web_user(&self, username: &str) -> Option<WebUser> {
         let pool = self.pool()?;
         let row = sqlx::query_as::<_, WebUser>(
@@ -218,10 +226,11 @@ impl Db {
         }
     }
 
-    /// 确保 web_users 表中至少有一个启用的 admin 用户。
-    /// 启动时调用：检查表中是否已有 enabled=1 的用户，没有则注入默认 admin。
-    /// 默认密码从环境变量 NSBC_DEFAULT_ADMIN_PW 读取，未设则用 "Admin123"。
-    /// PHC 由调用方预先计算并传入（Db 不依赖 auth 模块）。
+    /// Ensure at least one enabled admin user exists in the web_users table.
+    /// Called at startup: checks whether an enabled=1 user already exists; injects
+    /// the default admin if not.
+    /// Default password is read from the NSBC_DEFAULT_ADMIN_PW env var; "Admin123" if unset.
+    /// PHC is pre-computed and passed in by the caller (Db does not depend on the auth module).
     pub async fn ensure_default_web_user(
         &self,
         username: &str,
@@ -230,15 +239,15 @@ impl Db {
     ) {
         let pool = match self.pool() {
             Some(p) => p,
-            None => return, // 无 DB，跳过 seed
+            None => return, // No DB, skip seed
         };
 
-        // 检查是否需要强制重置 admin 密码（运维应急用）
+        // Check whether admin password needs force-reset (ops emergency)
         let force_reset = std::env::var("NSBC_RESET_ADMIN").ok()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
-        // 查询现有记录（拿到 phc 判断是否为空）
+        // Query existing row (checks if phc is empty)
         let existing: Result<Option<(i64, String)>, _> = sqlx::query_as(
             "SELECT id, password_phc FROM web_users WHERE username = $1 LIMIT 1"
         )
@@ -248,7 +257,7 @@ impl Db {
 
         match existing {
             Ok(Some((id, old_phc))) => {
-                // 已存在：如果 phc 为空 或 显式要求重置 → UPDATE
+                // Already exists: UPDATE when phc is empty OR force-reset requested explicitly
                 let need_update = force_reset || old_phc.is_empty();
                 if !need_update {
                     tracing::info!(user = %username,
@@ -279,7 +288,7 @@ impl Db {
                 }
                 return;
             }
-            Ok(None) => {} // 需要 INSERT
+            Ok(None) => {} // need INSERT
             Err(e) => {
                 tracing::warn!(error = %e,
                     "web_users: check existing failed, skip seed");
@@ -287,7 +296,7 @@ impl Db {
             }
         }
 
-        // INSERT OR IGNORE / ON CONFLICT DO NOTHING 幂等插入
+        // INSERT OR IGNORE / ON CONFLICT DO NOTHING — idempotent insert
         let sql = match self.backend() {
             "postgres" =>
                 "INSERT INTO web_users (username, role, password_phc, enabled, description) \
@@ -316,12 +325,14 @@ impl Db {
         }
     }
 
-    /// 追加一行配置变更历史（config_history 表）。DB 未配置 → 静默跳过
-    /// 返回 Ok(())；后端写入失败 → 向上返回 sqlx::Error（由调用方决定降级）。
-    /// `actor` 通常是 Web 侧 API 调用占位 "api"（操作人已由 rbac middleware
-    /// 独立审计）；`action` 如 "set" / "set-noop" / "reload"；`old_value` 为空
-    /// 时传 None；`new_value` 必填。时间戳由列 DEFAULT 自动填充（避免跨后端
-    /// NOW()/datetime('now') 差异）。
+    /// Append a config change history row (config_history table). DB not configured
+    /// → silently skips and returns Ok(()); backend write failure → returns sqlx::Error
+    /// upward (caller decides on degradation).
+    /// `actor` is typically the Web-side API placeholder "api" (operator identity is
+    /// independently audited by the rbac middleware); `action` e.g. "set" / "set-noop" /
+    /// "reload"; `old_value` passes None when empty; `new_value` is required.
+    /// Timestamp auto-filled by column DEFAULT (avoids cross-backend NOW()/datetime('now')
+    /// differences).
     pub async fn insert_config_history(
         &self,
         actor: &str,
@@ -331,9 +342,9 @@ impl Db {
         new_value: &str,
     ) -> Result<(), sqlx::Error> {
         let Some(pool) = self.pool.as_ref() else { return Ok(()); };
-        // 注意：config_history DDL 列名是 `key`（不是 cfg_key）。
-        // changed_at 由列 DEFAULT 自动填（SQLite datetime('now') / PG NOW() /
-        // MySQL CURRENT_TIMESTAMP(3)），此处不传。
+        // Note: config_history DDL column name is `key` (not cfg_key).
+        // changed_at is auto-filled by column DEFAULT (SQLite datetime('now') / PG NOW() /
+        // MySQL CURRENT_TIMESTAMP(3)); we do not pass it here.
         sqlx::query(
             "INSERT INTO config_history (actor, action, key, old_value, new_value) \
              VALUES ($1, $2, $3, $4, $5)",
@@ -348,19 +359,20 @@ impl Db {
         Ok(())
     }
 
-    /// 追加一行话单（cdr 表）。DB 未配置 → 静默跳过 Ok；call_id 唯一键冲突
-    /// → 忽略；其他错误返回 sqlx::Error。
+    /// Append one CDR row to the cdr table. DB not configured → silently skip Ok;
+    /// call_id unique-key conflict → ignore; other errors return sqlx::Error.
     ///
-    /// 字段映射（新 cdr_event_t → 旧 DDL 列）：
-    ///   call_id → call_id (UNIQUE 冲突即幂等)
-    ///   from_num → caller；to_num → callee
-    ///   start_ms/end_ms → start_time/end_time (ISO 毫秒字符串，三后端 TEXT/时间戳都兼容)
-    ///   duration_s → duration_sec；cause → cause_code；disposition → cause_text
-    ///   扩展字段（tenant/trunk/rec_path/dir/phase/emergency/answer_ms/billsec）
-    ///     打包进 metadata JSON（TEXT/TEXT/JSON 三后端都能吃字符串 JSON）
-    ///   a_call_id/b_call_id/leg_a_final/leg_b_final → NULL（旧 B2B 腿诊断遗留列）。
+    /// Field mapping:
+    ///   call_id → call_id (UNIQUE conflict = idempotent)
+    ///   from_num → caller; to_num → callee
+    ///   start_ms/end_ms → start_time/end_time (ISO millisecond string, all-backend TEXT/timestamp compatible)
+    ///   duration_s → duration_sec; cause → cause_code; disposition → cause_text
+    ///   Extension fields (tenant/trunk/rec_path/dir/phase/emergency/answer_ms/billsec)
+    ///     packed into metadata JSON (TEXT/TEXT/JSON — all three backends accept JSON strings)
+    ///   a_call_id/b_call_id/leg_a_final/leg_b_final → NULL (legacy B2B leg-diagnostic columns).
     ///
-    /// 跨后端冲突忽略语法：pg/sqlite 用 ON CONFLICT DO NOTHING，mysql 用 INSERT IGNORE。
+    /// Cross-backend conflict-ignore syntax: pg/sqlite use ON CONFLICT DO NOTHING,
+    /// mysql uses INSERT IGNORE.
     pub async fn insert_cdr(
         &self,
         call_id: &str,
@@ -387,14 +399,15 @@ impl Db {
     ) -> Result<(), sqlx::Error> {
         let Some(pool) = self.pool.as_ref() else { return Ok(()); };
 
-        // 时间戳（毫秒 epoch → ISO 8601 字符串，所有后端 TEXT/时间戳列都能存）。
+        // Timestamp (epoch ms → ISO 8601 string; all backend TEXT/timestamp columns store fine).
         let start_iso = ms_to_iso(start_ms);
         let answer_iso = if answer_ms > 0 { ms_to_iso(answer_ms) } else { None };
         let end_iso = if end_ms > 0 { ms_to_iso(end_ms) } else { None };
         let billsec_i64 = billsec as i64;
 
-        // metadata JSON 字符串（三后端都能接受）。codec/IP 等扩展字段塞进 metadata——
-        // 不碰 cdr 表 schema（最小侵入），前端解析 metadata JSON 展示。
+        // metadata JSON string (ingestible by all three backends). codec/IP extension fields
+        // stuffed into metadata — do not touch cdr table schema (minimal intrusion),
+        // front-end parses metadata JSON to display.
         let mut meta_obj = serde_json::json!({
             "tenant": tenant,
             "trunk": trunk,
@@ -405,8 +418,9 @@ impl Db {
             "billsec": billsec,
             "emergency": emergency,
         });
-        // codec / IP 字段（空串时跳过——signaling.c END 链路填完整，START/ANSWER 早期事件可能空）
-        // 兼容旧 Rust：let chain guard（if let ... if COND）需 1.65+，改嵌套 if
+        // codec / IP fields (skip when empty — signaling.c END chain fills completely;
+        // early START/ANSWER events may be empty)
+        // Rust 1.65+ required for let-chains (if let ... if COND); use nested if instead
         if let Some(s) = from_ip   { if !s.is_empty() { meta_obj["from_ip"]   = serde_json::Value::String(s.into()); } }
         if let Some(s) = codec_a   { if !s.is_empty() { meta_obj["codec_a"]   = serde_json::Value::String(s.into()); } }
         if let Some(s) = codec_b   { if !s.is_empty() { meta_obj["codec_b"]   = serde_json::Value::String(s.into()); } }
@@ -444,14 +458,14 @@ impl Db {
         Ok(())
     }
 
-    /// register.write：UPSERT 注册快照（REQ-DATA-SVC-002 C→Web write-through）。
+    /// register.write: UPSERT registration snapshot (REQ-DATA-SVC-002 C→Web write-through).
     ///
-    /// 唯一键 user_name + instance_id（多终端/GRUU 场景区分设备），重复推送原地
-    /// 刷新 contact/agent/expires_at/updated_at；expires_at 由 now + expires_sec
-    /// 计算为 ISO 8601 字符串（与 cdr 时间列同模式）。
-    /// MySQL 用 ON DUPLICATE KEY UPDATE，sqlite/pg 用 ON CONFLICT DO UPDATE。
-    /// NAT 元数据（REQ-NAT-001）：received_ip/received_port/nat_detected/
-    /// public_contact/transport — C 侧 registrar.c 检测填充，Web 端原样落库展示。
+    /// Unique key is user_name + instance_id (multi-terminal/GRUU scenarios distinguish devices);
+    /// repeated pushes refresh contact/agent/expires_at/updated_at in place; expires_at is
+    /// computed as ISO 8601 string from now + expires_sec (same pattern as cdr time columns).
+    /// MySQL uses ON DUPLICATE KEY UPDATE; sqlite/pg use ON CONFLICT DO UPDATE.
+    /// NAT metadata (REQ-NAT-001): received_ip/received_port/nat_detected/
+    /// public_contact/transport — C-side registrar.c detects and fills, Web side stores as-is.
     pub async fn upsert_registration(
         &self,
         user_name: &str,
@@ -459,7 +473,7 @@ impl Db {
         instance_id: &str,
         agent: Option<&str>,
         expires_sec: u32,
-        // NAT 元数据（REQ-NAT-001）
+        // NAT metadata (REQ-NAT-001)
         received_ip: Option<&str>,
         received_port: Option<i64>,
         nat_detected: Option<i64>,
@@ -475,7 +489,7 @@ impl Db {
         let expires_at = ms_to_iso(now_ms + expires_sec as u64 * 1000);
         let updated_at = ms_to_iso(now_ms);
 
-        // 空字符串 option 归一（C 侧 push 的 JSON 空字符串 → Web None）
+        // Empty-string option normalization (C-side pushed JSON empty string → Web None)
         let received_ip = received_ip.and_then(|s| if s.is_empty() { None } else { Some(s) });
         let public_contact = public_contact.and_then(|s| if s.is_empty() { None } else { Some(s) });
         let transport = transport.and_then(|s| if s.is_empty() { None } else { Some(s) });
@@ -521,8 +535,8 @@ impl Db {
         Ok(())
     }
 
-    /// runtime.write：追加呼叫状态变迁轨迹（runtime_state 表，纯 INSERT）。
-    /// state：DIALING/EARLY/ANSWERED/HANGUP 等；detail 为可选 JSON 字符串。
+    /// runtime.write: append a call state change trajectory row (runtime_state table, INSERT only).
+    /// state: DIALING/EARLY/ANSWERED/HANGUP etc.; detail is optional JSON string.
     pub async fn insert_runtime_state(
         &self,
         call_id: &str,
@@ -541,8 +555,8 @@ impl Db {
         Ok(())
     }
 
-    /// audit.write：C 侧 CLI/OAM 操作审计（audit_log 表，Web 侧认证审计同表）。
-    /// C 核心经 UDS 推送的场景无来源 IP，ip 传 None。
+    /// audit.write: C-side CLI/OAM operation audit (audit_log table, Web-side auth audit same table).
+    /// Scenarios pushed by the C core over UDS have no source IP — pass None for ip.
     pub async fn insert_audit_event(
         &self,
         event: &str,
@@ -568,11 +582,12 @@ impl Db {
         Ok(())
     }
 
-    /// session.write：UPSERT 实时呼叫会话快照（REQ-DATA-SVC-002 C→Web write-through）。
+    /// session.write: UPSERT real-time call session snapshot (REQ-DATA-SVC-002 C→Web write-through).
     ///
-    /// call_id 作为唯一键；C 侧经 data.sock 推送 SESSION 事件时调用。
-    /// from_num / to_num 为空串时保留已有值（会话早期事件可能还没拿到号码）。
-    /// 三后端 upsert 语法差异：mysql ON DUPLICATE KEY UPDATE，pg/sqlite ON CONFLICT DO UPDATE。
+    /// call_id is the unique key; called when the C side pushes SESSION events via data.sock.
+    /// from_num / to_num are preserved as existing when empty (early session events may not yet
+    /// have the numbers).
+    /// Cross-backend upsert syntax differences: mysql ON DUPLICATE KEY UPDATE, pg/sqlite ON CONFLICT DO UPDATE.
     pub async fn upsert_call(
         &self,
         call_id: &str,
@@ -652,24 +667,24 @@ impl Db {
     }
 }
 
-/// 毫秒 epoch → ISO 8601 UTC 字符串（YYYY-MM-DDTHH:MM:SS.sssZ）；0 输入返回 None。
-/// 纯 std 实现（无需 chrono 依赖），毫秒精度。SQLite/MySQL TEXT 列直接存字符串；
-/// PostgreSQL TIMESTAMPTZ 列也接受 ISO 字符串。
+/// Epoch milliseconds → ISO 8601 UTC string (YYYY-MM-DDTHH:MM:SS.sssZ); None on 0 input.
+/// Pure std implementation (no chrono dependency), millisecond precision.
+/// SQLite/MySQL TEXT columns store strings directly; PostgreSQL TIMESTAMPTZ also accepts ISO strings.
 fn ms_to_iso(ms: u64) -> Option<String> {
     if ms == 0 { return None; }
     let secs = (ms / 1000) as u64;
     let ms_rem = ms % 1000;
 
-    // Unix epoch → UTC 年月日时分秒。
-    // 用简化 Zeller 推导：epoch 以 1970-01-01 为起点。
+    // Unix epoch → UTC year/month/day/hour/min/sec.
+    // Use simplified Zeller derivation: epoch starts at 1970-01-01.
     let days = secs / 86_400;
     let rem_sec = secs % 86_400;
     let h = rem_sec / 3_600;
     let m = (rem_sec % 3_600) / 60;
     let s = rem_sec % 60;
 
-    // 1970-01-01 是 Thursday（day_of_week=4, 周日=0），day 0 是 Thu。
-    // 简化版：累加年、月天数，考虑闰年。
+    // 1970-01-01 is Thursday (day_of_week=4, Sunday=0), day 0 = Thu.
+    // Simplified version: accumulate year/month days, handle leap years.
     let mut y: u32 = 1970;
     let mut d_rem = days as u32;
     loop {
@@ -698,8 +713,8 @@ fn ms_to_iso(ms: u64) -> Option<String> {
     ))
 }
 
-/// 判断 sqlx 错误是否是 "database does not exist"
-/// 三后端不同：pg "does not exist"，mysql "Unknown database"
+/// Determine whether a sqlx error is "database does not exist".
+/// Three backends differ: pg "does not exist", mysql "Unknown database"
 fn db_missing(e: &sqlx::Error) -> bool {
     let msg = format!("{}", e).to_ascii_lowercase();
     msg.contains("does not exist")        // PostgreSQL 42P01
@@ -707,14 +722,13 @@ fn db_missing(e: &sqlx::Error) -> bool {
         || msg.contains("no such database")
 }
 
-/// 统一占位符转换——任何 SQL 先过这个函数再丢给 sqlx。
-/// 接受两种输入风格，统一输出后端要求的格式：
-///
-///   postgres:  `?` → `$1, $2...`   `$N` 保持不变
-///   sqlite:    `?` → `$1, $2...`   `$N` 保持不变
-///   mysql:     `$N` → `?`           `?` 保持不变
-///
-/// 规则：只要 SQL 里有 `?` 就当"原生 `?` 风格"处理；只要有 `${digit}` 就当"pg 风格"处理。
+/// Unified placeholder conversion — any SQL passes through this function before being handed to sqlx.
+/// Accepts both input styles and outputs the backend-required format:
+///   postgres:  `?` → `$1, $2...`   `$N` kept as-is
+///   sqlite:    `?` → `$1, $2...`   `$N` kept as-is
+///   mysql:     `$N` → `?`           `?` kept as-is
+/// Rule: as soon as the SQL contains `?`, treat it as "native `?` style"; as soon as it contains `${digit}`,
+/// treat it as "pg style".
 fn fix_ph(sql: &str, backend: &str) -> String {
     let has_q = sql.contains('?');
     let has_dollar = sql.chars().zip(sql.chars().skip(1))
@@ -751,16 +765,16 @@ fn fix_ph(sql: &str, backend: &str) -> String {
     }
 }
 
-/// 剥离 RETURNING 子句（MySQL 不支持 RETURNING）。
-/// 只处理末尾的 `RETURNING *` 或 `RETURNING col1, col2...`，大小写不敏感。
+/// Strip RETURNING clause (MySQL does not support RETURNING).
+/// Only handles trailing `RETURNING *` or `RETURNING col1, col2...`, case-insensitive.
 fn strip_returning(sql: &str) -> String {
     let lower = sql.to_ascii_lowercase();
     if let Some(idx) = lower.rfind(" returning ") {
-        // 找到 'returning '（前有空格避免误匹配），截掉
+        // Find 'returning ' (preceded by space to avoid false matches), cut it off
         let trimmed = sql[..idx].trim_end();
         trimmed.to_string()
     } else if let Some(idx) = lower.rfind("returning ") {
-        // 行首或无前导空格的情况
+        // Leading line or no preceding space
         let trimmed = sql[..idx].trim_end();
         trimmed.to_string()
     } else {
@@ -768,20 +782,20 @@ fn strip_returning(sql: &str) -> String {
     }
 }
 
-/// 从 DSN 里把数据库名抽出来，再替换成默认库（postgres/mysql），
-/// 连上去跑 CREATE DATABASE。成功返回 Ok(())。
-///
-///   postgres://user:pass@host:5432/nsbcdb  → 先连 postgres → CREATE DATABASE nsbcdb
-///   mysql://user:pass@host:3306/nsbcdb     → 先连 mysql    → CREATE DATABASE nsbcdb
+/// Extract the database name from a DSN, replace it with the admin DB (postgres/mysql),
+/// connect and run CREATE DATABASE. Success returns Ok(()).
+///   postgres://user:pass@host:5432/nsbcdb  → first connect to postgres → CREATE DATABASE nsbcdb
+///   mysql://user:pass@host:3306/nsbcdb     → first connect to mysql    → CREATE DATABASE nsbcdb
 async fn auto_create_database(dsn: &str, backend: &str) -> Result<(), sqlx::Error> {
-    // 从 DSN 解析出目标库名（先 clone 出来，避免 parsed 被借用导致后面 match 无法 move）
+    // Parse the target DB name from the DSN first (clone it out so that the borrowed parsed
+    // struct does not block later moves)
     let parsed = parse_dsn(dsn);
     let db_name: String = parsed
         .as_ref()
         .and_then(|d| d.path.strip_prefix('/').map(|s| s.to_string()))
         .ok_or_else(|| sqlx::Error::Configuration("cannot parse database name from DSN".into()))?;
 
-    // 替换路径为默认管理库，建临时连接
+    // Replace the path with the default admin DB, build a temporary connection
     let admin_default = match backend {
         "postgres" => "postgres",
         "mysql"    => "mysql",
@@ -793,7 +807,7 @@ async fn auto_create_database(dsn: &str, backend: &str) -> Result<(), sqlx::Erro
             rebuild_dsn(&p, backend)
         }
         None => {
-            // parse 失败兜底：手搓（只支持最简单 host:port 无 query 的情况）
+            // Parse-failure fallback: hand-build (only covers the simplest host:port, no query)
             let scheme_end = dsn.find("://").unwrap_or(0);
             let path_start = dsn[scheme_end + 3..].find('/').map(|i| scheme_end + 3 + i).unwrap_or(dsn.len());
             let before_path = dsn[..path_start].to_string();
@@ -803,7 +817,7 @@ async fn auto_create_database(dsn: &str, backend: &str) -> Result<(), sqlx::Erro
 
     info!(admin_dsn = %admin_dsn, "connecting admin db to create database '{db_name}'");
     let admin_pool = Pool::<Any>::connect(&admin_dsn).await?;
-    // CREATE DATABASE 不能用 prepared statement（多数后端不支持）
+    // CREATE DATABASE cannot use prepared statements (most backends don't support it)
     let escaped = db_name.replace('`', "").replace('"', "").replace('\'', "");
     if escaped.is_empty() || escaped.len() > 64 {
         return Err(sqlx::Error::Configuration(format!("invalid database name: {db_name}").into()));
@@ -817,15 +831,15 @@ async fn auto_create_database(dsn: &str, backend: &str) -> Result<(), sqlx::Erro
     Ok(())
 }
 
-// ---------- DSN 解析（极简，只覆盖我们用到的字段）----------
+// ---------- Minimal DSN parser (only covers the fields we need) ----------
 #[derive(Default)]
 struct DsnParts {
     scheme: String,
-    userinfo: String, // "user:pass" 或空
+    userinfo: String,   // "user:pass" or empty
     host: String,
-    port: String,     // 带冒号 ":5432" 或空
+    port: String,       // ":5432" with colon, or empty
     path: String,     // "/dbname"
-    query: String,    // "?a=b" 或空
+    query: String,      // "?a=b" or empty
 }
 
 fn parse_dsn(dsn: &str) -> Option<DsnParts> {
@@ -871,9 +885,9 @@ async fn connect_and_migrate(dsn: &str) -> Result<Pool<Any>, sqlx::Error> {
     sqlx::any::install_default_drivers();
     let backend = scheme(dsn);
 
-    // SQLite：内存库每连接独立实例 → pool size 锁 1；
-    // 外加 journal_mode=MEMORY + synchronous=OFF 绕沙箱文件限制。
-    // 文件库也受益（journal 不写磁盘）。
+    // SQLite: in-memory databases are per-connection independent → lock pool size to 1;
+    // also journal_mode=MEMORY + synchronous=OFF to bypass sandbox file restrictions.
+    // File databases also benefit (journal does not hit disk).
     let pool = if backend == "sqlite" {
         use sqlx::pool::PoolOptions;
         PoolOptions::<Any>::new()
@@ -893,43 +907,45 @@ async fn connect_and_migrate(dsn: &str) -> Result<Pool<Any>, sqlx::Error> {
     Ok(pool)
 }
 
-/// 自动探测机器公网 IPv4 地址。
+/// Auto-detect the machine's public IPv4 address.
 ///
-/// 优先级（快 → 慢）：
-///   1) `NSBC_PUBLIC_IP` 环境变量（运维显式指定，最高优先，零延迟）
-///   2) `NSBC_SKIP_PUBLIC_IP_DETECT=1` → 跳过探测返回 None（纯内网/完全 NAT 场景）
-///   3) 国内优先：ip.sb (10ms) → ip138 (50ms) → myip.ipip.net (30ms)
-///      全部 1.5s 超时并行，第一个返回胜出
-///   4) 国际 fallback：ifconfig.me / api.ipify.org / ident.me（各 1.5s 超时）
+/// Priority (fast → slow):
+///   1) `NSBC_PUBLIC_IP` env var (explicit ops override, highest priority, zero latency)
+///   2) `NSBC_SKIP_PUBLIC_IP_DETECT=1` → skip detection return None (pure intranet / full NAT scenario)
+///   3) Domestic first: ip.sb (10ms) → ip138 (50ms) → myip.ipip.net (30ms)
+///      all with 1.5s timeout parallel, first to return wins
+///   4) International fallback: ifconfig.me / api.ipify.org / ident.me (1.5s timeout each)
 ///
-/// 国内服务器走阿里云国际出口时，ifconfig.me 等海外服务可达但 >500ms；
-/// ip.sb / ipip.net 走国内线路 <20ms 稳定。先跑国内轮次，国内全挂才 fallback。
+/// Domestic servers going through Alibaba Cloud international egress can reach ifconfig.me etc.
+/// but >500ms; ip.sb / ipip.net hit the domestic circuit <20ms stable. Run the domestic round
+/// first, only fall back when domestic all fail.
 ///
-/// 实现用 `std::process::Command` 调 `curl`（云服务器必有），零新 crate 依赖。
+/// Implementation uses `std::process::Command` to call `curl` (always present on cloud
+/// servers), zero new crate deps.
 async fn detect_public_ip() -> Option<String> {
-    // 1) env var 最高优先
+    // 1) env var is highest priority
     if let Ok(v) = std::env::var("NSBC_PUBLIC_IP") {
         let v = v.trim().to_string();
         if is_valid_ipv4(&v) {
-            tracing::info!(ip = %v, "🌐 NSBC_PUBLIC_IP env 生效");
+            tracing::info!(ip = %v, "🌐 NSBC_PUBLIC_IP env takes effect");
             return Some(v);
         }
     }
 
-    // 2) 显式跳过探测
+    // 2) explicit skip detection
     if std::env::var("NSBC_SKIP_PUBLIC_IP_DETECT").ok()
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
     {
-        tracing::info!("🌐 NSBC_SKIP_PUBLIC_IP_DETECT=1 — 跳过公网 IP 探测");
+        tracing::info!("🌐 NSBC_SKIP_PUBLIC_IP_DETECT=1 — skip public IP probe");
         return None;
     }
 
-    // 3) 国内优先（阿里云/腾讯云国内出口访问 <20ms；各 1.5s 超时）
+    // 3) Domestic first (Aliyun/Tencent domestic egress hits <20ms; 1.5s timeout each)
     let domestic: &[&str] = &[
-        "https://ip.sb/ip",          // 七牛云 IP 检测，国内最快
-        "https://myip.ipip.net",       // ipip.net 国内节点
-        "https://api.ip.sb/ip",        // ip.sb API 路径变体
+        "https://ip.sb/ip",          // Qiniu Cloud IP detection, fastest domestic
+        "https://myip.ipip.net",       // ipip.net domestic node
+        "https://api.ip.sb/ip",        // ip.sb API path variant
         "https://ip138.com/ips138.asp?action=ip", // ip138
     ];
 
@@ -937,7 +953,7 @@ async fn detect_public_ip() -> Option<String> {
         return Some(ip);
     }
 
-    // 4) 国际 fallback（国内全挂才跑；不常见但覆盖特殊网络场景）
+    // 4) International fallback (only runs when domestic all fail; uncommon but covers special networks)
     let international: &[&str] = &[
         "https://ifconfig.me/ip",
         "https://api.ipify.org",
@@ -947,15 +963,17 @@ async fn detect_public_ip() -> Option<String> {
     probe_batch(international, 1500).await
 }
 
-/// 并行探测一批 IP 服务，**第一个返回合法 IPv4 的立刻胜出**（不等其他）。
-/// 全部失败/超时 → None。单次请求最大超时 ms。
+/// Probe a batch of IP services in parallel, **the first to return a valid IPv4 wins
+/// immediately** (does not wait for the rest). All failures/timeouts → None. Per-request
+/// max timeout in ms.
 ///
-/// 关键：所有 curl 同时用 `spawn_blocking` 并行启动，用 tokio select! 真·抢跑——
-/// 最快的那个（国内 ip.sb <20ms）返回合法 IP 就立即返回，不等最慢的超时。
+/// Key: all curl processes are launched in parallel using `spawn_blocking`, and tokio
+/// select! is used for real race — the fastest (domestic ip.sb <20ms) returning a valid IP
+/// causes immediate return, not waiting for the slowest one to timeout.
 async fn probe_batch(services: &[&str], timeout_ms: u64) -> Option<String> {
     let timeout_s = (timeout_ms as f64 / 1000.0).ceil() as u64;
 
-    // 并行启动所有 curl
+    // Launch all curls in parallel
     let mut handles: Vec<tokio::task::JoinHandle<Option<String>>> = Vec::with_capacity(services.len());
     for url in services {
         let url = url.to_string();
@@ -979,30 +997,32 @@ async fn probe_batch(services: &[&str], timeout_ms: u64) -> Option<String> {
         }));
     }
 
-    // 真·抢跑：只对已完成的 handle 取结果，没完成的 yield 让出后下一轮再看
+    // Race to the first valid IP: drain handles as they complete so we never poll the
+    // same JoinHandle twice (tokio panics on double-poll of a completed JoinHandle).
     loop {
-        let mut all_done = true;
-        let mut found = None;
-        for h in handles.iter_mut() {
-            if !h.is_finished() {
-                all_done = false;
-                continue;  // 还在跑，跳过不阻塞
+        if handles.is_empty() { break; }
+        let mut i = 0;
+        while i < handles.len() {
+            if !handles[i].is_finished() {
+                i += 1;
+                continue;  // still running, skip
             }
-            // 已完成 → 瞬间 await（不阻塞）
+            // Completed → poll exactly ONCE, then drop the handle (Vec::swap_remove
+            // is O(1) and guarantees this handle is never touched again).
+            let h = handles.swap_remove(i);
             if let Ok(Some(ip)) = h.await {
-                found = Some(ip);
-                break;
+                return Some(ip);
             }
+            // else: returned None or JoinError, move on to next handle
         }
-        if let Some(ip) = found { return Some(ip); }
-        if all_done { break; }
-        tokio::task::yield_now().await;  // 让出 CPU，blocking 线程跑完后再来
+        if handles.is_empty() { break; }
+        tokio::task::yield_now().await;  // yield CPU so blocking threads can finish and we check again
     }
     None
 }
 
-/// 极简 IPv4 验证：四段 0-255 数字，点分隔。
-/// 不依赖 std::net::Ipv4Addr（其实也可以用，但保持零依赖风格）。
+/// Minimal IPv4 validator: four dotted 0-255 numbers.
+/// Does not depend on std::net::Ipv4Addr (could, but keeping zero-dep style).
 fn is_valid_ipv4(s: &str) -> bool {
     let mut parts = 0u32;
     for seg in s.split('.') {
@@ -1019,17 +1039,21 @@ fn is_valid_ipv4(s: &str) -> bool {
     parts == 4
 }
 
-/// 执行 DDL（幂等，所有语句带 IF NOT EXISTS）。
-/// 三后端语法差异在各自分支内处理。
+/// Execute DDL (idempotent, all statements carry IF NOT EXISTS).
+/// Cross-backend syntax differences handled in each branch.
 async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Error> {
-    // --- cdr 表（CDR 通话记录，承载千万~亿级数据）---
-    // answer_time / billsec 是 INSERT 必需列（之前手动 ALTER 补过，新 DB 必须建在表结构里）。
-    // ================================================================
-    // 租户（REQ-TENANT-001）——租户维度隔离
-    // tenant_id 是所有业务表的外键；tenant_name 是人类可读标识，日志/CDR/API 全带。
-    // 识别规则（呼入时匹配）：domain 匹配 SIP Realm、did_prefix 匹配入站 DID、trunk 匹配入中继名。
-    // 默认租户 (id=1, name='default') 在 run_migrations 末尾 INSERT，兼容零租户时代的老数据。
-    // ================================================================
+    // --- cdr table (call detail records, carries tens of millions to hundreds of millions of rows) ---
+    // answer_time / billsec are INSERT-required columns (previously manually ALTER-patched;
+    // new DBs must have them in the create-table statement).
+    // ====================================================================
+    // Tenant (REQ-TENANT-001) — tenant-dimension isolation
+    // tenant_id is the foreign key for all business tables; tenant_name is the
+    // human-readable identifier, present throughout logs/CDRs/APIs.
+    // Match rule (matched on inbound): domain matches SIP Realm, did_prefix
+    // matches inbound DID, trunk matches inbound trunk name.
+    // Default tenant (id=1, name='default') is INSERTed at the end of run_migrations,
+    // backward-compatible with zero-tenant-era legacy data.
+    // ====================================================================
     let _ = sqlx::query(&match backend {
         "sqlite" =>
             "CREATE TABLE IF NOT EXISTS tenants (
@@ -1069,7 +1093,7 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
     }).execute(pool).await;
 
-    // 确保默认租户存在（id=1, name='nsbc.local'——即 SIP 默认 realm）
+    // Ensure the default tenant exists (id=1, name='nsbc.local' — SIP default realm)
     {
         let cnt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tenants")
             .fetch_one(pool).await.unwrap_or(0);
@@ -1077,19 +1101,22 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
             let _ = sqlx::query(
                 "INSERT INTO tenants (id, tenant_name, description, enabled) VALUES (1, 'nsbc.local', 'Default SIP realm', 1)"
             ).execute(pool).await;
-            // 自增 ID 对齐（PG 用 setval、SQLite AUTOINCREMENT 不管、MySQL AUTO_INCREMENT 不管）
+            // Auto-increment ID alignment (PG uses setval, SQLite AUTOINCREMENT no-op, MySQL AUTO_INCREMENT no-op)
             let _ = sqlx::query("SELECT setval(pg_get_serial_sequence('tenants','id'), GREATEST(COALESCE((SELECT MAX(id) FROM tenants),1),1), true)").execute(pool).await;
         }
     }
 
     // ================================================================
-    // CDR（呼叫详细记录）
+    // CDR (call detail record)
     // ================================================================
-    // 索引策略：单 start_time 索引已覆盖时间范围查询；caller+callee 各单独索引覆盖号码过滤；
-    // 复合索引 (start_time, caller) / (start_time, callee) 覆盖最常见的"按时间范围+号码"查询模式。
-    // SQLite：无原生分区，靠 WAL + auto_vacuum + 好索引；单表 1-2 亿行实测可用。
-    // PostgreSQL：推荐按月分区（RANGE PARTITION BY start_time_date），见 run_cdr_partitioning()。
-    // MySQL：推荐 PARTITION BY RANGE (TO_DAYS(start_time))，见 run_cdr_partitioning()。
+    // Index strategy: single start_time index already covers time-range queries; caller/callee
+    // each have their own index for number filtering; compound (start_time, caller) /
+    // (start_time, callee) covers the most common "time range + number" query pattern.
+    // SQLite: no native partitioning — rely on WAL + auto_vacuum + good indexes; single
+    // table with 1-200 million rows is proven usable.
+    // PostgreSQL: monthly partitioning recommended (RANGE PARTITION BY start_time_date),
+    // see run_cdr_partitioning().
+    // MySQL: PARTITION BY RANGE (TO_DAYS(start_time)) recommended, see run_cdr_partitioning().
     let cdr_ddl = match backend {
         "sqlite" =>
             "CREATE TABLE IF NOT EXISTS cdr (
@@ -1159,10 +1186,11 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
     };
     sqlx::query(cdr_ddl).execute(pool).await?;
 
-    // --- cdr 索引（幂等，IF NOT EXISTS）---
-    // 单列索引：caller / callee / start_time / cause_code 覆盖基础过滤；
-    // 复合索引 (start_time, caller) / (start_time, callee) 覆盖"时间范围+号码"查询模式。
-    // 注意：复合索引不能走 format! 循环（会拼成 ON cdr((a,b)) → SQLite row value misused）。
+    // --- cdr indexes (idempotent, IF NOT EXISTS) ---
+    // Single-column: caller / callee / start_time / cause_code for basic filtering;
+    // compound (start_time, caller) / (start_time, callee) for "time range + number" queries.
+    // Note: compound indexes cannot go through a format! loop (would become ON cdr((a,b))
+    // → SQLite row value misused).
     let cdr_single_indexes: &[(&str, &str)] = &[
         ("idx_cdr_start",  "start_time"),
         ("idx_cdr_caller", "caller"),
@@ -1174,7 +1202,7 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
             "CREATE INDEX IF NOT EXISTS {idx} ON cdr({col})"
         )).execute(pool).await?;
     }
-    // 复合索引：完整 SQL，避免双括号
+    // Composite indexes: full SQL, avoid double parentheses
     let cdr_composite_indexes: &[&str] = &[
         "CREATE INDEX IF NOT EXISTS idx_cdr_start_caller  ON cdr(start_time, caller)",
         "CREATE INDEX IF NOT EXISTS idx_cdr_start_callee  ON cdr(start_time, callee)",
@@ -1184,7 +1212,7 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
         sqlx::query(sql).execute(pool).await?;
     }
 
-    // --- 升级迁移：旧表追加 answer_time / billsec（幂等）---
+    // --- Upgrade migration: append answer_time / billsec to old tables (idempotent) ---
     match backend {
         "sqlite" => {
             let cols: Vec<(i64, String)> = sqlx::query_as("PRAGMA table_info(cdr)")
@@ -1203,7 +1231,7 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
         }
     }
 
-    // SQLite：打开 WAL + auto_vacuum=INCREMENTAL（千万级数据必备）
+    // SQLite: enable WAL + auto_vacuum=INCREMENTAL (essential for multi-million-row data)
     if backend == "sqlite" {
         let _ = sqlx::query("PRAGMA journal_mode=WAL").execute(pool).await;
         let _ = sqlx::query("PRAGMA auto_vacuum=INCREMENTAL").execute(pool).await;
@@ -1248,7 +1276,7 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
     };
     sqlx::query(cfg_ddl).execute(pool).await?;
 
-    // --- audit_log（Web 侧认证/操作事件）---
+    // --- audit_log (Web-side auth/operation events) ---
     let audit_ddl = match backend {
         "sqlite" =>
             "CREATE TABLE IF NOT EXISTS audit_log (
@@ -1287,12 +1315,13 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
     };
     sqlx::query(audit_ddl).execute(pool).await?;
 
-    // --- registrations（REQ-DATA-SVC-002 C→Web register.write 的落库目标）---
-    // C 核心经 UDS 推送的注册快照（分机 + register 型中继出站注册状态）。
-    // user_name + instance_id 唯一（多终端/GRUU 场景），重复推送 UPSERT 刷新。
-    // 时间列统一 TEXT 存 ISO 8601 字符串（与 cdr.start_time 同模式，三后端兼容）。
-    // NAT 元数据（REQ-NAT-001）：received_ip/received_port/nat_detected/
-    // public_contact/transport 由 C 侧 registrar.c 检测填充，Web 端原样落库。
+    // --- registrations (REQ-DATA-SVC-002 C→Web register.write target table) ---
+    // C-side snapshot pushed via UDS (extensions + register-type trunk outbound registration state).
+    // user_name + instance_id is unique (multi-terminal/GRUU scenarios); repeated pushes UPSERT
+    // to refresh. Time columns uniformly use TEXT storing ISO 8601 strings (same pattern as
+    // cdr.start_time, compatible across all three backends).
+    // NAT metadata (REQ-NAT-001): received_ip/received_port/nat_detected/
+    // public_contact/transport are filled by C-side registrar.c detection, Web stores as-is.
     let reg_ddl = match backend {
         "sqlite" =>
             "CREATE TABLE IF NOT EXISTS registrations (
@@ -1349,9 +1378,10 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
     };
     sqlx::query(reg_ddl).execute(pool).await?;
 
-    // --- registrations NAT 字段 ALTER TABLE 迁移（REQ-NAT-001）---
-    // 对已有 registrations 表补 5 个 NAT 列；新表（CREATE TABLE IF NOT EXISTS）已包含，
-    // 此 ALTER 仅对"旧表升级"场景生效。三后端各自 IF NOT EXISTS。
+    // --- registrations NAT fields ALTER TABLE migration (REQ-NAT-001) ---
+    // Add 5 NAT columns to existing registrations table; new tables (CREATE TABLE IF NOT EXISTS)
+    // already include them — this ALTER only applies to "upgrade from old table" scenarios.
+    // Each backend handles IF NOT EXISTS independently.
     {
         let nat_cols: &[(&str, &str, &str)] = &[
             ("received_ip",    "TEXT NOT NULL DEFAULT ''",          "VARCHAR(64) NOT NULL DEFAULT ''"),
@@ -1394,9 +1424,10 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
         }
     }
 
-    // --- runtime_state（REQ-DATA-SVC-002 runtime.write 的落库目标）---
-    // 呼叫状态变迁轨迹（DIALING/EARLY/ANSWERED/HANGUP...），CDR 之外的实时轨迹。
-    // 注意：建表与索引必须拆成两条语句（sqlx prepared statement 不支持 `;` 链）。
+    // --- runtime_state (REQ-DATA-SVC-002 runtime.write target table) ---
+    // Call state change trajectory (DIALING/EARLY/ANSWERED/HANGUP...), real-time trajectory
+    // outside of CDR. Note: create-table and index must be two separate statements (sqlx
+    // prepared statements do not support `;` chains).
     let rt_ddl = match backend {
         "sqlite" =>
             "CREATE TABLE IF NOT EXISTS runtime_state (
@@ -1431,11 +1462,11 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
             .execute(pool).await?;
     }
 
-    // --- calls（REQ-DATA-SVC-002 session.write 的落库目标）---
-    // 实时会话快照（UPDATE ON CONFLICT），call_id 唯一键；每次 session 事件
-    // 刷新 state/event/cause/last_seen；from_num/to_num 采用 CASE WHEN 空值保护
-    // （session 事件可能只带 call_id + state，号码字段留空，避免初始化阶段
-    // 把已有的号码覆盖成空）。
+    // --- calls (REQ-DATA-SVC-002 session.write target table) ---
+    // Real-time session snapshot (UPDATE ON CONFLICT), call_id unique key; every session
+    // event refreshes state/event/cause/last_seen; from_num/to_num use CASE WHEN empty-value
+    // protection (session events may only carry call_id + state, number fields left empty —
+    // avoid overwriting existing values to empty during initialization).
     let calls_ddl = match backend {
         "sqlite" =>
             "CREATE TABLE IF NOT EXISTS calls (
@@ -1496,8 +1527,9 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
             .execute(pool).await?;
     }
 
-    // --- 自动迁移：已有 calls 表缺新列时补（SQLite ALTER TABLE ADD COLUMN 安全幂等）---
-    // from_ip / codec_a / codec_b / a_peer_ip / b_peer_ip —— 本次新增列
+    // --- Auto-migration: add new columns to existing calls table when missing
+    // (SQLite ALTER TABLE ADD COLUMN is safe and idempotent) ---
+    // from_ip / codec_a / codec_b / a_peer_ip / b_peer_ip — new columns added this round
     for (col, def) in &[
         ("from_ip",   "TEXT NOT NULL DEFAULT ''"),
         ("codec_a",   "TEXT NOT NULL DEFAULT ''"),
@@ -1505,16 +1537,18 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
         ("a_peer_ip", "TEXT NOT NULL DEFAULT ''"),
         ("b_peer_ip", "TEXT NOT NULL DEFAULT ''"),
     ] {
+        // already present → silently ignored (sqlite / pg / mysql do not error on duplicate ADD)
         let _ = sqlx::query(&format!(
             "ALTER TABLE calls ADD COLUMN {} {}", col, def
-        )).execute(pool).await; // 列已存在 → 静默忽略（sqlite / pg / mysql 皆不报错）
+        )).execute(pool).await;
     }
 
-    // --- extensions（REQ-WEB-016 分机管理 CRUD）---
-    // 每个分机：extension（分机号）+ ha1（SIP 认证 hash）+ realm（SIP 域）
-    // + enabled（是否启用）+ clip（强制 CLIP）+ clir（CLIR Privacy:id）+
-    // max_contacts（同时注册数）+ dialplan_match（DP 匹配规则 JSON）+
-    // description（备注）。extension + realm 联合唯一键（同一域内分机号唯一）。
+    // --- extensions (REQ-WEB-016 extension management CRUD) ---
+    // Each extension: extension (extension number) + ha1 (SIP auth hash) + realm (SIP domain)
+    // + enabled (enabled?) + clip (force CLIP) + clir (CLIR Privacy:id) +
+    // max_contacts (max simultaneous registrations) + dialplan_match (DP match rule JSON) +
+    // description (remark). extension + realm is composite unique key (extension number unique
+    // within the same domain).
     let ext_ddl = match backend {
         "sqlite" =>
             "CREATE TABLE IF NOT EXISTS extensions (
@@ -1589,7 +1623,7 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
     };
     sqlx::query(ext_ddl).execute(pool).await?;
 
-    // --- extensions 升级（旧表追加外部分机列 + tenant_id，幂等） ---
+    // --- extensions upgrade (old tables append external extension columns + tenant_id, idempotent) ---
     {
         const EXT_REQUIRED_COLS: &[(&str, &str, &str)] = &[
             ("tenant_id",        "INTEGER NOT NULL DEFAULT 1",          "BIGINT NOT NULL DEFAULT 1"),
@@ -1633,7 +1667,7 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
         }
     }
 
-    // extensions 索引
+    // --- extensions indexes ---
     for (idx, col) in [
         ("idx_ext_enabled", "enabled"),
         ("idx_ext_clip",    "clip"),
@@ -1643,7 +1677,7 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
         )).execute(pool).await?;
     }
 
-    // --- gateways（REQ-WEB-016 外线网关逻辑分组，对应 route_group_t）---
+    // --- gateways (REQ-WEB-016 outbound gateway logical group, corresponds to route_group_t) ---
     let gw_ddl = match backend {
         "sqlite" =>
             "CREATE TABLE IF NOT EXISTS gateways (
@@ -1677,7 +1711,7 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
     };
     sqlx::query(gw_ddl).execute(pool).await?;
 
-    // --- trunks（REQ-WEB-016 中继，对应 trunk_t）---
+    // --- trunks (REQ-WEB-016 trunk, corresponds to trunk_t) ---
     let tr_ddl = match backend {
         "sqlite" =>
             "CREATE TABLE IF NOT EXISTS trunks (
@@ -1812,12 +1846,12 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
     };
     sqlx::query(tr_ddl).execute(pool).await?;
 
-    // 升级：旧表追加 FreeSWITCH 兼容 + 用户新增列（幂等）
-    // 专家 3.7：明列 REQUIRED_COLS 的 (name, sqlite_type, pg_type) 三元组，避免实现时遗漏
+    // Upgrade: append FreeSWITCH-compatible + user-added columns to existing tables (idempotent)
+    // Expert 3.7: explicit REQUIRED_COLS (name, sqlite_type, pg_type) tuples, avoid missing at implementation
     {
         const TRUNK_REQUIRED_COLS: &[(&str, &str, &str)] = &[
             ("tenant_id",              "INTEGER NOT NULL DEFAULT 1",         "BIGINT NOT NULL DEFAULT 1"),
-            // (列名, SQLite 类型, PG 类型) — profile_name 之前版本已在单独块加过，这里保留做幂等
+            // (column name, SQLite type, PG type) — profile_name was already added in a separate block earlier; keep here for idempotency
             ("profile_name",          "TEXT NOT NULL DEFAULT ''",          "VARCHAR(64) NOT NULL DEFAULT ''"),
             ("password",               "TEXT NOT NULL DEFAULT ''",          "VARCHAR(256) NOT NULL DEFAULT ''"),
             ("from_user",              "TEXT NOT NULL DEFAULT ''",          "VARCHAR(64) NOT NULL DEFAULT ''"),
@@ -1890,7 +1924,7 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
         }
     }
 
-    // trunks 索引
+    // trunks indexes
     for (idx, col) in [
         ("idx_tr_enabled",     "enabled"),
         ("idx_tr_gateway",     "gateway_name"),
@@ -1902,7 +1936,7 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
         )).execute(pool).await?;
     }
 
-    // ================ routes（策略组） ================
+    // ================ routes (strategy groups) ================
     let rt_ddl = match backend {
         "sqlite" => r#"
             CREATE TABLE IF NOT EXISTS routes (
@@ -1941,15 +1975,15 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
     };
     sqlx::query(rt_ddl).execute(pool).await?;
 
-    // ================ dialplan_rules（分机/DID/出局规则） ================
+    // ================ dialplan_rules (extension/DID/outbound rules) ================
     let dp_ddl = match backend {
         "sqlite" => r#"
             CREATE TABLE IF NOT EXISTS dialplan_rules (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
                 tenant_id     INTEGER NOT NULL DEFAULT 1,
                 name          TEXT    NOT NULL,
-                layer         TEXT    NOT NULL DEFAULT 'ext',  -- §15: 保留但废弃，由 target 前缀自动推断
-                /* ====== §15 新增 ====== */
+                layer         TEXT    NOT NULL DEFAULT 'ext',  -- §15: preserved but deprecated, inferred automatically from target prefix
+                /* ====== §15 additions ====== */
                 profile_name  TEXT    NOT NULL DEFAULT 'internal',
                 src_ip_cidr   TEXT    NOT NULL DEFAULT '10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8',
                 /* ===================== */
@@ -1958,10 +1992,10 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
                 prio          INTEGER NOT NULL DEFAULT 1,
                 strip         INTEGER NOT NULL DEFAULT 0,
                 target        TEXT    NOT NULL,
-                rec_action    INTEGER NOT NULL DEFAULT 0,  /* 0=none 1=start 2=stop，由 C 侧 dp_execute 透传 */
-                rec_path_template TEXT NOT NULL DEFAULT '',  /* 可选录音路径模板，空=系统默认 yyyymmdd/callid_mix_seq.wav */
+                rec_action    INTEGER NOT NULL DEFAULT 0,  /* 0=none 1=start 2=stop, passed through by C-side dp_execute */
+                rec_path_template TEXT NOT NULL DEFAULT '',  /* optional recording path template, empty = system default yyyymmdd/callid_mix_seq.wav */
                 action_json   TEXT    NOT NULL DEFAULT '{}',
-                app_chain     TEXT    NOT NULL DEFAULT '[]',  /* REQ-DP-APP-001: Application 链 JSON 数组 */
+                app_chain     TEXT    NOT NULL DEFAULT '[]',  /* REQ-DP-APP-001: Application chain JSON array */
                 enabled       INTEGER NOT NULL DEFAULT 1,
                 description   TEXT    NOT NULL DEFAULT '',
                 created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
@@ -1974,8 +2008,8 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
                 id            BIGSERIAL PRIMARY KEY,
                 tenant_id     BIGINT  NOT NULL DEFAULT 1,
                 name          TEXT    NOT NULL,
-                layer         TEXT    NOT NULL DEFAULT 'ext',  -- §15: 保留但废弃，由 target 前缀自动推断
-                /* ====== §15 新增 ====== */
+                layer         TEXT    NOT NULL DEFAULT 'ext',  -- §15: preserved but deprecated, inferred automatically from target prefix
+                /* ====== §15 additions ====== */
                 profile_name  TEXT    NOT NULL DEFAULT 'internal',
                 src_ip_cidr   TEXT    NOT NULL DEFAULT '10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8',
                 /* ===================== */
@@ -1987,7 +2021,7 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
                 rec_action    INTEGER NOT NULL DEFAULT 0,
                 rec_path_template TEXT NOT NULL DEFAULT '',
                 action_json   TEXT   NOT NULL DEFAULT '{}',
-                app_chain     TEXT   NOT NULL DEFAULT '[]',  /* REQ-DP-APP-001: Application 链 JSON 数组 */
+                app_chain     TEXT   NOT NULL DEFAULT '[]',  /* REQ-DP-APP-001: Application chain JSON array */
                 enabled       INTEGER NOT NULL DEFAULT 1,
                 description   TEXT    NOT NULL DEFAULT '',
                 created_at    TEXT NOT NULL DEFAULT (to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD') || 'T' || to_char(NOW() AT TIME ZONE 'UTC', 'HH24:MI:SS.MS') || 'Z'),
@@ -2000,8 +2034,8 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
                 id            BIGINT AUTO_INCREMENT PRIMARY KEY,
                 tenant_id     BIGINT       NOT NULL DEFAULT 1,
                 name          VARCHAR(128) NOT NULL,
-                layer         VARCHAR(16)  NOT NULL DEFAULT 'ext',  -- §15: 保留但废弃，由 target 前缀自动推断
-                /* ====== §15 新增 ====== */
+                layer         VARCHAR(16)  NOT NULL DEFAULT 'ext',  -- §15: preserved but deprecated, inferred automatically from target prefix
+                /* ====== §15 additions ====== */
                 profile_name  VARCHAR(32)  NOT NULL DEFAULT 'internal',
                 src_ip_cidr   VARCHAR(128) NOT NULL DEFAULT '10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8',
                 /* ===================== */
@@ -2013,7 +2047,7 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
                 rec_action    INT          NOT NULL DEFAULT 0,
                 rec_path_template VARCHAR(256) NOT NULL DEFAULT '',
                 action_json   JSON         NOT NULL,
-                app_chain     JSON         NOT NULL,  /* REQ-DP-APP-001: Application 链 JSON 数组 */
+                app_chain     JSON         NOT NULL,  /* REQ-DP-APP-001: Application chain JSON array */
                 enabled       TINYINT(1)   NOT NULL DEFAULT 1,
                 description   VARCHAR(512) NOT NULL DEFAULT '',
                 created_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
@@ -2024,7 +2058,7 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
     };
     sqlx::query(dp_ddl).execute(pool).await?;
 
-    // dialplan_rules 索引
+    // dialplan_rules indexes
     for (idx, col) in [
         ("idx_dp_layer",   "layer"),
         ("idx_dp_enabled", "enabled"),
@@ -2035,15 +2069,15 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
         )).execute(pool).await?;
     }
 
-    /* ====== §15 增量 ALTER TABLE：profile_name + src_ip_cidr ======
-     * 运行时（表已存在且有数据）：ALTER TABLE ADD COLUMN 自动填 DEFAULT 值
-     *   → 旧规则 profile_name='internal'、src_ip_cidr='0.0.0.0/0'
-     *   → 行为完全不变（向后兼容）
-     * 新建 DB：CREATE TABLE 已包含新列（见 §15.3 DDL）
+    /* ====== §15 incremental ALTER TABLE: profile_name + src_ip_cidr ======
+     * Runtime (table exists and has data): ALTER TABLE ADD COLUMN auto-fills DEFAULT values
+     *   -> old rules default profile_name='internal', src_ip_cidr='0.0.0.0/0'
+     *   -> behavior unchanged (backward compatible)
+     * New DB: CREATE TABLE already includes these columns (see §15.3 DDL)
      *
-     * SQLite 不支持一次 ALTER 多列，分开两条
-     * MySQL ALTER 支持一次多列
-     * PostgreSQL ALTER 支持一次多列 */
+     * SQLite does not support ALTER with multiple columns at once; issue separate statements
+     * MySQL ALTER supports multiple columns at once
+     * PostgreSQL ALTER supports multiple columns at once */
     let dp_alter = match backend {
         "mysql" => "ALTER TABLE dialplan_rules \
                     ADD COLUMN profile_name VARCHAR(32) NOT NULL DEFAULT 'internal' AFTER layer, \
@@ -2052,30 +2086,31 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
                     ADD COLUMN rec_path_template VARCHAR(256) NOT NULL DEFAULT '' AFTER rec_action, \
                     ADD COLUMN app_chain  JSON NOT NULL AFTER action_json",
         _ => {
-            // SQLite / PostgreSQL 各自一条
+            // SQLite / PostgreSQL each get their own statements
             sqlx::query("ALTER TABLE dialplan_rules ADD COLUMN profile_name TEXT NOT NULL DEFAULT 'internal'")
-                .execute(pool).await.ok();  // 列已存在时忽略错误
+                .execute(pool).await.ok();  // ignore error if column already exists
             sqlx::query("ALTER TABLE dialplan_rules ADD COLUMN src_ip_cidr TEXT NOT NULL DEFAULT '10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8'")
                 .execute(pool).await.ok();
             sqlx::query("ALTER TABLE dialplan_rules ADD COLUMN rec_action INTEGER NOT NULL DEFAULT 0")
                 .execute(pool).await.ok();
             sqlx::query("ALTER TABLE dialplan_rules ADD COLUMN rec_path_template TEXT NOT NULL DEFAULT ''")
                 .execute(pool).await.ok();
-            /* REQ-DP-APP-001：Application 链列（存量库补） */
+            /* REQ-DP-APP-001: Application chain column (backfill for existing DBs) */
             sqlx::query("ALTER TABLE dialplan_rules ADD COLUMN app_chain TEXT NOT NULL DEFAULT '[]'")
                 .execute(pool).await.ok();
-            ""  // 返回空串，避免下方重复执行
+            ""  // return empty string to avoid duplicate execution below
         }
     };
     if !dp_alter.is_empty() {
         sqlx::query(dp_alter).execute(pool).await.ok();
     }
-    // §15 新增：(profile_name, prio) 联合索引——dialplan 热路径高频访问点
+    // §15 new: (profile_name, prio) compound index — high-frequency access point in
+    //   the dialplan hot path
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_dp_profile_prio \
                  ON dialplan_rules(profile_name, prio)")
         .execute(pool).await.ok();
 
-    // ================ ha_groups（高可用组） ================
+    // ================ ha_groups (high-availability groups) ================
     let ha_ddl = match backend {
         "sqlite" => r#"
             CREATE TABLE IF NOT EXISTS ha_groups (
@@ -2217,7 +2252,7 @@ let acct_ddl = match backend {
     "#,
 };
 sqlx::query(acct_ddl).execute(pool).await?;
-    // ================ time_groups（时间策略组） ================
+    // ================ time_groups (time policy groups) ================
     let tg_ddl = match backend {
         "sqlite" => r#"
             CREATE TABLE IF NOT EXISTS time_groups (
@@ -2259,7 +2294,7 @@ sqlx::query(acct_ddl).execute(pool).await?;
     };
     sqlx::query(tg_ddl).execute(pool).await?;
 
-    // ================ queues（分机队列） ================
+    // ================ queues (extension queues) ================
     let q_ddl = match backend {
         "sqlite" => r#"
             CREATE TABLE IF NOT EXISTS queues (
@@ -2312,7 +2347,7 @@ sqlx::query(acct_ddl).execute(pool).await?;
     };
     sqlx::query(q_ddl).execute(pool).await?;
 
-    // ================ ivr_menus（IVR 菜单） ================
+    // ================ ivr_menus (IVR menus) ================
     let ivr_ddl = match backend {
         "sqlite" => r#"
             CREATE TABLE IF NOT EXISTS ivr_menus (
@@ -2369,8 +2404,8 @@ sqlx::query(acct_ddl).execute(pool).await?;
     };
     sqlx::query(ivr_ddl).execute(pool).await?;
 
-    // ================ sip_profiles（多 SIP 传输 Profile） ================
-    // 字段与 C 侧 src/include/sip_profile.h sip_profile_t 1:1 对齐
+    // ================ sip_profiles (multi-SIP transport Profiles) ================
+    // Fields 1:1 aligned with C-side src/include/sip_profile.h sip_profile_t
     let sp_ddl = match backend {
         "sqlite" => r#"
             CREATE TABLE IF NOT EXISTS sip_profiles (
@@ -2463,7 +2498,7 @@ sqlx::query(acct_ddl).execute(pool).await?;
     };
     sqlx::query(sp_ddl).execute(pool).await?;
 
-    // 升级：已存在的表追加 auth_calls / ip_whitelist / ip_blacklist（幂等）
+    // Upgrade: append auth_calls / ip_whitelist / ip_blacklist to existing tables (idempotent)
     match backend {
         "sqlite" => {
             let cols: Vec<(i64, String)> = sqlx::query_as("PRAGMA table_info(sip_profiles)")
@@ -2480,7 +2515,7 @@ sqlx::query(acct_ddl).execute(pool).await?;
             }
         }
         _ => {
-            // PG/MySQL：ADD COLUMN IF NOT EXISTS 幂等
+            // PG/MySQL: ADD COLUMN IF NOT EXISTS for idempotency
             let _ = sqlx::query("ALTER TABLE sip_profiles ADD COLUMN IF NOT EXISTS auth_calls INTEGER NOT NULL DEFAULT 0").execute(pool).await;
             let _ = sqlx::query("ALTER TABLE sip_profiles ADD COLUMN IF NOT EXISTS ip_whitelist TEXT NOT NULL DEFAULT ''").execute(pool).await;
             let _ = sqlx::query("ALTER TABLE sip_profiles ADD COLUMN IF NOT EXISTS ip_blacklist TEXT NOT NULL DEFAULT ''").execute(pool).await;
@@ -2491,8 +2526,8 @@ sqlx::query(acct_ddl).execute(pool).await?;
         "CREATE INDEX IF NOT EXISTS idx_sp_enabled ON sip_profiles(enabled)"
     ).execute(pool).await?;
 
-    // 默认 seed：internal（auth_calls=true 必须 Digest 认证）+ external（auth_calls=false FreeSWITCH external 模式）
-    // 只 INSERT IF NOT EXISTS，不覆盖用户已改
+    // Default seed: internal (auth_calls=true, mandatory Digest auth) + external (auth_calls=false, FreeSWITCH external mode)
+    // Only INSERT IF NOT EXISTS; do not overwrite user changes
     let seed = match backend {
         "sqlite" => r#"
             INSERT OR IGNORE INTO sip_profiles
@@ -2502,10 +2537,10 @@ sqlx::query(acct_ddl).execute(pool).await?;
             VALUES
                 ('internal', 1, '0.0.0.0', '0.0.0.0', 5060, 5060, 5061, 1, 1, 0,
                  10000, 59999, 1, 'nsbc.local', 1, '', '',
-                 'Internal profile — all endpoints must Digest-authenticate (类 FreeSWITCH internal)'),
+                 'Internal profile — all endpoints must Digest-authenticate (FreeSWITCH-like internal)'),
                 ('external', 1, '0.0.0.0', '0.0.0.0', 5080, 5080, 5081, 1, 1, 0,
                  10000, 59999, 1, 'nsbc.local', 0, '', '',
-                 'External profile — 类 FreeSWITCH external 模式，默认不强制认证；用 IP blacklist 静默丢弃扫描')
+                 'External profile — FreeSWITCH-like external mode; auth not enforced by default; silent-drop scans via IP blacklist')
         "#,
         "postgres" => r#"
             INSERT INTO sip_profiles
@@ -2515,10 +2550,10 @@ sqlx::query(acct_ddl).execute(pool).await?;
             VALUES
                 ('internal', 1, '0.0.0.0', '0.0.0.0', 5060, 5060, 5061, 1, 1, 0,
                  10000, 59999, 1, 'nsbc.local', 1, '', '',
-                 'Internal profile — all endpoints must Digest-authenticate (类 FreeSWITCH internal)'),
+                 'Internal profile — all endpoints must Digest-authenticate (FreeSWITCH-like internal)'),
                 ('external', 1, '0.0.0.0', '0.0.0.0', 5080, 5080, 5081, 1, 1, 0,
                  10000, 59999, 1, 'nsbc.local', 0, '', '',
-                 'External profile — 类 FreeSWITCH external 模式，默认不强制认证；用 IP blacklist 静默丢弃扫描')
+                 'External profile — FreeSWITCH-like external mode; auth not enforced by default; silent-drop scans via IP blacklist')
             ON CONFLICT (name) DO NOTHING
         "#,
         _ => r#"
@@ -2529,20 +2564,20 @@ sqlx::query(acct_ddl).execute(pool).await?;
             VALUES
                 ('internal', 1, '0.0.0.0', '0.0.0.0', 5060, 5060, 5061, 1, 1, 0,
                  10000, 59999, 1, 'nsbc.local', 1, '', '',
-                 'Internal profile — all endpoints must Digest-authenticate (类 FreeSWITCH internal)'),
+                 'Internal profile — all endpoints must Digest-authenticate (FreeSWITCH-like internal)'),
                 ('external', 1, '0.0.0.0', '0.0.0.0', 5080, 5080, 5081, 1, 1, 0,
                  10000, 59999, 1, 'nsbc.local', 0, '', '',
-                 'External profile — 类 FreeSWITCH external 模式，默认不强制认证；用 IP blacklist 静默丢弃扫描')
+                 'External profile — FreeSWITCH-like external mode; auth not enforced by default; silent-drop scans via IP blacklist')
         "#,
     };
     let _ = sqlx::query(seed).execute(pool).await;
 
-    // ===== 公网 IP 自动探测 + 回填（P1 增强）=====
-    // 只在 profile 的 external_sip_ip / external_rtp_ip 为空时 UPDATE ——
-    // 不覆盖用户手工配置的值；探测失败静默跳过（纯 optional 增强）。
+    // ===== Auto-detect public IP + backfill (P1 enhancement) =====
+    // Only UPDATE when the profile's external_sip_ip / external_rtp_ip fields are empty —
+    // do not overwrite manually configured values; on detection failure, silently skip (pure optional enhancement).
     match detect_public_ip().await {
         Some(pub_ip) => {
-            info!(ip = %pub_ip, "🌐 探测到公网 IP — 回填 sip_profiles.external_sip_ip/external_rtp_ip");
+            info!(ip = %pub_ip, "🌐 Detected public IP — backfilling sip_profiles.external_sip_ip/external_rtp_ip");
             let upd_sql = match backend {
                 "postgres" =>
                     "UPDATE sip_profiles \
@@ -2561,22 +2596,22 @@ sqlx::query(acct_ddl).execute(pool).await?;
                 Ok(r) => {
                     if r.rows_affected() > 0 {
                         info!(rows = r.rows_affected(), pub_ip = %pub_ip,
-                              "✅ sip_profiles external_sip_ip/external_rtp_ip 已自动设置")
+                              "✅ sip_profiles external_sip_ip/external_rtp_ip auto-set successfully")
                     } else {
-                        info!("所有 sip_profiles 已配置 external_ip — 跳过自动探测回填");
+                        info!("All sip_profiles already have external_ip configured — skipping auto-detect backfill");
                     }
                 }
-                Err(e) => warn!(error = %e, "sip_profiles external_ip auto-update 失败（非致命）"),
+                Err(e) => warn!(error = %e, "sip_profiles external_ip auto-update failed (non-fatal)"),
             }
         }
         None => {
-            warn!("⚠️ 未探测到公网 IP — sip_profiles.external_sip_ip/external_rtp_ip 保持空值；\
-                  公网部署请手工填或设 NSBC_PUBLIC_IP env");
+            warn!("⚠️ No public IP detected — sip_profiles.external_sip_ip/external_rtp_ip remain empty; \
+                  for public deployments, fill them manually or set NSBC_PUBLIC_IP env");
         }
     }
 
-    // 默认 extensions seed：1000-1019，密码统一 876876，realm=nsbc.local
-    // HA1 = md5(extension:realm:password)，SIP Digest 认证用
+    // Default extensions seed: 1000-1019, uniform password 876876, realm=nsbc.local
+    // HA1 = md5(extension:realm:password), used for SIP Digest auth
     let default_realm = "nsbc.local";
     let default_pass  = "876876";
     for n in 1000..1020u32 {
@@ -2604,22 +2639,22 @@ sqlx::query(acct_ddl).execute(pool).await?;
             .execute(pool).await;
     }
 
-    // 默认 dialplan_rules seed：Internal 分机对打 + 出局占位规则
-    // 幂等（ON CONFLICT DO NOTHING / INSERT OR IGNORE）
+    // Default dialplan_rules seed: Internal extension-to-extension calls + default outbound placeholder rule
+    // Idempotent (ON CONFLICT DO NOTHING / INSERT OR IGNORE)
     //
-    // 规则设计：
-    // 1. Internal 分机对打（prio=10，最高优先）
-    //    layer=ext, match=^1[01]\d{2}$  → 直接送到分机 `${1}`
-    //    匹配 1000-1099 / 1100-1199（保留未来扩到几千的空间）
-    //    ⚠️ External profile 不接受 REGISTER（silent drop），因此不再需要独立的 ext 层规则。
-    // 2. 默认出局占位（prio=99）
-    //    layer=out, match=^\d{5,}$      → 送 default gateway（后续网关配置好改）
+    // Rule design:
+    // 1. Internal extension-to-extension (prio=10, highest priority)
+    //    layer=ext, match=^1[01]\d{2}$  -> directly route to extension `${1}`
+    //    matches 1000-1099 / 1100-1199 (room for future expansion to thousands)
+    //    ⚠️ External profile does not accept REGISTER (silent drop), so no separate ext-layer rule needed.
+    // 2. Default outbound placeholder (prio=99)
+    //    layer=out, match=^\d{5,}$      -> send to default gateway (configure gateway later to enable)
     //
-    // run_migrations 已经知道 backend（postgresql/mysql/sqlite），直接 match
+    // run_migrations already knows the backend (postgresql/mysql/sqlite), match directly
     let rules: &[(&str, &str, &str, i64, i64, &str, &str, i64, &str)] = &[
         // name, layer, match_expr, prio, strip, target, action_json, enabled, description
-        ("Internal 分机对打",      "ext",  "^1[01]\\d{2}$", 10, 0, "${1}", "{}", 1, "Internal profile：1000-1199 分机号直接对打"),
-        ("默认出局占位",            "out",  "^\\d{5,}$",     99, 0, "gateway:default", "{}", 0, "匹配 5+ 位被叫，暂关；配好网关后启用"),
+        ("Internal extension-to-extension",  "ext",  "^1[01]\\d{2}$", 10, 0, "${1}", "{}", 1, "Internal profile: 1000-1199 extensions call each other directly"),
+        ("Default outbound placeholder",     "out",  "^\\d{5,}$",     99, 0, "gateway:default", "{}", 0, "Match 5+ digit called numbers; disabled by default, enable after gateway is configured"),
     ];
     for (name, layer, mx, prio, strip, target, action, en, desc) in rules {
         let sql = match backend {
@@ -2644,11 +2679,11 @@ sqlx::query(acct_ddl).execute(pool).await?;
             .execute(pool).await;
     }
 
-    // ================ web_users (Web 管理登录用户) ================
-    // Web 管理后台登录账号表：username + role(L0/L1/L2) + argon2id PHC。
-    // 与 extensions（SIP 分机）完全独立：extensions 存 SIP Digest ha1，
-    // web_users 存 Web 管理登录 argon2id 密码哈希。
-    // 账号来源优先级：DB 中 web_users 表 → 若空则 fallback 到 AuthSvc 内存 AccountStore。
+    // ================ web_users (Web admin login users) ================
+    // Web admin backend login account table: username + role(L0/L1/L2) + argon2id PHC.
+    // Completely independent from extensions (SIP extensions): extensions store SIP Digest ha1,
+    // web_users store Web admin login argon2id password hashes.
+    // Account source priority: DB web_users table -> if empty, fallback to AuthSvc in-memory AccountStore.
     let wu_ddl = match backend {
         "sqlite" => r#"
             CREATE TABLE IF NOT EXISTS web_users (
@@ -2689,10 +2724,10 @@ sqlx::query(acct_ddl).execute(pool).await?;
     };
     sqlx::query(wu_ddl).execute(pool).await?;
 
-    // ================ security_blacklist（静态安全围栏：NIP 三层 + deny/allow 双模式） ================
+    // ================ security_blacklist (static security fence: NIP 3-layer + deny/allow dual mode) ================
     // rule_type: 'ip_cidr' | 'ua' | 'called_prefix' | 'caller_prefix'
-    // kind:      'deny'（命中即丢） | 'allow'（命中才放；配了 allow 后未命中一律丢）
-    // Web 安全中心管理 → spawn_push → C security.blacklist.reload <json> 整表替换。
+    // kind:      'deny' (drop on match) | 'allow' (pass on match; once allow is configured, unmatched items are dropped)
+    // Web security center manages -> spawn_push -> C security.blacklist.reload <json> full table replace.
     let bl_ddl = match backend {
         "sqlite" => r#"
             CREATE TABLE IF NOT EXISTS security_blacklist (
@@ -2736,10 +2771,10 @@ sqlx::query(acct_ddl).execute(pool).await?;
     };
     sqlx::query(bl_ddl).execute(pool).await?;
 
-    // --- security_blacklist schema 升级（老表没有 kind 列时补） ---
+    // --- security_blacklist schema upgrade (backfill kind column when missing in old tables) ---
     match backend {
         "sqlite" => {
-            // SQLite: 查 PRAGMA → 无 kind 列则 ADD COLUMN
+            // SQLite: query PRAGMA -> if no kind column, ADD COLUMN
             let has_kind: String = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM pragma_table_info('security_blacklist') WHERE name='kind'"
             ).fetch_one(pool).await.unwrap_or_default();
@@ -2748,9 +2783,9 @@ sqlx::query(acct_ddl).execute(pool).await?;
                     "ALTER TABLE security_blacklist ADD COLUMN kind TEXT NOT NULL DEFAULT 'deny'"
                 ).execute(pool).await?;
             }
-            // 老 UNIQUE(rule_type, value) 约束无法直接改成 UNIQUE(kind, rule_type, value)，
-            // SQLite 3.35+ 支持 ALTER TABLE ... RENAME + CREATE TABLE，但简单起见：
-            // 运行时检查冲突（kind='deny', rule_type='ip_cidr', value='X' 与 kind='allow' 同值允许共存）
+            // Old UNIQUE(rule_type, value) constraint cannot be directly changed to UNIQUE(kind, rule_type, value),
+            // SQLite 3.35+ supports ALTER TABLE ... RENAME + CREATE TABLE, but for simplicity:
+            // runtime conflict checking (kind='deny', rule_type='ip_cidr', value='X' coexisting with kind='allow' same value is allowed)
         }
         "postgres" => {
             sqlx::query(
@@ -2758,7 +2793,7 @@ sqlx::query(acct_ddl).execute(pool).await?;
             ).execute(pool).await?;
             sqlx::query(
                 "ALTER TABLE security_blacklist ALTER COLUMN rule_type TYPE VARCHAR(16)"
-            ).execute(pool).await.ok();  // 改大列宽，已大则忽略
+            ).execute(pool).await.ok();  // widen column width; ignore if already wider
             sqlx::query(
                 "ALTER TABLE security_blacklist DROP CONSTRAINT IF EXISTS security_blacklist_rule_type_value_key"
             ).execute(pool).await.ok();
@@ -2771,7 +2806,7 @@ sqlx::query(acct_ddl).execute(pool).await?;
             ).execute(pool).await.ok();
         }
         _ => {
-            // MySQL: ALTER TABLE ADD COLUMN IF NOT EXISTS（MySQL 8.0+ 支持 IF NOT EXISTS）
+            // MySQL: ALTER TABLE ADD COLUMN IF NOT EXISTS (MySQL 8.0+ supports IF NOT EXISTS)
             sqlx::query(
                 "ALTER TABLE security_blacklist ADD COLUMN kind VARCHAR(16) NOT NULL DEFAULT 'deny'"
             ).execute(pool).await.ok();
@@ -2787,9 +2822,9 @@ sqlx::query(acct_ddl).execute(pool).await?;
         }
     }
 
-    // security_config（单行：围栏模式 + fail2ban 五维配置）
-    // fence_mode: 1=security（完整围栏，默认）/ 0=performance（全关）
-    // method_blocked: 位图 (1<<(method-1))，uint32
+    // security_config (single row: fence mode + fail2ban 5-dimension configuration)
+    // fence_mode: 1=security (full fence, default) / 0=performance (all off)
+    // method_blocked: bitmap (1<<(method-1)), uint32
     // auto_ban=1/0, authfail_threshold=1-1000, authfail_window_s=1-86400,
     // ban_duration_s=1-604800(7d), ratelimit_regs=1-1000, ratelimit_window_s=1-3600
     let sc_ddl = match backend {
@@ -2835,11 +2870,11 @@ sqlx::query(acct_ddl).execute(pool).await?;
     };
     sqlx::query(sc_ddl).execute(pool).await?;
 
-    // --- security_config 增量 ALTER TABLE 迁移 ---
-    // 旧表：仅 fence_mode + method_blocked 两列。新增 fail2ban 六维。
-    // SQLite: ALTER TABLE 不支持 IF NOT EXISTS，try + 忽略重复列错误即可
-    // Postgres: 9.6+ 支持 ADD COLUMN IF NOT EXISTS
-    // MySQL: 8.0+ 支持 ADD COLUMN IF NOT EXISTS
+    // --- security_config incremental ALTER TABLE migration ---
+    // Old tables: only fence_mode + method_blocked columns. New fail2ban 6 dimensions added.
+    // SQLite: ALTER TABLE does not support IF NOT EXISTS; try and ignore duplicate column errors
+    // Postgres: 9.6+ supports ADD COLUMN IF NOT EXISTS
+    // MySQL: 8.0+ supports ADD COLUMN IF NOT EXISTS
     for (name, col_def) in [
         ("auto_ban",           "INTEGER NOT NULL DEFAULT 1"),
         ("authfail_threshold", "INTEGER NOT NULL DEFAULT 5"),
@@ -2861,7 +2896,7 @@ sqlx::query(acct_ddl).execute(pool).await?;
                 )).execute(pool).await;
             }
             _ => {
-                // MySQL: auto_ban 用 TINYINT(1)，其他 INT
+                // MySQL: auto_ban uses TINYINT(1); others use INT
                 let mysql_def = if name == "auto_ban" {
                     "TINYINT(1) NOT NULL DEFAULT 1".to_string()
                 } else {
@@ -2887,7 +2922,7 @@ sqlx::query(acct_ddl).execute(pool).await?;
     Ok(())
 }
 
-/// Web 管理用户（从 web_users 表查询返回）。
+/// Web admin user (returned from web_users table queries).
 #[derive(Clone, Debug, sqlx::FromRow)]
 pub struct WebUser {
     pub id: i64,
@@ -2897,7 +2932,7 @@ pub struct WebUser {
     pub enabled: i64,
 }
 
-/// CDR 记录（SELECT 输出结构）。
+/// CDR record (SELECT output structure).
 #[derive(Clone, Debug, sqlx::FromRow, serde::Serialize)]
 pub struct CdrRow {
     pub call_id: String,
@@ -2917,7 +2952,7 @@ pub struct CdrRow {
     pub metadata: Option<String>,
 }
 
-/// 分页参数。
+/// Pagination parameters.
 #[derive(Clone, Debug, Default)]
 pub struct CdrQuery {
     pub caller: Option<String>,
@@ -2938,7 +2973,7 @@ impl CdrQuery {
     }
 }
 
-/// 执行 CDR 查询（动态 WHERE 子句，参数化避免注入）。
+/// Execute CDR query (dynamic WHERE clause, parameterized to avoid injection).
 pub async fn query_cdrs(
     pool: &Pool<Any>,
     q: &CdrQuery,
@@ -2946,7 +2981,7 @@ pub async fn query_cdrs(
 ) -> Result<(Vec<CdrRow>, i64), sqlx::Error> {
     let q = q.clone().normalized();
 
-    // 动态拼接 WHERE 子句；? 占位符数量与 bind 顺序对应
+    // Build WHERE clause dynamically; ? placeholder count maps to bind order
     let mut where_clauses: Vec<String> = Vec::new();
     let mut bound_idx: u32 = 0;
     let mut binds: Vec<String> = Vec::new();
@@ -2991,7 +3026,7 @@ pub async fn query_cdrs(
                 cause_code, cause_text, leg_a_final, leg_b_final, metadata \
          FROM cdr {where_sql} ORDER BY start_time DESC LIMIT ? OFFSET ?"
     );
-    // LIMIT/OFFSET 作为最后两个参数绑定
+    // LIMIT/OFFSET bound as the last two parameters
     let final_limit = binds.len() + 1;
     let final_offset = binds.len() + 2;
     let rows_sql = rows_sql
@@ -3006,9 +3041,9 @@ pub async fn query_cdrs(
     Ok((rows, total))
 }
 
-// ---------- recordings 查询（REQ-REC-004 Web REST） ----------
+// ---------- recordings query (REQ-REC-004 Web REST) ----------
 
-/// 单行录音记录：从 cdr 表中挑出 metadata 含 rec_path 的记录展开。
+/// Single recording row: extract records with metadata containing rec_path from cdr table.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RecordingRow {
     pub call_id:      String,
@@ -3048,8 +3083,8 @@ pub async fn query_recordings(
     let limit  = q.limit.unwrap_or(50).clamp(1, 500) as i64;
     let offset = q.offset.unwrap_or(0).max(0) as i64;
 
-    // 跨后端 metadata->rec_path 提取：
-    //   PG      metadata ->> 'rec_path'  (jsonb 文本操作符)
+    // Cross-backend metadata->rec_path extraction:
+    //   PG      metadata ->> 'rec_path'  (jsonb text operator)
     //   MySQL   JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.rec_path'))
     //   SQLite  json_extract(metadata, '$.rec_path')
     let (rec_path_sql, has_rec_sql): (&str, &str) = match backend {
@@ -3067,7 +3102,7 @@ pub async fn query_recordings(
         ),
     };
 
-    // 动态 WHERE 子句（has_rec_sql 是固定条件，caller/callee/from/to 是可选条件）
+    // Dynamic WHERE clause (has_rec_sql is a fixed condition; caller/callee/from/to are optional conditions)
     let mut where_clauses: Vec<String> = vec![has_rec_sql.to_string()];
     let mut binds: Vec<String> = Vec::new();
     let mut idx: u32 = 0;
@@ -3094,7 +3129,7 @@ pub async fn query_recordings(
 
     let where_sql = format!("WHERE {}", where_clauses.join(" AND "));
 
-    // COUNT — 复用同一个 WHERE + binds（不增占位）
+    // COUNT — reuse the same WHERE + binds (no extra placeholders)
     let count_sql = format!("SELECT COUNT(*) FROM cdr {where_sql}");
     let mut count_q = sqlx::query_scalar::<_, i64>(&count_sql);
     for b in &binds { count_q = count_q.bind(b.as_str()); }
@@ -3129,7 +3164,7 @@ pub async fn query_recordings(
         let metadata: Option<String>     = row.try_get("metadata").ok();
         let rec_path: String             = row.try_get("rec_path").unwrap_or_default();
 
-        // tenant 从 metadata JSON 解析（三后端列名一致，不再开一列）
+        // tenant parsed from metadata JSON (all three backends use the same column name; no separate column needed)
         let tenant = metadata
             .as_ref()
             .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
@@ -3146,16 +3181,16 @@ pub async fn query_recordings(
     Ok((out, total))
 }
 
-// ---------- extensions CRUD（REQ-WEB-016）----------
+// ---------- extensions CRUD (REQ-WEB-016) ----------
 
-/// 分机记录（SELECT 输出 + INSERT/UPDATE 输入统一用）。
+/// Extension record (used uniformly for SELECT output + INSERT/UPDATE input).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct Extension {
     pub id:           i64,
     pub tenant_id:    i64,
     pub extension:    String,
     pub realm:         String,
-    pub password:      String,    // 明文密码（内网管理端可见，API 暴露）
+    pub password:      String,    // plaintext password (visible to intranet admin endpoint, exposed in API)
     pub ha1:           String,
     pub ha1b:          String,
     #[serde(serialize_with = "bool_i64::serialize")]
@@ -3166,25 +3201,25 @@ pub struct Extension {
     pub max_contacts:  i64,
     pub dialplan_match: String,
     pub description:   String,
-    // --- 外部分机支持（REQ-PBX-EXT-EXT-001） ---
+    // --- External extension support (REQ-PBX-EXT-EXT-001) ---
     pub ext_type:        String,   // 'internal' | 'external'
-    pub external_number: String,   // 外呼目标号码（E.164）
-    pub trunk_name:      String,   // 出局中继（走哪个 trunk 外呼）
-    pub display_number:  String,   // 外呼时的主叫显示（caller_id）
+    pub external_number: String,   // Outbound target number (E.164)
+    pub trunk_name:      String,   // Outbound trunk (which trunk to use for outbound calls)
+    pub display_number:  String,   // Caller display number during outbound calls (caller_id)
     pub created_at:    String,
     pub updated_at:    String,
 }
 
-/// 创建分机请求体（不含 id/created_at/updated_at，由 DB 生成）。
-/// password 可选：给了就服务端算 ha1/ha1b；不给则 ha1 必须手动传。
+/// Create extension request body (excludes id/created_at/updated_at, generated by DB).
+/// password is optional: if provided, server computes ha1/ha1b; otherwise ha1 must be supplied manually.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ExtensionCreate {
     pub tenant_id:      i64,
     pub extension:    String,
     #[serde(default)]
     pub realm:          String,
-    /// 可选明文密码：传了则服务端自动算 ha1 = md5(ext:realm:password)。
-    /// API response **永远不回传此列**。
+    /// Optional plaintext password: if provided, server auto-computes ha1 = md5(ext:realm:password).
+    /// API response **never echoes this field back**.
     #[serde(default)]
     pub password:       String,
     #[serde(default)]
@@ -3203,7 +3238,7 @@ pub struct ExtensionCreate {
     pub dialplan_match: String,
     #[serde(default)]
     pub description:    String,
-    // --- 外部分机支持 ---
+    // --- External extension support ---
     #[serde(default = "default_internal")]
     pub ext_type:        String,
     #[serde(default)]
@@ -3218,7 +3253,7 @@ fn default_enabled() -> bool { true }
 fn default_max_contacts() -> i64 { 10 }
 fn default_internal() -> String { "internal".to_string() }
 
-/// 更新分机请求体（所有字段可选）。password 传了就同时更新 ha1/ha1b。
+/// Update extension request body (all fields optional). If password is provided, ha1/ha1b are updated together.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct ExtensionUpdate {
     pub tenant_id:      Option<i64>,
@@ -3232,7 +3267,7 @@ pub struct ExtensionUpdate {
     pub max_contacts:   Option<i64>,
     pub dialplan_match: Option<String>,
     pub description:    Option<String>,
-    // --- 外部分机支持 ---
+    // --- External extension support ---
     pub ext_type:        Option<String>,
     pub external_number: Option<String>,
     pub trunk_name:      Option<String>,
@@ -3240,7 +3275,7 @@ pub struct ExtensionUpdate {
 }
 
 impl Db {
-    /// 列表查询：按 extension/realm/enabled 过滤，分页。
+    /// List query: filter by extension/realm/enabled, paginated.
     pub async fn list_extensions(
         &self,
         tenant_id: Option<i64>,
@@ -3302,7 +3337,7 @@ impl Db {
         Ok((rows, total))
     }
 
-    /// 按 id 查单条。
+    /// Look up a single record by id.
     pub async fn get_extension(&self, id: i64) -> Result<Option<Extension>, sqlx::Error> {
         let Some(pool) = self.pool() else { return Ok(None); };
         let sql = fix_ph("SELECT id, tenant_id, extension, realm, password, ha1, ha1b, enabled, clip, clir, max_contacts, dialplan_match, description, ext_type, external_number, trunk_name, display_number, created_at, updated_at FROM extensions WHERE id = $1", self.backend());
@@ -3311,7 +3346,7 @@ impl Db {
         Ok(row)
     }
 
-    /// 按 extension + realm 联合唯一键查。
+    /// Look up by the compound unique key extension + realm.
     pub async fn get_extension_by_eaor(
         &self, extension: &str, realm: &str,
     ) -> Result<Option<Extension>, sqlx::Error> {
@@ -3325,7 +3360,7 @@ impl Db {
         Ok(row)
     }
 
-    /// 创建分机。UNIQUE 冲突返回 sqlx::Error（调用方判断 409）。
+    /// Create an extension. UNIQUE conflict returns sqlx::Error (caller decides 409).
     pub async fn create_extension(
         &self, c: ExtensionCreate,
     ) -> Result<Extension, sqlx::Error> {
@@ -3334,16 +3369,16 @@ impl Db {
         };
         let backend = self.backend();
         let dp = if c.dialplan_match.is_empty() { "{}".to_string() } else { c.dialplan_match };
-        /* Phase 2 多租户安全加固：realm 强制 = tenant_name（从 tenants 表按 tenant_id 查）
-         * 以前硬编码 "nsbc.local" 或信任前端传值 → 不同租户分机可能 realm 相同 →
-         * ep_ha1_lookup 认证时被错误匹配/不匹配。
-         * tenant_id 找不到（租户被删）→ fallback "nsbc.local"。 */
+        /* Phase 2 multi-tenant hardening: realm forced = tenant_name (lookup from tenants table by tenant_id)
+         * Previously hardcoded "nsbc.local" or trusting frontend input -> different-tenant extensions could
+         * share the same realm -> ep_ha1_lookup auth would incorrectly match/mismatch.
+         * tenant_id not found (tenant deleted) -> fallback "nsbc.local". */
         let realm_sub_sql = fix_ph("SELECT tenant_name FROM tenants WHERE id = $1", backend);
         let realm: String = sqlx::query_scalar(&realm_sub_sql)
             .bind(c.tenant_id).fetch_optional(pool).await?
             .unwrap_or_else(|| "nsbc.local".to_string());
 
-        // 密码处理：给了明文就算 ha1/ha1b；没给但 ha1 传了就直接用
+        // Password handling: if plaintext provided, compute ha1/ha1b; otherwise use supplied ha1 directly
         let (password, ha1, ha1b) = if !c.password.is_empty() {
             let ha1_hex = ha1_of(&c.extension, &realm, &c.password);
             let ha1b_hex = ha1_of(&c.extension, &realm, &c.password);
@@ -3387,7 +3422,7 @@ impl Db {
         }
     }
 
-    /// 部分更新。返回更新后的记录；不存在返回 sqlx::Error（调用方判断 404）。
+    /// Partial update. Returns the updated record; returns sqlx::Error if not found (caller decides 404).
     pub async fn update_extension(
         &self, id: i64, u: ExtensionUpdate,
     ) -> Result<Extension, sqlx::Error> {
@@ -3409,16 +3444,16 @@ impl Db {
             }};
         }
 
-        /* Phase 2 多租户：先查现有 extension 的 tenant_id/realm/extension，
-         * 因为 realm 强制 = tenant_name，tenant_id 变更时 realm 必须同步变更。 */
+        /* Phase 2 multi-tenant: first look up the existing extension's tenant_id/realm/extension,
+         * because realm is forced = tenant_name; when tenant_id changes, realm must change in sync. */
         let old_row_sql = fix_ph("SELECT tenant_id, realm, extension FROM extensions WHERE id = $1", backend);
         let (old_tid, old_realm, ext): (i64, String, String) = sqlx::query_as(&old_row_sql)
             .bind(id).fetch_one(pool).await?;
         let new_tid = u.tenant_id.unwrap_or(old_tid);
         let realm_changed = new_tid != old_tid;
 
-        /* 计算更新后的 realm：tenant_id 变更 → 从 tenants 表查新 tenant_name；
-         * 不变 → 保持旧值。tenant 被删 → fallback "nsbc.local"。 */
+        /* Compute the updated realm: tenant_id changed -> look up new tenant_name from tenants table;
+         * unchanged -> keep old value. tenant deleted -> fallback "nsbc.local". */
         let new_realm: String = if realm_changed {
             let realm_sub_sql = fix_ph("SELECT tenant_name FROM tenants WHERE id = $1", backend);
             sqlx::query_scalar(&realm_sub_sql)
@@ -3426,13 +3461,14 @@ impl Db {
                 .unwrap_or_else(|| "nsbc.local".to_string())
         } else { old_realm.clone() };
 
-        // password + realm 组合处理：算正确的 ha1
+        // password + realm combined handling: compute correct ha1
         let ha1_from_password: Option<(String, String)> = if let Some(ref pw) = u.password {
             let ha1_hex = ha1_of(&ext, &new_realm, pw);
             let ha1b_hex = ha1_of(&ext, &new_realm, pw);
             Some((ha1_hex, ha1b_hex))
         } else if realm_changed {
-            /* tenant_id 变了但没改密码 → 用新 realm 重算 ha1（旧 ha1 是老 realm 算的，会导致认证失败） */
+            /* tenant_id changed but password not updated -> recompute ha1 with new realm
+             * (old ha1 was computed against old realm, will cause auth failure) */
             let pw_sql = fix_ph("SELECT password FROM extensions WHERE id = $1", backend);
             let cur_pw: String = sqlx::query_scalar(&pw_sql).bind(id).fetch_one(pool).await?;
             if !cur_pw.is_empty() {
@@ -3442,7 +3478,7 @@ impl Db {
             } else { None }
         } else { None };
 
-        // tenant_id + realm 同步写入
+        // tenant_id + realm written in sync
         set_if_some!("tenant_id", Some(new_tid.to_string()));
         if realm_changed {
             idx += 1; sets.push(format!("realm = ${idx}")); binds.push(new_realm.clone());
@@ -3466,20 +3502,20 @@ impl Db {
         }
         set_if_some!("dialplan_match", u.dialplan_match.as_ref().map(|s| s.clone()));
         set_if_some!("description",    u.description.as_ref().map(|s| s.clone()));
-        // --- 外部分机支持 ---
+        // --- External extension support ---
         set_if_some!("ext_type",        u.ext_type.as_ref().map(|s| s.clone()));
         set_if_some!("external_number", u.external_number.as_ref().map(|s| s.clone()));
         set_if_some!("trunk_name",      u.trunk_name.as_ref().map(|s| s.clone()));
         set_if_some!("display_number",  u.display_number.as_ref().map(|s| s.clone()));
 
         if sets.is_empty() {
-            // 没传任何字段——直接返回现有记录
+            // No fields supplied — just return the existing record
             return self.get_extension(id).await.and_then(|r| {
                 r.ok_or_else(|| sqlx::Error::RowNotFound)
             });
         }
 
-        // updated_at 自动更新（三后端表达式略有不同）
+        // updated_at auto-updated (expression differs slightly across backends)
         let ts_expr = match backend {
             "sqlite" => "datetime('now')",
             "postgres" => "CAST(NOW() AS TEXT)",
@@ -3518,7 +3554,7 @@ impl Db {
         }
     }
 
-    /// 删除分机。返回 true=删除；false=不存在。
+    /// Delete extension. Returns true=deleted; false=not found.
     pub async fn delete_extension(&self, id: i64) -> Result<bool, sqlx::Error> {
         let Some(pool) = self.pool() else { return Ok(false); };
         let sql = fix_ph("DELETE FROM extensions WHERE id = $1", self.backend());
@@ -3526,7 +3562,7 @@ impl Db {
         Ok(res.rows_affected() > 0)
     }
 
-    /// 导出所有启用分机（供 extensions.reload UDS 命令批量推入核心）。
+    /// Export all enabled extensions (bulk-push into core via extensions.reload UDS command).
     pub async fn list_enabled_extensions(&self) -> Result<Vec<Extension>, sqlx::Error> {
         let Some(pool) = self.pool() else { return Ok(Vec::new()); };
         let rows = sqlx::query_as::<_, Extension>(
@@ -3538,7 +3574,7 @@ impl Db {
 
 // ---------- gateways + trunks CRUD（REQ-WEB-016）----------
 
-/// 外线网关（逻辑分组，对应 route_group_t）。
+/// Outbound gateway (logical group, corresponds to route_group_t).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct Gateway {
     pub id:            i64,
@@ -3566,7 +3602,7 @@ pub struct GatewayUpdate {
     pub enabled:       Option<bool>,
 }
 
-/// 中继（对应 trunk_t）。
+/// Trunk (corresponds to trunk_t).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct Trunk {
     pub id:             i64,
@@ -3588,7 +3624,7 @@ pub struct Trunk {
     pub max_channels:   i64,
     pub failover_code:  i64,
     pub description:    String,
-    // --- FreeSWITCH 兼容 + 用户新增字段 ---
+    // --- FreeSWITCH-compatible + user-added fields ---
     pub password:                String,
     pub from_user:               String,
     pub from_domain:             String,
@@ -3608,7 +3644,7 @@ pub struct Trunk {
     pub caller_id_pool:          String,
     pub per_number_max_channels: i64,
     pub custom_headers:          String,
-    // --- 3GPP IMS 自动头注入（REQ-TRUNK-IMS-001） ---
+    // --- 3GPP IMS automatic header injection (REQ-TRUNK-IMS-001) ---
     pub ims_enabled:             i64,
     pub ims_domain:              String,
     pub ims_auto_privacy:        i64,
@@ -3652,7 +3688,7 @@ pub struct TrunkCreate {
     pub failover_code:  i64,
     #[serde(default)]
     pub description:    String,
-    // --- FreeSWITCH 兼容 + 用户新增字段 ---
+    // --- FreeSWITCH-compatible + user-added fields ---
     #[serde(default)] pub password:                String,
     #[serde(default)] pub from_user:               String,
     #[serde(default)] pub from_domain:             String,
@@ -3675,7 +3711,7 @@ pub struct TrunkCreate {
     #[serde(default)] pub caller_id_pool:          String,
     #[serde(default)] pub per_number_max_channels: i64,
     #[serde(default)] pub custom_headers:          String,
-    // --- 3GPP IMS 自动头注入 ---
+    // --- 3GPP IMS automatic header injection ---
     #[serde(default, deserialize_with = "deserialize_i64_or_bool")] pub ims_enabled: i64,
     #[serde(default)] pub ims_domain:              String,
     #[serde(default, deserialize_with = "deserialize_i64_or_bool")] pub ims_auto_privacy: i64,
@@ -3702,7 +3738,7 @@ pub struct TrunkUpdate {
     pub max_channels:   Option<i64>,
     pub failover_code:  Option<i64>,
     pub description:    Option<String>,
-    // --- FreeSWITCH 兼容 + 用户新增字段 ---
+    // --- FreeSWITCH-compatible + user-added fields ---
     pub password:                Option<String>,
     pub from_user:               Option<String>,
     pub from_domain:             Option<String>,
@@ -3725,7 +3761,7 @@ pub struct TrunkUpdate {
     pub caller_id_pool:          Option<String>,
     pub per_number_max_channels: Option<i64>,
     pub custom_headers:          Option<String>,
-    // --- 3GPP IMS 自动头注入 ---
+    // --- 3GPP IMS automatic header injection ---
     pub ims_enabled:             Option<bool>,
     pub ims_domain:              Option<String>,
     pub ims_auto_privacy:        Option<bool>,
@@ -3740,9 +3776,9 @@ fn default_3600() -> i64 { 3600 }
 fn default_5060() -> i64 { 5060 }
 fn default_static_peer() -> String { "static_peer".to_string() }
 
-/// 前端 bool 字段（true/false）→ Rust i64(0/1) 兼容。serde 默认不会自动 bool↔i64 转换，
-/// 前端 formSchema 里 type:'bool' 的字段 POST 时发 JSON true/false，Rust i64 直接炸 422。
-/// 用法：#[serde(default, deserialize_with = "deserialize_i64_or_bool")]
+/// Frontend bool fields (true/false) -> Rust i64(0/1) compatibility. serde does not auto-convert bool<->i64,
+/// so when frontend formSchema has type:'bool' and POSTs JSON true/false, Rust i64 would 422.
+/// Usage: #[serde(default, deserialize_with = "deserialize_i64_or_bool")]
 fn deserialize_i64_or_bool<'de, D>(deserializer: D) -> Result<i64, D::Error>
 where D: serde::Deserializer<'de>
 {
@@ -3755,7 +3791,7 @@ where D: serde::Deserializer<'de>
         MaybeBoolOrI64::Int(i) => Ok(i),
     }
 }
-/// Option<i64> 版本：前端可以传 bool / i64 / null / 不传 → Option<i64>
+/// Option<i64> version: frontend may pass bool / i64 / null / omit -> Option<i64>
 fn deserialize_opt_i64_or_bool<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
 where D: serde::Deserializer<'de>
 {
@@ -4035,7 +4071,7 @@ impl Db {
         set_i!("max_channels", u.max_channels);
         set_i!("failover_code", u.failover_code);
         set_s!("description", u.description.clone());
-        // --- FreeSWITCH 兼容 + 用户新增字段 ---
+        // --- FreeSWITCH-compatible + user-added fields ---
         set_s!("password", u.password.clone());
         set_s!("from_user", u.from_user.clone());
         set_s!("from_domain", u.from_domain.clone());
@@ -4055,7 +4091,7 @@ impl Db {
         set_s!("caller_id_pool", u.caller_id_pool.clone());
         set_i!("per_number_max_channels", u.per_number_max_channels);
         set_s!("custom_headers", u.custom_headers.clone());
-        // --- 3GPP IMS 自动头注入 ---
+        // --- 3GPP IMS automatic header injection ---
         set_b!("ims_enabled",      u.ims_enabled);
         set_s!("ims_domain",       u.ims_domain.clone());
         set_b!("ims_auto_privacy", u.ims_auto_privacy);
@@ -4113,9 +4149,9 @@ impl Db {
 
 // ---------- dialplan_rules + routes CRUD（REQ-WEB-016 / REQ-PBX-DP-001）----------
 
-/// 路由策略组（对应 C 侧 route_group_t——中继组选路策略容器）。
-/// 一个 route 可以关联多个 trunk（通过 trunk.gateway_name 或独立桥表——
-/// 先用 gateway_name 字符串关联，假期回来编译时决定是否加 route_trunks 桥表）。
+/// Route policy group (corresponds to C side route_group_t — route selection policy container).
+/// A route may associate with multiple trunks (via trunk.gateway_name or an independent join table —
+/// currently using gateway_name string association; will decide at compile time later whether to add a route_trunks join table).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct Route {
     pub id:            i64,
@@ -4147,10 +4183,10 @@ pub struct RouteUpdate {
     pub description:   Option<String>,
 }
 
-/// 分机/DID/出局规则（对应 C 侧 dp_rule）。
-/// - layer: "ext" 分机内呼 / "biz" 企业业务号 / "out" 出局路由
-/// - match_expr: 被叫/主叫模式（"2000" / "100[0-9]" / "_44XXX" 等，pm_pattern_t 匹配）
-/// - target: out 层=route/trunk 名；ext/biz 层=extension 号/IVR/queue
+/// Extension/DID/outbound rule (corresponds to C side dp_rule).
+/// - layer: "ext" extension internal call / "biz" enterprise business number / "out" outbound route
+/// - match_expr: called/calling pattern ("2000" / "100[0-9]" / "_44XXX" etc., pm_pattern_t matching)
+/// - target: out layer = route/trunk name; ext/biz layer = extension number/IVR/queue
 /// - action: JSON {"clip":"...", "clir":true, "record":true, "emergency":false, ...}
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct DialplanRule {
@@ -4158,7 +4194,7 @@ pub struct DialplanRule {
     pub tenant_id:  i64,
     pub name:       String,
     pub layer:          String,
-    /* §15 新增：强制分区键 + 规则级 IP 准入 */
+    /* §15 new: forced partition key + per-rule IP admission */
     pub profile_name:   String,  /* DEFAULT 'internal' */
     pub src_ip_cidr:    String,  /* DEFAULT '10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8' */
     pub match_expr:     String,
@@ -4166,10 +4202,10 @@ pub struct DialplanRule {
     pub prio:           i64,
     pub strip:          i64,
     pub target:         String,
-    pub rec_action:     i64,  /* 0=none 1=start 2=stop — C 侧 dp_execute 每条规则独立携带 */
-    pub rec_path_template: String,  /* 可选路径模板，空=默认 yyyymmdd/callid_mix_seq.wav */
+    pub rec_action:     i64,  /* 0=none 1=start 2=stop — C side dp_execute carries independently per rule */
+    pub rec_path_template: String,  /* optional path template, empty=default yyyymmdd/callid_mix_seq.wav */
     pub action_json:    String,
-    /* REQ-DP-APP-001: Application 链 JSON 数组 — reload 时推给 C 侧 dp_json_parse_one */
+    /* REQ-DP-APP-001: Application chain JSON array — pushed to C side dp_json_parse_one on reload */
     pub app_chain:      String,
     #[serde(serialize_with = "bool_i64::serialize")]
     pub enabled:        i64,
@@ -4182,10 +4218,10 @@ pub struct DialplanRule {
 pub struct DialplanRuleCreate {
     pub tenant_id:  i64,
     pub name:       String,
-    /* §15: layer 保留但废弃，由 target 前缀自动推断——不再要求前端传 */
+    /* §15: layer kept but deprecated, auto-inferred from target prefix — no longer required from frontend */
     #[serde(default = "default_ext")]
     pub layer:          String,
-    /* §15 新增：默认 'internal' 和 RFC1918 内网网段，向后兼容旧 API 调用 */
+    /* §15 new: default 'internal' and RFC1918 intranet subnets, backward-compatible with old API callers */
     #[serde(default = "default_internal")]
     pub profile_name:   String,
     #[serde(default = "default_rfc1918")]
@@ -4201,10 +4237,10 @@ pub struct DialplanRuleCreate {
     #[serde(default)]
     pub rec_action:     i64,  /* 0=none 1=start 2=stop */
     #[serde(default)]
-    pub rec_path_template: String,  /* 可选路径模板，空=系统默认 */
+    pub rec_path_template: String,  /* optional path template, empty=system default */
     #[serde(default = "default_empty_json")]
     pub action_json:    String,
-    /* REQ-DP-APP-001: 默认空数组（无 app_chain 时跳过） */
+    /* REQ-DP-APP-001: default empty array (skip when no app_chain) */
     #[serde(default = "default_empty_array")]
     pub app_chain:      String,
     #[serde(default = "default_true")]
@@ -4218,7 +4254,7 @@ pub struct DialplanRuleUpdate {
     pub tenant_id:  Option<i64>,
     pub name:       Option<String>,
     pub layer:      Option<String>,
-    /* §15 新增：允许更新 */
+    /* §15 new: updates allowed */
     pub profile_name:   Option<String>,
     pub src_ip_cidr:    Option<String>,
     pub match_expr:     Option<String>,
@@ -4227,7 +4263,7 @@ pub struct DialplanRuleUpdate {
     pub strip:          Option<i64>,
     pub target:         Option<String>,
     pub rec_action:     Option<i64>,  /* 0=none 1=start 2=stop */
-    pub rec_path_template: Option<String>,  /* 可选路径模板 */
+    pub rec_path_template: Option<String>,  /* optional path template */
     pub action_json:    Option<String>,
     /* REQ-DP-APP-001 */
     pub app_chain:      Option<String>,
@@ -4238,11 +4274,11 @@ pub struct DialplanRuleUpdate {
 fn default_priority() -> String { "priority".to_string() }
 fn default_empty_json() -> String { "{}".to_string() }
 fn default_empty_array() -> String { "[]".to_string() }
-/* §15 RFC1918 内网网段（默认 IP 准入，防盗打） */
+/* §15 RFC1918 intranet subnets (default IP admission, toll fraud prevention) */
 const RFC1918_CIDR_DEFAULT: &str = "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8";
 fn default_ext() -> String { "ext".to_string() }
-/* default_internal() 已在 L2633 定义 */
-/* §15 RFC1918 内网网段默认 IP 准入（防盗打） */
+/* default_internal() already defined at L2633 */
+/* §15 RFC1918 intranet subnets default IP admission (toll fraud prevention) */
 fn default_rfc1918() -> String { RFC1918_CIDR_DEFAULT.to_string() }
 
 // ---------- ha_groups CRUD ----------
@@ -4437,8 +4473,8 @@ pub struct IvrMenuUpdate {
     pub description:     Option<String>,
 }
 
-/// SIP 传输 Profile（多实例：每个 profile 独立 socket/RTP/协议特性）。
-/// 字段与 C 侧 src/include/sip_profile.h sip_profile_t 1:1 对齐。
+/// SIP transport profile (multi-instance: each profile has independent socket/RTP/protocol characteristics).
+/// Fields align 1:1 with C side src/include/sip_profile.h sip_profile_t.
 #[derive(Clone, Debug, sqlx::FromRow, serde::Serialize, serde::Deserialize)]
 pub struct SipProfile {
     pub id:              i64,
@@ -4527,7 +4563,7 @@ pub struct SipProfileUpdate {
 }
 
 
-// ================ rate_tables 结构体 ================
+// ================ rate_tables structs ================
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct RateTable {
@@ -4582,7 +4618,7 @@ pub struct RateTableUpdate {
 
 fn default_1i64() -> i64 { 1 }
 
-// ================ security_blacklist 结构体（NIP 三层围栏 + deny/allow 双模式） ================
+// ================ security_blacklist structs (NIP 3-layer fence + deny/allow dual mode) ================
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct SecurityBlacklist {
@@ -4600,8 +4636,8 @@ pub struct SecurityBlacklist {
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct SecurityBlacklistCreate {
     #[serde(default = "default_deny")]
-    pub kind:       String,   // 缺省 deny
-    /// 前端提交 "type"，DB 列名 rule_type，双名兼容
+    pub kind:       String,   // default deny
+    /// Frontend submits "type", DB column is rule_type, dual-name compatibility
     #[serde(rename = "type", alias = "rule_type")]
     pub rule_type:  String,
     pub value:      String,
@@ -4613,29 +4649,29 @@ pub struct SecurityBlacklistCreate {
 
 fn default_deny() -> String { "deny".into() }
 
-/// 仅允许改备注/启用（改 value = 删了重加，绕开 unique 冲突语义）
+/// Only comments/enabled may be changed (changing value = delete + re-add, avoids unique constraint semantics)
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct SecurityBlacklistUpdate {
     pub comment: Option<String>,
     pub enabled: Option<bool>,
 }
 
-// ================ security_config 结构体（全局围栏配置） ================
+// ================ security_config structs (global fence configuration) ================
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct SecurityConfig {
     pub fence_mode:       i64,  // 1=security, 0=performance
-    pub method_blocked:   i64,  // 位图 (1<<(method-1))
-    // fail2ban 五维配置（与 C 侧 security.c 的 g_cfg 对齐）
-    pub auto_ban:             i64, // 1=开（默认）, 0=关
-    pub authfail_threshold:   i64, // 窗口内认证失败次数阈值，默认 5
-    pub authfail_window_s:    i64, // 时间窗秒，默认 60
-    pub ban_duration_s:       i64, // 基础封禁秒（递进封禁基准），默认 3600
-    pub ratelimit_regs:       i64, // REGISTER 纯频率阈值，默认 20/60s
-    pub ratelimit_window_s:   i64, // ratelimit 窗口秒，默认 60
+    pub method_blocked:   i64,  // bitmap (1<<(method-1))
+    // fail2ban 5-dimension config (aligns with C side security.c g_cfg)
+    pub auto_ban:             i64, // 1=on (default), 0=off
+    pub authfail_threshold:   i64, // auth failure count threshold within window, default 5
+    pub authfail_window_s:    i64, // time window in seconds, default 60
+    pub ban_duration_s:       i64, // base ban duration in seconds (progressive ban baseline), default 3600
+    pub ratelimit_regs:       i64, // REGISTER pure frequency threshold, default 20/60s
+    pub ratelimit_window_s:   i64, // ratelimit window seconds, default 60
 }
 
-// ================ accounts 结构体 ================
+// ================ accounts structs ================
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct Account {
@@ -4870,8 +4906,8 @@ impl Db {
         set_ir!("prio", u.prio);
         set_ir!("strip", u.strip);
         set_sr!("target", u.target.clone());
-        set_ir!("rec_action", u.rec_action);  /* §16 新增：录音控制每条规则独立 */
-        set_sr!("rec_path_template", u.rec_path_template.clone());  /* §18 新增：可选路径模板 */
+        set_ir!("rec_action", u.rec_action);  /* §16 new: recording control per rule independently */
+        set_sr!("rec_path_template", u.rec_path_template.clone());  /* §18 new: optional path template */
         set_sr!("action_json", u.action_json.clone());
         set_sr!("app_chain", u.app_chain.clone());  /* REQ-DP-APP-001 */
         set_br!("enabled", u.enabled);
@@ -5306,22 +5342,22 @@ impl Db {
         Ok(res.rows_affected() > 0)
     }
 
-    /// 列出所有启用的队列（供 C 侧 reload 用）。同时 JOIN tenants 表取 tenant_name，
-    /// 因为 C 侧 queue_table_reload_json 用 tenant_name 字符串做匹配（SIP realm），
-    /// 不能用 tenant_id 数字串。
+    /// List all enabled queues (for C side reload). Also JOINs tenants table to get tenant_name,
+    /// because C side queue_table_reload_json matches on tenant_name string (SIP realm),
+    /// cannot use tenant_id numeric string.
     pub async fn list_enabled_queues(&self) -> Result<Vec<(Queue, String)>, sqlx::Error> {
         let Some(pool) = self.pool() else { return Ok(Vec::new()); };
-        // 用 LEFT JOIN 兼容租户被删的情况（fallback 用 tenant_id 数字串）
-        // sqlx::query_as 不支持 tuple 里放 Option<T>，这里用手动 Fetch 再组装
+        // Use LEFT JOIN approach to handle deleted tenants (fallback uses tenant_id numeric string)
+        // sqlx::query_as does not support tuples with Option<T>; use manual Fetch then assemble
         let rows: Vec<Queue> = sqlx::query_as::<_, Queue>(
             "SELECT q.* FROM queues q WHERE q.enabled = 1 ORDER BY q.name"
         ).fetch_all(pool).await?;
-        // 批量拿 tenant_id → tenant_name 映射
+        // Batch fetch tenant_id -> tenant_name mapping
         let tenant_ids: Vec<i64> = rows.iter().map(|q| q.tenant_id).collect();
         let mut map: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
         if !tenant_ids.is_empty() {
-            // 用 IN 查询拿 tenant_name（多后端参数占位符统一用 $1 绑定 slice——需逐值 IN）
-            // 简单方案：每条单独查（队列数通常 <100，O(n) 可接受）
+            // Use individual lookups to fetch tenant_name (multi-backend param placeholders all use $1 binding per slice entry)
+            // Simple approach: query each one separately (queue count is typically <100, O(n) acceptable)
             for tid in &tenant_ids {
                 if map.contains_key(tid) { continue; }
                 let name: Option<String> = sqlx::query_scalar("SELECT tenant_name FROM tenants WHERE id = $1")
@@ -5666,7 +5702,7 @@ impl Db {
             .fetch_all(pool).await
     }
 
-// ===== 费率 CRUD =====
+// ===== Rate tables CRUD =====
 
 pub async fn list_rates(
     &self, prefix: Option<&str>, enabled: Option<bool>,
@@ -5756,7 +5792,7 @@ pub async fn update_rate(&self, id: i64, u: RateTableUpdate) -> Result<RateTable
     if let Some(v) = u.enabled { binds.push(("enabled", (v as i64).to_string())); }
     if let Some(ref v) = u.description { binds.push(("description", v.clone())); }
     if binds.is_empty() { return Err(sqlx::Error::RowNotFound); }
-    // 按列类型区分：整数列要 CAST（pg 严格类型不接受 text 参数赋整数列），文本列直接 $n
+    // Distinguish by column type: integer columns need CAST (pg strict types do not accept text params for integer columns), text columns use $n directly
     let sets: Vec<String> = binds.iter().enumerate().map(|(i, (k, _))| {
         if matches!(*k, "enabled" | "price_per_min_uc" | "connect_fee_uc" | "bill_inc_s" | "min_bill_s" | "initial_s") {
             format!("{} = CAST(${} AS INTEGER)", k, i + 1)
@@ -5798,7 +5834,7 @@ pub async fn list_enabled_rates(&self) -> Result<Vec<RateTable>, sqlx::Error> {
         .fetch_all(pool).await
 }
 
-// ===== 安全围栏 CRUD（NIP 三层 + deny/allow 双模式） =====
+// ===== Security fence CRUD (NIP 3-layer + deny/allow dual mode) =====
 
 pub async fn list_security_blacklist(
     &self, kind: Option<&str>, rule_type: Option<&str>, enabled: Option<bool>,
@@ -5880,7 +5916,7 @@ pub async fn update_security_blacklist(&self, id: i64, u: SecurityBlacklistUpdat
     if binds.is_empty() { return Err(sqlx::Error::RowNotFound); }
     let sets: Vec<String> = binds.iter().enumerate().map(|(i, (k, _))| {
         if *k == "enabled" {
-            format!("{} = CAST(${} AS INTEGER)", k, i + 1)  // pg 严格类型
+            format!("{} = CAST(${} AS INTEGER)", k, i + 1)  // pg strict type
         } else {
             format!("{} = ${}", k, i + 1)
         }
@@ -5912,7 +5948,7 @@ pub async fn delete_security_blacklist(&self, id: i64) -> Result<bool, sqlx::Err
     Ok(res.rows_affected() > 0)
 }
 
-/// sync 推送用：全量启用规则（C 侧 security.blacklist.reload 整表替换）
+/// For sync push: all enabled rules (C side security.blacklist.reload full table replace)
 pub async fn list_enabled_security_blacklist(&self) -> Result<Vec<SecurityBlacklist>, sqlx::Error> {
     let Some(pool) = self.pool() else { return Ok(Vec::new()); };
     let backend = self.backend();
@@ -5923,7 +5959,7 @@ pub async fn list_enabled_security_blacklist(&self) -> Result<Vec<SecurityBlackl
 
 // ===== security_config CRUD =====
 
-/// 读取全局安全配置；无行则返回默认。
+/// Read global security config; return defaults if no row exists.
 pub async fn get_security_config(&self) -> Result<SecurityConfig, sqlx::Error> {
     let Some(pool) = self.pool() else { return Ok(SecurityConfig::default()); };
     let backend = self.backend();
@@ -5933,7 +5969,7 @@ pub async fn get_security_config(&self) -> Result<SecurityConfig, sqlx::Error> {
     Ok(row.unwrap_or_default())
 }
 
-/// upsert：更新 id=1 行；不存在则 INSERT。
+/// Upsert: update row id=1; INSERT if not exists.
 pub async fn upsert_security_config(&self, cfg: &SecurityConfig) -> Result<SecurityConfig, sqlx::Error> {
     let Some(pool) = self.pool() else {
         return Err(sqlx::Error::Configuration("NSBC_DB_DSN not set".into()));
@@ -5974,7 +6010,7 @@ pub async fn upsert_security_config(&self, cfg: &SecurityConfig) -> Result<Secur
     self.get_security_config().await
 }
 
-// ===== 账户 CRUD =====
+// ===== Accounts CRUD =====
 
 pub async fn list_accounts(
     &self, keyword: Option<&str>, limit: i64, offset: i64,
@@ -6062,9 +6098,9 @@ pub async fn delete_account(&self, id: i64) -> Result<bool, sqlx::Error> {
     Ok(res.rows_affected() > 0)
 }
 
-} // ← 关闭 impl Db ④（routes + accounts 模块）
+} // <- close impl Db ④ (routes + accounts module)
 
-// ==================== 租户（REQ-TENANT-001） ====================
+// ==================== Tenants (REQ-TENANT-001) ====================
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct Tenant {
@@ -6186,7 +6222,7 @@ impl Db {
     }
 
     pub async fn delete_tenant(&self, id: i64) -> Result<bool, sqlx::Error> {
-        if id == 1 { return Ok(false); } // default tenant 不可删
+        if id == 1 { return Ok(false); } // default tenant cannot be deleted
         let Some(pool) = self.pool() else { return Ok(false); };
         let backend = self.backend();
         let res = sqlx::query(&fix_ph("DELETE FROM tenants WHERE id = $1", backend)).bind(id).execute(pool).await?;

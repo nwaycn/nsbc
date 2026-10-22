@@ -1,9 +1,9 @@
-// NSBC 实时事件/CDR 订阅客户端 (Unix Domain Socket / Rust)
+// NSBC realtime event/CDR subscription client (Unix Domain Socket / Rust)
 //
-// 零第三方依赖：纯 std。cargo build --release 后单二进制 ~200KB。
+// Zero third-party deps: pure std. Single ~200KB binary after cargo build --release.
 //
-// 用法:
-//   cargo run --release --                                       # 默认 /tmp/nsbc-e2e/control.sock
+// Usage:
+//   cargo run --release --                                       # default /tmp/nsbc-e2e/control.sock
 //   cargo run --release -- /var/run/nsbc/control.sock
 //   cargo run --release -- --topics events,cdr,log
 //   cargo build --release && ./target/release/nsbc-event-client
@@ -47,17 +47,17 @@ fn main() -> std::io::Result<()> {
         }
     }
 
-    // socket 文件检查
+    // socket file check
     if !Path::new(&uds_path).exists() {
         eprintln!("ERR: UDS socket not found: {}", uds_path);
         std::process::exit(2);
     }
 
-    // 连接
+    // Connect
     let mut sock = UnixStream::connect(&uds_path)?;
     println!("\x1b[2m[connected to {}]{}", uds_path, RESET);
 
-    // 收 banner + 提示符（短超时 2s）
+    // Receive banner + prompt (short 2s timeout)
     let mut reader = BufReader::new(sock.try_clone()?);
     let deadline = SystemTime::now() + Duration::from_secs(2);
     let mut line = String::new();
@@ -77,7 +77,7 @@ fn main() -> std::io::Result<()> {
     if !pull_only {
         write!(sock, "sub {}\n", topics)?;
         sock.flush()?;
-        // 收 sub 响应 + 提示符
+        // Receive sub response + prompt
         let deadline = SystemTime::now() + Duration::from_secs(2);
         while SystemTime::now() < deadline {
             line.clear();
@@ -95,7 +95,7 @@ fn main() -> std::io::Result<()> {
         println!("\x1b[2m[subscribed: {} — Ctrl-C to quit]{}", topics, RESET);
     }
 
-    // 主循环：阻塞 readline + 解析帧
+    // Main loop: blocking readline + frame parse
     loop {
         line.clear();
         match reader.read_line(&mut line) {
@@ -128,33 +128,33 @@ fn color_for(domain: &str) -> &'static str {
     }
 }
 
-/// 手写帧解析，避免引入 regex 依赖
-/// 帧格式: YYYY-MM-DDTHH:MM:SS.mmm DOMAIN body
+/// Hand-written frame parser to avoid a regex dependency.
+/// Frame format: YYYY-MM-DDTHH:MM:SS.mmm DOMAIN body
 #[cfg(unix)]
 fn print_frame(line: &str, reset: &str) {
     if line.is_empty() { return; }
 
-    // 命令响应 / banner 识别
+    // Command response / banner recognition
     if line.starts_with("NSBC ") || line.starts_with("OK ") ||
        line.starts_with("ERR ") || line.starts_with("subscribed:") {
         println!("\x1b[2m[cmd] {}{}", line, reset);
         return;
     }
 
-    // 帧头时间戳: 23 字符 "YYYY-MM-DDTHH:MM:SS.mmm"
-    // 简单检查: 长度足够 + 含 T 和 3 位毫秒
+    // Frame-header timestamp: 23 chars "YYYY-MM-DDTHH:MM:SS.mmm"
+    // Quick check: long enough + contains 'T' and 3-digit milliseconds
     if line.len() < 28 { return; }
     let ts = &line[..23];
     let rest = &line[23..];
     if !rest.starts_with(' ') { return; }
     let rest = &rest[1..];
 
-    // 找第一个空格切 DOMAIN
+    // Find first space to split off DOMAIN
     let domain_end = rest.find(' ').unwrap_or(rest.len());
     let domain = &rest[..domain_end];
     let body = if domain_end < rest.len() { &rest[domain_end + 1..] } else { "" };
 
-    // 时间戳简化显示: 15:04:05.000
+    // Shorten timestamp for display: 15:04:05.000
     let ts_short = if ts.len() >= 12 { &ts[11..23] } else { ts };
 
     let c = color_for(domain);

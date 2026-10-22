@@ -1,4 +1,4 @@
-// =============================================================================
+﻿// =============================================================================
 // NSBC Web — 实时监控 / 只读面板组件
 // 加载顺序：必须在 app-core.js 之后
 // 依赖：app-core.js 中声明的全局 const app, livePanel, API, ref, onMounted
@@ -27,10 +27,10 @@ function fmtDuration(ms) {
   return `${h}h${min}m${sec}s`;
 }
 
-// ---- 辅助：判断是否为"核心（nsbcd）未连接/启动"类错误，
-// 这类错误属于系统级（C 核心没跑、UDS 不存在、502 Bad Gateway），
-// 面板应静默（保持显示空/上次数据）+ console.warn，不渲染红色报错条，
-// 避免核心离线时 6 个轮询组件每 5s 各自刷一条"弹错"。
+// ---- 辅助：判断是否为"Core（nsbcd）Not connected/启动"类Error，
+// 这类Error属于系统级（C Core没跑、UDS 不存在、502 Bad Gateway），
+// 面板应静默（Hold显示空/上次数据）+ console.warn，不渲染红色报错，
+// 避免Core offline时 6 个轮询组件每 5s 各自刷一"弹错"。
 function isCoreOfflineError(msg) {
   if (!msg) return false;
   const m = String(msg).toLowerCase();
@@ -38,79 +38,79 @@ function isCoreOfflineError(msg) {
       || m.includes('timeout') || m.includes('connect') || m.includes('no such file');
 }
 
-// ===== 实时总览（综合状态） =====
+// ===== Realtime Overview（综合Status） =====
 app.component('realtime', {
   template: `
     <div>
       <div class="flex items-center justify-between mb-4">
-        <h2 class="text-lg font-semibold"><i class="fa-solid fa-gauge-high"></i> 实时总览</h2>
+        <h2 class="text-lg font-semibold"><i class="fa-solid fa-gauge-high"></i>{{ t(' Realtime Overview') }}</h2>
         <div class="flex items-center gap-2">
           <button @click="showOrigDlg = true" class="px-3 py-1.5 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded shadow-sm">
-            <i class="fa-solid fa-phone-plus mr-1"></i> 外呼测试
+            <i class="fa-solid fa-phone-plus mr-1"></i> Originate test
           </button>
-          <span class="text-xs text-gray-500">上次更新：{{ lastUpdated }}</span>
+          <span class="text-xs text-gray-500">{{ t('Last updated:') }} {{ lastUpdated }}</span>
         </div>
       </div>
-      <div v-if="loading" class="text-gray-400">加载中...</div>
+      <div v-if="loading" class="text-gray-400">{{ t('Loading...') }}</div>
       <div v-else-if="error" class="text-red-500 mb-4">⚠ {{ error }}</div>
       <div v-else class="grid grid-cols-2 md:grid-cols-4 gap-4">
         <div class="bg-blue-50 border border-blue-200 rounded-lg p-4">
-          <div class="text-xs text-blue-600 font-medium">活跃通话</div>
+          <div class="text-xs text-blue-600 font-medium">{{ t('Active calls') }}</div>
           <div class="text-3xl font-bold text-blue-700 mt-1">{{ calls && calls.active != null ? calls.active : '-' }}</div>
         </div>
         <div class="bg-green-50 border border-green-200 rounded-lg p-4">
-          <div class="text-xs text-green-600 font-medium">累计通话</div>
+          <div class="text-xs text-green-600 font-medium">{{ t('Total calls') }}</div>
           <div class="text-3xl font-bold text-green-700 mt-1">{{ calls && calls.total != null ? calls.total : '-' }}</div>
         </div>
         <div class="bg-red-50 border border-red-200 rounded-lg p-4">
-          <div class="text-xs text-red-600 font-medium">失败</div>
+          <div class="text-xs text-red-600 font-medium">{{ t('Failed') }}</div>
           <div class="text-3xl font-bold text-red-700 mt-1">{{ calls && calls.failed != null ? calls.failed : '-' }}</div>
         </div>
         <div class="bg-purple-50 border border-purple-200 rounded-lg p-4">
-          <div class="text-xs text-purple-600 font-medium">注册数</div>
+          <div class="text-xs text-purple-600 font-medium">{{ t('Registrations') }}</div>
           <div class="text-3xl font-bold text-purple-700 mt-1">{{ regs && regs.registrations != null ? regs.registrations : '-' }}</div>
         </div>
       </div>
 
-      <!-- 外呼测试弹窗 -->
+      <!-- Originate test弹窗 -->
       <div v-if="showOrigDlg" class="fixed inset-0 bg-black/40 flex items-center justify-center z-50" @click.self="showOrigDlg = false">
         <div class="bg-white rounded-xl shadow-2xl w-[420px] overflow-hidden">
           <div class="px-5 py-3 bg-blue-600 text-white flex items-center justify-between">
-            <h3 class="font-semibold"><i class="fa-solid fa-phone-plus mr-2"></i>外呼测试</h3>
+            <h3 class="font-semibold"><i class="fa-solid fa-phone-plus mr-2"></i>{{ t('Originate test') }}</h3>
             <button @click="showOrigDlg = false" class="hover:bg-white/20 rounded px-2">✕</button>
           </div>
           <div class="p-5 space-y-4">
             <div>
-              <label class="field-label">被叫号 / call-url</label>
-              <input v-model="origForm.call_url" class="field-input" placeholder="如 1003 或 sip:user@trunk">
+              <label class="field-label">{{ t('Destination / call-url') }}</label>
+              <input v-model="origForm.call_url" class="field-input" :placeholder="t('$n')">
             </div>
             <div class="grid grid-cols-2 gap-3">
               <div>
-                <label class="field-label">主叫号覆盖</label>
-                <input v-model="origForm.caller_id" class="field-input" placeholder="如 8888">
+                <label class="field-label">{{ t('Caller ID Override') }}</label>
+                <input v-model="origForm.caller_id" class="field-input" :placeholder="t('$n')">
               </div>
               <div>
-                <label class="field-label">主叫显示名</label>
-                <input v-model="origForm.caller_name" class="field-input" placeholder="如 Switch">
+                <label class="field-label">{{ t('CallerDisplay name') }}</label>
+                <input v-model="origForm.caller_name" class="field-input" :placeholder="t('$n')">
               </div>
             </div>
             <div>
-              <label class="field-label">振铃超时（秒）</label>
+              <label class="field-label">{{ t('Ringing timeout (s)') }}</label>
               <input v-model="origForm.timeout" type="number" min="1" max="3600"
-                     class="field-input" placeholder="如 50（不填用核心默认）">
+                     class="field-input" :placeholder="t('$n')">
             </div>
             <div>
-              <label class="field-label">应用（可选）</label>
+              <label class="field-label">{{ t('Application (optional)') }}</label>
               <select v-model="origForm.app" class="field-input">
-                <option value="park">park（保持）</option>
-                <option value="echo">echo（回声）</option>
-                <option value="hangup">hangup（挂断）</option>
-                <option value="answer">answer（应答）</option>
+                <option value="park">{{ t('park（Hold）') }}</option>
+                <option value="echo">{{ t('echo (echo test)') }}</option>
+                <option value="hangup">{{ t('hangup（Hang up）') }}</option>
+                <option value="answer">{{ t('answer (auto-answer)') }}</option>
               </select>
             </div>
             <div class="flex items-center gap-2 text-xs text-gray-500 bg-blue-50 border border-blue-200 rounded px-3 py-2">
               <i class="fa-solid fa-info-circle text-blue-600"></i>
-              <span>发送到核心 <code class="font-mono">originate {var=val,...}&lt;dest&gt; &amp;&lt;app&gt;</code>，ESL/api 命令实时生效</span>
+              <span>{{ t('Send to core ') }}<code class="font-mono">originate {var=val,...}&lt;dest&gt; &amp;&lt;app&gt;</code>{{ t('，ESL/api command takes effect immediately') }}</span>
             </div>
             <div v-if="origMsg" class="text-sm" :class="origOk ? 'text-green-600 bg-green-50' : 'text-red-600 bg-red-50'"
                  class="rounded px-3 py-2 border" :class="origOk ? 'border-green-200' : 'border-red-200'">
@@ -118,11 +118,11 @@ app.component('realtime', {
             </div>
           </div>
           <div class="px-5 py-3 bg-gray-50 flex justify-end gap-2">
-            <button @click="showOrigDlg = false" class="btn btn-ghost">取消</button>
+            <button @click="showOrigDlg = false" class="btn btn-ghost">{{ t('Cancel') }}</button>
             <button @click="submitOriginate" :disabled="origLoading || !origForm.call_url"
                     class="btn btn-primary disabled:opacity-50">
               <i v-if="origLoading" class="fa-solid fa-spinner fa-spin mr-1"></i>
-              {{ origLoading ? '发送中…' : '一键外呼' }}
+              {{ origLoading ? t('Sending...') : t('Originate now') }}
             </button>
           </div>
         </div>
@@ -131,7 +131,7 @@ app.component('realtime', {
   `,
   setup() {
     const calls = ref(null), regs = ref(null), loading = ref(false), error = ref(null), lastUpdated = ref('');
-    // 外呼测试弹窗状态
+    // 外呼测试弹窗Status
     const showOrigDlg = ref(false);
     const origForm = ref({ call_url: '', app: 'park', caller_id: '', caller_name: '', timeout: '' });
     const origLoading = ref(false);
@@ -143,14 +143,14 @@ app.component('realtime', {
       const dest = (f.call_url || '').trim();
       if (!dest) { return; }
       // 组装 FreeSWITCH 风格命令：{var=val,...}dest &app
-      // 核心 parse_fs_brace_vars 支持 origination_caller_id_number /
-      // origination_caller_id_name / originate_timeout（秒）。
+      // Core parse_fs_brace_vars 支持 origination_caller_id_number /
+      // origination_caller_id_name / originate_timeout（s）。
       const vars = [];
       if (f.caller_id)   vars.push('origination_caller_id_number=' + String(f.caller_id).trim());
       if (f.caller_name) vars.push('origination_caller_id_name=' + String(f.caller_name).trim());
       if (f.timeout)     vars.push('originate_timeout=' + parseInt(f.timeout, 10));
       let url = (vars.length ? '{' + vars.join(',') + '}' : '') + dest;
-      // answer 不是核心支持的后置 app（核心里它会跳过），仅支持 park/echo/hangup
+      // answer 不是Core支持的后置 app（Core里它会跳过），仅支持 park/echo/hangup
       if (f.app && f.app !== 'answer') url += ' &' + f.app;
       origLoading.value = true; origMsg.value = '';
       try {
@@ -158,7 +158,7 @@ app.component('realtime', {
         origMsg.value = r.status || 'originate-dispatched';
         origOk.value = true;
       } catch (e) {
-        origMsg.value = e.message || '外呼失败';
+        origMsg.value = e.message || 'Originate failed';
         origOk.value = false;
       }
       origLoading.value = false;
@@ -199,12 +199,12 @@ function fmtLoss(v) {
   return v + '%';
 }
 
-// 状态字符串 → 带颜色徽章（stateBadge）。
-// 覆盖 C 侧 LEG_* 状态名 + hold/unhold 自定义值：
+// Status字符串 → 带颜色徽章（stateBadge）。
+// 覆盖 C 侧 LEG_* Status名 + hold/unhold 自定义Value：
 //   LEG_NONE/CALLING → calling | LEG_RINGING → ringing | LEG_EARLY → early
 //   LEG_CONFIRMED → confirmed | LEG_HELD → held | LEG_TERMINATING → terminated
 //   LEG_TERMINATED/NULL → terminated
-//   hold → held | unhold → active（通话中，语义同 confirmed）
+//   hold → held | unhold → active（Active，语义同 confirmed）
 function stateBadge(v) {
   if (!v) return '<span class="text-gray-400">-</span>';
   const s = String(v).toLowerCase();
@@ -223,21 +223,21 @@ function stateBadge(v) {
   return `<span class="inline-block px-2 py-0.5 rounded text-xs font-medium ${cls}">${label}</span>`;
 }
 
-// ===== 在途呼叫 =====
-app.component('channels-live', livePanel('在途呼叫', 'fa-solid fa-phone-volume',
+// ===== 在途Call =====
+app.component('channels-live', livePanel(t('Live channels'), 'fa-solid fa-phone-volume',
   [
     { key: 'a_call_id',    label: 'A-Leg Call-ID' },
-    { key: 'a_state',      label: 'A 状态', fmt: stateBadge },
+    { key: 'a_state',      label: t('A-State'), fmt: stateBadge },
     { key: 'b_call_id',    label: 'B-Leg Call-ID' },
-    { key: 'b_state',      label: 'B 状态', fmt: stateBadge },
-    { key: 'caller',       label: '主叫' },
-    { key: 'callee',       label: '被叫' },
-    { key: 'start_ms',     label: '开始时间', fmt: fmtTime },
-    { key: 'answer_ms',    label: '接通时间', fmt: fmtClock },
-    { key: 'duration_ms',  label: '持续时长', fmt: fmtDuration },
-    { key: 'codec_a',      label: 'A 编码' },
-    { key: 'codec_b',      label: 'B 编码' },
-    { key: 'from_ip',      label: '来源 IP' },
+    { key: 'b_state',      label: t('B-State'), fmt: stateBadge },
+    { key: 'caller',       label: t('Caller') },
+    { key: 'callee',       label: t('Callee') },
+    { key: 'start_ms',     label: t('Start time'), fmt: fmtTime },
+    { key: 'answer_ms',    label: t('Answer time'), fmt: fmtClock },
+    { key: 'duration_ms',  label: t('Duration'), fmt: fmtDuration },
+    { key: 'codec_a',      label: t('A-Codec') },
+    { key: 'codec_b',      label: t('B-Codec') },
+    { key: 'from_ip',      label: t('Source IP') },
     { key: 'a_peer_ip',    label: 'A-RTP' },
     { key: 'b_peer_ip',    label: 'B-RTP' },
     { key: 'mos_x1000',    label: 'MOS', fmt: fmtMos },
@@ -250,7 +250,7 @@ app.component('channels-live', livePanel('在途呼叫', 'fa-solid fa-phone-volu
     actionCol: (row) => {
       const callId = row.a_call_id || row.b_call_id || '';
       if (!callId) return '';
-      return `<button onclick="nsbcHangup('${callId}')" class="px-2 py-1 text-xs text-red-600 border border-red-300 rounded hover:bg-red-50 hover:text-red-800"><i class="fa-solid fa-phone-slash"></i> 挂断</button>`;
+      return `<button onclick="nsbcHangup('${callId}')" class="px-2 py-1 text-xs text-red-600 border border-red-300 rounded hover:bg-red-50 hover:text-red-800"><i class="fa-solid fa-phone-slash"></i>{{ t(' Hang up') }}</button>`;
     },
   }));
 
@@ -269,33 +269,33 @@ function isoMs(s) {
   return isNaN(d.getTime()) ? 0 : d.getTime();
 }
 
-// ===== 通话记录（CDR） =====
+// ===== Call Record（CDR） =====
 app.component('cdrs-live', {
   template: `
     <div>
       <div class="flex items-center justify-between mb-4">
-        <h2 class="text-lg font-semibold"><i class="fa-solid fa-file-lines"></i> 最近通话记录</h2>
-        <div class="text-xs text-gray-500">共 {{ total }} 条 · 每 10 秒刷新</div>
+        <h2 class="text-lg font-semibold"><i class="fa-solid fa-file-lines"></i>{{ t(' Recent call records') }}</h2>
+        <div class="text-xs text-gray-500">{{ t('Total') }} {{ total }} · {{ t('refresh every 10s') }}</div>
       </div>
-      <div v-if="loading" class="text-gray-400">加载中...</div>
+      <div v-if="loading" class="text-gray-400">{{ t('Loading...') }}</div>
       <div v-else-if="error" class="text-red-500">⚠ {{ error }}</div>
-      <div v-else-if="!rows.length" class="text-center text-gray-400 py-12">暂无 CDR</div>
+      <div v-else-if="!rows.length" class="text-center text-gray-400 py-12">{{ t('No CDRs yet') }}</div>
       <table v-else class="w-full text-sm border-collapse">
         <thead><tr class="bg-gray-50 border-b">
-          <th class="px-3 py-2 text-left font-medium text-gray-600">主叫</th>
-          <th class="px-3 py-2 text-left font-medium text-gray-600">被叫</th>
-          <th class="px-3 py-2 text-left font-medium text-gray-600">来源 IP</th>
-          <th class="px-3 py-2 text-left font-medium text-gray-600">A 编码</th>
-          <th class="px-3 py-2 text-left font-medium text-gray-600">B 编码</th>
+          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Caller') }}</th>
+          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Callee') }}</th>
+          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Source IP') }}</th>
+          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('A-Codec') }}</th>
+          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('B-Codec') }}</th>
           <th class="px-3 py-2 text-left font-medium text-gray-600">Call-ID</th>
-          <th class="px-3 py-2 text-left font-medium text-gray-600">呼入时间</th>
-          <th class="px-3 py-2 text-left font-medium text-gray-600">应答时间</th>
-          <th class="px-3 py-2 text-left font-medium text-gray-600">接续时长</th>
-          <th class="px-3 py-2 text-left font-medium text-gray-600">挂机时间</th>
-          <th class="px-3 py-2 text-left font-medium text-gray-600">总时长</th>
-          <th class="px-3 py-2 text-left font-medium text-gray-600">计费时长</th>
-          <th class="px-3 py-2 text-left font-medium text-gray-600">处置</th>
-          <th class="px-3 py-2 text-left font-medium text-gray-600">录音</th>
+          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Start time') }}</th>
+          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Answer time') }}</th>
+          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Ringing time') }}</th>
+          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('End time') }}</th>
+          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('总Duration') }}</th>
+          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Billing duration') }}</th>
+          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Disposition') }}</th>
+          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Recording') }}</th>
         </tr></thead>
         <tbody>
           <tr v-for="(row, idx) in rows" :key="idx" class="border-b hover:bg-blue-50/50">
@@ -321,7 +321,7 @@ app.component('cdrs-live', {
             <td class="px-3 py-2 text-xs">
               <template v-if="getRecUrl(row)">
                 <audio :src="getRecUrl(row)" controls preload="none" class="h-6 align-middle"></audio>
-                <a :href="getRecUrl(row)" download target="_blank" class="ml-2 text-blue-600 hover:underline" title="下载">
+                <a :href="getRecUrl(row)" download target="_blank" class="ml-2 text-blue-600 hover:underline" :title="t('$n')">
                   <i class="fa-solid fa-download"></i>
                 </a>
               </template>
@@ -330,9 +330,9 @@ app.component('cdrs-live', {
           </tr>
         </tbody>
       </table>
-      <!-- 分页控件 -->
+      <!-- Pagination控件 -->
       <div v-if="total > pageSize" class="flex items-center justify-between mt-3 text-xs text-gray-500">
-        <div>共 {{ total }} 条 · 每页 {{ pageSize }} 条</div>
+        <div>Total {{ total }}  · 每 {{ pageSize }} </div>
         <div class="flex items-center gap-1">
           <button @click="goPage(1)" :disabled="currentPage===1" class="px-2 py-1 border rounded disabled:opacity-30">«</button>
           <button @click="goPage(currentPage-1)" :disabled="currentPage===1" class="px-2 py-1 border rounded disabled:opacity-30">‹</button>
@@ -374,13 +374,13 @@ app.component('cdrs-live', {
       // 后端公开文件路由是 /recordings/*path
       return '/recordings/' + recPath.replace(/^\/+/, '');
     }
-    // 接续时长（响铃到应答）= answer_time - start_time
+    // 接续Duration（响铃到应答）= answer_time - start_time
     function ringTime(startIso, answerIso) {
       if (!answerIso) return '-';
       const d = Math.round((isoMs(answerIso) - isoMs(startIso)) / 1000);
       return d >= 0 ? d + 's' : '-';
     }
-    // 计费时长 = 优先用后端 billsec，否则用 duration_sec - 接续时长
+    // 计费Duration = 优先用后端 billsec，否则用 duration_sec - 接续Duration
     function formatBillsec(row) {
       if (row.billsec != null) return row.billsec + 's';
       if (row.duration_sec != null && row.answer_time) {
@@ -413,7 +413,7 @@ app.component('metrics-live', {
   template: `
     <div>
       <h2 class="text-lg font-semibold mb-4"><i class="fa-solid fa-chart-line"></i> Prometheus 指标</h2>
-      <div v-if="loading" class="text-gray-400">加载中...</div>
+      <div v-if="loading" class="text-gray-400">{{ t('Loading...') }}</div>
       <div v-else-if="error" class="text-red-500">⚠ {{ error }}</div>
       <div v-else class="grid grid-cols-1 md:grid-cols-2 gap-2">
         <div v-for="(v, k) in metrics" :key="k" class="flex justify-between px-3 py-2 border rounded hover:bg-blue-50/50">
@@ -442,33 +442,33 @@ app.component('metrics-live', {
   },
 });
 
-// ===== 注册状态 =====
+// ===== Reg Status =====
 app.component('registrations-live', {
   template: `
     <div>
       <div class="flex items-center justify-between mb-4">
-        <h2 class="text-lg font-semibold"><i class="fa-solid fa-user-check"></i> 注册状态
+        <h2 class="text-lg font-semibold"><i class="fa-solid fa-user-check"></i> Registration status
           <span v-if="shown" class="text-sm text-gray-500">
-            ({{ shown }} 个分机<span v-if="total > shown"> · {{ total }} 个注册端点</span>)
+            ({{ shown }} <span v-if="total > shown"> · {{ total }} {{ t('registration endpoints') }}</span>)
           </span>
         </h2>
-        <div v-if="truncated" class="text-xs text-yellow-600">⚠ 输出被截断</div>
+        <div v-if="truncated" class="text-xs text-yellow-600">{{ t('⚠ Output truncated') }}</div>
       </div>
-      <div v-if="loading" class="text-gray-400">加载中...</div>
+      <div v-if="loading" class="text-gray-400">{{ t('Loading...') }}</div>
       <div v-else-if="error" class="text-red-500">⚠ {{ error }}</div>
-      <div v-else-if="!rows.length" class="text-center text-gray-400 py-12">暂无注册（未分机注册）</div>
+      <div v-else-if="!rows.length" class="text-center text-gray-400 py-12">{{ t('No registrations yet') }}</div>
       <table v-else class="w-full text-sm border-collapse">
         <thead><tr class="bg-gray-50 border-b">
-          <th class="px-3 py-2 text-left font-medium text-gray-600">分机</th>
+          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Extension') }}</th>
           <th class="px-3 py-2 text-left font-medium text-gray-600">AoR</th>
           <th class="px-3 py-2 text-left font-medium text-gray-600">Contact（原始）</th>
           <th class="px-3 py-2 text-left font-medium text-gray-600">NAT</th>
           <th class="px-3 py-2 text-left font-medium text-gray-600">Received</th>
-          <th class="px-3 py-2 text-left font-medium text-gray-600">可达 Contact</th>
+          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Public contact') }}</th>
           <th class="px-3 py-2 text-left font-medium text-gray-600">Transport</th>
-          <th class="px-3 py-2 text-left font-medium text-gray-600">已注册</th>
-          <th class="px-3 py-2 text-left font-medium text-gray-600">剩余</th>
-          <th class="px-3 py-2 text-left font-medium text-gray-600">状态</th>
+          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Registered') }}</th>
+          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Remaining') }}</th>
+          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Status') }}</th>
         </tr></thead>
         <tbody>
           <tr v-for="(row, idx) in rows" :key="idx" class="border-b hover:bg-blue-50/50">
@@ -488,7 +488,7 @@ app.component('registrations-live', {
               </div>
               <span v-else class="text-gray-400">-</span>
             </td>
-            <!-- 可达 Contact：NAT 改写后的公网可达地址（FreeSWITCH fs_nat=1 等效） -->
+            <!-- Public contact：NAT 改写后的公网可达地址（FreeSWITCH fs_nat=1 等效） -->
             <td class="px-3 py-2 font-mono text-xs truncate max-w-[240px]"
                 :class="row.nat_detected ? 'text-amber-700' : 'text-gray-500'"
                 :title="row.public_contact">
@@ -499,7 +499,7 @@ app.component('registrations-live', {
             <td class="px-3 py-2 text-xs" :class="renewClass(row.expires_sec)">{{ fmtDur(row.expires_sec) }}</td>
             <td class="px-3 py-2 text-xs">
               <span class="inline-block w-2 h-2 rounded-full mr-1" :class="row.expires_sec > 30 ? 'bg-green-500' : 'bg-yellow-500'"></span>
-              {{ row.expires_sec > 0 ? '在线' : '即将过期' }}
+              {{ row.expires_sec > 0 ? t('Online') : t('Expiring soon') }}
             </td>
           </tr>
         </tbody>
@@ -508,22 +508,22 @@ app.component('registrations-live', {
   `,
   setup() {
     const data = ref(null), loading = ref(false), error = ref(null);
-    // 按分机号去重：同一分机多终端注册时，保留剩余有效时间最长（最新注册）那条
-    // loc_db 允许多 binding（多终端/GRUU），UI 只显示每分机一条
+    // 按Extension去重：同一Extension多终端Register时，保留剩余有效时间最长（最新Register）那
+    // loc_db Allow多 binding（多终端/GRUU），UI 只显示每Extension一
     const rows = computed(() => {
       const list = (data.value && data.value.bindings) || [];
       const map = new Map();
       for (const b of list) {
         const key = b.user || b.aor || b.contact || '';
         const exist = map.get(key);
-        // 剩余时间更长 = 最新注册，保留
+        // 剩余时间更长 = 最新Register，保留
         if (!exist || (b.expires_sec ?? 0) > (exist.expires_sec ?? 0)) {
           map.set(key, b);
         }
       }
       return Array.from(map.values());
     });
-    // 总数 = 原始 binding 数（真实注册数，不去重）
+    // 总数 = 原始 binding 数（真实Register数，不去重）
     const total = computed(() => data.value?.registrations || ((data.value && data.value.bindings) || []).length);
     const shown = computed(() => rows.value.length);
     const truncated = computed(() => data.value?.truncated || false);
@@ -560,21 +560,21 @@ app.component('rates-live', {
   template: `
     <div>
       <div class="flex items-center justify-between mb-4">
-        <h2 class="text-lg font-semibold"><i class="fa-solid fa-coins"></i> 费率表</h2>
-        <span class="text-xs text-gray-500">共 {{ total }} 条 · 微元 (1e-6 元)</span>
+        <h2 class="text-lg font-semibold"><i class="fa-solid fa-coins"></i>{{ t(' Rate table') }}</h2>
+        <span class="text-xs text-gray-500">{{ t('Total') }} {{ total }} · {{ t('Micro-units (1e-6 CNY)') }}</span>
       </div>
-      <div v-if="loading" class="text-gray-400">加载中...</div>
+      <div v-if="loading" class="text-gray-400">{{ t('Loading...') }}</div>
       <div v-else-if="error" class="text-red-500">⚠ {{ error }}</div>
-      <div v-else-if="!rows.length" class="text-center text-gray-400 py-12">暂无费率（通过 C 侧 rate_upsert 或后续 Web CRUD 添加）</div>
+      <div v-else-if="!rows.length" class="text-center text-gray-400 py-12">{{ t('No rates yet (add via C-side rate_upsert or Web CRUD)') }}</div>
       <table v-else class="w-full text-sm border-collapse">
         <thead><tr class="bg-gray-50 border-b">
           <th class="px-3 py-2 text-left font-medium text-gray-600">前缀</th>
-          <th class="px-3 py-2 text-left font-medium text-gray-600">名称</th>
-          <th class="px-3 py-2 text-left font-medium text-gray-600">单价/分钟(微元)</th>
-          <th class="px-3 py-2 text-left font-medium text-gray-600">接通费(微元)</th>
-          <th class="px-3 py-2 text-left font-medium text-gray-600">计费块(s)</th>
-          <th class="px-3 py-2 text-left font-medium text-gray-600">最小收费(s)</th>
-          <th class="px-3 py-2 text-left font-medium text-gray-600">启用</th>
+          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Name') }}</th>
+          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Rate/min (µ)') }}</th>
+          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Connect fee (µ)') }}</th>
+          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Billing block (s)') }}</th>
+          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Min bill (s)') }}</th>
+          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Enable') }}</th>
         </tr></thead>
         <tbody>
           <tr v-for="(row, idx) in rows" :key="idx" class="border-b hover:bg-blue-50/50">
@@ -617,19 +617,19 @@ app.component('balances-live', {
   template: `
     <div>
       <div class="flex items-center justify-between mb-4">
-        <h2 class="text-lg font-semibold"><i class="fa-solid fa-wallet"></i> 账户余额</h2>
-        <span class="text-xs text-gray-500">共 {{ total }} 个账户 · 微元 (1e-6 元)</span>
+        <h2 class="text-lg font-semibold"><i class="fa-solid fa-wallet"></i>{{ t(' Account balance') }}</h2>
+        <span class="text-xs text-gray-500">{{ t('Total') }} {{ total }} {{ t('accounts') }} · {{ t('Micro-units (1e-6 CNY)') }}</span>
       </div>
-      <div v-if="loading" class="text-gray-400">加载中...</div>
+      <div v-if="loading" class="text-gray-400">{{ t('Loading...') }}</div>
       <div v-else-if="error" class="text-red-500">⚠ {{ error }}</div>
-      <div v-else-if="!rows.length" class="text-center text-gray-400 py-12">暂无账户</div>
+      <div v-else-if="!rows.length" class="text-center text-gray-400 py-12">{{ t('No accounts yet') }}</div>
       <table v-else class="w-full text-sm border-collapse">
         <thead><tr class="bg-gray-50 border-b">
           <th class="px-3 py-2 text-left font-medium text-gray-600">账户</th>
-          <th class="px-3 py-2 text-right font-medium text-gray-600">余额(微元)</th>
-          <th class="px-3 py-2 text-right font-medium text-gray-600">已预占(微元)</th>
-          <th class="px-3 py-2 text-right font-medium text-gray-600">透支额度(微元)</th>
-          <th class="px-3 py-2 text-right font-medium text-gray-600">可用余额</th>
+          <th class="px-3 py-2 text-right font-medium text-gray-600">{{ t('余额(Micro-units)') }}</th>
+          <th class="px-3 py-2 text-right font-medium text-gray-600">{{ t('Reserved (µ)') }}</th>
+          <th class="px-3 py-2 text-right font-medium text-gray-600">{{ t('Credit limit (µ)') }}</th>
+          <th class="px-3 py-2 text-right font-medium text-gray-600">{{ t('Available balance') }}</th>
         </tr></thead>
         <tbody>
           <tr v-for="(row, idx) in rows" :key="idx" class="border-b hover:bg-blue-50/50">
@@ -665,26 +665,26 @@ app.component('balances-live', {
   },
 });
 
-// ===== 媒体会话（bridge/transcode） =====
+// ===== MediaSession（bridge/transcode） =====
 app.component('transcode-live', {
   template: `
     <div>
       <div class="flex items-center justify-between mb-4">
-        <h2 class="text-lg font-semibold"><i class="fa-solid fa-microphone"></i> 媒体 Bridge 会话</h2>
-        <span class="text-xs text-gray-500">活跃会话：{{ total }}</span>
+        <h2 class="text-lg font-semibold"><i class="fa-solid fa-microphone"></i>{{ t(' Media Bridge sessions') }}</h2>
+        <span class="text-xs text-gray-500">{{ t('Active sessions:') }} {{ total }}</span>
       </div>
-      <div v-if="loading" class="text-gray-400">加载中...</div>
+      <div v-if="loading" class="text-gray-400">{{ t('Loading...') }}</div>
       <div v-else-if="error" class="text-red-500">⚠ {{ error }}</div>
-      <div v-else-if="!rows.length" class="text-center text-gray-400 py-12">无活跃媒体会话</div>
+      <div v-else-if="!rows.length" class="text-center text-gray-400 py-12">{{ t('无活跃Media sessions') }}</div>
       <table v-else class="w-full text-sm border-collapse">
         <thead><tr class="bg-gray-50 border-b">
           <th class="px-3 py-2 text-left font-medium text-gray-600">#</th>
           <th class="px-3 py-2 text-left font-medium text-gray-600">Call Key</th>
-          <th class="px-3 py-2 text-left font-medium text-gray-600">模式</th>
+          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Mode') }}</th>
           <th class="px-3 py-2 text-left font-medium text-gray-600">A-RTP</th>
           <th class="px-3 py-2 text-left font-medium text-gray-600">B-RTP</th>
-          <th class="px-3 py-2 text-right font-medium text-gray-600">转发包</th>
-          <th class="px-3 py-2 text-right font-medium text-gray-600">丢弃包</th>
+          <th class="px-3 py-2 text-right font-medium text-gray-600">{{ t('Forwarded pkts') }}</th>
+          <th class="px-3 py-2 text-right font-medium text-gray-600">{{ t('Dropped pkts') }}</th>
         </tr></thead>
         <tbody>
           <tr v-for="(row, idx) in rows" :key="idx" class="border-b hover:bg-blue-50/50">

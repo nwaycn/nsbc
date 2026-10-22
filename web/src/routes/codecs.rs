@@ -1,18 +1,18 @@
-//! Codec 注册表 REST（W-06 / Phase 3 mod_av 对齐）。
+//! Codec registry REST (W-06 / Phase 3 mod_av aligned).
 //!
-//! 单端点：`GET /codecs`
-//!   → JSON 数组 [{ "name": "PCMA", "pt": 8, "sample_rate": 8000,
+//! Single endpoint: `GET /codecs`
+//!   → JSON array [{ "name": "PCMA", "pt": 8, "sample_rate": 8000,
 //!                  "impl_module": "mod_codecs", "fmtp_default": "-",
 //!                  "media_type": "audio"}, ...]
 //!
-//! 数据来源：核心侧 UDS `show codecs` 命令（codec_registry 由
-//! mod_codecs（G711/G729）、mod_av（G722/Opus/H264/VP8/VP9）、
-//! 或未来 iLBC/AMR 模块在 init 时自注册条目）。
+//! Data source: core-side UDS `show codecs` command (codec_registry is
+//! self-registered at init time by mod_codecs (G711/G729), mod_av
+//! (G722/Opus/H264/VP8/VP9), or future iLBC/AMR modules).
 //!
-//! 典型用途：
-//!   - 前端分机编辑页 codec 下拉（按 media_type 分组 audio/video）
-//!   - 前端 transcode 页面 codec 选择
-//!   - 运维面板显示当前可用编解码清单
+//! Typical use:
+//!   - Front-end extension editor codec dropdown (grouped by media_type audio/video)
+//!   - Front-end transcode page codec selection
+//!   - Ops dashboard showing the current codec list
 
 use std::sync::Arc;
 
@@ -41,7 +41,7 @@ where
         .layer(ServiceBuilder::new().layer(TraceLayer::new_for_http()))
 }
 
-/// 路由层 Codec 条目（从 coreclient::CodecInfo 直接透传，无额外加工）。
+/// Route-layer Codec entry (pass-through from coreclient::CodecInfo, no extra processing).
 #[derive(Debug, Serialize)]
 pub struct CodecEntry {
     pub name: String,

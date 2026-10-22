@@ -1,25 +1,25 @@
 #!/bin/sh
 # =====================================================================
-# NSBC configure — FreeSWITCH 风格编译时模块裁剪 + 动态链接库分离
+# NSBC configure — FreeSWITCH-style compile-time module trimming + shared library separation
 # =====================================================================
-# 分层策略（REQ-ARCH-010）：
-#   STATIC 组 —— REQUIRED / CALL_PATH / MOD_L_EARLY 模块 → 静态链接进 nsbcd 主二进制
-#                EARLY 也进 STATIC：dlopen 依赖 mem/rcu，EARLY 时还没初始化完
-#   DYNAMIC 组 —— 非 REQUIRED/CALL_PATH/EARLY → 编 build/mod/mod_*.so，
-#                 启动时 dlopen（modules.conf 选中的才加载）
+# layering strategy (REQ-ARCH-010):
+#   STATIC group —— REQUIRED / CALL_PATH / MOD_L_EARLY modules -> static link into nsbcd main binary
+#                EARLY also goes STATIC: dlopen depends on mem/rcu which isn't initialized yet at EARLY stage
+#   DYNAMIC group —— non REQUIRED/CALL_PATH/EARLY -> build/mod/mod_*.so,
+#                    dlopen at startup (only modules selected in modules.conf are loaded)
 #
-# 用法：
-#   ./configure                                # 默认：modules.conf + 全 enable（除 disable）
-#   ./configure --with-modules=a,b,c          # 白名单：只编这些（REQUIRED 强制进 STATIC）
-#   ./configure --without-modules=x,y,z       # 黑名单：这些不编
-#   ./configure --modules-conf=<path>         # 指定别的 modules.conf
-#   ./configure --prefix=/usr/local           # install 前缀
+# Usage:
+#   ./configure                                # default: modules.conf + all enabled (except disabled)
+#   ./configure --with-modules=a,b,c          # whitelist: only build these (REQUIRED forced into STATIC)
+#   ./configure --without-modules=x,y,z       # blacklist: don't build these
+#   ./configure --modules-conf=<path>         # specify a different modules.conf
+#   ./configure --prefix=/usr/local           # install prefix
 #
-# 生成产物（分离「配置」与「构建」目录，make clean 只删 build/ 不动 .config/）：
-#   .config/config.mk                      Makefile include 它（项目根，clean 不删）
-#   src/core/builtin_modules.gen.inc       builtin.c __has_include 优先 include
-#   build/mod/mod.load                     动态模块 .so 路径列表（和 .so 同目录，dlopen 用）
-#   build/mod/mod_*.so                     动态链接库（Makefile 编）
+# Generated artifacts (separates "config" and "build" directories, make clean only deletes build/ not .config/):
+#   .config/config.mk                      Makefile includes it (project root, survives clean)
+#   src/core/builtin_modules.gen.inc       builtin.c __has_include priority include
+#   build/mod/mod.load                     dynamic module .so path list (same dir as .so, dlopen uses it)
+#   build/mod/mod_*.so                     shared libraries (Makefile builds)
 # =====================================================================
 
 set -e
@@ -51,25 +51,25 @@ done
 TMP=$(mktemp -d /tmp/nsbc_conf_XXXXXX)
 trap 'rm -rf "$TMP"' EXIT
 
-MODS_DB="$TMP/mods.db"          # 模块元数据：name|dir|src_file|req|cp|lvl|deps_list
+MODS_DB="$TMP/mods.db"          # module metadata: name|dir|src_file|req|cp|lvl|deps_list
 
 # =====================================================================
-# 1. 扫描所有模块定义（全量 src/**/*.c，排除 3rd / tests）
-#    每行格式：NAME|DIR|SRC_FILE|REQ|CP|LEVEL_NUM|DEPS_CSV
+# 1. scan all module definitions (full src/**/*.c, exclude 3rd / tests)
+#    each line format: NAME|DIR|SRC_FILE|REQ|CP|LEVEL_NUM|DEPS_CSV
 #
-#    扫描策略（修复 v1 版的 7 个 bug）：
-#      - 从宏第一个参数取模块名，不再用目录 basename（callcenter 下有 agent_pool + queue）
-#      - 每个 .c 文件可含多个 NSBC_MOD/NSBC_MOD0 宏（循环捕获所有）
-#      - deps 提取用 awk 跨行拼接，支持多行宏（signaling 用 \ 续行）
-#      - NSBC_MOD 和 NSBC_MOD0 统一做 dep 解析（media_bug 用 NSBC_MOD0 但带 deps）
-#      - 支持内联 deps 数组 (const char *[]){ "xxx", NULL }（hello 模块写法）
-#      - 扫描范围 src/**/*.c，覆盖 src/media/bridge/hep_sink.c 等非 src/mod 路径
+#    scan strategy (fixes 7 bugs from v1):
+#      - extract module name from first macro argument, no longer using directory basename (callcenter has agent_pool + queue)
+#      - each .c file can contain multiple NSBC_MOD/NSBC_MOD0 macros (loop to capture all)
+#      - deps extraction uses awk cross-line concatenation, supports multi-line macros (signaling uses \ continuation)
+#      - NSBC_MOD and NSBC_MOD0 uniformly do dep parsing (media_bug uses NSBC_MOD0 but has deps)
+#      - supports inline deps arrays (const char *[]){ "xxx", NULL } (hello module style)
+#      - scan scope src/**/*.c, covers non-src/mod paths like src/media/bridge/hep_sink.c
 # =====================================================================
 
 # ---------------------------------------------------------------------
-# scan_file：解析单个 .c 文件里的所有 NSBC_MOD / NSBC_MOD0 宏
-# 参数：$1 = .c 文件路径（相对项目根）
-# 输出（每行一个模块）：NAME|DIR|SRC_FILE|REQ|CP|LEVEL_NUM|DEPS_CSV
+# scan_file: parse all NSBC_MOD / NSBC_MOD0 macros in a single .c file
+# params: $1 = .c file path (relative to project root)
+# output (one module per line): NAME|DIR|SRC_FILE|REQ|CP|LEVEL_NUM|DEPS_CSV
 # ---------------------------------------------------------------------
 scan_file() {
     local src_file="$1"
@@ -77,23 +77,23 @@ scan_file() {
     mod_dir=$(dirname "$src_file")
 
     # -----------------------------------------------------------------
-    # 单次 awk pass 完成两件事：
-    #   1) 扫遍文件，把所有 xxx[] = { "yyy", NULL } 命名数组存进 deps_map[var] = "yyy,zzz"
-    #   2) 跨行拼接 NSBC_MOD / NSBC_MOD0 宏，解析模块元数据，deps_var 去 deps_map 查
-    # 输出：每行一个模块  NAME|DIR|SRC_FILE|REQ|CP|LEVEL_NUM|DEPS_CSV
+    # single awk pass does two things:
+    #   1) scan whole file, store all xxx[] = { "yyy", NULL } named arrays into deps_map[var] = "yyy,zzz"
+    #   2) cross-line concatenate NSBC_MOD / NSBC_MOD0 macros, parse module metadata, deps_var looks up in deps_map
+    # output: one module per line  NAME|DIR|SRC_FILE|REQ|CP|LEVEL_NUM|DEPS_CSV
     # -----------------------------------------------------------------
     awk -v src="$src_file" -v dir="$mod_dir" '
-    # ===== 第一阶段：扫命名 deps 数组定义 =====
+    # ===== phase 1: scan named deps array definitions =====
     /\[\][[:space:]]*=/ && match($0, /[a-zA-Z_][a-zA-Z0-9_]*\[\][[:space:]]*=/) {
         line = $0
-        # 提取变量名（剥掉 const char * 等前缀）
+        # extract variable name (strip const char * etc. prefixes)
         sub(/^[[:space:]]*/, "", line)
         sub(/\[\].*/, "", line)
         sub(/^(const[[:space:]]+)?char[[:space:]]*\*[[:space:]]*/, "", line)
         cur_dvar = line
         in_darr = 1
         darr_buf = ""
-        # 同行内找 { 之后的内容
+        # find content after { on same line
         idx = index($0, "{")
         if (idx > 0) darr_buf = substr($0, idx + 1)
         next
@@ -102,7 +102,7 @@ scan_file() {
         darr_buf = darr_buf " " $0
         if (match($0, /\}/)) {
             in_darr = 0
-            # 从 darr_buf 里抓所有 "xxx"
+            # extract all "xxx" from darr_buf
             csv = ""
             while (match(darr_buf, /"[^"]*"/)) {
                 s = substr(darr_buf, RSTART + 1, RLENGTH - 2)
@@ -117,10 +117,10 @@ scan_file() {
         next
     }
 
-    # ===== 第二阶段：扫 NSBC_MOD / NSBC_MOD0 宏 =====
+    # ===== phase 2: scan NSBC_MOD / NSBC_MOD0 macros =====
     {
         line = $0
-        sub(/\\$/, "", line)          # 吃掉末尾 \ 续行符
+        sub(/\\$/, "", line)          # strip trailing \ continuation
 
         if (!in_macro) {
             if (match(line, /NSBC_MOD0?(_CAT)?\(/)) {
@@ -158,13 +158,13 @@ scan_file() {
                            name, level_num, has_req, has_cp, deps_csv,
                            n, parts, lv, deps_arg, arr_text, inner,
                            is_cat, deps_idx) {
-        # 判断是不是 NSBC_MOD_CAT / NSBC_MOD0_CAT —— 剥宏头之前先判断
+        # check if NSBC_MOD_CAT / NSBC_MOD0_CAT — check before stripping macro header
         is_cat = 0
         if (index(full, "NSBC_MOD_CAT(") > 0 || index(full, "NSBC_MOD0_CAT(") > 0) {
             is_cat = 1
         }
 
-        # 剥掉 ); 后缀 + 宏头
+        # strip ); suffix + macro header
         sub(/\);?[[:space:]]*$/, "", full)
         sub(/^NSBC_MOD0?(_CAT)?\(/, "", full)
 
@@ -187,13 +187,13 @@ scan_file() {
         has_req = index(full, "MOD_F_REQUIRED") > 0 ? 1 : 0
         has_cp  = index(full, "MOD_F_CALL_PATH") > 0 ? 1 : 0
 
-        # deps —— NSBC_MOD(0) 是 parts[5]，NSBC_MOD(0)_CAT 多了 cat 参数在 parts[5]，deps 位移到 parts[6]
+        # deps —— NSBC_MOD(0) is parts[5], NSBC_MOD(0)_CAT has extra cat param in parts[5], deps shifts to parts[6]
         deps_csv = ""
         deps_idx = is_cat ? 6 : 5
         if (n >= deps_idx) {
             deps_arg = strip(parts[deps_idx])
             if (index(deps_arg, "{") > 0) {
-                # 内联数组：剥掉 { 之前的 (const char *[]) 前缀
+                # inline array: strip (const char *[]) prefix before {
                 arr_text = deps_arg
                 sub(/^[^}]*\{/, "{", arr_text)
                 while (match(arr_text, /"[^"]*"/)) {
@@ -204,7 +204,7 @@ scan_file() {
                     arr_text = substr(arr_text, RSTART + RLENGTH)
                 }
             } else if (deps_arg != "NULL" && deps_arg != "" && deps_arg in deps_map) {
-                # 命名数组 — 第一阶段已扫到
+                # named array — scanned in phase 1
                 deps_csv = deps_map[deps_arg]
             }
         }
@@ -242,10 +242,10 @@ scan_file() {
 }
 
 # =====================================================================
-# 全量扫描 src/**/*.c（排除 3rd / tests / 生成文件）
+# full scan src/**/*.c (exclude 3rd / tests / generated files)
 # =====================================================================
 
-# 扫描所有源文件 —— while read 放在当前 shell（不是管道 subshell）里才能调用 scan_file 函数
+# scan all source files — while read must be in current shell (not pipeline subshell) to call scan_file
 find src -name '*.c' -type f \
     ! -path 'src/core/stub_mods.c' \
     | sort > "$TMP/srcfiles.txt"
@@ -256,15 +256,15 @@ while IFS= read -r f; do
 done < "$TMP/srcfiles.txt"
 
 # ---------------------------------------------------------------------
-# 去重（按模块名，保留第一次扫描到的）
+# dedup (by module name, keep first scanned)
 # ---------------------------------------------------------------------
 if [ -s "$MODS_DB" ]; then
     awk -F'|' '!seen[$1]++' "$MODS_DB" > "$TMP/mods_dedup.db"
     mv "$TMP/mods_dedup.db" "$MODS_DB"
 fi
 
-# ========== 硬注入关键模块（防止 scan_file 正则漏扫）==========
-# 格式: NAME|DIR|SRC_FILE|REQ|CP|LEVEL_NUM|DEPS_CSV
+# ========== hard-inject critical modules (guard against scan_file regex misses) ==========
+# format: NAME|DIR|SRC_FILE|REQ|CP|LEVEL_NUM|DEPS_CSV
 # req=1 REQUIRED, cp=1 CALL_PATH, level 0=EARLY 2=NET_READY 3=WORKER_READY 4=FINAL
 HARD_INJECT_LINES="oam|src/oam|src/oam/oam_module.c|1|0|4|signaling
 security|src/mod/security|src/mod/security/security.c|1|0|4|oam,signaling
@@ -280,12 +280,12 @@ done
 # ================================================================
 
 if [ ! -s "$MODS_DB" ]; then
-    echo "ERROR: 没找到任何模块定义（NSBC_MOD/NSBC_MOD0）" >&2
+    echo "ERROR: no module definitions found (NSBC_MOD/NSBC_MOD0)" >&2
     exit 1
 fi
 
 # =====================================================================
-# 2. 读 modules.conf（白名单/黑名单）
+# 2. read modules.conf (whitelist / blacklist)
 # =====================================================================
 
 ENABLE_LIST=""
@@ -295,7 +295,7 @@ REQUIRED_LIST=$(awk -F'|' '$4==1 {print $1}' "$MODS_DB")
 if [ -f "$MODS_CONF" ]; then
     in_autoload=0
     while IFS= read -r raw; do
-        # 去掉 ; 及之后的行内注释、末尾空白
+        # strip inline comments starting with ; and trailing whitespace
         line=$(echo "$raw" | sed 's/;.*$//' | sed 's/[[:space:]]*$//')
         [ -z "$line" ] && continue
         case "$line" in \#*) continue ;; esac
@@ -313,10 +313,10 @@ if [ -f "$MODS_CONF" ]; then
         esac
     done < "$MODS_CONF"
 else
-    echo "WARN: $MODS_CONF 不存在 → 命令行覆盖或默认（全 enable）"
+    echo "WARN: $MODS_CONF not found -> command-line override or default (all enabled)"
 fi
 
-# 命令行覆盖
+# command-line overrides
 if [ -n "$WITH_MODS" ]; then
     ENABLE_LIST=$(echo "$WITH_MODS" | tr ',' ' ')
 fi
@@ -327,14 +327,14 @@ if [ -n "$WITHOUT_MODS" ]; then
 fi
 
 # =====================================================================
-# 3. 算 FINAL_ENABLED + 分 STATIC/DYNAMIC
+# 3. compute FINAL_ENABLED + split STATIC/DYNAMIC
 # =====================================================================
 
 FINAL_ENABLED=""
 has_whitelist=0
 [ -n "$ENABLE_LIST" ] && has_whitelist=1
 
-# 判集合成员
+# set membership test
 in_list() {
     case " $2 " in *" $1 "*) return 0 ;; esac
     return 1
@@ -343,26 +343,26 @@ in_list() {
 ALL_SCANNED=$(awk -F'|' '{print $1}' "$MODS_DB")
 
 if [ "$has_whitelist" -eq 1 ]; then
-    # 白名单模式：REQUIRED 强制进；enable 里的进；但 disable 里的不能和 enable 矛盾
+    # whitelist mode: REQUIRED forced in; enable items in; but disable items must not conflict with enable
     for name in $REQUIRED_LIST; do
         FINAL_ENABLED="$FINAL_ENABLED $name"
     done
     for name in $ENABLE_LIST; do
         in_list "$name" "$DISABLE_LIST" && {
-            echo "ERROR: '$name' 同时出现在 enable 和 disable — 矛盾" >&2; exit 1;
+            echo "ERROR: '$name' appears in both enable and disable — conflict" >&2; exit 1;
         }
         grep -q "^${name}|" "$MODS_DB" || {
-            echo "WARN: enable '$name' 没在 src/**/*.c 里找到 — 忽略（可能拼错）" >&2
+            echo "WARN: enable '$name' not found in src/**/*.c — ignoring (possibly typo)" >&2
             continue
         }
         in_list "$name" "$FINAL_ENABLED" || FINAL_ENABLED="$FINAL_ENABLED $name"
     done
 else
-    # 黑名单模式：扫描到的都 enable，除了 disable 里的
+    # blacklist mode: all scanned modules enabled, except those in disable
     for name in $ALL_SCANNED; do
         in_list "$name" "$DISABLE_LIST" && {
             in_list "$name" "$REQUIRED_LIST" && {
-                echo "ERROR: 禁止 disable REQUIRED 模块 '$name'" >&2; exit 1;
+                echo "ERROR: REQUIRED module '$name' cannot be disabled" >&2; exit 1;
             }
             continue
         }
@@ -370,8 +370,8 @@ else
     done
 fi
 
-# 分 STATIC（REQUIRED 或 CALL_PATH 或 EARLY）/ DYNAMIC（其它 FINAL_ENABLED）
-# EARLY 强制进 STATIC：dlopen 依赖 mem/rcu 基础设施，EARLY 时还没初始化完
+# split STATIC (REQUIRED or CALL_PATH or EARLY) / DYNAMIC (other FINAL_ENABLED)
+# EARLY forced into STATIC: dlopen depends on mem/rcu infrastructure not yet initialized at EARLY stage
 STATIC_MODS=""
 DYNAMIC_MODS=""
 while IFS='|' read -r name dir src_file req cp lvl deps_csv; do
@@ -383,17 +383,17 @@ while IFS='|' read -r name dir src_file req cp lvl deps_csv; do
     fi
 done < "$MODS_DB"
 
-# ---- 硬编码强制提升：主二进制硬依赖的模块 ----
+# ---- hardcoded forced promotion: modules that the main binary hard-depends on ----
 # src/core/signaling.c / stub_mods.c / src/oam/obs_control.c / src/sip/b2bua.c
-# 里直接调 dp_*/rt_*/recording_*/bill_*/outreg_*/app_* 等函数。
-# 这些模块如果在 DYNAMIC 组 → STATIC 链接时缺符号 → undefined reference。
-# 架构上就是这样——不硬编码这些就会链接挂。
-# ha：b2bua.c 直接调 ha_role() 做主备信令门控，且 src/ha/*.c 本就经
-# SRCS_CORE 编进主二进制——若落 DYNAMIC 会 .so/主二进制双份状态，
-# 门控读到的是主二进制里的 NULL g_ha，永远 ACTIVE，形同虚设。
-# security：b2bua.c 三接入点（INVITE/REGISTER guard 之外/OPTIONS）直接调
-# security_blacklist_check() 静默拦截——必须 STATIC 才能链接进主二进制。
-HARD_STATIC="oam dialplan outreg recording billing applications media_bug ha security"
+# directly call dp_*/rt_*/recording_*/bill_*/outreg_*/app_* etc. functions.
+# if these modules end up in DYNAMIC group -> STATIC link misses symbols -> undefined reference.
+# architecture is like this — without hardcoding these, linking fails.
+# ha: b2bua.c directly calls ha_role() for primary/standby signaling gating, and src/ha/*.c is already
+# compiled into main binary via SRCS_CORE — if it falls to DYNAMIC, .so/main binary would have duplicate state,
+# gating reads NULL g_ha from main binary, always ACTIVE, effectively useless.
+# security: b2bua.c has three access points (besides INVITE/REGISTER guard and OPTIONS) directly calling
+# security_blacklist_check() for silent interception — must be STATIC to link into main binary.
+HARD_STATIC="oam dialplan outreg recording billing applications media_bug ha security playback"
 for m in $HARD_STATIC; do
     if in_list "$m" "$DYNAMIC_MODS"; then
         STATIC_MODS="$STATIC_MODS $m"
@@ -403,11 +403,11 @@ for m in $HARD_STATIC; do
 done
 
 # =====================================================================
-# 4. 依赖校验
-#    规则：
-#      - enabled 模块的 deps 必须也 enabled（不能 disabled）
-#      - STATIC 模块的 deps 不能是 DYNAMIC（STATIC 先 init，DYNAMIC 还没 dlopen → NULL ptr）
-#      - DYNAMIC 模块的 deps 可以是 STATIC 或 DYNAMIC（STATIC 先 init，DYNAMIC 后 dlopen）
+# 4. dependency validation
+#    rules:
+#      - deps of enabled modules must also be enabled (cannot be disabled)
+#      - deps of STATIC modules cannot be DYNAMIC (STATIC inits first, DYNAMIC not yet dlopen'd -> NULL ptr)
+#      - deps of DYNAMIC modules can be STATIC or DYNAMIC (STATIC inits first, DYNAMIC dlopen'd later)
 # =====================================================================
 
 is_static() { case " $STATIC_MODS " in *" $1 "*) return 0 ;; esac; return 1; }
@@ -424,20 +424,20 @@ while IFS='|' read -r name dir src_file req cp lvl deps_csv; do
             exit 1
         }
         if [ "$owner_static" -eq 1 ] && is_dynamic "$dep"; then
-            echo "ERROR: STATIC module '$name' depends on DYNAMIC module '$dep' — STATIC 先 init 时 DYNAMIC 还没 dlopen" >&2
-            echo "       解决：把 '$dep' 也设为 REQUIRED/CALL_PATH/EARLY 让它进 STATIC" >&2
+            echo "ERROR: STATIC module '$name' depends on DYNAMIC module '$dep' — STATIC inits first, DYNAMIC not yet dlopen'd" >&2
+            echo "       fix: make '$dep' also REQUIRED/CALL_PATH/EARLY so it goes STATIC" >&2
             exit 1
         fi
     done
 done < "$MODS_DB"
 
 # =====================================================================
-# 4.5 外部依赖 pkg-config 检测
+# 4.5 external dependency pkg-config detection
 # =====================================================================
 
-# ---- SQLite（Phase E-04: cdr_wal sqlite3 WAL backend）----
-# 比文本 WAL 强：PRAGMA journal_mode=WAL + 持久化 committed 字段 + SELECT replay
-# 找不到 sqlite3 时自动降级文本 WAL（CRC+batch+replay truncate）
+# ---- SQLite (Phase E-04: cdr_wal sqlite3 WAL backend) ----
+# stronger than text WAL: PRAGMA journal_mode=WAL + persisted committed field + SELECT replay
+# auto-falls back to text WAL when sqlite3 not found (CRC+batch+replay truncate)
 HAVE_SQLITE3=0
 SQLITE_CPPFLAGS=""
 SQLITE_LDLIBS=""
@@ -452,7 +452,7 @@ else
     echo "    install: apt-get install libsqlite3-dev" >&2
 fi
 
-# ---- FFmpeg（mod_av 商业 codec 统一后端）----
+# ---- FFmpeg (mod_av commercial codec unified backend) ----
 HAVE_FFMPEG=0
 AV_CPPFLAGS=""
 AV_LDLIBS=""
@@ -467,7 +467,7 @@ else
 fi
 
 # =====================================================================
-# 5. 生成构建产物
+# 5. generate build artifacts
 # =====================================================================
 
 mkdir -p build build/mod src/core
@@ -479,24 +479,24 @@ mkdir -p build build/mod src/core
     echo "# Prefix    : $PREFIX"
     echo "# Modules conf: $MODS_CONF"
     echo ""
-    echo "# ---- Static modules (REQUIRED or CALL_PATH or EARLY) — 链接进 nsbcd ----"
+    echo "# ---- Static modules (REQUIRED or CALL_PATH or EARLY) — linked into nsbcd ----"
     printf "STATIC_MODS ="
     for m in $(echo "$STATIC_MODS" | tr ' ' '\n' | sort); do printf ' %s' "$m"; done
     echo ""
-    echo "# ---- Dynamic modules (非 REQUIRED/CALL_PATH/EARLY) — 编 .so ----"
+    echo "# ---- Dynamic modules (non REQUIRED/CALL_PATH/EARLY) — built as .so ----"
     printf "DYNAMIC_MODS ="
     for m in $(echo "$DYNAMIC_MODS" | tr ' ' '\n' | sort); do printf ' %s' "$m"; done
     echo ""
     echo ""
 
-    # STATIC_MOD_SRCS：每个 STATIC 模块的 find
-    # dir 优先从 MODS_DB 扫描结果取；查不到时用硬编码 fallback（关键模块兜底）
+    # STATIC_MOD_SRCS: find for each STATIC module
+    # dir preferentially from MODS_DB scan; fall back to hardcoded when not found (critical modules safety net)
     echo "STATIC_MOD_SRCS = \\"
     first=1
     for name in $(echo "$STATIC_MODS" | tr ' ' '\n' | sort); do
         dir=$(awk -F'|' -v n="$name" '$1==n {print $2; exit}' "$MODS_DB")
         if [ -z "$dir" ]; then
-            # 硬编码兜底：关键模块扫描不到也能编
+            # hardcoded fallback: critical modules can still build even if scan missed
             case "$name" in
                 oam)         dir="src/oam" ;;
                 ha)          dir="src/ha" ;;
@@ -524,27 +524,33 @@ mkdir -p build build/mod src/core
             echo "$s \\"
         fi
     done
-    # recording 模块额外补上 src/media/rec（实现分散在那里）
+    # recording module additionally includes src/media/rec (implementation spread there)
     if grep -q "^recording|" "$MODS_DB"; then
         if in_list "recording" "$STATIC_MODS"; then
             echo "  \$(shell find src/media/rec -name '*.c') \\"
         fi
     fi
+    # playback module additionally includes src/media/play (WAV player core: player.c)
+    if grep -q "^playback|" "$MODS_DB"; then
+        if in_list "playback" "$STATIC_MODS"; then
+            echo "  \$(shell find src/media/play -name '*.c') \\"
+        fi
+    fi
 
-    # DYNAMIC_MOD_SRCS：只给 mod_%.so 规则用
+    # DYNAMIC_MOD_SRCS: only for mod_%.so rule
     echo ""
-    echo "# ---- Dynamic modules per-module src (供 mod_%.so 规则用) ----"
+    echo "# ---- Dynamic modules per-module src (for mod_%.so rule) ----"
     while IFS='|' read -r name dir src_file req cp lvl deps_csv; do
         in_list "$name" "$DYNAMIC_MODS" || continue
         echo "MOD_SRC_${name} = \$(shell find $dir -name '*.c')"
     done < "$MODS_DB"
-    # recording 特例：src/mod/recording + src/media/rec 都要编进去
+    # recording special case: src/mod/recording + src/media/rec must both be built in
     in_list "recording" "$DYNAMIC_MODS" && echo "MOD_SRC_recording = \$(shell find src/mod/recording src/media/rec -name '*.c')"
-    # ai_dialog 特例：还依赖 src/mod/codecs/g711_codec.c（mock 编解码）
+    # ai_dialog special case: also depends on src/mod/codecs/g711_codec.c (mock encode/decode)
     in_list "ai_dialog" "$DYNAMIC_MODS" && echo "MOD_SRC_ai_dialog = \$(shell find src/mod/ai_dialog -name '*.c'; find src/mod/codecs -name 'g711_codec.c')"
-    # codecs 特例：真实 codec 实现 + vendored bcg729
+    # codecs special case: real codec impl + vendored bcg729
     in_list "codecs" "$DYNAMIC_MODS" && echo "MOD_SRC_codecs = \$(shell find src/mod/codecs -name '*.c'; find 3rd/bcg729/src -name '*.c')"
-    # playback 特例：依赖 src/media/play/player.c（WAV 播放器内核）
+    # playback special case: depends on src/media/play/player.c (WAV player core)
     in_list "playback" "$DYNAMIC_MODS" && echo "MOD_SRC_playback = \$(shell find src/mod/playback -name '*.c'; find src/media/play -name '*.c')"
 
     echo ""
@@ -564,14 +570,14 @@ mkdir -p build build/mod src/core
         echo "CPPFLAGS += -DHAVE_FFMPEG $AV_CPPFLAGS"
         echo "AV_LDLIBS = $AV_LDLIBS"
     else
-        echo "# FFmpeg not found — mod_av stub mode (ops->init=NULL → transcode_open returns NOTSUP)"
+        echo "# FFmpeg not found — mod_av stub mode (ops->init=NULL -> transcode_open returns NOTSUP)"
         echo "# install: apt-get install libavcodec-dev libavutil-dev libswresample-dev libswscale-dev"
         echo "# then re-run configure"
         echo "AV_LDLIBS = "
     fi
 
     echo ""
-    echo "# ---- CPPFLAGS：WITH_DLOPEN + HAVE_MOD_xxx 宏 ----"
+    echo "# ---- CPPFLAGS: WITH_DLOPEN + HAVE_MOD_xxx macros ----"
     echo "CPPFLAGS += -DNSBC_WITH_DLOPEN=1"
     mod_flags=""
     for name in $(echo "$FINAL_ENABLED" | tr ' ' '\n' | sort); do
@@ -580,9 +586,9 @@ mkdir -p build build/mod src/core
     [ -n "$mod_flags" ] && echo "CPPFLAGS +=$mod_flags"
 
     echo ""
-    echo "# ---- Post-build：把 build/mod 复制到项目根（nsbcd 同目录）----"
-    echo "# nsbcd 启动时 exe_dir/mod/mod.load → dlopen exe_dir/mod/mod_xxx.so"
-    echo "# install 时 PREFIX/sbin/nsbcd → PREFIX/lib/nsbc/ 另行处理（不依赖这里）"
+    echo "# ---- Post-build: copy build/mod to project root (nsbcd same directory) ----"
+    echo "# nsbcd startup: exe_dir/mod/mod.load -> dlopen exe_dir/mod/mod_xxx.so"
+    echo "# install-time PREFIX/sbin/nsbcd -> PREFIX/lib/nsbc/ handled separately (does not depend on this)"
     if [ -n "$DYNAMIC_MODS" ]; then
         echo "POST_BUILD_COPY = rm -rf ./mod && cp -a build/mod ./mod"
     else
@@ -593,9 +599,9 @@ mkdir -p build build/mod src/core
 echo "  ✓ $CONFIG_DIR/config.mk ($(wc -l < "$CONFIG_DIR/config.mk") lines)" >&2
 
 # ---- src/core/builtin_modules.gen.inc ----
-# STATIC 组按 level_num 升序 + name 字母序排
-# 注：`awk "$MODS_DB"` 如果 MODS_DB 丢失（set -e 下 exit 2），会导致脚本静默停在
-# 这里——config.mk 已经写完但 builtin 文件没生成。加 || { echo 报错; exit 1; } 显式报错。
+# STATIC group ordered by level_num ascending + name alphabetical
+# note: `awk "$MODS_DB"` when MODS_DB is missing (exit 2 under set -e) would cause script to silently stall here —
+# config.mk already written but builtin file not generated. Add || { echo error; exit 1; } for explicit error.
 if [ ! -s "$MODS_DB" ]; then
     echo "ERROR: MODS_DB=$MODS_DB missing or empty before builtin generation" >&2
     exit 1
@@ -628,14 +634,14 @@ STATIC_ORDERED=$(awk -F'|' -v enabled="$STATIC_MODS" '
 } > src/core/builtin_modules.gen.inc
 echo "  ✓ src/core/builtin_modules.gen.inc ($(wc -l < src/core/builtin_modules.gen.inc) lines, STATIC=$(echo "$STATIC_ORDERED" | tr '\n' ' '))" >&2
 
-# ---- build/mod/mod.load ---- 动态模块 .so 路径列表（每行一条）
-# 关键：mod.load 必须和 .so 放同一目录，modmgr_load_all 用 dirname(list_path) 作为 dlopen base dir
-# 这样 nsbcd 从 exe_dir/mod/mod.load 读 → dlopen exe_dir/mod/mod_xxx.so —— 不管从哪 cd 都能加载
+# ---- build/mod/mod.load ---- dynamic module .so path list (one per line)
+# key: mod.load must be in same directory as .so; modmgr_load_all uses dirname(list_path) as dlopen base dir
+# so nsbcd reads from exe_dir/mod/mod.load -> dlopen exe_dir/mod/mod_xxx.so — works regardless of cwd
 mkdir -p build/mod
 if [ -n "$DYNAMIC_MODS" ]; then
     : > build/mod/mod.load
     for name in $(echo "$DYNAMIC_MODS" | tr ' ' '\n' | sort); do
-        # 只存纯文件名 —— install 后 /etc/nsbc/mod/mod.load 同样工作
+        # only store bare filename — works the same after install at /etc/nsbc/mod/mod.load
         echo "mod_${name}.so" >> build/mod/mod.load
     done
 else
@@ -643,7 +649,7 @@ else
 fi
 
 # =====================================================================
-# 6. 打印摘要
+# 6. print summary
 # =====================================================================
 
 n_static=$(echo "$STATIC_MODS" | tr ' ' '\n' | sed '/^$/d' | wc -l)

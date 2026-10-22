@@ -1,5 +1,5 @@
-//! SIP 传输 Profile REST。6 端点：list/get/create/update/delete/reload。
-//! 对应 C 侧 src/include/sip_profile.h sip_profile_t。
+//! SIP transport Profile REST. Six endpoints: list/get/create/update/delete/reload.
+//! Corresponds to the C-side src/include/sip_profile.h sip_profile_t.
 
 use std::sync::Arc;
 

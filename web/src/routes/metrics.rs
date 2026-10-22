@@ -1,5 +1,6 @@
-//! 仪表盘指标（REQ-WEB-004/015）：透传核心 `stats` 的 Prometheus 指标
-//! 为只读 JSON（L0）。权威计数仍以 /calls、/registrations 专用命令为准。
+//! Dashboard metrics (REQ-WEB-004/015): pass-through of the core's `stats` Prometheus
+//! metrics as read-only JSON (L0). For authoritative counts use the dedicated /calls and
+//! /registrations commands.
 use std::sync::Arc;
 
 use axum::extract::State;

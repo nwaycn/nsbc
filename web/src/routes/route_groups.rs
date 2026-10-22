@@ -1,5 +1,6 @@
-//! 路由策略组 REST（REQ-WEB-016）。6 端点：list/get/create/update/delete/reload。
-//! 模块名 route_groups（避免与 axum::routing 子模块重名），URL 路径仍为 `/routes`。
+//! Route strategy group REST (REQ-WEB-016). Six endpoints: list/get/create/update/delete/reload.
+//! Module name route_groups (avoid name collision with axum::routing submodule);
+//! URL paths remain at `/routes`.
 
 use std::sync::Arc;
 

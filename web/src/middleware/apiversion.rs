@@ -1,8 +1,8 @@
-//! API 契约与版本发现（REQ-WEB-020）。
+﻿//! API contract and version discovery (REQ-WEB-020).
 //!
-//! 所有 /api 调用必须显式携带 `X-NSBC-API-Version: <major>`；
-//! 缺失或主版本不匹配一律 fail-closed（400），不做"猜测最新"。
-//! 版本暴露方式与核心 REST（/api/v1/）及实时控制接口统一。
+//! All /api calls must explicitly carry `X-NSBC-API-Version: <major>`;
+//! missing or mismatched major version -> fail-closed (400), no "guess latest".
+//! Version exposure is unified with core REST (/api/v1/) and real-time control interfaces.
 
 use axum::extract::Request;
 use axum::http::header::HeaderName;
@@ -44,7 +44,7 @@ pub async fn enforce(req: Request, next: Next) -> Result<Response, ApiError> {
     Ok(next.run(req).await)
 }
 
-/// "1" / "1.2" / "v1" 均取主版本号；非法（"latest"、空、非数字）→ None。
+/// "1" / "1.2" / "v1" all yield the major version; invalid ("latest", empty, non-numeric) -> None.
 fn parse_major(v: &str) -> Option<u32> {
     let v = v.strip_prefix('v').unwrap_or(v);
     v.split(['.', '-']).next()?.parse::<u32>().ok()

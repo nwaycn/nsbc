@@ -326,7 +326,7 @@ int dtls_server_set_peer_fp(dtls_server_t *d, const char *fp)
     if (!fp || !fp[0]) {
         d->cfg.peer_fp_sha256[0] = '\0';
         __atomic_thread_fence(__ATOMIC_RELEASE); /* 信令线程写 → reactor 线程读 */
-        llog(LOG_DEBUG, "dtls", "peer_fp_sha256 cleared fd=%d (宽松模式)", d->fd);
+        llog(LOG_DEBUG, "dtls", "peer_fp_sha256 cleared fd=%d (relaxed mode)", d->fd);
         return NSBC_OK;
     }
     size_t n = strlen(fp);
@@ -351,7 +351,7 @@ static int dtls_verify_peer_fp(dtls_server_t *d)
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
 
     if (!d->cfg.peer_fp_sha256[0]) {
-        llog(LOG_DEBUG, "dtls", "peer_fp not set fd=%d — SKIP verification (宽松模式)",
+        llog(LOG_DEBUG, "dtls", "peer_fp not set fd=%d — SKIP verification (relaxed mode)",
              d->fd);
         return NSBC_OK;
     }

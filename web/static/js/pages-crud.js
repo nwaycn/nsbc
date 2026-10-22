@@ -1,70 +1,70 @@
-// =============================================================================
-// NSBC Web — CRUD 实体页面组件
+﻿// =============================================================================
+// NSBC Web — CRUD 实体面组件
 // 加载顺序：必须在 app-core.js 之后
 // 依赖：app-core.js 中声明的全局 const app, crudTable
 // =============================================================================
 
-// --- 租户 ---
+// --- Tenant ---
 app.component('tenants', crudTable(
-  { label: '租户（SIP Realm）', icon: 'fa-solid fa-building' },
+  { label: t('Tenant（SIP Realm）'), icon: 'fa-solid fa-building' },
   '/tenants',
   [
     { key: 'id', label: 'ID', type: 'text' },
     { key: 'tenant_name', label: 'SIP Realm', type: 'text' },
-    { key: 'enabled', label: '状态', type: 'bool' },
+    { key: 'enabled', label: t('Status'), type: 'bool' },
   ],
   [
-    { key: 'tenant_name', label: 'SIP Realm（租户名）', type: 'text',
-      help: 'SIP 认证域 / 租户唯一标识，默认 nsbc.local。呼入 INVITE 的 From 域或分机注册 realm 必须与此值一致。如 "nsbc.local"、"acme.com"' },
-    { key: 'enabled', label: '启用', type: 'bool', default: true },
-    { key: 'description', label: '备注', type: 'textarea' },
-    { key: 'match_domain', label: '呼入 From 域匹配', type: 'text',
-      placeholder: 'acme.com', help: '呼入 From 域=此值时归入本租户（可选，留空则只靠 tenant_name/realm 匹配）' },
-    { key: 'match_did_prefix', label: '呼入 DID 号段前缀', type: 'text',
-      placeholder: '+86101234', help: '呼入号码以此前缀开头时归入本租户（可选）' },
-    { key: 'match_trunk', label: '呼入中继名匹配', type: 'text',
-      placeholder: '运营商A', help: '呼入走此中继时归入本租户（可选）' },
+    { key: 'tenant_name', label: t('SIP Realm (Tenant name)'), type: 'text',
+      help: 'SIP Auth Realm / Tenant unique id, default nsbc.local。Incoming call INVITE 的 From 域或ExtensionRegister realm 必须与此Value一致。如 "nsbc.local"、"acme.com"' },
+    { key: 'enabled', label: t('Enable'), type: 'bool', default: true },
+    { key: 'description', label: t('Notes'), type: 'textarea' },
+    { key: 'match_domain', label: t('Incoming call From domain match'), type: 'text',
+      placeholder: 'acme.com', help: t('Incoming call From domain matches → tenant (optional; empty = match by tenant_name/realm only)') },
+    { key: 'match_did_prefix', label: t('Incoming call DID Number Prefix'), type: 'text',
+      placeholder: '+86101234', help: t('Incoming callNumber starts with this prefix → tenant (optional)') },
+    { key: 'match_trunk', label: t('Incoming callTrunk Name match'), type: 'text',
+      placeholder: t('Carrier A'), help: t('Incoming callCalls using this trunk → tenant (optional)') },
   ],
 ));
 
-// --- 分机 ---
+// --- Extension ---
 app.component('extensions', crudTable(
-  { label: '分机', icon: 'fa-solid fa-phone' },
+  { label: t('Extension'), icon: 'fa-solid fa-phone' },
   '/extensions',
   [
-    { key: 'tenant_id', label: '租户ID', type: 'text' },
-    { key: 'extension', label: '分机号', type: 'text' },
-    { key: 'ext_type', label: '类型', type: 'text' },
-    { key: 'full_name', label: '姓名', type: 'text' },
-    { key: 'enabled', label: '状态', type: 'bool' },
+    { key: 'tenant_id', label: t('Tenant ID'), type: 'text' },
+    { key: 'extension', label: t('Extension'), type: 'text' },
+    { key: 'ext_type', label: t('Type'), type: 'text' },
+    { key: 'full_name', label: t('Full Name'), type: 'text' },
+    { key: 'enabled', label: t('Status'), type: 'bool' },
   ],
   [
-    { key: 'tenant_id', label: '租户', type: 'async-select',
-      help: '所属租户（列表会按当前租户自动过滤）' },
-    { key: 'extension', label: '分机号', type: 'text' },
-    { key: 'ext_type', label: '类型', type: 'select',
-      options: [{value:'internal', label:'内部分机（SIP 注册）'},
-                {value:'external', label:'外部分机（经中继外呼）'}],
-      default: 'internal', help: 'external 时下面三项必填' },
-    { key: 'password', label: '密码', type: 'password', help: '外部分机不注册可留空' },
-    { key: 'full_name', label: '姓名', type: 'text' },
-    { key: 'enabled', label: '启用', type: 'bool', default: true },
-    { key: 'description', label: '备注', type: 'textarea' },
-    // 外部分机配置（ext_type=external 时有效）
-    { key: 'external_number', label: '外部号码（E.164，如 +8613800138000）', type: 'text',
-      placeholder: '+8613800138000', help: '外呼拨打的真实号码' },
-    { key: 'trunk_name', label: '出局中继', type: 'text',
-      placeholder: '运营商IMS', help: '走哪个 trunk 外呼（Web 中继管理里的名字）' },
-    { key: 'display_number', label: '主叫显示号码（Caller ID）', type: 'text',
-      placeholder: '+861012345678', help: '对端看到的来电号码（空=用 trunk 默认）' },
+    { key: 'tenant_id', label: t('Tenant'), type: 'async-select',
+      help: 'Owner tenant (list auto-filtered by current tenant)' },
+    { key: 'extension', label: t('Extension'), type: 'text' },
+    { key: 'ext_type', label: t('Type'), type: 'select',
+      options: [{value:'internal', label:t('Internal Extension (SIP Register)')},
+                {value:'external', label:t('External Extension (outbound via trunk)')}],
+      default: 'internal', help: t('Required for external') },
+    { key: 'password', label: t('Password'), type: 'password', help: t('Leave empty if external extension does not register') },
+    { key: 'full_name', label: t('Full Name'), type: 'text' },
+    { key: 'enabled', label: t('Enable'), type: 'bool', default: true },
+    { key: 'description', label: t('Notes'), type: 'textarea' },
+    // 外部ExtensionConfig（ext_type=external 时有效）
+    { key: 'external_number', label: t('External Number (E.164, e.g. +8613800138000)'), type: 'text',
+      placeholder: '+8613800138000', help: t('Real outbound number') },
+    { key: 'trunk_name', label: t('Outbound Trunk'), type: 'text',
+      placeholder: '运营商IMS', help: t('走哪个 trunk 外呼（Web Trunk管理里的名字）') },
+    { key: 'display_number', label: t('Caller显示号码（Caller ID）'), type: 'text',
+      placeholder: '+861012345678', help: t('对端看到的Incoming号码（空=用 trunk Default）') },
   ],
   // asyncLoaders：动态下拉数据源
   {
     tenant_id: async () => {
       try {
         const r = await API.get('/tenants?limit=500&offset=0');
-        const opts = (r.items || []).map(t => ({ value: t.id, label: t.tenant_name + (t.enabled ? '' : ' (禁用)') }));
-        if (!opts.length) console.warn('[tenant_id async-loader] /tenants 返回空列表——检查 DB 是否有默认租户');
+        const opts = (r.items || []).map(t => ({ value: t.id, label: t.tenant_name + (t.enabled ? '' : t(' (Disable)')) }));
+        if (!opts.length) console.warn('[tenant_id async-loader] /tenants 返回空列表——检查 DB 是否有DefaultTenant');
         return opts;
       } catch (e) {
         console.error('[tenant_id async-loader] /tenants 加载失败:', e.message || e);
@@ -74,99 +74,99 @@ app.component('extensions', crudTable(
   },
 ));
 
-// --- 网关 ---
+// --- Gateway ---
 app.component('gateways', crudTable(
-  { label: '网关', icon: 'fa-solid fa-tower-broadcast' },
+  { label: t('Gateway'), icon: 'fa-solid fa-tower-broadcast' },
   '/gateways',
   [
-    { key: 'name', label: '名称', type: 'text' },
-    { key: 'enabled', label: '状态', type: 'bool' },
-    { key: 'description', label: '备注', type: 'text' },
+    { key: 'name', label: t('Name'), type: 'text' },
+    { key: 'enabled', label: t('Status'), type: 'bool' },
+    { key: 'description', label: t('Notes'), type: 'text' },
   ],
   [
-    { key: 'name', label: '名称', type: 'text' },
-    { key: 'enabled', label: '启用', type: 'bool', default: true },
-    { key: 'description', label: '备注', type: 'textarea' },
+    { key: 'name', label: t('Name'), type: 'text' },
+    { key: 'enabled', label: t('Enable'), type: 'bool', default: true },
+    { key: 'description', label: t('Notes'), type: 'textarea' },
   ],
 ));
 
-// --- 中继 ---
+// --- Trunk ---
 app.component('trunks', crudTable(
-  { label: '中继', icon: 'fa-solid fa-signal' },
+  { label: t('Trunk'), icon: 'fa-solid fa-signal' },
   '/trunks',
   [
-    { key: 'tenant_id', label: '租户ID', type: 'text' },
-    { key: 'name', label: '名称', type: 'text' },
-    { key: 'gateway_name', label: '网关', type: 'text' },
-    { key: 'kind', label: '类型', type: 'text' },
+    { key: 'tenant_id', label: t('Tenant ID'), type: 'text' },
+    { key: 'name', label: t('Name'), type: 'text' },
+    { key: 'gateway_name', label: t('Gateway'), type: 'text' },
+    { key: 'kind', label: t('Type'), type: 'text' },
     { key: 'host', label: '主机', type: 'text' },
-    { key: 'port', label: '端口', type: 'text' },
-    { key: 'enabled', label: '状态', type: 'bool' },
+    { key: 'port', label: t('Port'), type: 'text' },
+    { key: 'enabled', label: t('Status'), type: 'bool' },
   ],
   [
-    { key: 'tenant_id', label: '租户', type: 'async-select',
-      help: '所属租户（列表会按当前租户自动过滤）' },
-    { key: 'name', label: '名称', type: 'text' },
-    { key: 'gateway_name', label: '所属网关', type: 'async-select',
-      help: '从「网关」页面配置的组（可留空，表示该中继不属任何组）' },
+    { key: 'tenant_id', label: t('Tenant'), type: 'async-select',
+      help: 'Owner tenant (list auto-filtered by current tenant)' },
+    { key: 'name', label: t('Name'), type: 'text' },
+    { key: 'gateway_name', label: t('所属Gateway'), type: 'async-select',
+      help: '从「Gateway」面Config的组（可留空，表示该Trunk不属任何组）' },
     { key: 'profile_name', label: 'SIP Profile', type: 'async-select', default: 'external',
-      help: '从「SIP Profile」页面配置（internal=默认, external=公网, local=回环）' },
-    { key: 'kind', label: '中继类型', type: 'select', options: [
+      help: '从「SIP Profile」面Config（internal=Default, external=公网, local=回环）' },
+    { key: 'kind', label: t('TrunkType'), type: 'select', options: [
       { value: 'static_peer', label: 'static_peer (静态对端)' },
-      { value: 'register',    label: 'register (注册型)' },
+      { value: 'register',    label: t('register (Register型)') },
       { value: 'auth_out',    label: 'auth_out (出局鉴权)' },
     ]},
     { key: 'proto', label: '协议', type: 'select', options: [
       { value: 0, label: 'UDP (0)' }, { value: 1, label: 'TCP (1)' }, { value: 2, label: 'TLS (2)' },
     ]},
     { key: 'host', label: '主机地址', type: 'text' },
-    { key: 'port', label: '端口', type: 'number', default: 5060 },
+    { key: 'port', label: t('Port'), type: 'number', default: 5060 },
     { key: 'auth_user', label: '鉴权用户名', type: 'text' },
-    { key: 'password', label: '鉴权密码', type: 'text', editor: 'password' },
+    { key: 'password', label: t('鉴权Password'), type: 'text', editor: 'password' },
     { key: 'realm', label: 'Realm', type: 'text' },
     { key: 'codec_set', label: '可用编码（逗号分隔）', type: 'text',
       default: 'PCMA,PCMU' },
-    { key: 'weight', label: '权重', type: 'number', default: 10 },
-    { key: 'priority', label: '优先级', type: 'number', default: 1 },
-    { key: 'max_channels', label: '最大并发（硬性天花板）', type: 'number', default: 0 },
+    { key: 'weight', label: t('Weight'), type: 'number', default: 10 },
+    { key: 'priority', label: t('Priority'), type: 'number', default: 1 },
+    { key: 'max_channels', label: t('最大并发（硬性d花板）'), type: 'number', default: 0 },
     { key: 'per_number_max_channels', label: '单号码最大并发', type: 'number', default: 0 },
     { key: 'caller_id_pool', label: '号码池（逗号分隔）', type: 'textarea',
       placeholder: '8613800000000,8613800000001,8613800000002' },
-    { key: 'enabled', label: '启用', type: 'bool', default: true },
-    { key: 'description', label: '备注', type: 'textarea' },
+    { key: 'enabled', label: t('Enable'), type: 'bool', default: true },
+    { key: 'description', label: t('Notes'), type: 'textarea' },
     { key: 'from_user', label: '[FS] From User（空=auth_user）', type: 'text', default: '' },
     { key: 'from_domain', label: 'From Domain（空=走回退链 realm→proxy→host）', type: 'text', default: '' },
     { key: 'proxy', label: '出局代理（空=同 host）', type: 'text', default: '' },
-    { key: 'register_proxy', label: '注册专用代理（空=同 proxy）', type: 'text', default: '' },
-    { key: 'expire_seconds', label: '注册过期时间（秒）', type: 'number', default: 3600 },
-    { key: 'retry_seconds', label: '退避基数（秒，0=FS 语义不重试）', type: 'number', default: 5 },
+    { key: 'register_proxy', label: t('Register专用代理（空=同 proxy）'), type: 'text', default: '' },
+    { key: 'expire_seconds', label: t('RegisterExpires（s）'), type: 'number', default: 3600 },
+    { key: 'retry_seconds', label: t('退避基数（s，0=FS 语义不重试）'), type: 'number', default: 5 },
     { key: 'caller_id_in_from', label: 'caller_id_in_from（=1 只替换 From user part）', type: 'bool', default: false },
-    { key: 'contact_params', label: 'Contact 额外参数（如 transport=udp）', type: 'text', default: '' },
+    { key: 'contact_params', label: t('Contact 额外Parameters（如 transport=udp）'), type: 'text', default: '' },
     { key: 'extension_in_contact', label: 'extension_in_contact（=1 把 inbound_extension 放入 Contact）', type: 'bool', default: false },
     { key: 'ping_seconds', label: 'OPTIONS 健康探测间隔（0=关闭）', type: 'number', default: 0 },
-    { key: 'inbound_extension', label: '入站 DID 映射目标（如 2001）', type: 'text', default: '' },
-    { key: 'cid_type', label: 'CID 类型（预留 rpid 等）', type: 'text', default: '' },
+    { key: 'inbound_extension', label: t('入站 DID 映射Target（如 2001）'), type: 'text', default: '' },
+    { key: 'cid_type', label: t('CID Type（预留 rpid 等）'), type: 'text', default: '' },
     { key: 'rfc5626_enabled', label: 'RFC 5626 Outbound（预留）', type: 'bool', default: false },
     { key: 'reg_id', label: 'reg-id（RFC 5626 预留）', type: 'text', default: '' },
     { key: 'peer_ip', label: 'peer_ip 白名单（CIDR 逗号分隔，auth_out 用）', type: 'textarea', default: '' },
-    { key: 'ims_enabled', label: '运营商 IMS 中继（自动注入 PAI/PPID/PCPI 头）', type: 'bool', default: false },
+    { key: 'ims_enabled', label: t('运营商 IMS Trunk（自动注入 PAI/PPID/PCPI 头）'), type: 'bool', default: false },
     { key: 'ims_domain', label: 'IMS 根域（如 ims.mnc001.mcc460.3gppnetwork.org）', type: 'text', default: '',
       placeholder: 'ims.mnc001.mcc460.3gppnetwork.org',
       help: '必填：开启 IMS 后，PAI/PPID/PCPI 会用 {auth_user}@{ims_domain} 拼 SIP URI' },
-    { key: 'ims_auto_pani', label: '自动注入 P-Access-Network-Info（默认 E-UTRAN-TDD）', type: 'bool', default: false },
-    { key: 'ims_pani_value', label: '自定义 PANI 值（空=E-UTRAN-TDD）', type: 'text', default: '',
+    { key: 'ims_auto_pani', label: t('自动注入 P-Access-Network-Info（Default E-UTRAN-TDD）'), type: 'bool', default: false },
+    { key: 'ims_pani_value', label: t('自定义 PANI Value（空=E-UTRAN-TDD）'), type: 'text', default: '',
       placeholder: 'E-UTRAN-TDD; utran-cell-id-3gpp=0001001' },
     { key: 'ims_auto_privacy', label: '自动注入 Privacy: id（CLIR，对端 From 匿名）', type: 'bool', default: false },
     { key: 'custom_headers', label: '自定义 SIP 头（出站 INVITE）', type: 'textarea', default: '',
       placeholder: 'MyID=${callid}\r\nX-Biz-Caller=${caller}\r\nX-Biz-Callee=${callee}',
-      help: '每行一条，必须带 \\r\\n 结尾。可用变量：${callid} ${caller} ${callee} ${from_user} ${to_user} ${from_ip} ${to_ip}' },
+      help: '每行一，必须带 \\r\\n 结尾。可用变量：${callid} ${caller} ${callee} ${from_user} ${to_user} ${from_ip} ${to_ip}' },
   ],
   // asyncLoaders：动态下拉数据源
   {
     tenant_id: async () => {
       try {
         const r = await API.get('/tenants?limit=500&offset=0');
-        const opts = (r.items || []).map(t => ({ value: t.id, label: t.tenant_name + (t.enabled ? '' : ' (禁用)') }));
+        const opts = (r.items || []).map(t => ({ value: t.id, label: t.tenant_name + (t.enabled ? '' : t(' (Disable)')) }));
         if (!opts.length) console.warn('[trunks tenant_id] /tenants 返回空列表');
         return opts;
       } catch (e) {
@@ -177,13 +177,13 @@ app.component('trunks', crudTable(
     gateway_name: async () => {
       try {
         const r = await API.get('/gateways?limit=500&offset=0');
-        return (r.items || []).map(g => ({ value: g.name, label: `${g.name}${g.enabled ? '' : ' (禁用)'}` }));
+        return (r.items || []).map(g => ({ value: g.name, label: `${g.name}${g.enabled ? '' : t(' (Disable)')}` }));
       } catch (e) { return []; }
     },
     profile_name: async () => {
       try {
         const r = await API.get('/sip-profiles?limit=500&offset=0');
-        return (r.items || []).map(p => ({ value: p.name, label: `${p.name}${p.enabled ? '' : ' (禁用)'}` }));
+        return (r.items || []).map(p => ({ value: p.name, label: `${p.name}${p.enabled ? '' : t(' (Disable)')}` }));
       } catch (e) { return []; }
     },
   },
@@ -194,30 +194,30 @@ app.component('route-groups', crudTable(
   { label: '路由组', icon: 'fa-solid fa-route' },
   '/routes',
   [
-    { key: 'name', label: '名称', type: 'text' },
+    { key: 'name', label: t('Name'), type: 'text' },
     { key: 'strategy', label: '策略', type: 'text' },
-    { key: 'enabled', label: '状态', type: 'bool' },
+    { key: 'enabled', label: t('Status'), type: 'bool' },
   ],
   [
-    { key: 'name', label: '名称', type: 'text' },
+    { key: 'name', label: t('Name'), type: 'text' },
     { key: 'strategy', label: '选路策略', type: 'select', options: [
       { value: 'priority', label: 'priority (主备优先)' },
       { value: 'weight',   label: 'weight (加权散列)' },
       { value: 'least_busy', label: 'least_busy (最闲优先)' },
       { value: 'ring',     label: 'ring (轮询)' },
     ], default: 'priority' },
-    { key: 'enabled', label: '启用', type: 'bool', default: true },
-    { key: 'description', label: '备注', type: 'textarea' },
+    { key: 'enabled', label: t('Enable'), type: 'bool', default: true },
+    { key: 'description', label: t('Notes'), type: 'textarea' },
   ],
 ));
 
-/* §15 拨号规则：带 internal/external Profile Tab 分区（= FreeSWITCH default.xml vs public.xml）
- * CIDR 默认值：internal → RFC1918 内网网段（防盗打）；external → 0.0.0.0/0（外部网关 IP 不固定，用户按需配置） */
+/* §15 Dialplan Rules：带 internal/external Profile Tab 分区（= FreeSWITCH default.xml vs public.xml）
+ * CIDR DefaultValue：internal → RFC1918 内网网段（防盗打）；external → 0.0.0.0/0（外部Gateway IP 不固定，用户按需Config） */
 app.component('dialplan-rules', {
   template: `
     <div class="space-y-4">
       <div class="flex items-center justify-between">
-        <h2 class="text-lg font-semibold text-slate-800"><i class="fa-solid fa-code-branch mr-2 text-blue-600"></i>拨号规则</h2>
+        <h2 class="text-lg font-semibold text-slate-800"><i class="fa-solid fa-code-branch mr-2 text-blue-600"></i>{{ t('Dialplan Rules') }}</h2>
         <div class="flex items-center gap-2">
           <el-button size="small" @click="reloadRules">
             <el-icon><Refresh /></el-icon>Reload 到 C 侧
@@ -230,17 +230,17 @@ app.component('dialplan-rules', {
 
       <!-- Profile Tab 分区（= FreeSWITCH context） -->
       <el-tabs v-model="activeProfile" type="border-card">
-        <el-tab-pane label="internal — 内部 SIP Profile（已注册分机）" name="internal">
+        <el-tab-pane :label="t('$n')" name="internal">
           <el-table :data="pagedItems" border stripe size="default" style="width:100%">
             <el-table-column type="index" label="#" width="55" align="center"></el-table-column>
-            <el-table-column prop="tenant_id" label="租户" width="80" align="center">
+            <el-table-column prop="tenant_id" :label="t('$n')" width="80" align="center">
               <template #default="{ row }"><el-tag size="small" effect="plain">T{{ row.tenant_id || 1 }}</el-tag></template>
             </el-table-column>
-            <el-table-column prop="name" label="规则名称" min-width="140"></el-table-column>
-            <el-table-column prop="match_expr" label="被叫匹配" min-width="140">
+            <el-table-column prop="name" :label="t('$n')" min-width="140"></el-table-column>
+            <el-table-column prop="match_expr" :label="t('$n')" min-width="140">
               <template #default="{ row }"><code class="text-xs bg-slate-100 px-1 rounded">{{ row.match_expr }}</code></template>
             </el-table-column>
-            <el-table-column prop="target" label="目标资源" min-width="160"></el-table-column>
+            <el-table-column prop="target" :label="t('$n')" min-width="160"></el-table-column>
             <el-table-column prop="rec_action" label="录音" width="90" align="center">
               <template #default="{ row }">
                 <el-tag v-if="row.rec_action === 1" type="danger" effect="light" size="small" round>Start</el-tag>
@@ -251,27 +251,27 @@ app.component('dialplan-rules', {
             <el-table-column prop="rec_path_template" label="录音路径模板" min-width="200">
               <template #default="{ row }">
                 <code v-if="row.rec_path_template" class="text-xs text-emerald-600">{{ row.rec_path_template }}</code>
-                <span v-else class="text-slate-400 text-xs">默认</span>
+                <span v-else class="text-slate-400 text-xs">{{ t('Default') }}</span>
               </template>
             </el-table-column>
-            <el-table-column prop="prio" label="优先级" width="80" align="center"></el-table-column>
+            <el-table-column prop="prio" :label="t('$n')" width="80" align="center"></el-table-column>
             <el-table-column prop="src_ip_cidr" label="IP 准入 CIDR" min-width="180">
               <template #default="{ row }">
                 <code class="text-xs" :class="row.src_ip_cidr === '0.0.0.0/0' ? 'text-amber-600' : 'text-slate-500'">{{ row.src_ip_cidr }}</code>
               </template>
             </el-table-column>
-            <el-table-column prop="enabled" label="状态" width="80" align="center">
+            <el-table-column prop="enabled" :label="t('$n')" width="80" align="center">
               <template #default="{ row }">
                 <el-tag :type="row.enabled ? 'success' : 'info'" effect="light" size="small" round>
-                  {{ row.enabled ? '启用' : '禁用' }}
+                  {{ row.enabled ? t('Enable') : t('Disable') }}
                 </el-tag>
               </template>
             </el-table-column>
-            <el-table-column label="操作" width="150" align="center" fixed="right">
+            <el-table-column :label="t('$n')" width="150" align="center" fixed="right">
               <template #default="{ row }">
-                <el-button link type="primary" size="small" @click="openEdit(row)">编辑</el-button>
-                <el-popconfirm title="确认删除？" @confirm="del(row.id)">
-                  <template #reference><el-button link type="danger" size="small">删除</el-button></template>
+                <el-button link type="primary" size="small" @click="openEdit(row)">{{ t('Edit') }}</el-button>
+                <el-popconfirm :title="t('$n')" @confirm="del(row.id)">
+                  <template #reference><el-button link type="danger" size="small">{{ t('Delete') }}</el-button></template>
                 </el-popconfirm>
               </template>
             </el-table-column>
@@ -282,17 +282,17 @@ app.component('dialplan-rules', {
           </div>
         </el-tab-pane>
 
-        <el-tab-pane label="external — 外部 SIP Profile（SIP 网关/DID 中继）" name="external">
+        <el-tab-pane :label="t('$n')" name="external">
           <el-table :data="pagedItems" border stripe size="default" style="width:100%">
             <el-table-column type="index" label="#" width="55" align="center"></el-table-column>
-            <el-table-column prop="tenant_id" label="租户" width="80" align="center">
+            <el-table-column prop="tenant_id" :label="t('$n')" width="80" align="center">
               <template #default="{ row }"><el-tag size="small" effect="plain">T{{ row.tenant_id || 1 }}</el-tag></template>
             </el-table-column>
-            <el-table-column prop="name" label="规则名称" min-width="140"></el-table-column>
-            <el-table-column prop="match_expr" label="被叫匹配" min-width="140">
+            <el-table-column prop="name" :label="t('$n')" min-width="140"></el-table-column>
+            <el-table-column prop="match_expr" :label="t('$n')" min-width="140">
               <template #default="{ row }"><code class="text-xs bg-slate-100 px-1 rounded">{{ row.match_expr }}</code></template>
             </el-table-column>
-            <el-table-column prop="target" label="目标资源" min-width="160"></el-table-column>
+            <el-table-column prop="target" :label="t('$n')" min-width="160"></el-table-column>
             <el-table-column prop="rec_action" label="录音" width="90" align="center">
               <template #default="{ row }">
                 <el-tag v-if="row.rec_action === 1" type="danger" effect="light" size="small" round>Start</el-tag>
@@ -303,27 +303,27 @@ app.component('dialplan-rules', {
             <el-table-column prop="rec_path_template" label="录音路径模板" min-width="200">
               <template #default="{ row }">
                 <code v-if="row.rec_path_template" class="text-xs text-emerald-600">{{ row.rec_path_template }}</code>
-                <span v-else class="text-slate-400 text-xs">默认</span>
+                <span v-else class="text-slate-400 text-xs">{{ t('Default') }}</span>
               </template>
             </el-table-column>
-            <el-table-column prop="prio" label="优先级" width="80" align="center"></el-table-column>
+            <el-table-column prop="prio" :label="t('$n')" width="80" align="center"></el-table-column>
             <el-table-column prop="src_ip_cidr" label="IP 准入 CIDR" min-width="180">
               <template #default="{ row }">
                 <code class="text-xs" :class="row.src_ip_cidr === '0.0.0.0/0' ? 'text-amber-600' : 'text-slate-500'">{{ row.src_ip_cidr }}</code>
               </template>
             </el-table-column>
-            <el-table-column prop="enabled" label="状态" width="80" align="center">
+            <el-table-column prop="enabled" :label="t('$n')" width="80" align="center">
               <template #default="{ row }">
                 <el-tag :type="row.enabled ? 'success' : 'info'" effect="light" size="small" round>
-                  {{ row.enabled ? '启用' : '禁用' }}
+                  {{ row.enabled ? t('Enable') : t('Disable') }}
                 </el-tag>
               </template>
             </el-table-column>
-            <el-table-column label="操作" width="150" align="center" fixed="right">
+            <el-table-column :label="t('$n')" width="150" align="center" fixed="right">
               <template #default="{ row }">
-                <el-button link type="primary" size="small" @click="openEdit(row)">编辑</el-button>
-                <el-popconfirm title="确认删除？" @confirm="del(row.id)">
-                  <template #reference><el-button link type="danger" size="small">删除</el-button></template>
+                <el-button link type="primary" size="small" @click="openEdit(row)">{{ t('Edit') }}</el-button>
+                <el-popconfirm :title="t('$n')" @confirm="del(row.id)">
+                  <template #reference><el-button link type="danger" size="small">{{ t('Delete') }}</el-button></template>
                 </el-popconfirm>
               </template>
             </el-table-column>
@@ -335,116 +335,116 @@ app.component('dialplan-rules', {
         </el-tab-pane>
       </el-tabs>
 
-      <!-- 新建/编辑弹窗 -->
-      <el-dialog v-model="showModal" :title="(editingId ? '编辑' : '新建') + ' 拨号规则'" width="900px" destroy-on-close>
+      <!-- 新建/Edit弹窗 -->
+      <el-dialog v-model="showModal" ::title="t('$n')" width="900px" destroy-on-close>
         <el-form :model="form" label-position="top">
-          <el-form-item label="所属租户">
+          <el-form-item label="所属Tenant">
             <el-select v-model="form.tenant_id" style="width:100%" filterable>
               <el-option v-for="t in tenantOptions" :key="t.id" :value="t.id"
                 :label="'T' + t.id + ' — ' + t.tenant_name + (t.enabled ? '' : ' (停用)')">
               </el-option>
             </el-select>
-            <div class="text-xs text-slate-400 mt-1">跨租户规则互相隔离，默认选 T1 (default)</div>
+            <div class="text-xs text-slate-400 mt-1">{{ t('跨Tenant规则互相隔离，Default选 T1 (default)') }}</div>
           </el-form-item>
-          <el-form-item label="规则名称"><el-input v-model="form.name" placeholder="例：DID 51350820 → 内部 alice"></el-input></el-form-item>
+          <el-form-item :label="t('$n')"><el-input v-model="form.name" placeholder="例：DID 51350820 → 内部 alice"></el-input></el-form-item>
           <el-form-item label="所属 Profile（= FreeSWITCH context）">
             <el-select v-model="form.profile_name" style="width:100%" @change="onProfileChange">
-              <el-option value="internal" label="internal — 内部 SIP Profile（已注册分机）"></el-option>
-              <el-option value="external" label="external — 外部 SIP Profile（SIP 网关/DID 中继）"></el-option>
+              <el-option value="internal" :label="t('$n')"></el-option>
+              <el-option value="external" :label="t('$n')"></el-option>
             </el-select>
             <div class="text-xs text-slate-400 mt-1">internal = default.xml；external = public.xml，两个 context 规则完全隔离</div>
           </el-form-item>
-          <el-form-item :label="'源 IP 准入 CIDR（多网段逗号分隔）' + (form.profile_name === 'external' ? ' — 外部网关请填运营商 IP' : ' — 默认 RFC1918 内网防盗打')">
+          <el-form-item :label="'源 IP 准入 CIDR（多网段逗号分隔）' + (form.profile_name === 'external' ? ' — 外部Gateway请填运营商 IP' : ' — Default RFC1918 内网防盗打')">
             <el-input v-model="form.src_ip_cidr" placeholder="10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"></el-input>
           </el-form-item>
-          <el-form-item label="被叫匹配表达式">
+          <el-form-item label="CalleeMatch Expression">
             <div class="flex gap-2 items-start w-full">
               <el-input v-model="form.match_expr" placeholder="正则 / 通配符：^1[01]\d{2}$ / 100[0-9] / 51350820" style="flex:1"></el-input>
-              <el-button @click="validateMatchExpr" :type="matchValid === null ? 'info' : (matchValid ? 'success' : 'danger')">验证表达式</el-button>
+              <el-button @click="validateMatchExpr" :type="matchValid === null ? 'info' : (matchValid ? 'success' : 'danger')">{{ t('Validate Expression') }}</el-button>
             </div>
             <div v-if="matchValid !== null" class="mt-1 text-xs" :class="matchValid ? 'text-green-600' : 'text-red-500'">
-              <span v-if="matchValid">✓ 表达式合法（可用正则语法）</span>
-              <span v-else>✗ 表达式有问题：{{ matchError }}</span>
+              <span v-if="matchValid">{{ t('✓ Match Expression合法（可用正则语法）') }}</span>
+              <span v-else>✗ Match Expression有问题：{{ matchError }}</span>
             </div>
             <div v-if="matchValid" class="mt-1 text-xs text-slate-500">
               <div class="flex gap-2 items-center mt-1">
-                <span>测试号码：</span>
+                <span>Test Number：</span>
                 <el-input v-model="matchTestNum" size="small" style="width:160px" placeholder="如 11001"></el-input>
                 <el-tag v-if="matchTestResult !== null" :type="matchTestResult ? 'success' : 'info'" size="small">
-                  {{ matchTestResult ? '✓ 能匹配' : '✗ 不匹配' }}
+                  {{ matchTestResult ? t('✓ 能Match') : t('✗ 不Match') }}
                 </el-tag>
               </div>
             </div>
           </el-form-item>
-          <el-form-item label="主叫匹配（可选）"><el-input v-model="form.caller_match" placeholder="留空=不限制主叫"></el-input></el-form-item>
+          <el-form-item :label="t('$n')"><el-input v-model="form.caller_match" :placeholder="t('$n')"></el-input></el-form-item>
           <div class="grid grid-cols-2 gap-4">
-            <el-form-item label="同 Profile 内优先级（小值优先）">
+            <el-form-item label="同 Profile 内Priority（小Value优先）">
               <el-input-number v-model="form.prio" :controls="false" style="width:100%"></el-input-number>
             </el-form-item>
             <el-form-item label="去前导位数（strip）">
               <el-input-number v-model="form.strip" :controls="false" style="width:100%"></el-input-number>
             </el-form-item>
           </div>
-          <el-form-item label="被叫覆盖（dst_override）">
+          <el-form-item label="Callee覆盖（dst_override）">
             <el-input v-model="form.dst_override"
                       placeholder="空=strip 结果；可用 $1 $2 或 \${1} \${2}；如 888$2"
                       clearable>
             </el-input>
             <div class="text-xs text-slate-400 mt-1">
-              当被叫变换不是简单"去前导"时用这个；正则捕获组两种语法都支持：
+              当Callee变换不是简单"去前导"时用这个；正则捕获组两种语法都支持：
               <code class="bg-slate-100 px-1 rounded">$1</code>
               <code class="bg-slate-100 px-1 rounded mx-1">$2</code>
               <span class="mx-1">或</span>
               <code class="bg-slate-100 px-1 rounded">\${1}</code>
               <code class="bg-slate-100 px-1 rounded mx-1">\${2}</code>。
-              优先级：<b>dst_override</b> > strip > add_prefix。
+              Priority：<b>dst_override</b> > strip > add_prefix。
             </div>
           </el-form-item>
-          <el-form-item label="目标资源（只管路由）">
+          <el-form-item label="Target资源（只管路由）">
             <el-select v-model="form.target" filterable allow-create default-first-option
-              placeholder="选中继 / 网关组，或直接输入 extension:xxx" style="width:100%" clearable>
-              <el-option-group v-if="gatewayOptions.length" label="— 网关组（OUT 组选路）—">
+              :placeholder="t('$n')" style="width:100%" clearable>
+              <el-option-group v-if="gatewayOptions.length" :label="t('$n')">
                 <el-option v-for="o in gatewayOptions" :key="o.value" :value="o.value" :label="o.label"></el-option>
               </el-option-group>
-              <el-option-group v-if="trunkOptions.length" label="— 单中继（OUT 直连）—">
+              <el-option-group v-if="trunkOptions.length" :label="t('$n')">
                 <el-option v-for="o in trunkOptions" :key="o.value" :value="o.value" :label="o.label"></el-option>
               </el-option-group>
               <el-option-group v-if="trunkApiOk && !trunkOptions.length && !gatewayOptions.length" label="— OUT —">
-                <el-option disabled value="" label="（暂无可选目标，请先到「中继」「网关」页面创建并启用）"></el-option>
+                <el-option disabled value="" :label="t('$n')"></el-option>
               </el-option-group>
-              <el-option-group label="— EXT 分机 / BIZ 业务 —">
-                <el-option value="extension:" label="extension:<分机> → EXT"></el-option>
+              <el-option-group label="— EXT Extension / BIZ 业务 —">
+                <el-option value="extension:" :label="t('$n')"></el-option>
                 <el-option value="queue:"     label="queue:<队列> → BIZ"></el-option>
                 <el-option value="ivr:"       label="ivr:<IVR> → BIZ"></el-option>
                 <el-option value="hangup"     label="hangup → BIZ 挂机"></el-option>
               </el-option-group>
             </el-select>
             <div class="text-xs text-slate-400 mt-1">
-              <b>★ 设计解耦</b>：<b>目标资源只管路由</b>，被叫号码变换（strip/\${N}/dst_override）在下面「拨号动作」里独立配置。避免笛卡尔积爆炸。<br>
-              <b>示例</b>：match=<code>^(\\d{3,6})(\\d{11})$</code>，target=gateway:all_trunks，<b>dst_override=\${2}</b> → 外呼 捕获组2@all_trunks ✅
+              <b>★ 设计解耦</b>：<b>{{ t('Target资源只管路由') }}</b>{{ t('，Callee号码变换（strip/\${N}/dst_override）在下面「拨号Action」里独立Config。避免笛卡尔积爆炸。') }}<br>
+              <b>{{ t('e.g.') }}</b>：match=<code>^(\\d{3,6})(\\d{11})$</code>，target=gateway:all_trunks，<b>dst_override=\${2}</b> → 外呼 捕获组2@all_trunks ✅
             </div>
           </el-form-item>
           <div class="grid grid-cols-2 gap-4">
-            <el-form-item label="录音控制（本条规则命中时触发）">
+            <el-form-item label="录音控制（本规则命中时触发）">
               <el-select v-model="form.rec_action" style="width:100%">
-                <el-option :value="0" label="不录音（默认）"></el-option>
+                <el-option :value="0" :label="t('$n')"></el-option>
                 <el-option :value="1" label="Start — 命中后开始录音"></el-option>
                 <el-option :value="2" label="Stop — 命中后停止录音"></el-option>
               </el-select>
-              <div class="text-xs text-slate-400 mt-1">每条规则独立配置，下一条规则可不同；0=none 1=start 2=stop</div>
+              <div class="text-xs text-slate-400 mt-1">{{ t('每规则独立Config，下一规则可不同；0=none 1=start 2=stop') }}</div>
             </el-form-item>
-            <el-form-item label="媒体模式（本规则路由时）">
+            <el-form-item label="Media模式（本规则路由时）">
               <el-select v-model="form.media_mode" style="width:100%">
-                <el-option :value="0" label="auto — 按自动决策（默认）"></el-option>
-                <el-option :value="1" label="bypass — 强制媒体绕过 SBC 直连"></el-option>
-                <el-option :value="2" label="relay — 强制 SBC 转发媒体"></el-option>
+                <el-option :value="0" :label="t('$n')"></el-option>
+                <el-option :value="1" :label="t('$n')"></el-option>
+                <el-option :value="2" :label="t('$n')"></el-option>
               </el-select>
               <div class="text-xs text-slate-400 mt-1">
                 WebRTC 通话会被强制 relay 加密终结，bypass 对此类通话无效。
               </div>
             </el-form-item>
           </div>
-          <el-form-item label="录音路径模板（空=系统默认）">
+          <el-form-item label="录音路径模板（空=系统Default）">
             <el-input v-model="form.rec_path_template"
                       placeholder="如 YYYY-MM-DD/{caller}-{callee}-{callid}.wav"
                       clearable>
@@ -458,16 +458,16 @@ app.component('dialplan-rules', {
               。空模板时系统用 <code class="bg-slate-100 px-1 rounded">yyyymmdd/callid_mix_seq.wav</code>
             </div>
           </el-form-item>
-          <el-form-item label="启用">
-            <el-switch v-model="form.enabled" active-text="启用" inactive-text="禁用"></el-switch>
+          <el-form-item label="Enable">
+            <el-switch v-model="form.enabled" :active-text="t('$n')" :inactive-text="t('$n')"></el-switch>
           </el-form-item>
-          <el-form-item label="备注"><el-input v-model="form.description" type="textarea" :rows="2"></el-input></el-form-item>
-          <el-form-item label="拨号动作（SIP 头改写 / 号码变换）">
+          <el-form-item :label="t('$n')"><el-input v-model="form.description" type="textarea" :rows="2"></el-input></el-form-item>
+          <el-form-item label="拨号Action（SIP 头改写 / 号码变换）">
             <div class="w-full">
               <div class="flex justify-between items-center mb-1">
                 <span class="text-xs text-slate-500">结构化数据（点击切换 Raw JSON）</span>
                 <el-button link size="small" type="primary" @click="rawMode.action_json = !rawMode.action_json">
-                  {{ rawMode.action_json ? '结构化编辑' : 'Raw JSON' }}
+                  {{ rawMode.action_json ? t('结构化Edit') : 'Raw JSON' }}
                 </el-button>
               </div>
               <el-input v-if="rawMode.action_json" v-model="form.action_json" type="textarea" :rows="6"
@@ -475,16 +475,16 @@ app.component('dialplan-rules', {
               <dp-action-editor v-else v-model="form.action_json"></dp-action-editor>
             </div>
             <div class="text-xs text-slate-400 mt-1">
-              设置 SIP INVITE 出站头改写规则（对齐 FreeSWITCH sofia_glue.c 原生变量）。保存后点"Reload 到 C 侧"生效。
+              Settings SIP INVITE 出站头改写规则（对齐 FreeSWITCH sofia_glue.c 原生变量）。Save后点"Reload 到 C 侧"生效。
             </div>
           </el-form-item>
-          <!-- REQ-DP-APP-001: Application 链编辑器 -->
-          <el-form-item label="拨号动作链（Application Chain）">
+          <!-- REQ-DP-APP-001: Application 链Edit器 -->
+          <el-form-item label="拨号Application Chain（Application Chain）">
             <div class="w-full">
               <div class="flex justify-between items-center mb-1">
                 <span class="text-xs text-slate-500">顺序执行：pre_answer → playback → sleep → answer …（空链则跳过）</span>
                 <el-button link size="small" type="primary" @click="rawMode.app_chain = !rawMode.app_chain">
-                  {{ rawMode.app_chain ? '结构化编辑' : 'Raw JSON' }}
+                  {{ rawMode.app_chain ? t('结构化Edit') : 'Raw JSON' }}
                 </el-button>
               </div>
               <el-input v-if="rawMode.app_chain" v-model="form.app_chain" type="textarea" :rows="6"
@@ -492,14 +492,14 @@ app.component('dialplan-rules', {
               <dp-app-chain-editor v-else v-model="form.app_chain"></dp-app-chain-editor>
             </div>
             <div class="text-xs text-slate-400 mt-1">
-              选中命中本条规则后依次执行的 Application。C 侧 dp_execute 命中规则 → dp_execute_app_chain 逐条调 app_registry 中注册的 17 个内建 apps。
+              选中命中本规则后依次执行的 Application。C 侧 dp_execute 命中规则 → dp_execute_app_chain 逐调 app_registry 中Register的 17 个内建 apps。
               <code class="bg-slate-100 px-1 rounded ml-1">sleep</code> 返回 PENDING 时 timer_wheel 挂起，到点后自动继续。
             </div>
           </el-form-item>
         </el-form>
         <template #footer>
-          <el-button @click="showModal = false">取消</el-button>
-          <el-button type="primary" :loading="saving" @click="save">保存</el-button>
+          <el-button @click="showModal = false">{{ t('Cancel') }}</el-button>
+          <el-button type="primary" :loading="saving" @click="save">{{ t('Save') }}</el-button>
         </template>
       </el-dialog>
     </div>
@@ -518,17 +518,17 @@ app.component('dialplan-rules', {
     const form = ref({});
     const saving = ref(false);
     const rawMode = Vue.reactive({ action_json: false, app_chain: false });
-    // 正则验证状态
+    // 正则验证Status
     const matchValid = ref(null);    // null=未验证, true=合法, false=非法
     const matchError = ref('');
     const matchTestNum = ref('');
-    const matchTestResult = ref(null); // null=未测试, true=能匹配, false=不匹配
+    const matchTestResult = ref(null); // null=未测试, true=能Match, false=不Match
 
     // 外呼下拉选项（纯路由，不再自动拼 |${N} 组合——与 dst_override 解耦）
     const trunkOptions = ref([]);     // [{ value: 'trunk:xxx', label }]
     const gatewayOptions = ref([]);    // [{ value: 'gateway:xxx', label }]
     const trunkApiOk = ref(false);
-    // 租户下拉（tenant_id 外键）
+    // Tenant下拉（tenant_id 外Key）
     const tenantOptions = ref([]);    // [{ id, tenant_name, enabled }]
 
     async function fetchTenants() {
@@ -547,7 +547,7 @@ app.component('dialplan-rules', {
         }));
         trunkApiOk.value = true;
         ElementPlus.ElMessage({
-          message: `[诊断] 拉到 ${r.items?.length || 0} 条 trunk，其中 enabled=${enabled.length}`,
+          message: `[诊断] 拉到 ${r.items?.length || 0}  trunk，其中 enabled=${enabled.length}`,
           type: enabled.length ? 'success' : 'warning',
           duration: 4000, showClose: true,
         });
@@ -570,7 +570,7 @@ app.component('dialplan-rules', {
       } catch (e) { /* 静默 */ }
     }
 
-    /* 本地按 profile 过滤 + 分页 */
+    /* 本地按 profile 过滤 + 分 */
     const filteredItems = computed(() =>
       items.value.filter(r => r.profile_name === activeProfile.value)
     );
@@ -590,7 +590,7 @@ app.component('dialplan-rules', {
       try {
         const r = await API.post(API_PATH + '/reload');
         ElementPlus.ElMessage({
-          message: `已加载到 C 侧：${r.loaded} 条规则`,
+          message: `已加载到 C 侧：${r.loaded} 规则`,
           type: 'success',
           duration: 3000,
           showClose: true,
@@ -605,7 +605,7 @@ app.component('dialplan-rules', {
         });
       }
     }
-    // 从 action_json 里安全地取出顶层字段（dst_override 等），不存在返回默认值
+    // 从 action_json 里安全地取出顶层字段（dst_override 等），不存在返回DefaultValue
     function actGet(action_json, key, def) {
       try {
         const o = JSON.parse(action_json || '{}');
@@ -660,29 +660,29 @@ app.component('dialplan-rules', {
       editingId.value = row.id;
       showModal.value = true;
     }
-    /* profile 切换时智能填默认 CIDR（internal→RFC1918 防盗打，external→0.0.0.0/0 外部网关） */
+    /* profile 切换时智能填Default CIDR（internal→RFC1918 防盗打，external→0.0.0.0/0 外部Gateway） */
     function onProfileChange() {
       if (!editingId.value) {
         form.value.src_ip_cidr = form.value.profile_name === 'internal' ? RFC1918 : '0.0.0.0/0';
       }
     }
-    /* 正则表达式验证：JS RegExp 编译测试 + 可选号码匹配测试。
+    /* 正则Match Expression验证：JS RegExp 编译测试 + 可选号码Match测试。
      * 注：NSBC C 侧用 POSIX ERE，JS 语法与 POSIX ERE 基本兼容，
      * 但反向引用（\1 \2）等高级特性两端支持不同。这里做基础校验，
-     * 避免明显拼写错误（未闭合括号/方括号等）。 */
+     * 避免明显拼写Error（未闭合括号/方括号等）。 */
     function validateMatchExpr() {
       const expr = form.value.match_expr || '';
       matchTestResult.value = null;
       if (!expr.trim()) {
         matchValid.value = false;
-        matchError.value = '表达式为空';
+        matchError.value = 'Match Expression为空';
         return;
       }
       try {
         new RegExp(expr);
         matchValid.value = true;
         matchError.value = '';
-        // 如果有测试号码，同时跑一下匹配
+        // 如果有Test Number，同时跑一下Match
         const tn = matchTestNum.value.trim();
         if (tn) {
           try {
@@ -701,7 +701,7 @@ app.component('dialplan-rules', {
         }
       } catch (e) {
         matchValid.value = false;
-        matchError.value = e.message || '语法错误';
+        matchError.value = e.message || '语法Error';
       }
     }
     async function save() {
@@ -720,14 +720,14 @@ app.component('dialplan-rules', {
         else await API.post(API_PATH, payload);
         showModal.value = false;
         await load();
-      } catch (e) { alert('保存失败: ' + e.message); }
+      } catch (e) { alert('Save失败: ' + e.message); }
       finally { saving.value = false; }
     }
     async function del(id) {
       try {
         await API.delete(API_PATH + '/' + id);
         await load();
-      } catch (e) { alert('删除失败: ' + e.message); }
+      } catch (e) { alert('Delete失败: ' + e.message); }
     }
 
     onMounted(() => { load(); fetchTrunkOptions(); fetchGatewayOptions(); fetchTenants(); });
@@ -744,58 +744,58 @@ app.component('time-groups', crudTable(
   { label: '时间策略组', icon: 'fa-solid fa-clock' },
   '/time-groups',
   [
-    { key: 'name', label: '名称', type: 'text' },
-    { key: 'enabled', label: '状态', type: 'bool' },
+    { key: 'name', label: t('Name'), type: 'text' },
+    { key: 'enabled', label: t('Status'), type: 'bool' },
     { key: 'fallback_to', label: '回落至', type: 'text' },
-    { key: 'description', label: '备注', type: 'text' },
+    { key: 'description', label: t('Notes'), type: 'text' },
   ],
   [
-    { key: 'name', label: '名称', type: 'text' },
-    { key: 'enabled', label: '启用', type: 'bool', default: true },
+    { key: 'name', label: t('Name'), type: 'text' },
+    { key: 'enabled', label: t('Enable'), type: 'bool', default: true },
     { key: 'time_ranges', label: '时间范围', type: 'json', editor: 'time-ranges',
       default: '[{"days":"1-5","from":"09:00","to":"18:00"}]' },
-    { key: 'fallback_to', label: '回落目标', type: 'text' },
-    { key: 'description', label: '备注', type: 'textarea' },
+    { key: 'fallback_to', label: t('回落Target'), type: 'text' },
+    { key: 'description', label: t('Notes'), type: 'textarea' },
   ],
 ));
 
-// --- 分机队列 ---
+// --- Extension队列 ---
 app.component('queues', crudTable(
-  { label: '分机队列', icon: 'fa-solid fa-people-group' },
+  { label: t('Extension队列'), icon: 'fa-solid fa-people-group' },
   '/queues',
   [
-    { key: 'tenant_id', label: '租户ID', type: 'text' },
-    { key: 'name', label: '名称', type: 'text' },
-    { key: 'enabled', label: '状态', type: 'bool' },
+    { key: 'tenant_id', label: t('Tenant ID'), type: 'text' },
+    { key: 'name', label: t('Name'), type: 'text' },
+    { key: 'enabled', label: t('Status'), type: 'bool' },
     { key: 'ring_strategy', label: '策略', type: 'text' },
     { key: 'max_wait_sec', label: '最大等待', type: 'text' },
-    { key: 'moh_sound', label: '保持音', type: 'text' },
+    { key: 'moh_sound', label: t('Hold音'), type: 'text' },
   ],
   [
-    { key: 'tenant_id', label: '租户', type: 'async-select',
-      help: '所属租户（列表会按当前租户自动过滤）' },
-    { key: 'name', label: '名称', type: 'text' },
-    { key: 'enabled', label: '启用', type: 'bool', default: true },
-    { key: 'ring_strategy', label: '振铃策略', type: 'select', options: [
-      { value: 'ringall', label: 'ringall (全振铃)' },
-      { value: 'leastrecent', label: 'leastrecent (最近空闲)' },
+    { key: 'tenant_id', label: t('Tenant'), type: 'async-select',
+      help: 'Owner tenant (list auto-filtered by current tenant)' },
+    { key: 'name', label: t('Name'), type: 'text' },
+    { key: 'enabled', label: t('Enable'), type: 'bool', default: true },
+    { key: 'ring_strategy', label: t('Ringing策略'), type: 'select', options: [
+      { value: 'ringall', label: t('ringall (全Ringing)') },
+      { value: 'leastrecent', label: t('leastrecent (最近Idle)') },
       { value: 'roundrobin', label: 'roundrobin (轮询)' },
       { value: 'random', label: 'random (随机)' },
-      { value: 'fewestcalls', label: 'fewestcalls (最少呼叫)' },
+      { value: 'fewestcalls', label: t('fewestcalls (最少Call)') },
     ], default: 'ringall' },
-    { key: 'max_wait_sec', label: '最大等待 (秒)', type: 'number', default: 600 },
-    { key: 'moh_sound', label: '保持音乐', type: 'text', default: 'default' },
+    { key: 'max_wait_sec', label: t('最大等待 (s)'), type: 'number', default: 600 },
+    { key: 'moh_sound', label: t('Hold音乐'), type: 'text', default: 'default' },
     { key: 'members_json', label: '队列成员', type: 'json', editor: 'queue-members',
       default: '[{"extension":"2000","weight":10,"enabled":true}]' },
-    { key: 'description', label: '备注', type: 'textarea' },
+    { key: 'description', label: t('Notes'), type: 'textarea' },
   ],
   // asyncLoaders：动态下拉数据源
   {
     tenant_id: async () => {
       try {
         const r = await API.get('/tenants?limit=500&offset=0');
-        const opts = (r.items || []).map(t => ({ value: t.id, label: t.tenant_name + (t.enabled ? '' : ' (禁用)') }));
-        if (!opts.length) console.warn('[tenant_id async-loader] /tenants 返回空列表——检查 DB 是否有默认租户');
+        const opts = (r.items || []).map(t => ({ value: t.id, label: t.tenant_name + (t.enabled ? '' : t(' (Disable)')) }));
+        if (!opts.length) console.warn('[tenant_id async-loader] /tenants 返回空列表——检查 DB 是否有DefaultTenant');
         return opts;
       } catch (e) {
         console.error('[tenant_id async-loader] /tenants 加载失败:', e.message || e);
@@ -810,24 +810,24 @@ app.component('ivr-menus', crudTable(
   { label: 'IVR 菜单', icon: 'fa-solid fa-circle-question' },
   '/ivr-menus',
   [
-    { key: 'name', label: '名称', type: 'text' },
-    { key: 'enabled', label: '状态', type: 'bool' },
+    { key: 'name', label: t('Name'), type: 'text' },
+    { key: 'enabled', label: t('Status'), type: 'bool' },
     { key: 'timeout_sec', label: '超时', type: 'text' },
     { key: 'max_attempts', label: '重试次数', type: 'text' },
     { key: 'prompt_audio', label: '主提示音', type: 'text' },
   ],
   [
-    { key: 'name', label: '名称', type: 'text' },
-    { key: 'enabled', label: '启用', type: 'bool', default: true },
+    { key: 'name', label: t('Name'), type: 'text' },
+    { key: 'enabled', label: t('Enable'), type: 'bool', default: true },
     { key: 'prompt_audio', label: '主提示音', type: 'text' },
     { key: 'invalid_audio', label: '无效提示音', type: 'text' },
-    { key: 'timeout_sec', label: '超时 (秒)', type: 'number', default: 10 },
+    { key: 'timeout_sec', label: t('超时 (s)'), type: 'number', default: 10 },
     { key: 'max_attempts', label: '最大尝试', type: 'number', default: 3 },
-    { key: 'options_json', label: '按键选项', type: 'json', editor: 'ivr-options',
+    { key: 'options_json', label: t('按Key选项'), type: 'json', editor: 'ivr-options',
       default: '[{"key":"1","target":"queue-sales"},{"key":"2","target":"vm"}]' },
     { key: 'timeout_target', label: '超时跳转', type: 'text' },
     { key: 'invalid_target', label: '无效跳转', type: 'text' },
-    { key: 'description', label: '备注', type: 'textarea' },
+    { key: 'description', label: t('Notes'), type: 'textarea' },
   ],
 ));
 
@@ -836,19 +836,19 @@ app.component('ha-groups', crudTable(
   { label: '高可用组', icon: 'fa-solid fa-server' },
   '/ha-groups',
   [
-    { key: 'name', label: '名称', type: 'text' },
-    { key: 'enabled', label: '状态', type: 'bool' },
+    { key: 'name', label: t('Name'), type: 'text' },
+    { key: 'enabled', label: t('Status'), type: 'bool' },
     { key: 'quorum', label: '法定人数', type: 'text' },
-    { key: 'state', label: '当前状态', type: 'text' },
+    { key: 'state', label: t('CurrentStatus'), type: 'text' },
   ],
   [
-    { key: 'name', label: '名称', type: 'text' },
-    { key: 'enabled', label: '启用', type: 'bool', default: true },
+    { key: 'name', label: t('Name'), type: 'text' },
+    { key: 'enabled', label: t('Enable'), type: 'bool', default: true },
     { key: 'node_list_json', label: '节点列表', type: 'json', editor: 'ha-node-list',
       default: '[{"node_id":"node-1","host":"10.0.0.25","port":8080,"role":"slave"}]' },
     { key: 'quorum', label: '法定人数', type: 'number', default: 2 },
     { key: 'election_timeout', label: '选主超时 (ms)', type: 'number', default: 5000 },
-    { key: 'description', label: '备注', type: 'textarea' },
+    { key: 'description', label: t('Notes'), type: 'textarea' },
   ],
 ));
 
@@ -857,32 +857,32 @@ app.component('sip-profiles', crudTable(
   { label: 'SIP 传输 Profile', icon: 'fa-solid fa-network-wired' },
   '/sip-profiles',
   [
-    { key: 'name', label: '名称', type: 'text' },
-    { key: 'enabled', label: '状态', type: 'bool' },
+    { key: 'name', label: t('Name'), type: 'text' },
+    { key: 'enabled', label: t('Status'), type: 'bool' },
     { key: 'sip_ip', label: 'SIP 绑定 IP', type: 'text' },
-    { key: 'sip_udp_port', label: 'UDP 端口', type: 'text' },
+    { key: 'sip_udp_port', label: t('UDP Port'), type: 'text' },
     { key: 'dtmf_mode', label: 'DTMF 模式', type: 'text' },
   ],
   [
-    { key: 'name', label: 'Profile 名称', type: 'text' },
-    { key: 'enabled', label: '启用', type: 'bool', default: true },
+    { key: 'name', label: t('Profile Name'), type: 'text' },
+    { key: 'enabled', label: t('Enable'), type: 'bool', default: true },
     // ---- SIP 监听 ----
     { key: 'sip_ip', label: 'SIP 绑定 IP', type: 'text', default: '0.0.0.0' },
     { key: 'external_sip_ip', label: 'SIP NAT 公网 IP', type: 'text' },
-    { key: 'sip_udp_port', label: 'UDP 端口', type: 'number', default: 5060 },
-    { key: 'sip_tcp_port', label: 'TCP 端口', type: 'number', default: 5060 },
-    { key: 'sip_tls_port', label: 'TLS 端口', type: 'number', default: 5061 },
-    { key: 'enable_udp', label: '启用 UDP', type: 'bool', default: true },
-    { key: 'enable_tcp', label: '启用 TCP', type: 'bool', default: true },
-    { key: 'enable_tls', label: '启用 TLS', type: 'bool', default: false },
+    { key: 'sip_udp_port', label: t('UDP Port'), type: 'number', default: 5060 },
+    { key: 'sip_tcp_port', label: t('TCP Port'), type: 'number', default: 5060 },
+    { key: 'sip_tls_port', label: t('TLS Port'), type: 'number', default: 5061 },
+    { key: 'enable_udp', label: t('Enable UDP'), type: 'bool', default: true },
+    { key: 'enable_tcp', label: t('Enable TCP'), type: 'bool', default: true },
+    { key: 'enable_tls', label: t('Enable TLS'), type: 'bool', default: false },
     // ---- RTP ----
     { key: 'rtp_ip', label: 'RTP 绑定 IP', type: 'text', default: '0.0.0.0' },
     { key: 'external_rtp_ip', label: 'RTP NAT 公网 IP', type: 'text' },
-    { key: 'rtp_port_start', label: 'RTP 端口起始', type: 'number', default: 10000 },
-    { key: 'rtp_port_end', label: 'RTP 端口结束', type: 'number', default: 59999 },
+    { key: 'rtp_port_start', label: t('RTP Port起始'), type: 'number', default: 10000 },
+    { key: 'rtp_port_end', label: t('RTP Port结束'), type: 'number', default: 59999 },
     // ---- 协议特性 ----
-    { key: 'enable_prack', label: '启用 PRACK (RFC 3262)', type: 'bool', default: false },
-    { key: 'enable_update', label: '启用 UPDATE (RFC 3311)', type: 'bool', default: true },
+    { key: 'enable_prack', label: t('Enable PRACK (RFC 3262)'), type: 'bool', default: false },
+    { key: 'enable_update', label: t('Enable UPDATE (RFC 3311)'), type: 'bool', default: true },
     { key: 'dtmf_mode', label: 'DTMF 模式', type: 'select', options: [
       { value: 'rfc4733', label: 'RFC 4733 telephone-event (推荐)' },
       { value: 'info',    label: 'SIP INFO application/dtmf-relay' },
@@ -890,6 +890,6 @@ app.component('sip-profiles', crudTable(
       { value: 'auto',    label: '自动 (SDP 协商优先 RFC4733)' },
     ], default: 'rfc4733' },
     { key: 'realm', label: 'SIP Realm', type: 'text', default: 'nsbc.local' },
-    { key: 'description', label: '备注', type: 'textarea' },
+    { key: 'description', label: t('Notes'), type: 'textarea' },
   ],
 ));

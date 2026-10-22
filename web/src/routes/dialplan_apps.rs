@@ -1,11 +1,12 @@
-//! Dialplan Application 注册表 REST（REQ-DP-APP-001 / REQ-AI-001）。
+//! Dialplan Application registry REST (REQ-DP-APP-001 / REQ-AI-001).
 //!
-//! 单端点：`GET /dialplan-apps`
-//!   → JSON 数组 [{ "name": "answer", "help": "..."} , {"name": "ai", ...}]
-//! 数据来源：核心侧 UDS `show apps` 命令（应用注册表由 dialplan/ai_dialog/...
-//! 等模块在 init 时调 `app_register` 填入，`app_help` 统一输出）。
+//! Single endpoint: `GET /dialplan-apps`
+//!   → JSON array [{ "name": "answer", "help": "..."} , {"name": "ai", ...}]
+//! Data source: core-side UDS `show apps` command (the app registry is filled by
+//! modules such as dialplan/ai_dialog/... calling `app_register` at init time;
+//! `app_help` is the uniform output).
 //!
-//! 典型用途：前端 Dialplan Rule 编辑器的 app_chain 下拉选择。
+//! Typical use: front-end Dialplan Rule editor app_chain dropdown selection.
 
 use std::sync::Arc;
 

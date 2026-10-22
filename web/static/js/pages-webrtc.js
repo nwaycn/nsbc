@@ -1,9 +1,9 @@
-// =============================================================================
+﻿// =============================================================================
 // NSBC WebRTC — Vue 组件 + JsSIP 3.10.x
 // -----------------------------------------------------------------------------
 // 从 nsbc-phone.js 复用：addTrack 幂等 patch / fixVideoPortForLocal /
 // sdpCodecWhitelist / PC_CONFIG / ensureVideoReady / tryPlayWithGesture
-// Vue 组件自己持有 ua / session / localStream（避免全局状态冲突）
+// Vue 组件自己持有 ua / session / localStream（避免全局Status冲突）
 // =============================================================================
 
 /* global JsSIP, app, PC_CONFIG, fixVideoPortForLocal, sdpCodecWhitelist, ensureVideoReady, tryPlayWithGesture */
@@ -19,24 +19,24 @@ app.component('webrtc-page', {
 
     <div v-if="!isSecure" class="bg-yellow-50 border border-yellow-200 rounded-lg p-4 text-sm text-yellow-800">
       <i class="fa-solid fa-triangle-exclamation mr-2"></i>
-      getUserMedia 需要 HTTPS 或 localhost。当前：<code>{{ location }}</code>
+      getUserMedia 需要 HTTPS 或 localhost。Current：<code>{{ location }}</code>
     </div>
 
     <div class="bg-white rounded-lg border p-5 space-y-4">
-      <h3 class="font-medium">SIP 注册 <span class="text-xs text-gray-400 font-normal">· Realm = 租户名</span></h3>
+      <h3 class="font-medium">{{ t('SIP Register ') }}<span class="text-xs text-gray-400 font-normal">{{ t('· Realm = Tenant名') }}</span></h3>
       <div class="grid grid-cols-2 gap-3">
         <div><label class="text-xs text-gray-500">WSS 服务器</label>
           <input v-model="wssServer" class="w-full border rounded px-2 py-1 text-sm" :disabled="registered" /></div>
         <div><label class="text-xs text-gray-500">STUN 服务器</label>
           <input v-model="stunServer" class="w-full border rounded px-2 py-1 text-sm" :disabled="registered" /></div>
-        <div><label class="text-xs text-gray-500">分机号 (username)</label>
+        <div><label class="text-xs text-gray-500">{{ t('Extension (username)') }}</label>
           <input v-model="username" class="w-full border rounded px-2 py-1 text-sm" :disabled="registered" /></div>
-        <div><label class="text-xs text-gray-500">密码</label>
+        <div><label class="text-xs text-gray-500">{{ t('Password') }}</label>
           <input v-model="password" type="password" class="w-full border rounded px-2 py-1 text-sm" :disabled="registered" /></div>
-        <div class="col-span-2"><label class="text-xs text-gray-500">Realm / 租户</label>
+        <div class="col-span-2"><label class="text-xs text-gray-500">{{ t('Realm / Tenant') }}</label>
           <input v-model="realm" @change="onRealmChange"
                  class="w-full border rounded px-2 py-1 text-sm" :disabled="registered"
-                 placeholder="nsbc.local · SIP 认证域 / 租户唯一标识" /></div>
+                 placeholder="nsbc.local · SIP Auth Realm / Tenant唯一标识" /></div>
       </div>
       <div class="flex gap-2 items-center">
         <button v-if="!registered" @click="doRegister"
@@ -66,7 +66,7 @@ app.component('webrtc-page', {
         </button>
       </div>
       <div v-if="incomingCall" class="bg-yellow-50 border border-yellow-300 rounded p-3 flex justify-between items-center">
-        <span class="text-sm">📞 来电: {{ incomingFrom }}</span>
+        <span class="text-sm">📞 {{ t('Incoming:') }} {{ incomingFrom }}</span>
         <div class="flex gap-2">
           <button @click="doAccept" class="px-3 py-1 bg-green-500 text-white rounded text-sm">Accept</button>
           <button @click="doReject" class="px-3 py-1 bg-red-500 text-white rounded text-sm">Reject</button>
@@ -81,7 +81,7 @@ app.component('webrtc-page', {
     </div>
 
     <div class="bg-white rounded-lg border p-5 space-y-4">
-      <h3 class="font-medium">媒体</h3>
+      <h3 class="font-medium">{{ t('Media') }}</h3>
       <div class="grid grid-cols-2 gap-4">
         <div class="space-y-1">
           <div class="text-xs text-gray-500">本地 <span v-if="localStream?.getVideoTracks?.().length" class="text-green-500">●</span></div>
@@ -123,7 +123,7 @@ app.component('webrtc-page', {
     </div>
 
     <div class="bg-white rounded-lg border p-5 space-y-2">
-      <h3 class="font-medium">SIP 日志</h3>
+      <h3 class="font-medium">{{ t('SIP Log') }}</h3>
       <div ref="sipLog" class="border rounded p-2 text-xs bg-gray-900 text-green-400 h-48 overflow-y-auto font-mono">
         <div v-for="(l, i) in sipLogs" :key="i" v-html="l"></div>
       </div>
@@ -143,11 +143,11 @@ app.component('webrtc-page', {
 
       ua:         null,
       registered: false,
-      regStatus:  '未注册',
+      regStatus:  'Not registered',
       regClass:   'text-gray-400',
 
       session:        null,   // confirmed 后的 JsSIP session
-      pendingSession: null,   // 振铃阶段的 session（呼出/来电未接）
+      pendingSession: null,   // Ringing阶段的 session（Outgoing call/Incoming未接）
       inCall:         false,  // confirmed = true
       incomingCall:    false,
       incomingFrom:   '',
@@ -190,7 +190,7 @@ app.component('webrtc-page', {
       const v = (this.realm || '').trim();
       if (v) {
         try { localStorage.setItem('nsbc_sip_domain', v); } catch(_) {}
-        this.pushSipLog(`🔄 Realm = ${v}（租户 = SIP 域）`);
+        this.pushSipLog(`🔄 Realm = ${v}（Tenant = SIP 域）`);
       }
     },
 
@@ -265,15 +265,15 @@ app.component('webrtc-page', {
         if (st === 'connected' || st === 'completed') this.dumpMediaStats(pc, 'connected');
         if (st === 'failed' || st === 'disconnected') this.dumpMediaStats(pc, `fail-${st}`);
       };
-      // 呼出侧自己建 DataChannel
+      // Outgoing call侧自己建 DataChannel
       if (this.session && !this.isCallee) {
         try { this.dc = pc.createDataChannel('nsbc-chat'); this.bindDC(); } catch(_) {}
       }
 
-      // ★★★ 来电路径关键兜底（与 nsbc-phone.js 同步）★★★
+      // ★★★ Incoming路径关Key兜底（与 nsbc-phone.js 同步）★★★
       // JsSIP answer() 内部先 pc.setRemoteDescription(invite.sdp) → 浏览器触发 ontrack
-      // 然后才 emit('peerconnection') → _attachPC 注册 ontrack — 时序反了！
-      // 注册完 ontrack 后立即扫一遍已有的 receivers，把漏掉的 track 补回来
+      // 然后才 emit('peerconnection') → _attachPC Register ontrack — 时序反了！
+      // Register完 ontrack 后立即扫一遍已有的 receivers，把漏掉的 track 补回来
       setTimeout(() => {
         const existing = pc.getReceivers().filter(r => r.track).length;
         const ours = this.remoteStream.getTracks().length;
@@ -312,10 +312,10 @@ app.component('webrtc-page', {
       }
     },
 
-    // ======== 注册 ========
+    // ======== Register ========
     async doRegister() {
       if (!window.JsSIP) { alert('JsSIP 未加载！检查 index.html script src'); return; }
-      this.regStatus = '连接中...'; this.regClass = 'text-yellow-600';
+      this.regStatus = t('Connect中...'); this.regClass = 'text-yellow-600';
 
       try {
         const socket = new JsSIP.WebSocketInterface(this.wssServer);
@@ -336,7 +336,7 @@ app.component('webrtc-page', {
 
         this.ua.on('registered', () => {
           this.registered = true;
-          this.regStatus = '✅ 已注册 ' + this.username;
+          this.regStatus = '✅ Registered ' + this.username;
           this.regClass = 'text-green-600';
           this.pushSipLog(`<span class="text-green-400">REGISTERED</span> as ${this.username}`);
           // ★ 预热 AudioContext——Register 是用户手势，能绕过 autoplay 策略
@@ -349,12 +349,12 @@ app.component('webrtc-page', {
         });
         this.ua.on('unregistered', () => {
           this.registered = false;
-          this.regStatus = '未注册';
+          this.regStatus = 'Not registered';
           this.regClass = 'text-gray-400';
           this.pushSipLog(`<span class="text-gray-400">UNREGISTERED</span>`);
         });
         this.ua.on('registrationFailed', (e) => {
-          this.regStatus = '❌ 注册失败';
+          this.regStatus = '❌ Register失败';
           this.regClass = 'text-red-500';
           this.pushSipLog(`<span class="text-red-500">REGISTRATION FAILED</span> ${e.cause}`);
         });
@@ -370,7 +370,7 @@ app.component('webrtc-page', {
           } catch(_) {}
         });
 
-        // ★ 统一 Session 事件绑定（来电路径 + 呼出路径都走这里）
+        // ★ 统一 Session 事件绑定（Incoming路径 + Outgoing call路径都走这里）
         const self = this;
         this.ua.on('newRTCSession', (e) => {
           const session = e.session;
@@ -384,7 +384,7 @@ app.component('webrtc-page', {
             self.startRing();
             self._bindSession(session, true);
             // ★ 兜底：JsSIP 在 newRTCSession 之前就已 emit peerconnection + setRemoteDescription
-            // session.on('peerconnection') 注册太晚 → attachPC 永远不调 → ontrack 丢失
+            // session.on('peerconnection') Register太晚 → attachPC 永远不调 → ontrack 丢失
             const incomingPC = session.connection;
             if (incomingPC) {
               self.pushSipLog(`📶 callee: pc 已存在 — 手动 attachPC 兜底`);
@@ -392,7 +392,7 @@ app.component('webrtc-page', {
             }
           } else {
             self.pushSipLog(`📤 OUTGOING to ${from}`);
-            // ★ 呼出也要存 session，振铃阶段能挂断
+            // ★ Outgoing call也要存 session，Ringing阶段能Hang up
             self.pendingSession = session;
             self._bindSession(session, false);
           }
@@ -431,14 +431,14 @@ app.component('webrtc-page', {
         this.stopRing();
         const org = e?.originator;
         this.pushSipLog(`📴 ended (originator=${org})`);
-        this.onCallEnd(org === 'remote' ? '对端挂断' : '本地挂断');
+        this.onCallEnd(org === 'remote' ? t('对端Hang up') : t('Local hangup'));
       });
       session.on('failed', (e) => {
         this.stopRing();
         this.pushSipLog(`<span class="text-red-500">❌ failed:</span> ${e.cause || ''}`);
         this.onCallEnd('失败: ' + (e.cause || ''));
       });
-      // ★ 来电路径也要绑 peerconnection——answer() 后 ontrack 在 confirmed 之前就触发，
+      // ★ Incoming路径也要绑 peerconnection——answer() 后 ontrack 在 confirmed 之前就触发，
       // 如果 _attachPC 晚于 ontrack → 远端 track 丢失 → 听不到对端声音。
       session.on('peerconnection', this._makeSessionHandlers(isCallee).peerconnection);
     },
@@ -448,11 +448,11 @@ app.component('webrtc-page', {
       try { if (this.ua) this.ua.stop(); } catch(_) {}
       this.ua = null;
       this.registered = false;
-      this.regStatus = '未注册';
+      this.regStatus = 'Not registered';
       this.regClass = 'text-gray-400';
     },
 
-    // ======== 呼出 ========
+    // ======== Outgoing call ========
     async doCall() {
       if (!this.ua) return;
       let target = this.target.trim();
@@ -476,7 +476,7 @@ app.component('webrtc-page', {
       }
 
       try {
-        // eventHandlers 提前绑定 peerconnection（解决呼出时序坑）
+        // eventHandlers 提前绑定 peerconnection（解决Outgoing call时序坑）
         this.ua.call(target, {
           mediaStream: this.localStream,
           pcConfig: PC_CONFIG,
@@ -487,7 +487,7 @@ app.component('webrtc-page', {
       }
     },
 
-    // ======== 接听 ========
+    // ======== Accept ========
     async doAccept() {
       if (!this.pendingSession) return;
       this.stopRing();
@@ -527,10 +527,10 @@ app.component('webrtc-page', {
       this.pushSipLog(`REJECTED`);
     },
 
-    // ======== 挂断 ========
+    // ======== Hang up ========
     doHangup() {
       this.stopRing();
-      if (this.isHangingUp) { this.pushSipLog(`⚠️ 挂断进行中`); return; }
+      if (this.isHangingUp) { this.pushSipLog(`⚠️ Hang up进行中`); return; }
       this.isHangingUp = true;
 
       this.pushSipLog(`📞 HANGUP REQ session=${!!this.session} pending=${!!this.pendingSession}`);
@@ -541,7 +541,7 @@ app.component('webrtc-page', {
         this.pushSipLog(`<span class="text-red-500">HANGUP FAIL:</span> ${e.message}`);
       }
       // 无论怎样都走清理（JsSIP 的 terminate 是异步的，ended 事件会再次调 onCallEnd——但 Vue 的终止幂等检查已兜底）
-      setTimeout(() => { this.onCallEnd('本地挂断'); this.isHangingUp = false; }, 500);
+      setTimeout(() => { this.onCallEnd('Local hangup'); this.isHangingUp = false; }, 500);
     },
 
     onCallEnd(reason) {
@@ -574,7 +574,7 @@ app.component('webrtc-page', {
       }
     },
 
-    // ======== 媒体 ========
+    // ======== Media ========
     async dumpMediaStats(pc, tag) {
       try {
         const stats = await pc.getStats();
@@ -642,14 +642,14 @@ app.component('webrtc-page', {
       this.dcMsg = '';
     },
 
-    // ======== 来电铃声（Web Audio API 合成，无需外部 mp3）========
-    // 经典两音振铃：440Hz + 480Hz，按 2s 开 / 4s 关循环
+    // ======== Incoming铃声（Web Audio API 合成，无需外部 mp3）========
+    // 经典两音Ringing：440Hz + 480Hz，按 2s 开 / 4s 关循环
     startRing() {
       if (this.ringPlaying) return;
       try {
         if (!this.ringCtx) {
-          // AudioContext 在用户手势后才能创建——首次来电时浏览器可能未注册，
-          // 先懒创建一次；如果被 autoplay 策略挂起，register 按钮的点击
+          // AudioContext 在用户手势后才能Create——首次Incoming时浏览器可能Not registered，
+          // 先懒Create一次；如果被 autoplay 策略挂起，register 按钮的点击
           // 手势会在下面 resume 兜底。
           try { this.ringCtx = new (window.AudioContext || window.webkitAudioContext)(); }
           catch(_) { /* 不支持 Web Audio API */ return; }

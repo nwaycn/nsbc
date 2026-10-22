@@ -1,4 +1,4 @@
-//! 路由聚合（REQ-WEB-004 MVP 子集）。
+//! Route aggregation (REQ-WEB-004 MVP subset).
 
 pub mod auth;
 pub mod billing;
@@ -27,7 +27,7 @@ pub mod trunks;
 
 #[cfg(test)]
 mod tests {
-    //! 路由 ↔ 核心客户端映射测试（不含鉴权/版本中间件；全链路在 main 测试）。
+    //! Route ↔ core client mapping tests (no auth/version middleware; full-link tests in main).
     use std::collections::BTreeMap;
     use std::net::SocketAddr;
     use std::sync::Arc;
@@ -53,6 +53,9 @@ mod tests {
             api_major: API_MAJOR,
             bind: SocketAddr::from(([127, 0, 0, 1], 0)),
             recording_root: std::path::PathBuf::from("/tmp/nsbc-test-recordings"),
+            data_pushed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            calls_tx: tokio::sync::broadcast::channel(256).0,
+            vad_tx:   tokio::sync::broadcast::channel(1024).0,
         });
         let app = Router::new()
             .merge(super::system::router::<MockCore>())
@@ -103,7 +106,7 @@ mod tests {
         let (s, b) = get(&app, "/metrics").await;
         assert_eq!(s, StatusCode::OK);
         assert!(b.contains(r#""nsbc_up":1.0"#), "body={b}");
-        // 每路由确实打到对应控制命令（无伪造/缓存）
+        // Each route must hit the matching control command (no spoofed/cached results)
         assert_eq!(
             cmds.lock().unwrap().as_slice(),
             ["version", "show calls", "show registrations", "stats"]
@@ -132,19 +135,19 @@ mod tests {
         let canned = BTreeMap::from([
             ("hangup:c1".to_string(), Ok("OK hungup c1\n".into())),
             ("hangup:gone".to_string(), Err(CoreError::NotFound("x".into()))),
-            // 无 "hangup:other" 也无通用 "hangup" → mock 回 Protocol → 502
+            // No "hangup:other" entry and no generic "hangup" entry → mock returns Protocol → 502
         ]);
         let (app, cmds) = api_router(canned);
         let (s, b) = post(&app, "/calls/c1/hangup").await;
         assert_eq!(s, StatusCode::OK);
-        // serde_json 未启用 preserve_order，键按字典序输出
+        // serde_json does not enable preserve_order — keys emit in dictionary order
         assert_eq!(b, r#"{"call_id":"c1","status":"hungup"}"#);
         let (s, b) = post(&app, "/calls/gone/hangup").await;
         assert_eq!(s, StatusCode::NOT_FOUND);
         assert!(b.contains("CALL_NOT_FOUND"), "body={b}");
         let (s, _b) = post(&app, "/calls/other/hangup").await;
         assert_eq!(s, StatusCode::BAD_GATEWAY);
-        // 超长 id（>=128）在路由层直接 400，不发控制命令
+        // Oversized id (>=128) → route layer 400 directly, never sends control command
         let longid = "a".repeat(128);
         let (s, _b) = post(&app, &format!("/calls/{longid}/hangup")).await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
@@ -183,13 +186,13 @@ ssrc_out=UNAVAILABLE vq=UNAVAILABLE\n".into()),
         let (s, b) = get(&app, "/calls/c1").await;
         assert_eq!(s, StatusCode::OK);
         assert!(b.contains(r#""state":"CONFIRMED""#), "body={b}");
-        // P0 媒体面无采集来源：字段为 null（非估算值）
+        // P0 media plane has no collection source: fields remain null (not estimated values)
         assert!(b.contains(r#""mode":null"#), "body={b}");
-        // 已结束/不存在 → 404
+        // Finished / non-existent → 404
         let (s, b) = get(&app, "/calls/gone").await;
         assert_eq!(s, StatusCode::NOT_FOUND);
         assert!(b.contains("CALL_NOT_FOUND"), "body={b}");
-        // 非法字符（空格/控制字符）与超长 → 400，不发控制命令
+        // Illegal characters (space/control) and oversized → 400, no command sent
         let (s, _) = get(&app, "/calls/bad%20id").await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
         let (s, _) = get(&app, &format!("/calls/{}", "a".repeat(128))).await;
@@ -221,17 +224,17 @@ ssrc_out=UNAVAILABLE vq=UNAVAILABLE\n".into()),
         assert_eq!(s, StatusCode::OK);
         assert!(b.contains(r#""key":"log.level""#), "body={b}");
         assert!(b.contains(r#""value":"6""#), "body={b}");
-        // 敏感键：value=null、secret=true（**** 不出边车）
+        // Sensitive keys: value=null, secret=true (**** does not leave the sidecar)
         let (s, b) = get(&app, "/config/db.password").await;
         assert_eq!(s, StatusCode::OK);
         assert!(b.contains(r#""secret":true"#), "body={b}");
         assert!(b.contains(r#""value":null"#), "body={b}");
         assert!(!b.contains("****"), "body={b}");
-        // 不存在 → 404
+        // Non-existent → 404
         let (s, b) = get(&app, "/config/missing.key").await;
         assert_eq!(s, StatusCode::NOT_FOUND);
         assert!(b.contains("CONFIG"), "body={b}");
-        // 非法键（空格/点起/连续点/超长）→ 400，不发命令
+        // Illegal keys (space / leading dot / consecutive dots / oversized) → 400, no command sent
         for bad in ["/config/bad%20key", "/config/.leading",
                     "/config/a..b", &format!("/config/{}", "k".repeat(128))]
         {
@@ -262,7 +265,7 @@ ssrc_out=UNAVAILABLE vq=UNAVAILABLE\n".into()),
         assert!(b.contains(r#""redacted":true"#), "body={b}");
         assert!(b.contains(r#""key":"log.level""#), "body={b}");
         assert!(b.contains(r#""value":"6""#), "body={b}");
-        // 敏感项：value=null/secret=true，**** 不出边车
+        // Sensitive items: value=null/secret=true, **** does not leave the sidecar
         assert!(b.contains(r#""key":"db.dsn""#), "body={b}");
         assert!(b.contains(r#""secret":true"#), "body={b}");
         assert!(!b.contains("****"), "body={b}");

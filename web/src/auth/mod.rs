@@ -1,15 +1,15 @@
-//! 认证基座（REQ-WEB-008 P0，W3a）。
+﻿//! Auth foundation (REQ-WEB-008 P0, W3a).
 //!
-//! 组成：
-//!   - [`accounts`]：本地账号（argon2id PHC），环境/文件装配，fail-closed
-//!   - [`tokens`]：HS256 紧凑 JWT 签发/校验（access 15min / refresh 8h 默认）
-//!   - [`sessions`]：refresh 服务端状态（轮转/重放检测）+ access 吊销表
+//! Composition:
+//!   - [`accounts`]: local accounts (argon2id PHC), env/file config, fail-closed
+//!   - [`tokens`]: HS256 compact JWT sign/verify (access 15min / refresh 8h by default)
+//!   - [`sessions`]: refresh server-side state (rotation/replay detection) + access revocation table
 //!
-//! W3b 增补：登录失败锁定 + login/refresh/API 三桶 per-IP 限流（limiter）、
-//! 独立 JSONL 安全审计（audit）、口令策略与 hash-password 运维子命令。
-//! 仍后置：历史口令/强制首登改密（需账号状态存储）、单 IP 连接数上限与
-//! 自动封禁（传输层）、OIDC/LDAP/TOTP（SRS 明示"可选"）、
-//! mTLS 证书身份映射（REQ-WEB-007）。
+//! W3b additions: login failure lockout + login/refresh/API three-bucket per-IP rate limiting (limiter),
+//! independent JSONL security audit (audit), password policy and hash-password ops subcommand.
+//! Still deferred: password history / mandatory first-login password change (needs account state storage), per-IP connection limit and
+//! auto-ban (transport layer), OIDC/LDAP/TOTP (SRS marked "optional"),
+//! mTLS certificate identity mapping (REQ-WEB-007).
 
 pub mod accounts;
 pub mod audit;
@@ -20,7 +20,7 @@ pub mod tokens;
 
 use std::time::Duration;
 
-// 模块内自用走私有 use；对外仅重导出路由层直接使用的白名单校验。
+// Internal private use within module; only re-exports whitelist validation directly used by routing layer.
 use accounts::AccountStore;
 use audit::AuditLog;
 use limiter::{AbuseGuard, Limits};
@@ -29,7 +29,7 @@ use tokens::{Claims, TokenSvc};
 pub use accounts::valid_username;
 pub use audit::PeerCtx;
 
-/// 与核心 L0/L1/L2 同口径（REQ-OAM-008）；数值即 JWT role 声明。
+/// Same scale as core L0/L1/L2 (REQ-OAM-008); value is the JWT role claim.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Role {
     L0 = 0,
@@ -69,11 +69,11 @@ impl Role {
     }
 }
 
-/// 鉴权后的请求身份（rbac 校验通过后注入 request extensions）。
+/// Authenticated request identity (injected into request extensions after rbac check passes).
 #[derive(Clone, Debug)]
 pub struct Identity(pub Claims);
 
-/// 认证域全部运行态组件，经 AppState 单字段注入。
+/// All runtime components of the auth domain, injected via a single AppState field.
 pub struct AuthSvc {
     pub accounts: AccountStore,
     pub tokens: TokenSvc,
@@ -85,15 +85,15 @@ pub struct AuthSvc {
 }
 
 impl AuthSvc {
-    /// 环境装配（fail-closed；任一安全配置缺失/非法即拒绝启动）：
-    /// - `NSBC_JWT_SECRET` 或 `NSBC_JWT_SECRET_FILE`（≥32 字节，二选一必填）
-    /// - `NSBC_AUTH_ACCOUNTS` 或 `NSBC_AUTH_FILE`（账号文本，可空=登录全拒）
-    /// - `NSBC_ACCESS_TTL_SECS`（默认 900）、`NSBC_REFRESH_TTL_SECS`（默认 28800）
-    /// - 锁定/限流：`NSBC_LOCKOUT_THRESHOLD`(5)/`NSBC_LOCKOUT_SECS`(900)/
+    /// Environment configuration (fail-closed; refuse to start if any security config is missing/invalid):
+    /// - `NSBC_JWT_SECRET` or `NSBC_JWT_SECRET_FILE` (>=32 bytes, one of them required)
+    /// - `NSBC_AUTH_ACCOUNTS` or `NSBC_AUTH_FILE` (account text, empty=all logins rejected)
+    /// - `NSBC_ACCESS_TTL_SECS` (default 900), `NSBC_REFRESH_TTL_SECS` (default 28800)
+    /// - Lockout/rate-limit: `NSBC_LOCKOUT_THRESHOLD`(5)/`NSBC_LOCKOUT_SECS`(900)/
     ///   `NSBC_RL_LOGIN_PER_MIN`(10)/`NSBC_RL_REFRESH_PER_MIN`(30)/
-    ///   `NSBC_RL_API_PER_MIN`(120)，阈值 0=关闭对应机制
-    /// - `NSBC_AUDIT_FILE`（审计 JSONL；空=关闭并 warn，生产必须配置）
-    /// - `NSBC_PASSWORD_MIN_LEN`（默认 12，下限钳 8）
+    ///   `NSBC_RL_API_PER_MIN`(120); threshold 0 disables the respective mechanism
+    /// - `NSBC_AUDIT_FILE` (audit JSONL; empty=disabled with warn, must be configured for production)
+    /// - `NSBC_PASSWORD_MIN_LEN` (default 12, floored to 8)
     pub fn from_env() -> Result<AuthSvc, String> {
         let secret = env_bytes_or_file("NSBC_JWT_SECRET", "NSBC_JWT_SECRET_FILE")?
             .ok_or_else(|| "set NSBC_JWT_SECRET or NSBC_JWT_SECRET_FILE (>=32 bytes)".to_string())?;
@@ -107,7 +107,7 @@ impl AuthSvc {
         Self::build_from_parts(secret, accounts)
     }
 
-    /// 从 WebConfig::AuthSection 构造（env > file > defaults）。
+    /// Construct from WebConfig::AuthSection (env > file > defaults).
     pub fn from_config(cfg: &super::config::AuthSection) -> Result<AuthSvc, String> {
         // JWT secret: env > cfg > fail
         let secret = env_bytes_or_file("NSBC_JWT_SECRET", "NSBC_JWT_SECRET_FILE")?;
@@ -130,7 +130,7 @@ impl AuthSvc {
         };
 
         let accounts = if accounts_text.trim().is_empty() {
-            // 默认账号注入——cfg 里的 default_*_pw 覆盖内置默认
+            // Default account injection — cfg default_*_pw overrides built-in defaults
             if let Some(pw) = std::env::var("NSBC_DEFAULT_ADMIN_PW").ok() {
                 std::env::set_var("NSBC_DEFAULT_ADMIN_PW", &pw);
             } else if !cfg.default_admin_pw.is_empty() {
@@ -212,7 +212,7 @@ impl AuthSvc {
         }
     }
 
-    /// 测试装配：给定账号文本与固定密钥、生产默认阈值（仅 cfg(test) 可见）。
+    /// Test config: given account text and fixed keys, production default thresholds (visible only in cfg(test)).
     #[cfg(test)]
     pub(crate) fn for_test(accounts_text: &str) -> AuthSvc {
         AuthSvc::build(accounts_text, Limits::default(), AuditLog::disabled())
@@ -224,7 +224,7 @@ impl AuthSvc {
     }
 }
 
-/// 取 `$env` 原始字节或 `$env_file` 指向文件的字节（仅去尾部换行，不动其他字符）。
+/// Read raw bytes from `$env` or from the file pointed to by `$env_file` (only strip trailing newlines, leave other chars untouched).
 fn env_bytes_or_file(env: &str, file_env: &str) -> Result<Option<Vec<u8>>, String> {
     if let Ok(v) = std::env::var(env) {
         return Ok(Some(v.into_bytes()));

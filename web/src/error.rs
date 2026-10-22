@@ -1,5 +1,5 @@
-//! 统一错误响应（REQ-WEB-009/020）：所有越界/鉴权失败返回结构化 JSON，
-//! 不泄漏内部细节（REQ-WEB-018 最小化）。
+﻿//! Unified error response (REQ-WEB-009/020): all boundary/auth failures return structured JSON,
+//! no internal details leaked (REQ-WEB-018 minimalization).
 use axum::http::header::RETRY_AFTER;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -8,49 +8,49 @@ use serde_json::json;
 
 #[derive(Debug)]
 pub enum ApiError {
-    /// API 主版本缺失或不受支持（fail-closed，REQ-WEB-020）
+    /// API major version missing or unsupported (fail-closed, REQ-WEB-020)
     VersionMismatch { got: Option<String>, supported: u32 },
-    /// 未认证（无身份/令牌缺失）
+    /// Unauthenticated (no identity / missing token)
     Unauthenticated,
-    /// 凭证错误（用户名/口令；不区分用户是否存在，REQ-WEB-018）
+    /// Bad credentials (username/password; do not distinguish whether user exists, REQ-WEB-018)
     BadCredentials,
-    /// 令牌非法（签名/结构/类型错、已吊销）
+    /// Invalid token (wrong signature/structure/type, or revoked)
     TokenInvalid,
-    /// 令牌已过期
+    /// Token expired
     TokenExpired,
-    /// refresh 令牌重放（已轮转/登出的 jti 再次出现，REQ-WEB-008）
+    /// Refresh token replay (rotated/logged-out jti seen again, REQ-WEB-008)
     TokenReplay,
-    /// 账号因连续登录失败被锁定（REQ-WEB-004/008 失败锁定）
+    /// Account locked due to consecutive login failures (REQ-WEB-004/008 failure lockout)
     AccountLocked,
-    /// 触发 per-IP 接口限流（REQ-WEB-009）；载荷=窗口剩余秒数（Retry-After）
+    /// Per-IP interface rate limit triggered (REQ-WEB-009); payload=remaining seconds in window (Retry-After)
     RateLimited { retry_after: u64 },
-    /// 已认证但角色不足（L0<L1<L2，REQ-OAM-008）
+    /// Authenticated but insufficient role (L0<L1<L2, REQ-OAM-008)
     Forbidden { required: &'static str },
 
-    /// 核心不可达 / I/O / 协议违例（REQ-WEB-014 容错：显式 502）
+    /// Core unreachable / I/O / protocol violation (REQ-WEB-014 fault tolerance: explicit 502)
     CoreUnavailable,
-    /// 核心控制面超时（REQ-WEB-014：显式 504，调用方可退避重试）
+    /// Core control-plane timeout (REQ-WEB-014: explicit 504, caller may backoff and retry)
     CoreTimeout,
-    /// 请求体/参数非法
+    /// Invalid request body/parameters
     BadRequest(String),
-    /// 目标呼叫不存在（如 hangup 已结束/错误的 Call-ID，REQ-OAM-004）；
-    /// 不携带/回显 Call-ID 原值（REQ-WEB-018 最小化）。
+    /// Target call does not exist (e.g. hangup on already-ended / wrong Call-ID, REQ-OAM-004);
+    /// original Call-ID not echoed back (REQ-WEB-018 minimalization).
     CallNotFound,
-    /// 配置键不存在（GET /config/{key}，REQ-CFG-011）；不回显键原值。
+    /// Config key not found (GET /config/{key}, REQ-CFG-011); do not echo original key value.
     ConfigKeyNotFound,
 
-    /// DB 持久化层未配置（NSBC_DB_DSN 缺失或连接池初始化失败）。
-    /// 所有依赖 DB 的端点（CDR/history）统一返回 503，与核心不可达显式区分。
+    /// DB persistence layer not configured (NSBC_DB_DSN missing or connection pool init failed).
+    /// All DB-dependent endpoints (CDR/history) return unified 503, explicitly distinguished from core unreachable.
     DbUnavailable,
-    /// DB 查询执行期错误（SQL 语法/约束/网络）；message 内部详细，
-    /// 不回显给客户端（REQ-WEB-018 最小化）。
+    /// DB query execution error (SQL syntax/constraint/network); detailed in internal message,
+    /// not echoed back to client (REQ-WEB-018 minimalization).
     Db(String),
 
-    /// 资源不存在（CRUD GET/PUT/DELETE 目标 id 未找到）。
+    /// Resource not found (CRUD GET/PUT/DELETE target id not found).
     NotFound(String),
-    /// 资源冲突（UNIQUE 约束冲突如 extension+realm 重复）。
+    /// Resource conflict (UNIQUE constraint violation, e.g. duplicate extension+realm).
     Conflict(String),
-    /// 服务暂时不可用（如验证码存储满、后端资源耗尽）。
+    /// Service temporarily unavailable (e.g. captcha store full, backend resources exhausted).
     ServiceUnavailable(String),
 }
 
@@ -58,7 +58,7 @@ impl From<crate::auth::tokens::TokenError> for ApiError {
     fn from(e: crate::auth::tokens::TokenError) -> Self {
         match e {
             crate::auth::tokens::TokenError::Expired => ApiError::TokenExpired,
-            // 结构错/签名错/类型混用 统一 401 TOKEN_INVALID，不区分细节（REQ-WEB-018）
+            // Malformed signature/structure/type all map to 401 TOKEN_INVALID; do not distinguish details (REQ-WEB-018)
             _ => ApiError::TokenInvalid,
         }
     }
@@ -69,8 +69,8 @@ impl From<crate::coreclient::CoreError> for ApiError {
         match e {
             crate::coreclient::CoreError::Timeout => ApiError::CoreTimeout,
             crate::coreclient::CoreError::NotFound(_) => ApiError::CallNotFound,
-            // 连接失败 / 流错误 / 协议不符 / 核心拒绝 / 平台不支持 → 502，
-            // 不把内部细节回传给客户端（REQ-WEB-018 最小化）。
+            // Connection failure / stream error / protocol mismatch / core rejection / platform unsupported -> 502,
+            // do not echo internal details to client (REQ-WEB-018 minimalization).
             _ => ApiError::CoreUnavailable,
         }
     }
@@ -78,7 +78,7 @@ impl From<crate::coreclient::CoreError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        // 元组第 4 项=Retry-After 秒（仅限流非零）。
+        // Tuple 4th element = Retry-After seconds (only for rate-limit non-zero).
         let (status, code, msg, retry_after) = match self {
             ApiError::VersionMismatch { got, supported } => (
                 StatusCode::BAD_REQUEST,
@@ -156,14 +156,14 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(d) => {
                 (StatusCode::BAD_REQUEST, "BAD_REQUEST", d, 0)
             }
-            // 不回显 Call-ID 原值（REQ-WEB-018 最小化）
+            // Do not echo original Call-ID (REQ-WEB-018 minimalization)
             ApiError::CallNotFound => (
                 StatusCode::NOT_FOUND,
                 "CALL_NOT_FOUND",
                 "active call not found or already terminated".to_string(),
                 0,
             ),
-            // 不回显配置键原值（REQ-WEB-018 最小化）
+            // Do not echo original config key (REQ-WEB-018 minimalization)
             ApiError::ConfigKeyNotFound => (
                 StatusCode::NOT_FOUND,
                 "CONFIG_KEY_NOT_FOUND",
@@ -177,7 +177,7 @@ impl IntoResponse for ApiError {
                 0,
             ),
             ApiError::Db(msg) => {
-                // 内部错误详情仅落日志，不回显给客户端（REQ-WEB-018 最小化）
+                // Internal error details only logged, not echoed to client (REQ-WEB-018 minimalization)
                 tracing::warn!(%msg, "db query failed");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,

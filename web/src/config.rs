@@ -1,17 +1,18 @@
-//! NSBC Web 配置加载（REQ-WEB-006）。
+//! NSBC Web configuration loading (REQ-WEB-006).
 //!
-//! 优先级：**环境变量 > 配置文件 > 内置默认**。
-//! 配置文件与 nsbcd 共享同一 YAML（默认 `./conf/nsbc.yaml` 或 `/etc/nsbc/nsbc.yaml`），
-//! 从中读取 `web:`、`auth:`、`db:`、`core:`、`audit:` 段；nsbcd 忽略这些段。
+//! Precedence: **environment variables > config file > built-in defaults**.
+//! The config file is shared with nsbcd (same YAML — default `./conf/nsbc.yaml` or
+//! `/etc/nsbc/nsbc.yaml`); web reads `web:`, `auth:`, `db:`, `core:`, `audit:` sections;
+//! nsbcd ignores these.
 //!
-//! 为什么 YAML 而不是 TOML：nsbcd 已用 YAML 配置（键值对风格如 `log.path`），
-//! 统一格式用户只需维护一份文件。
+//! Why YAML instead of TOML: nsbcd already uses YAML config (key/value style like
+//! `log.path`); a unified format means operators only need to maintain one file.
 
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-/// 完整 Web 配置（从 YAML 反序列化 + 环境变量覆盖）。
+/// Full Web configuration (deserialized from YAML + environment variable overrides).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct WebConfig {
@@ -44,38 +45,47 @@ impl Default for WebSection {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct TlsSection {
-    /// TLS 开关。开发测试建议 true（WebRTC 需 HTTPS），纯内网调试可临时 false。
+    /// TLS toggle. Recommend true for dev/test (WebRTC requires HTTPS); may be
+    /// temporarily set false for LAN-only debugging.
     pub enabled: bool,
-    /// 证书 PEM 路径（enable=true 时必填，除非 auto_generate=true）
+    /// Certificate PEM path (required when enabled=true, unless auto_generate=true)
     pub cert_path: PathBuf,
-    /// 私钥 PEM 路径
+    /// Private key PEM path
     pub key_path:  PathBuf,
-    /// 证书/私钥文件不存在时自动生成自签证书（开发便利，生产请手动配）
+    /// Auto-generate self-signed certs when cert/key files are missing (convenient for dev;
+    /// configure manually for production)
     pub auto_generate: bool,
-    /// 自签证书有效期（天）。默认 2（极短 + 后台自动续期，安全优先）
+    /// Self-signed cert validity (days). Default 2 (very short + auto background renewal,
+    /// security first).
     pub validity_days: u32,
-    /// 自签证书 SAN 列表（逗号分隔）；空=自动填 bind 的 host
+    /// Self-signed cert SAN list (comma-separated); empty = auto-fill with bind host
     pub san: String,
 
-    // ===== 公网 ACME 模式（experimental — 需 certmagic 依赖；当前 fallback 自签） =====
+    // ===== Public ACME mode (experimental — needs certmagic dependency; currently
+    // falls back to self-signed) =====
 
-    /// true = 启用公网 ACME 证书（Let's Encrypt/ZeroSSL）。需 public_ip + domain 可达 80/443。
-    /// false = 内网自签证书（默认）。
+    /// true = enable public ACME certs (Let's Encrypt/ZeroSSL). Requires public_ip + domain
+    /// reachable on 80/443.
+    /// false = LAN self-signed cert (default).
     pub public: bool,
-    /// 公网模式下的真实域名（如 "nsbc.example.com"）。public=true 时必填。
+    /// Real domain name for public mode (e.g. "nsbc.example.com"). Required when public=true.
     pub domain: String,
-    /// ACME 账户通知邮箱（Let's Encrypt 到期邮件、吊销通知等）。可空但建议填。
+    /// ACME account notification email (Let's Encrypt expiry mail, revocation notices, etc.).
+    /// May be empty but recommended.
     pub acme_email: String,
-    /// ACME 账户 + 证书缓存目录（避免每次重启都重新申请触发 rate limit）。
+    /// ACME account + certificate cache directory (prevents re-requesting on every restart,
+    /// which would trigger rate limits).
     pub acme_cache_dir: String,
-    /// true = 用 Let's Encrypt staging（测试时用，避免触发生产 5/week/domain 限制）
+    /// true = use Let's Encrypt staging (for testing, avoids hitting the production
+    /// 5/week/domain limit)
     pub acme_staging: bool,
 
-    // ===== 内部自签续期参数 =====
+    // ===== Internal self-signed renewal parameters =====
 
-    /// 后台续期检查间隔（秒）。默认 3600（1 小时查一次）。
+    /// Background renewal check interval (seconds). Default 3600 (checks once per hour).
     pub check_interval_secs: u64,
-    /// 证书距到期剩余小时数 ≤ 此值时触发重签。默认 24（2 天有效期 → 1 天就续）。
+    /// Trigger re-signing when hours remaining before expiry ≤ this value. Default 24
+    /// (2-day validity → renew when 1 day remains).
     pub renew_threshold_hours: u64,
 }
 
@@ -86,17 +96,17 @@ impl Default for TlsSection {
             cert_path:  "/etc/nsbc/web-cert.pem".into(),
             key_path:   "/etc/nsbc/web-key.pem".into(),
             auto_generate: true,
-            validity_days: 2,                      // 默认 2 天
+            validity_days: 2,                      // Default 2 days
             san: String::new(),
 
-            public: false,                          // 默认内网
+            public: false,                          // Default: LAN
             domain: String::new(),
             acme_email: String::new(),
             acme_cache_dir: "/var/lib/nsbc/acme-cache".into(),
             acme_staging: false,
 
             check_interval_secs: 3600,              // 1h
-            renew_threshold_hours: 24,              // 24h 前续
+            renew_threshold_hours: 24,              // Renew 24h before expiry
         }
     }
 }
@@ -104,7 +114,7 @@ impl Default for TlsSection {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct AuthSection {
-    /// 显式账号串（ROLE:user:PHC 分号分隔）；空=走默认账号注入
+    /// Explicit account string (ROLE:user:PHC, semicolon-separated); empty = inject defaults
     pub accounts:          String,
     pub default_admin_pw:  String,
     pub default_dev_pw:    String,
@@ -164,9 +174,10 @@ impl Default for AuditSection {
     fn default() -> Self { Self { file: String::new() } }
 }
 
-/// 录音根目录（nsbcd 写文件，nsbc-web 读文件给浏览器下载）。
-/// 从共享 YAML 的 `recording.path` 读取；默认 `/var/lib/nsbc/recordings`（与 C 侧 cfg_schema.c 对齐）。
-/// 支持相对路径（相对于 YAML 所在目录 resolve）。
+/// Recording root directory (nsbcd writes files; nsbc-web reads them to serve for
+/// browser download). Read from `recording.path` in the shared YAML; default
+/// `/var/lib/nsbc/recordings` (aligned with C-side cfg_schema.c).
+/// Supports relative paths (resolved relative to the YAML file directory).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct RecordingSection {
@@ -180,12 +191,14 @@ impl Default for RecordingSection {
 }
 
 impl WebConfig {
-    /// 加载配置：先找配置文件 → 相对路径 resolve 为绝对路径 → 环境变量覆盖。
+    /// Load configuration: find config file first → resolve relative paths to absolute →
+    /// then apply environment variable overrides.
     ///
-    /// **相对路径解析规则**：所有路径类字段如果是相对路径，都相对于 YAML 文件
-    /// 所在目录解析（不是进程 cwd）。这样整个部署目录可自由搬迁，YAML 不变。
+    /// **Relative path resolution rules**: every path field that is a relative path
+    /// is resolved relative to the YAML file directory (not the process cwd). This way the
+    /// entire deployment directory can be freely moved without changing the YAML.
     pub fn load(config_path: Option<&str>) -> Result<Self, String> {
-        // 1. 找配置文件
+        // 1. Find config file
         let found_path = find_config(config_path);
         let (mut cfg, cfg_dir) = match found_path {
             Some(p) => {
@@ -193,8 +206,8 @@ impl WebConfig {
                     .map_err(|e| format!("failed to read {}: {e}", p.display()))?;
                 let c: WebConfig = serde_yaml::from_str(&content)
                     .map_err(|e| format!("failed to parse {}: {e}", p.display()))?;
-                // YAML 所在目录（用于后续相对路径 resolve）
-                // 必须 canonicalize 掉 find_config 里拼出来的 ".."！
+                // YAML directory (used for subsequent relative path resolution)
+                // Must canonicalize the ".." concatenated paths from find_config!
                 let dir = p.parent()
                     .and_then(|d| std::fs::canonicalize(d).ok())
                     .unwrap_or_else(|| p.parent().map(|d| d.to_path_buf()).unwrap_or_default());
@@ -207,11 +220,11 @@ impl WebConfig {
             }
         };
 
-        // 2. 相对路径 → 绝对路径
+        // 2. Relative paths → absolute paths
         tracing::info!("🔧 [resolve] cfg_dir = {:?}", cfg_dir.as_ref().map(|d| d.display().to_string()));
 
-        // 拿 exe_dir（二进制所在目录）——recording.path 相对它解析，
-        // 其他路径相对 cfg_dir（YAML 所在目录）解析
+        // Get exe_dir (binary directory) — recording.path resolves relative to it,
+        // other paths resolve relative to cfg_dir (YAML directory)
         let exe_dir = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().and_then(|d| std::fs::canonicalize(d).ok()));
@@ -223,17 +236,18 @@ impl WebConfig {
             cfg.resolve_recording_path_only(edir);
         }
 
-        // 3. 环境变量覆盖（env > file，env 通常是绝对路径，不做 resolve）
+        // 3. Environment variable overrides (env > file; env values are typically absolute,
+        // so no resolve needed)
         let cfg = apply_env_overrides(cfg);
         tracing::info!("🔧 [resolve] after env override db.dsn = {:?}", cfg.db.dsn);
 
         Ok(cfg)
     }
 
-    /// 把路径类字段从相对路径 resolve 为绝对路径。
-    /// - tls / uds / audit / db.dsn  → 相对 cfg_dir（YAML 所在目录）
-    /// - recording.path              → 相对 exe_dir（nsbc-web 二进制所在目录）
-    ///                                  绝对路径原样返回
+    /// Resolve path-like fields from relative paths to absolute paths.
+    /// - tls / uds / audit / db.dsn  → relative to cfg_dir (YAML directory)
+    /// - recording.path              → relative to exe_dir (nsbc-web binary directory)
+    ///                                  absolute paths are returned unchanged
     fn resolve_relative_paths(
         &mut self,
         cfg_dir: &std::path::Path,
@@ -255,20 +269,20 @@ impl WebConfig {
             self.audit.file = resolve_string_path(&self.audit.file, cfg_dir);
         }
 
-        // DB dsn：sqlite:///xxx 里的路径部分
+        // DB dsn: the path portion inside sqlite:///xxx
         if !self.db.dsn.is_empty() {
             self.db.dsn = resolve_dsn_path(&self.db.dsn, cfg_dir);
         }
 
-        // 录音根目录 —— 相对 exe_dir（nsbc-web 二进制所在目录）
-        // 绝对路径原样返回（resolve_path 内部判断）
+        // Recording root directory — relative to exe_dir (nsbc-web binary directory)
+        // Absolute paths returned unchanged (resolve_path handles that internally)
         if !self.recording.path.is_empty() {
             let base = exe_dir.unwrap_or(cfg_dir);
             self.recording.path = resolve_string_path(&self.recording.path, base);
         }
     }
 
-    /// 无 YAML fallback（全默认值）时，只 resolve recording.path
+    /// When there is no YAML fallback (all defaults), only resolve recording.path
     fn resolve_recording_path_only(&mut self, exe_dir: &std::path::Path) {
         if !self.recording.path.is_empty() {
             self.recording.path = resolve_string_path(&self.recording.path, exe_dir);
@@ -282,9 +296,9 @@ impl WebConfig {
     }
 }
 
-/// 把相对路径 resolve 到绝对路径（相对 cfg_dir），**同时 normalize `..` 和 `.`**。
-/// cfg_dir 必须是已经 canonicalize 过的绝对路径。
-/// 绝对路径原样返回。空 Path 返回 cfg_dir 本身。
+/// Resolve a relative path to absolute (relative to cfg_dir), **also normalize `..` and `.`**.
+/// cfg_dir must be an already-canonicalized absolute path.
+/// Absolute paths are returned unchanged. An empty Path returns cfg_dir itself.
 fn resolve_path(p: &std::path::Path, cfg_dir: &std::path::Path) -> std::path::PathBuf {
     if p.as_os_str().is_empty() {
         return cfg_dir.to_path_buf();
@@ -293,7 +307,7 @@ fn resolve_path(p: &std::path::Path, cfg_dir: &std::path::Path) -> std::path::Pa
         return p.to_path_buf();
     }
 
-    // 手动 normalize：数开头有多少个 ../，cfg_dir 向上走同样多的级
+    // Manual normalize: count leading "../", walk up cfg_dir by that many levels
     let mut up = 0usize;
     let mut remaining = p.as_os_str().to_string_lossy().into_owned();
     while let Some(new) = remaining.strip_prefix("../") {
@@ -309,19 +323,19 @@ fn resolve_path(p: &std::path::Path, cfg_dir: &std::path::Path) -> std::path::Pa
     for _ in 0..up {
         match base.parent() {
             Some(parent) => base = parent.to_path_buf(),
-            None => break,  // 已经到根了
+            None => break,  // Already at root
         }
     }
     if remaining.is_empty() { base } else { base.join(&remaining) }
 }
 
-/// String 版路径解析（用于 audit.file 这类 String 字段）。
+/// String version of path resolution (for String fields like audit.file).
 fn resolve_string_path(s: &str, cfg_dir: &std::path::Path) -> String {
     let p = std::path::Path::new(s);
     resolve_path(p, cfg_dir).to_string_lossy().into_owned()
 }
 
-/// UDS socket 路径：支持 "unix:<path>" 和纯路径两种写法。
+/// UDS socket path: supports both "unix:<path>" and plain path forms.
 fn resolve_uds_path(s: &str, cfg_dir: &std::path::Path) -> String {
     if let Some(rest) = s.strip_prefix("unix:") {
         format!("unix:{}", resolve_string_path(rest, cfg_dir))
@@ -330,20 +344,20 @@ fn resolve_uds_path(s: &str, cfg_dir: &std::path::Path) -> String {
     }
 }
 
-/// SQLite DSN 路径解析：只 resolve 相对路径，绝对路径原样保留。
+/// SQLite DSN path resolution: only resolve relative paths; absolute paths kept as-is.
 ///
-/// 判断规则（**path_part 内容优先**，斜杠数仅作参考）：
+/// Judgment rules (**path_part content takes priority**, number of slashes is only a hint):
 ///
-///   需要 resolve（相对）:
-///     - path_part 以 "../" 或 "./" 开头，或等于 "."
-///     - path_part 包含 "/../" 或 "/./" 等中间 .. 组件
-///     - leading_slashes < 3（sqlite://rel/path 这种 2 斜杠写法）
+///   Needs resolution (relative):
+///     - path_part starts with "../" or "./", or equals "."
+///     - path_part contains "/../" or "/./" or similar intermediate ".." components
+///     - leading_slashes < 3 (like sqlite://rel/path with 2 slashes)
 ///
-///   不需要 resolve（纯绝对路径）:
-///     - leading_slashes ≥ 3 **且** path_part 不含 ".." 也不含 "."
-///       例：sqlite:///home/NSBC/web.db  → 原样保留
+///   Does NOT need resolution (pure absolute):
+///     - leading_slashes ≥ 3 **and** path_part contains neither ".." nor "."
+///       Example: sqlite:///home/NSBC/web.db  → kept unchanged
 ///
-///   输出统一：绝对路径 3 斜杠格式 sqlite:///abs/path
+///   Unified output: absolute paths get 3-slash format sqlite:///abs/path
 fn resolve_dsn_path(dsn: &str, cfg_dir: &std::path::Path) -> String {
     tracing::info!("🔧 [resolve_dsn_path] input dsn = {:?}, cfg_dir = {:?}", dsn, cfg_dir.display());
     if dsn.contains(":memory:") {
@@ -361,8 +375,8 @@ fn resolve_dsn_path(dsn: &str, cfg_dir: &std::path::Path) -> String {
             return dsn.to_string();
         }
 
-        // path_part 包含 .. 或 . → 必须 resolve（不管斜杠数）
-        // path_part 以 / 开头 → 纯绝对路径，直接补斜杠输出
+        // path_part contains .. or . → must resolve (regardless of slash count)
+        // path_part starts with / → pure absolute path, just add leading slashes
         let has_dotdot = path_part.contains("..");
         let has_dot    = path_part.contains('/') && path_part.contains("./");
         let is_rel     = has_dotdot || has_dot || leading_slashes < 3;
@@ -371,13 +385,14 @@ fn resolve_dsn_path(dsn: &str, cfg_dir: &std::path::Path) -> String {
                        has_dotdot, has_dot, leading_slashes, is_rel);
 
         if is_rel {
-            // 相对路径 resolve 成绝对路径（resolve_string_path 返回带前导 / 的绝对路径）
+            // Resolve relative path to absolute (resolve_string_path returns absolute with
+            // leading /)
             let resolved = resolve_string_path(path_part, cfg_dir);
             let out = format!("sqlite://{}", resolved);
             tracing::info!("🔧 [resolve_dsn_path] → RELATIVE resolved to {:?}, output = {:?}", resolved, out);
             out
         } else {
-            // 纯绝对路径 → 统一输出 3 斜杠格式
+            // Pure absolute → unified 3-slash format
             let out = format!("sqlite:///{}", path_part);
             tracing::info!("🔧 [resolve_dsn_path] → ABSOLUTE passthrough, output = {:?}", out);
             out
@@ -388,13 +403,15 @@ fn resolve_dsn_path(dsn: &str, cfg_dir: &std::path::Path) -> String {
     }
 }
 
-/// 配置文件搜索顺序（与 nsbcd (C) 侧对齐，确保同级部署共用 conf/nsbc.yaml）：
-///   1. 显式 -c 参数
-///   2. <exe_dir>/conf/nsbc.yaml      ← 同级部署：nsbcd + nsbc-web + conf/ 都在同一目录
-///   3. <exe_dir>/../conf/nsbc.yaml   ← 兼容旧 web/ 子目录部署
-///   4. ./conf/nsbc.yaml              ← 当前工作目录
-///   5. /etc/nsbc/nsbc.yaml           ← 系统级 fallback
-///   6. None → 全部用内置默认值
+/// Config file search order (aligned with nsbcd (C) side, ensuring same-level deployment
+/// shares conf/nsbc.yaml):
+///   1. Explicit -c argument
+///   2. <exe_dir>/conf/nsbc.yaml      ← same-level deployment: nsbcd + nsbc-web + conf/ all
+///      in the same directory
+///   3. <exe_dir>/../conf/nsbc.yaml   ← backward compatibility with old web/ sub-dir deployment
+///   4. ./conf/nsbc.yaml              ← current working directory
+///   5. /etc/nsbc/nsbc.yaml           ← system-level fallback
+///   6. None → all built-in defaults
 fn find_config(explicit: Option<&str>) -> Option<PathBuf> {
     if let Some(p) = explicit {
         let pb = PathBuf::from(p);
@@ -403,21 +420,23 @@ fn find_config(explicit: Option<&str>) -> Option<PathBuf> {
         return None;
     }
 
-    // 2. exe_dir 相关路径（Rust std::env::current_exe 等价 C 的 /proc/self/exe）
+    // 2. exe_dir-related paths (Rust std::env::current_exe is equivalent to C's
+    // /proc/self/exe)
     let exe_candidates: Vec<PathBuf> = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .map(|exe_dir| {
             vec![
-                // 同级部署：exe_dir = /home/NSBC → /home/NSBC/conf/nsbc.yaml
+                // Same-level deployment: exe_dir = /home/NSBC → /home/NSBC/conf/nsbc.yaml
                 exe_dir.join("conf").join("nsbc.yaml"),
-                // 旧 web/ 子目录部署：exe_dir = /home/NSBC/web → /home/NSBC/web/../conf/nsbc.yaml
+                // Old web/ sub-dir deployment: exe_dir = /home/NSBC/web →
+                // /home/NSBC/web/../conf/nsbc.yaml
                 exe_dir.join("..").join("conf").join("nsbc.yaml"),
             ]
         })
         .unwrap_or_default();
 
-    // 3+4+5. 相对路径 + 系统级 fallback
+    // 3+4+5. Relative paths + system-level fallback
     let mut candidates: Vec<PathBuf> = exe_candidates;
     candidates.push(PathBuf::from("./conf/nsbc.yaml"));
     candidates.push(PathBuf::from("/etc/nsbc/nsbc.yaml"));
@@ -428,8 +447,8 @@ fn find_config(explicit: Option<&str>) -> Option<PathBuf> {
     None
 }
 
-/// 环境变量覆盖配置文件值（env > file）。
-/// 未设的 env 保持配置文件值。
+/// Environment variable overrides for config file values (env > file).
+/// Unset env vars keep the config file value.
 fn apply_env_overrides(mut cfg: WebConfig) -> WebConfig {
     // web.bind
     if let Ok(v) = std::env::var("NSBC_WEB_BIND") {

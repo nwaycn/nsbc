@@ -1,28 +1,31 @@
-//! Web→核心实时控制通道客户端（REQ-WEB-004 主，辅 REQ-WEB-013/014）。
+﻿//! Web→core realtime control channel client (REQ-WEB-004 primary, REQ-WEB-013/014 auxiliary).
 //!
-//! 唯一真实通道：核心 obs_control UNIX domain stream socket
-//! （cfg `oam.control_sock: unix:<path>`，文件权限 0600，仅本机特权账户）。
-//! 行文本协议，每帧以提示符 `nsbc> ` 结束：
-//!   连接横幅 : `NSBC <v> control interface (try 'help')\nnsbc> `
+//! The sole real channel: the core's obs_control UNIX domain stream socket
+//! (cfg `oam.control_sock: unix:<path>`, file mode 0600, privileged local account only).
+//! Line-text protocol, each frame terminated by prompt `nsbc> `:
+//!   Connect banner: `NSBC <v> control interface (try 'help')\nnsbc> `
 //!   `version`             → `nsbcd <v>\n`
 //!   `show calls`          → `active=N total=N failed=N\n`
-//!   `show channels`       → 每呼叫一行 `call a_callid=.. a_state=.. …`
-//!                           + 尾行 `channels=N truncated=0|1`
-//!   `uuid_dump <call-id>` → 逐 Leg `leg N state/proto/cseq/tags/media/…`
-//!                           SDP 段长度分帧（`leg N sdp_offer <len>` 后紧跟原字节）
-//!   `config.get <key>`    → 头行 `config key=.. layer=.. secret=0|1`
-//!                           + 值原文一行（敏感键 secret=1，值为 ****）
-//!   `config.export`       → 头行 `config-export keys=N redact=1`
-//!                           + 每键一行 `<dotted.key>: <value|****>`
+//!   `show channels`       → one line per call `call a_callid=.. a_state=.. …`
+//!                           + trailing summary line `channels=N truncated=0|1`
+//!   `uuid_dump <call-id>` → per-Leg `leg N state/proto/cseq/tags/media/…`
+//!                           SDP segment length-framed (`leg N sdp_offer <len>` followed
+//!                           by raw bytes)
+//!   `config.get <key>`    → header line `config key=.. layer=.. secret=0|1`
+//!                           + value on its own line (sensitive keys: secret=1, value is ****)
+//!   `config.export`       → header line `config-export keys=N redact=1`
+//!                           + one key per line `<dotted.key>: <value|****>`
 //!   `show registrations`  → `registrations=N\n`
-//!   `stats`               → Prometheus exposition（`# HELP/# TYPE` + `name value`）
-//! 核心拒绝时响应行以 `ERR` 起始。只读查询经 request()；写操作（挂断）
-//! 与需自分流 notfound 的只读命令（uuid_dump/config.get）用 send_cmd；
-//! config.set 等 Web 写入口暂不开放（P1 统一命令注册表+Idempotency-Key）。
+//!   `stats`               → Prometheus exposition (`# HELP/# TYPE` + `name value`)
+//! Core-side rejections start with an `ERR` line. Read-only queries go through request();
+//! write operations (hangup) and read-only commands that need their own notfound branching
+//! (uuid_dump/config.get) go through send_cmd; Web-side write entry points like config.set
+//! are not yet exposed (P1 unified command registry + Idempotency-Key).
 //!
-//! 容错（REQ-WEB-014）：连接 / I/O / 超时 / 协议错误显式分类，由路由映射为
-//! 502/504，边车不缓存、不伪造核心数据。所有解析均为纯函数，跨平台单测；
-//! UDS 传输仅 `cfg(unix)` 编译，Windows 开发机构建返回 [`CoreError::Unsupported`]。
+//! Fault tolerance (REQ-WEB-014): connect / I/O / timeout / protocol errors are explicitly
+//! classified; routes map them to 502/504. The sidecar does not cache or fabricate core data.
+//! All parsers are pure functions with cross-platform unit tests; UDS transport only compiles
+//! under `cfg(unix)`, Windows development builds return [`CoreError::Unsupported`].
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
@@ -31,35 +34,36 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-/// 核心控制口默认路径（与 configs/nsbc.yaml 的 oam.control_sock 一致）。
+/// Core control socket default path (matches configs/nsbc.yaml oam.control_sock).
 pub const DEFAULT_SOCK_PATH: &str = "/var/run/nsbc/control.sock";
 
 const PROMPT: &[u8] = b"nsbc> ";
-/// stats  exposition 核心侧上限 256KB，帧上限留足余量。
-/// 仅 cfg(unix) 传输读取路径使用，Windows 开发机构建无消费方。
+/// stats exposition capped at 256KB on the core side; frame limit leaves ample headroom.
+/// Only consumed by the cfg(unix) transport read path; Windows dev builds have no consumer.
 #[cfg_attr(not(unix), allow(dead_code))]
 const MAX_FRAME: usize = 512 * 1024;
 const DEFAULT_TIMEOUT_MS: u64 = 2000;
 
-/// 与核心控制面交互的错误分类（REQ-WEB-014）。
-/// Connect/Io/Timeout 仅由 cfg(unix) 真实传输构造；Windows 构建下分类仍由
-/// mock 单测与路由 502/504 映射覆盖，故非 unix 目标允许 dead_code。
+/// Error classification for core control-plane interaction (REQ-WEB-014).
+/// Connect/Io/Timeout are only constructed by the cfg(unix) real transport; under
+/// Windows builds the classification is still covered by mock unit tests and the
+/// route 502/504 mapping, so non-unix targets allow dead_code.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(not(unix), allow(dead_code))]
 pub enum CoreError {
-    /// 连接控制口失败（核心未起 / 权限不足 / 路径不存在）
+    /// Failed to connect to the control socket (core not running / permission denied / path absent)
     Connect(String),
-    /// 已连接后的流 I/O 失败（对端重置等）
+    /// Stream I/O failure after connect (peer reset, etc.)
     Io(String),
-    /// 单次请求超时
+    /// Single request timeout
     Timeout,
-    /// 目标对象不存在（如 hangup 的 Call-ID 已结束/不存在）→ HTTP 404
+    /// Target object not found (e.g. Call-ID for hangup already ended/absent) → HTTP 404
     NotFound(String),
-    /// 协议违例：帧不完整、UTF-8 非法、输出不符合契约
+    /// Protocol violation: truncated frame, invalid UTF-8, output did not match contract
     Protocol(String),
-    /// 核心返回 ERR 行
+    /// Core returned an ERR line
     CoreRejected(String),
-    /// 当前构建目标不支持该传输（Windows 无 UDS 控制口）
+    /// Current build target does not support this transport (Windows has no UDS control socket)
     Unsupported(&'static str),
 }
 
@@ -79,14 +83,14 @@ impl fmt::Display for CoreError {
 
 impl std::error::Error for CoreError {}
 
-/// `version` 响应。
+/// `version` response.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct VersionInfo {
-    /// 核心版本字符串（如 "2.5.5"）
+    /// Core version string (e.g. "2.5.5")
     pub core: String,
 }
 
-/// `show calls` 计数器（REQ-WEB-004 实时话务只读子集）。
+/// `show calls` counters (REQ-WEB-004 realtime traffic read-only subset).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct CallCounters {
     pub active: u64,
@@ -94,34 +98,35 @@ pub struct CallCounters {
     pub failed: u64,
 }
 
-/// 单条 dialplan Application（show apps 每行 "name  help"）。
-/// REQ-DP-APP-001 / REQ-AI-001：供前端 app_chain 编辑器下拉选择。
+/// Single dialplan Application (show apps per line "name  help").
+/// REQ-DP-APP-001 / REQ-AI-001: used by the front-end app_chain editor dropdown.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct AppInfo {
     pub name: String,
     pub help: String,
 }
 
-/// 单条 Codec 描述（show codecs 每行格式：name,pt,sample_rate,impl,fmtp）。
-/// 来源：核心侧 codec_registry 自注册条目；mod_codecs（G711/G729）、
-/// mod_av（G722/Opus/H264/VP8/VP9）、或未来 iLBC/AMR 模块 init 时填入。
+/// Single Codec description (show codecs per line: name,pt,sample_rate,impl,fmtp).
+/// Source: core-side codec_registry self-registered entries; mod_codecs (G711/G729),
+/// mod_av (G722/Opus/H264/VP8/VP9), or future iLBC/AMR modules fill them at init.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct CodecInfo {
-    /// 编解码名称，例 "PCMA" / "G729" / "G722" / "Opus" / "H264"
+    /// Codec name, e.g. "PCMA" / "G729" / "G722" / "Opus" / "H264"
     pub name: String,
-    /// RTP Payload Type（静态 0-95 或动态 96+）
+    /// RTP Payload Type (static 0-95 or dynamic 96+)
     pub pt: u8,
-    /// 采样率（Hz）：8000 / 16000 / 48000 / 90000（视频）
+    /// Sample rate (Hz): 8000 / 16000 / 48000 / 90000 (video)
     pub sample_rate: u32,
-    /// 注册模块名称，例 "mod_codecs" / "mod_av" — 帮助运维判断 codec 来自哪个 .so
+    /// Registering module name, e.g. "mod_codecs" / "mod_av" — helps ops judge which .so
+    /// provided this codec
     pub impl_module: String,
-    /// 可选 fmtp 默认值，例 "annexb=yes" / "maxplaybackrate=16000" / "packetization-mode=0"
+    /// Optional default fmtp, e.g. "annexb=yes" / "maxplaybackrate=16000" / "packetization-mode=0"
     pub fmtp_default: String,
-    /// 媒体类型："audio" / "video" — 前端分机编辑页按类型分组 codec 下拉
+    /// Media type: "audio" / "video" — front-end extension editor groups codec dropdown by type
     pub media_type: String,
 }
 
-/// 解析 show codecs 输出：
+/// Parse show codecs output:
 ///   codecs=N
 ///   NAME        PT  SRATE  IMPL        FMTP                       MEDIA
 ///   PCMA        8   8000   mod_codecs  -                          audio
@@ -135,16 +140,16 @@ fn parse_show_codecs(buf: &str) -> Vec<CodecInfo> {
         let trimmed = line.trim();
         if trimmed.is_empty() { continue; }
         if let Some(rest) = trimmed.strip_prefix("codecs=") {
-            // 头行 codecs=N
+            // Header line codecs=N
             if rest.trim().is_empty() { continue; }
             continue;
         }
-        // 跳过表头/提示行
+        // Skip header/prompt lines
         let low = trimmed.to_ascii_lowercase();
         if low.starts_with("name") || low.starts_with('(') { continue; }
 
-        // 5+ 空格分隔列：NAME PT SRATE IMPL FMTP MEDIA_TYPE
-        // 用 split_whitespace 再组合（FMTP 可含空格如 "annexb=yes"）
+        // 5+ space-separated columns: NAME PT SRATE IMPL FMTP MEDIA_TYPE
+        // Use split_whitespace then recombine (FMTP can contain spaces like "annexb=yes")
         let parts: Vec<&str> = trimmed.split_whitespace().collect();
         if parts.len() < 5 { continue; }
 
@@ -152,7 +157,7 @@ fn parse_show_codecs(buf: &str) -> Vec<CodecInfo> {
         let pt: u8 = match parts[1].parse() { Ok(v) => v, Err(_) => continue };
         let sample_rate: u32 = match parts[2].parse() { Ok(v) => v, Err(_) => continue };
         let impl_module = parts[3].to_string();
-        // MEDIA_TYPE 固定在最后一列；FMTP 为中间剩余列的拼接
+        // MEDIA_TYPE fixed at last column; FMTP is the concatenation of the middle columns
         let media_type = parts.last().unwrap_or(&"audio").to_string();
         let fmtp_default = if parts.len() >= 6 {
             parts[4..parts.len()-1].join(" ")
@@ -165,8 +170,8 @@ fn parse_show_codecs(buf: &str) -> Vec<CodecInfo> {
     out
 }
 
-/// 解析 show apps 输出：
-/// 头行 apps=N，后续每行 "name  help"（help 允许空）。
+/// Parse show apps output: header line apps=N, then each subsequent line "name  help"
+/// (help can be empty).
 fn parse_show_apps(buf: &str) -> Vec<AppInfo> {
     let mut out = Vec::new();
     for line in buf.lines() {
@@ -176,9 +181,9 @@ fn parse_show_apps(buf: &str) -> Vec<AppInfo> {
         }
         let trimmed = line.trim();
         if trimmed.is_empty() { continue; }
-        // 跳过括号提示 "(no app registry...)"
+        // Skip bracket prompt "(no app registry...)"
         if trimmed.starts_with('(') && trimmed.ends_with(')') { continue; }
-        // "name  help" — 按第一个双空格切；help 里可能含单空格
+        // "name  help" — split on the first double space; help may contain single spaces
         let mut parts = trimmed.splitn(2, "  ");
         let name = parts.next().unwrap_or("").trim().to_string();
         let help = parts.next().unwrap_or("").trim().to_string();
@@ -189,7 +194,7 @@ fn parse_show_apps(buf: &str) -> Vec<AppInfo> {
     out
 }
 
-/// 单条注册 binding（show registrations 每行）。
+/// Single registration binding (show registrations per line).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct BindingEntry {
     pub aor: String,
@@ -198,8 +203,8 @@ pub struct BindingEntry {
     pub expires_sec: Option<i64>,
     pub alive_sec: Option<i64>,
     pub q: Option<i64>,
-    /* === NAT 元数据（REQ-NAT-001）===
-     * C 侧 obs_control.c cmd_reg_line_cb 输出：nat=N transport=X received_ip=X received_port=N pub_contact=X */
+    /* === NAT metadata (REQ-NAT-001) ===
+     * C-side obs_control.c cmd_reg_line_cb output: nat=N transport=X received_ip=X received_port=N pub_contact=X */
     pub nat_detected: Option<i64>,
     pub transport: String,
     pub received_ip: String,
@@ -207,7 +212,7 @@ pub struct BindingEntry {
     pub public_contact: String,
 }
 
-/// `show registrations` 完整输出：每绑定一行 + 尾行汇总。
+/// `show registrations` full output: one line per binding + trailing summary line.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct RegistrationSummary {
     pub bindings: Vec<BindingEntry>,
@@ -215,9 +220,9 @@ pub struct RegistrationSummary {
     pub truncated: bool,
 }
 
-/// `config.get <key>` 生效值视图（REQ-CFG-011）。
-/// secret=true 时 value 恒为 None（核心 **** 脱敏，Web 不回显占位串）；
-/// layer 为命中配置层（default/system/env/profile/runtime/session）。
+/// Effective-value view of `config.get <key>` (REQ-CFG-011).
+/// When secret=true, value is always None (core side masks with ****; Web does not echo placeholders);
+/// layer indicates the matched config layer (default/system/env/profile/runtime/session).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ConfigValue {
     pub key: String,
@@ -226,8 +231,9 @@ pub struct ConfigValue {
     pub secret: bool,
 }
 
-/// `config.export` 全量快照中的单键项（REQ-CFG-013）。
-/// 脱敏导出下 secret=true 时 value 恒为 None（核心 ****，占位串不出边车）。
+/// Single key item in the full `config.export` snapshot (REQ-CFG-013).
+/// When secret=true under desensitized export, value is always None (core side masks with ****;
+/// placeholders do not leave the sidecar).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ConfigExportItem {
     pub key: String,
@@ -235,15 +241,15 @@ pub struct ConfigExportItem {
     pub secret: bool,
 }
 
-/// `config.export` 脱敏全量生效视图（GET /config）。
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+/// Desensitized full effective view of `config.export` (GET /config).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct ConfigExport {
     pub redacted: bool,
     pub items: Vec<ConfigExportItem>,
 }
 
-/// `show channels` 单行：一个在途呼叫的 A/B Leg 摘要（REQ-OAM-007）。
-/// 缺腿（如 originate 仅 B 腿在轮）或核心未采集字段为 None。
+/// `show channels` single row: A/B Leg summary of one in-progress call (REQ-OAM-007).
+/// Missing legs (e.g. originate with only B leg in the round) or fields not collected by core are None.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct CallSummary {
     pub a_call_id: Option<String>,
@@ -262,26 +268,29 @@ pub struct CallSummary {
     pub mos_x1000: Option<i32>,
 }
 
-/// `show channels` 全量快照；truncated=true 表示核心侧缓冲不足、尾部被截。
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+/// Full `show channels` snapshot (REQ-OAM-007: L0 read-only). `truncated=true` means
+/// the core-side buffer was insufficient and the tail was clipped; the caller must
+/// surface this to the front-end so operators know the list is partial.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct CallList {
     pub calls: Vec<CallSummary>,
     pub truncated: bool,
 }
 
-/// 单 Leg 媒体面视图（REQ-OBS-010）。None = 核心无采集来源（UNAVAILABLE，
-/// 如 P0 媒体未回挂 b2b 或 bypass 腿不经本设备），严禁以估算值填充。
+/// Single Leg media plane view (REQ-OBS-010). None = core has no collection source
+/// (UNAVAILABLE, e.g. P0 media did not yet attach to b2b or a bypass leg does not transit
+/// through this device); strictly forbidden to fill with estimated values.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct LegMedia {
     pub mode: Option<String>,
     pub gate: Option<String>,
     pub ssrc_in: Option<String>,
     pub ssrc_out: Option<String>,
-    /// 丢包/抖动/RTT/R-Factor/MOS 等 VQ 集合（P0 一律 None）。
+    /// Packet loss/jitter/RTT/R-Factor/MOS and other VQ metrics (P0 always None).
     pub vq: Option<String>,
 }
 
-/// `uuid_dump` 的单 Leg 明细：FSM/传输/CSeq/tag + 协商 SDP 原文 + 媒体视图。
+/// Single Leg detail from `uuid_dump`: FSM/transport/CSeq/tag + negotiated SDP raw + media view.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct LegDump {
     pub leg: u8,
@@ -297,8 +306,8 @@ pub struct LegDump {
     pub media: LegMedia,
 }
 
-/// `uuid_dump <call-id>` 双侧 Leg 诊断（REQ-OBS-010：不另造 ID，以
-/// A/B Leg Call-ID 为锚点；bypass/未接字段经 LegMedia=None 如实表达）。
+/// `uuid_dump <call-id>` dual-leg diagnosis (REQ-OBS-010: does not create a separate ID,
+/// anchored on A/B Leg Call-ID; bypass/unconnected fields are expressed truthfully via LegMedia=None).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct CallDetail {
     pub a_call_id: Option<String>,
@@ -308,22 +317,23 @@ pub struct CallDetail {
     pub legs: Vec<LegDump>,
 }
 
-/// `stats` 的 Prometheus exposition 快照：`指标名 → 值`。
-/// 当前核心指标均为 gauge 且无 label；带 `{...}` label 的采样按指标名聚合
-/// （同名最后一条生效），供仪表盘只读展示。权威计数仍以专用命令为准。
+/// `stats` Prometheus exposition snapshot: `metric_name -> value`.
+/// Current core metrics are all gauge with no labels; label-bearing `{...}` samples are
+/// aggregated by metric name (last occurrence wins), for read-only dashboard display.
+/// Authoritative counts still come from dedicated commands.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct MetricSnapshot(pub BTreeMap<String, f64>);
 
-/// `config.set` 响应。`changed=true` 表示核心侧实际修改了值；
-/// `changed=false` 表示键已存在新值（幂等成功，不算写入）。
+/// `config.set` response. `changed=true` means core actually modified the value;
+/// `changed=false` means the key already had the new value (idempotent success, not counted as a write).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ConfigSetResult {
     pub key: String,
     pub changed: bool,
 }
 
-/// 封禁/观察条目（`security.ban.list` 的 `ent` 行解析结果）。
-/// state: "ban"=封禁中（remaining_s>0）；"watch"=窗口内计数未达阈值。
+/// Ban/watch entry (parsed from the `ent` lines of `security.ban.list`).
+/// state: "ban" = banned (remaining_s>0); "watch" = count in window has not reached threshold.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct BanEntry {
     pub ip: String,
@@ -333,9 +343,9 @@ pub struct BanEntry {
     pub act_ago_s: u64,
 }
 
-/// 解析 `security.ban.list [filter]` 响应帧：
-/// 每条一行 `ent ip=X state=ban|watch fails=N remaining_s=N act_ago_s=N`，
-/// 尾行 `bans=N shown=M total=K`（跳过）；ERR 前缀 → CoreRejected。
+/// Parse `security.ban.list [filter]` response frame:
+/// each line is `ent ip=X state=ban|watch fails=N remaining_s=N act_ago_s=N`,
+/// trailing line `bans=N shown=M total=K` (skipped); ERR prefix -> CoreRejected.
 pub fn parse_ban_list(body: &str) -> Result<Vec<BanEntry>, CoreError> {
     let mut out = Vec::new();
     for line in body.lines() {
@@ -365,8 +375,8 @@ pub fn parse_ban_list(body: &str) -> Result<Vec<BanEntry>, CoreError> {
     Ok(out)
 }
 
-/// 核心侧最近 CDR（`cdr.recent` 命令输出单行的解析结果）。
-/// 字段与 cdr_event_t 一一对齐；`end_ms/billsec/duration_s` 等未应答时为 0。
+/// Recent CDR from core (parsed single-line output of `cdr.recent` command).
+/// Fields align 1:1 with cdr_event_t; `end_ms/billsec/duration_s` etc. are 0 when unanswered.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct CdrEvent {
     pub call_id: String,
@@ -385,7 +395,7 @@ pub struct CdrEvent {
     pub duration_s: u32,
     pub cause: i32,
     pub emergency: bool,
-    /* ---- 网络端点 + codec（与 cdr_event_t 一一对齐）---- */
+    /* ---- network endpoint + codec (aligns 1:1 with cdr_event_t) ---- */
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_ip: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -398,9 +408,9 @@ pub struct CdrEvent {
     pub codec_b: Option<String>,
 }
 
-/// `status` 综合状态快照（L1，REQ-CCMD-001，核心 cmd_registry 新增命令）。
-/// 核心输出格式：`status active_calls=N total=N failed=N registrations=N
-/// profiles=N started_ago_ms=U\nalive=1`（首行键值对；`alive=1` 为末尾锚行）。
+/// `status` overall status snapshot (L1, REQ-CCMD-001, new command added by core cmd_registry).
+/// Core output format: `status active_calls=N total=N failed=N registrations=N
+/// profiles=N started_ago_ms=U\nalive=1` (first line key-value pairs; `alive=1` is trailing anchor line).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct StatusInfo {
     pub active_calls: u64,
@@ -411,7 +421,7 @@ pub struct StatusInfo {
     pub started_ago_ms: u64,
 }
 
-/// `show rates` 的单条费率（与 C 侧 rate_entry_t 对齐，REQ-OAM-009）。
+/// Single rate entry from `show rates` (aligns with C side rate_entry_t, REQ-OAM-009).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct RateEntry {
     pub prefix: String,
@@ -424,14 +434,14 @@ pub struct RateEntry {
     pub enabled: bool,
 }
 
-/// `show rates` 清单 + 汇总。
+/// `show rates` list + summary.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct RateList {
     pub rates: Vec<RateEntry>,
     pub total: i64,
 }
 
-/// `show balances` 的单条账户。
+/// Single account from `show balances`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct AccountBalance {
     pub key: String,
@@ -446,7 +456,7 @@ pub struct AccountList {
     pub total: i64,
 }
 
-/// `show transcode` 的单条活跃 bridge 会话（REQ-OAM-010）。
+/// Single active bridge session from `show transcode` (REQ-OAM-010).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct BridgeSession {
     pub idx: i64,
@@ -465,11 +475,11 @@ pub struct BridgeList {
     pub total: i64,
 }
 
-/// 核心控制面只读能力。泛型注入（而非 `dyn`），生产用 [`RealCore`]，
-/// 路由测试用 mock；无需 async-trait 等额外依赖。
+/// Core control-plane read-only capabilities. Generic injection (not `dyn`);
+/// production uses [`RealCore`], routing tests use mocks; no extra deps like async-trait needed.
 ///
-/// 返回显式声明为 `impl Future + Send`（而非裸 `async fn`）：axum handler 的
-/// Future 必须 Send，裸 RPITIT 不带 Send 约束会让泛型 handler 不满足 Handler。
+/// Return type explicitly declared as `impl Future + Send` (not bare `async fn`): axum handler's
+/// Future must be Send; bare RPITIT lacks Send constraint, causing generic handlers to not satisfy Handler.
 pub trait CoreApi: Send + Sync {
     fn version(&self) -> impl Future<Output = Result<VersionInfo, CoreError>> + Send;
     fn call_counters(
@@ -479,137 +489,137 @@ pub trait CoreApi: Send + Sync {
         &self,
     ) -> impl Future<Output = Result<RegistrationSummary, CoreError>> + Send;
     fn metrics(&self) -> impl Future<Output = Result<MetricSnapshot, CoreError>> + Send;
-    /// 在途呼叫清单（`show channels`，L0 只读，REQ-OAM-007）。
+    /// In-progress call list (`show channels`, L0 read-only, REQ-OAM-007).
     fn list_calls(
         &self,
     ) -> impl Future<Output = Result<CallList, CoreError>> + Send;
-    /// 单呼叫双侧 Leg 诊断（`uuid_dump <call-id>`，L0 只读，
-    /// REQ-OAM-007/010）：Call-ID 已结束/不存在 → [`CoreError::NotFound`]。
+    /// Single call dual-leg diagnosis (`uuid_dump <call-id>`, L0 read-only,
+    /// REQ-OAM-007/010): Call-ID ended/not found -> [`CoreError::NotFound`].
     fn call_detail(
         &self,
         call_id: &str,
     ) -> impl Future<Output = Result<CallDetail, CoreError>> + Send;
-    /// 单个配置键生效值（`config.get <key>`，L0 只读，REQ-CFG-011）：
-    /// 键不存在 → [`CoreError::NotFound`]；敏感键 value=None/secret=true。
+    /// Effective value of a single config key (`config.get <key>`, L0 read-only, REQ-CFG-011):
+    /// key not found -> [`CoreError::NotFound`]; sensitive keys value=None/secret=true.
     fn config_get(
         &self,
         key: &str,
     ) -> impl Future<Output = Result<ConfigValue, CoreError>> + Send;
-    /// 全量脱敏生效视图（`config.export`，L0 只读，REQ-CFG-013）：
-    /// 敏感键 value=None/secret=true；核心拒绝见 [`CoreError::CoreRejected`]。
+    /// Full desensitized effective view (`config.export`, L0 read-only, REQ-CFG-013):
+    /// sensitive keys value=None/secret=true; core rejection -> [`CoreError::CoreRejected`].
     fn config_export(&self)
         -> impl Future<Output = Result<ConfigExport, CoreError>> + Send;
-    /// 强制挂断（REQ-OAM-004，写操作/L1 审计）：成功 Ok；目标不存在
-    /// [`CoreError::NotFound`]；核心拒绝见 [`CoreError::CoreRejected`]。
+    /// Force hangup (REQ-OAM-004, write op / L1 audit): success Ok; target not found
+    /// [`CoreError::NotFound`]; core rejection -> [`CoreError::CoreRejected`].
     fn hangup(
         &self,
         call_id: &str,
     ) -> impl Future<Output = Result<(), CoreError>> + Send;
 
-    /// 拨号 Application 注册表（`show apps`，L0 只读，REQ-DP-APP-001/REQ-AI-001）。
-    /// 返回所有已注册的 dialplan app 列表（answer/ai/bridge/...），
-    /// 未加载 dialplan 模块返回空数组。核心侧用 `app_help` 逐行输出，
-    /// 格式 `name  help`，Web 侧解析转 JSON。 */
+    /// Dialplan Application registry (`show apps`, L0 read-only, REQ-DP-APP-001/REQ-AI-001).
+    /// Returns the list of all registered dialplan apps (answer/ai/bridge/...),
+    /// empty array when the dialplan module is not loaded. Core side uses `app_help` to output
+    /// each line in `name  help` format; Web parses into JSON. */
     fn dialplan_apps(&self)
         -> impl Future<Output = Result<Vec<AppInfo>, CoreError>> + Send;
 
-    /// 拉取核心侧 Codec 注册表（`show codecs`）。
-    /// W-06 动态 codec 列表路由；C 侧 codec_registry 自注册后
-    /// 所有 mod_codecs / mod_av / 未来 iLBC/AMR 初始化条目会自动显示。
-    /// 未加载任何 codec 模块返回空数组（非 CoreRejected）。
+    /// Pull codec registry from core side (`show codecs`).
+    /// W-06 dynamic codec list routing; once C side codec_registry self-registers,
+    /// all mod_codecs / mod_av / future iLBC/AMR init entries show up automatically.
+    /// Empty array when no codec module loaded (not CoreRejected).
     fn show_codecs(&self)
         -> impl Future<Output = Result<Vec<CodecInfo>, CoreError>> + Send;
 
-    /// 配置键热设置（`config.set <k> <v>`，L1，REQ-CFG-011，核心侧审计）。
-    /// 返回 `ConfigSetResult` 含 applied/changed 标志；核心拒绝见
-    /// [`CoreError::CoreRejected`]；键不存在/值非法等 → 核心 ERR。
+    /// Hot-set a config key (`config.set <k> <v>`, L1, REQ-CFG-011, core side audit).
+    /// Returns `ConfigSetResult` with applied/changed flags; core rejection ->
+    /// [`CoreError::CoreRejected`]; key not found / illegal value etc. -> core ERR.
     fn config_set(
         &self,
         key: &str,
         value: &str,
     ) -> impl Future<Output = Result<ConfigSetResult, CoreError>> + Send;
 
-    /// 配置键 dry-run 校验（`config.validate <k> <v>`，L0，REQ-CFG-011，不应用）。
-    /// Ok 表示键和值通过核心侧校验；核心拒绝见 [`CoreError::CoreRejected`]。
+    /// Dry-run validate a config key (`config.validate <k> <v>`, L0, REQ-CFG-011, not applied).
+    /// Ok means key and value passed core-side validation; core rejection -> [`CoreError::CoreRejected`].
     fn config_validate(
         &self,
         key: &str,
         value: &str,
     ) -> impl Future<Output = Result<(), CoreError>> + Send;
 
-    /// 拉取核心侧最近 CDR（`cdr.recent [N]`，REQ-OBS-006 P1）。
-    /// 单帧多行动态，尾部 `cdrs=N` 锚行；核心未实现 →
-    /// [`CoreError::CoreRejected`]（ERR unknown command）。
+    /// Pull recent CDR from core side (`cdr.recent [N]`, REQ-OBS-006 P1).
+    /// Multi-frame dynamic output, trailing `cdrs=N` anchor line; not implemented on core ->
+    /// [`CoreError::CoreRejected`] (ERR unknown command).
     fn cdr_recent(
         &self,
         limit: u32,
     ) -> impl Future<Output = Result<Vec<CdrEvent>, CoreError>> + Send;
 
-    // ===== 安全封禁管理（security.ban.* 命令）=====
+    // ===== Security ban management (security.ban.* commands) =====
 
-    /// `security.ban.list [filter]` — 封禁/观察条目（filter=IP 子串搜索）。
+    /// `security.ban.list [filter]` — ban/watch entries (filter=IP substring search).
     fn security_ban_list(
         &self,
         filter: &str,
     ) -> impl Future<Output = Result<Vec<BanEntry>, CoreError>> + Send;
 
-    /// `security.ban.unban <ip>` — 解禁（清除该 IP 全部计数与封禁状态）。
+    /// `security.ban.unban <ip>` — unban (clear all counts and ban state for that IP).
     fn security_ban_unban(
         &self,
         ip: &str,
     ) -> impl Future<Output = Result<(), CoreError>> + Send;
 
-    // ===== reload 命令（Web DB → C 内存，假期回来 C 侧实现 cmd_register）=====
+    // ===== reload commands (Web DB -> C memory, C side implements cmd_register) =====
 
-    /// `extensions.reload <json>` — 分机表全量替换。
+    /// `extensions.reload <json>` — full extension table replace.
     fn reload_extensions(
         &self,
         json: &str,
     ) -> impl Future<Output = Result<(), CoreError>> + Send;
 
-    /// `gateways.reload <json>` — 网关/路由组表全量替换。
+    /// `gateways.reload <json>` — full gateway/route group table replace.
     fn reload_gateways(
         &self,
         json: &str,
     ) -> impl Future<Output = Result<(), CoreError>> + Send;
 
-    /// `trunks.reload <json>` — 中继表全量替换。
+    /// `trunks.reload <json>` — full trunk table replace.
     fn reload_trunks(
         &self,
         json: &str,
     ) -> impl Future<Output = Result<(), CoreError>> + Send;
 
-    /// `dialplan-rules.reload <json>` — Dialplan 规则表全量替换。
+    /// `dialplan-rules.reload <json>` — full dialplan rules table replace.
     fn reload_dialplan_rules(
         &self,
         json: &str,
     ) -> impl Future<Output = Result<(), CoreError>> + Send;
 
-    /// `queues.reload <json>` — ACD 队列表全量替换（REQ-PBX-CC-002）。
+    /// `queues.reload <json>` — full ACD queue table replace (REQ-PBX-CC-002).
     fn reload_queues(
         &self,
         json: &str,
     ) -> impl Future<Output = Result<(), CoreError>> + Send;
 
-    /// `profiles.reload <json>` — SIP Profile 表 RCU 原子替换。
+    /// `profiles.reload <json>` — SIP Profile table RCU atomic replace.
     fn reload_sip_profiles(
         &self,
         json: &str,
     ) -> impl Future<Output = Result<(), CoreError>> + Send;
 
-    /// `security.blacklist.reload <json>` — 静态安全黑名单（IP CIDR/UA）整表替换。
+    /// `security.blacklist.reload <json>` — full static security blacklist (IP CIDR/UA) table replace.
     fn reload_security_blacklist(
         &self,
         json: &str,
     ) -> impl Future<Output = Result<(), CoreError>> + Send;
 
-    // ===== REQ-CCMD-001 命令增强：呼叫级 L2 写操作 + originate + status =====
+    // ===== REQ-CCMD-001 command enhancements: call-level L2 write ops + originate + status =====
 
-    /// 通用呼叫级写操作（uuid_kill/hold/transfer/record/answer/send_dtmf/
-    /// broadcast/break/bridge —— 走 cmd_registry 路由）。
-    /// `action` 映射为核心命令名（如 `"kill"` → `uuid_kill`），
-    /// `args` 拼接为后续空格分隔的参数。返回 Ok(()) 表示核心接受命令；
-    /// Call-ID 不存在 → [`CoreError::NotFound`]；核心拒绝 → [`CoreError::CoreRejected`]。
+    /// Generic call-level write op (uuid_kill/hold/transfer/record/answer/send_dtmf/
+    /// broadcast/break/bridge — routed via cmd_registry).
+    /// `action` maps to core command name (e.g. `"kill"` -> `uuid_kill`),
+    /// `args` concatenated into subsequent space-separated params. Returns Ok(()) if core accepted;
+    /// Call-ID not found -> [`CoreError::NotFound`]; core rejection -> [`CoreError::CoreRejected`].
     fn call_action(
         &self,
         call_id: &str,
@@ -617,67 +627,67 @@ pub trait CoreApi: Send + Sync {
         args: &[&str],
     ) -> impl Future<Output = Result<(), CoreError>> + Send;
 
-    /// `send_msg <call-id> <body>` —— 对话内发送 MESSAGE（REQ-SIP-MSG-001）。
-    /// 独立于 call_action 因为核心命令名无前缀、且 body 可含空格。
+    /// `send_msg <call-id> <body>` — send MESSAGE within a dialog (REQ-SIP-MSG-001).
+    /// Independent from call_action because core command name has no prefix, and body may contain spaces.
     fn send_message(
         &self,
         call_id: &str,
         body: &str,
     ) -> impl Future<Output = Result<(), CoreError>> + Send;
 
-    /// `originate <call-url>` — 发起新呼出（L2）。call-url 格式由 Dialplan
-    /// originate 命令定义（见命令增强.md REQ-CCMD-001）。核心接受 → Ok(())；
-    /// 参数非法/核心拒绝 → [`CoreError::CoreRejected`]。
+    /// `originate <call-url>` — initiate a new outbound call (L2). call-url format is defined by Dialplan
+    /// originate command (see command enhancement doc REQ-CCMD-001). Core accepts -> Ok(());
+    /// illegal params / core rejection -> [`CoreError::CoreRejected`].
     fn originate(
         &self,
         call_url: &str,
     ) -> impl Future<Output = Result<(), CoreError>> + Send;
 
-    /// `status` — 综合状态快照（L1，REQ-CCMD-001）。
+    /// `status` — overall status snapshot (L1, REQ-CCMD-001).
     fn status(
         &self,
     ) -> impl Future<Output = Result<StatusInfo, CoreError>> + Send;
 
-    // ===== REQ-OAM-009：计费管理只读 =====
+    // ===== REQ-OAM-009: billing management read-only =====
 
-    /// `show rates` — 列出所有费率条目（L0）。
+    /// `show rates` — list all rate entries (L0).
     fn show_rates(
         &self,
     ) -> impl Future<Output = Result<RateList, CoreError>> + Send;
 
-    /// `show balances` — 列出所有账户余额（L0）。
+    /// `show balances` — list all account balances (L0).
     fn show_balances(
         &self,
     ) -> impl Future<Output = Result<AccountList, CoreError>> + Send;
 
-    // ===== REQ-OAM-010：媒体 bridge 活跃会话 =====
+    // ===== REQ-OAM-010: media bridge active sessions =====
 
-    /// `show transcode` — 活跃 bridge/relay 会话清单（L0）。
+    /// `show transcode` — active bridge/relay session list (L0).
     fn show_transcode(
         &self,
     ) -> impl Future<Output = Result<BridgeList, CoreError>> + Send;
 
-    // ===== REQ-OAM-009：计费写命令（rate reload + account open/topup）=====
+    // ===== REQ-OAM-009: billing write commands (rate reload + account open/topup) =====
 
-    /// `rate.reload <json>` — 费率表全量替换（RCU 原子换指针）。
+    /// `rate.reload <json>` — full rate table replace (RCU atomic pointer swap).
     fn reload_rates(
         &self,
         json: &str,
     ) -> impl Future<Output = Result<(), CoreError>> + Send;
 
-    /// `rate.upsert <json>` — 单条费率条目 upsert（JSON 对象）。
+    /// `rate.upsert <json>` — single rate entry upsert (JSON object).
     fn rate_upsert_json(
         &self,
         json: &str,
     ) -> impl Future<Output = Result<(), CoreError>> + Send;
 
-    /// `rate.delete <prefix>` — 删除指定前缀的费率条目。
+    /// `rate.delete <prefix>` — delete rate entries matching a prefix.
     fn rate_delete(
         &self,
         prefix: &str,
     ) -> impl Future<Output = Result<(), CoreError>> + Send;
 
-    /// `account.open <key> <balance_uc> <credit_limit_uc>` — 开账户。
+    /// `account.open <key> <balance_uc> <credit_limit_uc>` — open account.
     fn account_open(
         &self,
         key: &str,
@@ -685,7 +695,7 @@ pub trait CoreApi: Send + Sync {
         credit_limit_uc: i64,
     ) -> impl Future<Output = Result<(), CoreError>> + Send;
 
-    /// `account.topup <key> <delta_uc>` — 账户充值（可为负=扣减）。
+    /// `account.topup <key> <delta_uc>` — account topup (can be negative = deduction).
     fn account_topup(
         &self,
         key: &str,
@@ -693,7 +703,7 @@ pub trait CoreApi: Send + Sync {
     ) -> impl Future<Output = Result<(), CoreError>> + Send;
 }
 
-/// 真实核心客户端：短连接（核心侧每命令独立帧），可廉价 Clone 共享配置。
+/// Real core client: short connection (each command is an independent frame on core side), cheap Clone for sharing config.
 #[derive(Clone, Debug)]
 pub struct RealCore {
     sock_path: PathBuf,
@@ -705,8 +715,8 @@ impl RealCore {
         Self { sock_path, timeout }
     }
 
-    /// 去掉 `unix:` 前缀 — config.rs 的 resolve_uds_path 会保留这个前缀，
-    /// 但 tokio::net::UnixStream::connect 需要的是纯文件路径。
+    /// Strip `unix:` prefix — config.rs resolve_uds_path keeps this prefix,
+    /// but tokio::net::UnixStream::connect needs the plain file path.
     fn to_path_buf(s: String) -> PathBuf {
         if let Some(rest) = s.strip_prefix("unix:") {
             PathBuf::from(rest)
@@ -715,8 +725,8 @@ impl RealCore {
         }
     }
 
-    /// 环境配置：`NSBC_CONTROL_SOCK`（默认 /var/run/nsbc/control.sock），
-    /// `NSBC_CORE_TIMEOUT_MS`（默认 2000ms，REQ-WEB-014）。
+    /// Env config: `NSBC_CONTROL_SOCK` (default /var/run/nsbc/control.sock),
+    /// `NSBC_CORE_TIMEOUT_MS` (default 2000ms, REQ-WEB-014).
     #[allow(dead_code)]
     pub fn from_env() -> Self {
         let sock_path = std::env::var("NSBC_CONTROL_SOCK")
@@ -730,8 +740,8 @@ impl RealCore {
         Self::new(sock_path, timeout)
     }
 
-    /// 从 WebConfig::CoreSection 构造（环境变量仍可覆盖 sock 路径）。
-    /// cfg.control_sock 可能带 `unix:` 前缀 — 统一剥掉。
+    /// Construct from WebConfig::CoreSection (env var may still override sock path).
+    /// cfg.control_sock may carry `unix:` prefix — strip uniformly.
     pub fn from_config(cfg: &super::config::CoreSection) -> Self {
         let sock_path = std::env::var("NSBC_CONTROL_SOCK")
             .map(Self::to_path_buf)
@@ -775,46 +785,46 @@ impl CoreApi for RealCore {
         )
     }
     async fn call_detail(&self, call_id: &str) -> Result<CallDetail, CoreError> {
-        // 同 hangup：notfound 要映射 404，用 send_cmd 不走统一 ERR 预判。
+        // Same as hangup: notfound must map to 404; use send_cmd, skip the unified ERR pre-check.
         let cmd = format!("uuid_dump {call_id}");
         let body = send_cmd(&self.sock_path, self.timeout, &cmd).await?;
         parse_call_detail(&body)
     }
     async fn config_get(&self, key: &str) -> Result<ConfigValue, CoreError> {
-        // 只读但需自分流 notfound→404（invalid key 由路由层先行拦截）。
+        // Read-only but must self-dispatch notfound -> 404 (invalid key is blocked earlier by routing layer).
         let cmd = format!("config.get {key}");
         let body = send_cmd(&self.sock_path, self.timeout, &cmd).await?;
         parse_config_value(&body)
     }
     async fn config_export(&self) -> Result<ConfigExport, CoreError> {
-        // 纯只读无 notfound 语义：ERR 统一交 request() 预判为 CoreRejected。
+        // Pure read-only with no notfound semantics: ERR is pre-checked as CoreRejected by request().
         parse_config_export(
             &request(&self.sock_path, self.timeout, "config.export").await?,
         )
     }
     async fn hangup(&self, call_id: &str) -> Result<(), CoreError> {
-        // 命令字符串先构造为 owned，await 期不借用入参；call_id 合法性
-        // （长度/字符集）由路由层与核心侧双重校验，传输层只负责忠实发送。
+        // Build command string as owned first so we do not borrow input params across await; call_id validity
+        // (length/charset) is validated twice by routing layer and core; transport layer only sends faithfully.
         let cmd = format!("hangup {call_id}");
         let body = send_cmd(&self.sock_path, self.timeout, &cmd).await?;
         parse_hangup(&body)
     }
     async fn dialplan_apps(&self) -> Result<Vec<AppInfo>, CoreError> {
-        // show apps → 头行 apps=N + 每行 "name  help"；未加载 dialplan 模块
-        // 时输出 "(no app registry ...)"，parse_show_apps 跳过它返回空数组。
+        // show apps -> header apps=N + each line "name  help"; when dialplan module is not loaded
+        // output is "(no app registry ...)", parse_show_apps skips it and returns empty array.
         let body = send_cmd(&self.sock_path, self.timeout, "show apps").await?;
         Ok(parse_show_apps(&body))
     }
     async fn show_codecs(&self) -> Result<Vec<CodecInfo>, CoreError> {
-        // show codecs → 头行 codecs=N + 每行 "NAME PT SRATE IMPL FMTP MEDIA"；
-        // 未加载 codec 模块时输出 "(no codec registry ...)"，parse_show_codecs
-        // 跳过它返回空数组。C 侧 codec_registry 自注册后条目自动显示。
+        // show codecs -> header codecs=N + each line "NAME PT SRATE IMPL FMTP MEDIA";
+        // when codec module not loaded output is "(no codec registry ...)", parse_show_codecs
+        // skips it and returns empty array. C side codec_registry self-registering entries auto-display.
         let body = send_cmd(&self.sock_path, self.timeout, "show codecs").await?;
         Ok(parse_show_codecs(&body))
     }
     async fn config_set(&self, key: &str, value: &str) -> Result<ConfigSetResult, CoreError> {
-        // split_kv 按第一个空格切分 key 与 value，值可含空格；
-        // 空值（删除语义）用 `config.set <key> ` 结尾一个空格表示。
+        // split_kv splits key from value at first space; value may contain spaces;
+        // Empty value (deletion) is expressed by a trailing space in `config.set <key> `.
         let cmd = format!("config.set {key} {value}");
         let body = send_cmd(&self.sock_path, self.timeout, &cmd).await?;
         parse_config_set(&body, key)
@@ -844,7 +854,7 @@ impl CoreApi for RealCore {
         if body.trim_start().starts_with("OK") {
             Ok(())
         } else {
-            // "ERR security.ban.unban ip=X not found" 等
+            // "ERR security.ban.unban ip=X not found" etc.
             let msg = body.trim().strip_prefix("ERR").unwrap_or(body.trim());
             Err(CoreError::CoreRejected(msg.trim().to_string()))
         }
@@ -885,7 +895,7 @@ impl CoreApi for RealCore {
         action: &str,
         args: &[&str],
     ) -> Result<(), CoreError> {
-        // 构造 `uuid_<action> <call_id> <args...>`
+        // Build `uuid_<action> <call_id> <args...>`
         let args_str = if args.is_empty() {
             String::new()
         } else {
@@ -901,8 +911,8 @@ impl CoreApi for RealCore {
     }
 
     async fn send_message(&self, call_id: &str, body: &str) -> Result<(), CoreError> {
-        // send_msg 命令格式：send_msg <call-id> <body>，body 可含空格，
-        // 故直接拼接（call_id 已由路由层校验合法字符集）。
+        // send_msg command format: send_msg <call-id> <body>, body may contain spaces,
+        // so just concatenate directly (call_id charset already validated by routing layer).
         let cmd = format!("send_msg {call_id} {body}");
         let resp = send_cmd(&self.sock_path, self.timeout, &cmd).await?;
         parse_call_action_ok_err(&resp, call_id)
@@ -955,7 +965,7 @@ impl CoreApi for RealCore {
     }
 }
 
-/// 发送单条命令并返回提示符之前的响应文本（已 trim、已分类 ERR 行）。
+/// Send a single command and return response text before the prompt (already trimmed, ERR lines already classified).
 async fn request(
     sock: &Path,
     timeout: Duration,
@@ -966,7 +976,7 @@ async fn request(
     Ok(body)
 }
 
-/// 仅取响应文本，不预判 ERR（写命令需要区分 ERR 语义，如 notfound→404）。
+/// Only fetch response text, do not pre-check ERR (write commands need to distinguish ERR semantics, e.g. notfound->404).
 async fn send_cmd(
     sock: &Path,
     timeout: Duration,
@@ -982,7 +992,7 @@ async fn send_cmd(
         .to_string())
 }
 
-/// UDS 传输（仅 unix 目标）：连接 → 排空连接横幅 → 发命令 → 读到下一提示符。
+/// UDS transport (unix targets only): connect -> drain connection banner -> send command -> read until next prompt.
 #[cfg(unix)]
 async fn request_raw(
     sock: &Path,
@@ -998,7 +1008,7 @@ async fn request_raw(
         Err(_) => return Err(CoreError::Timeout),
     };
 
-    // 横幅以首个提示符结束，排空但不解析（版本不一致不影响后续命令）。
+    // Banner ends at first prompt; drain but do not parse (version mismatch does not affect subsequent commands).
     let mut banner = Vec::new();
     read_until_prompt(&mut stream, timeout, &mut banner).await?;
 
@@ -1044,8 +1054,8 @@ async fn read_until_prompt<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
-/// 非 unix 目标（Windows 开发机）：传输不编译，显式 Unsupported，
-/// 解析层与路由逻辑仍可在本机构建和测试。
+/// Non-unix target (Windows dev machine): transport does not compile, explicitly Unsupported,
+/// parsing layer and routing logic can still build and test on this machine.
 #[cfg(not(unix))]
 async fn request_raw(
     _sock: &Path,
@@ -1057,7 +1067,7 @@ async fn request_raw(
     ))
 }
 
-/// 核心 `ERR ...` 行 → [`CoreError::CoreRejected`]。
+/// Core `ERR ...` line -> [`CoreError::CoreRejected`].
 fn check_rejected(body: &str) -> Result<(), CoreError> {
     for line in body.lines() {
         let t = line.trim();
@@ -1068,7 +1078,7 @@ fn check_rejected(body: &str) -> Result<(), CoreError> {
     Ok(())
 }
 
-/// 解析 `nsbcd <version>`。
+/// Parse `nsbcd <version>`.
 pub fn parse_version(body: &str) -> Result<VersionInfo, CoreError> {
     let line = body.lines().next().unwrap_or("").trim();
     let mut it = line.split_whitespace();
@@ -1080,7 +1090,7 @@ pub fn parse_version(body: &str) -> Result<VersionInfo, CoreError> {
     }
 }
 
-/// 从 `k=v k=v ...` 单行取一个 u64 键。
+/// Extract a u64 key from a single `k=v k=v ...` line.
 fn kv_u64(line: &str, key: &str) -> Option<u64> {
     line.split_whitespace()
         .filter_map(|tok| tok.split_once('='))
@@ -1088,7 +1098,7 @@ fn kv_u64(line: &str, key: &str) -> Option<u64> {
         .and_then(|(_, v)| v.parse::<u64>().ok())
 }
 
-/// 解析 `active=N total=N failed=N`（键序不敏感，缺一即协议错误）。
+/// Parse `active=N total=N failed=N` (key order insensitive; missing key is protocol error).
 pub fn parse_call_counters(body: &str) -> Result<CallCounters, CoreError> {
     let line = body.lines().next().unwrap_or("");
     match (
@@ -1105,8 +1115,8 @@ pub fn parse_call_counters(body: &str) -> Result<CallCounters, CoreError> {
     }
 }
 
-/// 解析 show registrations：每有效绑定一行 `reg k=v k=v ...`，
-/// 尾行 `registrations=N truncated=T`（channels=N 同模式）。
+/// Parse show registrations: one `reg k=v k=v ...` line per valid binding,
+/// trailing line `registrations=N truncated=T` (channels=N same pattern).
 pub fn parse_registrations(body: &str) -> Result<RegistrationSummary, CoreError> {
     let mut bindings = Vec::new();
     let mut total: u64 = 0;
@@ -1126,9 +1136,9 @@ pub fn parse_registrations(body: &str) -> Result<RegistrationSummary, CoreError>
                 q: kv_opt(toks.iter().copied(), "q")
                     .and_then(|v| v.parse::<i64>().ok())
                     .filter(|&v| v > 0),
-                /* REQ-NAT-001：NAT 元数据解析。旧版 C 核心可能还没输出这些字段，
-                 * kv_opt 返回 None → 各 String 字段 unwrap_or_default() 为空串，
-                 * 整数字段 None。前端展示用 Optional 安全处理。 */
+                /* REQ-NAT-001: NAT metadata parsing. Older C core may not yet emit these fields,
+                 * kv_opt returns None -> each String field unwrap_or_default() yields empty string,
+                 * integer fields become None. Frontend display handles them safely via Optional. */
                 nat_detected: kv_opt(toks.iter().copied(), "nat")
                     .and_then(|v| v.parse::<i64>().ok()),
                 transport: kv_opt(toks.iter().copied(), "transport").unwrap_or_default(),
@@ -1151,7 +1161,7 @@ pub fn parse_registrations(body: &str) -> Result<RegistrationSummary, CoreError>
         } else if line.is_empty() {
             continue;
         }
-        // 兼容旧版只输出 registrations=N（无 reg 行）
+        // Backward-compatible with old version that only outputs registrations=N (no reg lines)
         else if let Some(n) = kv_u64(line, "registrations") {
             total = n;
         }
@@ -1159,9 +1169,9 @@ pub fn parse_registrations(body: &str) -> Result<RegistrationSummary, CoreError>
     Ok(RegistrationSummary { bindings, registrations: total, truncated })
 }
 
-/// 解析 `hangup <call-id>` 响应帧（C 侧 obs_control cmd_hangup）：
+/// Parse `hangup <call-id>` response frame (C side obs_control cmd_hangup):
 /// `OK hungup [call-id]` → Ok(())；`ERR notfound` → [`CoreError::NotFound`]；
-/// 其余 `ERR ...` → [`CoreError::CoreRejected`]；不符契约 → Protocol。
+/// Any other `ERR ...` -> [`CoreError::CoreRejected`]; contract mismatch -> Protocol.
 pub fn parse_hangup(body: &str) -> Result<(), CoreError> {
     let line = body.lines().next().unwrap_or("").trim();
     if line == "OK hungup" || line.starts_with("OK hungup ") {
@@ -1175,8 +1185,8 @@ pub fn parse_hangup(body: &str) -> Result<(), CoreError> {
     }
 }
 
-/// 解析 `config.set <k> <v>` / `config.validate <k> <v>` 响应（C 侧 obs_control
-/// cmd_config_propose；见 src/oam/obs_control.c）：
+/// Parse `config.set <k> <v>` / `config.validate <k> <v>` response (C side obs_control
+/// cmd_config_propose; see src/oam/obs_control.c):
 ///   `OK set <key>` / `OK unchanged <key>` → Ok(ConfigSetResult{changed})
 ///   `ERR ...` → CoreRejected
 pub fn parse_config_set(body: &str, key: &str) -> Result<ConfigSetResult, CoreError> {
@@ -1187,7 +1197,7 @@ pub fn parse_config_set(body: &str, key: &str) -> Result<ConfigSetResult, CoreEr
     } else if let Some(rest) = line.strip_prefix("OK unchanged ") {
         Ok(ConfigSetResult { key: rest.trim().to_string(), changed: false })
     } else {
-        // 有些分支核心可能回 `OK set <key> <reason>`，先尝试宽松匹配
+        // Some core branches may return `OK set <key> <reason>`; try permissive match first
         if line.starts_with("OK set ") {
             let rest = line.strip_prefix("OK set ").unwrap_or("").trim();
             let reported_key = rest.split_whitespace().next().unwrap_or(key);
@@ -1202,7 +1212,7 @@ pub fn parse_config_set(body: &str, key: &str) -> Result<ConfigSetResult, CoreEr
     }
 }
 
-/// 解析 `config.validate <k> <v>` 响应：
+/// Parse `config.validate <k> <v>` response:
 ///   `OK` / `OK valid` → Ok(())
 ///   `ERR ...` → CoreRejected
 pub fn parse_config_validate(body: &str) -> Result<(), CoreError> {
@@ -1215,13 +1225,13 @@ pub fn parse_config_validate(body: &str) -> Result<(), CoreError> {
     }
 }
 
-/// 解析 `cdr.recent [N]` 响应帧（C 侧 obs_control cmd_cdr_recent，P1）：
-/// 头行可能为 `cdrs=N`（与 show channels 的 `channels=N truncated=0` 类似）；
-/// 每 CDR 一行，键值对：
+/// Parse `cdr.recent [N]` response frame (C side obs_control cmd_cdr_recent, P1):
+/// Header may be `cdrs=N` (similar to `channels=N truncated=0` from show channels);
+/// One CDR per line, key-value pairs:
 ///   `cdr call_id=X tenant=Y from=A to=B [trunk=T] [rec=R] dir=<in|out|int|unk>
 ///    phase=<start|answer|end> disp=<answered|noanswer|busy|failed|abandoned>
 ///    start_ms=U answer_ms=U end_ms=U billsec=U duration_s=U cause=N emergency=0|1`
-/// 尾部可能有 `cdrs=N` 汇总锚行；无 CDR 时仅 `cdrs=0`。
+/// Trailing `cdrs=N` summary anchor line possible; when no CDRs, only `cdrs=0`.
 pub fn parse_cdr_recent(body: &str) -> Result<Vec<CdrEvent>, CoreError> {
     let mut cdrs = Vec::new();
     for line in body.lines() {
@@ -1234,12 +1244,12 @@ pub fn parse_cdr_recent(body: &str) -> Result<Vec<CdrEvent>, CoreError> {
             let toks: Vec<&str> = rest.split_whitespace().collect();
             cdrs.push(parse_cdr_line(&toks)?);
         }
-        // `cdrs=N` 汇总行跳过（已逐行解析）
+        // Skip `cdrs=N` summary line (already parsed line by line)
     }
     Ok(cdrs)
 }
 
-/// 单行解析（`cdr` 前缀已剥，剩余 `k=v k=v ...` token 序列）。
+/// Single-line parsing (`cdr` prefix already stripped, remaining `k=v k=v ...` token sequence).
 fn parse_cdr_line(toks: &[&str]) -> Result<CdrEvent, CoreError> {
     let kv = |k: &str| kv_opt(toks.iter().copied(), k);
     let kvi64 = |k: &str| kv_opt(toks.iter().copied(), k).and_then(|v| v.parse::<i32>().ok());
@@ -1271,8 +1281,8 @@ fn parse_cdr_line(toks: &[&str]) -> Result<CdrEvent, CoreError> {
         duration_s: kvu32("duration_s"),
         cause: kvi64("cause").unwrap_or(0),
         emergency,
-        // codec/IP 扩展字段：`cdr.recent` 单行输出不带这些，用 Default 给 None
-        // UDS SESSION_END 完整 JSON 推送（write_cdr 链路）才会填
+        // codec/IP extension fields: single-line `cdr.recent` output does not include these, use Default for None
+        // Only populated by the full JSON push on UDS SESSION_END (write_cdr path)
         ..Default::default()
     })
 }
@@ -1283,12 +1293,12 @@ fn check_err_line(line: &str) -> Result<(), CoreError> {
     } else { Ok(()) }
 }
 
-/// 通用 uuid_* 呼叫级写操作 / originate 命令响应解析（核心 cmd_registry
-/// dispatch 输出）：
+/// Generic uuid_* call-level write op / originate command response parsing (core cmd_registry
+/// dispatch output):
 ///   `OK <action> [<detail>]` → Ok(())
 ///   `ERR notfound` / `ERR call-id not found` → [`CoreError::NotFound`]
 ///   `ERR ...` → [`CoreError::CoreRejected`]
-///   空响应 / 其他 → [`CoreError::Protocol`]
+///   empty response / other -> [`CoreError::Protocol`]
 pub fn parse_call_action_ok_err(body: &str, target: &str) -> Result<(), CoreError> {
     let line = body.lines().next().unwrap_or("").trim();
     if line.starts_with("OK") {
@@ -1304,11 +1314,11 @@ pub fn parse_call_action_ok_err(body: &str, target: &str) -> Result<(), CoreErro
     }
 }
 
-/// 解析 `status` 命令输出（REQ-CCMD-001 L1 只读）：
-/// 首行键值对 `status active_calls=N total=N failed=N registrations=N
-/// profiles=N started_ago_ms=U`（`status` 为命令行自身，核心输出不含命令名，
-/// 直接从 `active_calls=` 开始）；`alive=1` 为末尾锚行。
-/// 缺失字段默认 0（非必需），协议违例（空响应/无 alive 锚）返回 Protocol。
+/// Parse `status` command output (REQ-CCMD-001 L1 read-only):
+/// First line key-value pairs `status active_calls=N total=N failed=N registrations=N
+/// profiles=N started_ago_ms=U` (`status` is the command line itself; core output does not include the command name,
+/// directly starting from `active_calls=`); `alive=1` is the trailing anchor line.
+/// Missing fields default to 0 (non-required); protocol violation (empty response / no alive anchor) returns Protocol.
 pub fn parse_status(body: &str) -> Result<StatusInfo, CoreError> {
     let mut active_calls = 0u64;
     let mut total_calls = 0u64;
@@ -1328,7 +1338,7 @@ pub fn parse_status(body: &str) -> Result<StatusInfo, CoreError> {
             saw_alive = rest.starts_with('1');
             continue;
         }
-        // 键值对行：可能以 "status " 开头（命令 echo-back），剥离后统一处理
+        // Key-value pair line: may start with "status " (command echo-back); strip then process uniformly
         let stripped = line.strip_prefix("status ").unwrap_or(line);
         for tok in stripped.split_whitespace() {
             if let Some((k, v)) = tok.split_once('=') {
@@ -1340,7 +1350,7 @@ pub fn parse_status(body: &str) -> Result<StatusInfo, CoreError> {
                     "registrations" => registrations = parse_u(v),
                     "profiles" => profiles = parse_u(v),
                     "started_ago_ms" => started_ago_ms = parse_u(v),
-                    _ => {} // 未知键忽略，协议宽松
+                    _ => {} // unknown keys ignored, permissive protocol
                 }
             }
         }
@@ -1354,8 +1364,8 @@ pub fn parse_status(body: &str) -> Result<StatusInfo, CoreError> {
     })
 }
 
-/// 解析 `show rates` 帧（REQ-OAM-009）：
-/// 头行 `rates=N` + 每费率一行 `rate prefix=X name=Y price_per_min_uc=N
+/// Parse `show rates` frame (REQ-OAM-009):
+/// Header `rates=N` + one rate per line `rate prefix=X name=Y price_per_min_uc=N
 /// connect_fee_uc=F bill_inc_s=I min_bill_s=M initial_s=S enabled=B`。
 pub fn parse_show_rates(body: &str) -> Result<RateList, CoreError> {
     let mut rates = Vec::new();
@@ -1398,7 +1408,7 @@ pub fn parse_show_rates(body: &str) -> Result<RateList, CoreError> {
     Ok(RateList { rates, total })
 }
 
-/// 解析 `show balances` 帧：头行 `accounts=N` + 每行 `account key=K
+/// Parse `show balances` frame: header `accounts=N` + per-line `account key=K
 /// balance_uc=B reserved_uc=R credit_limit_uc=C`。
 pub fn parse_show_balances(body: &str) -> Result<AccountList, CoreError> {
     let mut accounts = Vec::new();
@@ -1434,7 +1444,7 @@ pub fn parse_show_balances(body: &str) -> Result<AccountList, CoreError> {
     Ok(AccountList { accounts, total })
 }
 
-/// 解析 `show transcode` 帧：头行 `sessions=N` + 每行 `bridge idx=I
+/// Parse `show transcode` frame: header `sessions=N` + per-line `bridge idx=I
 /// call_key=P mode=M a_rtp=A b_rtp=B pkts=N drops=D`。
 pub fn parse_show_transcode(body: &str) -> Result<BridgeList, CoreError> {
     let mut sessions = Vec::new();
@@ -1474,7 +1484,7 @@ pub fn parse_show_transcode(body: &str) -> Result<BridgeList, CoreError> {
     Ok(BridgeList { sessions, total })
 }
 
-/// 从 `k=v k=v ...` token 序列取一个字符串键；"-" 与缺失均视为 None。
+/// Extract a string key from `k=v k=v ...` token sequence; "-" and missing both treated as None.
 fn kv_opt<'a, I, S>(toks: I, key: &str) -> Option<String>
 where
     I: IntoIterator<Item = &'a S>,
@@ -1488,9 +1498,9 @@ where
         .map(str::to_string)
 }
 
-/// 解析 `show channels` 帧：
-/// `call a_callid=X a_state=S b_callid=Y b_state=S`（每呼叫一行，
-/// "-" → None）+ 尾行 `channels=N truncated=0|1`（协议锚点，缺一即错）。
+/// Parse `show channels` frame:
+/// `call a_callid=X a_state=S b_callid=Y b_state=S` (one line per call,
+/// "-" -> None) + trailing line `channels=N truncated=0|1` (protocol anchor; missing one is an error).
 pub fn parse_call_list(body: &str) -> Result<CallList, CoreError> {
     let mut calls = Vec::new();
     let mut summary = false;
@@ -1526,7 +1536,7 @@ pub fn parse_call_list(body: &str) -> Result<CallList, CoreError> {
                     .filter(|&v| v >= 0),
             });
         } else if let Some(rest) = line.strip_prefix("channels=") {
-            // channels=N truncated=T（同一尾行两个 k=v）
+            // channels=N truncated=T (two k=v on the same trailing line)
             let mut toks = rest.split_whitespace();
             if toks.next().and_then(|v| v.parse::<u64>().ok()).is_none() {
                 return Err(CoreError::Protocol(format!("bad channels: {body:?}")));
@@ -1544,10 +1554,10 @@ pub fn parse_call_list(body: &str) -> Result<CallList, CoreError> {
     Ok(CallList { calls, truncated })
 }
 
-/// 解析 `uuid_dump <call-id>` 帧（长度分帧，SDP 可含任意换行）：
-/// 头行 `call a_callid=.. a_state=.. b_callid=.. b_state=..`；
-/// 每 Leg：state/tags/media 三组键值行 + 可选 `leg N sdp_offer|sdp_answer <len>`
-/// 后紧跟 len 字节原文。媒体 UNAVAILABLE → None；notfound/ERR 显式分类。
+/// Parse `uuid_dump <call-id>` frame (length-framed, SDP may contain newlines):
+/// Header `call a_callid=.. a_state=.. b_callid=.. b_state=..`;
+/// Per leg: three groups of state/tags/media key-value lines + optional `leg N sdp_offer|sdp_answer <len>`
+/// followed immediately by len bytes of raw text. Media UNAVAILABLE -> None; notfound/ERR explicitly classified.
 pub fn parse_call_detail(body: &str) -> Result<CallDetail, CoreError> {
     let line0 = body.lines().next().unwrap_or("").trim();
     if line0 == "ERR notfound" {
@@ -1584,8 +1594,8 @@ pub fn parse_call_detail(body: &str) -> Result<CallDetail, CoreError> {
             ));
             pos = after_nl;
         } else if let Some(rest) = line.strip_prefix("leg ") {
-            // 行式：
-            //   N state=.. proto=.. reliable=B cseq=K routes=R（无指令词）
+            // Line format:
+            //   N state=.. proto=.. reliable=B cseq=K routes=R (no command keyword)
             //   N tags local=.. remote=..
             //   N media mode=.. gate=.. ssrc_in=.. ssrc_out=.. vq=..
             //   N sdp_offer|sdp_answer <len>
@@ -1596,7 +1606,7 @@ pub fn parse_call_detail(body: &str) -> Result<CallDetail, CoreError> {
                 .ok_or_else(|| CoreError::Protocol(format!("bad leg line: {line:?}")))?;
             let key = it.next().unwrap_or("");
             let rest_toks: Vec<&str> = it.collect();
-            // 状态行首 token 即 state=X；其余行首 token 为指令词。
+            // First token of state line is state=X; first token of remaining lines is a command keyword.
             if key.starts_with("state=") {
                 saw_leg = true;
                 let mut toks = vec![key];
@@ -1642,8 +1652,8 @@ pub fn parse_call_detail(body: &str) -> Result<CallDetail, CoreError> {
                 leg.local_tag = kv_opt(rest_toks.iter().copied(), "local");
                 leg.remote_tag = kv_opt(rest_toks.iter().copied(), "remote");
             } else if key == "media" {
-                // UNAVAILABLE = 核心无采集来源（P0 媒体面/ bypass Leg）→ null，
-                // 严禁映射为任何估算值。
+                // UNAVAILABLE = core has no source (P0 media plane / bypass leg) -> null,
+                // must not map to any estimated value.
                 let val = |k: &str| {
                     kv_opt(rest_toks.iter().copied(), k)
                         .filter(|v| v != "UNAVAILABLE")
@@ -1684,8 +1694,8 @@ pub fn parse_call_detail(body: &str) -> Result<CallDetail, CoreError> {
                 } else {
                     leg.answer = Some(raw);
                 }
-                // 核心在 SDP 原文后固定补一个 '\n' 分隔符（SDP 自身
-                // 末尾的 CRLF 计入 len，不属于分隔符）。
+                // Core always appends a '\n' separator after raw SDP (SDP itself
+                // trailing CRLF counts toward len, not part of separator).
                 pos = if end < bytes.len() && bytes[end] == b'\n' {
                     end + 1
                 } else {
@@ -1697,7 +1707,7 @@ pub fn parse_call_detail(body: &str) -> Result<CallDetail, CoreError> {
             }
             pos = after_nl;
         } else {
-            pos = after_nl; // 空行/未知行忽略
+            pos = after_nl; // blank/unknown lines skipped
         }
     }
 
@@ -1716,10 +1726,10 @@ pub fn parse_call_detail(body: &str) -> Result<CallDetail, CoreError> {
     })
 }
 
-/// 解析 `config.get <key>` 帧（两行）：
-/// `config key=<k> layer=<name> secret=<0|1>` + 值原文一行。
-/// 敏感键 secret=1：value=None（核心 **** 脱敏，占位串不向上泄漏）。
-/// 注：传输层对帧整体 trim，标量空值无法分帧（声明键均有默认值，不预期）。
+/// Parse `config.get <key>` frame (two lines):
+/// `config key=<k> layer=<name> secret=<0|1>` + one raw value line.
+/// Sensitive key secret=1: value=None (core **** redacted, placeholder does not leak upward).
+/// Note: transport trims the whole frame; scalar empty values cannot be framed (declared keys all have defaults, not expected).
 pub fn parse_config_value(body: &str) -> Result<ConfigValue, CoreError> {
     let line0 = body.lines().next().unwrap_or("").trim_end();
     if line0 == "ERR notfound" {
@@ -1752,10 +1762,10 @@ pub fn parse_config_value(body: &str) -> Result<ConfigValue, CoreError> {
     })
 }
 
-/// 解析 `config.export` 帧：首行 `config-export keys=N redact=1`，
-/// 其后每键一行 `<dotted.key>: <value|****>`（以首个 ':' 切分；值可含
-/// 空格/':'；空值行 `key:` 合法，值为空串）。`#` 注释行与空行跳过；
-/// **** 归 None/secret=true；声明键数与实际行数不符按协议违例处理。
+/// Parse `config.export` frame: header `config-export keys=N redact=1`,
+/// followed by one key per line `<dotted.key>: <value|****>` (split at first ':'; value may contain
+/// spaces/':'; empty-value line `key:` is valid, value is empty string). Skip `#` comments and blank lines;
+/// **** maps to None/secret=true; declared key count vs actual line count mismatch treated as protocol violation.
 pub fn parse_config_export(body: &str) -> Result<ConfigExport, CoreError> {
     let mut lines = body.lines();
     let head = lines.next().unwrap_or("").trim_end();
@@ -1778,8 +1788,8 @@ pub fn parse_config_export(body: &str) -> Result<ConfigExport, CoreError> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        /* 键字符集为 [A-Za-z0-9._-]，不含 ':'，故首个 ':' 即分隔符。
-         * 不能要求 ": "：空值行（如 ha.peer:）经 trim_end 后无尾空格。 */
+        /* Key charset is [A-Za-z0-9._-], does not contain ':', so first ':' is the delimiter.
+         * Do not require ": ": empty-value lines (e.g. ha.peer:) have no trailing space after trim_end. */
         let ci = line
             .find(':')
             .ok_or_else(|| CoreError::Protocol(format!("bad export line: {line:?}")))?;
@@ -1804,7 +1814,7 @@ pub fn parse_config_export(body: &str) -> Result<ConfigExport, CoreError> {
     Ok(ConfigExport { redacted, items })
 }
 
-/// 解析 Prometheus exposition 为 `name → value`；跳过注释/空行/非法采样。
+/// Parse Prometheus exposition into `name -> value`; skip comments/blank lines/illegal samples.
 pub fn parse_metrics(body: &str) -> MetricSnapshot {
     let mut out = BTreeMap::new();
     for line in body.lines() {
@@ -1832,7 +1842,7 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
-    // ---- 纯解析层：覆盖成功 / 缺键 / 非法 / ERR / 注释 / label ----
+    // ---- Pure parsing layer: covers success / missing key / illegal / ERR / comment / label ----
 
     #[test]
     fn version_ok() {
@@ -1901,7 +1911,7 @@ nsbc_bad notanumber
     #[test]
     fn metrics_labeled_sample_strips_braces() {
         let m = parse_metrics("nsbc_x{dir=\"in\"} 1.5\nnsbc_x{dir=\"out\"} 2.5\n");
-        // 同名 last-wins
+        // Same name last-wins
         assert_eq!(m.0.get("nsbc_x"), Some(&2.5));
     }
 
@@ -1960,7 +1970,7 @@ nsbc_bad notanumber
 
     #[test]
     fn cdr_recent_parses_full_frame() {
-        // 单行 CDR（避免 Rust 字符串字面值中 \n 造成的视觉混乱）。
+        // Single-line CDR (avoid visual clutter from \n inside Rust string literals).
         let body = "\
 cdrs=1\ncdr call_id=call-1@host tenant=acme from=alice@A to=bob@B trunk=out rec=/var/rec/call1.wav dir=out phase=end disp=answered start_ms=1700000000000 answer_ms=1700000005000 end_ms=1700000070000 billsec=65 duration_s=70 cause=16 emergency=0\ncdrs=1\n";
         let cdrs = parse_cdr_recent(body).unwrap();
@@ -2027,7 +2037,7 @@ channels=2 truncated=0
 
     #[test]
     fn call_detail_full_frame_with_framed_sdp() {
-        // offer 内含多行（含伪造 "leg 1" 行），长度分帧必须原样保留
+        // offer may contain multi-line content (including forged "leg 1" lines); length framing must be preserved verbatim
         let offer = "v=0\r\no=- 1 1 IN IP4 1.2.3.4\r\nleg 1 state=FORGED\r\n";
         let body = format!(
             "call a_callid=a@h a_state=CONFIRMED b_callid=b@h b_state=EARLY\n\
@@ -2073,8 +2083,8 @@ leg 1 media mode=UNAVAILABLE gate=UNAVAILABLE ssrc_in=UNAVAILABLE ssrc_out=UNAVA
             parse_call_detail("ERR invalid call-id\n"),
             Err(CoreError::CoreRejected(_))
         ));
-        assert!(parse_call_detail("weird\n").is_err()); // 无 call 头/leg
-        // SDP 段截断（声明长度超出帧）
+        assert!(parse_call_detail("weird\n").is_err()); // no call header/leg
+        // SDP segment truncated (declared length exceeds frame)
         let bad = "call a_callid=a a_state=IDLE b_callid=- b_state=-\n\
 leg 0 state=IDLE proto=udp reliable=0 cseq=1 routes=0\n\
 leg 0 sdp_offer 50\nabc\n";
@@ -2091,13 +2101,13 @@ leg 0 sdp_offer 50\nabc\n";
         assert_eq!(v.value.as_deref(), Some("6"));
         assert_eq!(v.layer, "system");
         assert!(!v.secret);
-        // 值含空白也按第二行原文保留（不做空白分词）
+        // Values with whitespace kept as raw second line (no whitespace tokenization)
         let v2 = parse_config_value(
             "config key=log.path layer=default secret=0\n/var/log/nsbc/x.log\n",
         )
         .unwrap();
         assert_eq!(v2.value.as_deref(), Some("/var/log/nsbc/x.log"));
-        // 敏感键：secret=1 → value=None（**** 占位不外泄）
+        // Sensitive key: secret=1 -> value=None (**** placeholder, do not leak)
         let s = parse_config_value(
             "config key=db.password layer=system secret=1\n****\n",
         )
@@ -2117,13 +2127,13 @@ leg 0 sdp_offer 50\nabc\n";
             parse_config_value("ERR invalid key\n"),
             Err(CoreError::CoreRejected(_))
         ));
-        assert!(parse_config_value("weird\n").is_err()); // 无 config 头
+        assert!(parse_config_value("weird\n").is_err()); // no config header
         assert!(parse_config_value("config key=k layer=system secret=0\n").is_err());
-        // 缺值行
+        // Missing value line
         assert!(parse_config_value(
             "config layer=system secret=0\n6\n"
         )
-        .is_err()); // 缺 key
+        .is_err()); // missing key
     }
 
     #[test]
@@ -2138,17 +2148,17 @@ leg 0 sdp_offer 50\nabc\n";
         assert_eq!(e.items[0].key, "log.level");
         assert_eq!(e.items[0].value.as_deref(), Some("6"));
         assert!(!e.items[0].secret);
-        // 值内空格/": " 取首个分隔符之后原文
+        // Spaces / ": " inside value: take the raw text after the first delimiter
         assert_eq!(e.items[1].value.as_deref(), Some("NSBC/2.5 extra"));
-        // 敏感键脱敏：null + secret=true，**** 不出边车
+        // Sensitive key redacted: null + secret=true, **** does not leave the sidecar
         assert_eq!(e.items[2].key, "db.dsn");
         assert_eq!(e.items[2].value, None);
         assert!(e.items[2].secret);
-        // 防御性跳过注释/空行（核心当前不发，解析器容忍）
+        // Defensive skip comments/blank lines (core does not currently emit, parser tolerates)
         let with_comment = "config-export keys=1 redact=1\n# note\n\nlog.level: 6\n";
         let e2 = parse_config_export(with_comment).unwrap();
         assert_eq!(e2.items.len(), 1);
-        // 空值行（真实核心 ha.peer: 无尾空格）必须解析为空串而非协议错误
+        // Empty-value line (real core ha.peer: no trailing space) must parse as empty string, not protocol error
         let empty_val = "config-export keys=2 redact=1\nha.enabled: false\nha.peer:\n";
         let e3 = parse_config_export(empty_val).unwrap();
         assert_eq!(e3.items.len(), 2);
@@ -2159,19 +2169,19 @@ leg 0 sdp_offer 50\nabc\n";
 
     #[test]
     fn config_export_errors() {
-        // 键数不符（声明 2 实际 1）
+        // Key count mismatch (declared 2, actual 1)
         assert!(parse_config_export("config-export keys=2 redact=1\nlog.level: 6\n").is_err());
-        // 坏帧头 / 缺 keys / 非数字
+        // Bad frame header / missing keys / non-numeric
         assert!(parse_config_export("weird\n").is_err());
         assert!(parse_config_export("config-export redact=1\nlog.level: 6\n").is_err());
         assert!(parse_config_export("config-export keys=x redact=1\n").is_err());
-        // 值行无 ": " 分隔
+        // Value line has no ": " separator
         assert!(parse_config_export("config-export keys=1 redact=1\nlog.level=6\n").is_err());
-        // ERR 帧（真实链路经 request() 已预判为 CoreRejected，解析器同样拒绝）
+        // ERR frame (real path pre-checked as CoreRejected via request(); parser also rejects)
         assert!(parse_config_export("ERR export failed\n").is_err());
     }
 
-    // ---- MockCore：路由层测试用，记录命令、回放罐装响应 ----
+    // ---- MockCore: used by routing-layer tests; records commands and replays canned responses ----
 
     #[derive(Clone, Default)]
     pub(crate) struct MockCore {
@@ -2213,7 +2223,7 @@ leg 0 sdp_offer 50\nabc\n";
                 .lock()
                 .unwrap()
                 .push(format!("uuid_dump {call_id}"));
-            // 罐装键 "uuid_dump:<id>"，缺失即 Protocol（测试必须显式罐装）。
+            // Canned key "uuid_dump:<id>"; missing -> Protocol (tests must explicitly can).
             let key = format!("uuid_dump:{call_id}");
             let canned = self
                 .canned
@@ -2243,7 +2253,7 @@ leg 0 sdp_offer 50\nabc\n";
                 .lock()
                 .unwrap()
                 .push(format!("hangup {call_id}"));
-            // 罐装键：优先 "hangup:<id>"（区分成功/404），退回通用 "hangup"。
+            // Canned keys: prefer "hangup:<id>" (distinguishes success/404), fallback to generic "hangup".
             let key = format!("hangup:{call_id}");
             let canned = self
                 .canned
@@ -2256,14 +2266,14 @@ leg 0 sdp_offer 50\nabc\n";
             parse_hangup(&canned?)
         }
         async fn dialplan_apps(&self) -> Result<Vec<AppInfo>, CoreError> {
-            // 罐装 "show apps" 返回；默认空数组（dialplan 模块未加载）
+            // Can "show apps" response; default empty array (dialplan module not loaded)
             let body = self
                 .record("show apps")
                 .unwrap_or_else(|_| "apps=0\n".to_string());
             Ok(parse_show_apps(&body))
         }
         async fn show_codecs(&self) -> Result<Vec<CodecInfo>, CoreError> {
-            // 罐装 "show codecs" 返回；默认空数组（codec 模块未加载）
+            // Can "show codecs" response; default empty array (codec module not loaded)
             let body = self
                 .record("show codecs")
                 .unwrap_or_else(|_| "codecs=0\n".to_string());
@@ -2394,7 +2404,7 @@ leg 0 sdp_offer 50\nabc\n";
                 format!("uuid_{action} {call_id} {args_str}")
             };
             self.calls.lock().unwrap().push(cmd.clone());
-            // 罐装键优先 "uuid_<action>:<id>" → 退回 "uuid_<action>"
+            // Canned key prefers "uuid_<action>:<id>" -> fallback to "uuid_<action>"
             let key_specific = format!("uuid_{action}:{call_id}");
             let canned = self
                 .canned
@@ -2493,7 +2503,7 @@ leg 0 sdp_offer 50\nabc\n";
         }
     }
 
-    /// 非 unix 目标：RealCore 必须显式 Unsupported 而非 panic（Windows 可测）。
+    /// Non-unix target: RealCore must explicitly return Unsupported instead of panicking (testable on Windows).
     #[cfg(not(unix))]
     #[tokio::test]
     async fn real_core_unsupported_on_windows() {

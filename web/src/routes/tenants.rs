@@ -1,8 +1,8 @@
-//! 租户管理 REST（REQ-TENANT-001）。
+//! Tenant management REST (REQ-TENANT-001).
 //!
-//! 五个端点：列表/详情/创建/更新/删除。
-//! DB 未配置 → 所有端点返回 503。
-//! 默认租户 (id=1) 不可删除。
+//! Five endpoints: list/detail/create/update/delete.
+//! DB not configured → all endpoints return 503.
+//! Default tenant (id=1) cannot be deleted.
 
 use std::sync::Arc;
 

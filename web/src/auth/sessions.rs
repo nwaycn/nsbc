@@ -1,16 +1,16 @@
-//! 服务端会话状态（REQ-WEB-008：服务端可强制失效 + JWT 防重放）。
+//! Server-side session state (REQ-WEB-008: server can force invalidation + JWT anti-replay).
 //!
-//! 三张内存表（管理面低频，std::Mutex 足够；均不跨 await 持锁）：
-//!   - active：有效 refresh jti → 主体/角色/过期（刷新时必须在此表）
-//!   - used：  已轮转/已登出 refresh jti 的过期墓碑（重放检测，惰性清理）
-//!   - denied：已登出/封禁的 access jti → 过期（access 短时效，表有界）
+//! Three in-memory tables (management-plane low frequency, std::Mutex sufficient; no lock held across await):
+//!   - active: valid refresh jti -> subject/role/expiry (must be in this table to refresh)
+//!   - used:   expired tombstones for rotated/logged-out refresh jti (replay detection, lazy cleanup)
+//!   - denied: access jti that have been logged out/banned -> expiry (access is short-lived, table is bounded)
 //!
-//! 语义：
-//!   - refresh 令牌**单次使用**：consume 成功即移出 active、落入 used；
-//!     再次出示同一 jti → Replay（REQ-WEB-008 防重放），由调用方告警；
-//!   - access 令牌本身无状态，登出/封禁经 denied 表即时吊销，无需等 15min。
+//! Semantics:
+//!   - Refresh tokens are **single-use**: consume success removes from active, lands in used;
+//!     presenting the same jti again -> Replay (REQ-WEB-008 anti-replay), caller alerts;
+//!   - Access tokens themselves are stateless; logout/ban revokes instantly via denied table, no need to wait 15min.
 //!
-//! 重启即全表失效（运维语义：重启=强制全登出）；持久化封禁清单为后续项。
+//! All tables invalidated on restart (ops semantics: restart = force logout all); persistent ban list is a future item.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -24,9 +24,9 @@ pub struct RefreshEntry {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RefreshError {
-    /// 从未登记（伪造/重启后旧令牌/已过期被清理）
+    /// Never registered (forged / old token after restart / expired and cleaned up)
     Unknown,
-    /// 已被轮转或登出的 jti 再次使用 → 重放
+    /// Previously rotated or logged-out jti used again -> replay
     Replay,
 }
 
@@ -42,7 +42,7 @@ impl SessionStore {
         SessionStore::default()
     }
 
-    /// 登录/刷新成功后登记新的 refresh jti。
+    /// Register a new refresh jti after successful login/refresh.
     pub fn register_refresh(&self, jti: &str, sub: String, role: u8, exp: u64) {
         self.active.lock().unwrap().insert(
             jti.to_string(),
@@ -50,7 +50,7 @@ impl SessionStore {
         );
     }
 
-    /// 消费 refresh（轮转）：取出即删并立墓碑；exp 已过视为 Unknown。
+    /// Consume refresh (rotation): remove immediately and create tombstone; if exp passed, treat as Unknown.
     pub fn consume_refresh(
         &self,
         jti: &str,
@@ -75,7 +75,7 @@ impl SessionStore {
         Ok(entry)
     }
 
-    /// 登出时注销 refresh（幂等：不存在/过期均不报错）。
+    /// Deregister refresh on logout (idempotent: no error when not found / expired).
     pub fn revoke_refresh(&self, jti: &str, exp: u64, now: u64) {
         self.active.lock().unwrap().remove(jti);
         if exp > now {
@@ -83,14 +83,14 @@ impl SessionStore {
         }
     }
 
-    /// 吊销 access（登出/封禁）；exp 已过则无需落表。
+    /// Revoke access (logout/ban); if exp already passed, no need to add to table.
     pub fn deny_access(&self, jti: &str, exp: u64, now: u64) {
         if exp > now {
             self.denied.lock().unwrap().insert(jti.to_string(), exp);
         }
     }
 
-    /// access 是否在吊销表中（顺带惰性清理过期项）。
+    /// Whether access is in the revocation table (also lazily cleans expired entries).
     pub fn access_revoked(&self, jti: &str, now: u64) -> bool {
         let mut denied = self.denied.lock().unwrap();
         denied.retain(|_, exp| *exp > now);
@@ -108,9 +108,9 @@ mod tests {
         s.register_refresh("j1", "u0".into(), 0, 1000);
         let e = s.consume_refresh("j1", 100).unwrap();
         assert_eq!(e.sub, "u0");
-        // 同一 jti 再用 → 重放
+        // Same jti reused -> replay
         assert_eq!(s.consume_refresh("j1", 200), Err(RefreshError::Replay));
-        // 从未见过
+        // Never seen before
         assert_eq!(s.consume_refresh("nope", 200), Err(RefreshError::Unknown));
     }
 
@@ -118,9 +118,9 @@ mod tests {
     fn expired_refresh_unknown_after_purge() {
         let s = SessionStore::new();
         s.register_refresh("old", "u0".into(), 0, 1000);
-        // 过期后消费：视为无效（不立墓碑）
+        // Consumed after expiry: treat as invalid (no tombstone created)
         assert_eq!(s.consume_refresh("old", 1000), Err(RefreshError::Unknown));
-        // 表已清理，再来仍是 Unknown 而非 Replay
+        // Table cleaned; second attempt is still Unknown, not Replay
         assert_eq!(s.consume_refresh("old", 1001), Err(RefreshError::Unknown));
     }
 
@@ -130,9 +130,9 @@ mod tests {
         assert!(!s.access_revoked("a1", 100));
         s.deny_access("a1", 200, 100);
         assert!(s.access_revoked("a1", 100));
-        // 过期后惰性消失
+        // Expired entries disappear lazily
         assert!(!s.access_revoked("a1", 200));
-        // 已过期的不入库
+        // Expired entries do not enter the table
         s.deny_access("a2", 100, 100);
         assert!(!s.access_revoked("a2", 100));
     }
@@ -143,6 +143,6 @@ mod tests {
         s.register_refresh("j2", "u1".into(), 1, 1000);
         s.revoke_refresh("j2", 1000, 100);
         assert_eq!(s.consume_refresh("j2", 200), Err(RefreshError::Replay));
-        s.revoke_refresh("never", 1000, 100); // 不 panic
+        s.revoke_refresh("never", 1000, 100); // must not panic
     }
 }

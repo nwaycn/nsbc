@@ -30,24 +30,24 @@ tls_ctx_t *tls_ctx_server_new(const tls_cfg_t *cfg)
             cfg->cert_pem ? cfg->cert_pem : "(null)",
             cfg->key_pem  ? cfg->key_pem  : "(null)");
     if (!cfg->cert_pem || !cfg->cert_pem[0]) {
-        fprintf(stderr, "[tls] cert_pem 为空\n");
+        fprintf(stderr, "[tls] cert_pem is empty\n");
         goto fail;
     }
     cert_fp = fopen(cfg->cert_pem, "rb");
     if (!cert_fp) {
-        fprintf(stderr, "[tls] 证书读失败: %s (errno=%d: %s)\n",
+        fprintf(stderr, "[tls] failed to read certificate: %s (errno=%d: %s)\n",
                 cfg->cert_pem, errno, strerror(errno));
         goto fail;
     }
     fclose(cert_fp); cert_fp = NULL;
 
     if (!cfg->key_pem || !cfg->key_pem[0]) {
-        fprintf(stderr, "[tls] key_pem 为空\n");
+        fprintf(stderr, "[tls] key_pem is empty\n");
         goto fail;
     }
     key_fp = fopen(cfg->key_pem, "rb");
     if (!key_fp) {
-        fprintf(stderr, "[tls] 私钥读失败: %s (errno=%d: %s)\n",
+        fprintf(stderr, "[tls] failed to read private key: %s (errno=%d: %s)\n",
                 cfg->key_pem, errno, strerror(errno));
         goto fail;
     }
@@ -59,7 +59,7 @@ tls_ctx_t *tls_ctx_server_new(const tls_cfg_t *cfg)
     /* ---------- OpenSSL TLS 上下文 ---------- */
     c->ssl = SSL_CTX_new(TLS_server_method());
     if (!c->ssl) {
-        fprintf(stderr, "[tls] SSL_CTX_new 失败\n");
+        fprintf(stderr, "[tls] SSL_CTX_new failed\n");
         ERR_print_errors_fp(stderr);
         goto fail;
     }
@@ -99,19 +99,19 @@ tls_ctx_t *tls_ctx_server_new(const tls_cfg_t *cfg)
     SSL_CTX_set_options(c->ssl, SSL_OP_NO_COMPRESSION | SSL_OP_SINGLE_DH_USE);
 
     if (SSL_CTX_use_certificate_chain_file(c->ssl, cfg->cert_pem) != 1) {
-        fprintf(stderr, "[tls] SSL_CTX_use_certificate_chain_file 失败\n");
+        fprintf(stderr, "[tls] SSL_CTX_use_certificate_chain_file failed\n");
         ERR_print_errors_fp(stderr);
         goto fail_ssl;
     }
     if (SSL_CTX_use_PrivateKey_file(c->ssl, cfg->key_pem,
                                     SSL_FILETYPE_PEM) != 1) {
-        fprintf(stderr, "[tls] SSL_CTX_use_PrivateKey_file 失败\n");
+        fprintf(stderr, "[tls] SSL_CTX_use_PrivateKey_file failed\n");
         ERR_print_errors_fp(stderr);
         goto fail_ssl;
     }
     /* 证书-私钥配对校验：防止证书/私钥来自不同对 */
     if (!SSL_CTX_check_private_key(c->ssl)) {
-        fprintf(stderr, "[tls] 证书与私钥不匹配（check_private_key 失败）\n");
+        fprintf(stderr, "[tls] certificate does not match private key (check_private_key failed)\n");
         ERR_print_errors_fp(stderr);
         goto fail_ssl;
     }

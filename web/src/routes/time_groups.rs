@@ -1,4 +1,4 @@
-//! 时间策略组 REST。6 端点。
+//! Time strategy group REST. Six endpoints.
 
 use std::sync::Arc;
 

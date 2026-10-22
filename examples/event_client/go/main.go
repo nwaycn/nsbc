@@ -1,10 +1,10 @@
-// NSBC 实时事件/CDR 订阅客户端 (Unix Domain Socket / Go)
+// NSBC realtime event/CDR subscription client (Unix Domain Socket / Go)
 //
-// 纯 stdlib，无任何第三方依赖。go build 直接产出二进制。
+// Pure stdlib, no third-party deps. go build produces a binary directly.
 //
-// 用法:
-//   go run main.go                                   # 默认 /tmp/nsbc-e2e/control.sock
-//   go run main.go /var/run/nsbc/control.sock        # 自定义 UDS 路径
+// Usage:
+//   go run main.go                                   # default /tmp/nsbc-e2e/control.sock
+//   go run main.go /var/run/nsbc/control.sock        # custom UDS path
 //   go run main.go --topics events,cdr,log
 //   go build -o event_client . && ./event_client
 package main
@@ -21,7 +21,7 @@ import (
 	"time"
 )
 
-// 帧格式: YYYY-MM-DDTHH:MM:SS.mmm <DOMAIN> <body>
+// Frame format: YYYY-MM-DDTHH:MM:SS.mmm <DOMAIN> <body>
 var frameRE = regexp.MustCompile(`^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3})\s+(\S+)\s+(.*)$`)
 
 const (
@@ -61,7 +61,7 @@ func printFrame(line string) {
 		return
 	}
 	tsStr, domain, body := m[1], m[2], m[3]
-	// 缩短显示时间: 15:32:01.123
+	// Shorten timestamp for display: 15:32:01.123
 	if ts, err := time.Parse("2006-01-02T15:04:05.000", tsStr); err == nil {
 		tsStr = ts.Format("15:04:05.000")
 	}
@@ -86,8 +86,8 @@ func truncate(s string, n int) string {
 	return s[:n]
 }
 
-// recvUntilPrompt: 读直到看到 nsbc> 提示符或整体超时。
-// 每次 ReadString 前重置 deadline，避免中途超时导致已读部分丢失。
+// recvUntilPrompt: read until nsbc> prompt seen or overall timeout expires.
+// Reset deadline before every ReadString to avoid losing partial reads on mid-timeout.
 func recvUntilPrompt(c net.Conn, timeout time.Duration) string {
 	deadline := time.Now().Add(timeout)
 	var buf strings.Builder
@@ -103,9 +103,9 @@ func recvUntilPrompt(c net.Conn, timeout time.Duration) string {
 		}
 		if err != nil {
 			if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
-				continue // 局部超时，整体 deadline 还没到就继续
+				continue // local timeout, whole deadline not yet reached — try again
 			}
-			break // EOF / 其他错误
+			break // EOF / other error
 		}
 	}
 	c.SetReadDeadline(time.Time{})
@@ -119,8 +119,8 @@ func main() {
 		pullOnly bool
 	)
 	flag.StringVar(&udsPath, "uds", "/tmp/nsbc-e2e/control.sock", "control socket path")
-	flag.StringVar(&topics, "topics", "events,cdr", "订阅 topics，逗号分隔")
-	flag.BoolVar(&pullOnly, "pull-only", false, "只连不订")
+	flag.StringVar(&topics, "topics", "events,cdr", "topics to subscribe to, comma-separated")
+	flag.BoolVar(&pullOnly, "pull-only", false, "connect only, do not subscribe")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags]\n\nflags:\n", os.Args[0])
 		flag.PrintDefaults()
@@ -130,7 +130,7 @@ func main() {
 		udsPath = flag.Arg(0)
 	}
 
-	// 检查 socket 文件存在
+	// Check socket file exists
 	if fi, err := os.Stat(udsPath); err != nil || (fi != nil && fi.Mode()&os.ModeSocket == 0) {
 		fmt.Fprintf(os.Stderr, "ERR: UDS socket not found or not a socket: %s\n", udsPath)
 		os.Exit(2)
@@ -145,7 +145,7 @@ func main() {
 
 	fmt.Fprintf(os.Stdout, "\033[2m[connected to %s]%s\n", udsPath, reset)
 
-	// 收 banner + 提示符
+	// Receive banner + prompt
 	c.SetReadDeadline(time.Now().Add(2 * time.Second))
 	reader := bufio.NewReaderSize(c, 65536)
 	for {
@@ -165,7 +165,7 @@ func main() {
 	c.SetReadDeadline(time.Time{})
 
 	if !pullOnly {
-		// 发 sub 命令
+		// Send sub command
 		_, err := fmt.Fprintf(c, "sub %s\n", topics)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "ERR send sub: %v\n", err)
@@ -181,7 +181,7 @@ func main() {
 		fmt.Fprintf(os.Stdout, "\033[2m[subscribed: %s — Ctrl-C to quit]%s\n", topics, reset)
 	}
 
-	// 实时循环: 阻塞读 \n 分隔帧
+	// Realtime loop: blocking read \n-delimited frames
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {

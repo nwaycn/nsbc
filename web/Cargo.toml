@@ -2,7 +2,7 @@
 name = "nsbc-web"
 version = "2.5.5"
 edition = "2021"
-description = "NSBC Web 管理系统边车（REQ-WEB-001~021，与核心进程隔离部署）"
+description = "NSBC Web management sidecar (REQ-WEB-001~021, deployed separately from the core process)"
 publish = false
 
 [[bin]]
@@ -10,55 +10,66 @@ name = "nsbc-web"
 path = "src/main.rs"
 
 [dependencies]
-# 技术栈基线（REQ-WEB-002，冻结）：Tokio + Axum；禁 Actix-Web（unsafe）
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "io-util", "sync", "blocking"] }
+# Tech stack baseline (REQ-WEB-002, frozen): Tokio + Axum; Actix-Web forbidden (unsafe)
+# NOTE: do NOT add "blocking" feature — it existed only in tokio 0.x and was removed in tokio 1.0;
+# spawn_blocking is always available with rt/rt-multi-thread
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "io-util", "sync"] }
 axum = { version = "0.7", default-features = false, features = ["http1", "http2", "json", "matched-path", "query", "tokio"] }
-# SSE 实时推送（nsbc-esl-web §8#1）：BroadcastStream 把 tokio broadcast 通道
-# 转成 axum SSE 事件流，供前端 /calls/stream 实时订阅 SESSION 事件（替代 5s 轮询）。
-# 该 crate 已随 axum 依赖存在于 vendor/ 与 Cargo.lock（离线构建无需新增供应链面）。
+# SSE real-time push (nsbc-esl-web §8#1): BroadcastStream converts tokio broadcast channel
+# into axum SSE event stream, so front-end /calls/stream can subscribe to SESSION events in real time
+# (replaces 5-second polling). This crate already ships with axum in vendor/ and Cargo.lock
+# (no new supply-chain surface for offline builds).
 tokio-stream = { version = "0.1", default-features = false, features = ["sync"] }
 tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["trace", "limit", "set-header"] }
 hyper = { version = ">=1.1.0, <2", features = ["server", "http1"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "tls12", "std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
-# hyper 1.0 与 tokio-rustls 桥接：TokioIo 把 TlsStream(AsyncRead+AsyncWrite) 包成 hyper 能消费的 transport
+# Bridge between hyper 1.0 and tokio-rustls: TokioIo wraps TlsStream(AsyncRead+AsyncWrite)
+# into a transport that hyper can consume
 hyper-util = { version = "0.1", default-features = false, features = ["tokio", "server-auto", "http1", "service"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-# 配置/CDR 查询走核心 DBAL；边车直连库仅做只读展示（REQ-WEB-013 受限账号）
-# sqlx：Web 边车持久化层（REQ-WEB-013 受限账号只读 + CDR/audit 追加写）
-# any 特性允许 DSN scheme 运行期选择后端；derive 特性启用 FromRow 宏
+# Config/CDR queries go through the core DBAL; sidecar's direct DB connection is read-only
+# (REQ-WEB-013 restricted account)
+# sqlx: Web sidecar persistence layer (REQ-WEB-013 restricted account, read-only + append-only
+# writes for CDR/audit)
+# "any" feature lets the DSN scheme select the backend at runtime; "derive" enables the FromRow macro
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "postgres", "mysql", "tls-rustls", "any", "derive"] }
-# 前端静态资源编译期嵌入（REQ-WEB-004：nsbc-web 自举 SPA，零 Node 运行时依赖）
-# rust-embed 仅用 include_bytes! + PhantomData，无 unsafe，与 deny(unsafe_code) 兼容
+# Front-end static assets are embedded at compile time (REQ-WEB-004: nsbc-web bootstraps its own
+# SPA with zero Node runtime dependency)
+# rust-embed only uses include_bytes! + PhantomData — no unsafe, compatible with deny(unsafe_code)
 rust-embed = "8"
-# 认证基座（REQ-WEB-008 P0）：argon2id 口令校验（SRS 锁定的关键依赖之一）。
+# Authentication foundation (REQ-WEB-008 P0): argon2id password verification (one of the key
+# dependencies locked by SRS)
 argon2 = { version = "0.5", default-features = false, features = ["std"] }
-# JWT HS256 紧凑签发/校验：ring/getrandom/base64 已随 rustls 在锁内，直接引用不新增供应链面。
+# JWT HS256 compact signing/verification: ring/getrandom/base64 are already in the lock with rustls,
+# so referencing them adds no new supply-chain surface
 ring = { version = "0.17", default-features = false, features = ["std"] }
 getrandom = { version = "0.2" }
 base64 = "0.22"
-# SIP Digest HA1 计算（extensions 默认 seed 用）—— 零依赖，纯 Rust
+# SIP Digest HA1 computation (used for the default extensions seed) — zero dependencies, pure Rust
 md-5 = "0.10"
-# TLS 自签证书生成（Web 端 auto-generate P0 用）
+# TLS self-signed certificate generation (used for Web-side auto-generate P0)
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
-# PEM 文件解析（rustls 需要 Vec<CertificateDer> + PrivateKeyDer 构造 ServerConfig）
+# PEM file parsing (rustls needs Vec<CertificateDer> + PrivateKeyDer to build ServerConfig)
 rustls-pemfile = "2"
-# 证书有效期计算（time::OffsetDateTime::now_utc() + Duration::days）
+# Certificate validity computation (time::OffsetDateTime::now_utc() + Duration::days)
 time = { version = ">=0.3.34, <0.4", default-features = false, features = ["std"] }
 
-# ---- 公网 ACME 证书自动续期（experimental，feature-gated）----
-# 启用：cargo build --features acme
-# 默认关闭：不影响离线构建（vendor/ 无新增 crate）
-# 启用前需在有网络机器上跑：临时注释 .cargo/config.toml 里的 replace-with → cargo generate-lockfile → cargo vendor
+# ---- Public ACME certificate auto-renewal (experimental, feature-gated) ----
+# Enable: cargo build --features acme
+# Disabled by default: does not affect offline builds (no new crate in vendor/)
+# Before enabling, run on a machine with internet: temporarily comment out replace-with in
+# .cargo/config.toml → cargo generate-lockfile → cargo vendor
 certon = { version = "0.3", optional = true }
 
 [features]
-# 公网 HTTPS：certon 自动向 Let's Encrypt/ZeroSSL 申请证书 + 后台续期
+# Public HTTPS: certon automatically requests certificates from Let's Encrypt/ZeroSSL +
+# background renewal
 acme = ["certon"]
 
 [profile.release]

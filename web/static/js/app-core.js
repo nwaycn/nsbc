@@ -1,6 +1,6 @@
 // =============================================================================
-// NSBC Web — 核心层
-// 包含：API wrapper、结构化编辑器、Vue App 创建、CRUD/Live 工厂
+// NSBC Web — Core层
+// 包含：API wrapper、结构化Edit器、Vue App Create、CRUD/Live 工厂
 // 加载顺序：必须在 vendor/*.js 之后，pages/*.js 之前
 // =============================================================================
 /* global Vue, ElementPlus, ElementPlusIconsVue */
@@ -22,8 +22,8 @@ const API = {
     const hasBody = body !== undefined;
     const opts = { method, headers: this.headers(hasBody) };
     if (hasBody) opts.body = JSON.stringify(body);
-    // GET 请求自动拼 tenant_id（tenant_id=0 或空表示不过滤）
-    // 排除 /tenants 本身（租户元数据源，不能被 tenant_id 过滤）
+    // GET Request自动拼 tenant_id（tenant_id=0 或空表示不过滤）
+    // 排除 /tenants 本身（Tenant元数据源，不能被 tenant_id 过滤）
     let finalPath = path;
     if (!hasBody && method === 'GET' && !path.startsWith('/tenants')) {
       const tid = this.tenantId();
@@ -50,13 +50,13 @@ const API = {
             localStorage.setItem('nsbc_token', rd.access_token);
             if (rd.refresh_token) localStorage.setItem('nsbc_refresh_token', rd.refresh_token);
             try { window.__auth && (window.__auth.token = rd.access_token); } catch(_) {}
-            // 重放原请求（token 已更新）
+            // 重放原Request（token 已Update）
             const retryRes = await fetch(this.base + path, opts);
             if (retryRes.status === 401) {
               // 还是 401 → 真没救了
               localStorage.clear();
               location.hash = '#/login';
-              throw new Error('未授权');
+              throw new Error('Unauthorized');
             }
             const retryText = await retryRes.text();
             if (!retryRes.ok) throw new Error(retryText || retryRes.statusText);
@@ -69,7 +69,7 @@ const API = {
       localStorage.clear();
       try { window.__auth && (window.__auth.token = null, window.__auth.user = null, window.__auth.role = null); } catch(_) {}
       location.hash = '#/login';
-      throw new Error('未授权');
+      throw new Error('Unauthorized');
     }
     const text = await res.text();
     const data = text ? JSON.parse(text) : null;
@@ -82,7 +82,7 @@ const API = {
   delete: (p) => API.req('DELETE', p),
 };
 
-// ===== 结构化编辑器 =====
+// ===== 结构化Edit器 =====
 
 // 1) 时间段（time_ranges → JSON 数组）
 const TimeRangeEditor = {
@@ -90,19 +90,19 @@ const TimeRangeEditor = {
   template: `
     <div class="struct-editor">
       <div class="struct-header">
-        <span class="font-semibold">时间段规则（{{ rows.length }} 条）</span>
+        <span class="font-semibold">{{ t('Time Rules') }} ({{ rows.length }})</span>
         <span class="text-gray-400 text-[11px]">days: 1-5 / 1,3,5 / 0-6</span>
       </div>
-      <div v-if="!rows.length" class="px-3 py-6 text-center text-gray-400 text-sm">暂无时间段</div>
+      <div v-if="!rows.length" class="px-3 py-6 text-center text-gray-400 text-sm">{{ t('No time rules') }}</div>
       <div v-for="(row, idx) in rows" :key="idx" class="struct-row">
         <input v-model="row.days" placeholder="1-5" class="w-28">
-        <span class="text-gray-400 text-xs">起</span>
+        <span class="text-gray-400 text-xs">{{ t('From') }}</span>
         <input v-model="row.from" placeholder="09:00" class="w-24">
-        <span class="text-gray-400 text-xs">止</span>
+        <span class="text-gray-400 text-xs">{{ t('To') }}</span>
         <input v-model="row.to" placeholder="18:00" class="w-24">
         <i class="fa-solid fa-trash struct-del ml-auto" @click="rows.splice(idx,1)"></i>
       </div>
-      <div class="struct-add" @click="rows.push({days:'1-5',from:'09:00',to:'18:00'})"><i class="fa-solid fa-plus mr-1"></i>添加时间段</div>
+      <div class="struct-add" @click="rows.push({days:'1-5',from:'09:00',to:'18:00'})"><i class="fa-solid fa-plus mr-1"></i>{{ t('Add time rule') }}</div>
     </div>
   `,
   setup(props, { emit }) {
@@ -123,19 +123,19 @@ const QueueMembersEditor = {
   template: `
     <div class="struct-editor">
       <div class="struct-header">
-        <span class="font-semibold">队列成员（{{ rows.length }} 人）</span>
+        <span class="font-semibold">{{ t('Queue Members') }} ({{ rows.length }})</span>
         <span class="text-gray-400 text-[11px]">extension / weight(1-100) / enabled</span>
       </div>
-      <div v-if="!rows.length" class="px-3 py-6 text-center text-gray-400 text-sm">暂无成员</div>
+      <div v-if="!rows.length" class="px-3 py-6 text-center text-gray-400 text-sm">{{ t('No members') }}</div>
       <div v-for="(row, idx) in rows" :key="idx" class="struct-row">
-        <input v-model="row.extension" placeholder="分机号 2000" class="w-32">
-        <input v-model.number="row.weight" type="number" min="1" max="100" placeholder="权重" class="w-20">
+        <input v-model="row.extension" :placeholder="t('$n')" class="w-32">
+        <input v-model.number="row.weight" type="number" min="1" max="100" :placeholder="t('$n')" class="w-20">
         <label class="flex items-center gap-1 text-xs">
-          <input type="checkbox" v-model="row.enabled"> 启用
+          <input type="checkbox" v-model="row.enabled"> Enable
         </label>
         <i class="fa-solid fa-trash struct-del ml-auto" @click="rows.splice(idx,1)"></i>
       </div>
-      <div class="struct-add" @click="rows.push({extension:'',weight:10,enabled:true})"><i class="fa-solid fa-plus mr-1"></i>添加成员</div>
+      <div class="struct-add" @click="rows.push({extension:'',weight:10,enabled:true})"><i class="fa-solid fa-plus mr-1"></i>{{ t('Add member') }}</div>
     </div>
   `,
   setup(props, { emit }) {
@@ -150,25 +150,25 @@ const QueueMembersEditor = {
   },
 };
 
-// 3) IVR 按键选项（options_json → JSON 数组）
+// 3) IVR 按Key选项（options_json → JSON 数组）
 const IvrOptionsEditor = {
   props: ['modelValue'],
   template: `
     <div class="struct-editor">
       <div class="struct-header">
-        <span class="font-semibold">按键选项（{{ rows.length }} 项）</span>
+        <span class="font-semibold">{{ t('Key Options') }} ({{ rows.length }})</span>
         <span class="text-gray-400 text-[11px]">key=0-9/*/#  target=extension/queue/ivr/vm</span>
       </div>
-      <div v-if="!rows.length" class="px-3 py-6 text-center text-gray-400 text-sm">暂无选项</div>
+      <div v-if="!rows.length" class="px-3 py-6 text-center text-gray-400 text-sm">{{ t('No options') }}</div>
       <div v-for="(row, idx) in rows" :key="idx" class="struct-row">
         <select v-model="row.key" class="w-20">
           <option v-for="k in ['0','1','2','3','4','5','6','7','8','9','*','#']" :key="k" :value="k">{{ k }}</option>
         </select>
         <span class="text-gray-400">→</span>
-        <input v-model="row.target" placeholder="目标" class="flex-1">
+        <input v-model="row.target" :placeholder="t('$n')" class="flex-1">
         <i class="fa-solid fa-trash struct-del ml-2" @click="rows.splice(idx,1)"></i>
       </div>
-      <div class="struct-add" @click="rows.push({key:'1',target:''})"><i class="fa-solid fa-plus mr-1"></i>添加按键选项</div>
+      <div class="struct-add" @click="rows.push({key:'1',target:''})"><i class="fa-solid fa-plus mr-1"></i>{{ t('Add key option') }}</div>
     </div>
   `,
   setup(props, { emit }) {
@@ -190,8 +190,8 @@ const TrunkCodecEditor = {
   template: `
     <div class="struct-editor">
       <div class="struct-header">
-        <span class="font-semibold">可用编码（{{ selected.length }} 个）</span>
-        <span class="text-gray-400 text-[11px]">勾选自动生成逗号串</span>
+        <span class="font-semibold">{{ t('Available Codecs') }} ({{ selected.length }})</span>
+        <span class="text-gray-400 text-[11px]">{{ t('check to build comma list') }}</span>
       </div>
       <div class="codec-grid">
         <label v-for="c in TRUNK_CODECS" :key="c">
@@ -199,8 +199,8 @@ const TrunkCodecEditor = {
         </label>
       </div>
       <div class="struct-header border-t bg-white">
-        <span class="font-mono text-xs text-gray-600 truncate">{{ modelValue || '未选择' }}</span>
-        <button class="text-xs text-blue-600 hover:text-blue-800" @click="selectAll(true)">全选</button>
+        <span class="font-mono text-xs text-gray-600 truncate">{{ modelValue || t('not selected') }}</span>
+        <button class="text-xs text-blue-600 hover:text-blue-800" @click="selectAll(true)">{{ t('All') }}</button>
       </div>
     </div>
   `,
@@ -223,120 +223,120 @@ const DialplanActionEditor = {
   template: `
     <div class="struct-editor">
       <div class="struct-header">
-        <span class="font-semibold">拨号动作（dp_rule 附加字段）</span>
-        <span class="text-gray-400 text-[11px]">号码变换 / SIP 头改写 / 录音控制</span>
+        <span class="font-semibold">{{ t('Dial Action (dp_rule extra fields)') }}</span>
+        <span class="text-gray-400 text-[11px]">{{ t('number rewrite / SIP header override / recording control') }}</span>
       </div>
       <div class="px-3 py-3 space-y-2.5 bg-white max-h-[600px] overflow-y-auto">
         <!-- 号码变换 -->
-        <div class="text-[11px] text-gray-500 font-semibold pt-0.5">─ 号码变换 ─</div>
+        <div class="text-[11px] text-gray-500 font-semibold pt-0.5">{{ t('─ Number Rewrite ─') }}</div>
         <div class="struct-row">
-          <span class="struct-label w-40 shrink-0">clip 强制 CLIP</span>
-          <input v-model="action.clip" placeholder="空=不改写，如 442071234567">
+          <span class="struct-label w-40 shrink-0">{{ t('clip forced CLIP') }}</span>
+          <input v-model="action.clip" :placeholder="t('$n')">
         </div>
         <div class="struct-row">
           <label class="inline-flex items-center gap-1.5">
             <input type="checkbox" v-model="action.immediate" class="flex-none">
-            <span class="text-gray-600 text-xs">immediate — DigitMap 收齐即匹配</span>
+            <span class="text-gray-600 text-xs">{{ t('immediate — match when digitmap complete') }}</span>
           </label>
         </div>
         <div class="struct-row">
-          <span class="struct-label w-40 shrink-0">perm 出局权限</span>
+          <span class="struct-label w-40 shrink-0">{{ t('perm outbound permission') }}</span>
           <input v-model.number="action.perm" type="number" min="0" max="255" class="w-20">
           <span class="hint">(0-255)</span>
         </div>
 
         <!-- From 头 -->
-        <div class="text-[11px] text-gray-500 font-semibold pt-2">─ From 头（从低到高优先级） ─</div>
+        <div class="text-[11px] text-gray-500 font-semibold pt-2">{{ t('─ From Header (low → high priority) ─') }}</div>
         <div class="struct-row">
-          <span class="struct-label w-40 shrink-0">sip_from_display 显示名</span>
-          <input v-model="action.sip_from_display" placeholder='如 "Sales Team"'>
-          <span class="hint">组件级</span>
+          <span class="struct-label w-40 shrink-0">{{ t('sip_from_display Display') }}</span>
+          <input v-model="action.sip_from_display" :placeholder="t('e.g. &quot;Sales Team&quot;')">
+          <span class="hint">{{ t('component') }}</span>
         </div>
         <div class="struct-row">
-          <span class="struct-label w-40 shrink-0">sip_from_uri URI 部分</span>
-          <input v-model="action.sip_from_uri" placeholder="如 sip:alice@nsbc.local">
-          <span class="hint">组件级</span>
+          <span class="struct-label w-40 shrink-0">{{ t('sip_from_uri URI part') }}</span>
+          <input v-model="action.sip_from_uri" :placeholder="t('$n')">
+          <span class="hint">{{ t('component') }}</span>
         </div>
         <div class="struct-row">
-          <span class="struct-label w-40 shrink-0">sip_invite_from 完整From</span>
-          <input v-model="action.sip_invite_from" placeholder='完整 From 值（最高优先级）'>
-          <span class="hint">覆盖全部</span>
+          <span class="struct-label w-40 shrink-0">{{ t('sip_invite_from Full From') }}</span>
+          <input v-model="action.sip_invite_from" :placeholder="t('Full From value (highest priority)')">
+          <span class="hint">{{ t('overrides all') }}</span>
         </div>
         <div class="struct-row">
           <span class="struct-label w-40 shrink-0">sip_invite_from_uri</span>
-          <input v-model="action.sip_invite_from_uri" placeholder='纯 URI 覆盖，如 sip:alice@nsbc.local'>
-          <span class="hint">FS 对齐</span>
+          <input v-model="action.sip_invite_from_uri" :placeholder="t('URI override only, e.g. sip:alice@nsbc.local')">
+          <span class="hint">{{ t('FS-aligned') }}</span>
         </div>
         <div class="struct-row">
           <span class="struct-label w-40 shrink-0">sip_invite_from_params</span>
-          <input v-model="action.sip_invite_from_params" placeholder='如 transport=tls'>
+          <input v-model="action.sip_invite_from_params" :placeholder="t('e.g. transport=tls')">
           <span class="hint">From params</span>
         </div>
         <div class="struct-row">
           <span class="struct-label w-40 shrink-0">orig_caller_id_number</span>
-          <input v-model="action.origination_caller_id_number" placeholder='FreeSWITCH 精细化主叫 — 只填 user part'>
-          <span class="hint">FS 对齐</span>
+          <input v-model="action.origination_caller_id_number" :placeholder="t('FreeSWITCH granular caller — user part only')">
+          <span class="hint">{{ t('FS-aligned') }}</span>
         </div>
         <div class="struct-row">
           <span class="struct-label w-40 shrink-0">orig_caller_id_name</span>
-          <input v-model="action.origination_caller_id_name" placeholder='Display name（空=同 number）'>
-          <span class="hint">FS 对齐</span>
+          <input v-model="action.origination_caller_id_name" :placeholder="t('Display name (empty = same as number)')">
+          <span class="hint">{{ t('FS-aligned') }}</span>
         </div>
 
         <!-- To / R-URI / Contact -->
         <div class="text-[11px] text-gray-500 font-semibold pt-2">─ To / R-URI / Contact ─</div>
         <div class="struct-row">
-          <span class="struct-label w-40 shrink-0">sip_invite_to_uri To覆盖</span>
-          <input v-model="action.sip_invite_to_uri" placeholder="空=透传，如 sip:bob@other.com">
+          <span class="struct-label w-40 shrink-0">{{ t('sip_invite_to_uri To override') }}</span>
+          <input v-model="action.sip_invite_to_uri" :placeholder="t('$n')">
         </div>
         <div class="struct-row">
           <span class="struct-label w-40 shrink-0">sip_invite_to_params</span>
-          <input v-model="action.sip_invite_to_params" placeholder="如 user=phone">
+          <input v-model="action.sip_invite_to_params" :placeholder="t('$n')">
           <span class="hint">To params</span>
         </div>
         <div class="struct-row">
           <span class="struct-label w-40 shrink-0">sip_invite_req_uri R-URI</span>
-          <input v-model="action.sip_invite_req_uri" placeholder="完整 Request-URI 覆盖">
+          <input v-model="action.sip_invite_req_uri" :placeholder="t('$n')">
         </div>
         <div class="struct-row">
           <span class="struct-label w-40 shrink-0">sip_invite_tel_params</span>
           <input v-model="action.sip_invite_tel_params" placeholder="tel: URI params">
-          <span class="hint">tel: 追加</span>
+          <span class="hint">{{ t('tel: append') }}</span>
         </div>
         <div class="struct-row">
           <span class="struct-label w-40 shrink-0">sip_invite_contact_params</span>
-          <input v-model="action.sip_invite_contact_params" placeholder="如 transport=tcp">
+          <input v-model="action.sip_invite_contact_params" :placeholder="t('$n')">
           <span class="hint">Contact params</span>
         </div>
 
         <!-- Domain override -->
         <div class="text-[11px] text-gray-500 font-semibold pt-2">─ Domain override ─</div>
         <div class="struct-row">
-          <span class="struct-label w-40 shrink-0">sip_invite_domain 强制域</span>
-          <input v-model="action.sip_invite_domain" placeholder="如 sip.example.com">
-          <span class="hint">全局 host 替换</span>
+          <span class="struct-label w-40 shrink-0">{{ t('sip_invite_domain Forced domain') }}</span>
+          <input v-model="action.sip_invite_domain" :placeholder="t('$n')">
+          <span class="hint">{{ t('global host replace') }}</span>
         </div>
 
         <!-- Extra headers -->
-        <div class="text-[11px] text-gray-500 font-semibold pt-2">─ 额外 SIP 头（注入 extra 块） ─</div>
+        <div class="text-[11px] text-gray-500 font-semibold pt-2">{{ t('─ Extra SIP Headers (injected into extra block) ─') }}</div>
         <div class="struct-row">
           <span class="struct-label w-40 shrink-0">sip_invite_pid_params</span>
-          <input v-model="action.sip_invite_pid_params" placeholder="如 P-Asserted-Identity: <sip:+8613800138000@ims.mnc001.mcc460.3gppnetwork.org>">
-          <span class="hint">完整头行或简写</span>
+          <input v-model="action.sip_invite_pid_params" :placeholder="t('$n')">
+          <span class="hint">{{ t('full header line or shorthand') }}</span>
         </div>
         <div class="struct-row flex-wrap items-start">
-          <span class="struct-label w-40 shrink-0 self-stretch">sip_invite_params 多块</span>
+          <span class="struct-label w-40 shrink-0 self-stretch">{{ t('sip_invite_params multi-block') }}</span>
           <div class="flex-1 min-w-0">
             <textarea v-model="action.sip_invite_params" rows="4"
-              placeholder="每行一个完整头（C 侧自动拼接 \r\n），例如：&#10;P-Access-Network-Info: E-UTRAN-TDD; utran-cell-id-3gpp=0001001&#10;P-Called-Party-ID: <sip:+8613900139000@ims.mnc001.mcc460.3gppnetwork.org>&#10;Privacy: id"
+              placeholder="One full header per line (core joins with \r\n), e.g.:&#10;P-Access-Network-Info: E-UTRAN-TDD; utran-cell-id-3gpp=0001001&#10;P-Called-Party-ID: <sip:+8613900139000@ims.mnc001.mcc460.3gppnetwork.org>&#10;Privacy: id"
               class="w-full text-xs"></textarea>
             <div class="flex items-center gap-2 mt-1">
-              <span class="text-[11px] text-gray-400">快速插入：</span>
+              <span class="text-[11px] text-gray-400">{{ t('Quick insert:') }}</span>
               <button type="button" class="inline-block text-[11px] px-2 py-0.5 bg-slate-100 border border-slate-300 rounded hover:bg-slate-200" @click="tpl3gpp">3GPP IMS（PAI+PPID+PANI+PCPI）</button>
               <button type="button" class="inline-block text-[11px] px-2 py-0.5 bg-slate-100 border border-slate-300 rounded hover:bg-slate-200" @click="tplClir">运营商 CLIR（Privacy+PAI）</button>
             </div>
           </div>
-          <span class="hint">extra 头块</span>
+          <span class="hint">{{ t('extra header block') }}</span>
         </div>
       </div>
       <div class="struct-header border-t bg-white">
@@ -351,7 +351,7 @@ const DialplanActionEditor = {
       dst_override: '', clip: '', perm: 0, immediate: false,
       // From 头
       sip_invite_from: '', sip_invite_from_uri: '', sip_from_uri: '', sip_from_display: '', sip_invite_from_params: '',
-      // FS 精细化主叫（只填 user part，host 自动走 trunk.from_domain）
+      // FS 精细化Caller（只填 user part，host 自动走 trunk.from_domain）
       origination_caller_id_number: '', origination_caller_id_name: '',
       // To / R-URI / Contact
       sip_invite_to_uri: '', sip_invite_to_params: '',
@@ -381,7 +381,7 @@ const DialplanActionEditor = {
         action.sip_from_uri = v.sip_from_uri ?? '';
         action.sip_from_display = v.sip_from_display ?? '';
         action.sip_invite_from_params = v.sip_invite_from_params ?? '';
-        // FS 精细化主叫
+        // FS 精细化Caller
         action.origination_caller_id_number = v.origination_caller_id_number ?? '';
         action.origination_caller_id_name = v.origination_caller_id_name ?? '';
         // To / R-URI / Contact
@@ -405,8 +405,8 @@ const DialplanActionEditor = {
     watch(action, syncTo, { deep: true });
     syncFrom();
     // —— 快速模板注入 ——
-    // 3GPP IMS 运营商常用头：PAI（主叫身份）、PPID（首选主叫）、
-    // PANI（接入网类型）、PCPI（被叫 E.164 标识）、Privacy（CLIR）
+    // 3GPP IMS 运营商常用头：PAI（Caller身份）、PPID（首选Caller）、
+    // PANI（接入网Type）、PCPI（Callee E.164 标识）、Privacy（CLIR）
     function tpl3gpp() {
       action.sip_invite_pid_params = 'P-Asserted-Identity: <sip:+8613800138000@ims.mnc001.mcc460.3gppnetwork.org>';
       action.sip_invite_params =
@@ -415,8 +415,8 @@ P-Access-Network-Info: E-UTRAN-TDD; utran-cell-id-3gpp=0001001
 P-Called-Party-ID: <sip:+8613900139000@ims.mnc001.mcc460.3gppnetwork.org>
 Privacy: id`;
     }
-    // 运营商 CLIR：主叫号码隐藏（Privacy: id 触发 B 腿 From anonymize）
-    // + 带 P-Asserted-Identity 让对端网络仍能拿到真实主叫用于计费/路由
+    // 运营商 CLIR：Caller ID隐藏（Privacy: id 触发 B 腿 From anonymize）
+    // + 带 P-Asserted-Identity 让对端网络仍能拿到真实Caller用于计费/路由
     function tplClir() {
       action.sip_invite_pid_params = 'P-Asserted-Identity: <sip:+8613800138000@ims.mnc001.mcc460.3gppnetwork.org>';
       action.sip_invite_params =
@@ -433,13 +433,13 @@ const AppChainEditor = {
   template: `
     <div class="app-chain-editor">
       <div class="struct-header">
-        <span class="font-semibold">拨号动作链（Application Chain）</span>
-        <span class="text-gray-400 text-[11px]">按顺序执行：pre_answer → playback → sleep → answer …</span>
+        <span class="font-semibold">{{ t('Dial Application Chain') }}</span>
+        <span class="text-gray-400 text-[11px]">{{ t('Run in order: pre_answer → playback → sleep → answer …') }}</span>
       </div>
       <div class="px-3 py-3 bg-white space-y-2">
-        <!-- 添加动作 -->
+        <!-- 添加Action -->
         <div class="flex items-center gap-2">
-          <el-select v-model="nextApp" placeholder="选择要添加的应用…" style="flex:1" size="small" filterable>
+          <el-select v-model="nextApp" :placeholder="t('$n')" style="flex:1" size="small" filterable>
             <el-option-group v-for="g in appGroups" :key="g.label" :label="g.label">
               <el-option v-for="a in g.apps" :key="a.name" :value="a.name" :label="a.name + ' — ' + a.desc">
                 <div class="flex justify-between items-center w-full">
@@ -454,9 +454,9 @@ const AppChainEditor = {
           </el-button>
         </div>
 
-        <!-- 空状态 -->
+        <!-- 空Status -->
         <div v-if="!chain.length" class="text-center py-4 text-gray-400 text-xs">
-          暂无拨号动作。上方选一个 app 添加进来，按顺序执行。
+          暂无拨号Action。上方选一个 app 添加进来，按顺序执行。
         </div>
 
         <!-- 链列表 -->
@@ -486,7 +486,7 @@ const AppChainEditor = {
       </div>
       <div class="struct-header border-t bg-white">
         <span class="font-mono text-[11px] text-gray-500 truncate">
-          JSON: {{ chain.length ? preview : '[] (空链，C 侧跳过)' }}
+          JSON: {{ chain.length ? preview : '[] (empty chain, skipped by core)' }}
         </span>
       </div>
     </div>
@@ -495,33 +495,33 @@ const AppChainEditor = {
     const { ref, computed, watch } = Vue;
     const { Plus, ArrowUp, ArrowDown, Delete } = ElementPlusIconsVue || {};
 
-    /* C 侧 app_registry.c builtin_apps[] 注册的 17 个内建 apps（必须对齐） */
+    /* C 侧 app_registry.c builtin_apps[] Register的 17 个内建 apps（必须对齐） */
     const APP_DESCS = {
-      answer:              '应答来电（发送 200 OK）',
-      pre_answer:          'Early Media 预应答（发 183，不发 200 OK）',
-      bridge:              '桥接到 sofia/gateway/<gw>/<ext>',
-      playback:            '播放单个音频文件',
-      post_playback:       '接通后放音（阶段区分用）',
-      record:              '录制当前通话音频',
-      transfer:            '转移当前通话（REFER 或 302）',
-      set:                 '设置通道变量 var=value',
-      conference:          '加入会议 <room>@<profile>',
-      play_and_get_digits: '播放提示音并收集 DTMF',
-      sleep:               '暂停执行（毫秒）',
-      park:                '保持通话等待取回（hold + MoH）',
-      att_xfer:            '出席/咨询转移',
-      gentones:            '生成特定音调序列',
-      endless_playback:    '循环播放（uuid_break 可中断）',
-      uuid_break:          '打断 playback/sleep',
-      read:                'DTMF 收号',
+      answer:              'Answer inbound (send 200 OK)',
+      pre_answer:          'Early media pre-answer (183, no 200 OK)',
+      bridge:              'Bridge to sofia/gateway/<gw>/<ext>',
+      playback:            'Play a single audio file',
+      post_playback:       'Play after answer (phase marker)',
+      record:              'Record current call audio',
+      transfer:            'Transfer current call (REFER or 302)',
+      set:                 'Set channel variable var=value',
+      conference:          'Join conference <room>@<profile>',
+      play_and_get_digits: 'Play prompt and collect DTMF',
+      sleep:               'Pause execution (ms)',
+      park:                'Hold call for pickup (hold + MoH)',
+      att_xfer:            'Attended/consultative transfer',
+      gentones:            'Generate tone sequence',
+      endless_playback:    'Endless loop playback (uuid_break to interrupt)',
+      uuid_break:          'Interrupt playback/sleep',
+      read:                'Collect DTMF digits',
     };
 
-    /* 按执行阶段分组（引导用户构建合理顺序） */
+    /* 按执行阶段Group（引导用户构建合理顺序） */
     const appGroups = computed(() => [
-      { label: '— Early Media / 应答阶段 —', apps: ['pre_answer', 'playback', 'post_playback', 'sleep', 'answer', 'endless_playback', 'read', 'play_and_get_digits'] },
-      { label: '— 路由/桥接阶段 —',        apps: ['bridge', 'transfer', 'att_xfer', 'conference', 'park'] },
-      { label: '— 变量/控制 —',            apps: ['set', 'uuid_break', 'gentones'] },
-      { label: '— 媒体/录音 —',            apps: ['record'] },
+      { label: t('— Early Media / Answer Phase —'), apps: ['pre_answer', 'playback', 'post_playback', 'sleep', 'answer', 'endless_playback', 'read', 'play_and_get_digits'] },
+      { label: t('— Routing / Bridge Phase —'),        apps: ['bridge', 'transfer', 'att_xfer', 'conference', 'park'] },
+      { label: t('— Variables / Control —'),            apps: ['set', 'uuid_break', 'gentones'] },
+      { label: t('— Media / Recording —'),            apps: ['record'] },
     ].map(g => ({
       label: g.label,
       apps: g.apps.map(n => ({ name: n, desc: APP_DESCS[n] || '' })),
@@ -534,10 +534,10 @@ const AppChainEditor = {
     function needsData(name){ return ['playback','post_playback','endless_playback','sleep','bridge','transfer','conference','set','gentones','record','play_and_get_digits','read'].includes(name); }
     function dataPlaceholder(name) {
       const H = {
-        playback:             'welcome.wav 或 /path/to/file.wav',
+        playback:             'welcome.wav or /path/to/file.wav',
         post_playback:        'announce.wav',
         endless_playback:     'hold_music.wav',
-        sleep:                '1500 (毫秒)',
+        sleep:                '1500 (ms)',
         bridge:               'sofia/gateway/my_trunk/8613800138000',
         transfer:             'sip:support@other.com',
         conference:           'my_room@default',
@@ -547,7 +547,7 @@ const AppChainEditor = {
         play_and_get_digits:  'prompt.wav 3 5000',
         read:                 '5 10000',
       };
-      return H[name] || '(无 data)';
+      return H[name] || '(no data)';
     }
 
     function addApp() {
@@ -598,10 +598,10 @@ const HaNodeListEditor = {
   template: `
     <div class="struct-editor">
       <div class="struct-header">
-        <span class="font-semibold">集群节点（{{ rows.length }} 个）</span>
+        <span class="font-semibold">{{ t('Cluster Nodes') }} ({{ rows.length }})</span>
         <span class="text-gray-400 text-[11px]">node_id/host/port/role(master|slave|witness)</span>
       </div>
-      <div v-if="!rows.length" class="px-3 py-6 text-center text-gray-400 text-sm">暂无节点</div>
+      <div v-if="!rows.length" class="px-3 py-6 text-center text-gray-400 text-sm">{{ t('No nodes') }}</div>
       <div v-for="(row, idx) in rows" :key="idx" class="struct-row">
         <input v-model="row.node_id" placeholder="node-1" class="w-28">
         <input v-model="row.host" placeholder="10.0.0.25" class="w-36">
@@ -613,7 +613,7 @@ const HaNodeListEditor = {
         </select>
         <i class="fa-solid fa-trash struct-del ml-auto" @click="rows.splice(idx,1)"></i>
       </div>
-      <div class="struct-add" @click="rows.push({node_id:'',host:'',port:8080,role:'slave'})"><i class="fa-solid fa-plus mr-1"></i>添加节点</div>
+      <div class="struct-add" @click="rows.push({node_id:'',host:'',port:8080,role:'slave'})"><i class="fa-solid fa-plus mr-1"></i>{{ t('Add node') }}</div>
     </div>
   `,
   setup(props, { emit }) {
@@ -649,17 +649,17 @@ const app = createApp({
     const clientIp = ref('---');
     const route = ref(location.hash.replace('#', '') || '/realtime');
 
-    // ===== 多租户全局状态 =====
+    // ===== 多Tenant全局Status =====
     const tenantId = ref(parseInt(localStorage.getItem('nsbc_tenant_id') || '1', 10) || 1);
     const tenantOptions = ref([]);  // [{value, label}]
     const tenantLoading = ref(false);
     function changeTenant(id) {
       tenantId.value = id;
       localStorage.setItem('nsbc_tenant_id', id.toString());
-      // 同步写入 SIP realm（WebRTC 页面和独立 webrtc.html 都会读这个）
+      // 同步写入 SIP realm（WebRTC 面和独立 webrtc.html 都会读这个）
       const t = tenantOptions.value.find(x => x.value === id);
       if (t && t.label) {
-        const tn = t.label.replace(/\s*\(禁用\)\s*$/, '').trim();
+        const tn = t.label.replace(/\s*\(Disable\)\s*$/, '').trim();
         try { localStorage.setItem('nsbc_sip_domain', tn); } catch(_) {}
       }
       // 广播给所有 crudTable 重新加载
@@ -671,7 +671,7 @@ const app = createApp({
         const r = await API.get('/tenants?limit=500&offset=0');
         tenantOptions.value = (r.items || []).map(t => ({
           value: t.id,
-          label: t.tenant_name + (t.enabled ? '' : ' (禁用)'),
+          label: t.tenant_name + (t.enabled ? '' : t(' (Disable)')),
         }));
       } catch (e) { tenantOptions.value = []; }
       finally { tenantLoading.value = false; }
@@ -681,31 +681,31 @@ const app = createApp({
 
     const menuItems = [
       // 实时监控（置于顶部，运维高频）
-      { path: '/realtime',      label: '实时总览', icon: 'fa-solid fa-gauge-high' },
-      { path: '/channels',     label: '在途呼叫', icon: 'fa-solid fa-phone-volume' },
-      { path: '/cdrs',          label: '通话记录', icon: 'fa-solid fa-file-lines' },
-      { path: '/metrics',       label: '性能指标', icon: 'fa-solid fa-chart-line' },
-      { path: '/registrations', label: '注册状态', icon: 'fa-solid fa-user-check' },
-      { path: '/security-center', label: '安全中心', icon: 'fa-solid fa-shield-halved' },
+      { path: '/realtime',      label: t('Realtime Overview'), icon: 'fa-solid fa-gauge-high' },
+      { path: '/channels',     label: t('Live Calls'), icon: 'fa-solid fa-phone-volume' },
+      { path: '/cdrs',          label: t('Call Record'), icon: 'fa-solid fa-file-lines' },
+      { path: '/metrics',       label: t('Metrics'), icon: 'fa-solid fa-chart-line' },
+      { path: '/registrations', label: t('Reg Status'), icon: 'fa-solid fa-user-check' },
+      { path: '/security-center', label: t('Security Center'), icon: 'fa-solid fa-shield-halved' },
       // 业务数据
-      { path: '/tenants',      label: '租户（SIP Realm）', icon: 'fa-solid fa-building' },
-      { path: '/extensions',   label: '分机',     icon: 'fa-solid fa-phone' },
+      { path: '/tenants',      label: t('Tenant (SIP Realm)'), icon: 'fa-solid fa-building' },
+      { path: '/extensions',   label: t('Extension'),     icon: 'fa-solid fa-phone' },
       { path: '/sip-profiles', label: 'SIP Profile', icon: 'fa-solid fa-network-wired' },
-      { path: '/gateways',     label: '网关',     icon: 'fa-solid fa-tower-broadcast' },
-      { path: '/trunks',       label: '中继',     icon: 'fa-solid fa-signal' },
-      // 路由组已移到后端核心侧（nsbcd route_group_t），Web 侧暂不暴露
-      { path: '/dialplan-rules', label: '拨号规则', icon: 'fa-solid fa-code-branch' },
-      { path: '/time-groups',  label: '时间策略', icon: 'fa-solid fa-clock' },
-      { path: '/queues',       label: '分机队列', icon: 'fa-solid fa-people-group' },
-      { path: '/ivr-menus',    label: 'IVR 菜单', icon: 'fa-solid fa-circle-question' },
-      // 计费与媒体
-      { path: '/rates',        label: '费率管理', icon: 'fa-solid fa-coins' },
-      { path: '/balances',     label: '账户余额', icon: 'fa-solid fa-wallet' },
-      { path: '/transcode',    label: '媒体会话', icon: 'fa-solid fa-microphone' },
+      { path: '/gateways',     label: t('Gateway'),     icon: 'fa-solid fa-tower-broadcast' },
+      { path: '/trunks',       label: t('Trunk'),     icon: 'fa-solid fa-signal' },
+      // 路由组已移到后端Core侧（nsbcd route_group_t），Web 侧暂不暴露
+      { path: '/dialplan-rules', label: t('Dialplan Rules'), icon: 'fa-solid fa-code-branch' },
+      { path: '/time-groups',  label: t('Time Groups'), icon: 'fa-solid fa-clock' },
+      { path: '/queues',       label: t('Extension Queues'), icon: 'fa-solid fa-people-group' },
+      { path: '/ivr-menus',    label: t('IVR Menus'), icon: 'fa-solid fa-circle-question' },
+      // 计费与Media
+      { path: '/rates',        label: t('Rates'), icon: 'fa-solid fa-coins' },
+      { path: '/balances',     label: t('Balances'), icon: 'fa-solid fa-wallet' },
+      { path: '/transcode',    label: t('MediaSession'), icon: 'fa-solid fa-microphone' },
       // 系统
-      { path: '/ha-groups',    label: '高可用组', icon: 'fa-solid fa-server' },
+      { path: '/ha-groups',    label: t('HA Groups'), icon: 'fa-solid fa-server' },
       // 工具
-      { path: '/webrtc',       label: 'WebRTC 测试', icon: 'fa-solid fa-video' },
+      { path: '/webrtc',       label: t('WebRTC Test'), icon: 'fa-solid fa-video' },
     ];
 
     window.addEventListener('hashchange', () => { route.value = location.hash.replace('#', '') || '/extensions'; });
@@ -734,7 +734,7 @@ const app = createApp({
         localStorage.setItem('nsbc_user',  auth.user);
         localStorage.setItem('nsbc_role',  auth.role);
         if (r.refresh_token) localStorage.setItem('nsbc_refresh_token', r.refresh_token);
-        // 登录成功后拉取租户列表
+        // 登录Success后拉取Tenant列表
         fetchTenants();
         location.hash = '#/realtime';
       } catch (e) {
@@ -749,8 +749,8 @@ const app = createApp({
     refreshCaptcha();
     window.__auth = auth;  // 暴露给 API 401 handler 使用
 
-    // ===== 登录态自动恢复：页面刷新后也拉租户列表 =====
-    // fetchTenants 原来只在 login() 成功回调里调 — 页面刷新（localStorage 有 token）
+    // ===== 登录态自动恢复：面Refresh后也拉Tenant列表 =====
+    // fetchTenants 原来只在 login() Success回调里调 — 面Refresh（localStorage 有 token）
     // 不走 login()，导致 tenantOptions 永远为空 → 所有 tenant_id 下拉无选项
     if (auth.token) fetchTenants();
 
@@ -759,7 +759,7 @@ const app = createApp({
   },
 });
 
-// 注册结构化编辑器
+// Register结构化Edit器
 app.component('time-range-editor',    TimeRangeEditor);
 app.component('queue-members-editor',  QueueMembersEditor);
 app.component('ivr-options-editor',    IvrOptionsEditor);
@@ -780,13 +780,13 @@ function crudTable(entity, path, columns, formSchema, asyncLoaders = null) {
         <div class="flex items-center justify-between">
           <h2 class="text-lg font-semibold text-slate-800"><i class="${entity.icon} mr-2 text-blue-600"></i>${entity.label}</h2>
           <div class="flex items-center gap-2">
-            <el-select v-if="hasBoolColumn" v-model="filterEnabled" placeholder="状态" size="small" style="width:110px" clearable>
-              <el-option label="全部" value=""></el-option>
-              <el-option label="启用" value="true"></el-option>
-              <el-option label="禁用" value="false"></el-option>
+            <el-select v-if="hasBoolColumn" v-model="filterEnabled" :placeholder="t('$n')" size="small" style="width:110px" clearable>
+              <el-option :label="t('$n')" value=""></el-option>
+              <el-option :label="t('$n')" value="true"></el-option>
+              <el-option :label="t('$n')" value="false"></el-option>
             </el-select>
             <el-button type="primary" size="small" @click="openCreate">
-              <el-icon><Plus /></el-icon>新建
+              <el-icon><Plus /></el-icon>New
             </el-button>
           </div>
         </div>
@@ -796,22 +796,22 @@ function crudTable(entity, path, columns, formSchema, asyncLoaders = null) {
           <el-table-column v-for="c in columns" :key="c.key" :prop="c.key" :label="c.label" min-width="120">
             <template #default="{ row }">
               <el-tag v-if="c.type === 'bool'" :type="row[c.key] ? 'success' : 'info'" effect="light" size="small" round>
-                {{ row[c.key] ? '启用' : '禁用' }}
+                {{ row[c.key] ? t('Enable') : t('Disable') }}
               </el-tag>
               <span v-else-if="c.type === 'json'" class="font-mono text-xs text-slate-500" :title="row[c.key]" style="max-width:200px;display:inline-block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{{ row[c.key] }}</span>
               <span v-else class="text-slate-700">{{ row[c.key] != null && row[c.key] !== '' ? row[c.key] : '-' }}</span>
             </template>
           </el-table-column>
-          <el-table-column label="操作" width="180" align="center" fixed="right">
+          <el-table-column :label="t('$n')" width="180" align="center" fixed="right">
             <template #default="{ row }">
               <div style="display:flex; gap:4px; justify-content:center; align-items:center; flex-wrap:nowrap;">
                 <el-button link type="primary" size="small" @click="openEdit(row)">
-                  <el-icon><Edit /></el-icon>编辑
+                  <el-icon><Edit /></el-icon>Edit
                 </el-button>
-                <el-popconfirm title="确认删除？" @confirm="del(row.id)">
+                <el-popconfirm :title="t('$n')" @confirm="del(row.id)">
                   <template #reference>
                     <el-button link type="danger" size="small">
-                      <el-icon><Delete /></el-icon>删除
+                      <el-icon><Delete /></el-icon>Delete
                     </el-button>
                   </template>
                 </el-popconfirm>
@@ -831,31 +831,31 @@ function crudTable(entity, path, columns, formSchema, asyncLoaders = null) {
           ></el-pagination>
         </div>
 
-        <el-dialog v-model="showModal" :title="(editingId ? '编辑' : '新建') + ' ${entity.label}'" width="720px" destroy-on-close>
+        <el-dialog v-model="showModal" ::title="t('$n')" width="720px" destroy-on-close>
           <el-form :model="form" label-position="top">
             <el-form-item v-for="f in formSchema" :key="f.key" :label="f.label">
               <template v-if="f.type === 'select'">
-                <el-select v-model="form[f.key]" placeholder="请选择" style="width:100%" clearable>
+                <el-select v-model="form[f.key]" :placeholder="t('$n')" style="width:100%" clearable>
                   <el-option v-for="o in f.options" :key="o.value" :label="o.label" :value="o.value"></el-option>
                 </el-select>
               </template>
               <template v-else-if="f.type === 'async-select'">
-                <el-select v-model="form[f.key]" placeholder="加载中..." style="width:100%" clearable :loading="asyncLoading[f.key]">
+                <el-select v-model="form[f.key]" :placeholder="t('$n')" style="width:100%" clearable :loading="asyncLoading[f.key]">
                   <el-option v-for="o in asyncOptions[f.key]" :key="o.value" :label="o.label" :value="o.value"></el-option>
                 </el-select>
               </template>
               <el-input-number v-else-if="f.type === 'number'" v-model="form[f.key]" :controls="false" style="width:100%"></el-input-number>
-              <el-switch v-else-if="f.type === 'bool'" v-model="form[f.key]" active-text="启用" inactive-text="禁用"></el-switch>
+              <el-switch v-else-if="f.type === 'bool'" v-model="form[f.key]" :active-text="t('$n')" :inactive-text="t('$n')"></el-switch>
               <template v-else-if="f.type === 'json'">
                 <div class="w-full">
                   <div class="flex justify-between items-center mb-1">
-                    <span class="text-xs text-slate-500">结构化数据（点击切换 Raw JSON）</span>
+                    <span class="text-xs text-slate-500">{{ t('Structured data (click to toggle Raw JSON)') }}</span>
                     <el-button link size="small" type="primary" @click="rawMode[f.key] = !rawMode[f.key]">
-                      {{ rawMode[f.key] ? '结构化编辑' : 'Raw JSON' }}
+                      {{ rawMode[f.key] ? t('Structured') : 'Raw JSON' }}
                     </el-button>
                   </div>
                   <el-input v-if="rawMode[f.key]" v-model="form[f.key]" type="textarea" :rows="6"
-                    placeholder='有效 JSON，例如 {"clip":"44"}' resize="none"></el-input>
+                    :placeholder="t('Valid JSON, e.g. {&quot;clip&quot;:&quot;44&quot;}')" resize="none"></el-input>
                   <trunk-codec-editor v-else-if="f.editor === 'trunk-codec'" v-model="form[f.key]"></trunk-codec-editor>
                   <dp-action-editor   v-else-if="f.editor === 'dp-action'"   v-model="form[f.key]"></dp-action-editor>
                   <time-range-editor  v-else-if="f.editor === 'time-ranges'"  v-model="form[f.key]"></time-range-editor>
@@ -863,18 +863,18 @@ function crudTable(entity, path, columns, formSchema, asyncLoaders = null) {
                   <ivr-options-editor v-else-if="f.editor === 'ivr-options'"  v-model="form[f.key]"></ivr-options-editor>
                   <ha-node-list-editor v-else-if="f.editor === 'ha-node-list'"  v-model="form[f.key]"></ha-node-list-editor>
                   <el-input v-else v-model="form[f.key]" type="textarea" :rows="6" resize="none"
-                    placeholder='输入 JSON 字符串'></el-input>
+                    placeholder='Enter JSON string'></el-input>
                 </div>
               </template>
               <el-input v-else-if="f.type === 'textarea'" v-model="form[f.key]" type="textarea" :rows="3" resize="vertical"></el-input>
-              <el-input v-else-if="f.type === 'password'" v-model="form[f.key]" type="password" show-password :placeholder="f.help || '请输入密码'"></el-input>
-              <el-input v-else v-model="form[f.key]" :placeholder="'请输入 ' + f.label"></el-input>
+              <el-input v-else-if="f.type === 'password'" v-model="form[f.key]" type="password" show-password ::placeholder="t('$n')"></el-input>
+              <el-input v-else v-model="form[f.key]" ::placeholder="t('$n')"></el-input>
               <div v-if="f.help" class="text-xs text-slate-400 mt-1">{{ f.help }}</div>
             </el-form-item>
           </el-form>
           <template #footer>
-            <el-button @click="showModal = false">取消</el-button>
-            <el-button type="primary" :loading="saving" @click="save">保 存</el-button>
+            <el-button @click="showModal = false">{{ t('Cancel') }}</el-button>
+            <el-button type="primary" :loading="saving" @click="save">{{ t('Save') }}</el-button>
           </template>
         </el-dialog>
       </div>
@@ -886,7 +886,7 @@ function crudTable(entity, path, columns, formSchema, asyncLoaders = null) {
       const showModal = ref(false), editingId = ref(null);
       const form = reactive({}), saving = ref(false);
       const rawMode = reactive({});
-      const errorMsg = ref('');  // 显示在列表上方的错误提示
+      const errorMsg = ref('');  // 显示在列表上方的Error提示
       // async-select 动态选项
       const asyncOptions = reactive({});
       const asyncLoading = reactive({});
@@ -903,7 +903,7 @@ function crudTable(entity, path, columns, formSchema, asyncLoaders = null) {
           items.value = r.items || []; total.value = r.total || items.value.length;
         } catch (e) {
           items.value = []; total.value = 0;
-          errorMsg.value = '加载失败: ' + (e.message || e) + '（检查后端是否已编译 / DB 是否可用 / 登录是否过期）';
+          errorMsg.value = t('Load failed: ') + (e.message || e) + t(' (check backend build / DB availability / login expiry)');
         }
       }
       async function loadAsyncOptions() {
@@ -923,7 +923,7 @@ function crudTable(entity, path, columns, formSchema, asyncLoaders = null) {
           form[f.key] = f.type === 'bool' ? true : (f.default ?? '');
           if (f.editor) rawMode[f.key] = false;
         });
-        // 自动填入当前全局租户 ID（覆盖 default）
+        // 自动填入Current全局Tenant ID（覆盖 default）
         if (formSchema.some(f => f.key === 'tenant_id')) {
           form.tenant_id = API.tenantId();
         }
@@ -944,32 +944,32 @@ function crudTable(entity, path, columns, formSchema, asyncLoaders = null) {
           for (const f of formSchema) {
             if (f.type === 'json') {
               try { const v = form[f.key] || 'null'; if (v !== 'null') JSON.parse(v); }
-              catch { alert(f.label + ' 不是有效 JSON'); saving.value = false; return; }
+              catch { alert(f.label + ' is not valid JSON'); saving.value = false; return; }
             }
           }
           const body = {};
           formSchema.forEach(f => {
             const v = form[f.key];
             if (v === undefined) return;
-            // password 字段：空字符串也不传（编辑时留空 = 不改密码）
+            // password 字段：空字符串也不传（Edit时留空 = 不改Password）
             if (f.type === 'password' && v === '') return;
             body[f.key] = v;
           });
           if (editingId.value) await API.put(path + '/' + editingId.value, body);
           else await API.post(path, body);
           showModal.value = false; await load();
-        } catch (e) { alert('保存失败: ' + e.message); }
+        } catch (e) { alert('Save failed: ' + e.message); }
         finally { saving.value = false; }
       }
       async function del(id) {
-        if (!confirm('确认删除 ID=' + id + '？')) return;
+        if (!confirm(t('Confirm delete ID=') + id + '?')) return;
         try { await API.delete(path + '/' + id); await load(); }
-        catch (e) { alert('删除失败: ' + e.message); }
+        catch (e) { alert('Delete failed: ' + e.message); }
       }
 
       onMounted(() => {
         load(); loadAsyncOptions();
-        // 监听租户切换，自动重新加载当前实体列表
+        // 监听Tenant切换，自动重新加载Current实体列表
         const onTenantChanged = () => { load(); };
         window.addEventListener('nsbc-tenant-changed', onTenantChanged);
         onBeforeUnmount(() => {
@@ -994,21 +994,21 @@ function livePanel(title, icon, columns, apiPath, opts = {}) {
         <div class="flex items-center justify-between mb-4">
           <h2 class="text-lg font-semibold"><i :class="icon"></i> ${title}</h2>
           <div class="flex items-center gap-2 text-xs text-gray-500">
-            <span v-if="loading"><i class="fa-solid fa-spinner fa-spin"></i> 加载中</span>
+            <span v-if="loading"><i class="fa-solid fa-spinner fa-spin"></i>{{ t(' Loading...') }}</span>
             <span v-else-if="error" class="text-red-500">⚠ {{ error }}</span>
-            <span v-else>✓ 已刷新 {{ lastUpdated }}</span>
-            <button @click="load" class="px-2 py-1 border rounded hover:bg-gray-50">刷新</button>
+            <span v-else>✓ Refreshed {{ lastUpdated }}</span>
+            <button @click="load" class="px-2 py-1 border rounded hover:bg-gray-50">{{ t('Refresh') }}</button>
           </div>
         </div>
         <div v-if="!allRows.length && !loading" class="text-center text-gray-400 py-12">
-          暂无数据
+          No data
         </div>
         <div v-else class="overflow-x-auto border rounded">
         <table class="w-full text-sm border-collapse min-w-[1400px]">
           <thead>
             <tr class="bg-gray-50 border-b">
               <th v-for="c in columns" :key="c.key" class="px-3 py-2 text-left font-medium text-gray-600 whitespace-nowrap">{{ c.label }}</th>
-              <th v-if="actionCol" class="px-3 py-2 text-left font-medium text-gray-600 sticky right-0 bg-gray-50 border-l">操作</th>
+              <th v-if="actionCol" class="px-3 py-2 text-left font-medium text-gray-600 sticky right-0 bg-gray-50 border-l">{{ t('Action') }}</th>
             </tr>
           </thead>
           <tbody>
@@ -1026,9 +1026,9 @@ function livePanel(title, icon, columns, apiPath, opts = {}) {
           </tbody>
         </table>
         </div>
-        <!-- 分页控件 -->
+        <!-- 分控件 -->
         <div v-if="allRows.length > pageSize" class="flex items-center justify-between mt-3 text-xs text-gray-500">
-          <div>共 {{ allRows.length }} 条 · 每页 {{ pageSize }} 条</div>
+          <div>Total {{ allRows.length }}  · {{ pageSize }} per page </div>
           <div class="flex items-center gap-1">
             <button @click="currentPage = 1" :disabled="currentPage===1" class="px-2 py-1 border rounded disabled:opacity-30">«</button>
             <button @click="currentPage--" :disabled="currentPage===1" class="px-2 py-1 border rounded disabled:opacity-30">‹</button>
@@ -1078,13 +1078,13 @@ function livePanel(title, icon, columns, apiPath, opts = {}) {
       function extractRows(data) {
         if (!data) return [];
         return data.rates || data.accounts || data.sessions || data.calls || data.cdrs
-            || data.items  // 后端分页结构
+            || data.items  // 后端分结构
             || (data.metrics && Object.entries(data.metrics).map(([k,v]) => ({metric: k, value: v})))
             || (Array.isArray(data) ? data : []);
       }
 
       onMounted(() => { load(); if (refreshMs > 0) timer = setInterval(load, refreshMs); });
-      // nsbc-esl-web §8#1：SSE 推送触发静默刷新（不闪 loading），与 refreshMs
+      // nsbc-esl-web §8#1：SSE 推送触发静默Refresh（不闪 loading），与 refreshMs
       // 轮询构成 push+pull 双路径。修复：清定时器须在卸载时（原误用 onMounted，
       // 导致 setInterval 刚建即被清除，轮询实际不生效）。
       const onSseRefresh = () => load(true);
@@ -1095,36 +1095,36 @@ function livePanel(title, icon, columns, apiPath, opts = {}) {
   };
 }
 
-// 所有 const / function 在经典 script 标签间自动共享全局词法作用域，
+// 所有 const / function 在经典 script 标签间自动Total享全局词法作用域，
 // 后续 pages-crud.js / pages-live.js 可直接使用 app, crudTable, livePanel, API 等。
 
-// ===== 全局挂断函数（livePanel actionCol 用 v-html + onclick 调） =====
+// ===== 全局Hang up函数（livePanel actionCol 用 v-html + onclick 调） =====
 window.nsbcHangup = async function(callId) {
   if (!callId) return;
-  if (!confirm('确认挂断通话 ' + callId + ' ？')) return;
+  if (!confirm(t('Confirm hang up call ') + callId + '?')) return;
   try {
     await API.post('/calls/' + encodeURIComponent(callId) + '/hangup', {});
-    // 触发所有 livePanel 刷新
+    // 触发所有 livePanel Refresh
     document.dispatchEvent(new CustomEvent('nsbc-refresh'));
-    alert('挂断指令已发送');
+    alert('Hang up command sent');
   } catch (e) {
-    alert('挂断失败: ' + (e.message || e));
+    alert('Hang up failed: ' + (e.message || e));
   }
 };
 
 // ===== SESSION 实时推送消费者（SSE，nsbc-esl-web §8#1）=====
 // 双路径设计（符合项目「订阅推送 + 拉取」约束）：本消费者把服务端 /calls/stream
-// 的 SESSION 事件转成本地 nsbc-refresh 事件即时刷新 livePanel；若 SSE 不可用，
+// 的 SESSION 事件转成本地 nsbc-refresh 事件即时Refresh livePanel；若 SSE 不可用，
 // 各面板的 refreshMs 轮询自动兜底，无感降级。
 // 说明：EventSource 无法携带 Authorization 头，故用 fetch + ReadableStream 手解析
-// SSE 帧（event:/data: 行，空行分隔）；连接断开按指数退避（1s→30s）重连。
+// SSE 帧（event:/data: 行，空行分隔）；Connection lost按指数退避（1s→30s）重连。
 (function () {
   const MAX_BACKOFF = 30000;
   let refreshTimer = null;
   let backoff = 1000;
 
-  // 合并突发事件：一次呼叫会有 create/answer/hold/... 多个事件，300ms 去抖后
-  // 只触发一次面板刷新，避免高频重拉。
+  // 合并突发事件：一次Call会有 create/answer/hold/... 多个事件，300ms 去抖后
+  // 只触发一次面板Refresh，避免高频重拉。
   function scheduleRefresh() {
     if (refreshTimer) return;
     refreshTimer = setTimeout(() => {
@@ -1143,12 +1143,12 @@ window.nsbcHangup = async function(callId) {
       res = await fetch(API.base + '/calls/stream', { headers: h });
       if (!res.ok || !res.body) throw new Error('HTTP ' + res.status);
     } catch (e) {
-      console.warn('[live] SSE 连接失败，' + backoff + 'ms 后重连：', e.message || e);
+      console.warn(t('[live] SSE connect failed, retrying in ') + backoff + t('ms: '), e.message || e);
       setTimeout(streamLoop, backoff);
       backoff = Math.min(backoff * 2, MAX_BACKOFF);
       return;
     }
-    backoff = 1000;  // 连接成功，重置退避
+    backoff = 1000;  // Connected，Reset退避
     const reader = res.body.getReader();
     const dec = new TextDecoder();
     let buf = '';
@@ -1167,7 +1167,7 @@ window.nsbcHangup = async function(callId) {
         }
       }
     } catch (e) {
-      console.warn('[live] SSE 读取中断：', e.message || e);
+      console.warn('[live] SSE read interrupted: ', e.message || e);
     }
     setTimeout(streamLoop, backoff);        // 断线重连
     backoff = Math.min(backoff * 2, MAX_BACKOFF);

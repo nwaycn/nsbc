@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>NSBC WebRTC 视频通话</title>
+<title>NSBC WebRTC Video通话</title>
 <script src="js/sip-0.21.2.min.js"></script>
 <style>
   * { box-sizing: border-box; }
@@ -64,7 +64,7 @@
   .toolbar { display:flex; gap:6px; flex-wrap:wrap; }
   .toolbar button { padding:4px 12px; font-size:12px; }
 
-  /* 来电弹窗 */
+  /* Incoming弹窗 */
   .ring { animation: ring 0.6s ease-in-out infinite; }
   @keyframes ring { 0%,100%{ transform:rotate(-3deg);} 50%{ transform:rotate(3deg);} }
 </style>
@@ -72,36 +72,36 @@
 <body>
 <div class="wrap">
 
-  <h1>NSBC WebRTC 视频通话 <span class="tag">独立页面 · SIP.js + WSS</span></h1>
+  <h1>NSBC WebRTC Video通话 <span class="tag">独立页面 · SIP.js + WSS</span></h1>
 
   <div class="grid">
 
     <!-- 左侧：账号注册 -->
     <div class="card">
-      <h3>SIP 账号</h3>
-      <div class="row"><label>WSS 服务器</label><input id="wss" value="" placeholder="自动从 URL 推导"></div>
-      <div class="row"><label>STUN</label><input id="stun" value="" placeholder="自动从 URL 推导"></div>
-      <div class="row"><label>分机号</label><input id="user" value="1000"></div>
-      <div class="row"><label>密码</label><input id="pass" type="password" value=""></div>
-      <div class="row"><label>Realm / 租户</label><input id="realm" value="nsbc.local" placeholder="nsbc.local · SIP 域 / 租户名"></div>
+      <h3>SIP Account</h3>
+      <div class="row"><label>WSS Server</label><input id="wss" value="" placeholder="Auto derive from URL"></div>
+      <div class="row"><label>STUN Server</label><input id="stun" value="" placeholder="Auto derive from URL"></div>
+      <div class="row"><label>Extension</label><input id="user" value="1000"></div>
+      <div class="row"><label>Password</label><input id="pass" type="password" value=""></div>
+      <div class="row"><label>Realm / Tenant</label><input id="realm" value="nsbc.local" placeholder="nsbc.local · SIP 域 / 租户名"></div>
       <div class="row">
         <button class="btn btn-green" id="btnReg" onclick="doRegister()">▶ Register</button>
         <button class="btn btn-red"   id="btnUnreg" onclick="doUnregister()" disabled>Unregister</button>
-        <span class="status" id="regStatus">未注册</span>
+        <span class="status" id="regStatus">Not registered</span>
       </div>
     </div>
 
-    <!-- 右侧：视频 -->
+    <!-- 右侧：Video -->
     <div class="card">
-      <h3>视频</h3>
+      <h3>Video</h3>
       <div class="videos">
         <div class="video-box">
           <video id="localVideo" autoplay muted playsinline></video>
-          <div class="lbl"><span class="dot off" id="localDot"></span>本地</div>
+          <div class="lbl"><span class="dot off" id="localDot"></span>Local</div>
         </div>
         <div class="video-box">
           <video id="remoteVideo" autoplay playsinline></video>
-          <div class="lbl"><span class="dot off" id="remoteDot"></span>远端</div>
+          <div class="lbl"><span class="dot off" id="remoteDot"></span>Remote</div>
         </div>
       </div>
       <div class="toolbar">
@@ -111,9 +111,9 @@
     </div>
   </div>
 
-  <!-- 来电弹窗 -->
+  <!-- Incoming弹窗 -->
   <div class="incoming" id="incoming">
-    <div>📞 来电: <span class="from" id="inFrom">—</span> <span class="ring">🔔</span></div>
+    <div>📞 Incoming: <span class="from" id="inFrom">—</span> <span class="ring">🔔</span></div>
     <div>
       <button class="btn btn-green" onclick="doAccept()" style="margin-right:6px">Accept</button>
       <button class="btn btn-red"   onclick="doReject()">Reject</button>
@@ -125,11 +125,11 @@
     <!-- 呼叫 -->
     <div class="card">
       <h3>呼叫</h3>
-      <div class="row"><label>被叫</label><input id="target" placeholder="sip:1001@nsbc.local"></div>
+      <div class="row"><label>Callee</label><input id="target" placeholder="sip:1001@nsbc.local"></div>
       <div class="row">
         <button class="btn btn-green" id="btnCall" onclick="doCall()" disabled>📞 Call</button>
         <button class="btn btn-red"   id="btnHang" onclick="doHangup()" disabled>✕ Hangup</button>
-        <span class="status" id="callStatus">空闲</span>
+        <span class="status" id="callStatus">Idle</span>
       </div>
     </div>
 
@@ -137,16 +137,16 @@
     <div class="card">
       <h3>DataChannel</h3>
       <div class="dc-area">
-        <input id="dcMsg" placeholder="输入消息，回车发送..." disabled onkeydown="if(event.key==='Enter') dcSend()">
+        <input id="dcMsg" placeholder="Type message, Enter to send..." disabled onkeydown="if(event.key==='Enter') dcSend()">
         <button class="btn btn-blue" onclick="dcSend()" id="btnDc" disabled>Send</button>
       </div>
-      <div class="dc-log" id="dcLog"><div class="sys">等待 DataChannel open...</div></div>
+      <div class="dc-log" id="dcLog"><div class="sys">Waiting for DataChannel open...</div></div>
     </div>
   </div>
 
   <!-- SIP 日志 -->
   <div class="card" style="margin-top:16px">
-    <h3>SIP 实时日志</h3>
+    <h3>SIP Live Log</h3>
     <div class="sip-log" id="sipLog"></div>
   </div>
 
@@ -160,7 +160,7 @@
 // =============================================================================
 
 const $ = (id) => document.getElementById(id);
-// ===== Realm / 租户动态化 =====
+// ===== Realm / Tenant动态化 =====
 function getSipDomain() {
   const dom = document.getElementById('realm');
   if (dom && dom.value && dom.value.trim()) {
@@ -266,7 +266,7 @@ let dc = null, dcOpen = false;
   }
 })();
 
-// 自动从当前页面 URL 推导 WSS / STUN 服务器
+// 自动从当前页面 URL 推导 WSS / STUN Server 服务器
 // 例: https://10.0.0.80:8443/webrtc.html → host=10.0.0.80
 //     https://webrtc.nway.com.cn/webrtc.html → host=webrtc.nway.com.cn
 (function autoDeriveServers() {
@@ -277,10 +277,10 @@ let dc = null, dcOpen = false;
   if (host) {
     wssEl.value = 'wss://' + host + ':5062';
     stunEl.value = 'stun:' + host + ':3478';
-    console.log('[NSBC] 自动探测 host=' + host + ' → WSS=' + wssEl.value + '  STUN=' + stunEl.value);
+    console.log('[NSBC] 自动探测 host=' + host + ' → WSS=' + wssEl.value + '  STUN Server=' + stunEl.value);
   } else {
     // file:// 或 data:// 协议——无法自动推导，留空让用户手动填
-    console.warn('[NSBC] 无法自动探测（当前协议: ' + window.location.protocol + '），请手动填写 WSS/STUN');
+    console.warn('[NSBC] 无法自动探测（当前协议: ' + window.location.protocol + '），请手动填写 WSS/STUN Server');
     wssEl.placeholder = '手动填写 (如 wss://10.0.0.80:5062)';
     stunEl.placeholder = '手动填写 (如 stun:10.0.0.80:3478)';
   }
@@ -441,7 +441,7 @@ async function doRegister() {
 
     // delegate — 0.21.x 事件不再是 .on()，走 delegate 回调
     const delegate = {
-      // 来电：创建 Invitation 后立即赋值 modifier + 立即加 stateChange 监听（关键：在 accept() 之前！）
+      // Incoming：创建 Invitation 后立即赋值 modifier + 立即加 stateChange 监听（关键：在 accept() 之前！）
       onInvite: async (inv) => {
         // 只注册一次 sdpCodecWhitelist（UA config 可能已继承）
         const defaultMods = inv.sessionDescriptionHandlerModifiers || [];
@@ -504,7 +504,7 @@ async function doRegister() {
             log('ok', '✅ ANSWER ESTABLISHED (via delegate listener)');
             setupMedia(session, true);
           } else if (state === SIP.SessionState.Terminated) {
-            log('info', '来电已挂断');
+            log('info', 'Incoming已挂断');
             $('incoming').classList.remove('show'); invitation = null;
             onCallEnd('对端挂断');
           }
@@ -526,8 +526,8 @@ async function doRegister() {
             constraints: { audio: true, video: true },
             peerConnectionConfiguration: {
               // 内网 ICE-Lite 场景下 host candidate 直连就够，
-              // 显式设空数组防止 SIP.js 注入默认 STUN（如 Google stun:stun.l.google.com:19302）
-              // 外网 STUN 连不上会导致 Chrome ICE gathering 长时间卡住。
+              // 显式设空数组防止 SIP.js 注入默认 STUN Server（如 Google stun:stun.l.google.com:19302）
+              // 外网 STUN Server 连不上会导致 Chrome ICE gathering 长时间卡住。
               iceServers: [],
               iceTransportPolicy: 'all',
               bundlePolicy: 'max-bundle',
@@ -565,7 +565,7 @@ async function doRegister() {
             })
             .catch(e => log('warn', '⚠️ 媒体权限被拒绝: ' + e.message));
       } else if (state === SIP.RegistererState.Unregistered) {
-        $('regStatus').textContent = '未注册'; $('regStatus').className = 'status';
+        $('regStatus').textContent = 'Not registered'; $('regStatus').className = 'status';
         $('btnReg').disabled = false; $('btnUnreg').disabled = true; $('btnCall').disabled = true;
         log('info', 'UNREGISTERED');
       } else if (state === SIP.RegistererState.RegistrationFailed) {
@@ -607,7 +607,7 @@ window.addEventListener('beforeunload', () => {
 async function doCall() {
   if (!ua) return;
   const target = SIP.UserAgent.makeURI($('target').value);
-  if (!target) { log('err', '被叫 URI 无效'); return; }
+  if (!target) { log('err', 'Callee URI 无效'); return; }
 
   log('tx', `📤 INVITE → ${target.user}`);
   $('callStatus').textContent = '呼叫中...'; $('btnCall').disabled = true;
@@ -617,7 +617,7 @@ async function doCall() {
     // ✅ 让 SIP.js SDH 自己调 getUserMedia（通过 sessionDescriptionHandlerOptions.constraints）
     inviter = new SIP.Inviter(ua, target, {
       // 关键：0.21.x 需要通过 Inviter 构造函数传入 sessionDescriptionHandlerOptions
-      // 才能让 SDH 在 createOffer() 前拿到带 video 的本地流
+      // 才能让 SDH 在 createOffer() 前拿到带 video 的Local流
       sessionDescriptionHandlerOptions: {
         constraints: { audio: true, video: true },
       },
@@ -825,15 +825,15 @@ async function doHangup() {
     hangupErr = e;
     log('err', 'HANGUP FAIL: ' + (e.message || e));
   }
-  // 无论成功/失败/超时都执行清理（UI 必须回到空闲）
-  const reason = hangupErr ? ('本地挂断' + (hangupErr.message ? ' (' + hangupErr.message + ')' : '')) : '本地挂断';
+  // 无论成功/失败/超时都执行清理（UI 必须回到Idle）
+  const reason = hangupErr ? ('Local挂断' + (hangupErr.message ? ' (' + hangupErr.message + ')' : '')) : 'Local挂断';
   onCallEnd(reason);
   isHangingUp = false;
 }
 
 function onCallEnd(reason) {
   log('info', 'CALL END: ' + reason);
-  $('callStatus').textContent = '空闲';
+  $('callStatus').textContent = 'Idle';
   $('btnCall').disabled = !ua; $('btnHang').disabled = true;
   closePC(); stopMedia();
   session = null; inviter = null; invitation = null;
@@ -867,7 +867,7 @@ async function setupMedia(sess, isCallee) {
     ` ${r.track ? `${r.track.kind}[${r.track.label||'?'} enabled=${r.track.enabled} muted=${r.track.muted} ready=${r.track.readyState}]` : ' null'}`
   ).join(','));
 
-  // ---- 本地流绑定（SDH 已经在 invite/accept 时调 getUserMedia + addTrack 了，
+  // ---- Local流绑定（SDH 已经在 invite/accept 时调 getUserMedia + addTrack 了，
   // setupMedia 只是把 sdh.localStream 绑到 <video> 标签展示；
   // 只有在极端 fallback 情况（SDH localStream 丢失且 PC sender 也空）才手动补 addTrack）----
   const ls = sdh.localStream;
@@ -875,7 +875,7 @@ async function setupMedia(sess, isCallee) {
     localStream = ls;
     $('localVideo').srcObject = ls;
     $('localDot').className = 'dot on';
-    log('ok', `📺 本地流 OK (${ls.getTracks().length} tracks, SDH 已注入)`);
+    log('ok', `📺 Local流 OK (${ls.getTracks().length} tracks, SDH 已注入)`);
   } else {
     // Fallback：SDH localStream 丢失（不该发生，但防一手）
     log('warn', '⚠️ sdh.localStream 为空 — 尝试 fallback getUserMedia');
@@ -895,7 +895,7 @@ async function setupMedia(sess, isCallee) {
     }
   }
 
-  // ---- 远端流绑定（已到达的） ----
+  // ---- Remote流绑定（已到达的） ----
   if (receivers.length > 0) {
     if (!remoteStream) remoteStream = new MediaStream();
     receivers.forEach(r => {
@@ -905,7 +905,7 @@ async function setupMedia(sess, isCallee) {
     if (remoteStream.getTracks().length > 0) {
       $('remoteVideo').srcObject = remoteStream;
       $('remoteDot').className = 'dot on';
-      log('ok', `📺 远端流已绑定 (${remoteStream.getTracks().length} tracks)`);
+      log('ok', `📺 Remote流已绑定 (${remoteStream.getTracks().length} tracks)`);
     }
   }
 
@@ -939,7 +939,7 @@ async function setupMedia(sess, isCallee) {
     pc.ondatachannel = (e) => { log('info', '📥 DC inbound: ' + e.channel.label); dc = e.channel; bindDC(); };
   }
 
-  // ---- ⑤ ontrack（迟到远端 track）----
+  // ---- ⑤ ontrack（迟到Remote track）----
   pc.ontrack = (e) => {
     log('ok', `🎬 ONTRACK: ${e.track.kind} label=${e.track.label} enabled=${e.track.enabled} ready=${e.track.readyState}`);
     if (!remoteStream) remoteStream = new MediaStream();
@@ -1033,8 +1033,8 @@ async function ensureMedia() {
 function stopMedia() {
   // ★ 保护 window.__pendingStream（模板流）：不要 stop 它的 track。
   // 原因：MediaStreamTrack 是独占硬件的——stop 它 = 关摄像头/麦克风，
-  // 下次来电 getUserMedia 要重新申请权限 + 冷启动摄像头（慢且闪）。
-  // 模板流常驻 = 硬件一直开着（微功耗），下次来电 PC addTrack 直接引用。
+  // 下次Incoming getUserMedia 要重新申请权限 + 冷启动摄像头（慢且闪）。
+  // 模板流常驻 = 硬件一直开着（微功耗），下次Incoming PC addTrack 直接引用。
   // 只有页面 unload / unregister 时才彻底 stop（见 window.onbeforeunload / doUnreg）。
 
   // ① 停 localStream（如果不是 pendingStream 的引用）

@@ -299,7 +299,7 @@ int vad_start_for_call(void *call_key, int leg_mask, uint16_t threshold) {
     if (!call_key) return -1;
     int idx = find_or_alloc_slot(call_key);
     if (idx < 0) {
-        llog(LOG_WARN, "vad", "VAD 状态表已满（%d 槽）", VAD_MAX_CALLS);
+        llog(LOG_WARN, "vad", "VAD state table full (%d slots)", VAD_MAX_CALLS);
         return -1;
     }
     if (threshold > 0) g_states[idx].threshold = threshold;

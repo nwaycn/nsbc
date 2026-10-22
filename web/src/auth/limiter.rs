@@ -1,19 +1,19 @@
-//! 登录失败锁定 + 三接口 per-IP 限流（REQ-WEB-004/008 失败锁定、REQ-WEB-009）。
+﻿//! Login failure lockout + three-endpoint per-IP rate limiting (REQ-WEB-004/008 failure lockout, REQ-WEB-009).
 //!
-//! 设计取舍（P0 最小实现，管理面低频）：
-//!   - **锁定维度=用户名**：防针对单账号的口令喷洒/爆破，与来源 IP 无关；
-//!     账号不存在的尝试也计数（不区分用户是否存在，REQ-WEB-018）。
-//!   - **限流维度=源 IP × 桶**：固定窗口（60s），login/refresh/命令执行
-//!         三桶独立阈值；超限 429 + Retry-After。
-//!   - 阈值均可经环境配置，0=关闭该机制（见 [`Limits`]）。
-//!   - std::Mutex 短临界区，不跨 await 持锁；计数器有界（超 1024 键惰性清过期）。
-//!   - 单 IP 并发连接上限（传输层计数）与自动封禁为后续项，见 state §6#5。
-//!   - 进程内状态：重启即清零（与 sessions 同口径）。
+//! Design tradeoffs (P0 minimal implementation, management-plane low frequency):
+//!   - **Lockout keyed by username**: prevents credential spraying/brute force against single accounts, independent of source IP;
+//!     attempts against non-existent accounts are also counted (no user-existence distinction, REQ-WEB-018).
+//!   - **Rate-limit keyed by source IP x bucket**: fixed window (60s), login/refresh/command execution
+//!         three independent thresholds per bucket; exceeding returns 429 + Retry-After.
+//!   - All thresholds configurable via env, 0=disables the respective mechanism (see [`Limits`]).
+//!   - std::Mutex short critical sections, no lock held across await; counter bounded (lazy-expire when over 1024 keys).
+//!   - Per-IP concurrent connection cap (transport-layer counting) and auto-ban are future items, see state §6#5.
+//!   - In-process state: cleared on restart (consistent with sessions).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// 限流桶：REQ-WEB-009 要求登录/刷新/命令执行三类接口分别限流。
+/// Rate-limit buckets: REQ-WEB-009 requires login/refresh/command-exec endpoints to be limited separately.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Bucket {
     Login,
@@ -30,7 +30,7 @@ impl Bucket {
         }
     }
 
-    /// 按请求路径（已剥 /api/v1 前缀）选桶。
+    /// Select bucket by request path (already stripped of /api/v1 prefix).
     pub fn for_path(path: &str) -> Bucket {
         match path {
             "/auth/login" => Bucket::Login,
@@ -48,20 +48,20 @@ impl Bucket {
     }
 }
 
-/// 全部防滥用阈值（fail-closed 装配，非法值拒绝启动；0=关闭对应机制）。
+/// All anti-abuse thresholds (fail-closed config, refuse startup on invalid values; 0=disables the respective mechanism).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
-    /// 连续失败多少次后锁定账号（默认 5）
+    /// Number of consecutive failures before locking the account (default 5)
     pub lock_threshold: u32,
-    /// 锁定时长秒（默认 900）
+    /// Lockout duration in seconds (default 900)
     pub lock_secs: u64,
-    /// 每 IP 每分钟 login 请求数（默认 10）
+    /// login requests per IP per minute (default 10)
     pub rl_login: u32,
-    /// 每 IP 每分钟 refresh 请求数（默认 30）
+    /// refresh requests per IP per minute (default 30)
     pub rl_refresh: u32,
-    /// 每 IP 每分钟其余 /api 请求数（默认 120）
+    /// remaining /api requests per IP per minute (default 120)
     pub rl_api: u32,
-    /// 限流窗口秒（默认 60；Retry-After 按窗口余量给）
+    /// Rate-limit window seconds (default 60; Retry-After given per window remainder)
     pub window_secs: u64,
 }
 
@@ -84,7 +84,7 @@ struct Window {
     count: u32,
 }
 
-/// 固定窗口 per-IP 计数器。
+/// Fixed-window per-IP counter.
 pub struct RateLimiter {
     cfg: Limits,
     wins: Mutex<HashMap<(u8, String), Window>>,
@@ -106,14 +106,14 @@ impl RateLimiter {
         }
     }
 
-    /// 记一次请求；超限返回 Retry-After 建议秒数（≥1）。
+    /// Record a request; if exceeded, returns suggested Retry-After seconds (>=1).
     pub fn check(&self, b: Bucket, ip: &str, now: u64) -> Result<(), u64> {
         let limit = self.limit_for(b);
         if limit == 0 || self.cfg.window_secs == 0 {
             return Ok(());
         }
         let mut wins = self.wins.lock().unwrap();
-        // 防御键无限增长（攻击/伪造 XFF 场景）：表过大时清掉本窗口已结束的键。
+        // Prevent unbounded key growth (attack/spoofed XFF scenario): when table too large, purge keys that have ended in this window.
         if wins.len() > 1024 {
             wins.retain(|_, w| now.saturating_sub(w.start) < self.cfg.window_secs);
         }
@@ -137,26 +137,26 @@ impl RateLimiter {
         Ok(())
     }
 
-    /// 桶名（审计/日志用）。
+    /// Bucket name (used in audit/logging).
     pub fn bucket_name(b: Bucket) -> &'static str {
         b.as_str()
     }
 }
 
-/// 失败结果：锁 crossing 当次仍返回凭证错误（由路由决定 401），后续尝试 423。
+/// Failure result: lock-crossing attempt still returns bad credentials (routing layer decides 401); subsequent attempts get 423.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FailOutcome {
-    /// 未锁定；载荷=距锁定剩余失败次数
+    /// Not locked; payload = remaining failure count before lock
     Remaining(u32),
-    /// 本次失败已触发锁定
+    /// This failure triggered the lock
     JustLocked { until: u64 },
 }
 
-/// 按用户名的连续失败计数 + 锁定到期表。
+/// Per-username consecutive failure count + lock-expiration table.
 pub struct Lockout {
     threshold: u32,
     secs: u64,
-    /// username → (连续失败数, 锁定到期 UNIX 秒；0=未锁)
+    /// username -> (failure count, lock-expire UNIX seconds; 0=not locked)
     m: Mutex<HashMap<String, (u32, u64)>>,
 }
 
@@ -169,12 +169,12 @@ impl Lockout {
         }
     }
 
-    /// 是否处于锁定期（顺带把过期锁复位）。
+    /// Whether currently in lockout period (also resets expired locks).
     pub fn is_locked(&self, user: &str, now: u64) -> bool {
         let mut m = self.m.lock().unwrap();
         match m.get_mut(user) {
             Some((_, until)) if *until > now => true,
-            // 锁已过期：复位失败计数；未锁定（until==0）时保留计数。
+            // Lock expired: reset failure count; if not locked (until==0), keep the count.
             Some((fails, until)) => {
                 if *until != 0 {
                     *fails = 0;
@@ -186,7 +186,7 @@ impl Lockout {
         }
     }
 
-    /// 记一次失败；threshold=0 表示关闭锁定（永远 Remaining）。
+    /// Record a failure; threshold=0 means lockout disabled (always Remaining).
     pub fn record_fail(&self, user: &str, now: u64) -> FailOutcome {
         if self.threshold == 0 {
             return FailOutcome::Remaining(u32::MAX);
@@ -197,7 +197,7 @@ impl Lockout {
             return FailOutcome::JustLocked { until: e.1 };
         }
         if e.1 != 0 {
-            *e = (0, 0); // 上一锁已过期，重新计数
+*e = (0, 0); // previous lock expired, recount
         }
         e.0 += 1;
         if e.0 >= self.threshold {
@@ -208,13 +208,13 @@ impl Lockout {
         FailOutcome::Remaining(self.threshold - e.0)
     }
 
-    /// 登录成功：清零计数与锁。
+    /// Login success: clear count and lock.
     pub fn clear(&self, user: &str) {
         self.m.lock().unwrap().remove(user);
     }
 }
 
-/// 防滥用组合件（AuthSvc 单字段持有）。
+/// Anti-abuse composite (held in a single AuthSvc field).
 pub struct AbuseGuard {
     pub rate: RateLimiter,
     pub lock: Lockout,
@@ -245,11 +245,11 @@ mod tests {
         }
         let retry = g.check(Bucket::Login, "1.2.3.4", 100).unwrap_err();
         assert!((1..=60).contains(&retry));
-        // 桶间互不影响
+        // Buckets independent from each other
         assert!(g.check(Bucket::Refresh, "1.2.3.4", 100).is_ok());
-        // IP 间互不影响
+        // IPs independent from each other
         assert!(g.check(Bucket::Login, "9.9.9.9", 100).is_ok());
-        // 窗口滚动后恢复
+        // Recovers after window rolls
         assert!(g.check(Bucket::Login, "1.2.3.4", 160).is_ok());
     }
 
@@ -271,16 +271,16 @@ mod tests {
             l.record_fail("u", 2),
             FailOutcome::JustLocked { until: 902 }
         );
-        // 锁定期内：is_locked 真；再失败仍是锁定态
+        // During lockout: is_locked true; further failures remain in locked state
         assert!(l.is_locked("u", 3));
         assert_eq!(
             l.record_fail("u", 3),
             FailOutcome::JustLocked { until: 902 }
         );
-        // 到期自动解锁并重新计数
+        // Auto-unlocks on expiry and recounts
         assert!(!l.is_locked("u", 903));
         assert_eq!(l.record_fail("u", 903), FailOutcome::Remaining(2));
-        // 成功登录清零
+        // Successful login clears
         l.clear("u");
         assert_eq!(l.record_fail("u", 904), FailOutcome::Remaining(2));
     }

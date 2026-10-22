@@ -1,24 +1,24 @@
-//! 安全中心 API：动态封禁（security.ban.* 命令面）+ 静态围栏 CRUD + 全局配置。
+//! Security center API: dynamic bans (security.ban.* command surface) + static fence CRUD + global config.
 //!
-//! 动态封禁（内置 fail2ban）误封真实客户时的查看/搜索/解禁入口：
-//!   GET    /security/bans?query=IP子串 → 列表（L0 只读）
-//!   DELETE /security/bans/{ip}         → 解禁（L1 写默认）
+//! Dynamic ban (built-in fail2ban) view/search/unban entry point when real customers get falsely banned:
+//!   GET    /security/bans?query=IP fragment → list (L0 read-only)
+//!   DELETE /security/bans/{ip}              → unban (L1 write by default)
 //!
-//! 静态围栏（NIP 三层：IP CIDR / UA / 号码前缀，deny+allow 双模式）：
-//!   GET    /security/blacklist?kind=deny|allow&type=... → 列表（L0）
-//!   POST   /security/blacklist                          → 新增（L1）
-//!   PUT    /security/blacklist/{id}                     → 改备注/启停
-//!   DELETE /security/blacklist/{id}                     → 删除
-//!   写操作后 spawn_push(Kind::SecurityBlacklist) → C reload
+//! Static fence (NIP three layers: IP CIDR / UA / number prefix, deny+allow dual mode):
+//!   GET    /security/blacklist?kind=deny|allow&type=... → list (L0)
+//!   POST   /security/blacklist                          → add (L1)
+//!   PUT    /security/blacklist/{id}                     → change remark/enable
+//!   DELETE /security/blacklist/{id}                     → delete
+//!   After write: spawn_push(Kind::SecurityBlacklist) → C reload
 //!
-//! 全局围栏配置（单行 security_config 表）：
+//! Global fence config (single-row security_config table):
 //!   GET    /security/config → fence_mode + method_blocked
-//!   PUT    /security/config → upsert 后 spawn_push
+//!   PUT    /security/config → upsert then spawn_push
 //!
-//! 命令注入防护：query/filter 与 ip 都直接拼接进 UDS 命令行
-//! （`security.ban.list <filter>` / `security.ban.unban <ip>`），
-//! 必须白名单校验字符集（IPv4 点分 / IPv6 冒号 + 十六进制），
-//! 禁止空格/换行等 token 分隔符进入命令行。
+//! Command injection defense: query/filter and ip are directly concatenated into UDS command lines
+//! (`security.ban.list <filter>` / `security.ban.unban <ip>`), so the charset MUST
+//! be whitelist-validated (IPv4 dotted / IPv6 colon + hex), forbidding space/newline
+//! and other token separators from entering the command line.
 
 use std::sync::Arc;
 
@@ -57,9 +57,9 @@ where
         )
 }
 
-// ====================== 动态封禁 ======================
+// ====================== Dynamic bans ======================
 
-/// IP 子串字符白名单：字母数字、'.'、':'（IPv4/IPv6 字面量子集）。
+/// IP substring character whitelist: alphanumeric, '.', ':' (subset of IPv4/IPv6 literals).
 fn is_safe_ip_fragment(s: &str) -> bool {
     s.len() <= 45
         && s.bytes()
@@ -96,13 +96,13 @@ async fn unban<C: CoreApi + Clone>(
     Ok(axum::Json(json!({ "ok": true, "ip": ip })))
 }
 
-// ====================== 校验函数 ======================
+// ====================== Validation helpers ======================
 
 const VALID_KINDS: [&str; 2] = ["deny", "allow"];
 const VALID_TYPES: [&str; 4] = ["ip_cidr", "ua", "called_prefix", "caller_prefix"];
 
-/// CIDR 规范化：单 IP 自动补 /32（v4）或 /128（v6）；
-/// 带 prefix 时校验格式与范围。
+/// CIDR normalization: single IP auto-padded with /32 (v4) or /128 (v6);
+/// when a prefix is present, validate the format and range.
 fn normalize_cidr(v: &str) -> Result<String, String> {
     let v = v.trim();
     if v.is_empty() || v.len() > 64 {
@@ -137,7 +137,7 @@ fn normalize_cidr(v: &str) -> Result<String, String> {
     }
 }
 
-/// UA 规则校验：1-128 字节，禁控制字符（大小写不敏感子串）
+/// UA rule validation: 1-128 bytes, control characters forbidden (case-insensitive substring)
 fn validate_ua(v: &str) -> Result<String, String> {
     let v = v.trim();
     if v.is_empty() || v.len() > 128 {
@@ -149,9 +149,9 @@ fn validate_ua(v: &str) -> Result<String, String> {
     Ok(v.to_string())
 }
 
-/// 号码前缀校验（called/caller）：1-128 字节；
-/// 可带尾部 '*' 前缀通配（如 "100*"）；否则精确匹配（如 "100"）。
-/// 禁控制字符 / 空格 / 字母（纯数字 + 可选 '*' 后缀）。
+/// Number prefix validation (called/caller): 1-128 bytes;
+/// allows trailing '*' prefix wildcard (e.g. "100*"); otherwise exact match (e.g. "100").
+/// Forbids control chars / whitespace / letters (pure digits + optional trailing '*').
 fn validate_prefix(v: &str) -> Result<String, String> {
     let v = v.trim();
     if v.is_empty() || v.len() > 128 {
@@ -171,11 +171,11 @@ fn validate_prefix(v: &str) -> Result<String, String> {
     Ok(v.to_string())
 }
 
-// ====================== 静态围栏 CRUD ======================
+// ====================== Static fence CRUD ======================
 
 #[derive(Deserialize, Default)]
 pub struct BlacklistQueryParams {
-    pub kind:       Option<String>,   // deny | allow（缺省=全部）
+    pub kind:       Option<String>,   // deny | allow (default = all)
     #[serde(rename = "type", alias = "rule_type")]
     pub rule_type:  Option<String>,
     pub enabled:    Option<String>,
@@ -333,7 +333,7 @@ async fn delete_blacklist<C: CoreApi + Clone + Send + Sync + 'static>(
     Ok(StatusCode::NO_CONTENT)
 }
 
-// ====================== 全局围栏配置 ======================
+// ====================== Global fence config ======================
 
 async fn get_config<C: CoreApi + Clone>(
     State(st): State<Arc<AppState<C>>>,
@@ -344,11 +344,11 @@ async fn get_config<C: CoreApi + Clone>(
     Ok(axum::Json(cfg))
 }
 
-/// PUT /security/config —— fence_mode + method_blocked + fail2ban 五维配置。
-/// 字段范围校验：fence_mode=0/1, method_blocked=uint32, auto_ban=0/1,
+/// PUT /security/config — fence_mode + method_blocked + fail2ban five-dimensional config.
+/// Field-range validation: fence_mode=0/1, method_blocked=uint32, auto_ban=0/1,
 /// threshold=1-1000, window_s=1-86400, ban_duration_s=1-604800(7d),
-/// ratelimit_regs=1-1000, ratelimit_window_s=1-3600。
-/// 写后 spawn_push 让 C 侧 reload 生效。
+/// ratelimit_regs=1-1000, ratelimit_window_s=1-3600.
+/// After writing: spawn_push lets C reload take effect.
 async fn put_config<C: CoreApi + Clone + Send + Sync + 'static>(
     State(st): State<Arc<AppState<C>>>,
     Json(body): Json<Value>,
@@ -369,7 +369,7 @@ async fn put_config<C: CoreApi + Clone + Send + Sync + 'static>(
         return Err(ApiError::BadRequest("method_blocked out of uint32 range".into()));
     }
 
-    // fail2ban 五维（可选，缺省填默认值）
+    // fail2ban five dimensions (optional, default values filled when omitted)
     let auto_ban = body.get("auto_ban").and_then(|v| v.as_i64()).unwrap_or(1);
     if auto_ban != 0 && auto_ban != 1 {
         return Err(ApiError::BadRequest("auto_ban must be 0 or 1".into()));
@@ -410,7 +410,7 @@ async fn put_config<C: CoreApi + Clone + Send + Sync + 'static>(
             saved.ratelimit_regs, saved.ratelimit_window_s),
     ).await;
 
-    // 触发 C 侧 reload（从 YAML 重新 cfg_get 配置）
+    // Trigger C reload (re-reads cfg from YAML via cfg_get)
     crate::sync::spawn_push(st.clone(), crate::sync::Kind::SecurityBlacklist);
     Ok(axum::Json(saved))
 }

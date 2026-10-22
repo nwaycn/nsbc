@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""NSBC 实时事件/CDR 订阅客户端（Unix Domain Socket / Python）
+"""NSBC realtime event/CDR subscription client (Unix Domain Socket / Python)
 
-连到 nsbcd 的 control socket（默认 /tmp/nsbc-e2e/control.sock），
-先发 sub events,cdr 订阅，然后实时打印推送帧。
+Connects to nsbcd's control socket (default /tmp/nsbc-e2e/control.sock),
+sends `sub events,cdr` subscription, then prints pushed frames in real time.
 
-用法:
+Usage:
     python3 event_client.py
     python3 event_client.py /var/run/nsbc/control.sock
     python3 event_client.py --topics events,cdr,log
     python3 event_client.py --pull-only
 
-帧格式 (nsbcd 服务端统一):
+Frame format (nsbcd server-side unified):
     events: YYYY-MM-DDTHH:MM:SS.mmm CALL_INCOMING  k=v k=v ...
     events: YYYY-MM-DDTHH:MM:SS.mmm CALL_ANSWERED  k=v k=v ...
     events: YYYY-MM-DDTHH:MM:SS.mmm CALL_END       k=v k=v ...
@@ -124,7 +124,7 @@ def main():
         sys.stdout.write(resp); sys.stdout.flush()
 
     if args.pull_only:
-        print('\033[2m[interactive — Ctrl-D to exit]{RESET}')
+        print(f'\033[2m[interactive — Ctrl-D to exit]{RESET}')
         s.sendall(b'\n')
         import select
         while True:

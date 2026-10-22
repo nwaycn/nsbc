@@ -1,11 +1,13 @@
-//! 登录/刷新/登出（REQ-WEB-004 登录与会话、REQ-WEB-008 会话）。
+//! Login / refresh / logout (REQ-WEB-004 login and session, REQ-WEB-008 session).
 //!
-//! 两个公开端点（login/refresh）挂在 rbac 层之外（但仍过版本治理与体限）；
-//! logout 为受保护端点（出示 access 令牌吊销自身 + 可选 refresh）。
+//! Two public endpoints (login/refresh) sit outside the rbac layer (but still go
+//! through version governance and body size limits); logout is a protected endpoint
+//! (present access token → revoke self + optional refresh).
 //!
-//! 错误语义（REQ-WEB-018）：用户名不存在与口令错误**同一条** 401，
-//! 不回显账号是否存在；令牌类错误不回传具体 JWT 内容。
-//! 登录失败锁定/接口限流在 W3b（REQ-WEB-009），本单元只留安全日志。
+//! Error semantics (REQ-WEB-018): non-existent username and wrong password share
+//! **the same** 401; never leak whether the account exists. Token errors do not echo
+//! the concrete JWT content. Login-failure lockout / interface rate limiting live in
+//! W3b (REQ-WEB-009); this module only writes security logs.
 use std::sync::Arc;
 
 use axum::extract::{Extension, State};
@@ -40,13 +42,13 @@ where
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)] // REQ-WEB-009：拒绝未知字段
+#[serde(deny_unknown_fields)] // REQ-WEB-009: reject unknown fields
 struct LoginReq {
     username: String,
     password: String,
-    /// 验证码 ID（可选：若配置关闭或首次使用可空）
+    /// Captcha ID (optional: may be empty if config disables it or on first use)
     captcha_id: Option<String>,
-    /// 验证码答案（可选；存在时必须正确）
+    /// Captcha answer (optional; must be correct when present)
     captcha_code: Option<String>,
 }
 
@@ -75,20 +77,22 @@ async fn get_captcha<C: CoreApi + Clone + 'static>(
     }
 }
 
-/// POST /api/v1/auth/login → access(15min)+refresh(8h)。
+/// POST /api/v1/auth/login → access(15min)+refresh(8h).
 async fn login<C: CoreApi + Clone + 'static>(
     State(st): State<Arc<AppState<C>>>,
     Extension(peer): Extension<PeerCtx>,
     Json(req): Json<LoginReq>,
 ) -> ApiResult<Json<Value>> {
-    // 白名单式入参校验（REQ-WEB-009）；口令长度按字节上限，字符不限制（允许任意 Unicode）。
+    // Whitelist-style input validation (REQ-WEB-009); password length uses byte
+    // upper bound, characters unrestricted (allow arbitrary Unicode).
     if !valid_username(&req.username) || req.password.is_empty() || req.password.len() > 256 {
         return Err(ApiError::BadRequest("invalid username or password".into()));
     }
 
-    // 验证码强制校验（REQ-WEB-009：必须先 GET /auth/captcha 拿到 captcha_id，
-    // 然后 login 时带 captcha_id + captcha_code，verify 正确才继续）。
-    // captcha_id/captcha_code 缺失或为空 → 直接拒，不走密码校验路径（省 CPU）。
+    // Captcha mandatory verification (REQ-WEB-009: must GET /auth/captcha first to get
+    // captcha_id, then bring captcha_id + captcha_code on login; only proceed when
+    // verify succeeds). Missing or empty captcha_id/captcha_code → reject directly,
+    // never go through the password verification path (save CPU).
     let cid = match &req.captcha_id {
         Some(s) if !s.is_empty() => s,
         _ => {
@@ -114,7 +118,8 @@ async fn login<C: CoreApi + Clone + 'static>(
         return Err(ApiError::BadRequest("invalid captcha".into()));
     }
     let now = now_secs();
-    // 锁定检查先于 argon2 校验（省 CPU、无账号枚举差异之外的信息泄漏）。
+    // Lockout check before argon2 verification (save CPU, no info leak beyond account
+    // enumeration difference).
     if st.auth.guard.lock.is_locked(&req.username, now) {
         tracing::warn!(user = %req.username, "login blocked: account locked");
         st.auth.audit.record(
@@ -126,9 +131,10 @@ async fn login<C: CoreApi + Clone + 'static>(
         return Err(ApiError::AccountLocked);
     }
 
-    // 账号验证：只从数据库 web_users 表查询（唯一权威账号源）。
-    // 彻底废弃配置文件 auth.accounts、NSBC_AUTH_FILE、NSBC_AUTH_ACCOUNTS
-    // 等文本账号源，登录一律走 DB。
+    // Account verification: only query the web_users table from the database
+    // (the single authoritative account source). Completely deprecate text-based
+    // account sources such as config file auth.accounts / NSBC_AUTH_FILE /
+    // NSBC_AUTH_ACCOUNTS — login always goes through the DB.
     let verified_role: Option<crate::auth::Role> = {
         let db_user = st.db.get_web_user(&req.username).await;
         if let Some(u) = db_user {
@@ -161,7 +167,7 @@ async fn login<C: CoreApi + Clone + 'static>(
                 }
             }
         } else {
-            None // DB 未配置 / 用户不存在 → 统一当作凭据错误
+            None // DB not configured / user not found → uniformly treated as bad credentials
         }
     };
 
@@ -207,8 +213,8 @@ async fn login<C: CoreApi + Clone + 'static>(
     Ok(Json(token_pair(access.0, refresh.0, st.auth.tokens.access_ttl_secs())))
 }
 
-/// POST /api/v1/auth/refresh：refresh 单次使用，成功即轮转；
-/// 旧 jti 再出现视为重放（REQ-WEB-008），安全告警并 401。
+/// POST /api/v1/auth/refresh: refresh is single-use, rotated on success;
+/// an old jti appearing again is treated as replay (REQ-WEB-008), security alert + 401.
 async fn refresh_token<C: CoreApi + Clone + 'static>(
     State(st): State<Arc<AppState<C>>>,
     Extension(peer): Extension<PeerCtx>,
@@ -251,8 +257,8 @@ async fn refresh_token<C: CoreApi + Clone + 'static>(
     Ok(Json(token_pair(access.0, refresh.0, st.auth.tokens.access_ttl_secs())))
 }
 
-/// POST /api/v1/auth/logout：吊销当前 access（至其 exp）+ 可选 refresh。
-/// 幂等：refresh 缺失/过期不报错。
+/// POST /api/v1/auth/logout: revoke the current access (until its exp) + optional refresh.
+/// Idempotent: missing/expired refresh does not error.
 async fn logout<C: CoreApi + Clone + 'static>(
     State(st): State<Arc<AppState<C>>>,
     Extension(peer): Extension<PeerCtx>,
@@ -264,7 +270,7 @@ async fn logout<C: CoreApi + Clone + 'static>(
     st.auth.sessions.deny_access(&access.jti, access.exp, now);
     if let Some(Json(body)) = payload {
         if let Some(rt) = body.refresh_token.filter(|s| !s.is_empty()) {
-            // refresh 过期/伪造也不影响登出成功
+            // Expired / forged refresh also does not affect logout success
             if let Ok(c) = st.auth.tokens.verify(&rt, TokenKind::Refresh, now) {
                 st.auth.sessions.revoke_refresh(&c.jti, c.exp, now);
                 revoked_refresh = true;

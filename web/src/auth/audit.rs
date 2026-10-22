@@ -1,15 +1,15 @@
-//! 安全/操作审计（REQ-WEB-010）。
+﻿//! Security / ops audit (REQ-WEB-010).
 //!
-//! 与业务 tracing 日志**物理隔离**：审计事件以 JSON Lines 追加到独立文件
-//! （O_APPEND，部署侧独立轮转/保留策略，默认保留 1 年），不随业务日志轮转
-//! 被覆盖。每条事件落盘即 flush（管理面低频， durability 优先于吞吐）。
+//! **Physically isolated** from business tracing logs: audit events are appended as JSON Lines to a dedicated file
+//! (O_APPEND, independent rotation/retention policy on the deploy side, default retention 1 year); not rotated together with business logs
+//! and not overwritten. Each event is flushed immediately on disk (management-plane low frequency, durability prioritized over throughput).
 //!
-//! 失败策略：磁盘满/权限错等写入失败只记 tracing::error，不阻断业务请求
-//! （fail-open for availability；审计中断对运维可见，不能让管理面整体不可用，
-//! 该取舍已在 state §6 登记）。
+//! Failure policy: write failures such as disk-full / permission-error only log tracing::error, do NOT block business requests
+//! (fail-open for availability; audit outages are visible to ops, management plane must not become entirely unavailable,
+//! this tradeoff is recorded in state §6).
 //!
-//! 未配置 NSBC_AUDIT_FILE 时 sink 关闭（启动 warn）——开发/测试形态；
-//! 生产部署必须配置。
+//! When NSBC_AUDIT_FILE is not configured, sink is disabled (warning at startup) — development/testing posture;
+//! production deployments must configure it.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -26,12 +26,12 @@ pub struct AuditLog {
 }
 
 impl AuditLog {
-    /// 未启用（无审计文件）。
+    /// Disabled (no audit file).
     pub fn disabled() -> AuditLog {
         AuditLog { sink: None }
     }
 
-    /// 打开（不存在则创建，仅追加）；路径非法/不可写返回 Err（启动 fail-closed）。
+    /// Open (create if not exists, append-only); return Err for invalid/unwritable path (fail-closed at startup).
     pub fn open(path: &str) -> Result<AuditLog, String> {
         let f = OpenOptions::new()
             .create(true)
@@ -47,7 +47,7 @@ impl AuditLog {
         self.sink.is_some()
     }
 
-    /// 记一条事件。`detail` 的字段平铺进事件 JSON；与保留字段重名被忽略。
+    /// Record an event. `detail` fields are flattened into event JSON; names colliding with reserved fields are ignored.
     pub fn record(&self, event: &str, sub: Option<&str>, peer: &PeerCtx, detail: Value) {
         let Some(sink) = &self.sink else {
             return;
@@ -56,7 +56,7 @@ impl AuditLog {
             Value::Object(m) => m,
             _ => serde_json::Map::new(),
         };
-        // 固定字段优先，不允许 detail 覆盖。
+        // Fixed fields take precedence; do not allow detail to overwrite.
         o.insert("ts".into(), json!(now_secs()));
         o.insert("event".into(), json!(event));
         o.insert("sub".into(), json!(sub));
@@ -82,12 +82,12 @@ impl AuditLog {
     }
 }
 
-/// 请求来源上下文（限流中间件构造后注入 extensions，全链路复用）。
+/// Request-source context (constructed by rate-limit middleware then injected into extensions, reused across the full chain).
 #[derive(Clone, Debug, Default)]
 pub struct PeerCtx {
-    /// 对端 IP；无 ConnectInfo（测试/非 TCP 接入）时为 "-"
+    /// Peer IP; "-" when ConnectInfo is absent (tests / non-TCP access)
     pub ip: String,
-    /// User-Agent，截断 200 字符
+    /// User-Agent, truncated to 200 chars
     pub ua: String,
 }
 
@@ -150,6 +150,6 @@ mod tests {
     fn disabled_sink_is_silent() {
         let log = AuditLog::disabled();
         assert!(!log.is_enabled());
-        log.record("x", None, &PeerCtx::default(), json!({})); // 不应恐慌
+        log.record("x", None, &PeerCtx::default(), json!({})); // must not panic
     }
 }

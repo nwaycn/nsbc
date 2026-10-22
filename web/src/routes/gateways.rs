@@ -1,4 +1,4 @@
-//! 外线网关管理 REST（REQ-WEB-016）。6 端点：list/get/create/update/delete/reload。
+//! Outbound gateway management REST (REQ-WEB-016). Six endpoints: list/get/create/update/delete/reload.
 
 use std::sync::Arc;
 

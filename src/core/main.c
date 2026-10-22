@@ -688,7 +688,7 @@ int main(int argc, char **argv)
         if (rc_mods == NSBC_OK) {
             llog(LOG_INFO, "core", "modules config: %d disable / %d enable", nd, ne);
         } else {
-            llog(LOG_INFO, "core", "modules: YAML 无 modules 段 → 全 enable");
+            llog(LOG_INFO, "core", "modules: no modules section in YAML → all enabled");
         }
 
         /* enable 白名单：有 enable 列表时，不在白名单里的普通模块（非 REQUIRED）→ disable */

@@ -1,21 +1,21 @@
 # ============================================================
-# nsbc-web (Rust 边车) 构建 Makefile
+# nsbc-web (Rust sidecar) build Makefile
 # ============================================================
 #
-# 用法：
-#   make fetch         联网拉依赖（禁用 vendor → 重建 lockfile → fetch）
-#   make vendor        联网 vendor（fetch + cargo vendor）
-#   make build         默认内网模式编译（零外部 crate，离线）
-#   make build-acme    公网 ACME 模式编译（需先 make vendor）
-#   make run           默认内网模式启动
-#   make run-acme      公网 ACME 模式启动
+# Usage:
+#   make fetch         online dep fetch (disable vendor -> rebuild lockfile -> fetch)
+#   make vendor        online vendor (fetch + cargo vendor)
+#   make build         default intranet mode build (zero external crates, offline)
+#   make build-acme    public ACME mode build (must run make vendor first)
+#   make run           default intranet mode start
+#   make run-acme      public ACME mode start
 #   make clean         cargo clean
 #
-# 注意：
-#   - cargo fetch / generate-lockfile 不支持 --features
-#     lockfile 永远包含 Cargo.toml 里写的所有依赖（含 optional certon）
-#     只有 build/check/run 才根据 --features 决定是否 include
-#   - --features 放在 cargo 子命令名之后：
+# Note:
+#   - cargo fetch / generate-lockfile does not support --features
+#     lockfile always contains all deps in Cargo.toml (including optional certon)
+#     only build/check/run decides whether to include based on --features
+#   - --features goes AFTER the cargo subcommand name:
 #     ✅ cargo build --features acme
 #     ❌ cargo --features acme build
 #
@@ -27,16 +27,20 @@ BINARY      := $(RELEASE_DIR)/nsbc-web
 FEATURES    :=
 OFFLINE     := --offline --locked
 
-# 自动检测 .cargo/config.toml 是否存在 vendor 配置
+# auto-detect whether .cargo/config.toml has vendor config
 VENDOR_CFG  := .cargo/config.toml
 VENDOR_BAK  := .cargo/config.toml.bak
 
 .PHONY: all fetch vendor build build-acme run run-acme clean check check-acme
 
-# ===== 1. 联网准备（首次或 Cargo.toml 改过才跑）=====
-# cargo generate-lockfile 自动解析 Cargo.toml 里所有 deps（包括 optional certon）
+# ===== 1. online preparation (first time or after Cargo.toml changes) =====
+# cargo generate-lockfile auto-parses all deps in Cargo.toml (including optional certon)
+#
+# fetch (default): preserve existing Cargo.lock if present, only regenerate when absent.
+#   → Keeps reproducible builds; does NOT pull latest versions on every run.
+#   → Use make fetch-refresh after editing Cargo.toml / bumping deps to force a fresh resolve.
 fetch:
-	@echo "=== 临时禁用 vendor 配置（联网模式）==="
+	@echo "=== temporarily disable vendor config (online mode) ==="
 	@if [ -f $(VENDOR_CFG) ]; then \
 		cp $(VENDOR_CFG) $(VENDOR_BAK); \
 		rm -f $(VENDOR_CFG); \
@@ -44,62 +48,71 @@ fetch:
 	else \
 		echo "  no $(VENDOR_CFG) — skip"; \
 	fi
-	@echo "=== 重建 Cargo.lock（联网下载所有 deps）==="
-	rm -f Cargo.lock
-	$(CARGO) generate-lockfile
+	@if [ -f Cargo.lock ]; then \
+		echo "=== Cargo.lock present — skip generate-lockfile, cargo fetch only ==="; \
+	else \
+		echo "=== no Cargo.lock — running cargo generate-lockfile ==="; \
+		$(CARGO) generate-lockfile; \
+	fi
 	$(CARGO) fetch
-	@echo "=== 恢复 vendor 配置 ==="
+	@echo "=== restore vendor config ==="
 	@if [ -f $(VENDOR_BAK) ]; then \
 		mv $(VENDOR_BAK) $(VENDOR_CFG); \
 		echo "  restored $(VENDOR_CFG)"; \
 	fi
-	@echo "✅ fetch 完成（Cargo.lock 已更新）"
+	@echo "✅ fetch done (Cargo.lock preserved)"
+
+# Force-fetch: delete Cargo.lock + fully regenerate (use after Cargo.toml edits)
+fetch-refresh:
+	@echo "=== FORCE rebuild Cargo.lock ==="
+	rm -f Cargo.lock
+	@$(MAKE) fetch
 
 vendor: fetch
-	@echo "=== 清空旧 vendor ==="
+	@echo "=== clear old vendor ==="
 	rm -rf vendor
 	@echo "=== cargo vendor ==="
 	$(CARGO) vendor vendor --versioned-dirs
-	@echo "✅ vendor 完成（vendor/ 目录已生成）"
+	@echo "✅ vendor done (vendor/ directory generated)"
 
-# ===== 2. 编译 =====
+# ===== 2. compile =====
 all: build
 
 build:
-	@echo "=== cargo build --release（默认内网模式）==="
+	@echo "=== cargo build --release (default intranet mode) ==="
 	$(CARGO) build --release $(OFFLINE)
-	@echo "✅ build 完成 → $(BINARY)"
-	@echo "=== 复制到 ../ ==="
+	@echo "✅ build done → $(BINARY)"
+	@echo "=== copy to ../ ==="
 	cp -f target/release/nsbc-web ../.
 	cp -rf static ../.
-	@echo "✅ install 完成（二进制 + static 已复制到上一级目录）"
+	@echo "✅ install done (binary + static copied to parent directory)"
 
 build-acme:
-	@echo "=== cargo build --release --features acme（公网 ACME）==="
+	@echo "=== cargo build --release --features acme (public ACME) ==="
 	$(CARGO) build --release $(OFFLINE) --features acme
-	@echo "✅ build-acme 完成 → $(BINARY)  (certon TLS-ALPN-01 已编译)"
-	@echo "=== 复制到 ../ ==="
+	@echo "✅ build-acme done → $(BINARY)  (certon TLS-ALPN-01 compiled)"
+	@echo "=== copy to ../ ==="
 	cp -f target/release/nsbc-web ../.
 	cp -rf static ../.
-	@echo "✅ install 完成（二进制 + static 已复制到上一级目录）"
+	@echo "✅ install done (binary + static copied to parent directory)"
 
-# ===== 3. 快速 check（不产出二进制）=====
+# ===== 3. quick check (no binary output) =====
 check:
 	$(CARGO) check --release $(OFFLINE)
 
 check-acme:
 	$(CARGO) check --release $(OFFLINE) --features acme
 
-# ===== 4. 运行 =====
+# ===== 4. run =====
 run: build
-	@echo "=== 启动 nsbc-web（默认内网模式）==="
+	@echo "=== start nsbc-web (default intranet mode) ==="
 	./$(BINARY)
 
 run-acme: build-acme
-	@echo "=== 启动 nsbc-web（公网 ACME TLS-ALPN-01）==="
+	@echo "=== start nsbc-web (public ACME TLS-ALPN-01) ==="
 	./$(BINARY)
 
-# ===== 5. 清理 =====
+# ===== 5. clean =====
 clean:
 	$(CARGO) clean
-	@echo "✅ cargo clean 完成"
+	@echo "✅ cargo clean done"

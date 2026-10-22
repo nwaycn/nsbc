@@ -1,14 +1,14 @@
-//! 分机管理 REST（REQ-WEB-016）。
+//! Extension management REST (REQ-WEB-016).
 //!
-//! 六个端点：列表/详情/创建/更新/删除 + 一个 reload 推送核心。
-//! DB 未配置（Db::new() / pool=None）→ 所有端点返回 503 DbUnavailable，
-//! 不阻断主业务启动（REQ-WEB-013 可选持久化设计）。
+//! Six endpoints: list/detail/create/update/delete + a reload that pushes to the core.
+//! DB not configured (Db::new() / pool=None) → all endpoints return 503 DbUnavailable;
+//! does not block main business startup (REQ-WEB-013 optional persistence design).
 //!
-//! reload 端点（POST /extensions/reload）：
-//!   查 DB 所有 enabled 分机 → ExtSyncDto（去 password，只下发 HA1）→
-//!   UDS 命令 `extensions.reload <json>` 批量推给核心。
-//!   CRUD 保存后另有 sync::spawn_push 自动推送（300ms 防抖合并），
-//!   reload 端点保留为手动全量兜底。
+//! Reload endpoint (POST /extensions/reload):
+//!   Query DB for all enabled extensions → ExtSyncDto (strips password, only sends HA1) →
+//!   UDS command `extensions.reload <json>` batch push to core.
+//!   CRUD save also auto-pushes via sync::spawn_push (300ms debounced merge);
+//!   reload endpoint is kept as a manual full-total fallback.
 
 use std::sync::Arc;
 
@@ -33,7 +33,8 @@ where
     C: CoreApi + Clone + 'static,
 {
     Router::new()
-        // reload 在 /:id 之前注册——axum 按注册顺序匹配防止 /reload 被当成 :id
+        // reload registered before /:id — axum matches by registration order, prevents
+        // /reload from being consumed as :id
         .route("/extensions", get(list::<C>).post(create::<C>))
         .route("/extensions/reload", post(reload::<C>))
         .route(
@@ -52,7 +53,7 @@ pub struct ListQuery {
     pub tenant_id: Option<i64>,
     pub extension: Option<String>,
     pub realm:     Option<String>,
-    pub enabled:    Option<String>,   // "true"/"false" 或空
+    pub enabled:    Option<String>,   // "true"/"false" or empty
     pub limit:     Option<i64>,
     pub offset:    Option<i64>,
 }
@@ -107,7 +108,7 @@ pub async fn create<C: CoreApi + Clone + Send + Sync + 'static>(
     st.db.pool().ok_or(ApiError::DbUnavailable)?;
 
     let row = st.db.create_extension(body).await.map_err(|e| {
-        // UNIQUE 冲突 → 409 Conflict
+        // UNIQUE conflict → 409 Conflict
         if let sqlx::Error::Database(ref db_err) = e {
             let msg = db_err.message().to_ascii_lowercase();
             if msg.contains("unique") || msg.contains("duplicate") {
@@ -119,14 +120,14 @@ pub async fn create<C: CoreApi + Clone + Send + Sync + 'static>(
         ApiError::Db(e.to_string())
     })?;
 
-    // 审计（复用 config_history）
+    // Audit (reuses config_history)
     let _ = st.db.insert_config_history(
         "api", "create",
         &format!("extensions/{}", row.id),
         None, &format!("extension={} realm={}", row.extension, row.realm),
     ).await;
 
-    // 保存成功 → 推送核心（300ms 防抖合并）
+    // After save succeeds → push to core (300ms debounced merge)
     crate::sync::spawn_push(st.clone(), crate::sync::Kind::Extensions);
 
     Ok((StatusCode::CREATED, Json(row)))
@@ -183,7 +184,7 @@ pub async fn delete_one<C: CoreApi + Clone + Send + Sync + 'static>(
     Ok(StatusCode::NO_CONTENT)
 }
 
-// --- reload（批量推送到核心 UDS）---
+// --- reload (batch push to core UDS) ---
 
 pub async fn reload<C: CoreApi + Clone + Send + Sync>(
     State(st): State<Arc<AppState<C>>>,
@@ -191,7 +192,7 @@ pub async fn reload<C: CoreApi + Clone + Send + Sync>(
     st.db.pool().ok_or(ApiError::DbUnavailable)?;
     let rows = st.db.list_enabled_extensions().await
         .map_err(|e| ApiError::Db(e.to_string()))?;
-    // ExtSyncDto：密码永不离开 Web 端（C 侧只需 HA1 做 Digest 校验）
+    // ExtSyncDto: password never leaves the Web side (C side only needs HA1 for Digest verification)
     let dtos: Vec<crate::sync::ExtSyncDto> =
         rows.iter().map(crate::sync::ExtSyncDto::from).collect();
     let json = serde_json::to_string(&dtos).map_err(|e| ApiError::Db(e.to_string()))?;

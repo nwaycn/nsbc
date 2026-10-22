@@ -1,21 +1,22 @@
-//! 实时话务（REQ-WEB-004 P0 / REQ-OAM-007）：
-//! - GET  /calls         活动通话计数（只读，`show calls`）
-//! - GET  /channels      在途呼叫 A/B Leg 清单（只读，`show channels`）
-//! - GET  /calls/{id}    单呼叫双侧 Leg 诊断（只读，`uuid_dump`）
-//! - POST /calls/{id}/hangup 强制挂断（L1 审计，`hangup`）
+//! Real-time traffic (REQ-WEB-004 P0 / REQ-OAM-007):
+//! - GET  /calls         Active call counters (read-only, `show calls`)
+//! - GET  /channels      In-flight call A/B Leg listing (read-only, `show channels`)
+//! - GET  /calls/{id}    Single-call two-sided Leg diagnosis (read-only, `uuid_dump`)
+//! - POST /calls/{id}/hangup Force hangup (L1 audit, `hangup`)
 //!
-//! REQ-CCMD-001 命令增强（L2，核心 cmd_registry 新路由）：
+//! REQ-CCMD-001 command enhancements (L2, core cmd_registry new routes):
 //! - POST /calls/{id}/kill          uuid_kill
 //! - POST /calls/{id}/answer        uuid_answer
-//! - POST /calls/{id}/hold          uuid_hold（body on/off）
-//! - POST /calls/{id}/transfer      uuid_transfer（body dest）
-//! - POST /calls/{id}/record        uuid_record（body action+path）
-//! - POST /calls/{id}/send-dtmf     uuid_send_dtmf（body digits）
-//! - POST /calls/{id}/send-msg      send_msg（body text，MESSAGE 转发）
-//! - POST /originate                originate（body call_url）
+//! - POST /calls/{id}/hold          uuid_hold (body on/off)
+//! - POST /calls/{id}/transfer      uuid_transfer (body dest)
+//! - POST /calls/{id}/record        uuid_record (body action+path)
+//! - POST /calls/{id}/send-dtmf     uuid_send_dtmf (body digits)
+//! - POST /calls/{id}/send-msg      send_msg (body text, MESSAGE forward)
+//! - POST /originate                originate (body call_url)
 //!
-//! 媒体面字段（模式/门控/SSRC/VQ）在核心无采集来源时一律以 null 如实表达
-//! （REQ-OBS-010：UNAVAILABLE，严禁估算）。
+//! Media plane fields (mode / gate / SSRC / VQ) always surface as null when the
+//! core has no collection source — UNACCURATE when REQ-OBS-010 is UNAVAILABLE;
+//! never guess values.
 use std::convert::Infallible;
 use std::sync::Arc;
 
@@ -39,13 +40,14 @@ where
     Router::new()
         .route("/calls", get(list_calls::<C>))
         .route("/channels", get(list_channels::<C>))
-        // nsbc-esl-web §8#1：SESSION 实时事件 SSE 流（静态段优先于 /calls/:id）
+        // nsbc-esl-web §8#1: SESSION real-time event SSE stream (static segment
+        // takes priority over /calls/:id)
         .route("/calls/stream", get(stream_calls::<C>))
-        // REQ-AI-BARGEIN-001：VAD_EVENT 实时 SSE 流（外部 AI 引擎订阅）
+        // REQ-AI-BARGEIN-001: VAD_EVENT real-time SSE stream (external AI engine subscribes)
         .route("/vad/stream", get(stream_vad::<C>))
         .route("/calls/:id", get(get_call::<C>))
         .route("/calls/:id/hangup", post(hangup::<C>))
-        // REQ-CCMD-001 新增 L2 命令端点
+        // REQ-CCMD-001 new L2 command endpoints
         .route("/calls/:id/kill", post(kill::<C>))
         .route("/calls/:id/answer", post(answer::<C>))
         .route("/calls/:id/hold", post(hold::<C>))
@@ -60,13 +62,15 @@ where
         .route("/originate", post(originate::<C>))
 }
 
-/// GET /calls/stream — SESSION 实时事件 SSE 流（nsbc-esl-web §8#1）。
+/// GET /calls/stream — SESSION real-time event SSE stream (nsbc-esl-web §8#1).
 ///
-/// C→Web data.sock 推送的 SESSION 事件经 [`AppState::calls_tx`] 广播，此处转成
-/// `text/event-stream`。鉴权仍走 protected router 的 Bearer rbac（路径
-/// `/calls/stream` 命中 L0 只读）。前端用 fetch 流式消费（EventSource 无法带
-/// Authorization 头），event 名统一为 `session`，data 为 `{"kind","payload"}`。
-/// 慢消费者落后丢帧时下发 `lag` 事件，前端可整表重拉一次兜底。
+/// SESSION events pushed by C→Web data.sock are broadcast via [`AppState::calls_tx`]
+/// and converted here into `text/event-stream`. Auth still goes through the protected
+/// router's Bearer rbac (the path `/calls/stream` resolves to L0 read-only). The
+/// front-end consumes via fetch stream (EventSource cannot carry the Authorization
+/// header); event name is unified as `session`, data is `{"kind","payload"}`. When
+/// a slow consumer lags and drops frames, emit a `lag` event so the front-end can do
+/// a full-table re-pull as a fallback.
 async fn stream_calls<C>(
     State(state): State<Arc<AppState<C>>>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>>
@@ -84,9 +88,10 @@ where
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-/// GET /vad/stream — VAD_EVENT 实时 SSE 流（REQ-AI-BARGEIN-001）。
-/// 外部 AI 引擎（Go / Python / Node）通过此端点订阅 vad_event JSON，
-/// 实现 barge-in 决策（用户说话 → mute AI 侧 → ASR → LLM → TTS → broadcast → unmute）。
+/// GET /vad/stream — VAD_EVENT real-time SSE stream (REQ-AI-BARGEIN-001).
+/// External AI engines (Go / Python / Node) subscribe to vad_event JSON through this
+/// endpoint to implement barge-in decisions (user speaking → mute AI side → ASR → LLM →
+/// TTS → broadcast → unmute).
 async fn stream_vad<C>(
     State(state): State<Arc<AppState<C>>>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>>
@@ -104,15 +109,16 @@ where
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-/// Call-ID 路由层校验：1..127 字节、可见 ASCII（0x21-0x7e），
-/// 与核心 obs_control valid_callid()/DLG_CALLID_MAX 对齐，双端各验一次。
+/// Call-ID routing-layer validation: 1..127 bytes, printable ASCII (0x21-0x7e),
+/// aligned with core obs_control valid_callid()/DLG_CALLID_MAX. Both ends validate
+/// once each.
 fn valid_call_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() < 128
         && id.bytes().all(|b| (0x21..=0x7e).contains(&b))
 }
 
-/// 通用 L2 action 成功响应（所有 uuid_* 写操作共用）。
+/// Generic L2 action success response (shared by all uuid_* write operations).
 #[derive(Debug, Serialize)]
 struct ActionResponse {
     status: &'static str,
@@ -123,22 +129,22 @@ fn action_response(call_id: &str) -> Json<ActionResponse> {
     Json(ActionResponse { status: "ok", call_id: call_id.to_string() })
 }
 
-/// GET /api/v1/calls：核心当前呼叫计数器（L0 只读）。
+/// GET /api/v1/calls: core current call counters (L0 read-only).
 async fn list_calls<C: CoreApi + Clone + 'static>(
     State(st): State<Arc<AppState<C>>>,
 ) -> ApiResult<Json<CallCounters>> {
     Ok(Json(st.core.call_counters().await?))
 }
 
-/// GET /api/v1/channels：核心在途呼叫 A/B Leg 摘要（L0 只读，REQ-OAM-007）。
+/// GET /api/v1/channels: core in-flight call A/B Leg summary (L0 read-only, REQ-OAM-007).
 async fn list_channels<C: CoreApi + Clone + 'static>(
     State(st): State<Arc<AppState<C>>>,
 ) -> ApiResult<Json<CallList>> {
     Ok(Json(st.core.list_calls().await?))
 }
 
-/// GET /api/v1/calls/{id}：单呼叫双侧 Leg 会话诊断（L0 只读，
-/// REQ-OAM-007/010）。Call-ID 不存在/已结束 → 404；核心不可达 → 502/504。
+/// GET /api/v1/calls/{id}: single-call two-sided Leg session diagnosis (L0 read-only,
+/// REQ-OAM-007/010). Call-ID missing/ended → 404; core unreachable → 502/504.
 async fn get_call<C: CoreApi + Clone + 'static>(
     State(st): State<Arc<AppState<C>>>,
     Path(id): Path<String>,
@@ -149,10 +155,11 @@ async fn get_call<C: CoreApi + Clone + 'static>(
     Ok(Json(st.core.call_detail(&id).await?))
 }
 
-/// POST /api/v1/calls/{id}/hangup —— L1 操作，转发核心
-/// `hangup <call-id>`（REQ-OAM-004），核心侧强制审计。
-/// 成功 200；Call-ID 不存在/已结束 → 404；核心不可达 → 502/504。
-/// 长度上限与核心 DLG_CALLID_MAX-1 对齐（1..127 字节，字符集由核心复验）。
+/// POST /api/v1/calls/{id}/hangup — L1 operation, forwards to core
+/// `hangup <call-id>` (REQ-OAM-004); core-side forced audit.
+/// Success 200; Call-ID missing/ended → 404; core unreachable → 502/504.
+/// Length upper bound aligns with core DLG_CALLID_MAX-1 (1..127 bytes, charset
+/// re-verified by core).
 async fn hangup<C: CoreApi + Clone + 'static>(
     State(st): State<Arc<AppState<C>>>,
     Path(id): Path<String>,
@@ -167,9 +174,9 @@ async fn hangup<C: CoreApi + Clone + 'static>(
     })))
 }
 
-// ===== REQ-CCMD-001 L2 命令端点 =====
+// ===== REQ-CCMD-001 L2 command endpoints =====
 
-/// POST /calls/{id}/kill —— uuid_kill [cause]，cause 可选 1-699。
+/// POST /calls/{id}/kill — uuid_kill [cause], cause optional 1-699.
 #[derive(Debug, Deserialize)]
 struct KillBody {
     cause: Option<u16>,
@@ -194,7 +201,7 @@ async fn kill<C: CoreApi + Clone + 'static>(
     Ok(action_response(&id))
 }
 
-/// POST /calls/{id}/answer —— uuid_answer。
+/// POST /calls/{id}/answer — uuid_answer.
 async fn answer<C: CoreApi + Clone + 'static>(
     State(st): State<Arc<AppState<C>>>,
     Path(id): Path<String>,
@@ -206,7 +213,7 @@ async fn answer<C: CoreApi + Clone + 'static>(
     Ok(action_response(&id))
 }
 
-/// POST /calls/{id}/hold —— uuid_hold on/off。
+/// POST /calls/{id}/hold — uuid_hold on/off.
 #[derive(Debug, Deserialize)]
 struct HoldBody {
     on: bool,
@@ -225,14 +232,14 @@ async fn hold<C: CoreApi + Clone + 'static>(
     Ok(action_response(&id))
 }
 
-/// POST /calls/{id}/mute —— uuid_mute on/off [leg]（REQ-AI-BARGEIN-001）。
-/// barge-in 核心命令：用户开始说话时 AI 引擎调 mute on leg=1（AI 侧），
-/// 用户停住后调 mute off 恢复。
+/// POST /calls/{id}/mute — uuid_mute on/off [leg] (REQ-AI-BARGEIN-001).
+/// Barge-in core command: when the user starts speaking the AI engine calls mute
+/// on leg=1 (AI side); when the user pauses it calls mute off to resume.
 #[derive(Debug, Deserialize)]
 struct MuteBody {
-    /// true → mute on；false → mute off
+    /// true → mute on; false → mute off
     on: bool,
-    /// 0=A腿(用户) 1=B腿(AI) -1=双腿(默认)
+    /// 0=A leg (user) 1=B leg (AI) -1=both legs (default)
     leg: Option<i32>,
 }
 
@@ -248,17 +255,18 @@ async fn mute<C: CoreApi + Clone + 'static>(
     let leg_str = match body.leg {
         Some(0) => "0",
         Some(1) => "1",
-        _ => "-1", // -1 或 None → 双腿
+        _ => "-1", // -1 or None → both legs
     };
     st.core.call_action(&id, "mute", &[flag, leg_str]).await?;
     Ok(action_response(&id))
 }
 
-/// POST /calls/{id}/broadcast —— uuid_broadcast <wav_path>（REQ-AI-BARGEIN-001）。
-/// AI TTS 合成 WAV 后调用，把音频注入到通话侧播放给用户听。
+/// POST /calls/{id}/broadcast — uuid_broadcast <wav_path> (REQ-AI-BARGEIN-001).
+/// Called after AI TTS synthesizes a WAV, to inject audio into the call side so the user
+/// can hear it.
 #[derive(Debug, Deserialize)]
 struct BroadcastBody {
-    /// WAV 文件路径（nsbcd 进程能访问的绝对路径）
+    /// WAV file path (absolute path reachable by the nsbcd process)
     wav_path: String,
 }
 
@@ -277,11 +285,12 @@ async fn broadcast<C: CoreApi + Clone + 'static>(
     Ok(action_response(&id))
 }
 
-/// POST /calls/{id}/vad-start —— uuid_vad_start <threshold>（REQ-AI-BARGEIN-001）。
-/// B 腿 answer 后 AI 引擎调此命令启动 VAD 监控，之后 state.vad_tx 开始推 VAD_EVENT。
+/// POST /calls/{id}/vad-start — uuid_vad_start <threshold> (REQ-AI-BARGEIN-001).
+/// After the B leg answers, the AI engine calls this command to start VAD monitoring;
+/// afterwards state.vad_tx begins pushing VAD_EVENTs.
 #[derive(Debug, Deserialize)]
 struct VadStartBody {
-    /// RMS 阈值（int16 PCM 振幅），默认 800，静音 < 300，正常说话 > 1000
+    /// RMS threshold (int16 PCM amplitude), default 800, silence < 300, normal speech > 1000
     threshold: Option<u16>,
 }
 
@@ -298,8 +307,8 @@ async fn vad_start<C: CoreApi + Clone + 'static>(
     Ok(action_response(&id))
 }
 
-/// POST /calls/{id}/vad-stop —— uuid_vad_stop（REQ-AI-BARGEIN-001）。
-/// 通话结束前清理 VAD 监控。
+/// POST /calls/{id}/vad-stop — uuid_vad_stop (REQ-AI-BARGEIN-001).
+/// Clean up VAD monitoring before the call ends.
 async fn vad_stop<C: CoreApi + Clone + 'static>(
     State(st): State<Arc<AppState<C>>>,
     Path(id): Path<String>,
@@ -311,7 +320,7 @@ async fn vad_stop<C: CoreApi + Clone + 'static>(
     Ok(action_response(&id))
 }
 
-/// POST /calls/{id}/transfer —— uuid_transfer dest。
+/// POST /calls/{id}/transfer — uuid_transfer dest.
 #[derive(Debug, Deserialize)]
 struct TransferBody {
     dest: String,
@@ -332,12 +341,12 @@ async fn transfer<C: CoreApi + Clone + 'static>(
     Ok(action_response(&id))
 }
 
-/// POST /calls/{id}/record —— uuid_record start|stop [path]。
+/// POST /calls/{id}/record — uuid_record start|stop [path].
 #[derive(Debug, Deserialize)]
 struct RecordBody {
     /// start | stop
     action: String,
-    /// start 时必填
+    /// Required at start time
     path: Option<String>,
 }
 
@@ -367,7 +376,7 @@ async fn record<C: CoreApi + Clone + 'static>(
     Ok(action_response(&id))
 }
 
-/// POST /calls/{id}/send-dtmf —— uuid_send_dtmf digits（0-9*#A-D，≤32）。
+/// POST /calls/{id}/send-dtmf — uuid_send_dtmf digits (0-9*#A-D, ≤32).
 #[derive(Debug, Deserialize)]
 struct SendDtmfBody {
     digits: String,
@@ -396,7 +405,7 @@ async fn send_dtmf<C: CoreApi + Clone + 'static>(
     Ok(action_response(&id))
 }
 
-/// POST /calls/{id}/send-msg —— send_msg <call-id> <body>（MESSAGE 转发）。
+/// POST /calls/{id}/send-msg — send_msg <call-id> <body> (MESSAGE forward).
 #[derive(Debug, Deserialize)]
 struct SendMessageBody {
     text: String,
@@ -419,7 +428,7 @@ async fn send_message<C: CoreApi + Clone + 'static>(
     Ok(action_response(&id))
 }
 
-/// POST /originate —— originate <call-url>。
+/// POST /originate — originate <call-url>.
 #[derive(Debug, Deserialize)]
 struct OriginateBody {
     call_url: String,

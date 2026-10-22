@@ -1,17 +1,20 @@
-//! Web DB → C 核心配置全量推送（REQ-DATA-SVC-003，混合式同步 S4/S5）。
+//! Web DB → C core full configuration push (REQ-DATA-SVC-003, hybrid sync S4/S5).
 //!
-//! 数据流：Web 数据库（sqlite/postgres/mysql）为唯一数据源 →
-//! control.sock `*.reload <json>` 命令 → C 侧内存表整表替换。
+//! Data flow: Web database (sqlite/postgres/mysql) is the single source of truth →
+//! control.sock `*.reload <json>` command → C-side in-memory table whole-table replacement.
 //!
-//! 触发点：
-//!   - UDS HELLO（[`crate::uds_server`]）：核心进程启动/重连成功 → [`on_hello`]
-//!     全量推四类（extensions → trunks → dialplan-rules → sip-profiles）
-//!   - CRUD 保存后（routes 各 handler）：[`spawn_push`] 单类推送（300ms 防抖合并）
+//! Triggers:
+//!   - UDS HELLO ([`crate::uds_server`]): core process start/reconnect succeeds →
+//!     [`on_hello`] pushes all four (extensions → trunks → dialplan-rules → sip-profiles)
+//!   - After CRUD save (various routes handlers): [`spawn_push`] single-kind push
+//!     (300ms debounced merge)
 //!
-//! 可靠性：每类独立重试（backoff 500ms→8s 共 5 次）；单类失败不阻断其余类；
-//! 重试耗尽记 ERROR，等下一次触发（HELLO 重连/CRUD/手动 reload 端点）补推。
+//! Reliability: each kind retries independently (backoff 500ms→8s, 5 times total);
+//! one kind failure does not block others; if all retries are exhausted it logs ERROR
+//! and waits for the next trigger (HELLO reconnect / CRUD / manual reload endpoint).
 //!
-//! 安全：分机推送走 [`ExtSyncDto`]（不含明文 password，只下发 HA1）。
+//! Security: extension push goes through [`ExtSyncDto`] (no plaintext password, only
+//! HA1 is sent down).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -19,8 +22,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::AppState;
 use crate::coreclient::CoreApi;
 
-/// 分机同步 DTO：DB Extension → C ext_table_reload_json。
-/// 密码永不离开 Web 端（C 侧只需 HA1 做 Digest 校验）。
+/// Extension sync DTO: DB Extension → C ext_table_reload_json.
+/// Password never leaves Web side (C side only needs HA1 for Digest verification).
 #[derive(Debug, serde::Serialize)]
 pub struct ExtSyncDto {
     pub extension:    String,
@@ -46,19 +49,19 @@ impl From<&crate::db::Extension> for ExtSyncDto {
     }
 }
 
-/// 队列同步 DTO：DB Queue → C queue_table_reload_json。
-/// 字段名/类型严格匹配 C 侧解析 schema（queue.c 中的 reload handler）。
+/// Queue sync DTO: DB Queue → C queue_table_reload_json.
+/// Field names/types strictly match C-side parsing schema (the reload handler in queue.c).
 ///
-/// | DTO 字段        | C 侧用途             | Rust 来源                     |
-/// |-----------------|---------------------|-------------------------------|
-/// | tenant          | 按租户匹配队列槽     | tenant_id:i64 → format!("{id}") |
-/// | name            | 队列唯一名           | name: String                  |
-/// | enabled         | json_truthy 布尔     | enabled:i64 != 0              |
-/// | strategy        | CQ_STRATEGY_* 解析   | ring_strategy: String         |
-/// | max_wait_s      | 超时溢出（秒）       | max_wait_sec: i64             |
-/// | wrap_time_s     | 座席话后整理（秒）   | 暂固定 30（Rust 侧字段待加）    |
-/// | require_skill   | 技能路由过滤         | 暂 ""（Rust 侧字段待加）       |
-/// | members         | 成员分机列表         | members_json: String → 解析 Vec<String> |
+/// | DTO field        | C-side purpose       | Rust source                  |
+/// |------------------|----------------------|------------------------------|
+/// | tenant           | Match queue slot by tenant | tenant_id:i64 → format!("{id}") |
+/// | name             | Queue unique name    | name: String                 |
+/// | enabled          | json_truthy bool    | enabled:i64 != 0             |
+/// | strategy         | CQ_STRATEGY_* parsing | ring_strategy: String      |
+/// | max_wait_s       | Timeout overflow (s) | max_wait_sec: i64            |
+/// | wrap_time_s      | Agent after-call wrap-up (s) | currently hardcoded 30
+/// | require_skill    | Skill routing filter | currently "" (Rust-side field TBD) |
+/// | members          | Member extension list | members_json: String → parse Vec<String> |
 #[derive(Debug, serde::Serialize)]
 pub struct QueueSyncDto {
     pub tenant:       String,
@@ -71,8 +74,8 @@ pub struct QueueSyncDto {
     pub members:      Vec<String>,
 }
 
-/// 安全围栏同步 DTO：DB SecurityBlacklist → C security_blacklist_reload_json。
-/// 字段名严格匹配 C 侧解析 schema（security.c：kind/type/value/comment/enabled）。
+/// Security-blacklist sync DTO: DB SecurityBlacklist → C security_blacklist_reload_json.
+/// Field names strictly match C-side parsing schema (security.c: kind/type/value/comment/enabled).
 #[derive(Debug, serde::Serialize)]
 pub struct BlacklistSyncDto {
     pub kind:       String,
@@ -95,7 +98,7 @@ impl From<&crate::db::SecurityBlacklist> for BlacklistSyncDto {
     }
 }
 
-/// 推送的配置类别（与 C 侧 reload 命令一一对应）。
+/// Config kinds that can be pushed (one-to-one mapping with C-side reload commands).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Kind {
     Extensions,
@@ -127,7 +130,7 @@ impl Kind {
     }
 }
 
-/// 查 DB → 组 JSON（单类全量快照）。
+/// Query DB → build JSON (single-kind full snapshot).
 async fn snapshot<C: CoreApi + Clone + Send + Sync>(
     st: &Arc<AppState<C>>,
     kind: Kind,
@@ -176,7 +179,7 @@ async fn snapshot<C: CoreApi + Clone + Send + Sync>(
                 .list_enabled_queues()
                 .await
                 .map_err(|e| format!("db: {e}"))?;
-            // rows 是 Vec<(Queue, tenant_name)> —— JOIN tenants 拿的 realm
+            // rows is Vec<(Queue, tenant_name)> — realm from JOIN with tenants
             let dtos: Vec<QueueSyncDto> = rows.into_iter().map(|(q, tenant_name)| {
                 let members: Vec<String> = serde_json::from_str(&q.members_json).unwrap_or_default();
                 QueueSyncDto {
@@ -219,7 +222,7 @@ async fn snapshot<C: CoreApi + Clone + Send + Sync>(
     }
 }
 
-/// 单类推送：快照 → CoreApi.reload_*，失败按 [500ms,1s,2s,4s,8s] 重试。
+/// Single-kind push: snapshot → CoreApi.reload_*; retry on failure with [500ms,1s,2s,4s,8s].
 async fn push_kind<C: CoreApi + Clone + Send + Sync>(
     st: &Arc<AppState<C>>,
     kind: Kind,
@@ -230,7 +233,7 @@ async fn push_kind<C: CoreApi + Clone + Send + Sync>(
         let (json, n) = match snapshot(st, kind).await {
             Ok(v) => v,
             Err(e) => {
-                // DB 读失败也走重试（连接池瞬时抖动）
+                // DB read failure also goes through retry (connection pool transient jitter)
                 tracing::warn!(kind = kind.name(), attempt, error = %e, "sync snapshot failed");
                 if attempt == DELAYS_MS.len() {
                     return Err(e);
@@ -264,7 +267,8 @@ async fn push_kind<C: CoreApi + Clone + Send + Sync>(
     unreachable!()
 }
 
-/// 全量推送（四类串行；单类失败不阻断，记 ERROR 等下次触发补推）。
+/// Full push (four kinds in sequence; one kind failure does not block others — log ERROR,
+/// the next trigger will retry).
 pub async fn push_all<C: CoreApi + Clone + Send + Sync>(st: Arc<AppState<C>>) {
     tracing::info!("full config push begin (hello)");
     let mut failed = Vec::new();
@@ -281,7 +285,8 @@ pub async fn push_all<C: CoreApi + Clone + Send + Sync>(st: Arc<AppState<C>>) {
     }
 }
 
-/// UDS HELLO 入口：核心连接建立/重连 → 全量推送（后台任务，不阻塞 HELLO_ACK）。
+/// UDS HELLO entry point: core connects/reconnects → full push (background task, does not
+/// block HELLO_ACK).
 pub fn on_hello<C: CoreApi + Clone + Send + Sync + 'static>(st: Arc<AppState<C>>) {
     tokio::spawn(async move {
         push_all(st).await;
@@ -289,7 +294,7 @@ pub fn on_hello<C: CoreApi + Clone + Send + Sync + 'static>(st: Arc<AppState<C>>
 }
 
 // ---------------------------------------------------------------------------
-// CRUD 保存后单类推送（S5）：300ms 防抖 + 同类任务合并
+// Single-kind push after CRUD save (S5): 300ms debounce + merge same-kind tasks
 // ---------------------------------------------------------------------------
 
 type GateMap = Mutex<HashMap<Kind, tokio::task::JoinHandle<()>>>;
@@ -299,10 +304,12 @@ fn gates() -> &'static GateMap {
     GATES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// CRUD 成功后调用：安排一次单类推送。
+/// Called after CRUD succeeds: schedule a single-kind push.
 ///
-/// 防抖：任务先睡 300ms 合并窗口内连续修改（唤醒后查的 DB 快照已含全部）；
-/// 合并：同类已有 pending/running 任务时跳过（该任务会覆盖本次变更）。
+/// Debounce: the task sleeps 300ms first to merge consecutive modifications within the
+/// window (after waking up, the DB snapshot already contains all of them).
+/// Merge: if there is already a pending/running task for the same kind, skip — that
+/// task will cover this change.
 pub fn spawn_push<C: CoreApi + Clone + Send + Sync + 'static>(
     st: Arc<AppState<C>>,
     kind: Kind,
@@ -310,7 +317,7 @@ pub fn spawn_push<C: CoreApi + Clone + Send + Sync + 'static>(
     let mut g = gates().lock().unwrap();
     if let Some(h) = g.get(&kind) {
         if !h.is_finished() {
-            return; // 已有 pending 推送，将覆盖本次变更
+            return; // Already a pending push, will cover this change
         }
     }
     let h = tokio::spawn(async move {
@@ -323,25 +330,27 @@ pub fn spawn_push<C: CoreApi + Clone + Send + Sync + 'static>(
 }
 
 // ---------------------------------------------------------------------------
-// 周期性全量重推（HA 双机部署的配置一致性保障）
+// Periodic full re-push (HA dual-node config consistency guarantee)
 // ---------------------------------------------------------------------------
 
-/// 每 60s 向本机 nsbcd 全量重推五类配置。
+/// Every 60 seconds, full re-push five kinds of config to the local nsbcd.
 ///
-/// 为什么需要：CRUD 推送（spawn_push）只发生在「处理该次 HTTP 请求」
-/// 的 Web 实例上——双机部署时 VIP 流量只到一台，另一台的 nsbcd 若只
-/// 靠 HELLO 快照，运行期配置变更永远到不了它，failover 后就会拿旧
-/// profile/拨号规则/分机表服务。也覆盖「Web 重启而核心未重启（无新
-/// HELLO）」的时序。
+/// Why this is needed: CRUD pushes (spawn_push) only happen on the Web instance that
+/// handled that HTTP request — in a dual-node deployment VIP traffic only goes to one,
+/// the other's nsbcd only ever gets the HELLO snapshot, so runtime config changes never
+/// reach it. After failover it would serve with stale profile / dialplan rules /
+/// extension table. This also covers the "Web restart while core did not (no new HELLO)"
+/// timing scenario.
 ///
-/// 幂等：C 侧 reload 是整表 RCU 原子替换，重复推送无副作用；单机
-/// 部署同样无害。成功静默（避免每分钟刷日志），失败记 WARN 由下一
-/// 周期补推。间隔硬编码 60s，不引入配置项。
+/// Idempotent: C-side reload does whole-table RCU atomic replace, repeated pushes have
+/// no side effects; also harmless in single-node deployments. Success is silent
+/// (avoid per-minute log spam); failures are WARN and retried next cycle. Interval
+/// hardcoded at 60s, no config knob introduced.
 pub fn spawn_periodic_push<C: CoreApi + Clone + Send + Sync + 'static>(
     st: Arc<AppState<C>>,
 ) {
     tokio::spawn(async move {
-        // interval 首个 tick 立即完成：启动即推一次全量
+        // interval's first tick completes immediately: push full set once at startup
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {

@@ -1,26 +1,26 @@
-//! 计费管理 REST（REQ-OAM-009）：费率表 + 计费账户。
+//! Billing management REST (REQ-OAM-009): rate tables + billing accounts.
 //!
-//! 费率（rate_tables）：
-//!   GET    /rates              列表（DB，分页 + prefix/enabled 过滤）
-//!   GET    /rates/:id          详情（DB）
-//!   POST   /rates              创建（DB）
-//!   PUT    /rates/:id          更新（DB）
-//!   DELETE /rates/:id          删除（DB）
-//!   POST   /rates/reload       推送所有 enabled → 核心 UDS（rate.reload）
-//!   GET    /rates/core         核心侧实时费率快照（show rates，L0 只读）
+//! Rate tables:
+//!   GET    /rates              List (DB, pagination + prefix/enabled filter)
+//!   GET    /rates/:id          Detail (DB)
+//!   POST   /rates              Create (DB)
+//!   PUT    /rates/:id          Update (DB)
+//!   DELETE /rates/:id          Delete (DB)
+//!   POST   /rates/reload       Push all enabled → core UDS (rate.reload)
+//!   GET    /rates/core         Core-side real-time rate snapshot (show rates, L0 read-only)
 //!
-//! 账户（accounts）：
-//!   GET    /balances           列表（DB，分页 + keyword 过滤）
-//!   GET    /balances/:id       详情（DB）
-//!   POST   /balances           开户（DB + account.open UDS）
-//!   POST   /balances/:id/topup 充值（DB + account.topup UDS）
-//!   DELETE /balances/:id       销户（仅 DB；核心侧保留 reserve 状态）
-//!   GET    /balances/core      核心侧实时余额快照（show balances，L0 只读）
+//! Accounts:
+//!   GET    /balances           List (DB, pagination + keyword filter)
+//!   GET    /balances/:id       Detail (DB)
+//!   POST   /balances           Open account (DB + account.open UDS)
+//!   POST   /balances/:id/topup Top up (DB + account.topup UDS)
+//!   DELETE /balances/:id       Close account (DB only; core side keeps reserve state)
+//!   GET    /balances/core      Core-side real-time balance snapshot (show balances, L0 read-only)
 //!
-//! 设计原则：
-//!   - DB CRUD 与 reload 分离（extensions.rs 同款模式），reload 显式触发
-//!   - accounts 的 topup 同步写 DB + 推 UDS（避免 DB/核心分叉）
-//!   - prefix/account_key UNIQUE 冲突 → 409 Conflict
+//! Design principles:
+//!   - DB CRUD separated from reload (same pattern as extensions.rs); reload is explicit
+//!   - Account topup does sync DB write + UDS push simultaneously (avoid DB/core divergence)
+//!   - prefix/account_key UNIQUE conflict → 409 Conflict
 
 use std::sync::Arc;
 
@@ -46,8 +46,8 @@ where
     C: CoreApi + Clone + 'static,
 {
     Router::new()
-        // reload 和 core 快照在 /:id 之前注册——axum 按注册顺序匹配
-        // ===== 费率 =====
+        // reload and core snapshot registered before /:id — axum matches by registration order
+        // ===== Rate tables =====
         .route("/rates", get(list_rates::<C>).post(create_rate::<C>))
         .route("/rates/reload", post(reload_rates::<C>))
         .route("/rates/core", get(core_rates::<C>))
@@ -57,7 +57,7 @@ where
                 .put(update_rate::<C>)
                 .delete(delete_rate::<C>),
         )
-        // ===== 账户 =====
+        // ===== Accounts =====
         .route("/balances", get(list_accounts::<C>).post(open_account::<C>))
         .route("/balances/core", get(core_balances::<C>))
         .route("/balances/:id", get(get_account::<C>).delete(close_account::<C>))
@@ -66,7 +66,7 @@ where
 }
 
 // ================================================================
-// 费率 CRUD
+// Rate table CRUD
 // ================================================================
 
 #[derive(Debug, Deserialize, Default)]
@@ -190,7 +190,7 @@ async fn delete_rate<C: CoreApi + Clone + Send + Sync>(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// POST /rates/reload — DB enabled 费率 → 核心 UDS rate.reload
+/// POST /rates/reload — DB enabled rate tables → core UDS rate.reload
 async fn reload_rates<C: CoreApi + Clone + Send + Sync>(
     State(st): State<Arc<AppState<C>>>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -210,7 +210,7 @@ async fn reload_rates<C: CoreApi + Clone + Send + Sync>(
     Ok(Json(json!({ "loaded": rows.len() })))
 }
 
-/// GET /rates/core — 核心侧实时费率快照（show rates）
+/// GET /rates/core — core-side real-time rate snapshot (show rates)
 async fn core_rates<C: CoreApi + Clone + 'static>(
     State(st): State<Arc<AppState<C>>>,
 ) -> Result<Json<RateList>, ApiError> {
@@ -218,7 +218,7 @@ async fn core_rates<C: CoreApi + Clone + 'static>(
 }
 
 // ================================================================
-// 账户 CRUD
+// Account CRUD
 // ================================================================
 
 #[derive(Debug, Deserialize, Default)]
@@ -228,7 +228,7 @@ pub struct AccountListQuery {
     pub offset:  Option<i64>,
 }
 
-/// POST /balances/:id/topup 请求体
+/// POST /balances/:id/topup request body
 #[derive(Debug, Deserialize)]
 pub struct TopupBody {
     pub delta_uc: i64,
@@ -260,7 +260,7 @@ async fn get_account<C: CoreApi + Clone + Send + Sync>(
     Ok(Json(row))
 }
 
-/// POST /balances — 开户（DB + 核心 UDS account.open）
+/// POST /balances — open account (DB + core UDS account.open)
 async fn open_account<C: CoreApi + Clone + Send + Sync>(
     State(st): State<Arc<AppState<C>>>,
     Json(body): Json<AccountCreate>,
@@ -277,7 +277,8 @@ async fn open_account<C: CoreApi + Clone + Send + Sync>(
         ApiError::Db(e.to_string())
     })?;
 
-    // 同步推核心（失败不回滚 DB——下次 reload 会覆盖；但返回 207 Mixed 告知）
+    // Sync push to core (failure does not roll back DB — next reload will override;
+    // but return 207 Mixed to inform)
     let core_res = st.core.account_open(
         &body.account_key, body.balance_uc, body.credit_limit_uc,
     ).await;
@@ -295,7 +296,7 @@ async fn open_account<C: CoreApi + Clone + Send + Sync>(
     Ok((StatusCode::CREATED, Json(row)))
 }
 
-/// POST /balances/:id/topup — 充值（DB + 核心 UDS account.topup）
+/// POST /balances/:id/topup — top up (DB + core UDS account.topup)
 async fn topup_account<C: CoreApi + Clone + Send + Sync>(
     State(st): State<Arc<AppState<C>>>,
     Path(id): Path<i64>,
@@ -303,7 +304,7 @@ async fn topup_account<C: CoreApi + Clone + Send + Sync>(
 ) -> Result<impl IntoResponse, ApiError> {
     st.db.pool().ok_or(ApiError::DbUnavailable)?;
 
-    // 先查账户（存在性 + 取 key）
+    // Look up account first (existence check + fetch key)
     let acct = st.db.get_account(id).await
         .map_err(|e| ApiError::Db(e.to_string()))?
         .ok_or_else(|| ApiError::NotFound("account not found".into()))?;
@@ -315,7 +316,7 @@ async fn topup_account<C: CoreApi + Clone + Send + Sync>(
         }
     })?;
 
-    // 同步推核心
+    // Sync push to core
     let core_res = st.core.account_topup(&acct.account_key, body.delta_uc).await;
     if let Err(e) = &core_res {
         tracing::warn!(error = %e, key = %acct.account_key, delta = body.delta_uc,
@@ -332,7 +333,8 @@ async fn topup_account<C: CoreApi + Clone + Send + Sync>(
     Ok(Json(row))
 }
 
-/// DELETE /balances/:id — 销户（仅 DB；核心侧保留 reserve 状态避免结算错账）
+/// DELETE /balances/:id — close account (DB only; core side keeps reserve state to
+/// avoid settling miscalculations)
 async fn close_account<C: CoreApi + Clone + Send + Sync>(
     State(st): State<Arc<AppState<C>>>,
     Path(id): Path<i64>,
@@ -359,7 +361,7 @@ async fn close_account<C: CoreApi + Clone + Send + Sync>(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// GET /balances/core — 核心侧实时余额快照（show balances）
+/// GET /balances/core — core-side real-time balance snapshot (show balances)
 async fn core_balances<C: CoreApi + Clone + 'static>(
     State(st): State<Arc<AppState<C>>>,
 ) -> Result<Json<AccountList>, ApiError> {

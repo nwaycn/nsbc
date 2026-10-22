@@ -1,14 +1,14 @@
-//! 登录验证码（REQ-WEB-009 增强）。
+﻿//! Login captcha (REQ-WEB-009 enhancement).
 //!
-//! 零新依赖：用现有 `getrandom` 生成随机字符，SVG 字符串模板渲染，
-//! 内存 `Mutex<HashMap>` 存 captcha_id → (text, expiry)，TTL 5 分钟。
+//! Zero new dependencies: random chars from existing `getrandom`, rendered via SVG string template,
+//! in-memory `Mutex<HashMap>` stores captcha_id -> (text, expiry), TTL 5 minutes.
 //!
-//! 安全设计：
-//! - captcha_id 为 32 hex（128 bit 随机），不可预测
-//! - 答案 text 用 4 字符大写字母+数字（易读）
-//! - 一次消费：校验后立即删除
-//! - TTL 过期自动清理（懒执行，每次生成时顺便清过期项）
-//! - 每进程最多 1024 个活跃验证码（防内存 DoS）
+//! Security design:
+//! - captcha_id is 32 hex chars (128-bit random), unpredictable
+//! - Answer text uses 4 chars of uppercase letters + digits (easy to read)
+//! - Single-use: deleted immediately after verification
+//! - TTL expiry auto-cleanup (lazy: clean expired items each time a new one is generated)
+//! - At most 1024 active captchas per process (prevents memory DoS)
 
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
@@ -16,12 +16,12 @@ use std::time::{Duration, Instant};
 
 use getrandom::getrandom;
 
-/// 验证码存储：captcha_id → (答案文本, 过期时间)
+/// Captcha store: captcha_id -> (answer text, expiry time)
 pub struct CaptchaStore {
     inner: Mutex<HashMap<String, (String, Instant)>>,
-    /// 活跃验证码上限（防内存 DoS）
+    /// Active captcha cap (prevents memory DoS)
     max_active: usize,
-    /// 单个验证码 TTL
+    /// Per-captcha TTL
     ttl: Duration,
 }
 
@@ -30,19 +30,19 @@ impl CaptchaStore {
         Self {
             inner: Mutex::new(HashMap::new()),
             max_active: 1024,
-            ttl: Duration::from_secs(300), // 5 分钟
+            ttl: Duration::from_secs(300), // 5 minutes
         }
     }
 
-    /// 生成新验证码 → (captcha_id, svg_string)。
-    /// 内存满时清理过期项后仍超上限则返回 None。
+    /// Generate new captcha -> (captcha_id, svg_string).
+    /// Returns None when store is still over cap after cleaning expired items.
     pub fn generate(&self) -> Option<(String, String)> {
         let mut map = self.lock();
-        // 先清理过期项
+        // First clean expired items
         let now = Instant::now();
         map.retain(|_, v| v.1 > now);
 
-        // 活跃数超限 → 清理过期后仍满 → 拒绝
+        // Active count over cap -> still full after cleanup -> reject
         if map.len() >= self.max_active {
             map.retain(|_, v| v.1 > now);
             if map.len() >= self.max_active {
@@ -59,7 +59,7 @@ impl CaptchaStore {
         Some((captcha_id, svg))
     }
 
-    /// 校验并消费验证码。正确 → true，错误/过期/不存在 → false。
+    /// Verify and consume captcha. Correct -> true; wrong/expired/not found -> false.
     pub fn verify(&self, captcha_id: &str, captcha_code: &str) -> bool {
         let mut map = self.lock();
         let now = Instant::now();
@@ -83,7 +83,7 @@ impl Default for CaptchaStore {
     }
 }
 
-/// 生成指定长度的随机 hex 字符串
+/// Generate random hex string of given length
 fn random_hex(len: usize) -> String {
     let mut buf = vec![0u8; len];
     getrandom(&mut buf).expect("getrandom failed");
@@ -91,7 +91,7 @@ fn random_hex(len: usize) -> String {
     hex.join("")
 }
 
-/// 生成指定长度的随机大写字母+数字（去掉易混淆字符 O/0/I/1/L）
+/// Generate random uppercase letters + digits of given length (exclude confusable chars O/0/I/1/L)
 const ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 
 fn random_text(len: usize) -> String {
@@ -102,8 +102,8 @@ fn random_text(len: usize) -> String {
         .collect()
 }
 
-/// 渲染简单 SVG 验证码（4 字符，扭曲+干扰线+噪点）
-/// viewBox 96×36；零外部图像依赖。
+/// Render simple SVG captcha (4 chars, with distortion + interference lines + noise points)
+/// viewBox 96x36; zero external image dependencies.
 fn render_svg(text: &str) -> String {
     let width = 96usize;
     let height = 36usize;
@@ -111,7 +111,7 @@ fn render_svg(text: &str) -> String {
     let n = chars.len();
     let step = width.saturating_sub(16) / n.max(1);
 
-    // 每字符随机偏移+颜色
+    // Per-char random offset + color
     let mut char_exprs = String::new();
     let color_palette = ["#2c5f8a", "#3d7a9e", "#1f4d6e", "#4a6b8c"];
     for (i, &c) in chars.iter().enumerate() {
@@ -131,7 +131,7 @@ fn render_svg(text: &str) -> String {
         ));
     }
 
-    // 2 条随机干扰线
+    // 2 random interference lines
     let mut lines = String::new();
     for _ in 0..2 {
         let x1 = random_range(4, width as i32 - 16);
@@ -143,7 +143,7 @@ fn render_svg(text: &str) -> String {
         ));
     }
 
-    // 6 个噪点
+    // 6 noise points
     let mut dots = String::new();
     for _ in 0..6 {
         let cx = random_range(0, width as i32);
@@ -182,7 +182,7 @@ mod tests {
         assert!(svg.contains("<svg"));
         assert!(svg.contains("<text"));
 
-        // 不存在的 captcha_id → false
+        // Non-existent captcha_id -> false
         assert!(!store.verify("unknown", "ABCD"));
     }
 
@@ -210,7 +210,7 @@ mod tests {
         assert!(svg.contains("<text"));
         assert!(svg.contains("<line"));
         assert!(svg.contains("<circle"));
-        // 字符应该出现在 <text> 标签之间
+        // Chars should appear between <text> tags
         assert!(svg.contains(">A<") || svg.contains("'A'>") || svg.contains(">A</text"));
     }
 }

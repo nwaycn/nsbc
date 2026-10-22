@@ -1,10 +1,10 @@
-/* global JsSIP */
+﻿/* global JsSIP */
 // =============================================================================
-// nsbc-phone.js — NSBC WebRTC 共享电话层
+// nsbc-phone.js — NSBC WebRTC Total享电话层
 // -----------------------------------------------------------------------------
 // 包含完整的 JsSIP 3.10.x 控制逻辑 + Hold/DTMF/拨号盘增强功能。
-// 多个 HTML 页面可以通过 <script src="js/nsbc-phone.js"></script> 共享。
-// 页面需先加载 jssip-3.10.0.min.js，并提供这些 DOM ID:
+// 多个 HTML 面可以通过 <script src="js/nsbc-phone.js"></script> Total享。
+// 面需先加载 jssip-3.10.0.min.js，并提供这些 DOM ID:
 //   wss, stun, user, pass, btnReg, btnUnreg, regStatus,
 //   localVideo, remoteVideo, localDot, remoteDot, btnMute, btnStopVid, btnHold,
 //   target, btnCall, btnHang, callStatus,
@@ -22,8 +22,8 @@ let remoteStream = null;
 let dc = null, dcOpen = false;
 let isHangingUp = false;
 
-// ============ 振铃音（Web Audio 合成，无需外部文件） ============
-// 经典 440+480Hz 双音振铃（Bell 风格），2s on / 4s off 循环
+// ============ Ringing音（Web Audio 合成，无需外部文件） ============
+// 经典 440+480Hz 双音Ringing（Bell 风格），2s on / 4s off 循环
 let _ringAC = null, _ringTimer = null, _ringGain = null;
 function playRingTone() {
   if (_ringTimer) return;           // 已在响
@@ -33,12 +33,12 @@ function playRingTone() {
     const osc1 = _ringAC.createOscillator(); osc1.frequency.value = 440;
     const osc2 = _ringAC.createOscillator(); osc2.frequency.value = 480;
     const gain = _ringAC.createGain();
-    gain.gain.value = 0;            // 初始静音，让 gain 包络控制 on/off
+    gain.gain.value = 0;            // 初始Mute，让 gain 包络控制 on/off
     osc1.connect(gain); osc2.connect(gain); gain.connect(_ringAC.destination);
     osc1.start(); osc2.start();
     _ringGain = gain;
 
-    // 2秒响 + 4秒停 循环（经典振铃节奏）
+    // 2s响 + 4s停 循环（经典Ringing节奏）
     const tick = () => {
       if (!_ringGain) return;
       if (_ringGain.gain.value === 0) {
@@ -51,7 +51,7 @@ function playRingTone() {
       }
     };
     tick();
-    log('info', '🔔 180 Ringing → 播放本地振铃');
+    log('info', '🔔 180 Ringing → 播放本地Ringing');
   } catch (e) {
     console.warn('[NSBC] playRingTone fail:', e.message);
   }
@@ -68,8 +68,8 @@ function _destroyRingTone() {
   stopRingTone();
   if (_ringAC) { try { _ringAC.close(); } catch(_) {} _ringAC = null; _ringGain = null; }
 }
-// SIP realm/domain — 优先读页面 Realm 输入框，fallback 到 localStorage，最后 fallback nsbc.local
-// 多租户场景：realm = 租户名（tenant_name），每个租户可以有独立的 SIP 域
+// SIP realm/domain — 优先读面 Realm 输入框，fallback 到 localStorage，最后 fallback nsbc.local
+// 多Tenant场景：realm = Tenant名（tenant_name），每个Tenant可以有独立的 SIP 域
 function getSipDomain() {
   const dom = document.getElementById('realm');
   if (dom && dom.value && dom.value.trim()) {
@@ -137,7 +137,7 @@ function fixVideoPortForLocal(sdp) {
 })();
 
 // ============================================================================
-// 【修复】patch setLocalDescription — 诊断用（仅打 m-lines 日志）
+// 【修复】patch setLocalDescription — 诊断用（仅打 m-lines Log）
 // ============================================================================
 (function() {
   if (!window.RTCPeerConnection) return;
@@ -248,7 +248,7 @@ function sdpCodecWhitelist(description) {
   return { sdp: lines.join('\r\n'), type: description.type };
 }
 
-// ============ 日志 ============
+// ============ Log ============
 function log(cls, msg) {
   const ts = new Date().toLocaleTimeString();
   const div = document.createElement('div');
@@ -269,7 +269,7 @@ function dcLog(text, incoming) {
   box.appendChild(div); box.scrollTop = box.scrollHeight;
 }
 
-// ============ SIP 消息日志 ============
+// ============ SIP 消息Log ============
 function onSipMessage(e) {
   try {
     if (e.direction === 'incoming') {
@@ -320,7 +320,7 @@ function tryPlayWithGesture(el) {
     _playingEls.set(el, p);
     p.then(() => {
       _playingEls.delete(el);
-      console.log('[NSBC] ✅ 播放成功:', el.id);
+      console.log('[NSBC] ✅ 播放Success:', el.id);
     }).catch(err => {
       _playingEls.delete(el);
       console.warn('[NSBC] ⚠️ play() 失败:', el.id, err.name, err.message);
@@ -366,7 +366,7 @@ function attachPC(pc, session) {
     log(st === 'connected' || st === 'completed' ? 'ok' : 'info', `📶 PC conn: ${st}`);
     if (st === 'connected' || st === 'completed') {
       dumpMediaStats(pc, 'connected');
-      // ★ 媒体管道完全就绪后，再统一绑 srcObject + play()
+      // ★ Media管道完全就绪后，再统一绑 srcObject + play()
       // 此时 DTLS/SRTP 已建立，Chrome 不会再因内部 load() 打断 play()
       const rv = $('remoteVideo');
       if (rv && remoteStream && remoteStream.getTracks().length > 0) {
@@ -387,10 +387,10 @@ function attachPC(pc, session) {
   pc.onicegatheringstatechange = () => log('info', `🧊 ICE gather: ${pc.iceGatheringState}`);
   pc.onsignalingstatechange = () => log('info', `📡 signaling: ${pc.signalingState}`);
 
-  // ★★★ 来电路径关键兜底 ★★★
+  // ★★★ Incoming路径关Key兜底 ★★★
   // JsSIP answer() 内部先 pc.setRemoteDescription(invite.sdp) → 浏览器触发 ontrack
-  // 然后才 emit('peerconnection') → 我们 attachPC 注册 ontrack — 时序反了！
-  // 解决：attachPC 注册 ontrack 后，立即扫一遍已有的 receivers，把漏掉的 track 补回来
+  // 然后才 emit('peerconnection') → 我们 attachPC Register ontrack — 时序反了！
+  // 解决：attachPC Register ontrack 后，立即扫一遍已有的 receivers，把漏掉的 track 补回来
   setTimeout(() => {
     const existing = pc.getReceivers().filter(r => r.track).length;
     const ours = remoteStream.getTracks().length;
@@ -454,7 +454,7 @@ async function ensureVideoReady(stream, timeoutMs = 2500) {
   const v = stream.getVideoTracks()[0];
   if (!v) { log('warn', '⚠️ 流里没有 video track'); return; }
   if (v.readyState === 'live' && !v.muted) {
-    log('ok', `🎥 video track 已就绪 (readyState=live, muted=false)`);
+    log('ok', `🎥 video track Ready (readyState=live, muted=false)`);
     return;
   }
   log('warn', `⏳ 等待 video unmute (readyState=${v.readyState}, muted=${v.muted})`);
@@ -506,7 +506,7 @@ function makeSessionHandlers(isCallee) {
 function onSessionConfirmed(session, isCallee) {
   currentSession = session;
   pendingSession = null;
-  const cs = $('callStatus'); if (cs) cs.textContent = '通话中 ✅';
+  const cs = $('callStatus'); if (cs) cs.textContent = 'Active ✅';
   const bh = $('btnHang'); if (bh) bh.disabled = false;
   const inc = $('incoming'); if (inc) inc.classList.remove('show');
 
@@ -539,18 +539,18 @@ function bindSessionNonPC(session, isCallee, skipPeerConn) {
 
     // ★ 区分 180 vs 183（RFC 3261 §21.1.2 / §21.1.5）
     if (code === 180) {
-      // 180 Ringing — 对端开始振铃，无早期媒体；播本地自定义振铃音
+      // 180 Ringing — 对端开始Ringing，无Early media；播本地自定义Ringing音
       if (!isCallee) playRingTone();
     } else if (code === 183) {
-      // 183 Session Progress — 对端可能带早期媒体（SDP 已在 183 里）
-      // 停本地振铃，让远端 early media（如 MOH / 提前语音）透传
+      // 183 Session Progress — 对端可能带Early media（SDP 已在 183 里）
+      // 停本地Ringing，让远端 early media（如 MOH / 提前语音）透传
       stopRingTone();
-      log('info', `📡 183 → 远端早期媒体接管`);
+      log('info', `📡 183 → Remote early media takeover`);
     }
   });
   session.on('accepted', () => {
     log('ok', '✅ accepted (180/183)');
-    stopRingTone();   // 对方接了，不管之前是 180 还是 183，振铃都停
+    stopRingTone();   // 对方接了，不管之前是 180 还是 183，Ringing都停
   });
   session.on('confirmed', () => {
     log('ok', '✅ confirmed (Established)');
@@ -561,7 +561,7 @@ function bindSessionNonPC(session, isCallee, skipPeerConn) {
     stopRingTone();
     const org = e && e.originator;
     log('info', `📴 ended (originator=${org})`);
-    onCallEnd(org === 'remote' ? '对端挂断' : '本地挂断');
+    onCallEnd(org === 'remote' ? '对端Hang up' : 'Local hangup');
   });
   session.on('failed', (e) => {
     stopRingTone();
@@ -594,7 +594,7 @@ function bindSessionNonPC(session, isCallee, skipPeerConn) {
 // ============ Register ============
 async function doRegister() {
   if (!window.JsSIP) { alert('JsSIP 未加载！请检查 jssip-3.10.0.min.js'); return; }
-  const rs = $('regStatus'); if (rs) { rs.textContent = '连接中...'; rs.className = 'status'; }
+  const rs = $('regStatus'); if (rs) { rs.textContent = 'Connect中...'; rs.className = 'status'; }
   const br = $('btnReg'); if (br) br.disabled = true;
 
   // ★ 预热 AudioContext——Register 点击是用户手势，能解锁 autoplay 策略，
@@ -627,19 +627,19 @@ async function doRegister() {
     ua.on('disconnected', () => log('warn', '🔌 JsSIP disconnected'));
 
     ua.on('registered', () => {
-      const rs2 = $('regStatus'); if (rs2) { rs2.textContent = '✅ 已注册 ' + user; rs2.className = 'status ok'; }
+      const rs2 = $('regStatus'); if (rs2) { rs2.textContent = '✅ Registered ' + user; rs2.className = 'status ok'; }
       const bu = $('btnUnreg'); if (bu) bu.disabled = false;
       const bc = $('btnCall'); if (bc) bc.disabled = false;
       log('ok', `REGISTERED as ${user}`);
     });
     ua.on('unregistered', () => {
-      const rs3 = $('regStatus'); if (rs3) { rs3.textContent = '未注册'; rs3.className = 'status'; }
+      const rs3 = $('regStatus'); if (rs3) { rs3.textContent = 'Not registered'; rs3.className = 'status'; }
       const bu2 = $('btnUnreg'); if (bu2) bu2.disabled = true;
       const bc2 = $('btnCall'); if (bc2) bc2.disabled = true;
       log('info', 'UNREGISTERED');
     });
     ua.on('registrationFailed', (e) => {
-      const rs4 = $('regStatus'); if (rs4) { rs4.textContent = '❌ 注册失败'; rs4.className = 'status err'; }
+      const rs4 = $('regStatus'); if (rs4) { rs4.textContent = '❌ Register失败'; rs4.className = 'status err'; }
       const br2 = $('btnReg'); if (br2) br2.disabled = false;
       log('err', `REGISTRATION FAILED: ${e.cause}`);
     });
@@ -656,11 +656,11 @@ async function doRegister() {
         const inf = $('inFrom'); if (inf) inf.textContent = from;
         const inc = $('incoming'); if (inc) inc.classList.add('show');
         bindSessionNonPC(session, true, false);
-        // ★ 来电铃声：INVITE 到达即播放（accept/reject/failed/ended 都会 stopRingTone）
+        // ★ Incoming铃声：INVITE 到达即播放（accept/reject/failed/ended 都会 stopRingTone）
         playRingTone();
-        // ★ 兜底：JsSIP 在触发 newRTCSession 事件之前，就已经创建 pc
+        // ★ 兜底：JsSIP 在触发 newRTCSession 事件之前，就已经Create pc
         // 并 emit('peerconnection', pc) + setRemoteDescription 了，
-        // 此时我们的 session.on('peerconnection') 还没注册 → attachPC 永远不调 → ontrack 丢失！
+        // 此时我们的 session.on('peerconnection') 还没Register → attachPC 永远不调 → ontrack 丢失！
         // 检查 session.connection 已存在 → 立即手动 attachPC 一次
         const incomingPC = session.connection;
         if (incomingPC) {
@@ -669,7 +669,7 @@ async function doRegister() {
         }
       } else {
         log('info', `📤 outgoing to ${from}`);
-        // ★ 呼出也要存 session + 开 Hangup 按钮，让振铃阶段能挂断
+        // ★ Outgoing call也要存 session + 开 Hangup 按钮，让Ringing阶段能Hang up
         pendingSession = session;
         const bh2 = $('btnHang'); if (bh2) bh2.disabled = false;
         bindSessionNonPC(session, false, true);
@@ -677,7 +677,7 @@ async function doRegister() {
     });
 
     ua.start();
-    log('info', 'JsSIP UA 已启动，等待 WebSocket 连接...');
+    log('info', 'JsSIP UA 已启动，等待 WebSocket Connect...');
   } catch(e) {
     const rs5 = $('regStatus'); if (rs5) { rs5.textContent = '❌ 异常'; rs5.className = 'status err'; }
     const br3 = $('btnReg'); if (br3) br3.disabled = false;
@@ -694,16 +694,16 @@ async function doUnregister() {
   }, 500);
 }
 
-// ============ 呼出 ============
+// ============ Outgoing call ============
 async function doCall() {
   if (!ua) return;
   let target = $('target').value.trim();
-  if (!target) { log('err', '被叫为空'); return; }
+  if (!target) { log('err', 'Callee为空'); return; }
   if (!target.startsWith('sip:')) target = 'sip:' + target;
   if (!target.includes('@')) target = target + '@' + getSipDomain();
 
   log('tx', `📤 INVITE → ${target}`);
-  const cs = $('callStatus'); if (cs) cs.textContent = '呼叫中...';
+  const cs = $('callStatus'); if (cs) cs.textContent = 'Calling...';
   const bc = $('btnCall'); if (bc) bc.disabled = true;
 
   try {
@@ -717,7 +717,7 @@ async function doCall() {
     }
   } catch(e) {
     log('err', '❌ getUserMedia FAIL: ' + e.message);
-    if (cs) cs.textContent = '❌ 无媒体';
+    if (cs) cs.textContent = '❌ 无Media';
     if (bc) bc.disabled = false;
     return;
   }
@@ -729,18 +729,18 @@ async function doCall() {
         eventHandlers: makeSessionHandlers(false),
     });
   } catch(e) {
-    if (cs) cs.textContent = '❌ 呼叫失败';
+    if (cs) cs.textContent = '❌ Call失败';
     if (bc) bc.disabled = false;
     log('err', 'CALL FAIL: ' + (e.message || e));
   }
 }
 
-// ============ 接听 ============
+// ============ Accept ============
 async function doAccept() {
   if (!pendingSession) return;
   const inc = $('incoming'); if (inc) inc.classList.remove('show');
   log('ok', '✅ ACCEPT');
-  const cs = $('callStatus'); if (cs) cs.textContent = '接听中...';
+  const cs = $('callStatus'); if (cs) cs.textContent = 'Accept中...';
 
   try {
     if (!localStream) {
@@ -753,7 +753,7 @@ async function doAccept() {
     }
   } catch(e) {
     log('err', '❌ getUserMedia FAIL: ' + e.message);
-    if (cs) cs.textContent = '❌ 无媒体';
+    if (cs) cs.textContent = '❌ 无Media';
     return;
   }
 
@@ -779,9 +779,9 @@ function doReject() {
   log('info', 'REJECTED');
 }
 
-// ============ 挂断 ============
+// ============ Hang up ============
 async function doHangup() {
-  if (isHangingUp) { log('warn', '⚠️ 挂断进行中，忽略重复点击'); return; }
+  if (isHangingUp) { log('warn', '⚠️ Hang up进行中，忽略重复点击'); return; }
   isHangingUp = true;
 
   log('info', `📞 HANGUP REQ current=${!!currentSession} pending=${!!pendingSession}`);
@@ -790,19 +790,19 @@ async function doHangup() {
     if (s) {
       s.terminate();
     } else {
-      log('warn', '⚠️ 无会话可挂断');
+      log('warn', '⚠️ 无Session可Hang up');
     }
   } catch(e) {
     log('err', 'HANGUP FAIL: ' + (e.message || e));
   }
-  onCallEnd('本地挂断');
+  onCallEnd('Local hangup');
   isHangingUp = false;
 }
 
 function onCallEnd(reason) {
-  _destroyRingTone();   // ★ 彻底停振铃 + 关闭 AudioContext，防止资源残留
+  _destroyRingTone();   // ★ 彻底停Ringing + 关闭 AudioContext，防止资源残留
   log('info', 'CALL END: ' + reason);
-  const cs = $('callStatus'); if (cs) cs.textContent = '空闲';
+  const cs = $('callStatus'); if (cs) cs.textContent = 'Idle';
   const bc = $('btnCall'); if (bc) bc.disabled = !ua;
   const bh = $('btnHang'); if (bh) bh.disabled = true;
   closePC(); stopMedia();
@@ -814,9 +814,9 @@ function onCallEnd(reason) {
   if (hb) { hb.textContent = '⏸ Hold'; hb.classList.remove('btn-held'); }
 }
 
-// ============ 媒体控制 ============
+// ============ Media控制 ============
 function stopMedia() {
-  window.__nsbcRvBound = false;  // 重置，让下次通话能重新绑定 srcObject
+  window.__nsbcRvBound = false;  // Reset，让下次通话能重新绑定 srcObject
   _playingEls.delete($('remoteVideo'));
   _playingEls.delete($('localVideo'));
 
@@ -872,7 +872,7 @@ function bindDC() {
     const dm = $('dcMsg'); if (dm) dm.disabled = false;
     const bd = $('btnDc'); if (bd) bd.disabled = false;
     log('ok', '📨 DC OPEN');
-    dcLog('[system] DataChannel 已连接', false);
+    dcLog('[system] DataChannel 已Connect', false);
     const dm2 = $('dcMsg'); if (dm2) dm2.focus();
   };
   dc.onclose = () => {
@@ -880,7 +880,7 @@ function bindDC() {
     const dm = $('dcMsg'); if (dm) dm.disabled = true;
     const bd = $('btnDc'); if (bd) bd.disabled = true;
     log('info', '📨 DC CLOSED');
-    dcLog('[system] DataChannel 已断开', false);
+    dcLog('[system] DataChannel 已Disconnect', false);
   };
   dc.onmessage = (e) => dcLog(e.data, true);
   dc.onerror = (e) => log('err', 'DC error: ' + e);
@@ -926,7 +926,7 @@ async function dumpMediaStats(pc, tag) {
   }
 }
 
-// ============ 页面关闭 ============
+// ============ 面关闭 ============
 window.addEventListener('beforeunload', () => {
   try { if (currentSession) currentSession.terminate(); } catch(_) {}
   try { if (pendingSession) pendingSession.terminate(); } catch(_) {}
@@ -1042,7 +1042,7 @@ function doHold() {
 
 function doDialKey(key) {
   const valid = '0123456789*#';
-  // 通话中 → 发 DTMF
+  // Active → 发 DTMF
   if (currentSession && valid.indexOf(key) >= 0) {
     nsbcPhone.sendDTMF(key);
     return;
@@ -1055,8 +1055,8 @@ function doDialKey(key) {
   else if (valid.indexOf(key) >= 0) { tgt.value += key; }
 }
 
-// ---------- 启动日志（script 在 </body> 前执行，DOM 已就绪）----------
-log('info', '页面加载完成 · JsSIP ' + (window.JsSIP ? (window.JsSIP.version || '3.x') + ' ✅' : '❌ 未加载'));
+// ---------- 启动Log（script 在 </body> 前执行，DOM Ready）----------
+log('info', '面加载完成 · JsSIP ' + (window.JsSIP ? (window.JsSIP.version || '3.x') + ' ✅' : '❌ 未加载'));
 if (window.location.protocol !== 'https:' && window.location.hostname !== 'localhost') {
   log('warn', 'getUserMedia 需要 HTTPS 或 localhost');
 }

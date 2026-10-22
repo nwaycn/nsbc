@@ -1,4 +1,4 @@
-//! Dialplan 规则 REST（REQ-PBX-DP-001）。6 端点：list/get/create/update/delete/reload。
+//! Dialplan rule REST (REQ-PBX-DP-001). Six endpoints: list/get/create/update/delete/reload.
 
 use std::sync::Arc;
 
@@ -41,9 +41,10 @@ pub struct ListQuery {
     pub offset: Option<i64>,
 }
 
-/// P2-安全：校验 app_chain JSON 数组里的每个 app 名是否在核心已注册名单内。
-/// 无效 app 名 → 400 Bad Request（不让 DB 存脏数据）。
-/// 核心拿不到时（dialplan 模块没加载）跳过校验 —— 执行器会自行报 NOENT。
+/// P2-security: validate each app name inside the app_chain JSON array against the
+/// core's registered name list. Invalid app → 400 Bad Request (no dirty data in DB).
+/// Skip validation when core is unavailable (dialplan module not loaded) — the executor
+/// will report NOENT on its own.
 fn validate_app_chain<S: AsRef<str>>(
     app_chain_json: S,
     known_apps: &[String],
@@ -107,9 +108,10 @@ pub async fn create<C: CoreApi + Clone + Send + Sync + 'static>(
 ) -> Result<impl IntoResponse, ApiError> {
     st.db.pool().ok_or(ApiError::DbUnavailable)?;
 
-    // P2-安全：app_chain 白名单校验（核心 dialplan 模块未加载时跳过，
-    // 返回 known_apps 空数组会让非空 app_chain 全部 fail —— 这是正确行为：
-    // 你不能在 dialplan 模块没启时要求一个不存在的 app）
+    // P2-security: app_chain whitelist validation (skip when core dialplan module is
+    // not loaded; an empty known_apps array will make a non-empty app_chain all fail —
+    // which is correct: you cannot request a non-existent app when the dialplan
+    // module is disabled)
     let app_chain = body.app_chain.as_str();
     if !app_chain.trim().is_empty() {
         let known: Vec<String> = st.core.dialplan_apps().await
@@ -143,7 +145,7 @@ pub async fn update<C: CoreApi + Clone + Send + Sync + 'static>(
 ) -> Result<impl IntoResponse, ApiError> {
     st.db.pool().ok_or(ApiError::DbUnavailable)?;
 
-    // P2-安全：只有传了 app_chain 更新才校验
+    // P2-security: only validate when app_chain is being updated
     if let Some(ref app_chain) = body.app_chain {
         if !app_chain.trim().is_empty() {
             let known: Vec<String> = st.core.dialplan_apps().await

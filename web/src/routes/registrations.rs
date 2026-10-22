@@ -1,6 +1,7 @@
-//! 注册摘要（REQ-WEB-004 仪表盘）：当前在线注册数（L0 只读）。
-//! 数据来自核心控制口 `show registrations`（组合根只读计数槽，
-//! 不横向包含 registrar 内部头，A3 分层约束）。
+//! Registration summary (REQ-WEB-004 dashboard): current online registration count
+//! (L0 read-only). Data comes from the core control socket `show registrations`
+//! (composite root read-only counter slot, does not horizontally include registrar's
+//! internal header; A3 layering constraint).
 use std::sync::Arc;
 
 use axum::extract::State;

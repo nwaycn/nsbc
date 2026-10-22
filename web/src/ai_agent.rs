@@ -1,14 +1,14 @@
-//! AI Agent 核心模块（REQ-AI-BARGEIN-001 P0）。
+//! AI Agent core module (REQ-AI-BARGEIN-001 P0).
 //!
-//! 订阅 data.sock 推送的 VAD_EVENT（通过 state.vad_tx broadcast channel），
-//! 实现用户打断 AI 说话（barge-in）：
-//!   SILENCE→SPEECH（用户开始说话）→ uuid_mute call-id on 1（静音 AI 侧）
-//!   SPEECH→SILENCE（用户停住）     → uuid_mute call-id off 1（恢复）
+//! Subscribes to VAD_EVENT pushed by data.sock (via state.vad_tx broadcast channel),
+//! implements user interrupting AI speech (barge-in):
+//!   SILENCE→SPEECH (user starts speaking) → uuid_mute call-id on 1 (mute AI side)
+//!   SPEECH→SILENCE (user pauses)        → uuid_mute call-id off 1 (resume)
 //!
-//! P0：只做 mute 切换 + tracing 日志（证明链路通）。
-//! P1：接 AI ASR（hep_sink）+ LLM + TTS（uuid_broadcast）完整对话循环。
+//! P0: only mute switching + tracing logs (prove the path works).
+//! P1: wire up AI ASR (hep_sink) + LLM + TTS (uuid_broadcast) for the full dialogue loop.
 //!
-//! 架构：
+//! Architecture:
 //! ```
 //! nsbcd vad_engine ──uds_send_vad──► uds_server.rs dispatch_push
 //!                                            │
@@ -16,7 +16,7 @@
 //!                                            │
 //!                                   state.vad_tx.send()  (broadcast)
 //!                                            │
-//!                                   ai_agent.rs subscribe ──► barge-in 决策
+//!                                   ai_agent.rs subscribe ──► barge-in decision
 //! ```
 
 use std::sync::Arc;
@@ -27,15 +27,16 @@ use tracing::{debug, info, warn};
 use crate::coreclient::CoreApi;
 use crate::AppState;
 
-/// 启动 AI Agent barge-in 后台任务。订阅 vad_tx channel，收到 VAD_EVENT 后
-/// 调 control.sock 的 uuid_mute 命令实现静音切换。
+/// Spawn the AI Agent barge-in background task. Subscribes to the vad_tx channel;
+/// on receiving VAD_EVENT it issues uuid_mute commands via control.sock to toggle muting.
 pub fn spawn<C>(state: Arc<AppState<C>>) -> tokio::task::JoinHandle<()>
 where
     C: CoreApi + Clone + 'static,
 {
-    // Subscribe 时跳过历史（只看未来事件），避免启动瞬间 burst 处理。
+    // Skip history when subscribing (only care about future events) to avoid burst
+    // processing at startup.
     let mut rx = state.vad_tx.subscribe();
-    // 丢掉 Lagged 历史（只关心实时 VAD 状态变化）
+    // Drop the Lagged history (only care about real-time VAD state changes)
     let _ = rx.recv();
 
     tokio::spawn(async move {
@@ -54,7 +55,8 @@ where
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     debug!(skipped = n, "ai_agent: lagged, skipped old VAD_EVENTs");
-                    // Lagged 时丢掉——VAD 是瞬时状态，追历史没意义
+                    // Drop on lagged — VAD is an instantaneous state, catching up on history
+                    // has no value
                 }
             }
         }
@@ -63,19 +65,20 @@ where
     })
 }
 
-/// 解析单条 VAD_EVENT + 执行 barge-in 决策。
+/// Parse a single VAD_EVENT + execute barge-in decision.
 ///
-/// C 侧 vad_engine 推的 JSON 结构：
+/// JSON structure pushed by the C-side vad_engine:
 ///   {"kind":"vad_event","payload":{"event":"VAD_EVENT","call_key":"0x7f...","leg":0,
 ///    "state":"SPEECH|SILENCE","rms":1234,"ts_ns":...}}
 ///
-/// leg=0 = A 腿（主叫侧 / 用户侧），leg=1 = B 腿（被叫侧 / AI 侧）。
-/// 用户侧 leg=0 检测到说话 → 应该静音 AI 侧 leg=1。
+/// leg=0 = A leg (caller side / user side), leg=1 = B leg (callee side / AI side).
+/// When the user-side leg=0 detects speech → we should mute the AI-side leg=1.
 ///
-/// P0 简化：只打 tracing 日志（链路验证）。
-/// P1 升级：call_key→call-id 映射（从 SESSION 事件提取）→ call_action mute on/off。
-///   C 侧 call_key 是 b2b_call_t* 指针地址（"0x..."），control.sock 的 uuid_mute 命令
-///   期望 b2b_leg.callid 字符串——两者不同。需要在 Rust 侧维护映射表。
+/// P0 simplified: only emit tracing logs (link verification).
+/// P1 upgrade: call_key→call-id mapping (extracted from SESSION events) → call_action mute on/off.
+///   The C-side call_key is a b2b_call_t* pointer address ("0x..."), while control.sock's
+///   uuid_mute command expects a b2b_leg.callid string — they are different. We need to maintain
+///   a mapping table on the Rust side.
 async fn handle_vad_event<C>(
     state: &Arc<AppState<C>>,
     raw: &str,
@@ -86,7 +89,7 @@ where
     let root: serde_json::Value = serde_json::from_str(raw)
         .map_err(|e| format!("invalid VAD_EVENT JSON: {e}"))?;
 
-    // 兼容：有时 raw 就是 payload 本身（没 kind 包裹）
+    // Compatibility: sometimes raw is the payload itself (no "kind" wrapper)
     let payload = if let Some(p) = root.get("payload") {
         p.clone()
     } else {
@@ -110,7 +113,7 @@ where
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
 
-    // 只处理 A 腿（用户侧）的 VAD 状态变化
+    // Only process VAD state changes on the A leg (user side)
     if leg != 0 {
         return Ok(());
     }
@@ -119,16 +122,16 @@ where
 
     match state_str {
         "SPEECH" => {
-            // 用户开始说话 → barge-in 触发
-            // P0: 只记录日志（call_key 是 C 指针，暂不调 control.sock）
-            // P1: call_action(call_key, "mute", &["on", "1"]) —— 需要 call-id 映射
+            // User starts speaking → barge-in triggered
+            // P0: only log (call_key is a C pointer, don't call control.sock yet)
+            // P1: call_action(call_key, "mute", &["on", "1"]) — needs call-id mapping
             info!(call_key, rms, "ai_agent: barge-in trigger → should mute AI side (P0: log only)");
         }
         "SILENCE" => {
-            // 用户停住 → 恢复
+            // User pauses → resume
             info!(call_key, rms, "ai_agent: silence → should unmute AI side (P0: log only)");
         }
-        _ => { /* 未知状态忽略 */ }
+        _ => { /* Unknown state, ignore */ }
     }
 
     Ok(())
