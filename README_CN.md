@@ -44,55 +44,55 @@
 
 ```mermaid
 graph TD
-    subgraph 外部网络
-        Phone[SIP 话机<br/>UDP/TCP/TLS]
-        WebRTC[WebRTC 客户端<br/>DTLS-SRTP]
-        PSTN[PSTN 网关]
-        Trunk[SIP Trunk]
-        Admin[运维人员]
+    subgraph External["外部网络"]
+        Phone["SIP 话机<br/>UDP/TCP/TLS"]
+        WebRTC["WebRTC 客户端<br/>DTLS-SRTP"]
+        PSTN["PSTN 网关"]
+        Trunk["SIP Trunk"]
+        Admin["运维人员"]
     end
 
     subgraph NSBCD["nsbcd (C 守护进程 — 单二进制)"]
-        subgraph 传输层
-            TP[UDP/TCP/TLS 监听<br/>src/net/]
-            WSL[WebSocket 监听<br/>ws_listener.c]
+        subgraph Transport["传输层"]
+            TP["UDP/TCP/TLS 监听<br/>src/net/"]
+            WSL["WebSocket 监听<br/>ws_listener.c"]
         end
 
-        subgraph 核心
-            RE[Reactor 事件循环<br/>reactor.c]
-            WK[Worker 线程池<br/>worker.c]
-            SIP[SIP 事务栈<br/>sip_txn.c / sip_transport.c]
-            B2B[B2BUA 引擎<br/>b2bua.c]
+        subgraph Core["核心"]
+            RE["Reactor 事件循环<br/>reactor.c"]
+            WK["Worker 线程池<br/>worker.c"]
+            SIP["SIP 事务栈<br/>sip_txn.c / sip_transport.c"]
+            B2B["B2BUA 引擎<br/>b2bua.c"]
         end
 
-        subgraph 媒体
-            MB[Media Bridge<br/>media_bridge.c]
-            BR[Bridge / Media Bug<br/>media_bug.c]
-            DS[DTLS-SRTP<br/>dtls_srtp.c]
-            JIT[Jitter Buffer + VAD]
+        subgraph Media["媒体"]
+            MB["Media Bridge<br/>media_bridge.c"]
+            BR["Bridge / Media Bug<br/>media_bug.c"]
+            DS["DTLS-SRTP<br/>dtls_srtp.c"]
+            JIT["Jitter Buffer + VAD"]
         end
 
-        subgraph 注册
-            LOC[Location DB<br/>location_db.c]
-            REGN[Registrar<br/>registrar.c]
+        subgraph Registrar["注册"]
+            LOC["Location DB<br/>location_db.c"]
+            REGN["Registrar<br/>registrar.c"]
         end
 
-        subgraph 模块系统
-            STATIC[内置（静态链接）]
-            DYN[mod_*.so (dlopen)]
+        subgraph Modules["模块系统"]
+            STATIC["内置（静态链接）"]
+            DYN["mod_*.so (dlopen)"]
         end
 
-        subgraph 可观测性
-            OBS[obs_control / metric_reg]
-            HEP[HEPv3 Sink]
+        subgraph Observability["可观测性"]
+            OBS["obs_control / metric_reg"]
+            HEP["HEPv3 Sink"]
         end
     end
 
     subgraph WEB["nsbc-web (Rust 边车)"]
-        AX[Axum / Tokio]
-        DB[(SQLite/Postgres)]
-        SPA[内嵌 SPA]
-        CTRL[UDS / Esl Client]
+        AX["Axum / Tokio"]
+        DB[("SQLite/Postgres")]
+        SPA["内嵌 SPA"]
+        CTRL["UDS / Esl Client"]
     end
 
     Phone --> TP
