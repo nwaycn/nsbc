@@ -14,6 +14,7 @@
 #define NSBC_SECURITY_H
 
 #include "nsbc_common.h"
+#include "net_sock.h"      /* nsbc_sa_t (完整定义：ss + len) + nsbc_sa_fmt */
 #include "sip_msg.h"       /* sip_method_t（method 禁用位图） */
 
 #include <sys/socket.h>   /* struct sockaddr（统一检查入参） */
@@ -42,7 +43,14 @@ typedef struct {
     int authfail_window_s;        /* 计数窗口秒（默认 60） */
     int ban_duration_s;           /* 封禁时长秒（默认 3600） */
     int ratelimit_regs;           /* REGISTER ratelimit：窗口内次数阈值（默认 20） */
-    int ratelimit_window_s;       /* REGISTER ratelimit：窗口秒（默认 60） */
+    int ratelimit_window_s;       /* REGISTER/INVITE ratelimit 共用窗口秒（默认 60） */
+    int ratelimit_invites;        /* 被动阈值：窗口内 txn slab 分配失败次数（默认 30）。
+                                    * 攻击者 flood 打满 slab 才触发；正常流量不可能打满 slab。
+                                    * 设 0 关闭此阈值。与 ratelimit_invites_active 双阈值独立。 */
+    int ratelimit_invites_active; /* 主动阈值：per-IP 每秒新 INVITE 次数（默认 20）。
+                                    * 还没造成 slab 压力就按频率拦——攻击者发 > 20 INVITE/s
+                                    * 立刻封，正常合法呼叫不会触发（坐席并发不会超过此数）。
+                                    * 设 0 关闭此主动阈值。共用 ratelimit_window_s 窗口秒。 */
     /* NIP Phase 5 新增 */
     int fence_mode;               /* 1=security（默认）/ 0=performance */
     uint32_t method_blocked;      /* 禁用 method 位图：(1<<(SIP_M_xxx - 1)) */
@@ -112,6 +120,12 @@ int security_blacklist_reload_json(const char *json, char *out_err,
 
 /* 当前 fence_mode 快照（atomic 读取）——b2bua.c 热路径可能直接查 */
 int security_fence_mode_get(void);
+
+/* reactor 层前置封禁/黑名单查询（recvfrom 后 parse 前调用）：
+ * 返回 1 表示该 IP 应被静默丢弃（封禁中 / 静态 CIDR 黑名单命中），
+ * 调用方直接 continue 跳过 parse 和 b2b_on_rx；返回 0 放行。
+ * 性能敏感：内部原子读 fence_mode + 哈希桶链表，无 parse 成本。 */
+int security_is_blocked(const nsbc_sa_t *src);
 
 #ifdef __cplusplus
 }

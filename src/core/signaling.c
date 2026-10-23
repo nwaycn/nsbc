@@ -1416,7 +1416,12 @@ static int sig_init(struct nsbc_ctx *ctx)
         snprintf(s->local_host, sizeof(s->local_host), "%s", listen_ip);
     }
 
-    long max_calls = 20000;
+    long max_calls = 200000;  /* 默认支持 5-10 万活跃呼叫：
+                               * txn_slab = max_calls 个事务（每呼叫 2 txn → 10 万呼叫）
+                               * call_session/sdp 各 max_calls
+                               * sip_msg = max_calls × 2；pktbuf = max_calls × 4
+                               * 内存估算：~200MB slab + ~200MB pktbuf ≈ 400MB
+                               * 机器 < 4GB 内存请下调，或设 core.max_calls 覆盖 */
     cfg_get_int(ctx->cfg, "core.max_calls", &max_calls, NULL);
     long port_lo = 10000, port_hi = 59999;
     cfg_get_int(ctx->cfg, "rtp.port_start", &port_lo, NULL);

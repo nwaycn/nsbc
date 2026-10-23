@@ -10,6 +10,7 @@
 #include "log.h"
 #include "sip_profile.h"   /* sip_profile_at / sip_profile_count */
 #include "ws_listener.h"
+#include "security.h"     /* ban_is_banned / security_check_ip — reactor 层前置黑名单检查 */
 
 /* reactor 线程内本地接收端口传递（b2bua.c 写入，sip_tr_send 读取，
  * 同一 epoll 线程内同步执行）。定义在此文件：sip_transport 是核心公共模块，
@@ -348,6 +349,18 @@ static int frame_cb(void *ud, const uint8_t *msg, size_t len)
         return 0;
     if (len > s_cur_conn->fr.max_msg)
         return 1;
+    /* TCP/TLS reactor 层前置封禁检查（同 UDP） */
+    if (security_is_blocked(&s_cur_conn->peer)) {
+        static unsigned blk_tcp = 0;
+        if (blk_tcp++ % 1024 == 0) {
+            char dip[INET6_ADDRSTRLEN] = {0};
+            nsbc_sa_fmt(&s_cur_conn->peer, dip, sizeof(dip));
+            llog(LOG_NOTICE, "sip",
+                 "TCP/TLS reactor silent-drop: blocked ip=%s (dropped=%u)",
+                 dip, blk_tcp);
+        }
+        return 0;
+    }
     t->cfg.rx(t->cfg.rx_ud,
               s_cur_conn->is_tls ? SIP_TR_TLS : SIP_TR_TCP,
               &s_cur_conn->peer, NULL, (const char *)msg, len);
@@ -634,6 +647,20 @@ static void on_udp_event(int fd, uint32_t ev, void *arg)
                 /* SHOULD 400：截断报文解析不可靠，P0 记录并丢弃 */
                 llog(LOG_INFO, "sip", "truncated UDP datagram %zuB, drop",
                      d->len);
+                continue;
+            }
+            /* reactor 层前置封禁检查：auto-ban 表 + 静态 CIDR 黑名单。
+             * 只查 IP，不查 UA/号码前缀（需要 parse 后的头，放 b2bua 层）。
+             * 省掉被封 IP 的 sip_parse_ex + b2b_on_rx 调用栈开销。 */
+            if (security_is_blocked(&d->peer)) {
+                static unsigned blk = 0;
+                if (blk++ % 1024 == 0) {
+                    char dip[INET6_ADDRSTRLEN] = {0};
+                    nsbc_sa_fmt(&d->peer, dip, sizeof(dip));
+                    llog(LOG_NOTICE, "sip",
+                         "UDP reactor silent-drop: blocked ip=%s (dropped=%u)",
+                         dip, blk);
+                }
                 continue;
             }
             t->cfg.rx(t->cfg.rx_ud, SIP_TR_UDP, &d->peer, &d->local,

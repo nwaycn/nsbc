@@ -45,6 +45,7 @@ static pthread_t g_thr;
 
 static nsbc_atomic_t g_dropped;
 static nsbc_atomic_t g_written;
+static int g_write_errs;        /* 连续 write 错误计数；触发 reopen */
 
 /* ---- per-thread ring（干净布局） ---- */
 typedef struct ring2 {
@@ -151,7 +152,52 @@ static void *logger_main(void *arg)
                     break;
                 log_slot_t *s = &r->slots[t];
                 if (g_fd >= 0) {
-                    if (write(g_fd, s->data, s->len) < 0 && errno == EINTR) {}
+                    ssize_t w = write(g_fd, s->data, s->len);
+                    if (w < 0) {
+                        if (errno == EINTR) {
+                            /* 重试即可，不计入错误 */
+                            continue;
+                        }
+                        g_write_errs++;
+                        /* 每秒最多打一条 warn（避免刷屏） */
+                        static time_t last_warn;
+                        time_t now = time(NULL);
+                        if (now != last_warn) {
+                            fprintf(stderr,
+                                    "[log-flush] write FAIL fd=%d errno=%d(%s) "
+                                    "path=%s (consecutive=%d)\n",
+                                    g_fd, errno, strerror(errno),
+                                    g_log_path[0] ? g_log_path : "<stderr>",
+                                    g_write_errs);
+                            last_warn = now;
+                        }
+                        /* 连续错误过多 → 尝试重开（sleep/wake 后 fd 可能失效） */
+                        if (g_write_errs >= 100 && g_log_path[0]) {
+                            int nfd = open(g_log_path,
+                                           O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC,
+                                           0640);
+                            if (nfd >= 0) {
+                                fprintf(stderr,
+                                        "[log-flush] reopened fd %d → %d after %d errors\n",
+                                        g_fd, nfd, g_write_errs);
+                                if (g_fd >= 0) close(g_fd);
+                                g_fd = nfd;
+                                g_write_errs = 0;
+                            } else {
+                                /* reopen 也失败 → 退到 stderr */
+                                if (g_fd >= 0) close(g_fd);
+                                g_fd = -1;
+                                g_write_errs = 0;
+                                fprintf(stderr,
+                                        "[log-flush] reopen FAIL errno=%d(%s), "
+                                        "fallback to stderr\n",
+                                        errno, strerror(errno));
+                            }
+                        }
+                        /* 跳过这条，继续下一条 */
+                    } else {
+                        g_write_errs = 0; /* 成功清零 */
+                    }
                 } else {
                     fwrite(s->data, 1, s->len, stderr);
                 }
@@ -162,8 +208,17 @@ static void *logger_main(void *arg)
             r = r->next;
         }
         pthread_mutex_unlock(&g_reg_lock);
-        if (g_fd >= 0)
-            fsync(g_fd); /* 批量落盘；可配置为间隔 fsync，P0 先保守 */
+        if (g_fd >= 0) {
+            if (fsync(g_fd) < 0 && errno != EINTR) {
+                static time_t last_fsync_warn;
+                time_t now = time(NULL);
+                if (now != last_fsync_warn) {
+                    fprintf(stderr, "[log-flush] fsync FAIL fd=%d errno=%d(%s)\n",
+                            g_fd, errno, strerror(errno));
+                    last_fsync_warn = now;
+                }
+            }
+        }
         if (!g_running && !any)
             break;
         pthread_mutex_lock(&g_wake);

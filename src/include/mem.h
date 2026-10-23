@@ -102,6 +102,10 @@ void *mem_slab_alloc_direct(mem_slab_t *s);
 /* 按对象头归属直接还共享池，不要求归还到原分配线程（7.1.5） */
 void mem_obj_release(void *obj);
 
+/* Slab 容量 / 使用率查询（O(1)）：txn/media/... 过载降级用 */
+int    mem_slab_capacity(mem_slab_t *s);
+int    mem_slab_usage   (mem_slab_t *s); /* 返回已用槽数 = capacity - nfree */
+
 typedef struct {
     uint64_t nalloc;
     uint64_t nrelease;

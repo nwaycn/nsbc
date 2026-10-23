@@ -46,7 +46,16 @@ config_version: "1.0"
 core:
   # read by nsbcd (B2B memory limits, etc.)
   workers: 0            # 0 = match CPU core count
-  max_calls: 2000      # conservative value of 10K, increase as needed
+  # max_calls 是所有 slab 的根容量参数：
+  #   txn_slab     = max_calls（每呼叫 2 txn → 支持 max_calls/2 活跃呼叫）
+  #   dlg_slab     = max_calls
+  #   b2b_call     = sip.max_concurrent_calls（独立，默认 50000）
+  # 内存估算 ≈ max_calls × 1.1KB + 40MB 固定开销
+  #   50000  → ~95MB slab + 40MB arena ≈ 135MB  (2GB 机器足够)
+  #  200000  → ~300MB slab + 40MB arena ≈ 340MB  (4GB 机器推荐)
+  #  500000  → ~730MB slab + 40MB arena ≈ 770MB  (8GB+ 机器)
+  # 当前值 2000 是测试环境残留 —— 生产必须调大！
+  max_calls: 2000
   timer_tick_ms: 100
 
   # UDS socket already hardcoded to /var/run/nsbc/ in C/Web code,

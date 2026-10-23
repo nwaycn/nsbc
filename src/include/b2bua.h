@@ -548,9 +548,11 @@ void b2b_register_hook_rm(b2b_register_fn fn, void *ud);
  * security 的 sec_reg_cb 已在 REGISTER 链首自查。 */
 #define B2B_GUARD_HOOK_MAX  8
 typedef enum {
-    B2B_GUARD_INVITE = 0,    /* 新 INVITE 入口：PERM_DENIED → 静默丢 */
-    B2B_GUARD_AUTH_FAIL,     /* REGISTER 认证失败（registrar 403 路径） */
-    B2B_GUARD_AUTH_OK,       /* REGISTER 认证成功（清零 fail/ratelimit 计数） */
+    B2B_GUARD_INVITE = 0,        /* 新 INVITE 入口：PERM_DENIED → 静默丢 */
+    B2B_GUARD_AUTH_FAIL,         /* REGISTER 认证失败（registrar 403 路径） */
+    B2B_GUARD_AUTH_OK,           /* REGISTER 认证成功（清零 fail/ratelimit 计数） */
+    B2B_GUARD_INVITE_FAIL,       /* 被动：INVITE/REGISTER 事务层分配失败（slab 满/NOMEM/NOSPC） */
+    B2B_GUARD_INVITE_COUNT,      /* 主动：新 INVITE 到达 txn 层之前计数（per-IP 频率） */
 } b2b_guard_evt_t;
 typedef int (*b2b_guard_fn)(const char *src_ip, b2b_guard_evt_t evt, void *ud);
 int  b2b_guard_hook_add(b2b_guard_fn fn, void *ud);

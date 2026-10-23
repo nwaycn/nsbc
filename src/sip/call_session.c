@@ -164,14 +164,14 @@ call_mgr_t *call_mgr_create(const call_mgr_cfg_t *cfg)
 
     sc.name = "sip_msg";
     sc.obj_size = sizeof(sip_msg_t);
-    sc.capacity = max_calls * 2;
+    sc.capacity = cfg->sip_msg_capacity > 0 ? cfg->sip_msg_capacity : max_calls * 2;
     sc.batch = 8;
     if (mem_slab_create(&sc, &m->sip_slab) != NSBC_OK)
         goto fail4;
 
     sc.name = "sdp";
     sc.obj_size = sizeof(sdp_t);
-    sc.capacity = max_calls;
+    sc.capacity = cfg->sdp_capacity > 0 ? cfg->sdp_capacity : max_calls;
     sc.batch = 8;
     if (mem_slab_create(&sc, &m->sdp_slab) != NSBC_OK)
         goto fail4;

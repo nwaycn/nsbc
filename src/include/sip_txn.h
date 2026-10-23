@@ -145,6 +145,11 @@ uint64_t txn_mgr_retrans_in(txn_mgr_t *m);
 uint64_t txn_mgr_retrans_out(txn_mgr_t *m);
 uint64_t txn_mgr_timeouts(txn_mgr_t *m);
 
+/* 容量查询：slab 总容量（= core.max_calls 默认 200000） */
+uint64_t txn_mgr_capacity(txn_mgr_t *m);
+/* 使用率：0.0 ~ 1.0，O(1) 原子读 */
+double   txn_mgr_usage(txn_mgr_t *m);
+
 #ifdef __cplusplus
 }
 #endif

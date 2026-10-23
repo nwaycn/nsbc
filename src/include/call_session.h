@@ -48,8 +48,10 @@ typedef struct {
     size_t signal_bytes;        /* 信令域 Arena，0 → 64MiB */
     size_t packet_bytes;        /* 报文域 Arena，0 → 128MiB */
     size_t media_bytes;         /* 媒体域 Arena，0 → 64MiB */
-    int max_calls;              /* call_session 容量，0 → 4096 */
+    int max_calls;              /* call_session 容量 + txn/sip_msg 基础容量，0 → 4096 */
     int pktbuf_count;           /* 收包缓冲数量，0 → 2*max_calls */
+    int sdp_capacity;           /* sdp slab 容量，0 → max_calls（覆盖：sdp_t 大，建议小些） */
+    int sip_msg_capacity;       /* sip_msg slab 容量，0 → max_calls*2 */
 } call_mgr_cfg_t;
 
 call_mgr_t *call_mgr_create(const call_mgr_cfg_t *cfg);

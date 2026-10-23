@@ -711,14 +711,26 @@ int txn_server_input(txn_mgr_t *m, sip_msg_t *msg, const nsbc_sa_t *src,
         txn_kind_t kind =
             (msg->method == SIP_M_INVITE) ? TXN_IST : TXN_NIST;
         t = server_create_locked(m, msg, branch, blen, src, reliable, kind);
-        if (t)
+        if (t) {
             t_ref(t); /* 临持给锁外 TU 回调 */
+            /* 兜底 Timer：IST/NIST txn 创建后如果后续没走到 server_respond(status>=200)
+             * （ACL drop / profile deny / 号码不存在 / b2bua early return 等），
+             * tm_dead 永远不会被 arm，导致 refs=hash(1) 永不释放 → slab 泄漏！
+             * 先 arm tm_dead 兜底：IST 用 Timer P (64*T2=256s)，NIST 用 Timer F (64*T1=32s)。
+             * 后续 server_respond(status>=200) arm Timer H/I/J/K 之前先 tw_del 取消兜底。 */
+            uint32_t dead_ms;
+            if (kind == TXN_IST)
+                dead_ms = 64u * m->cfg.t2_ms;     /* Timer P: 256s 默认 */
+            else
+                dead_ms = 64u * m->cfg.t1_ms;     /* Timer F: 32s 默认 */
+            arm(t, &t->tm_dead, dead_ms, cb_dead, now_ms);
+        }
         pthread_mutex_unlock(&s->lock);
         if (!t)
             return NSBC_NOMEM;
         if (m->cfg.server_tu)
             m->cfg.server_tu(t, msg, TXN_EV_NEW_REQUEST, m->cfg.server_ud);
-        t_unref(t);
+        t_unref(t); /* 临持 */
         return TXN_NEW;
     }
     pthread_mutex_unlock(&s->lock);
@@ -859,17 +871,23 @@ int txn_send_response(sip_txn_t *t, const char *buf, size_t len,
         if (status >= 200 && t->state == TXN_IST_PROCEEDING) {
             t->state = TXN_IST_COMPLETED;
             t->interval = m->cfg.t1_ms;
+            /* 取消 TXN_NEW 时 arm 的兜底 Timer P，然后 arm 正常 Timer H */
+            if (tw_del(m->cfg.tw, &t->tm_dead))
+                t_unref(t); /* 抵消 arm 时的 ref */
             if (!t->reliable) {
                 arm(t, &t->tm_retr, m->cfg.t1_ms, cb_retr, now_ms); /* G */
             }
             arm(t, &t->tm_dead, 64u * m->cfg.t1_ms, cb_dead, now_ms); /* H */
         }
-        /* 1xx：留 PROCEEDING，无定时器；重传由请求重放触发 */
+        /* 1xx：留 PROCEEDING，兜底 Timer P 继续 tick；重传由请求重放触发 */
     } else { /* NIST */
         if (status < 200) {
             t->state = TXN_NIST_PROCEEDING;
         } else if (t->state != TXN_NIST_COMPLETED) {
             t->state = TXN_NIST_COMPLETED;
+            /* 取消 TXN_NEW 时 arm 的兜底 Timer F，然后 arm 正常 Timer J */
+            if (tw_del(m->cfg.tw, &t->tm_dead))
+                t_unref(t); /* 抵消 arm 时的 ref */
             if (!t->reliable) {
                 arm(t, &t->tm_dead, 64u * m->cfg.t1_ms, cb_dead,
                     now_ms); /* J */
@@ -943,6 +961,18 @@ uint64_t txn_mgr_retrans_out(txn_mgr_t *m)
 uint64_t txn_mgr_timeouts(txn_mgr_t *m)
 {
     return __atomic_load_n(&m->tmo, __ATOMIC_RELAXED);
+}
+uint64_t txn_mgr_capacity(txn_mgr_t *m)
+{
+    if (!m || !m->cfg.slab) return 0;
+    return (uint64_t)mem_slab_capacity(m->cfg.slab);
+}
+double txn_mgr_usage(txn_mgr_t *m)
+{
+    uint64_t cap = txn_mgr_capacity(m);
+    if (cap == 0) return 0.0;
+    uint64_t active = __atomic_load_n(&m->active, __ATOMIC_RELAXED);
+    return (double)active / (double)cap;
 }
 
 /*

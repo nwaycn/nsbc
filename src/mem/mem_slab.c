@@ -191,6 +191,20 @@ void mem_obj_release(void *obj)
     s->nrelease++;
 }
 
+int mem_slab_capacity(mem_slab_t *s)
+{
+    return s ? s->capacity : 0;
+}
+
+int mem_slab_usage(mem_slab_t *s)
+{
+    if (!s) return 0;
+    pthread_mutex_lock(&s->lock);
+    int used = s->capacity - s->nfree;
+    pthread_mutex_unlock(&s->lock);
+    return used;
+}
+
 void mem_slab_get_stat(const mem_slab_t *s, mem_slab_stat_t *out)
 {
     if (!s || !out)

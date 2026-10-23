@@ -40,6 +40,8 @@
 static int  ban_is_banned(const char *ip);
 static int  ban_note_fail(const char *ip);
 static int  ban_note_reg_req(const char *ip);
+static int  ban_note_inv_fail(const char *ip);   /* 被动：txn slab 分配失败计数 */
+static int  ban_note_inv_count(const char *ip); /* 主动：per-IP 新 INVITE 频率计数 */
 static uint32_t ban_duration_for_strikes(uint32_t base_s, int strikes);
 
 /* === 全局配置（init 时从 YAML 加载；简化骨架：默认全 0）=== */
@@ -642,6 +644,8 @@ int security_blacklist_reload_json(const char *json, char *out_err,
     int new_ban_duration_s = -1;
     int new_ratelimit_regs = -1;
     int new_ratelimit_window_s = -1;
+    int new_ratelimit_invites = -1;
+    int new_ratelimit_invites_active = -1;
 
     cJSON *arr = NULL;
     if (cJSON_IsArray(root)) {
@@ -672,6 +676,12 @@ int security_blacklist_reload_json(const char *json, char *out_err,
         cJSON *jrw = cJSON_GetObjectItem(root, "ratelimit_window_s");
         if (cJSON_IsNumber(jrw) && jrw->valueint >= 1 && jrw->valueint <= 3600)
             new_ratelimit_window_s = jrw->valueint;
+        cJSON *jri = cJSON_GetObjectItem(root, "ratelimit_invites");
+        if (cJSON_IsNumber(jri) && jri->valueint >= 0 && jri->valueint <= 1000)
+            new_ratelimit_invites = jri->valueint;
+        cJSON *jria = cJSON_GetObjectItem(root, "ratelimit_invites_active");
+        if (cJSON_IsNumber(jria) && jria->valueint >= 0 && jria->valueint <= 1000)
+            new_ratelimit_invites_active = jria->valueint;
     }
     if (!arr) {
         cJSON_Delete(root);
@@ -775,6 +785,8 @@ int security_blacklist_reload_json(const char *json, char *out_err,
     if (new_ban_duration_s >= 0)         g_cfg.ban_duration_s = new_ban_duration_s;
     if (new_ratelimit_regs >= 0)         g_cfg.ratelimit_regs = new_ratelimit_regs;
     if (new_ratelimit_window_s >= 0)     g_cfg.ratelimit_window_s = new_ratelimit_window_s;
+    if (new_ratelimit_invites >= 0)     g_cfg.ratelimit_invites = new_ratelimit_invites;
+    if (new_ratelimit_invites_active >= 0) g_cfg.ratelimit_invites_active = new_ratelimit_invites_active;
 
     log_notice("security",
                "fence reload: deny(cidr=%d ua=%d called=%d caller=%d) "
@@ -976,6 +988,11 @@ typedef struct ban_ent {
     char ip[INET6_ADDRSTRLEN];
     int  fails;              /* 窗口内累计 authfail 次数 */
     int  reqs;               /* 窗口内累计 REGISTER 请求次数（ratelimit） */
+    int  inv_req;            /* 被动：窗口内累计 INVITE/REGISTER 事务层分配失败次数
+                             * （txn slab NOMEM/NOSPC 时 b2bua 上报的 flood 指标） */
+    int  inv_count;          /* 主动：窗口内累计新 INVITE 到达次数（per-IP 频率）
+                             * b2bua 在 txn_server_input 之前上报；
+                             * 阈值 ratelimit_invites_active，共用 ratelimit_window_s。 */
     uint64_t win_start;      /* 计数窗口起点（mono ms） */
     uint64_t ban_until;      /* 封禁到期时刻（mono ms） */
     uint64_t last_act;       /* 最近活动（满表驱逐用） */
@@ -1137,7 +1154,93 @@ static int ban_note_reg_req(const char *ip)
     return banned_now;
 }
 
-/* 成功清零：auth OK 后清除该 IP 的 fails/reqs 计数。
+/* INVITE/REGISTER 事务层分配失败 ratelimit：与 REGISTER ratelimit 共用窗口秒，
+ * 阈值由 ratelimit_invites 控制（默认 30，设 0 关闭）。
+ * b2bua 在 txn_server_input 返回负码（slab 满/NOMEM/NOSPC）时调此函数。
+ * 典型场景：攻击者 flood 大量不同 branch 的 INVITE 打满 slab → 自己先被封，
+ * 正常合法呼叫不受影响（阈值足够大时，正常呼叫不可能打满）。 */
+static int ban_note_inv_fail(const char *ip)
+{
+    if (!g_cfg.auto_ban) return 0;
+    int window_s = g_cfg.ratelimit_window_s > 0 ? g_cfg.ratelimit_window_s : 60;
+    int thr = g_cfg.ratelimit_invites > 0 ? g_cfg.ratelimit_invites : 30;
+    if (thr <= 0) return 0;
+    uint64_t now = nsbc_now_ms();
+    int banned_now = 0;
+    pthread_mutex_lock(&g_ban_lock);
+    ban_ent_t *e = ban_find_locked(ip);
+    if (!e) {
+        if (g_ban_count >= BAN_MAX_ENTRIES && !ban_evict_locked(now)) {
+            pthread_mutex_unlock(&g_ban_lock);
+            return 0;
+        }
+        e = calloc(1, sizeof(*e));
+        if (!e) { pthread_mutex_unlock(&g_ban_lock); return 0; }
+        snprintf(e->ip, sizeof(e->ip), "%s", ip);
+        e->win_start = now;
+        unsigned b = ban_hash(ip);
+        e->next = g_ban_tab[b];
+        g_ban_tab[b] = e;
+        ++g_ban_count;
+    }
+    e->last_act = now;
+    if (e->ban_until > now) { pthread_mutex_unlock(&g_ban_lock); return 0; }
+    if (now - e->win_start > (uint64_t)window_s * 1000) {
+        e->win_start = now; e->inv_req = 0;
+    }
+    if (++e->inv_req >= thr) {
+        e->strikes++;
+        e->ban_until = now + (uint64_t)ban_duration_for_strikes(g_cfg.ban_duration_s, e->strikes) * 1000;
+        banned_now = 1;
+    }
+    pthread_mutex_unlock(&g_ban_lock);
+    return banned_now;
+}
+
+/* 主动 INVITE flood 检测：per-IP 窗口内新 INVITE 到达次数。
+ * 阈值 ratelimit_invites_active（默认 20），共用 ratelimit_window_s（默认 60s）。
+ * 与 ban_note_inv_fail 被动阈值独立——攻击者还没打满 slab 就被封。
+ * 正常合法呼叫不会触发（坐席并发远低于 20 INVITE/s per IP）。
+ * b2bua 在 txn_server_input 之前调本函数（纯 notify，返回值忽略）。 */
+static int ban_note_inv_count(const char *ip)
+{
+    if (!g_cfg.auto_ban) return 0;
+    int window_s = g_cfg.ratelimit_window_s > 0 ? g_cfg.ratelimit_window_s : 60;
+    int thr = g_cfg.ratelimit_invites_active > 0 ? g_cfg.ratelimit_invites_active : 20;
+    if (thr <= 0) return 0;
+    uint64_t now = nsbc_now_ms();
+    int banned_now = 0;
+    pthread_mutex_lock(&g_ban_lock);
+    ban_ent_t *e = ban_find_locked(ip);
+    if (!e) {
+        if (g_ban_count >= BAN_MAX_ENTRIES && !ban_evict_locked(now)) {
+            pthread_mutex_unlock(&g_ban_lock);
+            return 0;
+        }
+        e = calloc(1, sizeof(*e));
+        if (!e) { pthread_mutex_unlock(&g_ban_lock); return 0; }
+        snprintf(e->ip, sizeof(e->ip), "%s", ip);
+        e->win_start = now;
+        unsigned b = ban_hash(ip);
+        e->next = g_ban_tab[b];
+        g_ban_tab[b] = e;
+        ++g_ban_count;
+    }
+    e->last_act = now;
+    if (e->ban_until > now) { pthread_mutex_unlock(&g_ban_lock); return 0; }
+    if (now - e->win_start > (uint64_t)window_s * 1000) {
+        e->win_start = now; e->inv_count = 0;
+    }
+    if (++e->inv_count >= thr) {
+        e->strikes++;
+        e->ban_until = now + (uint64_t)ban_duration_for_strikes(g_cfg.ban_duration_s, e->strikes) * 1000;
+        banned_now = 1;
+    }
+    pthread_mutex_unlock(&g_ban_lock);
+    return banned_now;
+}
+
+/* 成功清零：auth OK 后清除该 IP 的 fails/reqs/inv_req/inv_count 计数。
  * 正常用户偶尔输错密码不会被封死。 */
 static void ban_clear_counts(const char *ip)
 {
@@ -1147,6 +1250,8 @@ static void ban_clear_counts(const char *ip)
     if (e && e->ban_until <= now) {
         e->fails = 0;
         e->reqs = 0;
+        e->inv_req = 0;
+        e->inv_count = 0;
         e->win_start = now;
         e->last_act = now;
     }
@@ -1167,6 +1272,25 @@ static int ban_is_banned(const char *ip)
     }
     pthread_mutex_unlock(&g_ban_lock);
     return hit;
+}
+
+/* reactor 层前置封禁/黑名单查询（recvfrom 后 parse 前调用）。
+ * 只查 IP：ban_is_banned（动态 auto-ban 表）+ security_check_ip（静态 CIDR 黑名单）。
+ * 不查 UA/号码前缀——它们需要 parse 后的 SIP 头，放在 b2bua 层更合适。
+ * 返回 1=静默丢弃，0=放行。 */
+int security_is_blocked(const nsbc_sa_t *src)
+{
+    if (!src) return 0;
+    char ip[INET6_ADDRSTRLEN] = {0};
+    nsbc_sa_fmt(src, ip, sizeof(ip));
+    if (!ip[0]) return 0;
+    /* 1. 动态封禁表（auto-ban） */
+    if (ban_is_banned(ip)) return 1;
+    /* 2. 静态 CIDR 黑名单（仅 block_on_register/invite 启用时） */
+    if ((g_cfg.block_on_register || g_cfg.block_on_invite) &&
+        security_check_ip(ip, &g_cfg))
+        return 1;
+    return 0;
 }
 
 static void ban_clear_all(void)
@@ -1206,6 +1330,36 @@ static int sec_guard_cb(const char *src_ip, b2b_guard_evt_t evt, void *ud)
     if (evt == B2B_GUARD_AUTH_OK) {
         if (g_cfg.auto_ban) ban_clear_counts(src_ip);
         return NSBC_OK;
+    }
+
+    if (evt == B2B_GUARD_INVITE_FAIL) {
+        /* b2bua 在 txn_server_input 返回负码时上报（slab 满/NOMEM/NOSPC）。
+         * 累计 inv_req 超 ratelimit_invites 阈值 → auto-ban。
+         * 正常合法呼叫不可能在短时间内打满 slab，攻击者 flood 才会触发。 */
+        if (ban_note_inv_fail(src_ip)) {
+            log_warn("security",
+                     "auto-ban ip=%s: %d txn slab alloc-fails in %ds window, "
+                     "banning for %ds (INVITE/REGISTER flood detected)",
+                     src_ip, g_cfg.ratelimit_invites > 0 ? g_cfg.ratelimit_invites : 30,
+                     g_cfg.ratelimit_window_s > 0 ? g_cfg.ratelimit_window_s : 60,
+                     ban_duration_for_strikes(g_cfg.ban_duration_s, 1));
+        }
+        return NSBC_OK;  /* 纯上报，拦截在 ban_is_banned 处生效 */
+    }
+
+    if (evt == B2B_GUARD_INVITE_COUNT) {
+        /* b2bua 在 txn_server_input 之前上报每个新 INVITE（主动防护）。
+         * 累计 inv_count 超 ratelimit_invites_active 阈值 → auto-ban。
+         * 攻击者还没造成 slab 压力就被封，正常合法呼叫不会触发。 */
+        if (ban_note_inv_count(src_ip)) {
+            log_warn("security",
+                     "auto-ban ip=%s: %d new INVITEs in %ds window, "
+                     "banning for %ds (INVITE flood detected, active ratelimit)",
+                     src_ip, g_cfg.ratelimit_invites_active > 0 ? g_cfg.ratelimit_invites_active : 20,
+                     g_cfg.ratelimit_window_s > 0 ? g_cfg.ratelimit_window_s : 60,
+                     ban_duration_for_strikes(g_cfg.ban_duration_s, 1));
+        }
+        return NSBC_OK;  /* 纯上报，拦截在 ban_is_banned 处生效 */
     }
 
     /* B2B_GUARD_INVITE：动态封禁 + 静态 CIDR 黑名单 */
@@ -1532,6 +1686,8 @@ static int security_init(struct nsbc_ctx *ctx)
     g_cfg.ban_duration_s = 3600;
     g_cfg.ratelimit_regs = 20;
     g_cfg.ratelimit_window_s = 60;
+    g_cfg.ratelimit_invites = 30;   /* 被动：INVITE/REGISTER txn slab 分配失败阈值 */
+    g_cfg.ratelimit_invites_active = 20;  /* 主动：per-IP 每秒新 INVITE 阈值 */
     g_cfg.fence_mode = 1;          /* NIP：默认 security 模式（完整围栏） */
     g_cfg.method_blocked = 0;      /* 默认不禁任何 SIP method */
     __atomic_store_n(&g_fence_mode, 1, __ATOMIC_RELAXED);    /* atomic 同步内存态 */
@@ -1569,6 +1725,12 @@ static int security_init(struct nsbc_ctx *ctx)
         if (cfg_get_int(ctx->cfg, "security.ratelimit_window_s", &v,
                         NULL) == NSBC_OK && v >= 1 && v <= 3600)
             g_cfg.ratelimit_window_s = (int)v;
+        if (cfg_get_int(ctx->cfg, "security.ratelimit_invites", &v,
+                        NULL) == NSBC_OK && v >= 0 && v <= 1000)
+            g_cfg.ratelimit_invites = (int)v;
+        if (cfg_get_int(ctx->cfg, "security.ratelimit_invites_active", &v,
+                        NULL) == NSBC_OK && v >= 0 && v <= 1000)
+            g_cfg.ratelimit_invites_active = (int)v;
     }
 
     /* 静态黑名单 YAML 种子（Web 推送 security.blacklist.reload 到达前生效；

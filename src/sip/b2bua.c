@@ -4786,6 +4786,15 @@ void b2b_on_rx(void *ud, sip_tr_proto_t proto, const nsbc_sa_t *src,
 
     int reliable = proto != SIP_TR_UDP;
     if (m.is_request) {
+        /* 主动 INVITE/REGISTER 频率计数（per-IP 窗口内次数）。
+         * 在 txn_server_input 之前上报——攻击者还没造成 slab 压力就被封。
+         * security 模块按 ratelimit_invites_active 阈值累计 inv_count，
+         * 超阈值触发 auto-ban；后续同 IP 的 INVITE 在 B2B_GUARD_INVITE
+         * 入口就被 ban_is_banned() 拦截，根本不会竞争 slab。
+         * 设 ratelimit_invites_active=0 关闭此主动阈值。 */
+        if (m.method == SIP_M_INVITE || m.method == SIP_M_REGISTER)
+            b2b_guard_notify(src_ip, B2B_GUARD_INVITE_COUNT);
+
         llog(LOG_DEBUG, "b2b", "txn_input msg.buf=%p msg.buflen=%zu txn_mgr=%p src_af=%d",
              m.buf, m.buflen, (void *)co->cfg.txn, src->ss.ss_family);
         int rc = txn_server_input(co->cfg.txn, &m, src, reliable, now_ms());
@@ -4900,6 +4909,19 @@ void b2b_on_rx(void *ud, sip_tr_proto_t proto, const nsbc_sa_t *src,
                                        NULL, NULL, NULL, NULL, 0);
             if (n > 0)
                 sip_tr_send(co->cfg.tr, proto, out, (size_t)n, src);
+        }
+        /* 事务层分配失败（slab 满 / NOMEM / NOSPC 等负错误码）：
+         * 显式静默丢弃 + 上报 security，累计该 IP 的失败次数，超阈值触发 auto-ban。
+         * 攻击者的 INVITE/REGISTER flood 打满 slab 后，自己先被封，
+         * 正常合法呼叫不受影响（阈值由 security 模块 ratelimit_invites 控制）。 */
+        if (rc < 0 && (m.method == SIP_M_INVITE || m.method == SIP_M_REGISTER)) {
+            static unsigned fail_drop_n = 0;
+            if (fail_drop_n++ % 32 == 0)
+                llog(LOG_WARN, "b2b",
+                     "txn alloc FAIL rc=%d method=%d ip=%s "
+                     "(silent drop, no response, dropped=%u)",
+                     rc, m.method, src_ip, fail_drop_n);
+            b2b_guard_notify(src_ip, B2B_GUARD_INVITE_FAIL);
         }
         return;
     }
