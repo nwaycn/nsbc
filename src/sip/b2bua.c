@@ -763,12 +763,32 @@ static void route_block(const b2b_leg_t *l, char *out, size_t outsz)
 {
     out[0] = '\0';
     size_t used = 0;
+    /* IMS Service-Route（RFC 3608）：最前——UE 后续 INVITE Route 链的第一个
+     * hop 必须是 registrar 返回的 Service-Route 值。格式：registrar 存的是
+     * 纯 URI "sip:tenant;lr"（无尖括号），这里包成标准 Route 值 "<sip:...>" */
+    if (l->service_route[0]) {
+        int n = snprintf(out + used, outsz - used,
+                         "Route: <%s>\r\n", l->service_route);
+        if (n > 0 && (size_t)n < outsz - used) used += (size_t)n;
+    }
     for (int i = 0; i < l->nroutes; ++i) {
-        int n = snprintf(out + used, outsz - used, "Route: <%s>\r\n",
-                         l->routes[i]);
-        if (n < 0 || (size_t)n >= outsz - used)
-            break;
-        used += (size_t)n;
+        /* routes[i] 存的是原始头 value——可能带尖括号（从 Route/Record-Route
+         * 头直接拷的）或不带（历史遗留的 host-only 值）。智能判断：已经带
+         * "< >" 就不再包尖括号，否则包。同时跳过逗号（多段只取第一段） */
+        const char *v = l->routes[i];
+        /* 跳过前导逗号（多值 comma-separated 场景） */
+        while (*v == ' ' || *v == ',') v++;
+        if (*v == '<') {
+            /* 已经是完整 "<uri>" 格式 */
+            int n = snprintf(out + used, outsz - used, "Route: %s\r\n", v);
+            if (n < 0 || (size_t)n >= outsz - used) break;
+            used += (size_t)n;
+        } else if (*v != '\0') {
+            /* 纯 URI（历史遗留 host-only）→ 包尖括号 */
+            int n = snprintf(out + used, outsz - used, "Route: <%s>\r\n", v);
+            if (n < 0 || (size_t)n >= outsz - used) break;
+            used += (size_t)n;
+        }
     }
 }
 
@@ -877,8 +897,14 @@ static int build_dlg_req(b2b_core_t *co, b2b_leg_t *l,
     char contact[B2B_HDR_MAX];
     uint16_t dlg_port = (call_ref && call_ref->prof && call_ref->prof->sip_udp_port)
                         ? call_ref->prof->sip_udp_port : (uint16_t)co->cfg.local_udp_port;
-    snprintf(contact, sizeof(contact), "<sip:%s:%d>",
-             adv_host, dlg_port);
+    /* GRUU（RFC 5627）：全局唯一 instance-id 拼到 Contact URI 参数 */
+    if (co->cfg.gruu_instance_id[0]) {
+        snprintf(contact, sizeof(contact),
+                 "<sip:%s:%d;+sip.instance=\"%s\">",
+                 adv_host, dlg_port, co->cfg.gruu_instance_id);
+    } else {
+        snprintf(contact, sizeof(contact), "<sip:%s:%d>", adv_host, dlg_port);
+    }
     sip_req_spec_t s; memset(&s, 0, sizeof(s));
     /* REQ-SIP-RURI-001：Request-URI 不允许 <>（name-addr 只用于 From/To/Contact 头）。
      * dlg->target 来自 200 OK Contact 头（<sip:...>），会带 <>，
@@ -1134,13 +1160,29 @@ static sip_txn_t *send_invite_b(b2b_call_t *c, int leg_idx,
     uint16_t adv_port = (op && op->sip_udp_port)
                         ? op->sip_udp_port : (uint16_t)co->cfg.local_udp_port;
     char contact[B2B_HDR_MAX];
+    /* GRUU（RFC 5627）：全局唯一 instance-id 拼到 Contact URI 参数链末尾 */
+    const char *gruu_suffix = co->cfg.gruu_instance_id[0]
+        ? co->cfg.gruu_instance_id : NULL;
     if (c->hdr_rw.sip_invite_contact_params[0]) {
-        snprintf(contact, sizeof(contact), "<sip:%s:%d;%s>",
-                 adv_host, adv_port,
-                 c->hdr_rw.sip_invite_contact_params);
+        if (gruu_suffix) {
+            snprintf(contact, sizeof(contact),
+                     "<sip:%s:%d;%s;+sip.instance=\"%s\">",
+                     adv_host, adv_port,
+                     c->hdr_rw.sip_invite_contact_params, gruu_suffix);
+        } else {
+            snprintf(contact, sizeof(contact), "<sip:%s:%d;%s>",
+                     adv_host, adv_port,
+                     c->hdr_rw.sip_invite_contact_params);
+        }
     } else {
-        snprintf(contact, sizeof(contact), "<sip:%s:%d>",
-                 adv_host, adv_port);
+        if (gruu_suffix) {
+            snprintf(contact, sizeof(contact),
+                     "<sip:%s:%d;+sip.instance=\"%s\">",
+                     adv_host, adv_port, gruu_suffix);
+        } else {
+            snprintf(contact, sizeof(contact), "<sip:%s:%d>",
+                     adv_host, adv_port);
+        }
     }
     /* REQ-DP-SIP-001：sip_invite_domain 全局 host 替换（From/To/RURI/Contact 统一处理） */
     if (c->hdr_rw.sip_invite_domain[0]) {
@@ -1297,6 +1339,18 @@ static sip_txn_t *send_invite_b(b2b_call_t *c, int leg_idx,
                 if (tr->ims_auto_privacy) {
                     io += (size_t)snprintf(_ims_work + io, sizeof(_ims_work) - io,
                         "Privacy: id\r\n");
+                }
+                /* P-Charging-Function-Addresses + P-Charging-Vector（RFC 7315，可选）
+                 * 运营商在线计费系统必需——CCF/ECF 地址 + 计费向量标识本次会话。 */
+                if (tr->ims_auto_charging) {
+                    if (tr->ims_pcfa[0]) {
+                        io += (size_t)snprintf(_ims_work + io, sizeof(_ims_work) - io,
+                            "P-Charging-Function-Addresses: %s\r\n", tr->ims_pcfa);
+                    }
+                    if (tr->ims_pcv[0]) {
+                        io += (size_t)snprintf(_ims_work + io, sizeof(_ims_work) - io,
+                            "P-Charging-Vector: %s\r\n", tr->ims_pcv);
+                    }
                 }
                 llog(LOG_INFO, "b2b", "send_invite_b trunk '%s' IMS auto "
                      "injected %zu bytes (domain=%s)", c->rt_name, io, tr->ims_domain);
@@ -3184,6 +3238,21 @@ void handle_new_invite(b2b_core_t *co, sip_txn_t *t,
                               const sip_msg_t *m, sip_tr_proto_t proto,
                               const nsbc_sa_t *src, uint16_t local_port)
 {
+    /* Emergency URN 检测（RFC 6881 / ETSI TS 183 041）：
+     * urn:service:sos / urn:service:sos.fire / urn:service:sos.medical 等
+     * 绕过静态黑名单（auto-ban 仍生效——防攻击者冒充 emergency flood），
+     * 同时绕过 HA standby（备机也接应急呼叫双保险）。 */
+    int is_emergency = 0;
+    if (m->ruri.scheme.p && m->ruri.scheme.len == 3
+        && strncasecmp(m->ruri.scheme.p, "urn", 3) == 0
+        && m->ruri.user.p && m->ruri.user.len >= 12
+        && !strncmp(m->ruri.user.p, "service:sos", 11)) {
+        is_emergency = 1;
+        llog(LOG_INFO, "b2b", "Emergency INVITE: ruri=%.*s@%.*s",
+             (int)m->ruri.user.len, m->ruri.user.p ? m->ruri.user.p : "",
+             (int)m->ruri.host.len, m->ruri.host.p ? m->ruri.host.p : "");
+    }
+
     /* 安全门（最前置）：被动态封禁的 IP（REGISTER 暴力失败超阈值）的
      * 新 INVITE 静默丢弃——不回任何响应，防 SBC 指纹暴露。
      * 静态黑名单（IP CIDR / UA，security 模块）次之。优先级：
@@ -3193,32 +3262,36 @@ void handle_new_invite(b2b_core_t *co, sip_txn_t *t,
         sa_ip_copy(src, gip, sizeof(gip));
         if (gip[0] && b2b_guard_check(gip, B2B_GUARD_INVITE) == NSBC_PERM_DENIED)
             return;
+
         /* NIP 完整围栏：method + IP + UA + 主叫 + 被叫
          * 优先级：method 禁用 → deny 全表 → allowlist 未命中
          * 命中一律静默丢弃（不回任何 SIP 响应，防 SBC 指纹暴露）。 */
-        char f_ua[256] = {0}, f_caller[128] = {0}, f_callee[128] = {0};
-        msg_ua_copy(m, f_ua, sizeof(f_ua));
-        msg_caller_copy(m, f_caller, sizeof(f_caller));
-        msg_callee_copy(m, f_callee, sizeof(f_callee));
-        security_fence_ctx_t fctx = {0};
-        fctx.src = (const struct sockaddr *)src;
-        fctx.method = SIP_M_INVITE;
-        fctx.ua = f_ua;
-        fctx.caller = f_caller;
-        fctx.callee = f_callee;
-        security_check_fence(&fctx);
-        if (fctx.hit != BLACKLIST_OK) {
-            security_fence_log_drop(fctx.hit, gip, f_ua, "INVITE",
-                                    f_caller, f_callee);
-            return;
+        if (!is_emergency) {
+            char f_ua[256] = {0}, f_caller[128] = {0}, f_callee[128] = {0};
+            msg_ua_copy(m, f_ua, sizeof(f_ua));
+            msg_caller_copy(m, f_caller, sizeof(f_caller));
+            msg_callee_copy(m, f_callee, sizeof(f_callee));
+            security_fence_ctx_t fctx = {0};
+            fctx.src = (const struct sockaddr *)src;
+            fctx.method = SIP_M_INVITE;
+            fctx.ua = f_ua;
+            fctx.caller = f_caller;
+            fctx.callee = f_callee;
+            security_check_fence(&fctx);
+            if (fctx.hit != BLACKLIST_OK) {
+                security_fence_log_drop(fctx.hit, gip, f_ua, "INVITE",
+                                        f_caller, f_callee);
+                return;
+            }
         }
     }
 
     /* HA 门控（REQ-HA-001）：备机不接新呼叫，静默丢弃（与 CIDR 拒绝
      * 同一惯例，不回响应防 SBC 指纹暴露）。VIP 已漂移时正常流量不会
      * 到达备机；keepalived 收敛窗口内的漏网直连流量在此兜底。
+     * 例外：Emergency URN:service:sos —— 备机也接应急呼叫（双保险）。
      * 仅拦新对话：in-dialog BYE/re-INVITE 走上面的分支不受影响。 */
-    if (ha_role() != HA_ROLE_ACTIVE) {
+    if (ha_role() != HA_ROLE_ACTIVE && !is_emergency) {
         /* 限频 WARN：STANDBY 丢呼叫若只打 DEBUG（默认级别不可见），
          * 主备仲裁异常时表现为"呼叫静默消失 + CDR 停止"且无日志可查。 */
         static unsigned drop_invite_n = 0;
@@ -4287,6 +4360,198 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
         return;
     }
 
+    /* ---- re-INVITE（RFC 3261 §14.2）：对话内媒体重协商 ----
+     * 和 UPDATE(RFC3311) 不同：re-INVITE 是 dialog 级 INVITE，会跟对话内
+     * 的 1xx/2xx/Bye 冲突——用 sip_upd guard 串行互斥（同 UPDATE 模式）。
+     * UA 发 re-INVITE 做 hold/unhold 是最常见场景，也可以是 codec 切换。 */
+    if (m->method == SIP_M_INVITE && sip_msg_in_dialog(m)) {
+        int leg = -1;
+        sip_hdr_t *cid = sip_hdr_get(m, SIP_H_CALL_ID);
+        b2b_call_t *c = cid ? tbl_find(co, cid->value.p, cid->value.len, &leg) : NULL;
+        if (!c || leg < 0) {
+            respond_txn(co, t, 481, NULL, NULL, NULL, 0);
+            return;
+        }
+        b2b_leg_t *l = &c->leg[leg];
+        int other = leg ^ 1;
+        b2b_leg_t *o = &c->leg[other];
+
+        /* re-INVITE 需要 dialog 至少有一条腿 CONFIRMED/EARLY（初始 INVITE 完成了） */
+        if (o->state != LEG_CONFIRMED && o->state != LEG_EARLY) {
+            respond_txn(co, t, 491, NULL, NULL, NULL, 0);
+            return;
+        }
+        if (!sip_upd_begin(&l->guard)) {
+            respond_txn(co, t, 491, NULL, NULL, NULL, 0);
+            return;
+        }
+        txn_set_ud(t, c);
+        txn_set_tu(t, b2b_server_tu);
+
+        /* 存 SDP：入站 re-INVITE 的 offer 可能带 hold 标志，
+         * 我们的 answer 要跟它匹配（cli_tu 回 200 OK 时自动用 l->offer） */
+        if (m->body.len && m->body.len <= B2B_SDP_MAX) {
+            memcpy(l->offer, m->body.p, m->body.len);
+            l->offer_len = m->body.len;
+            /* legacy hold：c=IN IP4 0.0.0.0；direction hold：a=sendonly */
+            const char *body = m->body.p;
+            if (memmem(body, m->body.len, "0.0.0.0", 7)
+                || memmem(body, m->body.len, "a=sendonly", 10)
+                || memmem(body, m->body.len, "a=inactive", 10)) {
+                llog(LOG_INFO, "b2b",
+                     "re-INVITE hold detected leg=%d callid=%s",
+                     leg, cid->value.p);
+                c->hold_legs |= (1u << leg);
+                /* 对端腿也被 hold（hold 语义：双方媒体都停）
+                 * 只做标志位，具体 MOH（Music on Hold）播放由 dialplan hook 触发 */
+            } else {
+                int was = c->hold_legs & (1u << leg);
+                if (was) {
+                    llog(LOG_INFO, "b2b",
+                         "re-INVITE unhold detected leg=%d callid=%s",
+                         leg, cid->value.p);
+                    c->hold_legs &= ~(1u << leg);
+                }
+            }
+        }
+
+        /* 转发 re-INVITE 到对端 leg（UPDATE 同模式） */
+        if (!sip_upd_begin(&o->guard)) {
+            sip_upd_end(&l->guard);
+            respond_txn(co, t, 491, NULL, NULL, NULL, 0);
+            return;
+        }
+        o->reinv = 1;
+        o->out_txn = NULL;
+
+        char extra[512];
+        extra[0] = '\0';
+        if (m->body.len)
+            snprintf(extra, sizeof(extra), "Content-Type: application/sdp\r\n");
+
+        char branch[40];
+        new_branch(branch, sizeof(branch));
+        long cs = ++o->cseq;
+        char to[B2B_HDR_MAX + DLG_TAG_MAX + 8];
+        snprintf(to, sizeof(to), "%s;tag=%s", o->to, o->rem_tag);
+        char ruri[DLG_URI_MAX + 8];
+        snprintf(ruri, sizeof(ruri), "%s",
+                 o->target[0] ? o->target : o->ruri);
+        char out[SIP_MAX_MSG * 2];
+        int n = build_dlg_req(co, o, SIP_M_INVITE, cs,
+                              ruri, to, branch,
+                              extra[0] ? extra : NULL,
+                              m->body.len ? m->body.p : NULL,
+                              m->body.len,
+                              out, sizeof(out));
+        if (n > 0) {
+            o->out_txn = txn_client_new(
+                co->cfg.txn, TXN_ICT, branch, strlen(branch), SIP_M_INVITE,
+                &o->dst, o->reliable, out, (size_t)n, cli_tu, c, now_ms());
+            if (o->out_txn)
+                snprintf(o->last_branch, sizeof(o->last_branch), "%s", branch);
+        }
+        if (!o->out_txn) {
+            sip_upd_end(&l->guard);
+            sip_upd_end(&o->guard);
+            respond_txn(co, t, 500, NULL, NULL, NULL, 0);
+        }
+        /* cli_tu 在 o->out_txn 终响应时回 A 腿 200 OK 并释放 guard */
+        return;
+    }
+
+    /* ---- REFER (RFC 3515)：入站 transfer 请求 ----
+     * blind transfer：UA 发 REFER + Refer-To（不带 Replaces），
+     *   我们对 B-腿发 BYE，然后对 Refer-To 目标发新 INVITE（重建桥）。
+     * attended transfer（带 Replaces）：暂不做，回 481 + log。 */
+    if (m->method == SIP_M_REFER && sip_msg_in_dialog(m)) {
+        int leg = -1;
+        sip_hdr_t *cid = sip_hdr_get(m, SIP_H_CALL_ID);
+        b2b_call_t *c = cid ? tbl_find(co, cid->value.p, cid->value.len, &leg) : NULL;
+        if (!c || leg < 0) {
+            respond_txn(co, t, 481, NULL, NULL, NULL, 0);
+            return;
+        }
+        b2b_leg_t *l = &c->leg[leg];     /* 发起 REFER 的腿（UA） */
+        int other = leg ^ 1;
+
+        /* REFER 时发起腿必须 CONFIRMED（在通话中） */
+        if (l->state != LEG_CONFIRMED && l->state != LEG_EARLY) {
+            respond_txn(co, t, 481, NULL, NULL, NULL, 0);
+            return;
+        }
+
+        sip_hdr_t *rt_hdr = sip_hdr_get(m, SIP_H_REFER_TO);
+        sip_hdr_t *repl_hdr = sip_hdr_get(m, SIP_H_REPLACES);
+
+        /* 无 Refer-To → 481 Invalid REFER */
+        if (!rt_hdr || !rt_hdr->value.p || !rt_hdr->value.len) {
+            respond_txn(co, t, 481, NULL, NULL, NULL, 0);
+            return;
+        }
+
+        /* 先解析 Replaces（如果有），后解析 Refer-To 目标 */
+        int is_attended = (repl_hdr && repl_hdr->value.p && repl_hdr->value.len);
+        char replaces[DLG_CALLID_MAX + DLG_TAG_MAX * 4 + 64];
+        replaces[0] = '\0';
+        if (is_attended) {
+            size_t rl = repl_hdr->value.len < sizeof(replaces) - 1
+                        ? repl_hdr->value.len : sizeof(replaces) - 1;
+            memcpy(replaces, repl_hdr->value.p, rl);
+            replaces[rl] = '\0';
+            /* 基本合法性：必须包含 call-id= 和 from-tag= */
+            if (!strstr(replaces, "call-id=") || !strstr(replaces, "from-tag=")) {
+                llog(LOG_WARN, "b2b",
+                     "attended transfer invalid Replaces format callid=%s",
+                     cid->value.p);
+                respond_txn(co, t, 400, NULL, NULL, NULL, 0);
+                return;
+            }
+            llog(LOG_INFO, "b2b",
+                 "REFER attended transfer callid=%s replaces=%s",
+                 cid->value.p, replaces);
+        }
+
+        /* 解析 Refer-To SIP URI → 提取目标号码 */
+        char refer_to[DLG_URI_MAX];
+        size_t rtl = rt_hdr->value.len < sizeof(refer_to) - 1
+                     ? rt_hdr->value.len : sizeof(refer_to) - 1;
+        memcpy(refer_to, rt_hdr->value.p, rtl);
+        refer_to[rtl] = '\0';
+        /* 去掉 <> 尖括号（Refer-To 通常是 "<sip:123@host>"） */
+        if (refer_to[0] == '<') {
+            char *end = strchr(refer_to, '>');
+            if (end) *end = '\0';
+            memmove(refer_to, refer_to + 1, strlen(refer_to));
+        }
+        char *at = strchr(refer_to, '@');
+        if (at) *at = '\0'; /* 留下 user 部分（目标号码） */
+
+        llog(LOG_INFO, "b2b",
+             "REFER %s transfer leg=%d target=%s callid=%s",
+             is_attended ? "attended" : "blind",
+             leg, refer_to, cid->value.p);
+
+        /* 1. 先对 REFER 发起腿回 202 Accepted（RFC 3515 要求必须立刻响应） */
+        respond_txn(co, t, 202, NULL, NULL, NULL, 0);
+
+        /* 2. b2b_transfer_call 内部持锁 + b2b_send_refer + 重建桥（异步）。
+         *    blind 模式传 replaces=NULL，attended 模式传解析好的 Replaces 串。 */
+        {
+            int rc = b2b_transfer_call(
+                c, other, refer_to,
+                is_attended ? CCF_XFER_CONSULTED : CCF_XFER_BLIND,
+                NULL,
+                is_attended ? replaces : NULL);
+            if (rc != NSBC_OK) {
+                llog(LOG_WARN, "b2b",
+                     "REFER transfer failed rc=%d kind=%d callid=%s",
+                     rc, is_attended, cid->value.p);
+            }
+        }
+        return;
+    }
+
     /* ---- UPDATE (RFC 3311)：对话内，转发到对端 leg ---- */
     if (m->method == SIP_M_UPDATE && sip_msg_in_dialog(m)) {
         int leg = -1;
@@ -4663,21 +4928,179 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
         return;
     }
 
-    /* NOTIFY/SUBSCRIBE 等其他对话内方法（暂不转发，只回 200） */
-    if (sip_msg_in_dialog(m)) {
+    /* ---- PUBLISH (RFC 3903)：presence 发布，dialog 内透传到对端 leg ----
+     * 场景：Bria/MicroSIP 等软电话 publish 自己的在线状态到 presence 服务器，
+     * B2BUA 只做中间转发。模式同 SUBSCRIBE/NOTIFY：guard 串行互斥 + body 透传。 */
+    if (m->method == SIP_M_PUBLISH && sip_msg_in_dialog(m)) {
         int leg = -1;
         sip_hdr_t *cid = sip_hdr_get(m, SIP_H_CALL_ID);
-        if (cid && tbl_find(co, cid->value.p, cid->value.len, &leg))
-            respond_txn(co, t, 200, NULL, NULL, NULL, 0);
-        else
+        b2b_call_t *c = cid ? tbl_find(co, cid->value.p, cid->value.len, &leg) : NULL;
+        if (!c || leg < 0) {
             respond_txn(co, t, 481, NULL, NULL, NULL, 0);
+            return;
+        }
+        b2b_leg_t *l = &c->leg[leg];
+        int other = leg ^ 1;
+        b2b_leg_t *o = &c->leg[other];
+        if (o->state != LEG_CONFIRMED && o->state != LEG_EARLY) {
+            respond_txn(co, t, 491, NULL, NULL, NULL, 0);
+            return;
+        }
+        if (!sip_upd_begin(&l->guard)) {
+            respond_txn(co, t, 491, NULL, NULL, NULL, 0);
+            return;
+        }
+        l->srv_txn = t;
+        txn_set_ud(t, c);
+
+        /* 透传 Content-Type + Content-Length（PUBLISH 带 application/pidf+xml） */
+        char extra[512];
+        extra[0] = '\0';
+        if (m->body.len && m->body.p) {
+            sip_hdr_t *ct = sip_hdr_get(m, SIP_H_CONTENT_TYPE);
+            if (ct && ct->value.p && ct->value.len) {
+                int n = snprintf(extra, sizeof(extra), "Content-Type: %.*s\r\n",
+                                 (int)ct->value.len, ct->value.p);
+                if (n > 0 && (size_t)n < sizeof(extra)) {
+                    int cl = snprintf(extra + n, sizeof(extra) - (size_t)n,
+                                      "Content-Length: %zu\r\n", m->body.len);
+                    if (cl > 0) n += cl;
+                }
+            }
+        }
+
+        /* 转发到对端 leg（NICT：non-INVITE client txn） */
+        if (!sip_upd_begin(&o->guard)) {
+            sip_upd_end(&l->guard);
+            respond_txn(co, l->srv_txn, 491, NULL, NULL, NULL, 0);
+            l->srv_txn = NULL;
+            return;
+        }
+        o->out_txn = NULL;
+
+        char branch[40];
+        new_branch(branch, sizeof(branch));
+        long cs = ++o->cseq;
+        char to[B2B_HDR_MAX + DLG_TAG_MAX + 8];
+        snprintf(to, sizeof(to), "%s;tag=%s", o->to, o->rem_tag);
+        char ruri[DLG_URI_MAX + 8];
+        snprintf(ruri, sizeof(ruri), "%s",
+                 o->target[0] ? o->target : o->ruri);
+        char out[SIP_MAX_MSG * 2];
+        int n = build_dlg_req(co, o, m->method, cs,
+                              ruri, to, branch,
+                              extra[0] ? extra : NULL,
+                              m->body.len ? m->body.p : NULL,
+                              m->body.len,
+                              out, sizeof(out));
+        if (n > 0) {
+            o->out_txn = txn_client_new(
+                co->cfg.txn, TXN_NICT,
+                branch, strlen(branch), m->method,
+                &o->dst, o->reliable, out, (size_t)n, cli_tu, c, now_ms());
+            if (o->out_txn)
+                snprintf(o->last_branch, sizeof(o->last_branch), "%s", branch);
+        }
+        if (!o->out_txn) {
+            sip_upd_end(&l->guard);
+            sip_upd_end(&o->guard);
+            respond_txn(co, l->srv_txn, 500, NULL, NULL, NULL, 0);
+            l->srv_txn = NULL;
+            return;
+        }
+        /* cli_tu 在 o->out_txn 终响应时回 A 腿并释放 guard */
         return;
     }
 
-    /* 非对话内的 NOTIFY/SUBSCRIBE：服务端主动发的（如 FS message-summary），
-     * 我们作为 B2BUA 不处理语音邮件等，但必须回 200 OK 表示收到
-     * （RFC 3265 §3.2.2 要求订阅者对 NOTIFY 回 200）。 */
+    /* ---- SUBSCRIBE / NOTIFY (RFC 3265)：对话内订阅/通知，转发到对端 leg ----
+     * MESSAGE/INFO 上面已各自处理，SUBSCRIBE/NOTIFY 也用同样的 guard 串行互斥。 */
+    if ((m->method == SIP_M_SUBSCRIBE || m->method == SIP_M_NOTIFY)
+        && sip_msg_in_dialog(m)) {
+        int leg = -1;
+        sip_hdr_t *cid = sip_hdr_get(m, SIP_H_CALL_ID);
+        b2b_call_t *c = cid ? tbl_find(co, cid->value.p, cid->value.len, &leg) : NULL;
+        if (!c || leg < 0) {
+            respond_txn(co, t, 481, NULL, NULL, NULL, 0);
+            return;
+        }
+        b2b_leg_t *l = &c->leg[leg];
+        int other = leg ^ 1;
+        b2b_leg_t *o = &c->leg[other];
+        if (o->state != LEG_CONFIRMED && o->state != LEG_EARLY) {
+            respond_txn(co, t, 491, NULL, NULL, NULL, 0);
+            return;
+        }
+        if (!sip_upd_begin(&l->guard)) {
+            respond_txn(co, t, 491, NULL, NULL, NULL, 0);
+            return;
+        }
+        l->srv_txn = t;
+        txn_set_ud(t, c);
+
+        /* 透传 Content-Type + Content-Length（SUBSCRIBE/NOTIFY 带 application/sipxml） */
+        char extra[512];
+        extra[0] = '\0';
+        if (m->body.len && m->body.p) {
+            sip_hdr_t *ct = sip_hdr_get(m, SIP_H_CONTENT_TYPE);
+            if (ct && ct->value.p && ct->value.len) {
+                int n = snprintf(extra, sizeof(extra), "Content-Type: %.*s\r\n",
+                                 (int)ct->value.len, ct->value.p);
+                if (n > 0 && (size_t)n < sizeof(extra)) {
+                    int cl = snprintf(extra + n, sizeof(extra) - (size_t)n,
+                                      "Content-Length: %zu\r\n", m->body.len);
+                    if (cl > 0) n += cl;
+                }
+            }
+        }
+
+        /* 转发到对端 leg */
+        if (!sip_upd_begin(&o->guard)) {
+            sip_upd_end(&l->guard);
+            respond_txn(co, l->srv_txn, 491, NULL, NULL, NULL, 0);
+            l->srv_txn = NULL;
+            return;
+        }
+        o->out_txn = NULL;
+
+        char branch[40];
+        new_branch(branch, sizeof(branch));
+        long cs = ++o->cseq;
+        char to[B2B_HDR_MAX + DLG_TAG_MAX + 8];
+        snprintf(to, sizeof(to), "%s;tag=%s", o->to, o->rem_tag);
+        char ruri[DLG_URI_MAX + 8];
+        snprintf(ruri, sizeof(ruri), "%s",
+                 o->target[0] ? o->target : o->ruri);
+        char out[SIP_MAX_MSG * 2];
+        int n = build_dlg_req(co, o, m->method, cs,
+                              ruri, to, branch,
+                              extra[0] ? extra : NULL,
+                              m->body.len ? m->body.p : NULL,
+                              m->body.len,
+                              out, sizeof(out));
+        if (n > 0) {
+            o->out_txn = txn_client_new(
+                co->cfg.txn, TXN_NICT,
+                branch, strlen(branch), m->method,
+                &o->dst, o->reliable, out, (size_t)n, cli_tu, c, now_ms());
+            if (o->out_txn)
+                snprintf(o->last_branch, sizeof(o->last_branch), "%s", branch);
+        }
+        if (!o->out_txn) {
+            sip_upd_end(&l->guard);
+            sip_upd_end(&o->guard);
+            respond_txn(co, l->srv_txn, 500, NULL, NULL, NULL, 0);
+            l->srv_txn = NULL;
+            return;
+        }
+        /* cli_tu 在 o->out_txn 终响应时回 A 腿并释放 guard */
+        return;
+    }
+
+    /* 非对话内的 NOTIFY/SUBSCRIBE/PUBLISH：服务端主动发的（如 FS message-summary），
+     * 我们作为 B2BUA 不处理语音邮件/presence 等，但必须回 200 OK 表示收到
+     * （RFC 3265 §3.2.2 / RFC 3903 §6.1 要求订阅者/接收方回 200）。 */
     if (m->method == SIP_M_NOTIFY || m->method == SIP_M_SUBSCRIBE
+        || m->method == SIP_M_PUBLISH
         || m->method == SIP_M_MESSAGE || m->method == SIP_M_INFO) {
         respond_txn(co, t, 200, NULL, NULL, NULL, 0);
         return;
@@ -4786,14 +5209,41 @@ void b2b_on_rx(void *ud, sip_tr_proto_t proto, const nsbc_sa_t *src,
 
     int reliable = proto != SIP_TR_UDP;
     if (m.is_request) {
-        /* 主动 INVITE/REGISTER 频率计数（per-IP 窗口内次数）。
-         * 在 txn_server_input 之前上报——攻击者还没造成 slab 压力就被封。
-         * security 模块按 ratelimit_invites_active 阈值累计 inv_count，
-         * 超阈值触发 auto-ban；后续同 IP 的 INVITE 在 B2B_GUARD_INVITE
-         * 入口就被 ban_is_banned() 拦截，根本不会竞争 slab。
-         * 设 ratelimit_invites_active=0 关闭此主动阈值。 */
-        if (m.method == SIP_M_INVITE || m.method == SIP_M_REGISTER)
-            b2b_guard_notify(src_ip, B2B_GUARD_INVITE_COUNT);
+        /* ---- FIND-3: method 白名单 reject（未知 method 立即 silent drop）----
+         * txn_server_input 不区分已知/未知 method，任何请求都会创建 IST/NIST。
+         * 攻击者发 SUBSCRIBE/REFER/自定义 X-FOO 能无限制打 txn slab，
+         * 且绕过 P1 主动防护（INVITE_COUNT 之前只对 INVITE/REGISTER 计数）。
+         * 这里做白名单 reject：RFC3261 + 常用扩展 = 13 种。 */
+        switch (m.method) {
+        case SIP_M_INVITE:
+        case SIP_M_ACK:
+        case SIP_M_BYE:
+        case SIP_M_CANCEL:
+        case SIP_M_OPTIONS:
+        case SIP_M_REGISTER:
+        case SIP_M_SUBSCRIBE:
+        case SIP_M_NOTIFY:
+        case SIP_M_PUBLISH:
+        case SIP_M_REFER:
+        case SIP_M_INFO:
+        case SIP_M_MESSAGE:
+        case SIP_M_UPDATE:
+        case SIP_M_PRACK:
+            break; /* 合法 method，继续处理 */
+        default: {
+            static unsigned unk_drop_n = 0;
+            if (unk_drop_n++ % 512 == 0)
+                llog(LOG_WARN, "b2b",
+                     "reject unknown method=%d (%.*s) from %s (silent drop)",
+                     m.method, (int)m.method_str.len,
+                     m.method_str.p ? m.method_str.p : "?", src_ip);
+            return;
+        }
+        }
+
+        /* 主动请求频率计数（per-IP 窗口内次数）——对 ALL 合法 method 计数，
+         * 不仅 INVITE/REGISTER。攻击者换 SUBSCRIBE/REFER 也会触发 auto-ban。 */
+        b2b_guard_notify(src_ip, B2B_GUARD_INVITE_COUNT);
 
         llog(LOG_DEBUG, "b2b", "txn_input msg.buf=%p msg.buflen=%zu txn_mgr=%p src_af=%d",
              m.buf, m.buflen, (void *)co->cfg.txn, src->ss.ss_family);
@@ -6087,7 +6537,8 @@ static int b2b_send_refer(b2b_call_t *c, int leg,
 }
 
 int b2b_transfer_call(b2b_call_t *call, int b_leg, const char *dest,
-                      int kind, b2b_call_t *consult_call)
+                      int kind, b2b_call_t *consult_call,
+                      const char *replaces_hdr)
 {
     if (!call || !dest) return NSBC_INVAL;
     if (b_leg < -1 || b_leg > 1) return NSBC_INVAL;
@@ -6099,14 +6550,15 @@ int b2b_transfer_call(b2b_call_t *call, int b_leg, const char *dest,
         unsigned char ch = (unsigned char)dest[i];
         if (ch < 0x21 || ch > 0x7e) return NSBC_INVAL;
     }
-    if (kind == CCF_XFER_CONSULTED && !consult_call) return NSBC_INVAL;
+    if (kind == CCF_XFER_CONSULTED && !replaces_hdr) return NSBC_INVAL;
 
     pthread_mutex_lock(&call->lock);
     if (call->dead) { pthread_mutex_unlock(&call->lock); return NSBC_NOENT; }
 
     /* Blind transfer：向 B-腿发 REFER（refer A→B→dest），同时向 A-腿发 BYE。
      * b_leg=-1：双腿同时，b_leg=1：仅 B 腿，b_leg=0：仅 A 腿（REFER 给 A）。
-     * Consulted transfer（attended）：先 hold + 新建 + Replaces——P1 保留 NOTSUP。 */
+     * Consulted transfer（attended）：REFER 带 Replaces 头指向 consultation
+     * dialog（A hold + 拨 C → A 确认接通 → REFER 让 B 和 C 对话）。 */
     int rc = NSBC_OK;
     if (kind == CCF_XFER_BLIND) {
         if (b_leg == -1 || b_leg == 1) {
@@ -6118,14 +6570,12 @@ int b2b_transfer_call(b2b_call_t *call, int b_leg, const char *dest,
             if (lr != NSBC_OK && rc == NSBC_OK) rc = lr;
         }
     } else {
-        /* CONSULTED：Replaces 头需要 consult_call 的 Call-ID + 双 tag */
-        char replaces[DLG_CALLID_MAX + DLG_TAG_MAX * 4 + 64];
-        /* consult_call 是不透明指针，我们不能解引用拿 callid/tag；
-         * P1：b2b_transfer_call 需要加 replaces 参数从 cmd_registry 传进来 */
-        replaces[0] = '\0';
-        int lr = b2b_send_refer(call, b_leg == 0 ? 0 : 1, dest, replaces);
+        /* CONSULTED：Replaces 头已经由调用方（REFER 入站）从 SIP 消息里解析好。
+         * 格式：call-id=xxx;from-tag=xxx;to-tag=xxx（RFC 3891） */
+        const char *rp = (replaces_hdr && replaces_hdr[0]) ? replaces_hdr : NULL;
+        int lr = b2b_send_refer(call, b_leg == 0 ? 0 : 1, dest, rp);
         rc = lr == NSBC_OK ? NSBC_OK : lr;
-        (void)consult_call;
+        (void)consult_call; /* 暂不用——replaces 字符串直接走 b2b_send_refer */
     }
 
     pthread_mutex_unlock(&call->lock);
@@ -6430,8 +6880,6 @@ int b2b_call_get_var(b2b_call_t *call, int leg, const char *key,
 
 /* ============================================================
  * Session Timer (RFC 4028) — 辅助函数 + 时间轮回调
- * 定义在文件末尾：此时所有类型 (b2b_core_t / b2b_call_t /
- * b2b_leg_t / tw_node_t / sess_timer_t) 都已完整可见
  * ============================================================ */
 
 /* 从 sip_msg_t 提取 Session-Expires / Min-SE / Supported:timer 原始头值 */

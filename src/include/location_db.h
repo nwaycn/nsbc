@@ -47,6 +47,13 @@ typedef struct {
     int      nat_detected;                 /* 1=检测到 NAT，0=公网直连 */
     char     public_contact[LOC_CONTACT_MAX]; /* NAT 改写后的可达 Contact（转发 INVITE 用这个） */
     int      transport_proto;              /* SIP_TR_UDP/TCP/TLS/WS/WSS */
+
+    /* === IMS Service-Route（RFC 3608）===
+     * registrar 场景：我们作为 CSCF 生成 "<sip:tenant_realm;lr>" 存一份；
+     * outreg 场景：上游 S-CSCF 在 REGISTER 200 OK 里返回的 Service-Route
+     * 存这里——后续 INVITE resolve 出站时 prepend 到 Route 头。
+     * 可能多值（comma-separated），RFC 3608 §4.3 要求保留 `;lr` 参数。 */
+    char     service_route[256];
 } loc_binding_t;
 
 typedef struct loc_db loc_db_t;

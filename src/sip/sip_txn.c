@@ -196,7 +196,7 @@ static void cb_dead(uint64_t now, void *arg)
 {
     sip_txn_t *t = (sip_txn_t *)arg;
     txn_mgr_t *m = t->mgr;
-    t_unref(t);
+    t_unref(t); /* 消费本次在轮引用 */
     (void)now;
     switch (t->state) {
     case TXN_ICT_CALLING:   /* Timer B */
@@ -209,6 +209,17 @@ static void cb_dead(uint64_t now, void *arg)
         t->state = (t->kind == TXN_ICT) ? TXN_ICT_TERMINATED
                  : (t->kind == TXN_IST) ? TXN_IST_TERMINATED
                  : TXN_NICT_TERMINATED;
+        t_remove_hash(t);
+        break;
+    case TXN_IST_PROCEEDING:  /* BUG-1 兜底 Timer P 触发：IST 从未收到过 2xx+ */
+    case TXN_NIST_TRYING:     /* BUG-1 兜底 Timer F 触发：NIST 从未收到过 2xx+ */
+        /* early return 场景（ACL deny / profile deny / 号码不存在等）。
+         * 没有 server_respond 被调，所以没人 arm Timer H/J，
+         * 我们在 TXN_NEW 时 arm 的 Timer P/F 就是最后的兜底。 */
+        llog(LOG_INFO, "txn",
+             "cb_dead: terminating orphan txn state=%d kind=%d refs=%ld",
+             t->state, t->kind, t->refs);
+        __atomic_add_fetch(&m->tmo, 1, __ATOMIC_RELAXED);
         t_remove_hash(t);
         break;
     case TXN_ICT_COMPLETED: /* Timer D */

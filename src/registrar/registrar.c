@@ -614,6 +614,71 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
     llog(LOG_INFO, "reg", "REGISTER auth OK → processing loc_add...");
     b2b_guard_notify(src_ip, B2B_GUARD_AUTH_OK); /* auth OK：通知 security 清零 fail/ratelimit 计数 */
 
+    /* ---- RFC 3327 §6.2：Path 头回显 ----
+     * IMS UE 发 REGISTER 时 P-CSCF 会插入 Path: <sip:p-cscf@...;lr> 头链；
+     * REGISTER 200 OK 必须原样回显请求里所有 Path 头，让 UE 知道后续
+     * INVITE 该走 P-CSCF 还是直连。我们作为 B2BUA/SBC 不是 S-CSCF，不生成
+     * 新 Path，但必须透传回 UE。Path 可能多值（comma-separated 或多行头）。 */
+    char path_extra[512]; path_extra[0] = '\0';
+    {
+        size_t po = 0;
+        int first = 1;
+        for (sip_hdr_t *h = sip_hdr_get(m, SIP_H_PATH); h;
+             h = sip_hdr_next(m, h)) {
+            if (h->type != SIP_H_PATH) break;
+            if (!first) {
+                /* 多 Path 头 → 逗号拼（RFC 3327 允许 comma-separated value） */
+                int w = snprintf(path_extra + po, sizeof(path_extra) - po, ", ");
+                if (w > 0 && (size_t)w < sizeof(path_extra) - po) po += (size_t)w;
+            }
+            first = 0;
+            int w = snprintf(path_extra + po, sizeof(path_extra) - po,
+                             "%.*s", (int)h->value.len, h->value.p ? h->value.p : "");
+            if (w > 0 && (size_t)w < sizeof(path_extra) - po) po += (size_t)w;
+        }
+        if (path_extra[0]) {
+            /* 包成完整头行："Path: ...\r\n" */
+            char full[600];
+            snprintf(full, sizeof(full), "Path: %s\r\n", path_extra);
+            path_extra[0] = '\0';
+            snprintf(path_extra, sizeof(path_extra), "%s", full);
+            llog(LOG_INFO, "reg", "REGISTER Path echo: %s", path_extra);
+        }
+    }
+
+    /* ---- RFC 3608：Service-Route 生成 + 入站回显 ----
+     * 我们作为 registrar/CSCF 生成 Service-Route 告诉 UE 后续
+     * INVITE/SUBSCRIBE 等请求应该用什么 Route 头来到达我们。
+     * UE 拿到后自动把 Service-Route 值拷贝到后续请求的 Route 头。
+     * 格式："Service-Route: <sip:{tenant_realm};lr>\r\n"
+     *   - lr = loose router（RFC 3608 §4.4 强制）
+     * 同时请求里如果已经带了 Service-Route（outreg 上游注入），也原样回显。 */
+    char generated_service_route[256]; generated_service_route[0] = '\0';
+    {
+        /* 1. 先生成本地 Service-Route（registrar 角色） */
+        snprintf(generated_service_route, sizeof(generated_service_route),
+                 "<sip:%s;lr>", reg_realm);
+    }
+
+    /* 合成 REGISTER 200 OK 公共 extra 前缀：Service-Route 在前，Path 在后，
+     * 最后 Contact/Expires 链由各个 respond 调用点再追加 */
+    char hdr_prefix[1024]; hdr_prefix[0] = '\0';
+    {
+        size_t ho = 0;
+        if (generated_service_route[0]) {
+            int w = snprintf(hdr_prefix + ho, sizeof(hdr_prefix) - ho,
+                             "Service-Route: %s\r\n", generated_service_route);
+            if (w > 0 && (size_t)w < sizeof(hdr_prefix) - ho) ho += (size_t)w;
+            llog(LOG_INFO, "reg", "REGISTER Service-Route generated: %s",
+                 generated_service_route);
+        }
+        if (path_extra[0]) {
+            int w = snprintf(hdr_prefix + ho, sizeof(hdr_prefix) - ho,
+                             "%s", path_extra);
+            if (w > 0 && (size_t)w < sizeof(hdr_prefix) - ho) ho += (size_t)w;
+        }
+    }
+
     /* 过期基线：Expires 头 */
     long def_exp = r->cfg.default_expires;
     sip_hdr_t *eh = sip_hdr_get(m, SIP_H_EXPIRES);
@@ -651,8 +716,16 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
     }
     if (ch0 && sip_hdr_parse_addr(ch0) == NSBC_OK && ch0->u.addr.star) {
         loc_remove(r->cfg.db, aor, "*");
-        respond(r, proto, src, m, 200, "Contact: *\r\nExpires: 0\r\n",
-                NULL, 0, txn);
+        /* 注销响应也带 Service-Route + Path（RFC 3608/3327 覆盖所有 REGISTER 200 OK） */
+        if (hdr_prefix[0]) {
+            char full_extra[1024];
+            snprintf(full_extra, sizeof(full_extra),
+                     "%sContact: *\r\nExpires: 0\r\n", hdr_prefix);
+            respond(r, proto, src, m, 200, full_extra, NULL, 0, txn);
+        } else {
+            respond(r, proto, src, m, 200, "Contact: *\r\nExpires: 0\r\n",
+                    NULL, 0, txn);
+        }
         return NSBC_OK;
     }
 
@@ -720,6 +793,10 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
 
         /* === NAT 检测 + Contact 改写（REQ-NAT-001）=== */
         b.transport_proto = proto;
+        /* IMS Service-Route：存到 binding 供 outreg 场景 resolve 出站时 prepend */
+        if (generated_service_route[0])
+            snprintf(b.service_route, sizeof(b.service_route),
+                     "%s", generated_service_route);
         /* 1. 取 src IP:port */
         char src_ip[INET6_ADDRSTRLEN] = "";
         uint16_t src_port = 0;
@@ -801,15 +878,21 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
     }
     if (!nc && !ch0) {
         /* 无 Contact 且非 *：查询口径（P0 直接 200 空列表） */
-        respond(r, proto, src, m, 200, NULL, NULL, 0, txn);
+        respond(r, proto, src, m, 200,
+                hdr_prefix[0] ? hdr_prefix : NULL, NULL, 0, txn);
         return NSBC_OK;
     }
 
     /* 200 回显当前绑定 */
     loc_binding_t list[16];
     int n = loc_query(r->cfg.db, aor, list, 16, now);
-    char extra[3072];
+    char extra[4096]; /* 扩大：hdr_prefix(1024) + Contact 链(3072) */
     size_t used = 0;
+    /* Service-Route + Path prepend */
+    if (hdr_prefix[0]) {
+        snprintf(extra, sizeof(extra), "%s", hdr_prefix);
+        used = strlen(extra);
+    }
     for (int i = 0; i < n; ++i) {
         long e = (long)((list[i].expire_ms - now) / 1000);
         int w = snprintf(extra + used, sizeof(extra) - used,

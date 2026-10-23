@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 typedef struct {
@@ -124,11 +125,26 @@ int reactor_wait(reactor_t *r, int timeout_ms)
     } while (n < 0 && errno == EINTR && !reactor_stopping(r));
     if (n < 0)
         return reactor_stopping(r) ? 0 : NSBC_ERR;
+    /* Reactor 慢处理 watchdog：
+     * epoll_wait 返回后，若单个 fd callback 链总耗时 > 500ms → 打限频 WARN。
+     * 慢速连接 / TLS 握手卡住 / 大包解析阻塞都会触发 — 帮运维定位 reactor 线程瓶颈。
+     * 用 CLOCK_MONOTONIC 不受 NTP 跳变影响。 */
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     for (int i = 0; i < n; ++i) {
         int fd = r->events[i].data.fd;
         if (fd >= r->slots_cap || !r->slots[fd].cb)
             continue;
         r->slots[fd].cb(fd, r->events[i].events, r->slots[fd].arg);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    uint64_t elapsed_ms = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000ULL
+                        + (uint64_t)(t1.tv_nsec - t0.tv_nsec) / 1000000ULL;
+    if (elapsed_ms > 500) {
+        static uint32_t wd_n = 0;
+        if (wd_n++ % 10 == 0)
+            fprintf(stderr, "reactor_warn: slow batch %lu ms n=%d (wd_n=%u)\n",
+                    (unsigned long)elapsed_ms, n, wd_n);
     }
     return n;
 }

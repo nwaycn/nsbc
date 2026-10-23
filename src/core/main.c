@@ -203,7 +203,7 @@ static void on_cfg_event(cfg_event_t ev, const char *detail, void *ud)
      * 有订阅者）。 */
     if ((ev == CFG_EV_RELOAD_SUCCESS || ev == CFG_EV_CHANGED ||
          ev == CFG_EV_ROLLBACK) && c && c->cfg) {
-        long lv = 6;
+        long lv = 4; /* LOG_WARN：生产环境默认 WARN（>=4），避免每 INVITE 一条 INFO 打爆 IO */
         cfg_get_int(c->cfg, "log.level", &lv, NULL);
         log_set_level((log_level_t)lv);
     }

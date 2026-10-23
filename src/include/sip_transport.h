@@ -44,6 +44,8 @@ typedef struct {
     int sndbuf_kb;
     size_t max_msg;
     int tcp_conn_max;
+    int tcp_conn_per_ip;       /* 每 IP 并发连接上限（防止单 IP SYN flood）；0=默认 50 */
+    int tcp_idle_timeout_ms;   /* TCP/TLS idle 超时断链（毫秒）；0=默认 30000 */
     void *tls_ctx; /* tls_ctx_server_new 产物；enable_tls 时必填 */
     sip_rx_fn rx;
     void *rx_ud;

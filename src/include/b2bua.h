@@ -85,6 +85,9 @@ typedef struct b2b_leg {
     long cseq;
     int reinv;
     char last_branch[40];
+    /* IMS Service-Route（RFC 3608）：resolve_cb 从 loc_binding_t 填入，
+     * send_invite_b 出站时 prepend 到 Route 头链。值形如 "<sip:tenant_realm;lr>" */
+    char service_route[256];
     char offer[B2B_SDP_MAX];
     size_t offer_len;
     char answer[B2B_SDP_MAX];
@@ -195,6 +198,9 @@ struct b2b_call {
     char from_ip[INET6_ADDRSTRLEN];
     void *rec[2];
     sip_txn_t *refer_txn;
+    /* re-INVITE hold/unhold 标志：bitmask，bit0=leg0 hold，bit1=leg1 hold。
+     * 入站 re-INVITE 带 c=0.0.0.0 / a=sendonly 时置位，对端腿 hold 也置位。 */
+    uint8_t hold_legs;
     /* 归属 SIP Profile（REQ-SIP-PROFILE-001）：handle_new_invite 按主叫
      * 源 IP 匹配（sip_profile_match_src），call_destroy 对称递减
      * active_calls。NULL = 无归属（外呼 originate / 无 ACL 配置）。
@@ -342,6 +348,9 @@ typedef struct {
     /* Session Timer (RFC 4028) 全局配置 */
     sess_timer_cfg_t sess_timer_cfg;
     int sess_timer_enabled;  /* 0=关闭(仅透传)，1=完整协商+刷新+超时 */
+    /* GRUU（RFC 5627 / RFC 7315）：全局唯一 instance-id
+     * 空字符串则不拼 ;+sip.instance 参数；YAML 配或启动时自动生成 UUID */
+    char gruu_instance_id[64];
     /* P1-12 INVITE 401/407 challenge：route_table 指针（b2bua.c cli_tu 里拿 trunk_t.password 现算 HA1） */
     const struct route_table *rt;
 } b2b_cfg_t;
@@ -586,7 +595,8 @@ int b2b_answer_call(b2b_call_t *call, int b_leg,
 int b2b_hold_call(b2b_call_t *call, int b_leg, int hold,
                   const char *sdp, size_t sdp_len);
 int b2b_transfer_call(b2b_call_t *call, int b_leg, const char *dest,
-                      int kind, b2b_call_t *consult_call);
+                      int kind, b2b_call_t *consult_call,
+                      const char *replaces_hdr);
 
 /* 桥接两路呼叫 / 注入音频 / 打断（uuid_bridge/uuid_broadcast/uuid_break） */
 int b2b_bridge(b2b_core_t *co, const char *callid_a, const char *callid_b);

@@ -76,6 +76,12 @@ typedef struct cnode {
     /* ★ 2026-10-16 诊断：transcode_seen 从 static __thread 改 per-call，
      * 避免长寿命媒体线程跨呼叫累积导致短通话（~400 包）永远碰不到 %1000 阈值。 */
     int transcode_seen_diag[2];
+    /* ★ RFC 3312 Precondition 前提条件门控——offer_hook 解析 offer SDP 置位
+     * precond_active（1=Require precondition 或 a=des:qos mandatory），
+     * answer_hook 解析 answer SDP 置位 precond_met（1=a=curr 覆盖所有 mandatory des）。
+     * relay_recv_one 转发前检查：precond_active && !precond_met → 丢包。 */
+    uint8_t precond_active;
+    uint8_t precond_met;
 } cnode_t;
 
 typedef struct {
@@ -677,6 +683,15 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
                      r->latched[0], r->latched[1],
                      r->have_peer[0], r->have_peer[1]);
             }
+            ++r->drops;
+            continue;
+        }
+
+        /* ★ RFC 3312 Precondition 前提条件门控：
+         * offer_hook 解析 offer SDP 置 precond_active=1，
+         * answer_hook 解析 answer SDP 置 precond_met=1。
+         * active 但未 met → 所有 RTP/RTCP 丢包（gate=LOCKED）。 */
+        if (r->node && r->node->precond_active && !r->node->precond_met) {
             ++r->drops;
             continue;
         }
@@ -2364,6 +2379,19 @@ int bridge_offer_hook(void *call, const char *in, size_t inlen,
         llog(LOG_WARN, "media", "offer_hook: entry_get NOMEM call=%p", call);
         return NSBC_NOMEM;
     }
+    /* ★ RFC 3312 Precondition 前提条件门控：offer 侧解析 SDP 检测是否带
+     * Require: precondition 或 a=des:qos mandatory ——置 precond_active=1。
+     * met 状态 offer 侧不可能有（需要 answer 的 a=curr），保持 0 让 gate=LOCKED。 */
+    e->precond_active = 0;
+    e->precond_met = 0;
+    if (inlen > 0) {
+        sdp_t s; memset(&s, 0, sizeof(s));
+        if (sdp_parse(&s, in, inlen) == NSBC_OK && s.nmedia > 0) {
+            e->precond_active = (uint8_t)sdp_media_preconditions_active(&s.media[0]);
+            if (e->precond_active)
+                llog(LOG_INFO, "media", "offer_hook: precondition ACTIVE (wait answer met)");
+        }
+    }
     /* ★ REQ-NAT-002：per-call NAT 公网 RTP IP —— offer 阶段查一次缓存到 cnode，
      * answer_hook 直接复用。profile 没配 → external_rtp_ip 空字符串 → fallback local_ip */
     e->external_rtp_ip[0] = '\0';
@@ -2737,6 +2765,20 @@ int bridge_answer_hook(void *call, const char *in, size_t inlen,
         memcpy(out, in, inlen < outsz ? inlen : outsz - 1);
         out[inlen < outsz ? inlen : outsz - 1] = '\0';
         return NSBC_NOTSUP;
+    }
+    /* ★ RFC 3312 Precondition met 检测：answer 侧解析 SDP 看 a=curr 是否
+     * 覆盖 offer 侧所有 mandatory des —— met=1 时 relay_recv_one gate 打开 */
+    if (inlen > 0) {
+        sdp_t s; memset(&s, 0, sizeof(s));
+        if (sdp_parse(&s, in, inlen) == NSBC_OK && s.nmedia > 0) {
+            /* answer 侧也可能有独立的 precondition（B 腿回 Require） */
+            if (sdp_media_preconditions_active(&s.media[0]))
+                e->precond_active = 1;
+            int new_met = sdp_media_preconditions_met(&s.media[0]);
+            if (new_met && !e->precond_met)
+                llog(LOG_INFO, "media", "answer_hook: precondition MET (gate OPEN)");
+            e->precond_met = (uint8_t)new_met;
+        }
     }
     relay_ports_t ports;
     ports.a_rtp = ports.b_rtp = 0; /* 已分配：取 fd 实际端口 */

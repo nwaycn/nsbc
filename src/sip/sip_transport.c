@@ -185,6 +185,10 @@ struct sip_transport {
     int conns_n;
     pthread_mutex_t clock; /* worker 外呼发送与 reactor 线程互斥 */
     conn_index_t idx;      /* (proto, peer) → conn* 哈希表 */
+    /* per-IP 连接计数：4096 桶，hash(ip) % BUCKETS —— 防单 IP SYN flood 打满全局 conn_max */
+#define IP_BUCKETS 4096
+    uint32_t ip_conn_count[IP_BUCKETS];
+    pthread_mutex_t ip_conn_lock;
 };
 
 /* reactor 分帧回调上下文 —— __thread：多 reactor 线程各自独立，互不覆盖 */
@@ -229,6 +233,24 @@ static void conn_close(sip_transport_t *t, int fd)
     free(c->sbuf);             /* 发送缓冲（可能还有残留数据，对端已断，直接丢） */
     pthread_mutex_destroy(&c->sbuf_lock);
     c->in_use = 0;
+    /* per-IP 计数减一（必须在 free(c) 之前，否则 use-after-free） */
+    {
+        uint32_t bucket = 0;
+        int fam = nsbc_sa_family(&c->peer);
+        if (fam == AF_INET) {
+            uint32_t ip = ((struct sockaddr_in *)&c->peer.ss)->sin_addr.s_addr;
+            bucket = (ip ^ (ip >> 8) ^ (ip >> 16) ^ (ip >> 24)) % IP_BUCKETS;
+        } else {
+            const uint8_t *p = ((struct sockaddr_in6 *)&c->peer.ss)->sin6_addr.s6_addr;
+            uint32_t h = 0;
+            for (int k = 0; k < 16; k++) h ^= ((uint32_t)p[k]) << ((k % 4) * 8);
+            bucket = h % IP_BUCKETS;
+        }
+        pthread_mutex_lock(&t->ip_conn_lock);
+        if (t->ip_conn_count[bucket] > 0)
+            t->ip_conn_count[bucket]--;
+        pthread_mutex_unlock(&t->ip_conn_lock);
+    }
     free(c);
     t->conns[i] = NULL;
     --t->conns_n;
@@ -493,6 +515,32 @@ static tr_conn_t *conn_accept(sip_transport_t *t, int lfd, int is_tls)
              t->cfg.tcp_conn_max);
         return NULL;
     }
+    /* per-IP 连接计数（防单 IP SYN flood 打满全局 conn_max） */
+    {
+        int per_ip_max = t->cfg.tcp_conn_per_ip > 0 ? t->cfg.tcp_conn_per_ip : 50;
+        /* IP hash：IPv4 直接取 4 字节 XOR；IPv6 取前 16 字节 XOR */
+        uint32_t bucket = 0;
+        int fam = nsbc_sa_family(&peer);
+        if (fam == AF_INET) {
+            uint32_t ip = ((struct sockaddr_in *)&peer.ss)->sin_addr.s_addr;
+            bucket = (ip ^ (ip >> 8) ^ (ip >> 16) ^ (ip >> 24)) % IP_BUCKETS;
+        } else {
+            const uint8_t *p = ((struct sockaddr_in6 *)&peer.ss)->sin6_addr.s6_addr;
+            uint32_t h = 0;
+            for (int k = 0; k < 16; k++) h ^= ((uint32_t)p[k]) << ((k % 4) * 8);
+            bucket = h % IP_BUCKETS;
+        }
+        pthread_mutex_lock(&t->ip_conn_lock);
+        if (t->ip_conn_count[bucket] >= (uint32_t)per_ip_max) {
+            pthread_mutex_unlock(&t->ip_conn_lock);
+            close(fd);
+            llog(LOG_WARN, "sip", "tcp per-IP conn limit %d, reject bucket=%u",
+                 per_ip_max, bucket);
+            return NULL;
+        }
+        t->ip_conn_count[bucket]++;
+        pthread_mutex_unlock(&t->ip_conn_lock);
+    }
     if (fd >= t->conns_cap) {
         int cap = t->conns_cap ? t->conns_cap * 2 : 256;
         while (cap <= fd)
@@ -517,6 +565,25 @@ static tr_conn_t *conn_accept(sip_transport_t *t, int lfd, int is_tls)
     c->in_use = 1;
     c->is_tls = is_tls;
     c->peer = peer;
+    /* TCP socket 选项：防半开连接 / idle 占 fd
+     *   SO_KEEPALIVE=1（保活探测，空闲 2h 后 OS 自动探测）
+     *   TCP_USER_TIMEOUT=idle_timeout_ms（强制断链，默认 30s）
+     * TCP_USER_TIMEOUT 是 Linux 专有，但内核 <2.6.37 时 setsockopt 失败
+     * 会 silent ignore — 不影响功能。 */
+    {
+        int keep = 1;
+        setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keep, sizeof(keep));
+    }
+    {
+        int uto = t->cfg.tcp_idle_timeout_ms > 0
+                  ? t->cfg.tcp_idle_timeout_ms : 30000;
+        /* 毫秒单位（Linux 4.x+）；老内核 silent ignore */
+#if defined(TCP_USER_TIMEOUT)
+        setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &uto, sizeof(uto));
+#else
+        (void)uto;
+#endif
+    }
     tcp_framer_init(&c->fr, c->fbuf, fcap, t->cfg.max_msg);
     /* 发送缓冲初始 32KB，最大单 SIP 消息 ~6KB × 多帧缓冲足够；
      * 不够时自动扩容（sip_tcp_enqueue 里 realloc）。 */
@@ -689,6 +756,9 @@ int sip_tr_create(const sip_tr_cfg_t *cfg, sip_transport_t **out)
         }
     }
     pthread_mutex_init(&t->clock, NULL);
+    /* per-IP 连接计数表 */
+    pthread_mutex_init(&t->ip_conn_lock, NULL);
+    memset(t->ip_conn_count, 0, sizeof(t->ip_conn_count));
     /* ---- 初始化 (proto, peer) 哈希表 ---- */
     pthread_mutex_init(&t->idx.lock, NULL);
     t->idx.slots = calloc(CONN_IDX_CAP, sizeof(tr_conn_t *));
@@ -811,6 +881,7 @@ void sip_tr_destroy(sip_transport_t *t)
     for (int i = 0; i < NET_BATCH; ++i)
         free(t->dg[i].buf);
     pthread_mutex_destroy(&t->clock);
+    pthread_mutex_destroy(&t->ip_conn_lock);
     free((void *)t->cfg.listen_ip);   /* strdup 来的，sip_tr_create 里分配 */
     free(t);
 }

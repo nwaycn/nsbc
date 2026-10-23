@@ -336,7 +336,7 @@ static int cmd_uuid_transfer(cmd_ctx_t *c, int argc, char **argv, void *ud)
                   callid, dest);
         return NSBC_NOENT;
     }
-    int rc = b2b_transfer_call(call, -1, dest, 0, NULL);
+    int rc = b2b_transfer_call(call, -1, dest, 0, NULL, NULL);
     if (rc == NSBC_OK) {
         c->io_printf(c->io_ud, "OK transfered %s → %s\n", callid, dest);
         log_audit("oam", "uuid-transfer", "call-id=%s dest=%s result=ok", callid, dest);
@@ -1408,7 +1408,7 @@ static int cmd_uuid_deflect(cmd_ctx_t *c, int argc, char **argv, void *ud)
         return NSBC_NOENT;
     }
 
-    int rc = b2b_transfer_call(call, -1, dest, 0 /*CCF_XFER_BLIND*/, NULL);
+    int rc = b2b_transfer_call(call, -1, dest, 0 /*CCF_XFER_BLIND*/, NULL, NULL);
     if (rc == NSBC_OK) {
         c->io_printf(c->io_ud, "OK deflected %s → %s\n", callid, dest);
         log_audit("oam", "uuid-deflect", "call-id=%s dest=%s result=ok", callid, dest);

@@ -128,13 +128,38 @@ sip_dialog_t *dlg_uas_new(dlg_mgr_t *m, const sip_msg_t *req)
     d->init_method = req->method;
     if (contact && sip_hdr_parse_addr(contact) == NSBC_OK)
         tok_copy(d->target, sizeof(d->target), contact->u.addr.uri.host);
-    /* UAS 路由集 = Record-Route 顺序拷贝 */
+    /* UAS 路由集（dialog route set）：
+     * RFC 3261 §12.2.1：dialog 内后续请求的 Route 头链由入站请求的
+     * Record-Route 头顺序生成。但 INVITE 入站时 UE 可能从 REGISTER 200 OK
+     * 的 Service-Route 拷贝了 Route 头（RFC 3608 §6.1）——如果请求没有
+     * Record-Route，dialog route set 就必须从 Route 头来。
+     *
+     * 顺序：先 Record-Route（权威），再 Route（UE 提供，补全）。
+     *
+     * 值处理：不剥壳原始头值，保留 `;lr` / `transport=tcp` 等参数——
+     * sip_hdr_parse_route 只解析 URI 部分丢弃参数，我们直接拷头 value
+     * （形如 "<sip:p-cscf;lr>" 或 "sip:host"），后续 route_block 拼
+     * "Route: <value>\r\n" 时能正确携带所有参数。 */
     int n = 0;
     for (sip_hdr_t *rr = sip_hdr_get(req, SIP_H_RECORD_ROUTE);
          rr && n < DLG_ROUTE_MAX; rr = sip_hdr_next(req, rr)) {
-        if (sip_hdr_parse_route(rr) == NSBC_OK) {
-            tok_copy(d->routes[n], DLG_URI_MAX, rr->u.route.uri.host);
+        if (rr->value.p && rr->value.len > 0) {
+            /* 保留完整头值（含 ;lr 等参数） */
+            snprintf(d->routes[n], sizeof(d->routes[n]), "%.*s",
+                     (int)rr->value.len, rr->value.p);
             ++n;
+        }
+    }
+    if (n == 0) {
+        /* 无 Record-Route → dialog route set 从 Route 头来
+         * （典型场景：UE 从 REGISTER Service-Route 拷过来的 Route: <sip:p-cscf;lr>） */
+        for (sip_hdr_t *rh = sip_hdr_get(req, SIP_H_ROUTE);
+             rh && n < DLG_ROUTE_MAX; rh = sip_hdr_next(req, rh)) {
+            if (rh->value.p && rh->value.len > 0) {
+                snprintf(d->routes[n], sizeof(d->routes[n]), "%.*s",
+                         (int)rh->value.len, rh->value.p);
+                ++n;
+            }
         }
     }
     d->nroutes = n;

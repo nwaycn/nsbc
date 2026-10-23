@@ -214,7 +214,7 @@ int sip_build_request(char *buf, size_t cap, const sip_req_spec_t *s)
     if (s->supported && s->supported[0]) {
         sipb_catf(&b, "Supported: %s\r\n", s->supported);
     } else {
-        sipb_cat(&b, "Supported: replaces, precondition, gruu, path, outbound, sec-agree, answermode, eventlist\r\n");
+        sipb_cat(&b, "Supported: replaces, 100rel, precondition, gruu, path, outbound, sec-agree, timer, answermode, eventlist\r\n");
     }
     /* ---- REQ-IMS：Allow 头通告本 B2BUA 支持的方法 ----
      * RFC 3261 §20.5 — 运营商 IMS/SSF 网关要求 Allow 头做兼容性判断；

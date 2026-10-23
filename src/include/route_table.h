@@ -92,6 +92,11 @@ typedef struct {
     uint8_t       ims_auto_privacy;      /* 1=自动加 Privacy: id（CLIR，对端 From anonymize） */
     uint8_t       ims_auto_pani;         /* 1=自动加 P-Access-Network-Info（默认 "E-UTRAN-TDD"） */
     char          ims_pani_value[128];   /* 自定义 PANI 值，空=默认 "E-UTRAN-TDD" */
+    /* === 3GPP IMS 计费头（RFC 7315） ===
+     * 运营商核心网计费系统用这两个头关联在线计费会话。 */
+    uint8_t       ims_auto_charging;                    /* 1=自动拼 P-Charging-Function-Addresses / Vector */
+    char          ims_pcfa[128];                        /* P-Charging-Function-Addresses 值，如 "ccf=a;ecf=b" */
+    char          ims_pcv[64];                          /* P-Charging-Vector 值，如 "icid-xxxx;orig-ioi=ims.mnc001.mcc460.3gppnetwork.org" */
 } trunk_t;
 
 typedef struct {

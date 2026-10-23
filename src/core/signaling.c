@@ -693,6 +693,11 @@ static int resolve_cb(b2b_call_t *call, const char *ruri, size_t ruri_len,
                 llog(LOG_INFO, "sig", "resolve: dp_ext target=%s aor=%s loc_n=%d contact=%s",
                      ext_user, aor, n, n > 0 ? b.contact : "(none)");
                 if (n > 0) {
+                    /* IMS Service-Route：存到 B 腿（后续 send_invite_b → route_block 自动 prepend） */
+                    if (call && b.service_route[0])
+                        snprintf(call->leg[1].service_route,
+                                 sizeof(call->leg[1].service_route),
+                                 "%s", b.service_route);
                     /* REQ-NAT-001：优先 NAT 改写后的 public_contact（可达）
                      * NAT 场景 public_contact != b.contact；公网直连两者相同 */
                     const char *route_contact =
@@ -966,6 +971,11 @@ static int resolve_cb(b2b_call_t *call, const char *ruri, size_t ruri_len,
         }
     }
     if (n > 0) {
+        /* IMS Service-Route：存到 B 腿 */
+        if (call && b.service_route[0])
+            snprintf(call->leg[1].service_route,
+                     sizeof(call->leg[1].service_route),
+                     "%s", b.service_route);
         /* Loop detection（用原始 contact 看——NAT 改写后的 public_contact 不可能等于 local_host） */
         size_t cl = strlen(b.contact);
         nsbc_sa_t contact_sa;
@@ -1580,6 +1590,9 @@ static int sig_start(struct nsbc_ctx *ctx)
     cfg_get_int(cfg, "net.sndbuf_kb", &sndbuf, NULL);
     cfg_get_int(cfg, "net.sip_max_msg", &maxmsg, NULL);
     cfg_get_int(cfg, "net.tcp_conn_max", &connmax, NULL);
+    long per_ip_max = 0, idle_ms = 0;
+    cfg_get_int(cfg, "net.tcp_conn_per_ip", &per_ip_max, NULL);
+    cfg_get_int(cfg, "net.tcp_idle_timeout_ms", &idle_ms, NULL);
     char listen_ip_cpy[64] = "0.0.0.0";
     {
         const char *listen_ip = NULL;
@@ -1620,6 +1633,8 @@ static int sig_start(struct nsbc_ctx *ctx)
     trc.sndbuf_kb = (int)sndbuf;
     trc.max_msg = (size_t)maxmsg;
     trc.tcp_conn_max = (int)connmax;
+    trc.tcp_conn_per_ip = (int)per_ip_max;
+    trc.tcp_idle_timeout_ms = (int)idle_ms;
     trc.tls_ctx = s->tls;
     trc.rx = b2b_on_rx;
     trc.rx_ud = NULL; /* b2b 构造后用 sip_tr_set_rx_ud 回填 */
