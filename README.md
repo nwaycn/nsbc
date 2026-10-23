@@ -52,7 +52,7 @@ graph TD
         Admin[Operator]
     end
 
-    subgraph "nsbcd (C daemon — single binary)"
+    subgraph NSBCD["nsbcd (C daemon — single binary)"]
         subgraph Transport
             TP[UDP/TCP/TLS Listener<br/>src/net/]
             WSL[WebSocket Listener<br/>ws_listener.c]
@@ -78,8 +78,8 @@ graph TD
         end
 
         subgraph Modules[Mod System]
-            STATIC[Built-in (statically linked)]
-            DYN[mod_*.so (dlopen)]
+            STATIC["Built-in (statically linked)"]
+            DYN["mod_*.so (dlopen)"]
         end
 
         subgraph Observability
@@ -88,7 +88,7 @@ graph TD
         end
     end
 
-    subgraph "nsbc-web (Rust sidecar)"
+    subgraph WEB["nsbc-web (Rust sidecar)"]
         AX[Axum / Tokio]
         DB[(SQLite/Postgres)]
         SPA[Embedded SPA]

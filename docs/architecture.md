@@ -11,7 +11,7 @@ dependency matrix has been verified against `builtin.c` and the `NSBC_MOD_CAT` d
 
 ```mermaid
 graph TD
-    subgraph "Rust Sidecar — nsbc-web (separate process)"
+    subgraph WEB["Rust Sidecar — nsbc-web (separate process)"]
         direction LR
         AX[AxeT Router<br/>axum 0.7 / tokio]
         AUTH[AuthSvc<br/>argon2id + JWT]
@@ -22,12 +22,12 @@ graph TD
         CORECLI --> DB
     end
 
-    subgraph "Unix Domain Sockets"
+    subgraph UDS["Unix Domain Sockets"]
         CTRL[control.sock<br/>OAM commands]
         DATA[data.sock<br/>C→Web events]
     end
 
-    subgraph "C Core — nsbcd (single multi-threaded process)"
+    subgraph CCORE["C Core — nsbcd (single multi-threaded process)"]
         direction TB
 
         subgraph Core["Core Foundation"]
@@ -43,8 +43,8 @@ graph TD
             BRIDGE[media_bridge.c<br/>bridge_mgr]
             LOC[location_db.c<br/>AoR → contact bindings]
             DLG[sip_dialog.c<br/>dlg_mgr]
-            TXN[sip_txn.c<br/>txn_mgr (64 shards)]
-            B2B[b2bua.c<br/>b2b_core (1024 shards)]
+            TXN["sip_txn.c<br/>txn_mgr (64 shards)"]
+            B2B["b2bua.c<br/>b2b_core (1024 shards)"]
             TR[sip_transport.c<br/>UDP/TCP/TLS/WS]
             REG[registrar.c<br/>reg_core + tbuckets]
         end
@@ -56,7 +56,7 @@ graph TD
         end
 
         subgraph Workers["Worker Pool (N threads, hw-concurrency)"]
-            WP[worker.c<br/>wpool (MPSC queues)]
+            WP["worker.c<br/>wpool (MPSC queues)"]
         end
 
         subgraph EventBus["Event Bus"]
@@ -146,11 +146,11 @@ graph TD
 ## 2. SIP Transaction State Machine
 
 ```mermaid
-stateDiagram-v2
+stateDiagram
     direction LR
     %% Client branch top, Server bottom
 
-    subgraph Client[Client-side (UAC)]
+    subgraph Client["Client-side (UAC)"]
         direction TB
         c_IDLE
         c_ICT_CALLING --> c_ICT_PROCEEDING: provisional 1xx
@@ -167,7 +167,7 @@ stateDiagram-v2
         c_IDLE --> c_NICT_TRYING: txn_client_new (non-INVITE)
     end
 
-    subgraph Server[Server-side (UAS)]
+    subgraph Server["Server-side (UAS)"]
         direction TB
         s_IDLE
         s_IST_PROCEEDING --> s_IST_COMPLETED: 2xx sent
@@ -275,7 +275,7 @@ Key function / type names verified:
 
 ```mermaid
 graph LR
-    subgraph "SDP Plane (reactor thread, synchronous)"
+    subgraph SDPPLANE["SDP Plane (reactor thread, synchronous)"]
         Offer["B-leg SDP offer<br/>(WebRTC DTLS / plain SIP)"]
         BHOOK["bridge_offer_hook<br/>(b2b_sdp_hook_add)"]
         Decide["bridge_decide<br/>policy + SDP inspection"]
@@ -284,7 +284,7 @@ graph LR
         Confirm["bridge_confirm<br/>final mode locked"]
     end
 
-    subgraph "Mode"
+    subgraph MODE["Mode"]
         direction TB
         MB_BYPASS["MB_BYPASS<br/>no ports allocated<br/>SDP pass-through"]
         MB_RELAY["MB_RELAY<br/>SSRC whitelist + rewrite<br/>RTCP observe + forward"]
@@ -292,7 +292,7 @@ graph LR
         MB_SRTP_RELAY["MB_SRTP_RELAY<br/>DTLS-SRTP endpoints<br/>libsrtp2 session"]
     end
 
-    subgraph "RTP Forwarding (epoll reactor thread)"
+    subgraph RTPFWD["RTP Forwarding (epoll reactor thread)"]
         direction TB
         SOCK_A["fd_rtp[0] / fd_rtcp[0]<br/>side A peer"]
         SOCK_B["fd_rtp[1] / fd_rtcp[1]<br/>side B peer"]
@@ -305,7 +305,7 @@ graph LR
         OBS["atomic RTP stats<br/>d_in_ssrc[2], d_rtp_jitter_ticks[2]<br/>RTCP RR fraction/lost/jitter"]
     end
 
-    subgraph "DTLS / SRTP"
+    subgraph DTLS_SRTP["DTLS / SRTP"]
         DTLS_S["dtls_server<br/>(WebRTC side)"]
         SRTP["nsbc_srtp_sess_t<br/>libsrtp2"]
     end
@@ -322,10 +322,10 @@ graph LR
     MB_TRANSCODE -.-> "transcode_sess[side]"
     MB_RELAY --> SSRC_POL --> LATCH --> SSRC_RW --> JBUF --> FEC --> REC --> OBS
 
-    style SDP Plane fill:#e8f0fe
-    style Mode fill:#fff4e5
-    style "RTP Forwarding (epoll reactor thread)" fill:#e8faf0
-    style "DTLS / SRTP" fill:#f7f0fe
+    style SDPPLANE fill:#e8f0fe
+    style MODE fill:#fff4e5
+    style RTPFWD fill:#e8faf0
+    style DTLS_SRTP fill:#f7f0fe
 ```
 
 Source identifiers ([media_bridge.c](../src/media/bridge/media_bridge.c),
@@ -392,20 +392,20 @@ Key facts from the source:
 
 ```mermaid
 graph TD
-    subgraph "nsbcd — C Core"
+    subgraph NSBCD["nsbcd — C Core"]
         Main["Main / Reactor Thread (1 epoll loop)<br/>reactor_wait(ctx.re, timeout)<br/>timeout = min(tw_next_wait_ms, 1000ms)"]
         Ticker["Ticker Thread<br/>pthread_cond_timedwait MONOTONIC<br/>→ tw_advance(ctx.tw, now)<br/>→ wpool_rcu_advance (every ~1s)"]
         Workers["Worker Pool (N = hw-concurrency)<br/>worker_main spins on mem_mpsc_pop<br/>sched_yield → nanosleep 200us backoff<br/>RCU reader join per thread"]
 
-        subgraph "RCU"
+        subgraph RCU["RCU"]
             RCU[mem_rcu_t<br/>reactor is writer<br/>workers are readers]
         end
 
-        subgraph "Timer Wheel"
+        subgraph TW["Timer Wheel"]
             TW["tw_t 100ms tick<br/>arm(t->tm_retr)<br/>arm(t->tm_dead)<br/>SessTimer refresh/expire nodes"]
         end
 
-        subgraph "Per-Core Event Bus"
+        subgraph PCORE["Per-Core Event Bus"]
             EB_R[per_core_ring<br/>write_pos only atomic_store<br/>read_pos atomic_load acquire<br/>g_global_seq __atomic_fetch_add]
         end
 
@@ -421,7 +421,7 @@ graph TD
         Workers -->|wpool_submit(hash_key)| B2B_shard
         Workers -->|wpool_submit_any| Bridge_shard
 
-        subgraph "Sharded Tables (pthread_mutex per shard)"
+        subgraph SHARDS["Sharded Tables (pthread_mutex per shard)"]
             B2B_shard["b2b_core.sh[1024]<br/>call_link_t head"]
             TXN_shard["txn_mgr.sh[64]<br/>hash chain by branch+method+kind"]
             Bridge_shard["bridge_mgr.sh[64]<br/>cnode_t head"]

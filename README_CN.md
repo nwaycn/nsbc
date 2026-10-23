@@ -52,7 +52,7 @@ graph TD
         Admin[运维人员]
     end
 
-    subgraph "nsbcd (C 守护进程 — 单二进制)"
+    subgraph NSBCD["nsbcd (C 守护进程 — 单二进制)"]
         subgraph 传输层
             TP[UDP/TCP/TLS 监听<br/>src/net/]
             WSL[WebSocket 监听<br/>ws_listener.c]
@@ -88,7 +88,7 @@ graph TD
         end
     end
 
-    subgraph "nsbc-web (Rust 边车)"
+    subgraph WEB["nsbc-web (Rust 边车)"]
         AX[Axum / Tokio]
         DB[(SQLite/Postgres)]
         SPA[内嵌 SPA]
