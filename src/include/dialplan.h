@@ -102,6 +102,16 @@ typedef struct dp_rule {
      *       1=bypass（媒体绕过 SBC，双方直连 RTP）
      *       2=relay  （强制 SBC 转发媒体，即使是私网也不让 bypass） */
     uint8_t media_mode;
+
+    /* ====== §XX 3GPP IMS 协议特性强制覆盖 ======
+     * 每个字段三态：0=auto 继承 profile 默认；1=强制开；2=强制关。
+     * 用三态不用 bool 是为了和 media_mode 保持一致，且能显式覆盖 profile 默认。
+     * 例：IMS 路由 force_precondition=1，老 PSTN 中继 force_precondition=2，
+     *     不写就是走 profile.enable_precondition。 */
+    uint8_t force_prack;         /* 覆盖 profile.enable_prack */
+    uint8_t force_precondition;  /* 覆盖 profile.enable_precondition */
+    uint8_t force_timer;         /* 覆盖 profile.enable_timer */
+    uint8_t force_gruu;          /* 覆盖 profile.enable_gruu */
 } dp_rule_t;
 
 typedef struct dp_table {
@@ -155,6 +165,14 @@ typedef struct {
      *   1=bypass 强制媒体绕过 SBC，双方直连（仅非 WebRTC 有效）
      *   2=relay  强制 SBC 转发媒体，禁止直连 */
     uint8_t media_mode;
+
+    /* ====== §XX 3GPP IMS 协议特性强制覆盖 ======
+     * 从命中规则透传（0=auto 继承 profile，1=强制开，2=强制关）。
+     * b2bua / media_bridge 构建出站头时先看这里，再 fallback profile。 */
+    uint8_t force_prack;
+    uint8_t force_precondition;
+    uint8_t force_timer;
+    uint8_t force_gruu;
 } dp_result_t;
 
 int dp_ctx_init(dp_ctx_t *ctx);

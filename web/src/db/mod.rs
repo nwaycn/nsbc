@@ -2426,6 +2426,11 @@ sqlx::query(acct_ddl).execute(pool).await?;
                 rtp_port_end         INTEGER NOT NULL DEFAULT 59999,
                 enable_prack         INTEGER NOT NULL DEFAULT 0,
                 enable_update        INTEGER NOT NULL DEFAULT 1,
+                enable_t140          INTEGER NOT NULL DEFAULT 0,
+                /* 3GPP IMS 协议特性开关（与 C 端 sip_profile_t 1:1 对齐） */
+                enable_precondition  INTEGER NOT NULL DEFAULT 0,
+                enable_timer         INTEGER NOT NULL DEFAULT 0,
+                enable_gruu          INTEGER NOT NULL DEFAULT 0,
                 dtmf_mode            TEXT    NOT NULL DEFAULT 'rfc4733',
                 realm                TEXT    NOT NULL DEFAULT 'nsbc.local',
                 auth_calls           INTEGER NOT NULL DEFAULT 0,
@@ -2455,6 +2460,11 @@ sqlx::query(acct_ddl).execute(pool).await?;
                 rtp_port_end         INTEGER NOT NULL DEFAULT 59999,
                 enable_prack         INTEGER NOT NULL DEFAULT 0,
                 enable_update        INTEGER NOT NULL DEFAULT 1,
+                enable_t140          INTEGER NOT NULL DEFAULT 0,
+                /* 3GPP IMS 协议特性开关（与 C 端 sip_profile_t 1:1 对齐） */
+                enable_precondition  INTEGER NOT NULL DEFAULT 0,
+                enable_timer         INTEGER NOT NULL DEFAULT 0,
+                enable_gruu          INTEGER NOT NULL DEFAULT 0,
                 dtmf_mode            TEXT    NOT NULL DEFAULT 'rfc4733',
                 realm                TEXT    NOT NULL DEFAULT 'nsbc.local',
                 auth_calls           INTEGER NOT NULL DEFAULT 0,
@@ -2513,12 +2523,24 @@ sqlx::query(acct_ddl).execute(pool).await?;
             if !col_names.contains(&"ip_blacklist") {
                 let _ = sqlx::query("ALTER TABLE sip_profiles ADD COLUMN ip_blacklist TEXT NOT NULL DEFAULT ''").execute(pool).await;
             }
+            /* ★ 3GPP IMS 协议特性开关（与 C 端 sip_profile_t.enable_* 对齐） */
+            for col in ["enable_t140", "enable_precondition", "enable_timer", "enable_gruu"] {
+                if !col_names.contains(&col) {
+                    let sql = format!("ALTER TABLE sip_profiles ADD COLUMN {} INTEGER NOT NULL DEFAULT 0", col);
+                    let _ = sqlx::query(&sql).execute(pool).await;
+                }
+            }
         }
         _ => {
             // PG/MySQL: ADD COLUMN IF NOT EXISTS for idempotency
             let _ = sqlx::query("ALTER TABLE sip_profiles ADD COLUMN IF NOT EXISTS auth_calls INTEGER NOT NULL DEFAULT 0").execute(pool).await;
             let _ = sqlx::query("ALTER TABLE sip_profiles ADD COLUMN IF NOT EXISTS ip_whitelist TEXT NOT NULL DEFAULT ''").execute(pool).await;
             let _ = sqlx::query("ALTER TABLE sip_profiles ADD COLUMN IF NOT EXISTS ip_blacklist TEXT NOT NULL DEFAULT ''").execute(pool).await;
+            /* ★ 3GPP IMS 协议特性开关（与 C 端 sip_profile_t.enable_* 对齐） */
+            for col in ["enable_t140", "enable_precondition", "enable_timer", "enable_gruu"] {
+                let sql = format!("ALTER TABLE sip_profiles ADD COLUMN IF NOT EXISTS {} INTEGER NOT NULL DEFAULT 0", col);
+                let _ = sqlx::query(&sql).execute(pool).await;
+            }
         }
     }
 
@@ -4500,6 +4522,15 @@ pub struct SipProfile {
     pub enable_prack:    i64,
     #[serde(serialize_with = "bool_i64::serialize")]
     pub enable_update:   i64,
+    #[serde(serialize_with = "bool_i64::serialize")]
+    pub enable_t140:     i64,
+    /* 3GPP IMS 协议特性开关（与 C 端 sip_profile_t 1:1 对齐） */
+    #[serde(serialize_with = "bool_i64::serialize")]
+    pub enable_precondition: i64,
+    #[serde(serialize_with = "bool_i64::serialize")]
+    pub enable_timer:    i64,
+    #[serde(serialize_with = "bool_i64::serialize")]
+    pub enable_gruu:     i64,
     pub dtmf_mode:       String,
     pub realm:           String,
     #[serde(serialize_with = "bool_i64::serialize")]
@@ -4529,6 +4560,11 @@ pub struct SipProfileCreate {
     pub rtp_port_end:    Option<i64>,
     pub enable_prack:    Option<bool>,
     pub enable_update:   Option<bool>,
+    pub enable_t140:     Option<bool>,
+    /* 3GPP IMS 协议特性开关（与 C 端 sip_profile_t 1:1 对齐） */
+    pub enable_precondition: Option<bool>,
+    pub enable_timer:    Option<bool>,
+    pub enable_gruu:     Option<bool>,
     pub dtmf_mode:       Option<String>,
     pub realm:           Option<String>,
     pub auth_calls:      Option<bool>,
@@ -4554,6 +4590,11 @@ pub struct SipProfileUpdate {
     pub rtp_port_end:    Option<i64>,
     pub enable_prack:    Option<bool>,
     pub enable_update:   Option<bool>,
+    pub enable_t140:     Option<bool>,
+    /* 3GPP IMS 协议特性开关（与 C 端 sip_profile_t 1:1 对齐） */
+    pub enable_precondition: Option<bool>,
+    pub enable_timer:    Option<bool>,
+    pub enable_gruu:     Option<bool>,
     pub dtmf_mode:       Option<String>,
     pub realm:           Option<String>,
     pub auth_calls:      Option<bool>,
@@ -5569,6 +5610,11 @@ impl Db {
             rtp_port_end: c.rtp_port_end.or(Some(59999)),
             enable_prack: c.enable_prack.or(Some(false)),
             enable_update: c.enable_update.or(Some(true)),
+            enable_t140: c.enable_t140.or(Some(false)),
+            /* 3GPP IMS：默认全关——需要 IMS 的客户显式开，普通中继场景保持原样 */
+            enable_precondition: c.enable_precondition.or(Some(false)),
+            enable_timer: c.enable_timer.or(Some(false)),
+            enable_gruu: c.enable_gruu.or(Some(false)),
             dtmf_mode: c.dtmf_mode.or_else(|| Some("rfc4733".into())),
             realm: c.realm.or_else(|| Some("nsbc.local".into())),
             auth_calls: c.auth_calls.or(Some(true)),
@@ -5581,9 +5627,11 @@ impl Db {
             "INSERT INTO sip_profiles \
              (name, enabled, sip_ip, external_sip_ip, rtp_ip, external_rtp_ip, \
               sip_udp_port, sip_tcp_port, sip_tls_port, enable_udp, enable_tcp, enable_tls, \
-              rtp_port_start, rtp_port_end, enable_prack, enable_update, dtmf_mode, realm, \
+              rtp_port_start, rtp_port_end, enable_prack, enable_update, enable_t140, \
+              enable_precondition, enable_timer, enable_gruu, \
+              dtmf_mode, realm, \
               auth_calls, ip_whitelist, ip_blacklist, description, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {ts}, {ts})"
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {ts}, {ts})"
         ), backend);
         let res = sqlx::query(&sql)
             .bind(&default.name)
@@ -5602,6 +5650,10 @@ impl Db {
             .bind(default.rtp_port_end.unwrap_or(59999))
             .bind(i64::from(default.enable_prack.unwrap_or(false)))
             .bind(i64::from(default.enable_update.unwrap_or(true)))
+            .bind(i64::from(default.enable_t140.unwrap_or(false)))
+            .bind(i64::from(default.enable_precondition.unwrap_or(false)))
+            .bind(i64::from(default.enable_timer.unwrap_or(false)))
+            .bind(i64::from(default.enable_gruu.unwrap_or(false)))
             .bind(&default.dtmf_mode.unwrap())
             .bind(&default.realm.unwrap())
             .bind(i64::from(default.auth_calls.unwrap_or(true)))
@@ -5657,6 +5709,11 @@ impl Db {
         set_i!("rtp_port_end", u.rtp_port_end);
         set_b!("enable_prack", u.enable_prack);
         set_b!("enable_update", u.enable_update);
+        set_b!("enable_t140", u.enable_t140);
+        /* 3GPP IMS 协议特性开关（与 C 端 sip_profile_t 1:1 对齐） */
+        set_b!("enable_precondition", u.enable_precondition);
+        set_b!("enable_timer", u.enable_timer);
+        set_b!("enable_gruu", u.enable_gruu);
         set_s!("dtmf_mode", u.dtmf_mode);
         set_s!("realm", u.realm);
         set_b!("auth_calls", u.auth_calls);

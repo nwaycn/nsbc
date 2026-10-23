@@ -595,6 +595,20 @@ static int dp_json_parse_one(cJSON *obj, dp_rule_t *r, uint32_t rid,
     if (j && cJSON_IsNumber(j) && j->valueint >= 0 && j->valueint <= 2)
         r->media_mode = (uint8_t)j->valueint;
 
+    /* ★ 3GPP IMS 协议特性强制覆盖（三态：0=auto 继承 profile, 1=强制开, 2=强制关） */
+    j = cJSON_GetObjectItem(obj, "force_prack");
+    if (j && cJSON_IsNumber(j) && j->valueint >= 0 && j->valueint <= 2)
+        r->force_prack = (uint8_t)j->valueint;
+    j = cJSON_GetObjectItem(obj, "force_precondition");
+    if (j && cJSON_IsNumber(j) && j->valueint >= 0 && j->valueint <= 2)
+        r->force_precondition = (uint8_t)j->valueint;
+    j = cJSON_GetObjectItem(obj, "force_timer");
+    if (j && cJSON_IsNumber(j) && j->valueint >= 0 && j->valueint <= 2)
+        r->force_timer = (uint8_t)j->valueint;
+    j = cJSON_GetObjectItem(obj, "force_gruu");
+    if (j && cJSON_IsNumber(j) && j->valueint >= 0 && j->valueint <= 2)
+        r->force_gruu = (uint8_t)j->valueint;
+
     /* §18 新增：可选录音路径模板（空串=系统默认） */
     j = cJSON_GetObjectItem(obj, "rec_path_template");
     if (j && cJSON_IsString(j) && j->valuestring[0])

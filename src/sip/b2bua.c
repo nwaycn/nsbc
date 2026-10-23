@@ -1234,8 +1234,32 @@ static sip_txn_t *send_invite_b(b2b_call_t *c, int leg_idx,
     char _extra_work[B2B_HDR_MAX * 4 * 2 + 2048]; _extra_work[0] = '\0';
     char *extra_ptr = NULL;
     size_t extra_off = 0;
-    if (a->timer_supported) {
-        int n = snprintf(st_extra, sizeof(st_extra), "Supported: timer,precondition,gruu,path,outbound,sec-agree\r\n");
+    /* ★ Supported 头：三层优先级链 cfg→profile→dialplan route 动态拼接
+     *   replaces=REFER attend/blind 必需；100rel=PRACK/precondition 必需；
+     *   precondition/timer/gruu 为 3GPP IMS 可选。
+     *   force_* 三态：0=AUTO(继承 profile) / 1=强制开 / 2=强制关。 */
+    {
+        sip_profile_t *pr = c->prof;
+        int do_prack, do_precond, do_timer, do_gruu;
+        /* helper 三态解析 */
+        #define DP_FORCE(f, prof_val)  \
+            (c->force_##f == 1 ? 1 : (c->force_##f == 2 ? 0 : (prof_val)))
+        int prof_prack   = pr ? pr->enable_prack        : 1;  /* profile NULL 默认开 */
+        int prof_precond = pr ? pr->enable_precondition : 1;
+        int prof_timer   = pr ? pr->enable_timer        : 1;
+        int prof_gruu    = pr ? pr->enable_gruu         : 1;
+        do_prack   = DP_FORCE(prack,        prof_prack);
+        do_precond = DP_FORCE(precondition, prof_precond);
+        do_timer   = DP_FORCE(timer,        prof_timer);
+        do_gruu    = DP_FORCE(gruu,         prof_gruu);
+        #undef DP_FORCE
+        int n = snprintf(st_extra, sizeof(st_extra),
+                         "Supported: replaces%s%s%s%s%s%s\r\n",
+                         do_prack      ? ", 100rel"       : "",
+                         do_precond    ? ", precondition" : "",
+                         do_timer      ? ", timer"        : "",
+                         do_gruu       ? ", gruu"         : "",
+                         ", path, outbound, sec-agree, answermode, eventlist");
         if (n > 0) { st_extra[n] = '\0'; }
     }
     if (a->session_expires[0] && !co->cfg.sess_timer_enabled) {
@@ -2245,8 +2269,14 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                                  "%.*s", (int)bose->value.len, bose->value.p);
                 }
 
-                /* Session Timer: extract Bob 200 OK + arm both legs */
-                if (co->cfg.sess_timer_enabled) {
+                /* Session Timer: extract Bob 200 OK + arm both legs
+                 * ★ 三层守卫：cfg.sess_timer_enabled (全局) → force_timer (dialplan 三态) → profile.enable_timer */
+                {
+                    sip_profile_t *pr = c->prof;
+                    /* force_timer 三态：0=AUTO(继承 profile) / 1=强制开 / 2=强制关 */
+                    int prof_en = pr ? pr->enable_timer : 1;  /* profile NULL 默认开 */
+                    int force_en = (c->force_timer == 1) ? 1 : (c->force_timer == 2 ? 0 : prof_en);
+                    if (co->cfg.sess_timer_enabled && force_en) {
                     sess_timer_nego_t nb;
                     b2b_leg_t *al = &c->leg[0];
                     uint64_t nm = now_ms();
@@ -2296,6 +2326,7 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                         }
                     }
                 }
+                } /* closes profile guard block */
                 send_ack_leg(c, 1);
                 if (!reinv) {
                     /* 向 A 透传 2xx，等 A 腿 ACK 后确认 */

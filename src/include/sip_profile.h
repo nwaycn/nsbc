@@ -78,6 +78,24 @@ typedef struct sip_profile {
     int enable_prack;                      /* RFC 3262 100rel/PRACK，默认 0 */
     int enable_update;                     /* RFC 3311 UPDATE，默认 1 */
     int enable_t140;                       /* T.140 text over SIP INFO，默认 0 */
+    int enable_precondition;               /* RFC 3312 Precondition SDP 前提条件
+                                              1=启用：Supported 通告 "precondition" +
+                                                media_bridge 在 offer/answer 侧检测
+                                                a=des/a=curr → 未 met 时 RTP gate=LOCKED
+                                              0=关闭（默认）：不通告、不检测、RTP 直接通
+                                              IMS PCC/PCF 场景开启；普通 PSTN/SIP 中继关闭 */
+    int enable_timer;                      /* RFC 4028 Session Timer 会话刷新
+                                              1=启用：Supported 通告 "timer" +
+                                                sess_timer_uas_negotiate +
+                                                sess_timer_arm/refresh/expire 全部生效
+                                              0=关闭（默认）：不透传、不协商、不 arm timer
+                                              运营商/IMS 场景通常开启；企业 PBX 可关 */
+    int enable_gruu;                       /* RFC 5627 GRUU +sip.instance
+                                              1=启用：Supported 通告 "gruu" +
+                                                出站 Contact 拼 +sip.instance="<uuid>"
+                                                （需要 cfg.gruu_instance_id 非空，
+                                                  profile 开关只负责拼不拼）
+                                              0=关闭（默认）：Contact 里无 +sip.instance */
 
     /* ---- DTMF ---- */
     profile_dtmf_mode_t dtmf_mode;         /* 默认 PROFILE_DTMF_RFC4733 */

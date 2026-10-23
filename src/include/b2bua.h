@@ -181,6 +181,13 @@ struct b2b_call {
     /* REQ-MEDIA-DP-001：拨号规则级媒体模式 override（0=auto,1=bypass,2=relay）
      * media_bridge 在 bridge_decide 时从 call 里读，WebRTC 强制 SRTP_RELAY 不受影响 */
     uint8_t media_mode;
+    /* ★ 拨号规则级 3GPP IMS 强制覆盖（从 dp_result_t 透传，三态：0=auto/1=开/2=关）
+     * 优先级链：call->force_* (dialplan route) → call->prof->enable_* (profile) → 默认
+     * 例：IMS 中继 route 强制 force_precondition=1，老 PSTN 中继强制 force_precondition=2 */
+    uint8_t force_prack;
+    uint8_t force_precondition;
+    uint8_t force_timer;
+    uint8_t force_gruu;
     char codec_a[32];
     char codec_b[32];
     uint8_t rtp_loss_pct;

@@ -622,6 +622,13 @@ static int resolve_cb(b2b_call_t *call, const char *ruri, size_t ruri_len,
         /* REQ-MEDIA-DP-001：拨号规则级媒体模式透传到 b2b_call → media_bridge */
         call->media_mode = dres.media_mode;
     }
+    /* ★ 3GPP IMS 协议特性 dialplan route 级强制覆盖透传（三态 0/1/2） */
+    if (dp_ok && call) {
+        call->force_prack        = dres.force_prack;
+        call->force_precondition = dres.force_precondition;
+        call->force_timer        = dres.force_timer;
+        call->force_gruu         = dres.force_gruu;
+    }
     /* FreeSWITCH 风格精细化主叫覆盖：origination_caller_id_number/name 透传
      * orig_caller_id_num 只填 user part，host 在 b2bua.c From 构造时根据 trunk 自动补 */
     if (dp_ok && call) {

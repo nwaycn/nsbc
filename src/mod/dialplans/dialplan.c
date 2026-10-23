@@ -394,6 +394,11 @@ int dp_execute(const dp_ctx_t *ctx, const dp_call_t *call, dp_result_t *res)
         res->rule_id = r->id;
         res->rec_action = r->rec_action;
         res->media_mode = r->media_mode;   /* REQ-MEDIA-DP-001：媒体模式透传到 media_bridge */
+        /* ★ 3GPP IMS 协议特性强制覆盖（三态 0/1/2）透传到 b2b_call → b2bua/media_bridge */
+        res->force_prack        = r->force_prack;
+        res->force_precondition = r->force_precondition;
+        res->force_timer        = r->force_timer;
+        res->force_gruu         = r->force_gruu;
         snprintf(res->rec_path_template, sizeof(res->rec_path_template), "%s", r->rec_path_template);
         if (clip_sub[0])
             snprintf(res->clip, sizeof(res->clip), "%s", clip_sub);

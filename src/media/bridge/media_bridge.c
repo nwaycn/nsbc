@@ -11,6 +11,7 @@
 #endif
 #include "media_bridge.h"
 #include "b2bua.h"        /* b2b_call_t.muted[] — uuid_mute 静音标志 */
+#include "sip_profile.h"  /* sip_profile_t.enable_precondition — RFC 3312 gate 守卫 */
 #include "sdp.h"
 #include "rtp.h"
 #include "sip_common.h"   /* sip_ci_eq */
@@ -2379,17 +2380,25 @@ int bridge_offer_hook(void *call, const char *in, size_t inlen,
         llog(LOG_WARN, "media", "offer_hook: entry_get NOMEM call=%p", call);
         return NSBC_NOMEM;
     }
-    /* ★ RFC 3312 Precondition 前提条件门控：offer 侧解析 SDP 检测是否带
-     * Require: precondition 或 a=des:qos mandatory ——置 precond_active=1。
-     * met 状态 offer 侧不可能有（需要 answer 的 a=curr），保持 0 让 gate=LOCKED。 */
+    /* ★ RFC 3312 Precondition 前提条件门控：
+     * profile->enable_precondition=0（企业 PBX 等场景关闭）→ 永远置 0，gate 常开；
+     * profile=NULL（无归属 profile）→ 默认关闭（普通 PSTN/SIP 中继场景）。
+     * 只有显式 enable_precondition=1 的 profile 才解析 a=des/a=curr。 */
     e->precond_active = 0;
     e->precond_met = 0;
-    if (inlen > 0) {
-        sdp_t s; memset(&s, 0, sizeof(s));
-        if (sdp_parse(&s, in, inlen) == NSBC_OK && s.nmedia > 0) {
-            e->precond_active = (uint8_t)sdp_media_preconditions_active(&s.media[0]);
-            if (e->precond_active)
-                llog(LOG_INFO, "media", "offer_hook: precondition ACTIVE (wait answer met)");
+    {
+        /* ★ 三层守卫：cfg（无）→ force_precondition (dialplan 三态) → profile.enable_precondition */
+        sip_profile_t *pr = call ? call->prof : NULL;
+        int prof_en = pr && pr->enable_precondition;  /* profile NULL 默认关 */
+        int force_f = call ? call->force_precondition : 0;
+        int enabled = (force_f == 1) ? 1 : (force_f == 2 ? 0 : prof_en);
+        if (enabled && inlen > 0) {
+            sdp_t s; memset(&s, 0, sizeof(s));
+            if (sdp_parse(&s, in, inlen) == NSBC_OK && s.nmedia > 0) {
+                e->precond_active = (uint8_t)sdp_media_preconditions_active(&s.media[0]);
+                if (e->precond_active)
+                    llog(LOG_INFO, "media", "offer_hook: precondition ACTIVE (wait answer met)");
+            }
         }
     }
     /* ★ REQ-NAT-002：per-call NAT 公网 RTP IP —— offer 阶段查一次缓存到 cnode，
@@ -2766,18 +2775,23 @@ int bridge_answer_hook(void *call, const char *in, size_t inlen,
         out[inlen < outsz ? inlen : outsz - 1] = '\0';
         return NSBC_NOTSUP;
     }
-    /* ★ RFC 3312 Precondition met 检测：answer 侧解析 SDP 看 a=curr 是否
-     * 覆盖 offer 侧所有 mandatory des —— met=1 时 relay_recv_one gate 打开 */
-    if (inlen > 0) {
-        sdp_t s; memset(&s, 0, sizeof(s));
-        if (sdp_parse(&s, in, inlen) == NSBC_OK && s.nmedia > 0) {
-            /* answer 侧也可能有独立的 precondition（B 腿回 Require） */
-            if (sdp_media_preconditions_active(&s.media[0]))
-                e->precond_active = 1;
-            int new_met = sdp_media_preconditions_met(&s.media[0]);
-            if (new_met && !e->precond_met)
-                llog(LOG_INFO, "media", "answer_hook: precondition MET (gate OPEN)");
-            e->precond_met = (uint8_t)new_met;
+    /* ★ RFC 3312 Precondition met 检测：
+     * 三层守卫同 offer_hook：force_precondition (dialplan) → profile.enable_precondition */
+    {
+        sip_profile_t *pr = call ? call->prof : NULL;
+        int prof_en = pr && pr->enable_precondition;
+        int force_f = call ? call->force_precondition : 0;
+        int enabled = (force_f == 1) ? 1 : (force_f == 2 ? 0 : prof_en);
+        if (enabled && inlen > 0) {
+            sdp_t s; memset(&s, 0, sizeof(s));
+            if (sdp_parse(&s, in, inlen) == NSBC_OK && s.nmedia > 0) {
+                if (sdp_media_preconditions_active(&s.media[0]))
+                    e->precond_active = 1;
+                int new_met = sdp_media_preconditions_met(&s.media[0]);
+                if (new_met && !e->precond_met)
+                    llog(LOG_INFO, "media", "answer_hook: precondition MET (gate OPEN)");
+                e->precond_met = (uint8_t)new_met;
+            }
         }
     }
     relay_ports_t ports;
