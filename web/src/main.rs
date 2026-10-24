@@ -658,7 +658,6 @@ async fn handle_tls_stream(
     );
     let _ = hyper::server::conn::http1::Builder::new()
         .keep_alive(true)
-        .header_read_timeout(Duration::from_secs(10))
         .serve_connection(io, svc)
         .await;
 }
