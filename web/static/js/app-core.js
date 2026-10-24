@@ -133,8 +133,8 @@ const QueueMembersEditor = {
       </div>
       <div v-if="!rows.length" class="px-3 py-6 text-center text-gray-400 text-sm">{{ t('No members') }}</div>
       <div v-for="(row, idx) in rows" :key="idx" class="struct-row">
-        <input v-model="row.extension" :placeholder="t('$n')" class="w-32">
-        <input v-model.number="row.weight" type="number" min="1" max="100" :placeholder="t('$n')" class="w-20">
+        <input v-model="row.extension" placeholder="Extension" class="w-32">
+        <input v-model.number="row.weight" type="number" min="1" max="100" placeholder="Weight" class="w-20">
         <label class="flex items-center gap-1 text-xs">
           <input type="checkbox" v-model="row.enabled"> Enable
         </label>
@@ -155,38 +155,188 @@ const QueueMembersEditor = {
   },
 };
 
-// 3) IVR 按Key选项（options_json → JSON 数组）
-const IvrOptionsEditor = {
+// 4) IVR 菜单树编辑器（REQ-PBX-IVR-004：与 C 侧 ivr_node_t 1:1 对齐的 JSON 树）
+//    每个节点：prompt/timeout/retries + choices + timeout_action + invalid_action
+//    choices 的 act 支持 submenu（跨节点跳转）/transfer/play/hangup/voicemail/http
+const IvrTreeEditor = {
   props: ['modelValue'],
   template: `
     <div class="struct-editor">
       <div class="struct-header">
-        <span class="font-semibold">{{ t('Key Options') }} ({{ rows.length }})</span>
-        <span class="text-gray-400 text-[11px]">key=0-9/*/#  target=extension/queue/ivr/vm</span>
+        <span class="font-semibold">{{ t('IVR Menu Tree') }} ({{ nodes.length }} {{ t('nodes') }})</span>
+        <span class="text-gray-400 text-[11px]">{{ t('entry node:') }} <b>{{ entryNode || 'main' }}</b>
+          · {{ t('act:') }} submenu / transfer / play / hangup / vm / http
+          · {{ t('choices key 0-9/*/#; act=submenu arg=other_node_name jumps to that node') }}
+        </span>
       </div>
-      <div v-if="!rows.length" class="px-3 py-6 text-center text-gray-400 text-sm">{{ t('No options') }}</div>
-      <div v-for="(row, idx) in rows" :key="idx" class="struct-row">
-        <select v-model="row.key" class="w-20">
-          <option v-for="k in ['0','1','2','3','4','5','6','7','8','9','*','#']" :key="k" :value="k">{{ k }}</option>
-        </select>
-        <span class="text-gray-400">→</span>
-        <input v-model="row.target" :placeholder="t('$n')" class="flex-1">
-        <i class="fa-solid fa-trash struct-del ml-2" @click="rows.splice(idx,1)"></i>
+      <div v-if="!nodes.length" class="px-3 py-6 text-center text-gray-400 text-sm">{{ t('No nodes — add one to start') }}</div>
+
+      <!-- 节点卡片列表 -->
+      <div v-for="(node, ni) in nodes" :key="ni"
+           class="border border-slate-200 rounded-lg mb-3 bg-white shadow-sm overflow-hidden">
+        <!-- 节点头 -->
+        <div class="px-3 py-2 bg-slate-50 flex items-center gap-2 border-b">
+          <i class="fa-solid fa-branch text-blue-600"></i>
+          <input v-model="node.name" class="w-32 text-sm font-mono" placeholder="node_name">
+          <input v-model="node.prompt" class="flex-1 text-sm" placeholder="prompt audio (e.g. welcome.wav)">
+          <i v-if="nodes.length > 1" class="fa-solid fa-trash text-red-500 cursor-pointer hover:text-red-700"
+             @click="nodes.splice(ni,1)"></i>
+        </div>
+
+        <!-- 节点超时配置 -->
+        <div class="px-3 py-2 bg-slate-50/50 flex flex-wrap gap-3 border-b text-sm">
+          <label class="flex items-center gap-1 text-gray-600">
+            {{ t('Initial timeout (s)') }}
+            <input type="number" v-model.number="node.initial_timeout_s" min="1" max="120" class="w-14 text-center border rounded">
+          </label>
+          <label class="flex items-center gap-1 text-gray-600">
+            {{ t('Interdigit (s)') }}
+            <input type="number" v-model.number="node.interdigit_timeout_s" min="1" max="60" class="w-14 text-center border rounded">
+          </label>
+          <label class="flex items-center gap-1 text-gray-600">
+            {{ t('Max retries') }}
+            <input type="number" v-model.number="node.max_retries" min="1" max="10" class="w-14 text-center border rounded">
+          </label>
+        </div>
+
+        <!-- 按键选项表 -->
+        <div class="px-3 py-2 border-b">
+          <div class="text-xs text-gray-500 mb-1">{{ t('Digit Choices') }} ({{ node.choices.length }})</div>
+          <div v-if="!node.choices.length" class="text-gray-300 text-xs italic mb-2">{{ t('no choices yet') }}</div>
+          <div v-for="(ch, ci) in node.choices" :key="ci" class="flex items-center gap-1 mb-1">
+            <select v-model="ch.key" class="w-16 text-sm">
+              <option v-for="k in ['0','1','2','3','4','5','6','7','8','9','*','#']" :key="k" :value="k">{{ k }}</option>
+            </select>
+            <select v-model="ch.act" class="w-24 text-sm">
+              <option value="submenu">{{ t('submenu') }}</option>
+              <option value="transfer">{{ t('transfer') }}</option>
+              <option value="play">{{ t('play') }}</option>
+              <option value="hangup">{{ t('hangup') }}</option>
+              <option value="voicemail">{{ t('voicemail') }}</option>
+              <option value="http_query">{{ t('http_query') }}</option>
+            </select>
+            <input v-model="ch.arg" class="flex-1 text-sm"
+                   :placeholder="ch.act==='submenu' ? 'target node name (e.g. sales)' :
+                                ch.act==='transfer' ? 'target ext/queue (e.g. 1000)' :
+                                ch.act==='play' ? 'audio file path' :
+                                ch.act==='http_query' ? 'URL' : ''">
+            <i class="fa-solid fa-trash text-gray-300 hover:text-red-500 cursor-pointer text-xs ml-1"
+               @click="node.choices.splice(ci,1)"></i>
+          </div>
+          <div class="text-blue-600 text-xs cursor-pointer hover:text-blue-800"
+               @click="node.choices.push({key:'1',act:'transfer',arg:''})">
+            <i class="fa-solid fa-plus mr-1"></i>{{ t('Add choice') }}
+          </div>
+        </div>
+
+        <!-- timeout_action / invalid_action -->
+        <div class="px-3 py-2 flex gap-3 text-xs">
+          <div class="flex-1 border-r pr-3">
+            <div class="text-gray-500 mb-1">{{ t('Timeout Action (after retries exhausted)') }}</div>
+            <div class="flex gap-1">
+              <select v-model="node.timeout_action.act" class="w-24">
+                <option value="hangup">{{ t('hangup') }}</option>
+                <option value="transfer">{{ t('transfer') }}</option>
+                <option value="play">{{ t('play') }}</option>
+              </select>
+              <input v-model="node.timeout_action.arg" class="flex-1" placeholder="target or audio">
+            </div>
+          </div>
+          <div class="flex-1">
+            <div class="text-gray-500 mb-1">{{ t('Invalid Action (unmatched digit)') }}</div>
+            <div class="flex gap-1">
+              <select v-model="node.invalid_action.act" class="w-24">
+                <option value="hangup">{{ t('hangup') }}</option>
+                <option value="transfer">{{ t('transfer') }}</option>
+                <option value="play">{{ t('play') }}</option>
+              </select>
+              <input v-model="node.invalid_action.arg" class="flex-1" placeholder="target or audio">
+            </div>
+          </div>
+        </div>
       </div>
-      <div class="struct-add" @click="rows.push({key:'1',target:''})"><i class="fa-solid fa-plus mr-1"></i>{{ t('Add key option') }}</div>
+
+      <!-- 底部：加节点 + 入口节点提示 -->
+      <div class="flex items-center gap-2 mt-2">
+        <div class="text-blue-600 text-xs cursor-pointer hover:text-blue-800 flex items-center gap-1"
+             @click="addNode">
+          <i class="fa-solid fa-plus"></i>{{ t('Add node') }}
+        </div>
+        <span class="text-gray-300">|</span>
+        <span class="text-gray-500 text-xs">{{ t('Tip: set entry_node field (above) to match a node.name') }}</span>
+      </div>
     </div>
   `,
   setup(props, { emit }) {
-    const rows = ref([]);
-    let _s = false;
-    function syncFrom() { _s = true; rows.value = JSON.parse(props.modelValue || '[]'); if (!rows.value.length) rows.value.push({key:'1',target:''}); _s = false; }
-    function syncTo()  { if (_s) return; emit('update:modelValue', JSON.stringify(rows.value)); }
+    const nodes = ref([]);
+    const entryNode = ref('main');
+    let _syncing = false;
+
+    function normalizeNode(n) {
+      return {
+        name: n.name || '',
+        prompt: n.prompt || '',
+        initial_timeout_s: n.initial_timeout_s || 5,
+        interdigit_timeout_s: n.interdigit_timeout_s || 3,
+        max_retries: n.max_retries || 3,
+        choices: (n.choices || []).map(c => ({
+          key: c.key || '1',
+          act: c.act || c.action?.act || 'transfer',
+          arg: c.arg || c.action?.arg || ''
+        })),
+        timeout_action: n.timeout_action || { act: 'hangup', arg: '' },
+        invalid_action: n.invalid_action || { act: 'hangup', arg: '' },
+      };
+    }
+
+    function syncFrom() {
+      _syncing = true;
+      try {
+        const raw = props.modelValue || '';
+        if (raw.startsWith('[')) {
+          const parsed = JSON.parse(raw);
+          nodes.value = (Array.isArray(parsed) ? parsed : []).map(normalizeNode);
+        } else {
+          // 旧前端发的扁平 options_json — 转换成单一 main 节点
+          const flat = raw ? JSON.parse(raw) : [];
+          const choices = (Array.isArray(flat) ? flat : []).map(o => ({
+            key: o.key || '1',
+            act: o.act || 'transfer',
+            arg: o.arg || o.target || ''
+          }));
+          nodes.value = [{
+            name: 'main', prompt: '',
+            initial_timeout_s: 5, interdigit_timeout_s: 3, max_retries: 3,
+            choices, timeout_action: { act: 'hangup', arg: '' },
+            invalid_action: { act: 'hangup', arg: '' },
+          }];
+          entryNode.value = 'main';
+        }
+        if (!nodes.value.length) nodes.value.push(normalizeNode({name:'main'}));
+      } catch(e) {
+        nodes.value = [normalizeNode({name:'main'})];
+      }
+      _syncing = false;
+    }
+    function syncTo() {
+      if (_syncing) return;
+      emit('update:modelValue', JSON.stringify(nodes.value));
+    }
+
+    function addNode() {
+      nodes.value.push(normalizeNode({ name: 'node_' + (nodes.value.length + 1) }));
+    }
+
     watch(() => props.modelValue, syncFrom);
-    watch(rows, syncTo, { deep: true });
+    watch(nodes, syncTo, { deep: true });
     syncFrom();
-    return { rows };
+    return { nodes, entryNode, addNode };
   },
 };
+
+// 旧 IvrOptionsEditor 保留做兼容（后端 options_json 字段仍可读写），
+// 新菜单统一用 IvrTreeEditor + nodes_json。
+const IvrOptionsEditor = IvrTreeEditor;
 
 // 4) Trunk Codec Set（逗号分隔字符串 "PCMA,PCMU,G729"）
 const TRUNK_CODECS = ['PCMA','PCMU','G711U','G711A','G729','G722','G722.2','ILBC','OPUS','SPEEX','GSM','AMR','AMR-WB'];
@@ -236,7 +386,7 @@ const DialplanActionEditor = {
         <div class="text-[11px] text-gray-500 font-semibold pt-0.5">{{ t('─ Number Rewrite ─') }}</div>
         <div class="struct-row">
           <span class="struct-label w-40 shrink-0">{{ t('clip forced CLIP') }}</span>
-          <input v-model="action.clip" :placeholder="t('$n')">
+          <input v-model="action.clip" placeholder="e.g. 1234567890">
         </div>
         <div class="struct-row">
           <label class="inline-flex items-center gap-1.5">
@@ -259,7 +409,7 @@ const DialplanActionEditor = {
         </div>
         <div class="struct-row">
           <span class="struct-label w-40 shrink-0">{{ t('sip_from_uri URI part') }}</span>
-          <input v-model="action.sip_from_uri" :placeholder="t('$n')">
+          <input v-model="action.sip_from_uri" placeholder="e.g. sip:user@domain">
           <span class="hint">{{ t('component') }}</span>
         </div>
         <div class="struct-row">
@@ -292,16 +442,16 @@ const DialplanActionEditor = {
         <div class="text-[11px] text-gray-500 font-semibold pt-2">─ To / R-URI / Contact ─</div>
         <div class="struct-row">
           <span class="struct-label w-40 shrink-0">{{ t('sip_invite_to_uri To override') }}</span>
-          <input v-model="action.sip_invite_to_uri" :placeholder="t('$n')">
+          <input v-model="action.sip_invite_to_uri" placeholder="e.g. sip:user@domain">
         </div>
         <div class="struct-row">
           <span class="struct-label w-40 shrink-0">sip_invite_to_params</span>
-          <input v-model="action.sip_invite_to_params" :placeholder="t('$n')">
+          <input v-model="action.sip_invite_to_params" placeholder="e.g. transport=ws">
           <span class="hint">To params</span>
         </div>
         <div class="struct-row">
           <span class="struct-label w-40 shrink-0">sip_invite_req_uri R-URI</span>
-          <input v-model="action.sip_invite_req_uri" :placeholder="t('$n')">
+          <input v-model="action.sip_invite_req_uri" placeholder="e.g. sip:user@domain">
         </div>
         <div class="struct-row">
           <span class="struct-label w-40 shrink-0">sip_invite_tel_params</span>
@@ -310,7 +460,7 @@ const DialplanActionEditor = {
         </div>
         <div class="struct-row">
           <span class="struct-label w-40 shrink-0">sip_invite_contact_params</span>
-          <input v-model="action.sip_invite_contact_params" :placeholder="t('$n')">
+          <input v-model="action.sip_invite_contact_params" placeholder="e.g. transport=ws;ob">
           <span class="hint">Contact params</span>
         </div>
 
@@ -318,7 +468,7 @@ const DialplanActionEditor = {
         <div class="text-[11px] text-gray-500 font-semibold pt-2">─ Domain override ─</div>
         <div class="struct-row">
           <span class="struct-label w-40 shrink-0">{{ t('sip_invite_domain Forced domain') }}</span>
-          <input v-model="action.sip_invite_domain" :placeholder="t('$n')">
+          <input v-model="action.sip_invite_domain" placeholder="e.g. nsbc.local">
           <span class="hint">{{ t('global host replace') }}</span>
         </div>
 
@@ -326,7 +476,7 @@ const DialplanActionEditor = {
         <div class="text-[11px] text-gray-500 font-semibold pt-2">{{ t('─ Extra SIP Headers (injected into extra block) ─') }}</div>
         <div class="struct-row">
           <span class="struct-label w-40 shrink-0">sip_invite_pid_params</span>
-          <input v-model="action.sip_invite_pid_params" :placeholder="t('$n')">
+          <input v-model="action.sip_invite_pid_params" placeholder="e.g. P-Asserted-Identity: <sip:...>
           <span class="hint">{{ t('full header line or shorthand') }}</span>
         </div>
         <div class="struct-row flex-wrap items-start">
@@ -444,7 +594,7 @@ const AppChainEditor = {
       <div class="px-3 py-3 bg-white space-y-2">
         <!-- 添加Action -->
         <div class="flex items-center gap-2">
-          <el-select v-model="nextApp" :placeholder="t('$n')" style="flex:1" size="small" filterable>
+          <el-select v-model="nextApp" placeholder="Select app to add..." style="flex:1" size="small" filterable>
             <el-option-group v-for="g in appGroups" :key="g.label" :label="g.label">
               <el-option v-for="a in g.apps" :key="a.name" :value="a.name" :label="a.name + ' — ' + a.desc">
                 <div class="flex justify-between items-center w-full">
@@ -696,6 +846,7 @@ const app = createApp({
       { path: '/tenants',      label: t('Tenant (SIP Realm)'), icon: 'fa-solid fa-building' },
       { path: '/extensions',   label: t('Extension'),     icon: 'fa-solid fa-phone' },
       { path: '/sip-profiles', label: 'SIP Profile', icon: 'fa-solid fa-network-wired' },
+      { path: '/config',       label: t('Config Hot-Editor'), icon: 'fa-solid fa-sliders' },
       { path: '/gateways',     label: t('Gateway'),     icon: 'fa-solid fa-tower-broadcast' },
       { path: '/trunks',       label: t('Trunk'),     icon: 'fa-solid fa-signal' },
       // 路由组已移到后端Core侧（nsbcd route_group_t），Web 侧暂不暴露
@@ -707,6 +858,7 @@ const app = createApp({
       { path: '/rates',        label: t('Rates'), icon: 'fa-solid fa-coins' },
       { path: '/balances',     label: t('Balances'), icon: 'fa-solid fa-wallet' },
       { path: '/transcode',    label: t('MediaSession'), icon: 'fa-solid fa-microphone' },
+      { path: '/codecs',       label: t('Codec Registry'), icon: 'fa-solid fa-code' },
       // 系统
       { path: '/ha-groups',    label: t('HA Groups'), icon: 'fa-solid fa-server' },
       // 工具
@@ -785,10 +937,10 @@ function crudTable(entity, path, columns, formSchema, asyncLoaders = null) {
         <div class="flex items-center justify-between">
           <h2 class="text-lg font-semibold text-slate-800"><i class="${entity.icon} mr-2 text-blue-600"></i>${entity.label}</h2>
           <div class="flex items-center gap-2">
-            <el-select v-if="hasBoolColumn" v-model="filterEnabled" :placeholder="t('$n')" size="small" style="width:110px" clearable>
-              <el-option :label="t('$n')" value=""></el-option>
-              <el-option :label="t('$n')" value="true"></el-option>
-              <el-option :label="t('$n')" value="false"></el-option>
+            <el-select v-if="hasBoolColumn" v-model="filterEnabled" placeholder="All" size="small" style="width:110px" clearable>
+              <el-option label="All" value=""></el-option>
+              <el-option label="Enabled" value="true"></el-option>
+              <el-option label="Disabled" value="false"></el-option>
             </el-select>
             <el-button type="primary" size="small" @click="openCreate">
               <el-icon><Plus /></el-icon>New
@@ -807,13 +959,13 @@ function crudTable(entity, path, columns, formSchema, asyncLoaders = null) {
               <span v-else class="text-slate-700">{{ row[c.key] != null && row[c.key] !== '' ? row[c.key] : '-' }}</span>
             </template>
           </el-table-column>
-          <el-table-column :label="t('$n')" width="180" align="center" fixed="right">
+          <el-table-column label="Actions" width="180" align="center" fixed="right">
             <template #default="{ row }">
               <div style="display:flex; gap:4px; justify-content:center; align-items:center; flex-wrap:nowrap;">
                 <el-button link type="primary" size="small" @click="openEdit(row)">
                   <el-icon><Edit /></el-icon>Edit
                 </el-button>
-                <el-popconfirm :title="t('$n')" @confirm="del(row.id)">
+                <el-popconfirm title="Delete this record?" @confirm="del(row.id)">
                   <template #reference>
                     <el-button link type="danger" size="small">
                       <el-icon><Delete /></el-icon>Delete
@@ -836,21 +988,21 @@ function crudTable(entity, path, columns, formSchema, asyncLoaders = null) {
           ></el-pagination>
         </div>
 
-        <el-dialog v-model="showModal" ::title="t('$n')" width="720px" destroy-on-close>
+        <el-dialog v-model="showModal" :title="editingId ? 'Edit' : 'Create New'" width="720px" destroy-on-close>
           <el-form :model="form" label-position="top">
             <el-form-item v-for="f in formSchema" :key="f.key" :label="f.label">
               <template v-if="f.type === 'select'">
-                <el-select v-model="form[f.key]" :placeholder="t('$n')" style="width:100%" clearable>
+                <el-select v-model="form[f.key]" placeholder="Please select" style="width:100%" clearable>
                   <el-option v-for="o in f.options" :key="o.value" :label="o.label" :value="o.value"></el-option>
                 </el-select>
               </template>
               <template v-else-if="f.type === 'async-select'">
-                <el-select v-model="form[f.key]" :placeholder="t('$n')" style="width:100%" clearable :loading="asyncLoading[f.key]">
+                <el-select v-model="form[f.key]" placeholder="Loading options..." style="width:100%" clearable :loading="asyncLoading[f.key]">
                   <el-option v-for="o in asyncOptions[f.key]" :key="o.value" :label="o.label" :value="o.value"></el-option>
                 </el-select>
               </template>
               <el-input-number v-else-if="f.type === 'number'" v-model="form[f.key]" :controls="false" style="width:100%"></el-input-number>
-              <el-switch v-else-if="f.type === 'bool'" v-model="form[f.key]" :active-text="t('$n')" :inactive-text="t('$n')"></el-switch>
+              <el-switch v-else-if="f.type === 'bool'" v-model="form[f.key]" active-text="ON" inactive-text="OFF"></el-switch>
               <template v-else-if="f.type === 'json'">
                 <div class="w-full">
                   <div class="flex justify-between items-center mb-1">
@@ -872,8 +1024,8 @@ function crudTable(entity, path, columns, formSchema, asyncLoaders = null) {
                 </div>
               </template>
               <el-input v-else-if="f.type === 'textarea'" v-model="form[f.key]" type="textarea" :rows="3" resize="vertical"></el-input>
-              <el-input v-else-if="f.type === 'password'" v-model="form[f.key]" type="password" show-password ::placeholder="t('$n')"></el-input>
-              <el-input v-else v-model="form[f.key]" ::placeholder="t('$n')"></el-input>
+              <el-input v-else-if="f.type === 'password'" v-model="form[f.key]" type="password" show-password placeholder="••••••••"></el-input>
+              <el-input v-else v-model="form[f.key]" placeholder="••••••••"></el-input>
               <div v-if="f.help" class="text-xs text-slate-400 mt-1">{{ f.help }}</div>
             </el-form-item>
           </el-form>
@@ -1181,3 +1333,5 @@ window.nsbcHangup = async function(callId) {
   // 延迟启动，等首帧/登录态就绪
   setTimeout(streamLoop, 1500);
 })();
+
+

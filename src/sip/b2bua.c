@@ -583,10 +583,11 @@ static void call_destroy(b2b_call_t *c)
     c->dead = 1;
     llog(LOG_INFO, "b2b", "call_destroy BEGIN callid=%s a_state=%d b_state=%d a_final=%d",
          c->leg[0].callid, c->leg[0].state, c->leg[1].state, c->a_final);
-    /* SIP Profile active_calls 对称递减（handle_new_invite 归属时 +1 配对） */
+    /* SIP Profile active_calls 对称递减（handle_new_invite 归属时 +1 配对）。
+     * ★ 注意：不能在这里置 c->prof=NULL —— 后面 g_end_hooks / on_end / b2b_emit_cdr(END)
+     * 都要读 c->prof->name 发事件。真正的 NULL 赋值在 mem_obj_release 之前。 */
     if (c->prof) {
         __sync_fetch_and_sub(&c->prof->active_calls, 1u);
-        c->prof = NULL;
     }
     disarm_noanswer_timer(c); /* catch-all：所有终止路径最终走到这里 */
     /* Session Timer: disarm all timer nodes */
@@ -652,12 +653,17 @@ static void call_destroy(b2b_call_t *c)
             if (n >= sizeof(call_destroy_callee)) n = sizeof(call_destroy_callee) - 1;
             memcpy(call_destroy_callee, p, n); call_destroy_callee[n] = '\0';
         }
+        char destroy_rec_path[CDR_REC_MAX] = {0};
         recording_apply_dp_action(co->cfg.rec_mgr, 2,
                                   c->leg[0].callid, "call_destroy",
                                   NULL,
                                   call_destroy_caller[0] ? call_destroy_caller : NULL,
                                   call_destroy_callee[0] ? call_destroy_callee : NULL,
-                                  NULL, 0);
+                                  destroy_rec_path, sizeof(destroy_rec_path));
+        /* 录音终态路径存进 call 对象：b2b_emit_cdr(END) 会把它写进 CDR，
+         * 之前传 NULL 导致 Web 端“录音”列永远是 '-'。 */
+        if (destroy_rec_path[0] && !c->rec_path[0])
+            snprintf(c->rec_path, sizeof(c->rec_path), "%s", destroy_rec_path);
     }
     /* REQ-MEDIA-BUG-001：per-call bugs 自动清理
      * ——global consumers 不依赖 call_key，不受 call_destroy 影响；
@@ -674,12 +680,22 @@ static void call_destroy(b2b_call_t *c)
                           c->a_final,
                           g_end_hooks[i].ud);
 
+    if (c->active)
+        add_atomic(&co->active, -1);
+    /* on_end（sig_on_end_cb）必须先于 b2b_emit_cdr(END) 执行：
+     * 里面从 bridge 视图计算 rtp_loss_pct/rtp_jitter_ms/mos_x1000 并存回 c，
+     * 兜底停录音产生 c->rec_path——这些字段是 END ev 的数据源。
+     * 旧顺序（emit → push → on_end）导致 END ev 拿不到 VQ/rec_path。 */
+    if (co->cfg.on_end)
+        co->cfg.on_end(c, co->cfg.end_ud);
+
     /* REQ-PBX-CDR-001：END emit — 所有 end hooks 跑完后统一发，
-     * 此时 a_final/cause 等终态字段已确定，billing 模块按 call_id 聚合 END 写库。*/
+     * 此时 a_final/cause 等终态字段已确定，billing 模块按 call_id 聚合 END 写库。
+     * b2b_emit_cdr END 分支同时把完整 ev 序列化进 c->cdr_json（供下方 SESSION_END 推送）。 */
     b2b_emit_cdr(c, CDR_PHASE_END);
 
     /* 白皮书 §10.3：所有 hook 跑完后统一发聚合 SESSION_END 事件。
-     * payload 携带完整 CDR 快照（billing_cdr_cb 已写入 c->cdr_json 或类似）。
+     * payload 携带完整 CDR 快照（b2b_emit_cdr END 已写入 c->cdr_json）。
      * event_handler_trigger 是同步订阅链（SESSION_CREATE/ANSWER/END），
      * nsbc_event_push 是异步 Per-Core Ring（双通道）。
      *
@@ -690,15 +706,13 @@ static void call_destroy(b2b_call_t *c)
      * cause 取 A 腿最终状态码。*/
     {
         int dir_out = c->orig_caller_id_num[0] != '\0';
-        /* 优先复用 signaling.c 填完的完整 CDR JSON（含 codec/IP/媒体质量等）。
-         * cdr_json 为空（signaling.c 链路异常降级）时，回退到残缺 snprintf。 */
         char end_json[1024];
         if (c->cdr_json[0]) {
-            /* signaling.c 的 cdr_event_to_json 产出的完整 JSON，直接透传 UDS */
+            /* b2b_emit_cdr(END) 产出的完整 CDR JSON，直接透传 UDS */
             snprintf(end_json, sizeof(end_json), "%s", c->cdr_json);
         } else {
-            /* P0 降级：signaling.c 的 CDR END 链路没跑到或编不过 cdr_event_to_json
-             * （比如缺少 -lcjson）——用最简 snprintf 保底，UDS/Rust 侧空串保护兜底 */
+            /* P0 降级：CDR END 链路异常（c->cdr_json 没填上）——
+             * 最简 snprintf 保底，UDS/Rust 侧空串保护兜底 */
             snprintf(end_json, sizeof(end_json),
                 "{\"event\":\"end\",\"call_id\":\"%s\",\"from\":\"%s\",\"to\":\"%s\","
                 "\"state\":\"terminated\",\"dir\":\"%s\",\"cause\":%d,"
@@ -719,10 +733,6 @@ static void call_destroy(b2b_call_t *c)
         uds_send_session(end_json);
     }
 
-    if (c->active)
-        add_atomic(&co->active, -1);
-    if (co->cfg.on_end)
-        co->cfg.on_end(c, co->cfg.end_ud);
     /* REQ-CHAN-VAR-001：per-call 通道变量销毁（必须在 mem_obj_release 之前，
      * 因为 slab 复用会把槽归零——不提前 destroy 会泄漏 arena-backed 哈希表）。
      * 懒初始化：vars 可能一直是 NULL（呼叫全程没 setvar）。 */
@@ -730,6 +740,11 @@ static void call_destroy(b2b_call_t *c)
         chan_var_destroy(c->vars);
         c->vars = NULL;
     }
+    /* 所有事件/回调跑完后再置 NULL —— 保证 g_end_hooks / on_end / b2b_emit_cdr(END)
+     * / SESSION_END 发事件时 c->prof / c->out_prof 还有效。mem_obj_release 之后
+     * 内存就被 slab 回收复用了。 */
+    c->prof = NULL;
+    c->out_prof = NULL;
     mem_obj_release(c);
 }
 
@@ -764,11 +779,12 @@ static void route_block(const b2b_leg_t *l, char *out, size_t outsz)
     out[0] = '\0';
     size_t used = 0;
     /* IMS Service-Route（RFC 3608）：最前——UE 后续 INVITE Route 链的第一个
-     * hop 必须是 registrar 返回的 Service-Route 值。格式：registrar 存的是
-     * 纯 URI "sip:tenant;lr"（无尖括号），这里包成标准 Route 值 "<sip:...>" */
+     * hop 必须是 registrar 返回的 Service-Route 值。
+     * ★ registrar.c L659 生成的 service_route 值已经带尖括号 "<sip:tenant;lr>"，
+     *   这里直接拼完整头行，不要再 snprintf 包一层尖括号！ */
     if (l->service_route[0]) {
         int n = snprintf(out + used, outsz - used,
-                         "Route: <%s>\r\n", l->service_route);
+                         "Route: %s\r\n", l->service_route);
         if (n > 0 && (size_t)n < outsz - used) used += (size_t)n;
     }
     for (int i = 0; i < l->nroutes; ++i) {
@@ -1244,22 +1260,21 @@ static sip_txn_t *send_invite_b(b2b_call_t *c, int leg_idx,
         /* helper 三态解析 */
         #define DP_FORCE(f, prof_val)  \
             (c->force_##f == 1 ? 1 : (c->force_##f == 2 ? 0 : (prof_val)))
-        int prof_prack   = pr ? pr->enable_prack        : 1;  /* profile NULL 默认开 */
-        int prof_precond = pr ? pr->enable_precondition : 1;
-        int prof_timer   = pr ? pr->enable_timer        : 1;
-        int prof_gruu    = pr ? pr->enable_gruu         : 1;
+        int prof_prack   = pr ? pr->enable_prack        : 0;  /* profile NULL → 默认关（REQ: IMS 三态默认 OFF） */
+        int prof_precond = pr ? pr->enable_precondition : 0;
+        int prof_timer   = pr ? pr->enable_timer        : 0;
+        int prof_gruu    = pr ? pr->enable_gruu         : 0;
         do_prack   = DP_FORCE(prack,        prof_prack);
         do_precond = DP_FORCE(precondition, prof_precond);
         do_timer   = DP_FORCE(timer,        prof_timer);
         do_gruu    = DP_FORCE(gruu,         prof_gruu);
         #undef DP_FORCE
         int n = snprintf(st_extra, sizeof(st_extra),
-                         "Supported: replaces%s%s%s%s%s%s\r\n",
+                         "Supported: replaces%s%s%s%s, path, outbound, sec-agree, answermode, eventlist\r\n",
                          do_prack      ? ", 100rel"       : "",
                          do_precond    ? ", precondition" : "",
                          do_timer      ? ", timer"        : "",
-                         do_gruu       ? ", gruu"         : "",
-                         ", path, outbound, sec-agree, answermode, eventlist");
+                         do_gruu       ? ", gruu"         : "");
         if (n > 0) { st_extra[n] = '\0'; }
     }
     if (a->session_expires[0] && !co->cfg.sess_timer_enabled) {
@@ -2274,7 +2289,7 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                 {
                     sip_profile_t *pr = c->prof;
                     /* force_timer 三态：0=AUTO(继承 profile) / 1=强制开 / 2=强制关 */
-                    int prof_en = pr ? pr->enable_timer : 1;  /* profile NULL 默认开 */
+                    int prof_en = pr ? pr->enable_timer : 0;  /* profile NULL → 默认关 */
                     int force_en = (c->force_timer == 1) ? 1 : (c->force_timer == 2 ? 0 : prof_en);
                     if (co->cfg.sess_timer_enabled && force_en) {
                     sess_timer_nego_t nb;
@@ -3032,6 +3047,28 @@ static void sip_uri_extract_user(char *out, size_t cap, const char *uri)
 /* ------------------------------------------------------------------ */
 /* REQ-PBX-CDR-001：话单事件 emit 辅助                                 */
 /* ------------------------------------------------------------------ */
+/* signaling.c 跨文件导出（同 g_ws_bridge_proto 先例，签名不入公共头）：
+ * 从 answer SDP 提取 codec 名 + peer addr:port，b2b_emit_cdr END 填 ev 用。 */
+extern int sig_sdp_extract_cdr(const char *sdp_buf, size_t sdp_len,
+                               char *codec_out, size_t codec_sz,
+                               char *peer_out,  size_t peer_sz);
+
+/* 两腿 answer SDP → c->codec_a/b（peer 丢弃）。
+ * ANSWER 阶段调用：SESSION_ANSWER 实时推送（读 c->codec_a/b）与
+ * END ev 兜底都能拿到 codec，Web 端"接通"状态即刻显示编码。 */
+static void call_fill_codecs(b2b_call_t *c)
+{
+    char peer[CDR_IP_MAX];
+    if (c->leg[0].answer_len && !c->codec_a[0])
+        sig_sdp_extract_cdr(c->leg[0].answer, c->leg[0].answer_len,
+                            c->codec_a, sizeof(c->codec_a),
+                            peer, sizeof(peer));
+    if (c->leg[1].answer_len && !c->codec_b[0])
+        sig_sdp_extract_cdr(c->leg[1].answer, c->leg[1].answer_len,
+                            c->codec_b, sizeof(c->codec_b),
+                            peer, sizeof(peer));
+}
+
 static void b2b_emit_cdr(b2b_call_t *c, cdr_phase_t phase)
 {
     /* ---- 1. 实时事件推送（无条件：billing 关掉也要让订阅者看到呼叫状态）----
@@ -3048,19 +3085,35 @@ static void b2b_emit_cdr(b2b_call_t *c, cdr_phase_t phase)
         /* leg[1].to 在 START 时还没赋值——fallback 到 A 腿原始 To */
         const char *to_uri  = c->leg[1].to[0] ? c->leg[1].to
                            : (c->leg[0].to[0] ? c->leg[0].to : "");
+        /* Profile 上下文：A 腿入站 profile + B 腿出站 profile（out_prof=中继/域外） */
+        const char *prof    = (c->prof && c->prof->name[0])    ? c->prof->name    : "-";
+        const char *oprof   = (c->out_prof && c->out_prof->name[0]) ? c->out_prof->name : prof;
+        const char *dp_tag  = (c->out_prof) ? "OUT" : "LOCAL";
+        /* 呼叫方向：orig_caller_id_num 非空=originate（外呼），空=INVITE（入呼） */
+        const char *dir_tag = (c->orig_caller_id_num[0] != '\0') ? "OUTBOUND" : "INBOUND";
 
         if (phase == CDR_PHASE_START) {
-            obs_event("CALL_INCOMING",
-                "call_id=%s orig=%s to=%s src_ip=%s trunk=%s",
-                call_id, orig, to_uri, from_ip, trunk);
+            obs_event(6, "CALL_INCOMING",
+                "call_id=%s orig=%s to=%s src_ip=%s trunk=%s prof=%s oprof=%s dp=%s dir=%s",
+                call_id, orig, to_uri, from_ip, trunk, prof, oprof, dp_tag, dir_tag);
         } else if (phase == CDR_PHASE_ANSWER) {
-            obs_event("CALL_ANSWERED",
-                "call_id=%s orig=%s to=%s trunk=%s",
-                call_id, orig, to_uri, trunk);
+            obs_event(6, "CALL_ANSWERED",
+                "call_id=%s orig=%s to=%s trunk=%s prof=%s oprof=%s dp=%s dir=%s",
+                call_id, orig, to_uri, trunk, prof, oprof, dp_tag, dir_tag);
         } else if (phase == CDR_PHASE_END) {
-            obs_event("CALL_END",
-                "call_id=%s orig=%s to=%s trunk=%s final=%d",
-                call_id, orig, to_uri, trunk, c->a_final);
+            /* ★ term 精确区分挂断发起方：
+             *   hangup_by=1 (A腿收到BYE) → term=A_UA 主叫/用户侧主动挂机
+             *   hangup_by=2 (B腿收到BYE) → term=B_UA 被叫/对端侧主动挂机
+             *   hangup_by=0 且 a_final=200 → term=LOCAL nbs本地收尾(双腿都收BYE)
+             *   hangup_by=0 且 a_final!=200 → term=LOCAL nbs内部处理(拒接/超时/404) */
+            const char *term;
+            if (c->hangup_by == 1)      term = "A_UA";
+            else if (c->hangup_by == 2) term = "B_UA";
+            else                        term = "LOCAL";
+            obs_event(c->a_final >= 400 && c->a_final < 500 ? 4 : 6,  /* 4xx client-error → WARN */
+                "CALL_END",
+                "call_id=%s orig=%s to=%s trunk=%s prof=%s oprof=%s dp=%s final=%d term=%s dir=%s",
+                call_id, orig, to_uri, trunk, prof, oprof, dp_tag, c->a_final, term, dir_tag);
         }
     }
 
@@ -3081,8 +3134,14 @@ static void b2b_emit_cdr(b2b_call_t *c, cdr_phase_t phase)
         char user[128]; sip_uri_extract_user(user, sizeof(user), to);
         snprintf(ev.to, sizeof(ev.to), "%s", user);
     }
-    ev.dir = CDR_DIR_UNKNOWN; /* P0 简化，后续按 host 判定域内/域外 */
+    /* dir 判定与 SESSION_* 推送点同逻辑：originate 路设置 orig_caller_id_num，
+     * 入向 INVITE 不会 → inbound；internal（分机互拨）细分后续需要 host 域判定再补 */
+    ev.dir = c->orig_caller_id_num[0] ? CDR_DIR_OUTBOUND : CDR_DIR_INBOUND;
     ev.phase = phase;
+    /* from_ip 全阶段填充：billing 的 START ev 是整体拷贝进聚合槽，
+     * 从 START 起就带上源 IP（END 分支也会重填兜底）。 */
+    if (c->from_ip[0])
+        snprintf(ev.from_ip, sizeof(ev.from_ip), "%s", c->from_ip);
     /* uptime → wall 转换：nsbc_now_ms() 是单调时钟（CLOCK_MONOTONIC），
      * nsbc_wall_ms() 是墙上时间（CLOCK_REALTIME epoch ms）。
      * sanity：算出来 < 2000-01-01 epoch ms → 无效（进程重启/未赋值/溢出），
@@ -3104,6 +3163,10 @@ static void b2b_emit_cdr(b2b_call_t *c, cdr_phase_t phase)
         ev.answer_ms = ans_wall;
         ev.billsec = ans_wall >= start_wall
                      ? (uint32_t)((ans_wall - start_wall) / 1000) : 0;
+        /* answer SDP 已到 → 就地填 c->codec_a/b：
+         * 紧随其后的 SESSION_ANSWER UDS 推送直接读这两个字段，
+         * Web 端"接通"实时状态即显示编码（不用等 END 落库）。 */
+        call_fill_codecs(c);
     }
     if (phase == CDR_PHASE_END) {
         uint64_t now_mon = nsbc_now_ms();
@@ -3128,6 +3191,46 @@ static void b2b_emit_cdr(b2b_call_t *c, cdr_phase_t phase)
             case 481: ev.disposition = CDR_DISP_FAILED;    break;
             default:  ev.disposition = CDR_DISP_FAILED;    break;
         }
+        /* ---- security threat 标记（REQ-SEC-005）----
+         * 源 IP 命中 auto-ban / blacklist → 标记 is_malicious + 原因。
+         * 让正常通话和恶意攻击在 CDR 层分流 —— 前端可以按 is_malicious
+         * Tab 切换（全部 / 正常 / 恶意），运维可以单独审计攻击流量。 */
+        if (c->from_ip[0]) {
+            char reason[32];
+            if (security_get_threat(c->from_ip, reason, sizeof(reason))) {
+                ev.is_malicious = 1;
+                snprintf(ev.threat_reason, sizeof(ev.threat_reason), "%s", reason);
+            }
+        }
+        /* ---- 网络端点 + codec + 媒体质量 + 录音（REQ-CDR-002 补全）----
+         * 旧版只有 signaling.c 的死路径填这些字段（ctx->cdr_emit 从未被赋值），
+         * 导致 Web 端 Source IP / A-B Codec / Threat / 录音列永远是 '-'。
+         * on_end（sig_on_end_cb）已在 call_destroy 里先于本函数执行，
+         * VQ 指标与 rec_path 均已存进 c。 */
+        if (c->from_ip[0])
+            snprintf(ev.from_ip, sizeof(ev.from_ip), "%s", c->from_ip);
+        if (c->leg[0].answer_len)
+            sig_sdp_extract_cdr(c->leg[0].answer, c->leg[0].answer_len,
+                                ev.codec_a, sizeof(ev.codec_a),
+                                ev.a_peer_ip, sizeof(ev.a_peer_ip));
+        if (c->leg[1].answer_len)
+            sig_sdp_extract_cdr(c->leg[1].answer, c->leg[1].answer_len,
+                                ev.codec_b, sizeof(ev.codec_b),
+                                ev.b_peer_ip, sizeof(ev.b_peer_ip));
+        /* c->codec_a/b 由 call_fill_codecs（ANSWER 阶段）填充，
+         * SDP 直接解析失败时兜底 */
+        if (!ev.codec_a[0] && c->codec_a[0])
+            snprintf(ev.codec_a, sizeof(ev.codec_a), "%s", c->codec_a);
+        if (!ev.codec_b[0] && c->codec_b[0])
+            snprintf(ev.codec_b, sizeof(ev.codec_b), "%s", c->codec_b);
+        ev.rtp_loss_pct = c->rtp_loss_pct;
+        ev.rtp_jitter_ms = c->rtp_jitter_ms;
+        ev.mos_x1000 = c->mos_x1000;
+        if (c->rec_path[0])
+            snprintf(ev.rec_path, sizeof(ev.rec_path), "%s", c->rec_path);
+        if (c->rt_name[0])
+            snprintf(ev.trunk, sizeof(ev.trunk), "%s", c->rt_name);
+        ev.emergency = c->emergency;
     }
     llog(LOG_INFO, "b2b", "cdr emit phase=%s callid=%s from=%s to=%s",
          cdr_phase_name(phase), ev.call_id, ev.from, ev.to);
@@ -3167,6 +3270,18 @@ static void b2b_emit_cdr(b2b_call_t *c, cdr_phase_t phase)
     for (int i = 0; i < g_cdr_hook_n; ++i)
         g_cdr_hooks[i].fn(g_cdr_hooks[i].ud, &ev);
     pthread_mutex_unlock(&g_cdr_hook_lock);
+
+    /* END：把完整 ev 序列化进 c->cdr_json——call_destroy 的 SESSION_END UDS
+     * 推送直接复用（含 from_ip/codec/threat/VQ/rec_path 全字段），
+     * 不再落进下方残缺 snprintf 降级路径。仅 END 存（START/ANSWER 的
+     * UDS 推送点各自有专用 JSON）。 */
+    if (phase == CDR_PHASE_END) {
+        char *j = cdr_event_to_json(&ev);
+        if (j) {
+            snprintf(c->cdr_json, sizeof(c->cdr_json), "%s", j);
+            free(j);
+        }
+    }
 }
 
 /* ---------- 安全黑名单接入 helpers ----------
@@ -3349,6 +3464,8 @@ void handle_new_invite(b2b_core_t *co, sip_txn_t *t,
     }
     memset(c, 0, sizeof(*c));
     c->core = co;
+    /* Emergency URN 标记进 call 对象：b2b_emit_cdr 写进 CDR emergency 位 */
+    c->emergency = (uint8_t)is_emergency;
 
     /* SIP Profile 归属（REQ-SIP-PROFILE-001）：
      * 先按入端口匹配（多端口场景最高效——从 5080 进来的包直接归属 external），
@@ -4374,6 +4491,8 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
             return;
         }
         c->leg[leg].state = LEG_TERMINATING;
+        /* ★ 记录谁发起的挂断：leg=0→A腿(主叫)发BYE，leg=1→B腿(被叫)发BYE */
+        c->hangup_by = leg + 1;
         int other = leg ^ 1;
         if (c->leg[other].state == LEG_CONFIRMED)
             send_bye_leg(c, other);
@@ -5151,20 +5270,48 @@ void b2b_on_rx(void *ud, sip_tr_proto_t proto, const nsbc_sa_t *src,
     sip_msg_t m;
     char src_ip[128] = {0};
     nsbc_sa_fmt(src, src_ip, sizeof(src_ip));
+    /* Guard/auto-ban key MUST be the pure source IP (no port).
+     * Keying by ip:port scatters one attacker across thousands of entries
+     * (a new UDP source port per packet), so the INVITE rate threshold is
+     * never reached and ban_is_banned(pure_ip) never matches. */
+    char src_gip[INET6_ADDRSTRLEN] = {0};
+    sa_ip_str(src, src_gip, sizeof(src_gip));
 
     /* 存入向本地端口到 __thread 变量（handle_new_invite 深层读） */
     g_rx_local_port = 0;
     if (local && local->ss.ss_family == AF_INET)
         g_rx_local_port = nsbc_sa_port(local);
-    llog(LOG_INFO, "b2b",
+    llog(LOG_DEBUG, "b2b",
          "b2b_on_rx: local_fam=%d local_port_direct=%u g_rx_local_port=%u",
          local ? local->ss.ss_family : 0,
          local ? nsbc_sa_port(local) : 0,
          g_rx_local_port);
 
     if (sip_parse_ex(&m, buf, len, SIP_F_COMPAT_ALL) != NSBC_OK) {
-        if (len > 2)
-            llog(LOG_WARN, "b2b", "rx BAD sip from %s len=%zu", src_ip, len);
+        /* 短包 keepalive 检测：
+         *   - "\r\n\r\n" (4B) — 标准 SIP NAT keepalive
+         *   - 全 \r/\n 的 2–8B 包 — 同类探测
+         *   - len<=4 的任何包 — 不可能是有效 SIP，静默 drop
+         * 对非纯 CRLF 但短于 16B 的包打 DEBUG hex dump，帮确认 peer 发了什么 */
+        if (len <= 4) return;
+        if (len <= 16) {
+            int all_crlf = 1;
+            for (size_t i = 0; i < len; ++i)
+                if (buf[i] != '\r' && buf[i] != '\n') { all_crlf = 0; break; }
+            if (all_crlf) return;
+            /* 不是纯 CRLF 但很短 — 打 DEBUG hex，观察一次即可 */
+            unsigned char *hb = (unsigned char *)buf;
+            llog(LOG_DEBUG, "b2b",
+                 "rx short non-sip len=%zu hex=%02x%02x%02x%02x%02x%02x%02x%02x from %s",
+                 len,
+                 len > 0 ? hb[0] : 0, len > 1 ? hb[1] : 0,
+                 len > 2 ? hb[2] : 0, len > 3 ? hb[3] : 0,
+                 len > 4 ? hb[4] : 0, len > 5 ? hb[5] : 0,
+                 len > 6 ? hb[6] : 0, len > 7 ? hb[7] : 0,
+                 src_ip);
+            return;
+        }
+        llog(LOG_WARN, "b2b", "rx BAD sip from %s len=%zu", src_ip, len);
         return;
     }
 
@@ -5273,8 +5420,10 @@ void b2b_on_rx(void *ud, sip_tr_proto_t proto, const nsbc_sa_t *src,
         }
 
         /* 主动请求频率计数（per-IP 窗口内次数）——对 ALL 合法 method 计数，
-         * 不仅 INVITE/REGISTER。攻击者换 SUBSCRIBE/REFER 也会触发 auto-ban。 */
-        b2b_guard_notify(src_ip, B2B_GUARD_INVITE_COUNT);
+         * 不仅 INVITE/REGISTER。攻击者换 SUBSCRIBE/REFER 也会触发 auto-ban。
+         * key 用纯 IP（src_gip）：带端口会把同一攻击者打散成上千条记录，
+         * 阈值永远凑不齐，且 ban_is_banned(纯IP) 永远查不到带端口的 key。 */
+        b2b_guard_notify(src_gip, B2B_GUARD_INVITE_COUNT);
 
         llog(LOG_DEBUG, "b2b", "txn_input msg.buf=%p msg.buflen=%zu txn_mgr=%p src_af=%d",
              m.buf, m.buflen, (void *)co->cfg.txn, src->ss.ss_family);
@@ -5402,7 +5551,7 @@ void b2b_on_rx(void *ud, sip_tr_proto_t proto, const nsbc_sa_t *src,
                      "txn alloc FAIL rc=%d method=%d ip=%s "
                      "(silent drop, no response, dropped=%u)",
                      rc, m.method, src_ip, fail_drop_n);
-            b2b_guard_notify(src_ip, B2B_GUARD_INVITE_FAIL);
+            b2b_guard_notify(src_gip, B2B_GUARD_INVITE_FAIL);
         }
         return;
     }

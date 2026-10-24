@@ -16,6 +16,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::coreclient::CoreApi;
 use crate::error::ApiError;
+use crate::sync;
 use crate::AppState;
 
 pub fn router<C>() -> Router<Arc<AppState<C>>>
@@ -31,9 +32,10 @@ where C: CoreApi + Clone + 'static,
 
 #[derive(Debug, Deserialize, Default)]
 pub struct ListQuery {
-    pub enabled: Option<String>,
-    pub limit:  Option<i64>,
-    pub offset: Option<i64>,
+    pub enabled:   Option<String>,
+    pub tenant_id: Option<i64>,
+    pub limit:     Option<i64>,
+    pub offset:    Option<i64>,
 }
 
 pub async fn list<C: CoreApi + Clone + Send + Sync>(
@@ -42,7 +44,7 @@ pub async fn list<C: CoreApi + Clone + Send + Sync>(
     st.db.pool().ok_or(ApiError::DbUnavailable)?;
     let enabled = match q.enabled.as_deref() { Some("true") => Some(true), Some("false") => Some(false), _ => None };
     let (items, total) = st.db
-        .list_ivr_menus(enabled, q.limit.unwrap_or(50).clamp(1, 500), q.offset.unwrap_or(0).max(0))
+        .list_ivr_menus(enabled, q.tenant_id, q.limit.unwrap_or(50).clamp(1, 500), q.offset.unwrap_or(0).max(0))
         .await.map_err(|e| ApiError::Db(e.to_string()))?;
     Ok(Json(json!({ "items": items, "total": total })))
 }
@@ -56,7 +58,7 @@ pub async fn get_one<C: CoreApi + Clone + Send + Sync>(
     Ok(Json(row))
 }
 
-pub async fn create<C: CoreApi + Clone + Send + Sync>(
+pub async fn create<C: CoreApi + Clone + Send + Sync + 'static>(
     State(st): State<Arc<AppState<C>>>, Json(body): Json<crate::db::IvrMenuCreate>,
 ) -> Result<impl IntoResponse, ApiError> {
     st.db.pool().ok_or(ApiError::DbUnavailable)?;
@@ -68,10 +70,11 @@ pub async fn create<C: CoreApi + Clone + Send + Sync>(
         ApiError::Db(e.to_string())
     })?;
     let _ = st.db.insert_config_history("api","create",&format!("ivr-menus/{}",row.id),None,&format!("ivr={}",row.name)).await;
+    sync::spawn_push(st.clone(), sync::Kind::IvrMenus);
     Ok((StatusCode::CREATED, Json(row)))
 }
 
-pub async fn update<C: CoreApi + Clone + Send + Sync>(
+pub async fn update<C: CoreApi + Clone + Send + Sync + 'static>(
     State(st): State<Arc<AppState<C>>>, Path(id): Path<i64>,
     Json(body): Json<crate::db::IvrMenuUpdate>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -81,10 +84,11 @@ pub async fn update<C: CoreApi + Clone + Send + Sync>(
         other => ApiError::Db(other.to_string()),
     })?;
     let _ = st.db.insert_config_history("api","update",&format!("ivr-menus/{}",row.id),None,&format!("ivr={}",row.name)).await;
+    sync::spawn_push(st.clone(), sync::Kind::IvrMenus);
     Ok(Json(row))
 }
 
-pub async fn delete_one<C: CoreApi + Clone + Send + Sync>(
+pub async fn delete_one<C: CoreApi + Clone + Send + Sync + 'static>(
     State(st): State<Arc<AppState<C>>>, Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, ApiError> {
     st.db.pool().ok_or(ApiError::DbUnavailable)?;
@@ -92,6 +96,7 @@ pub async fn delete_one<C: CoreApi + Clone + Send + Sync>(
         return Err(ApiError::NotFound("ivr menu not found".into()));
     }
     let _ = st.db.insert_config_history("api","delete",&format!("ivr-menus/{id}"),None,"deleted").await;
+    sync::spawn_push(st.clone(), sync::Kind::IvrMenus);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -100,6 +105,8 @@ pub async fn reload<C: CoreApi + Clone + Send + Sync>(
 ) -> Result<impl IntoResponse, ApiError> {
     st.db.pool().ok_or(ApiError::DbUnavailable)?;
     let rows = st.db.list_enabled_ivr_menus().await.map_err(|e| ApiError::Db(e.to_string()))?;
-    tracing::info!(count = rows.len(), "ivr-menus.reload — UDS not wired");
-    Ok(Json(json!({ "loaded": rows.len(), "uds_wired": false })))
+    let json = serde_json::to_string(&rows)
+        .map_err(|e| ApiError::Db(e.to_string()))?;
+    st.core.reload_ivr_menus(&json).await?;
+    Ok(Json(json!({ "reloaded": rows.len(), "uds_wired": true })))
 }

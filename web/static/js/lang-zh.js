@@ -1,4 +1,4 @@
-﻿// NSBC i18n — Chinese dictionary (key = English text, value = Chinese)
+// NSBC i18n — Chinese dictionary (key = English text, value = Chinese)
 // Generated from the original Chinese UI. Missing key => t() falls back to English.
 window.NSBC_DICT = {
   ' (check backend build / DB availability / login expiry)': '（检查后端是否已编译 / DB 是否可用 / 登录是否过期）',
@@ -333,5 +333,57 @@ window.NSBC_DICT = {
   '最大并发（硬性d花板）': '最大并发（硬性天花板）',
   '最大等待 (s)': '最大等待 (秒)',
   'Session Border Controller': 'Nway Session Border Controller',
+  // === Codec Registry ===
+  'Codec Registry': '编解码器注册表',
+  'Codec Name': '编解码器名称',
+  'PT': 'PT (Payload Type)',
+  'Sample Rate': '采样率',
+  'Impl Module': '实现模块',
+  'FMTP Default': 'FMTP 默认值',
+  'Media Type': '媒体类型',
+  // === Config Hot-Editor ===
+  'Config Hot-Editor': '热配置编辑器',
+  'Refresh': '刷新',
+  'Core Listen Addresses': '核心监听地址',
+  'Key': '配置键',
+  'Effective Value': '生效值',
+  'Layer': '配置层',
+  'Action': '操作',
+  '(unset)': '(未设置)',
+  'Hot-Set Config': '热设置配置',
+  'New Value': '新值',
+  '(empty = delete)': '(空值=删除该键)',
+  'Validate (Dry-run)': '校验（Dry-run）',
+  'Valid — core accepts this value': '✓ 校验通过 — Core 接受此值',
+  'Core rejected this value': '✗ Core 拒绝此值',
+  'Hot-set applied — core value changed': '✓ 热设置已应用 — Core 值已变更',
+  'Idempotent — value already equals target': '幂等 — 当前值已等于目标值',
+  'Cancel': '取消',
+  // === IMS Capability Override ===
+  'IMS Capability Override (3-state)': 'IMS 协议能力强制覆盖（三态）',
+  '100rel Force': '100rel 强制覆盖',
+  'Precondition Force': 'Precondition 强制覆盖',
+  'Session Timer Force': 'Session Timer 强制覆盖',
+  'GRUU Force': 'GRUU 强制覆盖',
+  'Auto (inherit profile)': '自动（继承 Profile 配置）',
+  'Force ON': '强制开启',
+  'Force OFF': '强制关闭',
+  // === Billing CRUD ===
+  'Rate Table': '费率表',
+  'Prefix': '前缀',
+  'Rate/min (µ)': '费率/分钟 (微单位)',
+  'Connect fee (µ)': '接通费 (微单位)',
+  'Billing block (s)': '计费块 (秒)',
+  'Min bill (s)': '最小计费 (秒)',
+  'Account Balance': '账户余额',
+  'Account Key': '账户标识',
+  'Balance (µ)': '余额 (微单位)',
+  'Credit limit (µ)': '信用额度 (微单位)',
+  'Opening balance (µ)': '开户余额 (微单位)',
+  'Micro-units per minute (1e-6 CNY)': '每分钟微单位（1e-6 元）',
+  'Per-call billing granularity': '每通话计费粒度',
+  'Minimum billing seconds per call': '每通话最小计费秒数',
+  'Unique account identifier (e.g. tenant-001)': '唯一账户标识（如 tenant-001）',
+  'Initial credit in micro-units (1e-6 CNY)': '初始信用微单位（1e-6 元）',
 };
 

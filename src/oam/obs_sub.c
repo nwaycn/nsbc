@@ -201,23 +201,30 @@ int obs_sub_publish(obs_sub_hub_t *h, obs_topic_t t, const char *fmt, ...)
 {
     char frame[OBS_FRAME_MAX];
     va_list ap;
-    int n, hits = 0;
+    int hits = 0;
     if (h == NULL || fmt == NULL || t < 0 || t >= OBS_TOPIC_MAX)
         return NSBC_INVAL;
-    va_start(ap, fmt);
-    n = vsnprintf(frame, sizeof(frame) - 1, fmt, ap);
-    va_end(ap);
-    if (n < 0)
+
+    /* 统一给每帧加 [TOPIC] 前缀，让订阅者精确分类帧来源 */
+    const char *tname = obs_topic_name(t);
+    int prefix = snprintf(frame, sizeof(frame), "[%s] ", tname);
+    if (prefix < 0 || prefix >= (int)sizeof(frame))
         return NSBC_ERR;
-    if (n >= OBS_FRAME_MAX - 1)
-        n = OBS_FRAME_MAX - 2;
-    frame[OBS_FRAME_MAX - 1] = '\0';
+
+    va_start(ap, fmt);
+    int body = vsnprintf(frame + prefix, sizeof(frame) - prefix - 1, fmt, ap);
+    va_end(ap);
+    if (body < 0) return NSBC_ERR;
+    if (body >= (int)(sizeof(frame) - prefix - 1))
+        body = sizeof(frame) - prefix - 2;
+    int total = prefix + body;
+    frame[total] = '\0';
 
     pthread_mutex_lock(&h->lock);
     for (int i = 0; i < OBS_SUBSCRIBER_MAX; ++i) {
         obs_sub_t *s = &h->subs[i];
         if (s->conn != NULL && (s->topics & (1u << (unsigned)t)) != 0) {
-            ring_push_locked(s, frame, n);
+            ring_push_locked(s, frame, total);
             ++hits;
         }
     }
@@ -245,6 +252,19 @@ size_t obs_sub_flush(obs_sub_hub_t *h, const void *conn)
         bytes = flush_one_locked(h, s);
     pthread_mutex_unlock(&h->lock);
     return bytes;
+}
+
+int obs_sub_ring_empty(obs_sub_hub_t *h, const void *conn)
+{
+    int empty = 1;
+    if (h == NULL || conn == NULL)
+        return 1;
+    pthread_mutex_lock(&h->lock);
+    obs_sub_t *s = by_conn_locked(h, conn);
+    if (s != NULL && s->conn != NULL && s->len[s->head] != 0)
+        empty = 0;
+    pthread_mutex_unlock(&h->lock);
+    return empty;
 }
 
 uint64_t obs_sub_drop_count(obs_sub_hub_t *h)
@@ -276,6 +296,8 @@ int obs_topic_parse(const char *name, obs_topic_t *out)
         *out = OBS_TOPIC_CDR;
     else if (strcmp(name, "log") == 0)
         *out = OBS_TOPIC_LOG;
+    else if (strcmp(name, "trace") == 0)
+        *out = OBS_TOPIC_TRACE;
     else
         return NSBC_NOENT;
     return NSBC_OK;
@@ -288,6 +310,7 @@ const char *obs_topic_name(obs_topic_t t)
     case OBS_TOPIC_EVENTS:  return "events";
     case OBS_TOPIC_CDR:     return "cdr";
     case OBS_TOPIC_LOG:     return "log";
+    case OBS_TOPIC_TRACE:   return "trace";
     }
     return "unknown";
 }
@@ -377,6 +400,19 @@ int obs_sub_publish_metrics(const char *fmt, ...)
     if (n < 0) return 0;
     if (n >= OBS_FRAME_MAX - 1) n = OBS_FRAME_MAX - 2;
     return obs_sub_publish(g_sub_hub, OBS_TOPIC_METRICS, "%s\n", frame);
+}
+
+int obs_sub_publish_trace(const char *fmt, ...)
+{
+    if (g_sub_hub == NULL || fmt == NULL) return 0;
+    char frame[OBS_FRAME_MAX];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(frame, sizeof(frame) - 1, fmt, ap);
+    va_end(ap);
+    if (n < 0) return 0;
+    if (n >= OBS_FRAME_MAX - 1) n = OBS_FRAME_MAX - 2;
+    return obs_sub_publish(g_sub_hub, OBS_TOPIC_TRACE, "%s\n", frame);
 }
 
 /*

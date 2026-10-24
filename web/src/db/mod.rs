@@ -226,6 +226,24 @@ impl Db {
         }
     }
 
+    /// Update web user password (argon2id PHC string). Returns true if any row affected.
+    pub async fn update_web_user_password(&self, id: i64, new_phc: &str) -> bool {
+        let Some(pool) = self.pool() else { return false };
+        match sqlx::query("UPDATE web_users SET password_phc = $1 WHERE id = $2")
+            .bind(new_phc)
+            .bind(id)
+            .execute(pool)
+            .await
+        {
+            Ok(r) => r.rows_affected() > 0,
+            Err(e) => {
+                tracing::warn!(user_id = id, error = %e,
+                    "web_users: update password failed");
+                false
+            }
+        }
+    }
+
     /// Ensure at least one enabled admin user exists in the web_users table.
     /// Called at startup: checks whether an enabled=1 user already exists; injects
     /// the default admin if not.
@@ -396,6 +414,10 @@ impl Db {
         codec_b: Option<&str>,
         a_peer_ip: Option<&str>,
         b_peer_ip: Option<&str>,
+        /* REQ-SEC-005: 恶意攻击标记 — security_get_threat 在 CDR END emit 时判定，
+         * 前端可以按 is_malicious Tab 分流（全部 / 正常 / 恶意） */
+        is_malicious: u8,
+        threat_reason: Option<&str>,
     ) -> Result<(), sqlx::Error> {
         let Some(pool) = self.pool.as_ref() else { return Ok(()); };
 
@@ -417,6 +439,11 @@ impl Db {
             "answer_ms": answer_ms,
             "billsec": billsec,
             "emergency": emergency,
+            /* REQ-SEC-005: 恶意攻击标记 — security_get_threat 在 b2b END emit 时判定 */
+            "is_malicious": is_malicious,
+            "threat_reason": threat_reason,
+            /* 源 IP — 前端 Source IP 列显示 + from_ip= 搜索 */
+            "from_ip": from_ip,
         });
         // codec / IP fields (skip when empty — signaling.c END chain fills completely;
         // early START/ANSWER events may be empty)
@@ -1994,6 +2021,11 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
                 target        TEXT    NOT NULL,
                 rec_action    INTEGER NOT NULL DEFAULT 0,  /* 0=none 1=start 2=stop, passed through by C-side dp_execute */
                 rec_path_template TEXT NOT NULL DEFAULT '',  /* optional recording path template, empty = system default yyyymmdd/callid_mix_seq.wav */
+                /* IMS force-override 三态字段：0=inherit 1=force on 2=force off */
+                force_prack        INTEGER NOT NULL DEFAULT 0,
+                force_precondition INTEGER NOT NULL DEFAULT 0,
+                force_timer        INTEGER NOT NULL DEFAULT 0,
+                force_gruu         INTEGER NOT NULL DEFAULT 0,
                 action_json   TEXT    NOT NULL DEFAULT '{}',
                 app_chain     TEXT    NOT NULL DEFAULT '[]',  /* REQ-DP-APP-001: Application chain JSON array */
                 enabled       INTEGER NOT NULL DEFAULT 1,
@@ -2020,6 +2052,11 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
                 target        TEXT    NOT NULL,
                 rec_action    INTEGER NOT NULL DEFAULT 0,
                 rec_path_template TEXT NOT NULL DEFAULT '',
+                /* IMS force-override 三态字段：0=inherit 1=force on 2=force off */
+                force_prack        INTEGER NOT NULL DEFAULT 0,
+                force_precondition INTEGER NOT NULL DEFAULT 0,
+                force_timer        INTEGER NOT NULL DEFAULT 0,
+                force_gruu         INTEGER NOT NULL DEFAULT 0,
                 action_json   TEXT   NOT NULL DEFAULT '{}',
                 app_chain     TEXT   NOT NULL DEFAULT '[]',  /* REQ-DP-APP-001: Application chain JSON array */
                 enabled       INTEGER NOT NULL DEFAULT 1,
@@ -2046,6 +2083,11 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
                 target        VARCHAR(256) NOT NULL,
                 rec_action    INT          NOT NULL DEFAULT 0,
                 rec_path_template VARCHAR(256) NOT NULL DEFAULT '',
+                /* IMS force-override 三态字段：0=inherit 1=force on 2=force off */
+                force_prack        TINYINT NOT NULL DEFAULT 0,
+                force_precondition TINYINT NOT NULL DEFAULT 0,
+                force_timer        TINYINT NOT NULL DEFAULT 0,
+                force_gruu         TINYINT NOT NULL DEFAULT 0,
                 action_json   JSON         NOT NULL,
                 app_chain     JSON         NOT NULL,  /* REQ-DP-APP-001: Application chain JSON array */
                 enabled       TINYINT(1)   NOT NULL DEFAULT 1,
@@ -2084,6 +2126,10 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
                     ADD COLUMN src_ip_cidr  VARCHAR(128) NOT NULL DEFAULT '10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8' AFTER profile_name, \
                     ADD COLUMN rec_action  INT NOT NULL DEFAULT 0 AFTER target, \
                     ADD COLUMN rec_path_template VARCHAR(256) NOT NULL DEFAULT '' AFTER rec_action, \
+                    ADD COLUMN force_prack        TINYINT NOT NULL DEFAULT 0 AFTER rec_path_template, \
+                    ADD COLUMN force_precondition TINYINT NOT NULL DEFAULT 0 AFTER force_prack, \
+                    ADD COLUMN force_timer        TINYINT NOT NULL DEFAULT 0 AFTER force_precondition, \
+                    ADD COLUMN force_gruu         TINYINT NOT NULL DEFAULT 0 AFTER force_timer, \
                     ADD COLUMN app_chain  JSON NOT NULL AFTER action_json",
         _ => {
             // SQLite / PostgreSQL each get their own statements
@@ -2094,6 +2140,15 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
             sqlx::query("ALTER TABLE dialplan_rules ADD COLUMN rec_action INTEGER NOT NULL DEFAULT 0")
                 .execute(pool).await.ok();
             sqlx::query("ALTER TABLE dialplan_rules ADD COLUMN rec_path_template TEXT NOT NULL DEFAULT ''")
+                .execute(pool).await.ok();
+            /* IMS force-override 三态字段 */
+            sqlx::query("ALTER TABLE dialplan_rules ADD COLUMN force_prack INTEGER NOT NULL DEFAULT 0")
+                .execute(pool).await.ok();
+            sqlx::query("ALTER TABLE dialplan_rules ADD COLUMN force_precondition INTEGER NOT NULL DEFAULT 0")
+                .execute(pool).await.ok();
+            sqlx::query("ALTER TABLE dialplan_rules ADD COLUMN force_timer INTEGER NOT NULL DEFAULT 0")
+                .execute(pool).await.ok();
+            sqlx::query("ALTER TABLE dialplan_rules ADD COLUMN force_gruu INTEGER NOT NULL DEFAULT 0")
                 .execute(pool).await.ok();
             /* REQ-DP-APP-001: Application chain column (backfill for existing DBs) */
             sqlx::query("ALTER TABLE dialplan_rules ADD COLUMN app_chain TEXT NOT NULL DEFAULT '[]'")
@@ -2348,12 +2403,20 @@ sqlx::query(acct_ddl).execute(pool).await?;
     sqlx::query(q_ddl).execute(pool).await?;
 
     // ================ ivr_menus (IVR menus) ================
+    // 三层数据模型（REQ-PBX-IVR-001~006）：
+    //   tenant_id        — 绑到 SIP Domain（同 extensions/gateways 多租户模型）
+    //   entry_node       — 入口节点名（对应 C 侧 ivr_profile_t.nodes[0].name）
+    //   nodes_json       — 完整菜单树 JSON（ivr_node_t[] 序列化，含 SUBMENU 跨节点跳转）
+    //   options_json     — 遗留扁平选项（兼容旧数据；nodes_json 为空时降级）
     let ivr_ddl = match backend {
         "sqlite" => r#"
             CREATE TABLE IF NOT EXISTS ivr_menus (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                name            TEXT    NOT NULL UNIQUE,
+                tenant_id       INTEGER NOT NULL DEFAULT 1,
+                name            TEXT    NOT NULL,
                 enabled         INTEGER NOT NULL DEFAULT 1,
+                entry_node      TEXT    NOT NULL DEFAULT 'main',
+                nodes_json      TEXT    NOT NULL DEFAULT '[{"name":"main","prompt":"","initial_timeout_s":5,"interdigit_timeout_s":3,"max_retries":3,"choices":[],"timeout_action":{"act":"hangup","arg":""},"invalid_action":{"act":"hangup","arg":""}}]',
                 prompt_audio    TEXT    NOT NULL DEFAULT '',
                 invalid_audio   TEXT    NOT NULL DEFAULT '',
                 timeout_sec     INTEGER NOT NULL DEFAULT 10,
@@ -2363,14 +2426,18 @@ sqlx::query(acct_ddl).execute(pool).await?;
                 invalid_target  TEXT    NOT NULL DEFAULT '',
                 description     TEXT    NOT NULL DEFAULT '',
                 created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
-                updated_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+                updated_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(tenant_id, name)
             )
         "#,
         "postgres" => r#"
             CREATE TABLE IF NOT EXISTS ivr_menus (
                 id              BIGSERIAL PRIMARY KEY,
-                name            TEXT    NOT NULL UNIQUE,
+                tenant_id       BIGINT  NOT NULL DEFAULT 1,
+                name            TEXT    NOT NULL,
                 enabled         INTEGER NOT NULL DEFAULT 1,
+                entry_node      TEXT    NOT NULL DEFAULT 'main',
+                nodes_json      TEXT    NOT NULL DEFAULT '[{"name":"main","prompt":"","initial_timeout_s":5,"interdigit_timeout_s":3,"max_retries":3,"choices":[],"timeout_action":{"act":"hangup","arg":""},"invalid_action":{"act":"hangup","arg":""}}]',
                 prompt_audio    TEXT    NOT NULL DEFAULT '',
                 invalid_audio   TEXT    NOT NULL DEFAULT '',
                 timeout_sec     INTEGER NOT NULL DEFAULT 10,
@@ -2380,14 +2447,18 @@ sqlx::query(acct_ddl).execute(pool).await?;
                 invalid_target  TEXT    NOT NULL DEFAULT '',
                 description     TEXT    NOT NULL DEFAULT '',
                 created_at      TEXT NOT NULL DEFAULT (to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD') || 'T' || to_char(NOW() AT TIME ZONE 'UTC', 'HH24:MI:SS.MS') || 'Z'),
-                updated_at      TEXT NOT NULL DEFAULT (to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD') || 'T' || to_char(NOW() AT TIME ZONE 'UTC', 'HH24:MI:SS.MS') || 'Z')
+                updated_at      TEXT NOT NULL DEFAULT (to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD') || 'T' || to_char(NOW() AT TIME ZONE 'UTC', 'HH24:MI:SS.MS') || 'Z'),
+                UNIQUE(tenant_id, name)
             )
         "#,
         _ => r#"
             CREATE TABLE IF NOT EXISTS ivr_menus (
                 id              BIGINT AUTO_INCREMENT PRIMARY KEY,
+                tenant_id       BIGINT       NOT NULL DEFAULT 1,
                 name            VARCHAR(128) NOT NULL,
                 enabled         TINYINT(1)   NOT NULL DEFAULT 1,
+                entry_node      VARCHAR(64)  NOT NULL DEFAULT 'main',
+                nodes_json      JSON         NOT NULL,
                 prompt_audio    VARCHAR(256) NOT NULL DEFAULT '',
                 invalid_audio   VARCHAR(256) NOT NULL DEFAULT '',
                 timeout_sec     INT          NOT NULL DEFAULT 10,
@@ -2398,11 +2469,69 @@ sqlx::query(acct_ddl).execute(pool).await?;
                 description     VARCHAR(512) NOT NULL DEFAULT '',
                 created_at      DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
                 updated_at      DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-                UNIQUE KEY uq_ivr_name (name)
+                UNIQUE KEY uq_ivr_tenant_name (tenant_id, name)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         "#,
     };
     sqlx::query(ivr_ddl).execute(pool).await?;
+
+    // --- ivr_menus upgrade（旧表追加 tenant_id/entry_node/nodes_json，幂等） ---
+    {
+        // info_schema 查询跨 backend 内联实现（Rust async lambda 语法不支持 `-> Ret`，直接展开）
+        let (has_t, has_e, has_n);
+        {
+            let sql = match backend {
+                "postgres" => "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='ivr_menus' AND column_name=$1)",
+                "mysql"     => "SELECT COUNT(*) FROM information_schema.columns WHERE table_name='ivr_menus' AND column_name=?",
+                _           => "SELECT COUNT(*) FROM pragma_table_info('ivr_menus') WHERE name = ?",
+            };
+            if backend == "postgres" {
+                let r: Result<Option<bool>, _> = sqlx::query_scalar(sql).bind("tenant_id").fetch_optional(pool).await;
+                has_t = r.unwrap_or(None).unwrap_or(false);
+            } else {
+                let r: Result<i64, _> = sqlx::query_scalar(sql).bind("tenant_id").fetch_one(pool).await;
+                has_t = r.unwrap_or(0) > 0;
+            }
+        }
+        {
+            let sql = match backend {
+                "postgres" => "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='ivr_menus' AND column_name=$1)",
+                "mysql"     => "SELECT COUNT(*) FROM information_schema.columns WHERE table_name='ivr_menus' AND column_name=?",
+                _           => "SELECT COUNT(*) FROM pragma_table_info('ivr_menus') WHERE name = ?",
+            };
+            if backend == "postgres" {
+                let r: Result<Option<bool>, _> = sqlx::query_scalar(sql).bind("entry_node").fetch_optional(pool).await;
+                has_e = r.unwrap_or(None).unwrap_or(false);
+            } else {
+                let r: Result<i64, _> = sqlx::query_scalar(sql).bind("entry_node").fetch_one(pool).await;
+                has_e = r.unwrap_or(0) > 0;
+            }
+        }
+        {
+            let sql = match backend {
+                "postgres" => "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='ivr_menus' AND column_name=$1)",
+                "mysql"     => "SELECT COUNT(*) FROM information_schema.columns WHERE table_name='ivr_menus' AND column_name=?",
+                _           => "SELECT COUNT(*) FROM pragma_table_info('ivr_menus') WHERE name = ?",
+            };
+            if backend == "postgres" {
+                let r: Result<Option<bool>, _> = sqlx::query_scalar(sql).bind("nodes_json").fetch_optional(pool).await;
+                has_n = r.unwrap_or(None).unwrap_or(false);
+            } else {
+                let r: Result<i64, _> = sqlx::query_scalar(sql).bind("nodes_json").fetch_one(pool).await;
+                has_n = r.unwrap_or(0) > 0;
+            }
+        }
+        if !has_t {
+            let col_ddl = match backend { "postgres" => "BIGINT NOT NULL DEFAULT 1", _ => "INTEGER NOT NULL DEFAULT 1" };
+            sqlx::query(&format!("ALTER TABLE ivr_menus ADD COLUMN tenant_id {}", col_ddl)).execute(pool).await.ok();
+        }
+        if !has_e {
+            sqlx::query("ALTER TABLE ivr_menus ADD COLUMN entry_node VARCHAR(64) NOT NULL DEFAULT 'main'").execute(pool).await.ok();
+        }
+        if !has_n {
+            sqlx::query("ALTER TABLE ivr_menus ADD COLUMN nodes_json TEXT NOT NULL DEFAULT '[\"name\":\"main\",\"prompt\":\"\",\"choices\":[]]'").execute(pool).await.ok();
+        }
+    }
 
     // ================ sip_profiles (multi-SIP transport Profiles) ================
     // Fields 1:1 aligned with C-side src/include/sip_profile.h sip_profile_t
@@ -2922,7 +3051,7 @@ sqlx::query(acct_ddl).execute(pool).await?;
                 let mysql_def = if name == "auto_ban" {
                     "TINYINT(1) NOT NULL DEFAULT 1".to_string()
                 } else {
-                    format!("INT NOT NULL DEFAULT {}", 
+                    format!("INT NOT NULL DEFAULT {}",
                         match name {
                             "authfail_threshold" => "5",
                             "authfail_window_s"  => "60",
@@ -2972,6 +3101,11 @@ pub struct CdrRow {
     pub leg_a_final: Option<i32>,
     pub leg_b_final: Option<i32>,
     pub metadata: Option<String>,
+    /* REQ-SEC-005: 从 metadata JSON 解析出的恶意标记 — 前端 Tab 分流（全部/正常/恶意） */
+    pub is_malicious: u8,
+    pub threat_reason: Option<String>,
+    /* from_ip 从 metadata JSON 解析 — 前端 Source IP 列显示 + from_ip= 搜索 */
+    pub from_ip: Option<String>,
 }
 
 /// Pagination parameters.
@@ -2979,10 +3113,23 @@ pub struct CdrRow {
 pub struct CdrQuery {
     pub caller: Option<String>,
     pub callee: Option<String>,
+    /// Call-ID 搜索（精确或 LIKE 前缀/后缀都支持，用 SQL LIKE）
+    pub call_id: Option<String>,
+    /// 源 IP 搜索（从 metadata JSON 提取 → Rust 侧 LIKE filter）
+    pub from_ip: Option<String>,
     pub from: Option<String>,
     pub to: Option<String>,
+    /// 通话时长范围（秒）— WHERE duration_sec >= min AND <= max
+    pub duration_min: Option<i64>,
+    pub duration_max: Option<i64>,
     pub limit: u32,
     pub offset: u32,
+    /* REQ-SEC-005: disposition + is_malicious 过滤（前端 Tab 分流） */
+    pub disposition: Option<String>,
+    pub is_malicious: Option<u8>,  /* Some(0)=正常, Some(1)=恶意, None=全部 */
+    /// 排序：默认 start_time DESC；可选 ("duration"|"answer_time") ("asc"|"desc")
+    pub sort_by: Option<String>,
+    pub sort_dir: Option<String>,
 }
 
 impl CdrQuery {
@@ -3003,30 +3150,45 @@ pub async fn query_cdrs(
 ) -> Result<(Vec<CdrRow>, i64), sqlx::Error> {
     let q = q.clone().normalized();
 
-    // Build WHERE clause dynamically; ? placeholder count maps to bind order
+    // Build WHERE clause dynamically — ALWAYS use '?' placeholders so sqlx::Any
+    // adapts them to the actual backend (PostgreSQL $N / MySQL ? / SQLite ?).
+    // Mixing '$N' and manually replaced LIMIT/OFFSET placeholders breaks Any's
+    // per-backend mapping — on SQLite this can silently drop the LIMIT clause.
     let mut where_clauses: Vec<String> = Vec::new();
-    let mut bound_idx: u32 = 0;
     let mut binds: Vec<String> = Vec::new();
 
     if let Some(c) = &q.caller {
-        bound_idx += 1;
-        where_clauses.push(format!("caller LIKE ${bound_idx}"));
+        where_clauses.push("caller LIKE ?".to_string());
         binds.push(format!("%{}%", c));
     }
     if let Some(c) = &q.callee {
-        bound_idx += 1;
-        where_clauses.push(format!("callee LIKE ${bound_idx}"));
+        where_clauses.push("callee LIKE ?".to_string());
         binds.push(format!("%{}%", c));
     }
+    if let Some(cid) = &q.call_id {
+        where_clauses.push("call_id LIKE ?".to_string());
+        binds.push(format!("%{}%", cid));
+    }
     if let Some(f) = &q.from {
-        bound_idx += 1;
-        where_clauses.push(format!("start_time >= ${bound_idx}"));
+        where_clauses.push("start_time >= ?".to_string());
         binds.push(f.clone());
     }
     if let Some(t) = &q.to {
-        bound_idx += 1;
-        where_clauses.push(format!("start_time <= ${bound_idx}"));
+        where_clauses.push("start_time <= ?".to_string());
         binds.push(t.clone());
+    }
+    if let Some(min) = q.duration_min {
+        where_clauses.push("duration_sec >= ?".to_string());
+        binds.push(min.to_string());
+    }
+    if let Some(max) = q.duration_max {
+        where_clauses.push("duration_sec <= ?".to_string());
+        binds.push(max.to_string());
+    }
+    /* REQ-SEC-005: disposition filter — cause_text 列就是 "answered"/"failed"/"busy" */
+    if let Some(d) = &q.disposition {
+        where_clauses.push("cause_text = ?".to_string());
+        binds.push(d.clone());
     }
 
     let where_sql = if where_clauses.is_empty() {
@@ -3035,32 +3197,151 @@ pub async fn query_cdrs(
         "WHERE ".to_string() + &where_clauses.join(" AND ")
     };
 
-    // count
+    let binds_strs: Vec<&str> = binds.iter().map(|s| s.as_str()).collect();
+
+    // count — shares WHERE binds (注意：is_malicious filter 在 Rust 侧做，
+    // 因为跨后端 JSON 提取函数不统一，先查足够多再 filter)
     let count_sql = format!("SELECT COUNT(*) FROM cdr {where_sql}");
     let mut count_q = sqlx::query_scalar::<_, i64>(&count_sql);
-    for b in &binds { count_q = count_q.bind(b.as_str()); }
-    let total: i64 = count_q.fetch_one(pool).await.unwrap_or(0);
+    for b in &binds_strs { count_q = count_q.bind(b); }
+    let total_unfiltered: i64 = count_q.fetch_one(pool).await.unwrap_or(0);
 
-    // rows
+    // rows — 先查够多（limit * 3），然后 Rust 侧从 metadata 解析 is_malicious/threat_reason + filter
+    let fetch_limit = if q.is_malicious.is_some() {
+        (q.limit as i64) * 3  /* 宽松取 3 倍，filter 后大概率够用 */
+    } else {
+        q.limit as i64
+    };
+
+    /* ---- 动态 ORDER BY（sort_by + sort_dir）----
+     * 安全：白名单列名（只允许 start_time/duration_sec/answer_time/caller/callee），
+     * 直接拼进 SQL（不是用户输入 bind），所以必须硬编码白名单。 */
+    let sort_col = match q.sort_by.as_deref() {
+        Some("duration") | Some("duration_sec") => "duration_sec",
+        Some("answer") | Some("answer_time") => "answer_time",
+        Some("caller") => "caller",
+        Some("callee") => "callee",
+        _ => "start_time",  /* 默认 */
+    };
+    let sort_dir = match q.sort_dir.as_deref() {
+        Some("asc") => "ASC",
+        _ => "DESC",  /* 默认 */
+    };
+    let order_by = format!("ORDER BY {sort_col} {sort_dir}, start_time DESC");
+
     let rows_sql = format!(
         "SELECT call_id, a_call_id, b_call_id, caller, callee, \
                 start_time, answer_time, end_time, duration_sec, billsec, \
                 cause_code, cause_text, leg_a_final, leg_b_final, metadata \
-         FROM cdr {where_sql} ORDER BY start_time DESC LIMIT ? OFFSET ?"
+         FROM cdr {where_sql} {order_by} LIMIT ? OFFSET ?"
     );
-    // LIMIT/OFFSET bound as the last two parameters
-    let final_limit = binds.len() + 1;
-    let final_offset = binds.len() + 2;
-    let rows_sql = rows_sql
-        .replace("LIMIT ?", &format!("LIMIT ${final_limit}"))
-        .replace("OFFSET ?", &format!("OFFSET ${final_offset}"));
 
-    let mut rows_q = sqlx::query_as::<_, CdrRow>(&rows_sql);
-    for b in &binds { rows_q = rows_q.bind(b.as_str()); }
-    rows_q = rows_q.bind(q.limit as i64).bind(q.offset as i64);
-    let rows: Vec<CdrRow> = rows_q.fetch_all(pool).await?;
+    // 先查原始行（不带 is_malicious/threat_reason — 它们在 metadata JSON 里）
+    let rows_raw: Vec<CdrRowRaw> = {
+        let mut rows_q = sqlx::query_as::<_, CdrRowRaw>(&rows_sql);
+        for b in &binds_strs { rows_q = rows_q.bind(b); }
+        rows_q = rows_q.bind(fetch_limit).bind(q.offset as i64);
+        rows_q.fetch_all(pool).await?
+    };
+    let rows_raw_len = rows_raw.len();  /* 提前存长度 — 后面 rows_raw.into_iter() 会 move */
+
+    /* REQ-SEC-005: 从 metadata JSON 解析 is_malicious + threat_reason + from_ip，Rust 侧 filter。
+     * 跨后端 JSON 提取函数不统一 → 全在 Rust 里做，零 schema 改动。 */
+    let q_from_ip = q.from_ip.clone();
+    let mut rows: Vec<CdrRow> = rows_raw.into_iter()
+        .map(|raw| {
+            let (is_mal, threat_reason, from_ip) = parse_meta(&raw.metadata);
+            CdrRow {
+                call_id: raw.call_id,
+                a_call_id: raw.a_call_id,
+                b_call_id: raw.b_call_id,
+                caller: raw.caller,
+                callee: raw.callee,
+                start_time: raw.start_time,
+                answer_time: raw.answer_time,
+                end_time: raw.end_time,
+                duration_sec: raw.duration_sec,
+                billsec: raw.billsec,
+                cause_code: raw.cause_code,
+                cause_text: raw.cause_text,
+                leg_a_final: raw.leg_a_final,
+                leg_b_final: raw.leg_b_final,
+                metadata: raw.metadata,
+                is_malicious: is_mal,
+                threat_reason,
+                from_ip,
+            }
+        })
+        .filter(|r| {
+            if let Some(want) = q.is_malicious {
+                if r.is_malicious != want { return false; }
+            }
+            /* from_ip LIKE filter — 从 metadata JSON 解析的字段，Rust 侧匹配 */
+            if let Some(want_ip) = &q_from_ip {
+                let needle = want_ip.to_lowercase();
+                let hay = r.from_ip.as_deref().unwrap_or("").to_lowercase();
+                if !hay.contains(&needle) { return false; }
+            }
+            true
+        })
+        .take(q.limit as usize)
+        .collect();
+
+    /* 如果有 is_malicious filter，total 也按 filter 后的逻辑算 — 近似用 total_unfiltered，
+     * 不精确但能让分页 UI 不乱。精确 total 需要再查一次 DB（查全量再 filter）。 */
+    let total = if q.is_malicious.is_some() {
+        // 近似：total_unfiltered 的按比例缩放
+        let filtered_count = rows.len() as i64;
+        // 如果 fetch 完还没取满，说明 DB 里 filter 后的总数就是 filtered_count
+        if (fetch_limit as usize) >= rows_raw_len {
+            filtered_count
+        } else {
+            // 近似：假设 filter 比例均匀
+            let ratio = filtered_count as f64 / rows_raw_len as f64;
+            (total_unfiltered as f64 * ratio) as i64
+        }
+    } else {
+        total_unfiltered
+    };
 
     Ok((rows, total))
+}
+
+/// CDR 原始行（不带 is_malicious/threat_reason — 从 metadata JSON 解析）
+#[derive(Clone, Debug, sqlx::FromRow)]
+struct CdrRowRaw {
+    call_id: String,
+    a_call_id: Option<String>,
+    b_call_id: Option<String>,
+    caller: Option<String>,
+    callee: Option<String>,
+    start_time: String,
+    answer_time: Option<String>,
+    end_time: Option<String>,
+    duration_sec: Option<i64>,
+    billsec: Option<i64>,
+    cause_code: Option<i32>,
+    cause_text: Option<String>,
+    leg_a_final: Option<i32>,
+    leg_b_final: Option<i32>,
+    metadata: Option<String>,
+}
+
+/// 从 metadata JSON 解析 is_malicious (u8) + threat_reason + from_ip。
+/// metadata 格式固定由 insert_cdr 的 meta_obj 生成：
+///   {"tenant":..., "is_malicious":0|1, "threat_reason":"ban"|"blacklist"|null, "from_ip":"1.2.3.4", ...}
+/// 解析失败（JSON 损坏 / key 不存在 / 旧数据）→ 默认 is_malicious=0, 其余 None。
+fn parse_meta(meta: &Option<String>) -> (u8, Option<String>, Option<String>) {
+    let Some(s) = meta else { return (0, None, None); };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(s) else { return (0, None, None); };
+    let is_mal = v.get("is_malicious").and_then(|x| x.as_u64()).unwrap_or(0) as u8;
+    let threat = v.get("threat_reason").and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let from_ip = v.get("from_ip").and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    (is_mal, threat, from_ip)
 }
 
 // ---------- recordings query (REQ-REC-004 Web REST) ----------
@@ -4226,6 +4507,11 @@ pub struct DialplanRule {
     pub target:         String,
     pub rec_action:     i64,  /* 0=none 1=start 2=stop — C side dp_execute carries independently per rule */
     pub rec_path_template: String,  /* optional path template, empty=default yyyymmdd/callid_mix_seq.wav */
+    /* IMS force-override 三态字段：0=inherit 1=force on 2=force off */
+    pub force_prack:       i64,
+    pub force_precondition: i64,
+    pub force_timer:       i64,
+    pub force_gruu:        i64,
     pub action_json:    String,
     /* REQ-DP-APP-001: Application chain JSON array — pushed to C side dp_json_parse_one on reload */
     pub app_chain:      String,
@@ -4260,6 +4546,15 @@ pub struct DialplanRuleCreate {
     pub rec_action:     i64,  /* 0=none 1=start 2=stop */
     #[serde(default)]
     pub rec_path_template: String,  /* optional path template, empty=system default */
+    /* IMS force-override 三态字段，default 0 = inherit */
+    #[serde(default)]
+    pub force_prack:       i64,
+    #[serde(default)]
+    pub force_precondition: i64,
+    #[serde(default)]
+    pub force_timer:       i64,
+    #[serde(default)]
+    pub force_gruu:        i64,
     #[serde(default = "default_empty_json")]
     pub action_json:    String,
     /* REQ-DP-APP-001: default empty array (skip when no app_chain) */
@@ -4286,6 +4581,11 @@ pub struct DialplanRuleUpdate {
     pub target:         Option<String>,
     pub rec_action:     Option<i64>,  /* 0=none 1=start 2=stop */
     pub rec_path_template: Option<String>,  /* optional path template */
+    /* IMS force-override 三态字段 */
+    pub force_prack:       Option<i64>,
+    pub force_precondition: Option<i64>,
+    pub force_timer:       Option<i64>,
+    pub force_gruu:        Option<i64>,
     pub action_json:    Option<String>,
     /* REQ-DP-APP-001 */
     pub app_chain:      Option<String>,
@@ -4295,6 +4595,11 @@ pub struct DialplanRuleUpdate {
 
 fn default_priority() -> String { "priority".to_string() }
 fn default_empty_json() -> String { "{}".to_string() }
+fn default_ivr_entry() -> String { "main".to_string() }
+fn default_ivr_nodes_json() -> String {
+    r#"[{"name":"main","prompt":"","initial_timeout_s":5,"interdigit_timeout_s":3,"max_retries":3,"choices":[],"timeout_action":{"act":"hangup","arg":""},"invalid_action":{"act":"hangup","arg":""}}]"#.to_string()
+}
+fn default_one() -> i64 { 1 }
 fn default_empty_array() -> String { "[]".to_string() }
 /* §15 RFC1918 intranet subnets (default IP admission, toll fraud prevention) */
 const RFC1918_CIDR_DEFAULT: &str = "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8";
@@ -4444,9 +4749,12 @@ fn default_moh() -> String { "default".to_string() }
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct IvrMenu {
     pub id:             i64,
+    pub tenant_id:      i64,
     pub name:           String,
     #[serde(serialize_with = "bool_i64::serialize")]
     pub enabled:        i64,
+    pub entry_node:     String,
+    pub nodes_json:     String,
     pub prompt_audio:   String,
     pub invalid_audio:  String,
     pub timeout_sec:    i64,
@@ -4461,30 +4769,38 @@ pub struct IvrMenu {
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct IvrMenuCreate {
-    pub name:            String,
+    #[serde(default = "default_one")]
+    pub tenant_id:       i64,
+    pub name:             String,
     #[serde(default = "default_true")]
-    pub enabled:         bool,
+    pub enabled:          bool,
+    #[serde(default = "default_ivr_entry")]
+    pub entry_node:       String,
+    #[serde(default = "default_ivr_nodes_json")]
+    pub nodes_json:       String,
     #[serde(default)]
-    pub prompt_audio:    String,
+    pub prompt_audio:     String,
     #[serde(default)]
-    pub invalid_audio:   String,
+    pub invalid_audio:    String,
     #[serde(default = "default_10")]
-    pub timeout_sec:     i64,
+    pub timeout_sec:      i64,
     #[serde(default = "default_3")]
-    pub max_attempts:    i64,
+    pub max_attempts:     i64,
     #[serde(default = "default_empty_json")]
-    pub options_json:    String,
+    pub options_json:     String,
     #[serde(default)]
-    pub timeout_target:  String,
+    pub timeout_target:   String,
     #[serde(default)]
-    pub invalid_target:  String,
+    pub invalid_target:   String,
     #[serde(default)]
-    pub description:     String,
+    pub description:      String,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct IvrMenuUpdate {
     pub enabled:         Option<bool>,
+    pub entry_node:      Option<String>,
+    pub nodes_json:      Option<String>,
     pub prompt_audio:    Option<String>,
     pub invalid_audio:   Option<String>,
     pub timeout_sec:     Option<i64>,
@@ -4900,13 +5216,17 @@ impl Db {
         sqlx::query_as::<_, DialplanRule>(
             "INSERT INTO dialplan_rules
                 (tenant_id, name, layer, profile_name, src_ip_cidr, match_expr, caller_match,
-                 prio, strip, target, rec_action, rec_path_template, action_json, app_chain, enabled, description)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                 prio, strip, target, rec_action, rec_path_template,
+                 force_prack, force_precondition, force_timer, force_gruu,
+                 action_json, app_chain, enabled, description)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
              RETURNING *"
         )
         .bind(c.tenant_id).bind(&c.name).bind(&c.layer).bind(&c.profile_name).bind(&c.src_ip_cidr)
         .bind(&c.match_expr).bind(&c.caller_match)
-        .bind(c.prio).bind(c.strip).bind(&c.target).bind(c.rec_action).bind(&c.rec_path_template).bind(&act).bind(&ac)
+        .bind(c.prio).bind(c.strip).bind(&c.target).bind(c.rec_action).bind(&c.rec_path_template)
+        .bind(c.force_prack).bind(c.force_precondition).bind(c.force_timer).bind(c.force_gruu)
+        .bind(&act).bind(&ac)
         .bind(c.enabled as i64).bind(&c.description)
         .fetch_one(pool).await
     }
@@ -4949,6 +5269,11 @@ impl Db {
         set_sr!("target", u.target.clone());
         set_ir!("rec_action", u.rec_action);  /* §16 new: recording control per rule independently */
         set_sr!("rec_path_template", u.rec_path_template.clone());  /* §18 new: optional path template */
+        /* IMS force-override 三态字段 */
+        set_ir!("force_prack", u.force_prack);
+        set_ir!("force_precondition", u.force_precondition);
+        set_ir!("force_timer", u.force_timer);
+        set_ir!("force_gruu", u.force_gruu);
         set_sr!("action_json", u.action_json.clone());
         set_sr!("app_chain", u.app_chain.clone());  /* REQ-DP-APP-001 */
         set_br!("enabled", u.enabled);
@@ -5416,17 +5741,24 @@ impl Db {
     // ===== ivr_menus =====
 
     pub async fn list_ivr_menus(
-        &self, enabled: Option<bool>, limit: i64, offset: i64,
+        &self, enabled: Option<bool>, tenant_id: Option<i64>, limit: i64, offset: i64,
     ) -> Result<(Vec<IvrMenu>, i64), sqlx::Error> {
         let Some(pool) = self.pool() else { return Ok((Vec::new(), 0)); };
         let backend = self.backend();
         let limit = limit.clamp(1, 500);
         let offset = offset.max(0);
-        let (where_sql, binds) = match enabled {
-            Some(v) => ("WHERE enabled = $1".to_string(),
-                        vec![if v { "1".to_string() } else { "0".to_string() }]),
-            None => (String::new(), Vec::new()),
-        };
+        let mut where_parts: Vec<&str> = Vec::new();
+        let mut binds: Vec<String> = Vec::new();
+        if let Some(v) = enabled {
+            where_parts.push("enabled = $1");
+            binds.push(if v { "1".to_string() } else { "0".to_string() });
+        }
+        if let Some(tid) = tenant_id {
+            let ph = format!("${}", binds.len() + 1);
+            where_parts.push("tenant_id = {ph}");
+            binds.push(tid.to_string());
+        }
+        let where_sql = if where_parts.is_empty() { String::new() } else { format!("WHERE {}", where_parts.join(" AND ")) };
         let count_sql = fix_ph(&format!("SELECT COUNT(*) FROM ivr_menus {where_sql}"), backend);
         let mut cq = sqlx::query_scalar::<_, i64>(&count_sql);
         for b in &binds { cq = cq.bind(b.as_str()); }
@@ -5452,16 +5784,18 @@ impl Db {
         let backend = self.backend();
         let is_mysql = backend == "mysql";
         let opts = if c.options_json.is_empty() { "[]".to_string() } else { c.options_json };
+        let nodes = if c.nodes_json.is_empty() { default_ivr_nodes_json() } else { c.nodes_json };
         let raw_sql = "INSERT INTO ivr_menus
-                (name, enabled, prompt_audio, invalid_audio, timeout_sec, max_attempts,
-                 options_json, timeout_target, invalid_target, description)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                (tenant_id, name, enabled, entry_node, nodes_json, prompt_audio, invalid_audio,
+                 timeout_sec, max_attempts, options_json, timeout_target, invalid_target, description)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
              RETURNING *";
         if is_mysql {
             let plain_sql = strip_returning(raw_sql);
             let sql = fix_ph(&plain_sql, backend);
             let res = sqlx::query(&sql)
-                .bind(&c.name).bind(c.enabled as i64)
+                .bind(c.tenant_id).bind(&c.name).bind(c.enabled as i64)
+                .bind(&c.entry_node).bind(&nodes)
                 .bind(&c.prompt_audio).bind(&c.invalid_audio)
                 .bind(c.timeout_sec).bind(c.max_attempts)
                 .bind(&opts).bind(&c.timeout_target).bind(&c.invalid_target)
@@ -5473,7 +5807,8 @@ impl Db {
         }
         let sql = fix_ph(raw_sql, backend);
         sqlx::query_as::<_, IvrMenu>(&sql)
-        .bind(&c.name).bind(c.enabled as i64)
+        .bind(c.tenant_id).bind(&c.name).bind(c.enabled as i64)
+        .bind(&c.entry_node).bind(&nodes)
         .bind(&c.prompt_audio).bind(&c.invalid_audio)
         .bind(c.timeout_sec).bind(c.max_attempts)
         .bind(&opts).bind(&c.timeout_target).bind(&c.invalid_target)
@@ -5506,6 +5841,8 @@ impl Db {
         }
 
         set_biv!("enabled", u.enabled);
+        set_siv!("entry_node", u.entry_node.clone());
+        set_siv!("nodes_json", u.nodes_json.clone());
         set_siv!("prompt_audio", u.prompt_audio.clone());
         set_siv!("invalid_audio", u.invalid_audio.clone());
         set_iiv!("timeout_sec", u.timeout_sec);
@@ -6153,6 +6490,20 @@ pub async fn delete_account(&self, id: i64) -> Result<bool, sqlx::Error> {
     let backend = self.backend();
     let res = sqlx::query(&fix_ph("DELETE FROM accounts WHERE id = $1", backend)).bind(id).execute(pool).await?;
     Ok(res.rows_affected() > 0)
+}
+
+pub async fn update_account(&self, id: i64, description: &str, credit_limit_uc: i64) -> Result<Option<Account>, sqlx::Error> {
+    let Some(pool) = self.pool() else { return Ok(None); };
+    let backend = self.backend();
+    let ts = match backend { "postgres" => "NOW()", "mysql" => "CURRENT_TIMESTAMP(3)", _ => "datetime('now')" };
+    let sql = format!(
+        "UPDATE accounts SET description = $1, credit_limit_uc = $2, updated_at = {ts} WHERE id = $3 RETURNING *"
+    );
+    sqlx::query_as::<_, Account>(&fix_ph(&sql, backend))
+        .bind(description)
+        .bind(credit_limit_uc)
+        .bind(id)
+        .fetch_optional(pool).await
 }
 
 } // <- close impl Db ④ (routes + accounts module)

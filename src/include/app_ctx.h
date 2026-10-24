@@ -71,8 +71,9 @@ typedef struct nsbc_ctx {
     void *binding_count_ud;
 
     /* 结构化事件上报槽（A4）：ha 等同层模块不得横向 include oam/obs.h；
-     * oam 模块 start 时接线为 obs_event，调用方需做 NULL 防护。 */
-    void (*event_fn)(const char *domain_action, const char *fmt, ...);
+     * oam 模块 start 时接线为 obs_event，调用方需做 NULL 防护。
+     * level: llog 级别（0=EMERG~7=DEBUG），-1=默认 INFO(6)。 */
+    void (*event_fn)(int level, const char *domain_action, const char *fmt, ...);
 
     /* CDR 上报槽（REQ-PBX-CDR-001）：sip/core 话务生命周期点产出
      * cdr_event_t（START/ANSWER/END），billing 模块 start 时接线为

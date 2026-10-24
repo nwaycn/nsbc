@@ -74,10 +74,15 @@ impl AccountStore {
     ///
     /// argon2id hashes are regenerated each startup (random salt), avoiding hardcoded leaks.
     pub fn with_defaults() -> Result<AccountStore, String> {
-        let admin_pw = std::env::var("NSBC_DEFAULT_ADMIN_PW")
-            .unwrap_or_else(|_| "Admin123".to_string());
-        let dev_pw = std::env::var("NSBC_DEFAULT_DEV_PW")
-            .unwrap_or_else(|_| "Admin123".to_string());
+        // Default passwords: env override > random (NOT hardcoded — security: avoid default backdoor)
+        let admin_pw = match std::env::var("NSBC_DEFAULT_ADMIN_PW") {
+            Ok(v) if !v.is_empty() => v,
+            _ => generate_random_password(16),
+        };
+        let dev_pw = match std::env::var("NSBC_DEFAULT_DEV_PW") {
+            Ok(v) if !v.is_empty() => v,
+            _ => generate_random_password(16),
+        };
 
         let admin_phc = hash_password_argon2id(&admin_pw)?;
         let dev_phc = hash_password_argon2id(&dev_pw)?;
@@ -94,8 +99,11 @@ impl AccountStore {
 
         tracing::warn!(
             "no accounts configured — bootstrapping default admin(L2) + dev(L1); \
-             override with NSBC_AUTH_ACCOUNTS or change defaults via \
-             NSBC_DEFAULT_ADMIN_PW / NSBC_DEFAULT_DEV_PW"
+             override with NSBC_AUTH_ACCOUNTS or NSBC_AUTH_FILE. \
+             Generated admin pw: {admin_pw}, dev pw: {dev_pw} (these are ephemeral; \
+             set NSBC_AUTH_ACCOUNTS or NSBC_DEFAULT_ADMIN_PW / NSBC_DEFAULT_DEV_PW to persist)",
+            admin_pw = admin_pw,
+            dev_pw = dev_pw,
         );
 
         Ok(AccountStore { by_name })
@@ -134,6 +142,29 @@ pub fn valid_username(s: &str) -> bool {
 #[derive(Clone, Copy, Debug)]
 pub struct PasswordPolicy {
     pub min_len: usize,
+}
+
+/// Generate a random alphanumeric password (base62, len bytes).
+/// Uses getrandom (already in Cargo.lock via rustls dependency chain).
+fn generate_random_password(len: usize) -> String {
+    use getrandom::getrandom;
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut buf = vec![0u8; len];
+    if getrandom(&mut buf).is_err() {
+        // Fallback: time-based (not secure but at least not a hardcoded backdoor)
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = ALPHABET[((t.wrapping_add(i as u64)) % ALPHABET.len() as u64) as usize];
+        }
+    } else {
+        for b in buf.iter_mut() {
+            *b = ALPHABET[(*b as usize) % ALPHABET.len()];
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 impl Default for PasswordPolicy {

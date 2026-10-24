@@ -330,6 +330,9 @@ async fn write_cdr(db: &crate::db::Db, v: &serde_json::Value) -> Result<(), Stri
     let codec_b   = opt_str(v, "codec_b");
     let a_peer_ip = opt_str(v, "a_peer_ip");
     let b_peer_ip = opt_str(v, "b_peer_ip");
+    /* REQ-SEC-005: 从 C 端 event_json 读 is_malicious + threat_reason */
+    let is_malicious = v.get("is_malicious").and_then(|x| x.as_u64()).unwrap_or(0) as u8;
+    let threat_reason = opt_str(v, "threat_reason");
     db.insert_cdr(
         call_id,
         opt_str(v, "tenant").as_deref(),
@@ -352,6 +355,8 @@ async fn write_cdr(db: &crate::db::Db, v: &serde_json::Value) -> Result<(), Stri
         codec_b.as_deref(),
         a_peer_ip.as_deref(),
         b_peer_ip.as_deref(),
+        is_malicious,
+        threat_reason.as_deref(),
     )
     .await
     .map_err(|e| e.to_string())

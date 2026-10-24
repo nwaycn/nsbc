@@ -127,6 +127,16 @@ int security_fence_mode_get(void);
  * 性能敏感：内部原子读 fence_mode + 哈希桶链表，无 parse 成本。 */
 int security_is_blocked(const nsbc_sa_t *src);
 
+/* CDR END emit 时查：源 IP 是否被标记为恶意（ban / blacklist / rate-limit）。
+ * @param ip           源 IP 字符串（纯 IP，无端口）
+ * @param reason_out   输出威胁原因（最多 31 字符 + \0），如 "ban", "blacklist", "ratelimit"
+ * @param reason_sz    reason_out 缓冲区大小
+ * @return 1=恶意攻击（填充 reason_out），0=正常（reason_out 为空）
+ *
+ * 只读、无副作用、线程安全（内部加 ban_lock 读 ban 表；blacklist 表用 wrlock 读）。
+ * 设计为 CDR 生成链上同步调用 — 不能阻塞太久，只查 hash 桶。 */
+int security_get_threat(const char *ip, char *reason_out, size_t reason_sz);
+
 #ifdef __cplusplus
 }
 #endif

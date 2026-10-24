@@ -1,4 +1,4 @@
-﻿// =============================================================================
+// =============================================================================
 // NSBC Web — CRUD 实体面组件
 // 加载顺序：必须在 app-core.js 之后
 // 依赖：app-core.js 中声明的全局 const app, crudTable
@@ -230,17 +230,17 @@ app.component('dialplan-rules', {
 
       <!-- Profile Tab 分区（= FreeSWITCH context） -->
       <el-tabs v-model="activeProfile" type="border-card">
-        <el-tab-pane :label="t('$n')" name="internal">
+        <el-tab-pane label="📥 Internal (SIP → internal)" name="internal">
           <el-table :data="pagedItems" border stripe size="default" style="width:100%">
             <el-table-column type="index" label="#" width="55" align="center"></el-table-column>
-            <el-table-column prop="tenant_id" :label="t('$n')" width="80" align="center">
+            <el-table-column prop="tenant_id" label="Tenant" width="80" align="center">
               <template #default="{ row }"><el-tag size="small" effect="plain">T{{ row.tenant_id || 1 }}</el-tag></template>
             </el-table-column>
-            <el-table-column prop="name" :label="t('$n')" min-width="140"></el-table-column>
-            <el-table-column prop="match_expr" :label="t('$n')" min-width="140">
+            <el-table-column prop="name" label="Name" min-width="140"></el-table-column>
+            <el-table-column prop="match_expr" label="Match Expression" min-width="140">
               <template #default="{ row }"><code class="text-xs bg-slate-100 px-1 rounded">{{ row.match_expr }}</code></template>
             </el-table-column>
-            <el-table-column prop="target" :label="t('$n')" min-width="160"></el-table-column>
+            <el-table-column prop="target" label="Target" min-width="160"></el-table-column>
             <el-table-column prop="rec_action" label="录音" width="90" align="center">
               <template #default="{ row }">
                 <el-tag v-if="row.rec_action === 1" type="danger" effect="light" size="small" round>Start</el-tag>
@@ -254,23 +254,23 @@ app.component('dialplan-rules', {
                 <span v-else class="text-slate-400 text-xs">{{ t('Default') }}</span>
               </template>
             </el-table-column>
-            <el-table-column prop="prio" :label="t('$n')" width="80" align="center"></el-table-column>
+            <el-table-column prop="prio" label="Priority" width="80" align="center"></el-table-column>
             <el-table-column prop="src_ip_cidr" label="IP 准入 CIDR" min-width="180">
               <template #default="{ row }">
                 <code class="text-xs" :class="row.src_ip_cidr === '0.0.0.0/0' ? 'text-amber-600' : 'text-slate-500'">{{ row.src_ip_cidr }}</code>
               </template>
             </el-table-column>
-            <el-table-column prop="enabled" :label="t('$n')" width="80" align="center">
+            <el-table-column prop="enabled" label="Enabled" width="80" align="center">
               <template #default="{ row }">
                 <el-tag :type="row.enabled ? 'success' : 'info'" effect="light" size="small" round>
                   {{ row.enabled ? t('Enable') : t('Disable') }}
                 </el-tag>
               </template>
             </el-table-column>
-            <el-table-column :label="t('$n')" width="150" align="center" fixed="right">
+            <el-table-column label="Actions" width="150" align="center" fixed="right">
               <template #default="{ row }">
                 <el-button link type="primary" size="small" @click="openEdit(row)">{{ t('Edit') }}</el-button>
-                <el-popconfirm :title="t('$n')" @confirm="del(row.id)">
+                <el-popconfirm title="Delete this rule?" @confirm="del(row.id)">
                   <template #reference><el-button link type="danger" size="small">{{ t('Delete') }}</el-button></template>
                 </el-popconfirm>
               </template>
@@ -282,17 +282,17 @@ app.component('dialplan-rules', {
           </div>
         </el-tab-pane>
 
-        <el-tab-pane :label="t('$n')" name="external">
+        <el-tab-pane label="📤 External (Gateway/Trunk → internal)" name="external">
           <el-table :data="pagedItems" border stripe size="default" style="width:100%">
             <el-table-column type="index" label="#" width="55" align="center"></el-table-column>
-            <el-table-column prop="tenant_id" :label="t('$n')" width="80" align="center">
+            <el-table-column prop="tenant_id" label="Tenant" width="80" align="center">
               <template #default="{ row }"><el-tag size="small" effect="plain">T{{ row.tenant_id || 1 }}</el-tag></template>
             </el-table-column>
-            <el-table-column prop="name" :label="t('$n')" min-width="140"></el-table-column>
-            <el-table-column prop="match_expr" :label="t('$n')" min-width="140">
+            <el-table-column prop="name" label="Name" min-width="140"></el-table-column>
+            <el-table-column prop="match_expr" label="Match Expression" min-width="140">
               <template #default="{ row }"><code class="text-xs bg-slate-100 px-1 rounded">{{ row.match_expr }}</code></template>
             </el-table-column>
-            <el-table-column prop="target" :label="t('$n')" min-width="160"></el-table-column>
+            <el-table-column prop="target" label="Target" min-width="160"></el-table-column>
             <el-table-column prop="rec_action" label="录音" width="90" align="center">
               <template #default="{ row }">
                 <el-tag v-if="row.rec_action === 1" type="danger" effect="light" size="small" round>Start</el-tag>
@@ -306,23 +306,23 @@ app.component('dialplan-rules', {
                 <span v-else class="text-slate-400 text-xs">{{ t('Default') }}</span>
               </template>
             </el-table-column>
-            <el-table-column prop="prio" :label="t('$n')" width="80" align="center"></el-table-column>
+            <el-table-column prop="prio" label="Priority" width="80" align="center"></el-table-column>
             <el-table-column prop="src_ip_cidr" label="IP 准入 CIDR" min-width="180">
               <template #default="{ row }">
                 <code class="text-xs" :class="row.src_ip_cidr === '0.0.0.0/0' ? 'text-amber-600' : 'text-slate-500'">{{ row.src_ip_cidr }}</code>
               </template>
             </el-table-column>
-            <el-table-column prop="enabled" :label="t('$n')" width="80" align="center">
+            <el-table-column prop="enabled" label="Enabled" width="80" align="center">
               <template #default="{ row }">
                 <el-tag :type="row.enabled ? 'success' : 'info'" effect="light" size="small" round>
                   {{ row.enabled ? t('Enable') : t('Disable') }}
                 </el-tag>
               </template>
             </el-table-column>
-            <el-table-column :label="t('$n')" width="150" align="center" fixed="right">
+            <el-table-column label="Actions" width="150" align="center" fixed="right">
               <template #default="{ row }">
                 <el-button link type="primary" size="small" @click="openEdit(row)">{{ t('Edit') }}</el-button>
-                <el-popconfirm :title="t('$n')" @confirm="del(row.id)">
+                <el-popconfirm title="Delete this rule?" @confirm="del(row.id)">
                   <template #reference><el-button link type="danger" size="small">{{ t('Delete') }}</el-button></template>
                 </el-popconfirm>
               </template>
@@ -336,7 +336,7 @@ app.component('dialplan-rules', {
       </el-tabs>
 
       <!-- 新建/Edit弹窗 -->
-      <el-dialog v-model="showModal" ::title="t('$n')" width="900px" destroy-on-close>
+      <el-dialog v-model="showModal" :title="editingId ? 'Edit Dialplan Rule' : 'New Dialplan Rule'" width="900px" destroy-on-close>
         <el-form :model="form" label-position="top">
           <el-form-item label="所属Tenant">
             <el-select v-model="form.tenant_id" style="width:100%" filterable>
@@ -346,11 +346,11 @@ app.component('dialplan-rules', {
             </el-select>
             <div class="text-xs text-slate-400 mt-1">{{ t('跨Tenant规则互相隔离，Default选 T1 (default)') }}</div>
           </el-form-item>
-          <el-form-item :label="t('$n')"><el-input v-model="form.name" placeholder="例：DID 51350820 → 内部 alice"></el-input></el-form-item>
+          <el-form-item label="Rule Name"><el-input v-model="form.name" placeholder="例：DID 51350820 → 内部 alice"></el-input></el-form-item>
           <el-form-item label="所属 Profile（= FreeSWITCH context）">
             <el-select v-model="form.profile_name" style="width:100%" @change="onProfileChange">
-              <el-option value="internal" :label="t('$n')"></el-option>
-              <el-option value="external" :label="t('$n')"></el-option>
+              <el-option value="internal" label="internal (SIP → internal)"></el-option>
+              <el-option value="external" label="external (Gateway/Trunk → internal)"></el-option>
             </el-select>
             <div class="text-xs text-slate-400 mt-1">internal = default.xml；external = public.xml，两个 context 规则完全隔离</div>
           </el-form-item>
@@ -376,7 +376,7 @@ app.component('dialplan-rules', {
               </div>
             </div>
           </el-form-item>
-          <el-form-item :label="t('$n')"><el-input v-model="form.caller_match" :placeholder="t('$n')"></el-input></el-form-item>
+          <el-form-item label="Caller Match (optional)"><el-input v-model="form.caller_match" placeholder="e.g. caller_id_number=^6202 ; empty = match any"></el-input></el-form-item>
           <div class="grid grid-cols-2 gap-4">
             <el-form-item label="同 Profile 内Priority（小Value优先）">
               <el-input-number v-model="form.prio" :controls="false" style="width:100%"></el-input-number>
@@ -402,18 +402,18 @@ app.component('dialplan-rules', {
           </el-form-item>
           <el-form-item label="Target资源（只管路由）">
             <el-select v-model="form.target" filterable allow-create default-first-option
-              :placeholder="t('$n')" style="width:100%" clearable>
-              <el-option-group v-if="gatewayOptions.length" :label="t('$n')">
+              placeholder="Select target..." style="width:100%" clearable>
+              <el-option-group v-if="gatewayOptions.length" label="— GATEWAY —">
                 <el-option v-for="o in gatewayOptions" :key="o.value" :value="o.value" :label="o.label"></el-option>
               </el-option-group>
-              <el-option-group v-if="trunkOptions.length" :label="t('$n')">
+              <el-option-group v-if="trunkOptions.length" label="— TRUNK —">
                 <el-option v-for="o in trunkOptions" :key="o.value" :value="o.value" :label="o.label"></el-option>
               </el-option-group>
               <el-option-group v-if="trunkApiOk && !trunkOptions.length && !gatewayOptions.length" label="— OUT —">
-                <el-option disabled value="" :label="t('$n')"></el-option>
+                <el-option disabled value="" label="(none available)"></el-option>
               </el-option-group>
               <el-option-group label="— EXT Extension / BIZ 业务 —">
-                <el-option value="extension:" :label="t('$n')"></el-option>
+                <el-option value="extension:" label="extension:<extension> → BIZ"></el-option>
                 <el-option value="queue:"     label="queue:<队列> → BIZ"></el-option>
                 <el-option value="ivr:"       label="ivr:<IVR> → BIZ"></el-option>
                 <el-option value="hangup"     label="hangup → BIZ 挂机"></el-option>
@@ -427,7 +427,7 @@ app.component('dialplan-rules', {
           <div class="grid grid-cols-2 gap-4">
             <el-form-item label="录音控制（本规则命中时触发）">
               <el-select v-model="form.rec_action" style="width:100%">
-                <el-option :value="0" :label="t('$n')"></el-option>
+                <el-option :value="0" label="Never"></el-option>
                 <el-option :value="1" label="Start — 命中后开始录音"></el-option>
                 <el-option :value="2" label="Stop — 命中后停止录音"></el-option>
               </el-select>
@@ -435,9 +435,9 @@ app.component('dialplan-rules', {
             </el-form-item>
             <el-form-item label="Media模式（本规则路由时）">
               <el-select v-model="form.media_mode" style="width:100%">
-                <el-option :value="0" :label="t('$n')"></el-option>
-                <el-option :value="1" :label="t('$n')"></el-option>
-                <el-option :value="2" :label="t('$n')"></el-option>
+                <el-option :value="0" label="Never"></el-option>
+                <el-option :value="1" label="mixed"></el-option>
+                <el-option :value="2" label="separate"></el-option>
               </el-select>
               <div class="text-xs text-slate-400 mt-1">
                 WebRTC 通话会被强制 relay 加密终结，bypass 对此类通话无效。
@@ -458,10 +458,45 @@ app.component('dialplan-rules', {
               。空模板时系统用 <code class="bg-slate-100 px-1 rounded">yyyymmdd/callid_mix_seq.wav</code>
             </div>
           </el-form-item>
+          <!-- 3GPP/IMS 强制覆盖（三态）：0=自动继承 profile 1=强制开启 2=强制关闭 -->
+          <el-divider content-position="left">
+            <i class="fas fa-signal mr-1 text-purple-500"></i>
+            {{ t('IMS Capability Override (3-state)') }}
+          </el-divider>
+          <div class="grid grid-cols-2 gap-4">
+            <el-form-item :label="t('100rel Force')">
+              <el-select v-model="form.force_prack" style="width:100%">
+                <el-option :value="0" :label="t('Auto (inherit profile)')"></el-option>
+                <el-option :value="1" :label="t('Force ON')"></el-option>
+                <el-option :value="2" :label="t('Force OFF')"></el-option>
+              </el-select>
+            </el-form-item>
+            <el-form-item :label="t('Precondition Force')">
+              <el-select v-model="form.force_precondition" style="width:100%">
+                <el-option :value="0" :label="t('Auto (inherit profile)')"></el-option>
+                <el-option :value="1" :label="t('Force ON')"></el-option>
+                <el-option :value="2" :label="t('Force OFF')"></el-option>
+              </el-select>
+            </el-form-item>
+            <el-form-item :label="t('Session Timer Force')">
+              <el-select v-model="form.force_timer" style="width:100%">
+                <el-option :value="0" :label="t('Auto (inherit profile)')"></el-option>
+                <el-option :value="1" :label="t('Force ON')"></el-option>
+                <el-option :value="2" :label="t('Force OFF')"></el-option>
+              </el-select>
+            </el-form-item>
+            <el-form-item :label="t('GRUU Force')">
+              <el-select v-model="form.force_gruu" style="width:100%">
+                <el-option :value="0" :label="t('Auto (inherit profile)')"></el-option>
+                <el-option :value="1" :label="t('Force ON')"></el-option>
+                <el-option :value="2" :label="t('Force OFF')"></el-option>
+              </el-select>
+            </el-form-item>
+          </div>
           <el-form-item label="Enable">
-            <el-switch v-model="form.enabled" :active-text="t('$n')" :inactive-text="t('$n')"></el-switch>
+            <el-switch v-model="form.enabled" active-text="ON" inactive-text="OFF"></el-switch>
           </el-form-item>
-          <el-form-item :label="t('$n')"><el-input v-model="form.description" type="textarea" :rows="2"></el-input></el-form-item>
+          <el-form-item label="Description"><el-input v-model="form.description" type="textarea" :rows="2"></el-input></el-form-item>
           <el-form-item label="拨号Action（SIP 头改写 / 号码变换）">
             <div class="w-full">
               <div class="flex justify-between items-center mb-1">
@@ -635,6 +670,11 @@ app.component('dialplan-rules', {
         rec_action: 0,
         media_mode: 0,
         rec_path_template: '',
+        /* IMS 三态强制覆盖：0=inherit 1=force on 2=force off */
+        force_prack: 0,
+        force_precondition: 0,
+        force_timer: 0,
+        force_gruu: 0,
         action_json: '{}',
         /* REQ-DP-APP-001: Application 链 JSON 数组 —— C 侧 dp_json_parse_one 解析 */
         app_chain: '[]',
@@ -811,22 +851,17 @@ app.component('ivr-menus', crudTable(
   '/ivr-menus',
   [
     { key: 'name', label: t('Name'), type: 'text' },
+    { key: 'tenant_id', label: t('Tenant'), type: 'text' },
+    { key: 'entry_node', label: 'Entry Node', type: 'text' },
     { key: 'enabled', label: t('Status'), type: 'bool' },
-    { key: 'timeout_sec', label: '超时', type: 'text' },
-    { key: 'max_attempts', label: '重试次数', type: 'text' },
-    { key: 'prompt_audio', label: '主提示音', type: 'text' },
   ],
   [
     { key: 'name', label: t('Name'), type: 'text' },
+    { key: 'tenant_id', label: t('Tenant'), type: 'number', default: 1 },
+    { key: 'entry_node', label: 'Entry Node', type: 'text', default: 'main' },
     { key: 'enabled', label: t('Enable'), type: 'bool', default: true },
-    { key: 'prompt_audio', label: '主提示音', type: 'text' },
-    { key: 'invalid_audio', label: '无效提示音', type: 'text' },
-    { key: 'timeout_sec', label: t('超时 (s)'), type: 'number', default: 10 },
-    { key: 'max_attempts', label: '最大尝试', type: 'number', default: 3 },
-    { key: 'options_json', label: t('按Key选项'), type: 'json', editor: 'ivr-options',
-      default: '[{"key":"1","target":"queue-sales"},{"key":"2","target":"vm"}]' },
-    { key: 'timeout_target', label: '超时跳转', type: 'text' },
-    { key: 'invalid_target', label: '无效跳转', type: 'text' },
+    { key: 'nodes_json', label: t('IVR Menu Tree'), type: 'json', editor: 'ivr-options',
+      default: '[{"name":"main","prompt":"welcome.wav","initial_timeout_s":5,"interdigit_timeout_s":3,"max_retries":3,"choices":[{"key":"1","act":"submenu","arg":"sales"},{"key":"2","act":"transfer","arg":"1000"},{"key":"*","act":"hangup","arg":""}],"timeout_action":{"act":"hangup","arg":""},"invalid_action":{"act":"play","arg":"invalid.wav"}}]' },
     { key: 'description', label: t('Notes'), type: 'textarea' },
   ],
 ));
@@ -883,6 +918,10 @@ app.component('sip-profiles', crudTable(
     // ---- 协议特性 ----
     { key: 'enable_prack', label: t('Enable PRACK (RFC 3262)'), type: 'bool', default: false },
     { key: 'enable_update', label: t('Enable UPDATE (RFC 3311)'), type: 'bool', default: true },
+    // ---- 3GPP/IMS 协议特性（默认关闭，按客户需求开启） ----
+    { key: 'enable_precondition', label: t('IMS Precondition (RFC 3312)'), type: 'bool', default: false },
+    { key: 'enable_timer', label: t('IMS Session Timer (RFC 4028)'), type: 'bool', default: false },
+    { key: 'enable_gruu', label: t('IMS GRUU (+sip.instance)'), type: 'bool', default: false },
     { key: 'dtmf_mode', label: 'DTMF 模式', type: 'select', options: [
       { value: 'rfc4733', label: 'RFC 4733 telephone-event (推荐)' },
       { value: 'info',    label: 'SIP INFO application/dtmf-relay' },
@@ -893,3 +932,5 @@ app.component('sip-profiles', crudTable(
     { key: 'description', label: t('Notes'), type: 'textarea' },
   ],
 ));
+
+

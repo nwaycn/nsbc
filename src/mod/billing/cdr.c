@@ -271,6 +271,26 @@ void cdr_sink_emit(void *ud, const cdr_event_t *ev)
         o->ev.cause = ev->cause;
         o->ev.end_ms = ev->end_ms;
         o->ev.emergency = ev->emergency;
+        /* REQ-CDR-002 补全：END ev 由 b2b_emit_cdr 填齐网络端点/codec/
+         * 媒体质量/threat 标记——必须并进聚合槽，否则这些字段在 START
+         * 拷贝时是空的，Web 端 Source IP/Codec/Threat 列永远显示 '-'。 */
+        if (ev->from_ip[0] != '\0')
+            snprintf(o->ev.from_ip, sizeof(o->ev.from_ip), "%s", ev->from_ip);
+        if (ev->codec_a[0] != '\0')
+            snprintf(o->ev.codec_a, sizeof(o->ev.codec_a), "%s", ev->codec_a);
+        if (ev->codec_b[0] != '\0')
+            snprintf(o->ev.codec_b, sizeof(o->ev.codec_b), "%s", ev->codec_b);
+        if (ev->a_peer_ip[0] != '\0')
+            snprintf(o->ev.a_peer_ip, sizeof(o->ev.a_peer_ip), "%s", ev->a_peer_ip);
+        if (ev->b_peer_ip[0] != '\0')
+            snprintf(o->ev.b_peer_ip, sizeof(o->ev.b_peer_ip), "%s", ev->b_peer_ip);
+        if (ev->is_malicious)
+            o->ev.is_malicious = 1;
+        if (ev->threat_reason[0] != '\0')
+            snprintf(o->ev.threat_reason, sizeof(o->ev.threat_reason), "%s", ev->threat_reason);
+        o->ev.rtp_loss_pct = ev->rtp_loss_pct;
+        o->ev.rtp_jitter_ms = ev->rtp_jitter_ms;
+        o->ev.mos_x1000 = ev->mos_x1000;
         if (ev->rec_path[0] != '\0')
             snprintf(o->ev.rec_path, sizeof(o->ev.rec_path), "%s", ev->rec_path);
         if (ev->trunk[0] != '\0')
@@ -338,12 +358,19 @@ char *cdr_event_to_json(const cdr_event_t *ev)
     cJSON_AddStringToObject(o, "dir",        cdr_dir_name(ev->dir));
     cJSON_AddStringToObject(o, "phase",      cdr_phase_name(ev->phase));
     cJSON_AddStringToObject(o, "disposition",cdr_disp_name(ev->disposition));
-    cJSON_AddNumberToObject(o, "start_ms",   (double)ev->start_ms);
-    cJSON_AddNumberToObject(o, "answer_ms",  (double)ev->answer_ms);
-    cJSON_AddNumberToObject(o, "end_ms",      (double)ev->end_ms);
-    cJSON_AddNumberToObject(o, "billsec",    (double)ev->billsec);
+    cJSON_AddNumberToObject(o, "start_ms", (double)ev->start_ms);
+    cJSON_AddNumberToObject(o, "answer_ms", (double)ev->answer_ms);
+    cJSON_AddNumberToObject(o, "end_ms", (double)ev->end_ms);
+    cJSON_AddNumberToObject(o, "billsec", (double)ev->billsec);
     cJSON_AddNumberToObject(o, "duration_s", (double)ev->duration_s);
-    cJSON_AddNumberToObject(o, "cause",       (double)ev->cause);
+    cJSON_AddNumberToObject(o, "cause", (double)ev->cause);
+    /* session 通道复用键（REQ-UDS-002）：call_destroy 的 SESSION_END 推送
+     * 直接透传本 JSON，Rust dispatch_session_push 读 event/state 更新 calls 表；
+     * cdr 通道（write_cdr）只取自己认识的键，多出的键无副作用。 */
+    cJSON_AddStringToObject(o, "event", cdr_phase_name(ev->phase));
+    cJSON_AddStringToObject(o, "state",
+        ev->phase == CDR_PHASE_END ? "terminated"
+      : ev->phase == CDR_PHASE_ANSWER ? "answered" : "ringing");
     cJSON_AddNumberToObject(o, "emergency",   (double)ev->emergency);
     /* 网络端点 */
     if (ev->from_ip[0])       cJSON_AddStringToObject(o, "from_ip",    ev->from_ip);
@@ -355,6 +382,13 @@ char *cdr_event_to_json(const cdr_event_t *ev)
     cJSON_AddNumberToObject(o, "rtp_loss_pct", (double)ev->rtp_loss_pct);
     cJSON_AddNumberToObject(o, "rtp_jitter_ms", (double)ev->rtp_jitter_ms);
     if (ev->mos_x1000 >= 0)  cJSON_AddNumberToObject(o, "mos_x1000",  (double)ev->mos_x1000);
+    /* REQ-SEC-005：恶意标记 + 原因 —— 之前漏序列化，Web 端 Threat 列
+     * 永远读不到（write_cdr 的 is_malicious 恒为 0）。 */
+    if (ev->is_malicious) {
+        cJSON_AddNumberToObject(o, "is_malicious", 1);
+        if (ev->threat_reason[0])
+            cJSON_AddStringToObject(o, "threat_reason", ev->threat_reason);
+    }
 
     char *json = cJSON_PrintUnformatted(o);
     cJSON_Delete(o);
@@ -478,13 +512,16 @@ uint64_t cdr_sink_total_dropped(const cdr_sink_t *s)   { return s ? s->total_dro
 static const char *f(const char *s) { return (s && *s) ? s : "-"; }
 
 /* 格式化一条已完成 CDR 为 `cdr k=v ...` 行（与 Web 侧 parse_cdr_line 对齐：
- * call_id/from/to 必给，dir/phase/disp 用名字枚举，emergency 0/1）。 */
+ * call_id/from/to 必给，dir/phase/disp 用名字枚举，emergency 0/1。
+ * REQ-CDR-002 补全：追加 from_ip/codec/peer/threat 扩展字段——poller 兜底
+ * 路径（UDS 断链时 cdr.recent 轮询落库）不再丢失这些列，与 write_cdr 同口径）。 */
 static int fmt_one(const cdr_event_t *ev, char *buf, size_t bufsz)
 {
     return snprintf(buf, bufsz,
         "cdr call_id=%s tenant=%s from=%s to=%s trunk=%s rec=%s "
         "dir=%s phase=%s disp=%s start_ms=%llu answer_ms=%llu end_ms=%llu "
-        "billsec=%u duration_s=%u cause=%d emergency=%d\n",
+        "billsec=%u duration_s=%u cause=%d emergency=%d "
+        "from_ip=%s codec_a=%s codec_b=%s a_peer=%s b_peer=%s mal=%d threat=%s\n",
         f(ev->call_id), f(ev->tenant), f(ev->from), f(ev->to),
         f(ev->trunk), f(ev->rec_path),
         cdr_dir_name(ev->dir), cdr_phase_name(ev->phase),
@@ -492,7 +529,10 @@ static int fmt_one(const cdr_event_t *ev, char *buf, size_t bufsz)
         (unsigned long long)ev->start_ms,
         (unsigned long long)ev->answer_ms,
         (unsigned long long)ev->end_ms,
-        ev->billsec, ev->duration_s, ev->cause, ev->emergency);
+        ev->billsec, ev->duration_s, ev->cause, ev->emergency,
+        f(ev->from_ip), f(ev->codec_a), f(ev->codec_b),
+        f(ev->a_peer_ip), f(ev->b_peer_ip),
+        ev->is_malicious ? 1 : 0, f(ev->threat_reason));
 }
 
 int cdr_sink_recent(cdr_sink_t *s, int limit, char *buf, size_t bufsz)

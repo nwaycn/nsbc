@@ -40,6 +40,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <netdb.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -85,8 +86,8 @@ static bug_store_t g_bug;
 /* hook 回调（媒体线程，每帧 RTP recv 都进）                             */
 /* ================================================================== */
 
-static void bug_rec_feed(void *ud, void *call_key, int leg, int pt,
-                         const void *payload, size_t len)
+static void bug_rec_feed(void *ud, void *call_key, const void *payload,
+                         size_t len, int leg, int pt)
 {
     bug_store_t *st = (bug_store_t *)ud;
     /* 快速路径：没有活跃 listener → 立即返回（<1μs，媒体线程零成本）*/
@@ -351,7 +352,7 @@ static void bug_fini(struct nsbc_ctx *ctx)
 
 static const char *bug_deps[] = { "signaling", NULL };
 
-NSBC_MOD_CAT(media_bug, "1.0", MOD_L_WORKER_READY, 0, MOD_CAT_MEDIA_BUG,
+NSBC_MOD_CAT(media_bug, 1, MOD_L_WORKER_READY, 0, MOD_CAT_MEDIA_BUG,
           bug_deps,
           bug_init, NULL, NULL, bug_fini);
 

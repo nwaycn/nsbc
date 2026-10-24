@@ -51,10 +51,11 @@
 static int sa_hide_ws_conn(nsbc_sa_t *sa, void *conn);
 
 /* CDR END 时从 answer SDP 提取 codec 名 + peer IP:port。
- * 返回 0=ok（两个 out 字段都填了），非 0 表示没找到/解析失败——调用方把 out 当空字符串。 */
-static int sig_sdp_extract_cdr(const char *sdp_buf, size_t sdp_len,
-                                char *codec_out, size_t codec_sz,
-                                char *peer_out,  size_t peer_sz);
+ * 返回 0=ok（两个 out 字段都填了），非 0 表示没找到/解析失败——调用方把 out 当空字符串。
+ * 非 static：b2bua.c 通过 extern 声明跨文件调用，签名不入公共头。 */
+int sig_sdp_extract_cdr(const char *sdp_buf, size_t sdp_len,
+                        char *codec_out, size_t codec_sz,
+                        char *peer_out,  size_t peer_sz);
 
 typedef struct sig_runtime {
     nsbc_ctx_t *ctx;
@@ -1119,30 +1120,6 @@ static void __attribute__((unused)) media_end_cb(void *call_key, void *ud)
  * 但本函数为 signaling 层内部 hook，与 b2b_call_t 同属 core/sip 域（非 mod 层），
  * 解引用拿 call_id 合法；真正的"跨模块禁止解引用"适用于 sip→mod 回调。 */
 
-/* 从 SIP URI 提取 user 部分（纯号码）——与 b2bua.c 同名同语义 helper，
- * signaling 层无法直接引用 b2bua.c 的 static 函数，故就地复制一份。 */
-static void sig_uri_extract_user(char *out, size_t cap, const char *uri)
-{
-    if (!uri || !cap) { out[0] = '\0'; return; }
-    const char *p = uri;
-    if (*p == '<') p++;
-    if (!strncasecmp(p, "sip:", 4)) p += 4;
-    else if (!strncasecmp(p, "tel:", 4)) p += 4;
-    const char *at = NULL;
-    const char *end = NULL;
-    for (const char *q = p; *q; ++q) {
-        if (*q == '@' && !at) at = q;
-        if (*q == ';' || *q == '>' || *q == ':' || *q == ' ' || *q == '"') {
-            end = q; break;
-        }
-    }
-    if (!end) end = p + strlen(p);
-    size_t n = at ? (size_t)(at - p) : (size_t)(end - p);
-    if (n >= cap) n = cap - 1;
-    memcpy(out, p, n);
-    out[n] = '\0';
-}
-
 static void sig_on_end_cb(void *call_key, void *ud)
 {
     sig_runtime_t *s = ud;
@@ -1215,11 +1192,12 @@ static void sig_on_end_cb(void *call_key, void *ud)
     if (s->bridge)
         bridge_release_call(s->bridge, call_key);
 
-    /* 3) 中继 rt_release（REQ-PBX-ROUTE-002：DP_LAYER_OUT rt_acquire 的配对释放） */
-    if (c && c->rt_name[0] && s->ctx && s->ctx->rt) {
+    /* 3) 中继 rt_release（REQ-PBX-ROUTE-002：DP_LAYER_OUT rt_acquire 的配对释放）。
+     * 注意：不能清空 c->rt_name——本回调现在先于 b2b_emit_cdr(END) 执行，
+     * END ev 的 trunk 字段还要读它（rt_release 只减引用计数，字符串保留无碍）。
+     * on_end 每通呼叫只在 call_destroy 里跑一次，无双重释放风险。 */
+    if (c && c->rt_name[0] && s->ctx && s->ctx->rt)
         rt_release(s->ctx->rt, c->rt_name);
-        c->rt_name[0] = '\0';
-    }
 
     /* 4) 兜底停录音（dialplan 没发 stop 时的保险），拿 final_path */
     char rec_path[CDR_REC_MAX];
@@ -1231,111 +1209,40 @@ static void sig_on_end_cb(void *call_key, void *ud)
                                       cid, "hangup",
                                       NULL, NULL, NULL,
                                       rec_path, sizeof(rec_path));
+            /* 录音终态路径存进 call 对象（first-wins：call_destroy 的兜底
+             * stop 在 on_end 之前先跑，通常已填过，这里只做补位），
+             * b2b_emit_cdr(END) 会把它写进 CDR rec_path。 */
+            if (rec_path[0] && c->rec_path[0] == '\0')
+                snprintf(c->rec_path, sizeof(c->rec_path), "%s", rec_path);
         }
     }
 
-    /* 5) 发 cdr END 事件（billing 模块按 call_id 聚合 START/END，END 触发写库） */
-    if (s->ctx && s->ctx->cdr_emit && c) {
-        cdr_event_t ev; memset(&ev, 0, sizeof(ev));
-        snprintf(ev.call_id, sizeof(ev.call_id), "%s", c->leg[0].callid);
-        if (c->leg[0].from[0]) {
-            char u[128]; sig_uri_extract_user(u, sizeof(u), c->leg[0].from);
-            snprintf(ev.from, sizeof(ev.from), "%s", u);
-        }
-        if (c->leg[1].to[0]) {
-            char u[128]; sig_uri_extract_user(u, sizeof(u), c->leg[1].to);
-            snprintf(ev.to, sizeof(ev.to), "%s", u);
-        }
-        if (rec_path[0])       snprintf(ev.rec_path, sizeof(ev.rec_path), "%s", rec_path);
-        ev.dir = CDR_DIR_UNKNOWN; /* P0 简化，按域内/域外用 host 判断 */
-        ev.phase = CDR_PHASE_END;
-        /* 时间戳：优先用 b2b_call_t 里记账点，END 时 end_ms 取 wall now。
-         * b2b_call_t 里 start_ms/answer_ms 是 monotonic（uptime），
-         * 这里转成 wall（epoch ms）。 */
-        {
-            uint64_t now_mon = nsbc_now_ms();
-            uint64_t now_wall = nsbc_wall_ms();
-            uint64_t sm = c->start_ms ? c->start_ms : now_mon;
-            uint64_t sw = now_wall - (now_mon - sm);
-            ev.start_ms  = (sw < 946684800000ULL) ? now_wall : sw;
-            if (c->answer_ms) {
-                uint64_t aw = now_wall - (now_mon - c->answer_ms);
-                ev.answer_ms = (aw < 946684800000ULL) ? now_wall : aw;
-            }
-            ev.end_ms    = now_wall; /* END 时当前 wall 时间 */
-        }
-        if (ev.answer_ms && ev.answer_ms >= ev.start_ms) {
-            ev.billsec = (uint32_t)((ev.answer_ms - ev.start_ms) / 1000);
-            ev.duration_s = (uint32_t)((ev.end_ms - ev.start_ms) / 1000);
-        } else if (ev.start_ms) {
-            ev.duration_s = (uint32_t)((ev.end_ms - ev.start_ms) / 1000);
-        }
-        /* 媒体质量指标（从 b2b_call_t 读，刚在上面 END 流程存回） */
-        if (c->codec_a[0]) snprintf(ev.codec_a, sizeof(ev.codec_a), "%s", c->codec_a);
-        if (c->codec_b[0]) snprintf(ev.codec_b, sizeof(ev.codec_b), "%s", c->codec_b);
-        ev.rtp_loss_pct = c->rtp_loss_pct;
-        ev.rtp_jitter_ms = c->rtp_jitter_ms;
-        ev.mos_x1000 = c->mos_x1000;
-        /* 网络端点 + codec fallback：从两腿 answer SDP 解析（b2b_call_t 的 codec_a/b 可能没人写）。
-         * 答非 0=解析失败/没找到，字段留空（已经 memset 过）。 */
-        if (c->leg[0].answer_len)
-            sig_sdp_extract_cdr(c->leg[0].answer, c->leg[0].answer_len,
-                                ev.codec_a, sizeof(ev.codec_a),
-                                ev.a_peer_ip, sizeof(ev.a_peer_ip));
-        if (c->leg[1].answer_len)
-            sig_sdp_extract_cdr(c->leg[1].answer, c->leg[1].answer_len,
-                                ev.codec_b, sizeof(ev.codec_b),
-                                ev.b_peer_ip, sizeof(ev.b_peer_ip));
-        /* from_ip：A 腿入向 INVITE 的 src（handle_new_invite 已存） */
-        if (c->from_ip[0])
-            snprintf(ev.from_ip, sizeof(ev.from_ip), "%s", c->from_ip);
-        if (c->a_final > 0)
-            ev.disposition = (c->a_final >= 200 && c->a_final < 300) ? CDR_DISP_ANSWERED
-                           : (c->a_final == 486) ? CDR_DISP_BUSY
-                           : (c->a_final == 480) ? CDR_DISP_NOANSWER
-                           : CDR_DISP_FAILED;
-        s->ctx->cdr_emit(s->ctx->cdr_ud, &ev);
-
-        /* signaling.c CDR END 完成后，把完整 cdr_event_t 序列化成 JSON 存进
-         * b2b_call_t.cdr_json——b2bua.c 后续推 UDS SESSION_END 事件时直接 memcpy 复用，
-         * 避免另造一份残缺 snprintf 漏掉 codec / IP / 媒体质量等字段。 */
-        {
-            char *j = cdr_event_to_json(&ev);
-            if (j) {
-                snprintf(c->cdr_json, sizeof(c->cdr_json), "%s", j);
-                free(j);
-            }
-        }
-
-        /* ---- 6) 实时事件推送：CALL_END（无条件；复用刚才填好的 ev 字段）----
-         * 订阅者收到 CDR_PHASE_END 的 cdr 帧 + CALL_END 的 events 帧，两帧互补：
-         *   - cdr 帧是完整 JSON 话单
-         *   - events 帧是短体事件，用于低延迟 UI 状态刷新
-         * duration/billsec 是整数秒，cause 来自 a_final（A 腿最终状态码）。 */
-        {
-            const char *call_id  = ev.call_id[0] ? ev.call_id : c->leg[0].callid;
-            const char *disp     = cdr_disp_name(ev.disposition);
-            const char *orig     = c->orig_number[0] ? c->orig_number : "";
-            const char *to_uri   = c->leg[1].to[0] ? c->leg[1].to
-                                 : (c->leg[0].to[0] ? c->leg[0].to : "");
-            const char *trunk    = c->rt_name[0] ? c->rt_name : "";
-            obs_event("CALL_END",
-                "call_id=%s orig=%s to=%s trunk=%s disp=%s cause=%d duration_s=%u billsec=%u",
-                call_id, orig, to_uri, trunk, disp, c->a_final,
-                (unsigned)ev.duration_s, (unsigned)ev.billsec);
-        }
-    } else if (s->ctx && c) {
-        /* billing 模块未启用（ctx->cdr_emit 为空）——也要发 CALL_END 事件
-         * 给订阅者；此时 duration/cause 直接从 b2b_call_t 取 */
+    /* 5) CDR END 事件由 b2bua.c call_destroy 里的 b2b_emit_cdr(CDR_PHASE_END)
+     *    统一发出（多槽链 billing_cdr_cb），本回调只发 CALL_END 实时事件。
+     *    旧的 ctx->cdr_emit 单槽 fallback 从未被赋值（billing 已改走 hook 链），
+     *    属死代码——若未来重新接线会造成 END 双发（billing 聚合按 call_id
+     *    二次触发写库），已整体移除。 */
+    if (s->ctx && c) {
+        /* billing 模块未启用也要发 CALL_END 事件给订阅者；
+         * duration/cause 直接从 b2b_call_t 取 */
         const char *call_id  = c->leg[0].callid;
         uint32_t  dur = 0;
         if (c->start_ms && c->start_ms <= nsbc_now_ms())
             dur = (uint32_t)((nsbc_now_ms() - c->start_ms) / 1000u);
-        obs_event("CALL_END",
-            "call_id=%s orig=%s cause=%d duration_s=%u",
+        const char *prof    = (c->prof && c->prof->name[0])    ? c->prof->name    : "-";
+        const char *oprof   = (c->out_prof && c->out_prof->name[0]) ? c->out_prof->name : prof;
+        const char *dp_tag  = (c->out_prof) ? "OUT" : "LOCAL";
+        const char *dir_tag = (c->orig_caller_id_num[0] != '\0') ? "OUTBOUND" : "INBOUND";
+        const char *term;
+        if (c->hangup_by == 1)      term = "A_UA";
+        else if (c->hangup_by == 2) term = "B_UA";
+        else                        term = "LOCAL";
+        obs_event(c->a_final >= 400 && c->a_final < 500 ? 4 : 6,
+            "CALL_END",
+            "call_id=%s orig=%s cause=%d duration_s=%u prof=%s oprof=%s dp=%s term=%s dir=%s",
             call_id,
             c->orig_number[0] ? c->orig_number : "",
-            c->a_final, dur);
+            c->a_final, dur, prof, oprof, dp_tag, term, dir_tag);
     }
 }
 
@@ -2040,8 +1947,10 @@ static void sig_fini(struct nsbc_ctx *ctx)
  *   - 无 audio media 但有 video → 取 video（fallback，极少数场景如 T.38）
  *   - 所有 media port=0（hold/rejected）→ peer 为空
  *   - codec build 失败 → codec 为空
+ * 非 static：core 层内跨文件（b2bua.c b2b_emit_cdr END 复用，同 sig_dp_ctx
+ * 先例），签名不入公共头，调用方 extern 声明。
  * ===================================================================== */
-static int sig_sdp_extract_cdr(const char *sdp_buf, size_t sdp_len,
+int sig_sdp_extract_cdr(const char *sdp_buf, size_t sdp_len,
                                 char *codec_out, size_t codec_sz,
                                 char *peer_out,  size_t peer_sz)
 {
@@ -2170,6 +2079,9 @@ static void sig_ws_bridge_rx(void *ud, const char *buf, size_t len, void *conn)
 
     llog(LOG_DEBUG, "ws", "rx %zuB SIP msg via %s", len,
          g_ws_bridge_proto == SIP_TR_WSS ? "WSS" : "WS");
+
+    /* siptrace RX — WS/WSS（与 UDP on_udp_event / TCP frame_cb 对称） */
+    sip_tr_rx_trace(g_ws_bridge_proto, NULL, 0, buf, len);
 
     b2b_on_rx(b2b, g_ws_bridge_proto, &src, &local, buf, len);
 }

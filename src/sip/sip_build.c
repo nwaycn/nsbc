@@ -202,9 +202,11 @@ int sip_build_request(char *buf, size_t cap, const sip_req_spec_t *s)
      * RFC 3261 §16.4：Route 头链在 Route 集合处理时消费；
      * RFC 3261 §16.6：Record-Route 配对 Route，让后续请求沿相同路径；
      * IMS P-CSCF→S-CSCF→AS 路由链必须由 B2BUA 作为 border element 写。
-     * NULL 表示本呼叫不需要（域内分机直连），不写头。 */
+     * NULL 表示本呼叫不需要（域内分机直连），不写头。
+     * ★ 关键：route_block() 已生成完整头块（每条含 "Route: " 前缀 + \r\n），
+     * 直接 cat 即可，**不要再 snprintf "Route: %s"** — 否则会双前缀！ */
     if (s->route && s->route[0])
-        sipb_catf(&b, "Route: %s\r\n", s->route);
+        sipb_cat(&b, s->route);
     if (s->record_route && s->record_route[0])
         sipb_catf(&b, "Record-Route: %s\r\n", s->record_route);
     /* ---- REQ-IMS：Supported 默认头通告扩展能力 ----

@@ -208,7 +208,7 @@ static void on_cfg_event(cfg_event_t ev, const char *detail, void *ud)
         log_set_level((log_level_t)lv);
     }
     if (c && c->event_fn)
-        c->event_fn(name, "%s", detail ? detail : "-");
+        c->event_fn(5, name, "%s", detail ? detail : "-");  /* NOTICE 级：配置变更值得留意 */
 }
 
 static void on_signal(int fd, uint32_t ev, void *arg)
@@ -515,7 +515,11 @@ int main(int argc, char **argv)
         fprintf(stderr, "log reopen failed: %s\n", logpath);
         return 1;
     }
-    fprintf(stderr, "[nsbcd] logging to %s\n", logpath);
+    /* size-based self-rotate: default 50MB per file, keep 5 copies
+     * (nsbcd.log.1 ~ nsbcd.log.5). No external logrotate dependency — the
+     * logger thread handles all rollover internally after each fsync. */
+    log_set_rotate(50LL * 1024LL * 1024LL, 5);
+    fprintf(stderr, "[nsbcd] logging to %s (self-rotate 50MB × 5)\n", logpath);
     llog(LOG_INFO, "core", "nsbcd %s starting, logfile=%s", NSBC_VERSION, logpath);
     log_audit_open(auditpath);
     log_audit("system", "boot", "nsbcd %s starting cfg=%s", NSBC_VERSION,

@@ -36,12 +36,18 @@ static void ev_lock_init(void)
     pthread_mutex_init(&g_ev.lock, NULL);
 }
 
+/* 事件级别名（与 llog level_chars[] 对齐） */
+static const char *ev_level_name[] = {
+    "EMERG", "ALERT", "CRIT", "ERR ", "WARN", "NOTIC", "INFO", "DEBUG"
+};
+
 /* 单生产者：任何线程可直接调 obs_event（caller 语义）；
  * 内部 mutex 保护 + 写完立刻 try 订阅推送（obs_sub_publish_events
  * 内部自带锁，不会与本函数死锁——锁序固定 g_ev.lock → g_sub_lock）。 */
-void obs_event(const char *domain_action, const char *fmt, ...)
+void obs_event(int level, const char *domain_action, const char *fmt, ...)
 {
     if (domain_action == NULL) return;
+    if (level < 0 || level > 7) level = 6;  /* 默认 INFO */
 
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -51,15 +57,15 @@ void obs_event(const char *domain_action, const char *fmt, ...)
     strftime(stamp, sizeof(stamp), "%Y-%m-%dT%H:%M:%S", &tmv);
     int mspart = (int)(ts.tv_nsec / 1000000);
 
-    char body[OBS_EVENT_MAX - 64];
+    char body[OBS_EVENT_MAX - 96];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(body, sizeof(body), fmt, ap);
     va_end(ap);
 
     char full[OBS_EVENT_MAX];
-    snprintf(full, sizeof(full), "%s.%03d %s %s", stamp, mspart,
-             domain_action, body);
+    snprintf(full, sizeof(full), "%s.%03d [%s] %s %s", stamp, mspart,
+             ev_level_name[level], domain_action, body);
 
     pthread_once(&once, ev_lock_init);
 

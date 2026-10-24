@@ -92,15 +92,14 @@ async fn list_recordings<C: CoreApi + Clone + 'static>(
 // Public file download (no RBAC)
 // ============================================================
 
-/// Public route (mounted outside app_router, no /api/v1 prefix, no RBAC layer).
-/// Note: `.with_state(state)` yields `Router<()>`, same pattern as api_router.
-pub fn public_file_router<C>(state: Arc<AppState<C>>) -> Router<()>
+/// Recordings file download — mounted inside protected RBAC layer (L0+).
+/// Unauthenticated requests return 401.
+pub fn public_file_router<C>(_state: Arc<AppState<C>>) -> Router<Arc<AppState<C>>>
 where
     C: CoreApi + Clone + 'static,
 {
     Router::new()
         .route("/recordings/*path", get(download_recording::<C>))
-        .with_state(state)
 }
 
 /// Allowed recording file extensions only (whitelist, prevent arbitrary file download).

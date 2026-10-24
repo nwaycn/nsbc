@@ -74,6 +74,9 @@ typedef struct {
     /* REQ-SIP-016 早期媒体追溯：early_bytes>0 表示存在早期媒体流量 */
     uint32_t    early_bytes;             /* 183/180 SDP 到 200 OK 之间累计字节 */
     uint32_t    early_duration_s;        /* 早期媒体时长秒（early_end_ms - 183_ms） */
+    /* security.c 标记：0=正常 1=恶意攻击（blacklist/ban/scan/brute-force） */
+    uint8_t     is_malicious;
+    char        threat_reason[32];       /* 恶意原因（如 "blacklist", "authfail", "ratelimit"） */
 } cdr_event_t;
 
 /* cdr_event_t → JSON（malloc 字符串，调用方 free）。

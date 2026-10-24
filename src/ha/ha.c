@@ -281,7 +281,8 @@ static void *ha_main(void *arg)
                  h->my_prio, h->node_id, h->peer_prio, h->peer_node);
             /* A4：经 ctx 事件槽上报，不横向 include oam/obs.h */
             if (h->ctx->event_fn)
-                h->ctx->event_fn(want == HA_ROLE_ACTIVE ? "HA_FAILOVER"
+                h->ctx->event_fn(want == HA_ROLE_ACTIVE ? 4 : 6,  /* FAILOVER=WARN, STANDBY=INFO */
+                                 want == HA_ROLE_ACTIVE ? "HA_FAILOVER"
                                                         : "HA_STANDBY",
                                  "role transition (%s)",
                                  want == HA_ROLE_ACTIVE ? "peer lost"

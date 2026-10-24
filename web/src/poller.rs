@@ -81,11 +81,13 @@ where
                                 c.duration_s,
                                 c.cause,
                                 c.emergency,
-                                None, // from_ip: poller fallback path can't get it, only UDS full push
-                                None, // codec_a
-                                None, // codec_b
-                                None, // a_peer_ip
-                                None, // b_peer_ip
+                                c.from_ip.as_deref(),
+                                c.codec_a.as_deref(),
+                                c.codec_b.as_deref(),
+                                c.a_peer_ip.as_deref(),
+                                c.b_peer_ip.as_deref(),
+                                c.is_malicious as u8,
+                                c.threat_reason.as_deref(),
                             )
                             .await
                         {

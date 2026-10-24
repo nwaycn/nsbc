@@ -86,7 +86,7 @@ static void *hello_thread(void *arg)
         pthread_mutex_unlock(&s->mtx);
 
         llog(LOG_NOTICE, "hello", "heartbeat #%lld", (long long)c);
-        obs_event("HELLO_HEARTBEAT", "count=%lld", (long long)c);
+        obs_event(6, "HELLO_HEARTBEAT", "count=%lld", (long long)c);
     }
 
     llog(LOG_INFO, "hello", "heartbeat thread exit, total=%lld",
@@ -126,7 +126,7 @@ static int hello_init(struct nsbc_ctx *ctx)
     g_hello = s;
 
     llog(LOG_INFO, "hello", "init ok (interval=%ldms)", s->interval_ms);
-    obs_event("HELLO_INIT", "interval_ms=%ld", s->interval_ms);
+    obs_event(6, "HELLO_INIT", "interval_ms=%ld", s->interval_ms);
     return NSBC_OK;
 }
 
@@ -157,7 +157,7 @@ static int hello_start(struct nsbc_ctx *ctx)
     }
     g_hello->running = 1;
 
-    obs_event("HELLO_START", "interval_ms=%ld", g_hello->interval_ms);
+    obs_event(6, "HELLO_START", "interval_ms=%ld", g_hello->interval_ms);
     return NSBC_OK;
 }
 
@@ -182,7 +182,7 @@ static void hello_stop(struct nsbc_ctx *ctx)
     /* 等线程退出（fini 不会再 join，这里在 stop 里 join 更干净） */
     pthread_join(g_hello->thr, NULL);
     g_hello->running = 0;
-    obs_event("HELLO_STOP", "total_heartbeats=%lld", (long long)g_hello->cnt);
+    obs_event(6, "HELLO_STOP", "total_heartbeats=%lld", (long long)g_hello->cnt);
 }
 
 

@@ -1281,8 +1281,12 @@ static int ban_is_banned(const char *ip)
 int security_is_blocked(const nsbc_sa_t *src)
 {
     if (!src) return 0;
+    /* Key must be the PURE IP (no port): nsbc_sa_fmt() appends ":port",
+     * which never matches the ban table (keyed by pure IP from
+     * registrar/guard paths) nor parses as an address for CIDR matching.
+     * sa_to_ip_str() is the same formatter the ban producers use. */
     char ip[INET6_ADDRSTRLEN] = {0};
-    nsbc_sa_fmt(src, ip, sizeof(ip));
+    sa_to_ip_str(src, ip, sizeof(ip));
     if (!ip[0]) return 0;
     /* 1. 动态封禁表（auto-ban） */
     if (ban_is_banned(ip)) return 1;
@@ -1290,6 +1294,35 @@ int security_is_blocked(const nsbc_sa_t *src)
     if ((g_cfg.block_on_register || g_cfg.block_on_invite) &&
         security_check_ip(ip, &g_cfg))
         return 1;
+    return 0;
+}
+
+/* CDR END emit 时查 threat — 只读、无副作用、线程安全。
+ * 顺序：ban（已封禁）→ blacklist（静态 deny）→ return 1。
+ * 两个查询都加各自的锁，都是 hash 桶链表遍历（O(1)~O(k)）。 */
+int security_get_threat(const char *ip, char *reason_out, size_t reason_sz)
+{
+    if (!reason_out || reason_sz == 0) return 0;
+    reason_out[0] = '\0';
+    if (!ip || !ip[0]) return 0;
+
+    /* 1. 动态封禁表（优先级最高 — 已被 auto_ban 判定为恶意） */
+    pthread_mutex_lock(&g_ban_lock);
+    ban_ent_t *be = ban_find_locked(ip);
+    pthread_mutex_unlock(&g_ban_lock);
+    if (be && be->ban_until > nsbc_now_ms()) {
+        snprintf(reason_out, reason_sz, "ban");
+        return 1;
+    }
+
+    /* 2. 静态黑名单（CIDR / UA deny 表） */
+    if (g_cfg.block_on_register || g_cfg.block_on_invite) {
+        if (security_check_ip(ip, &g_cfg)) {
+            snprintf(reason_out, reason_sz, "blacklist");
+            return 1;
+        }
+    }
+
     return 0;
 }
 

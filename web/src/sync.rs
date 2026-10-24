@@ -107,25 +107,40 @@ pub enum Kind {
     SipProfiles,
     Queues,
     SecurityBlacklist,
+    Gateways,
+    HaGroups,
+    IvrMenus,
+    RouteGroups,
+    Rates,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 6] = [
+    pub const ALL: [Kind; 11] = [
         Kind::Extensions,
         Kind::Trunks,
         Kind::DialplanRules,
         Kind::SipProfiles,
         Kind::Queues,
         Kind::SecurityBlacklist,
+        Kind::Gateways,
+        Kind::HaGroups,
+        Kind::IvrMenus,
+        Kind::RouteGroups,
+        Kind::Rates,
     ];
     fn name(self) -> &'static str {
         match self {
-            Kind::Extensions   => "extensions",
-            Kind::Trunks       => "trunks",
-            Kind::DialplanRules => "dialplan-rules",
-            Kind::SipProfiles  => "sip-profiles",
-            Kind::Queues       => "queues",
+            Kind::Extensions        => "extensions",
+            Kind::Trunks            => "trunks",
+            Kind::DialplanRules     => "dialplan-rules",
+            Kind::SipProfiles       => "sip-profiles",
+            Kind::Queues            => "queues",
             Kind::SecurityBlacklist => "security-blacklist",
+            Kind::Gateways          => "gateways",
+            Kind::HaGroups          => "ha-groups",
+            Kind::IvrMenus          => "ivr-menus",
+            Kind::RouteGroups       => "route-groups",
+            Kind::Rates             => "rates",
         }
     }
 }
@@ -219,6 +234,32 @@ async fn snapshot<C: CoreApi + Clone + Send + Sync>(
             });
             serde_json::to_string(&obj).map(|j| (j, n)).map_err(|e| e.to_string())
         }
+        Kind::Gateways => {
+            let rows = st.db.list_enabled_gateways().await.map_err(|e| format!("db: {e}"))?;
+            let n = rows.len();
+            serde_json::to_string(&rows).map(|j| (j, n)).map_err(|e| e.to_string())
+        }
+        Kind::HaGroups => {
+            let rows = st.db.list_enabled_ha_groups().await.map_err(|e| format!("db: {e}"))?;
+            let n = rows.len();
+            serde_json::to_string(&rows).map(|j| (j, n)).map_err(|e| e.to_string())
+        }
+        Kind::IvrMenus => {
+            let rows = st.db.list_enabled_ivr_menus().await.map_err(|e| format!("db: {e}"))?;
+            let n = rows.len();
+            serde_json::to_string(&rows).map(|j| (j, n)).map_err(|e| e.to_string())
+        }
+        Kind::RouteGroups => {
+            let rows = st.db.list_enabled_routes().await.map_err(|e| format!("db: {e}"))?;
+            let n = rows.len();
+            serde_json::to_string(&rows).map(|j| (j, n)).map_err(|e| e.to_string())
+        }
+        Kind::Rates => {
+            let (rows, _total) = st.db.list_rates(None, Some(true), i64::MAX, 0).await
+                .map_err(|e| format!("db: {e}"))?;
+            let n = rows.len();
+            serde_json::to_string(&rows).map(|j| (j, n)).map_err(|e| e.to_string())
+        }
     }
 }
 
@@ -249,6 +290,11 @@ async fn push_kind<C: CoreApi + Clone + Send + Sync>(
             Kind::SipProfiles   => st.core.reload_sip_profiles(&json).await,
             Kind::Queues        => st.core.reload_queues(&json).await,
             Kind::SecurityBlacklist => st.core.reload_security_blacklist(&json).await,
+            Kind::Gateways          => st.core.reload_gateways(&json).await,
+            Kind::HaGroups          => st.core.reload_ha_groups(&json).await,
+            Kind::IvrMenus          => st.core.reload_ivr_menus(&json).await,
+            Kind::RouteGroups       => st.core.reload_route_groups(&json).await,
+            Kind::Rates             => st.core.reload_rates(&json).await,
         };
         match r {
             Ok(()) => {

@@ -151,6 +151,10 @@ struct b2b_call {
     int media_done;
     int active;
     int a_final;
+    /* ★ 谁发起的挂断：0=unknown（nbs内部处理），1=A腿(主叫/用户侧)发BYE，2=B腿(被叫/对端侧)发BYE
+     * 在 b2bua.c SIP_M_BYE 入口处由收到 BYE 的 leg 决定；
+     * CALL_END 事件 / CDR emit 时读此值填 term=A_UA / B_UA / LOCAL */
+    int hangup_by;
     uint32_t dump_mark;
     tw_node_t noanswer_node;
     uint64_t start_ms;
@@ -203,11 +207,19 @@ struct b2b_call {
      * handle_new_invite 收到入站 INVITE 时从 src (nsbc_sa_t) 提取并存入。
      * 供 custom_headers ${from_ip} 变量替换使用。 */
     char from_ip[INET6_ADDRSTRLEN];
+    /* Final recording file path (stereo mix when both legs recorded).
+     * Filled by the recording fallback stop at call_destroy / sig_on_end_cb,
+     * consumed by b2b_emit_cdr(END) so the CDR carries the recording path. */
+    char rec_path[CDR_REC_MAX];
     void *rec[2];
     sip_txn_t *refer_txn;
     /* re-INVITE hold/unhold 标志：bitmask，bit0=leg0 hold，bit1=leg1 hold。
      * 入站 re-INVITE 带 c=0.0.0.0 / a=sendonly 时置位，对端腿 hold 也置位。 */
     uint8_t hold_legs;
+    /* Emergency URN call flag (RFC 6881 / ETSI TS 183 041): set when the
+     * inbound INVITE R-URI is urn:service:sos.* — written into the CDR
+     * emergency bit by b2b_emit_cdr(END). */
+    uint8_t emergency;
     /* 归属 SIP Profile（REQ-SIP-PROFILE-001）：handle_new_invite 按主叫
      * 源 IP 匹配（sip_profile_match_src），call_destroy 对称递减
      * active_calls。NULL = 无归属（外呼 originate / 无 ACL 配置）。
@@ -244,6 +256,10 @@ struct b2b_call {
      * 1024 足够容纳 codec/IP/媒体质量等全部字段；
      * 超长时 snprintf 截断（剩余字段 P0 降级不影响主流程）。 */
     char cdr_json[1024];
+    /* IVR session opaque pointer — set by dialplan 'ivr' app when the call
+     * enters IVR menu. media_bridge relay_recv_one uses it to deliver RFC4733
+     * DTMF digits via ivr_on_dtmf(). NULL = no IVR active on this call. */
+    void *ivr_sess;
 };
 typedef struct b2b_call b2b_call_t;
 

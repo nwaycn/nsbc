@@ -37,6 +37,8 @@ typedef enum {
 int log_init(const char *path, log_level_t level, uint32_t ring_slots);
 int log_audit_open(const char *path);
 void log_set_level(log_level_t level);
+log_level_t log_get_level(void);  /* 当前级别（供 console loglevel 回显） */
+void log_set_rotate(long long max_bytes, int keep);  /* size-based self-rotate; 0 bytes = off */
 void log_stop(void); /* 排空并停日志线程 */
 
 /* 工作线程显式登记（worker/net/timer 线程创建时调用，退出时 detach） */

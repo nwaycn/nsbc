@@ -8,6 +8,7 @@
 #include "tcp_framer.h"
 #include "tls_io.h"
 #include "log.h"
+#include "obs_sub.h"       /* obs_sub_publish_log — siptrace 同时推送给 UDS 订阅者 */
 #include "sip_profile.h"   /* sip_profile_at / sip_profile_count */
 #include "ws_listener.h"
 #include "security.h"     /* ban_is_banned / security_check_ip — reactor 层前置黑名单检查 */
@@ -16,6 +17,60 @@
  * 同一 epoll 线程内同步执行）。定义在此文件：sip_transport 是核心公共模块，
  * 保证其他模块（b2bua.c）可以 extern 引用。 */
 __thread uint16_t g_rx_local_port = 0;
+
+/* ------------------------------------------------------------------ */
+/* SIP trace 全局开关（类似 FreeSWITCH sofia global siptrace）
+ *
+ * volatile int — 读端只做一次缓存行读取，接近零开销；
+ * 写端由 UDS 命令 "sofia global siptrace on/off" 触发。 */
+static volatile int g_sip_trace = 0;
+
+void sip_tr_set_trace(int on) { g_sip_trace = on ? 1 : 0; }
+int  sip_tr_get_trace(void)   { return g_sip_trace; }
+
+/* 前向声明 — sip_tr_rx_trace 在下面调用 sip_trace_dump */
+static void sip_trace_dump(const char *tag, int dir,
+                           const char *peer_ip, uint16_t peer_port,
+                           const char *buf, size_t len);
+
+/* WS/WSS RX trace hook — signaling.c:sig_ws_bridge_rx 调
+ * proto = SIP_TR_WS 或 SIP_TR_WSS */
+void sip_tr_rx_trace(int proto, const char *peer_ip, uint16_t peer_port,
+                     const char *buf, size_t len)
+{
+    if (!g_sip_trace) return;
+    const char *ptag = (proto == SIP_TR_WSS) ? "WSS" : "WS";
+    sip_trace_dump(ptag, 0, peer_ip, peer_port, buf, len);
+}
+
+/* SIP trace — 原始文本 dump，双通道输出：
+ *   1) llog(LOG_DEBUG "siptrace") → 日志文件（tail -f 看）
+ *   2) obs_sub_publish_log         → UDS 订阅推送（client 发 "sub log" 即可实时收）
+ * 长包截断到 4KB。关闭 g_sip_trace 后零开销。 */
+static void sip_trace_dump(const char *tag, int dir,
+                           const char *peer_ip, uint16_t peer_port,
+                           const char *buf, size_t len)
+{
+    if (!g_sip_trace) return;
+    const size_t MAX_SHOW = 4096;
+    const size_t show = len > MAX_SHOW ? MAX_SHOW : len;
+    const char *d = dir > 0 ? "TX->" : "<-RX";
+
+    /* 双通道，互不影响：
+     *   1) llog(LOG_DEBUG "siptrace") → 日志文件（默认 INFO 级别不显示）
+     *   2) obs_sub_publish_trace       → 独立 topic "trace"
+     *      （客户端需显式 sub trace，不污染 log topic） */
+    llog(LOG_DEBUG, "siptrace",
+         "%s %s %s:%u (%zuB%s)\n%.*s",
+         d, tag, peer_ip ? peer_ip : "-", (unsigned)peer_port,
+         len, len > show ? " truncated" : "",
+         (int)show, buf);
+    obs_sub_publish_trace(
+         "siptrace %s %s %s:%u (%zuB%s)\n%.*s\n",
+         d, tag, peer_ip ? peer_ip : "-", (unsigned)peer_port,
+         len, len > show ? " truncated" : "",
+         (int)show, buf);
+}
 
 /* 从 AF_UNSPEC nsbc_sa_t padding 提取 ws_conn* — signaling.c 定义 */
 void *sig_ws_bridge_conn_from_sa(const nsbc_sa_t *sa);
@@ -383,6 +438,14 @@ static int frame_cb(void *ud, const uint8_t *msg, size_t len)
         }
         return 0;
     }
+    /* siptrace RX — TCP/TLS（与 UDP on_udp_event 对称） */
+    if (g_sip_trace) {
+        char dip[INET6_ADDRSTRLEN] = {0};
+        uint16_t dport = nsbc_sa_port(&s_cur_conn->peer);
+        nsbc_sa_fmt(&s_cur_conn->peer, dip, sizeof(dip));
+        sip_trace_dump(s_cur_conn->is_tls ? "TLS" : "TCP", 0, dip, dport,
+                       (const char *)msg, len);
+    }
     t->cfg.rx(t->cfg.rx_ud,
               s_cur_conn->is_tls ? SIP_TR_TLS : SIP_TR_TCP,
               &s_cur_conn->peer, NULL, (const char *)msg, len);
@@ -730,6 +793,14 @@ static void on_udp_event(int fd, uint32_t ev, void *arg)
                 }
                 continue;
             }
+            /* SIP trace RX（开关 g_sip_trace=1 时才打） */
+            if (g_sip_trace) {
+                char dip[INET6_ADDRSTRLEN] = {0};
+                uint16_t dport = nsbc_sa_port(&d->peer);
+                nsbc_sa_fmt(&d->peer, dip, sizeof(dip));
+                sip_trace_dump("UDP/5060", 0, dip, dport,
+                               (const char *)d->buf, d->len);
+            }
             t->cfg.rx(t->cfg.rx_ud, SIP_TR_UDP, &d->peer, &d->local,
                       (const char *)d->buf, d->len);
         }
@@ -889,6 +960,19 @@ void sip_tr_destroy(sip_transport_t *t)
 int sip_tr_send(sip_transport_t *t, sip_tr_proto_t proto,
                 const char *buf, size_t len, const nsbc_sa_t *dst)
 {
+    /* SIP trace TX（开关 g_sip_trace=1 时才打） */
+    if (g_sip_trace && dst) {
+        char dip[INET6_ADDRSTRLEN] = {0};
+        uint16_t dport = nsbc_sa_port(dst);
+        nsbc_sa_fmt(dst, dip, sizeof(dip));
+        const char *ptag = "?";
+        if (proto == SIP_TR_UDP) ptag = "UDP";
+        else if (proto == SIP_TR_TCP) ptag = "TCP";
+        else if (proto == SIP_TR_TLS) ptag = "TLS";
+        else if (proto == SIP_TR_WS) ptag = "WS";
+        else if (proto == SIP_TR_WSS) ptag = "WSS";
+        sip_trace_dump(ptag, 1, dip, dport, buf, len);
+    }
     if (proto == SIP_TR_UDP) {
         int udp = -1;
         uint16_t use_port = g_rx_local_port;
@@ -1090,8 +1174,16 @@ int sip_tr_add_listeners(sip_transport_t *t, const char *listen_ip,
         }
     }
 
-    llog(LOG_INFO, "sip", "add_listeners done: added=%d udp=%d tcp=%d tls=%d",
-         added, t->udp_fd_count, t->tcp_count, t->tls_count);
+    /* 每次 sip_tr_sync_from_profiles 会对每个 combo 调用本函数一次，
+     * 连续打印 LOG_INFO 是噪音。只在确实新增了 fd 时打 NOTICE，否则 DEBUG 级。 */
+    if (added > 0)
+        llog(LOG_NOTICE, "sip",
+             "add_listeners done: added=%d udp=%d tcp=%d tls=%d",
+             added, t->udp_fd_count, t->tcp_count, t->tls_count);
+    else
+        llog(LOG_DEBUG, "sip",
+             "add_listeners done (dup): added=0 udp=%d tcp=%d tls=%d",
+             t->udp_fd_count, t->tcp_count, t->tls_count);
     return NSBC_OK;
 }
 

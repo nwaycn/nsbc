@@ -90,6 +90,18 @@ int sip_tr_add_listeners(sip_transport_t *t, const char *listen_ip,
  * 在 profiles.reload 成功后调用，确保新端口被监听。 */
 int sip_tr_sync_from_profiles(sip_transport_t *t);
 
+/* ---- SIP trace 全局开关（类似 FreeSWITCH sofia global siptrace） ----
+ * 打开后 sip_tr_send（TX）和 on_udp_event（RX）会把完整 SIP 包转成
+ * hex+ascii 格式打 LOG_DEBUG "siptrace" 日志；关闭后为零开销（volatile 读）。 */
+void sip_tr_set_trace(int on);
+int  sip_tr_get_trace(void);
+
+/* WebRTC/WS RX trace hook — signaling.c:sig_ws_bridge_rx 调
+ * sip_tr_send(TX) 和 on_udp_event/frame_cb(RX) 已内建 trace，
+ * WS/WSS RX 入口在 signaling.c 不走 sip_transport，需要手动通知 */
+void sip_tr_rx_trace(int proto, const char *peer_ip, uint16_t peer_port,
+                     const char *buf, size_t len);
+
 /* ---- UAC 出站请求（P1；sip_transport_send_uac) ----
  *
  * 主动外发 SIP 请求（REGISTER / INVITE 等）。当前仅支持 UDP

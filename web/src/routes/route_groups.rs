@@ -18,6 +18,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::coreclient::CoreApi;
 use crate::error::ApiError;
+use crate::sync;
 use crate::AppState;
 
 pub fn router<C>() -> Router<Arc<AppState<C>>>
@@ -68,7 +69,7 @@ pub async fn get_one<C: CoreApi + Clone + Send + Sync>(
     Ok(Json(row))
 }
 
-pub async fn create<C: CoreApi + Clone + Send + Sync>(
+pub async fn create<C: CoreApi + Clone + Send + Sync + 'static>(
     State(st): State<Arc<AppState<C>>>,
     Json(body): Json<crate::db::RouteCreate>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -86,10 +87,11 @@ pub async fn create<C: CoreApi + Clone + Send + Sync>(
         "api", "create", &format!("routes/{}", row.id),
         None, &format!("route={} strategy={}", row.name, row.strategy),
     ).await;
+    sync::spawn_push(st.clone(), sync::Kind::RouteGroups);
     Ok((StatusCode::CREATED, Json(row)))
 }
 
-pub async fn update<C: CoreApi + Clone + Send + Sync>(
+pub async fn update<C: CoreApi + Clone + Send + Sync + 'static>(
     State(st): State<Arc<AppState<C>>>,
     Path(id): Path<i64>,
     Json(body): Json<crate::db::RouteUpdate>,
@@ -103,10 +105,11 @@ pub async fn update<C: CoreApi + Clone + Send + Sync>(
         "api", "update", &format!("routes/{}", row.id),
         None, &format!("route={}", row.name),
     ).await;
+    sync::spawn_push(st.clone(), sync::Kind::RouteGroups);
     Ok(Json(row))
 }
 
-pub async fn delete_one<C: CoreApi + Clone + Send + Sync>(
+pub async fn delete_one<C: CoreApi + Clone + Send + Sync + 'static>(
     State(st): State<Arc<AppState<C>>>,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -119,6 +122,7 @@ pub async fn delete_one<C: CoreApi + Clone + Send + Sync>(
     let _ = st.db.insert_config_history(
         "api", "delete", &format!("routes/{id}"), None, "deleted",
     ).await;
+    sync::spawn_push(st.clone(), sync::Kind::RouteGroups);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -128,10 +132,8 @@ pub async fn reload<C: CoreApi + Clone + Send + Sync>(
     st.db.pool().ok_or(ApiError::DbUnavailable)?;
     let rows = st.db.list_enabled_routes().await
         .map_err(|e| ApiError::Db(e.to_string()))?;
-    tracing::info!(count = rows.len(), "routes.reload requested — UDS command not yet wired");
-    Ok(Json(json!({
-        "loaded": rows.len(),
-        "uds_wired": false,
-        "message": "routes.reload UDS command will be wired after Linux compile"
-    })))
+    let json = serde_json::to_string(&rows)
+        .map_err(|e| ApiError::Db(e.to_string()))?;
+    st.core.reload_route_groups(&json).await?;
+    Ok(Json(json!({ "reloaded": rows.len(), "uds_wired": true })))
 }

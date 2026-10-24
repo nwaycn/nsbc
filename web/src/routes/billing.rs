@@ -39,6 +39,7 @@ use tower_http::trace::TraceLayer;
 use crate::coreclient::{AccountList, CoreApi, RateList};
 use crate::db::{AccountCreate, RateTableCreate, RateTableUpdate};
 use crate::error::ApiError;
+use crate::sync;
 use crate::AppState;
 
 pub fn router<C>() -> Router<Arc<AppState<C>>>
@@ -60,7 +61,7 @@ where
         // ===== Accounts =====
         .route("/balances", get(list_accounts::<C>).post(open_account::<C>))
         .route("/balances/core", get(core_balances::<C>))
-        .route("/balances/:id", get(get_account::<C>).delete(close_account::<C>))
+        .route("/balances/:id", get(get_account::<C>).put(update_account::<C>).delete(close_account::<C>))
         .route("/balances/:id/topup", post(topup_account::<C>))
         .layer(ServiceBuilder::new().layer(TraceLayer::new_for_http()))
 }
@@ -109,7 +110,7 @@ async fn get_rate<C: CoreApi + Clone + Send + Sync>(
     Ok(Json(row))
 }
 
-async fn create_rate<C: CoreApi + Clone + Send + Sync>(
+async fn create_rate<C: CoreApi + Clone + Send + Sync + 'static>(
     State(st): State<Arc<AppState<C>>>,
     Json(body): Json<RateTableCreate>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -131,10 +132,11 @@ async fn create_rate<C: CoreApi + Clone + Send + Sync>(
         None, &format!("prefix={}", row.prefix),
     ).await;
 
+    sync::spawn_push(st.clone(), sync::Kind::Rates);
     Ok((StatusCode::CREATED, Json(row)))
 }
 
-async fn update_rate<C: CoreApi + Clone + Send + Sync>(
+async fn update_rate<C: CoreApi + Clone + Send + Sync + 'static>(
     State(st): State<Arc<AppState<C>>>,
     Path(id): Path<i64>,
     Json(body): Json<RateTableUpdate>,
@@ -161,10 +163,11 @@ async fn update_rate<C: CoreApi + Clone + Send + Sync>(
         None, &format!("prefix={}", row.prefix),
     ).await;
 
+    sync::spawn_push(st.clone(), sync::Kind::Rates);
     Ok(Json(row))
 }
 
-async fn delete_rate<C: CoreApi + Clone + Send + Sync>(
+async fn delete_rate<C: CoreApi + Clone + Send + Sync + 'static>(
     State(st): State<Arc<AppState<C>>>,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -187,6 +190,7 @@ async fn delete_rate<C: CoreApi + Clone + Send + Sync>(
         "deleted",
     ).await;
 
+    sync::spawn_push(st.clone(), sync::Kind::Rates);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -328,6 +332,28 @@ async fn topup_account<C: CoreApi + Clone + Send + Sync>(
         &format!("balances/{}", row.id),
         Some(&format!("balance_uc={}", acct.balance_uc)),
         &format!("balance_uc={} delta={}", row.balance_uc, body.delta_uc),
+    ).await;
+
+    Ok(Json(row))
+}
+
+/// PUT /balances/:id — update account (description + credit_limit only; balance managed by billing system)
+async fn update_account<C: CoreApi + Clone + Send + Sync>(
+    State(st): State<Arc<AppState<C>>>,
+    Path(id): Path<i64>,
+    Json(body): Json<AccountCreate>,
+) -> Result<impl IntoResponse, ApiError> {
+    st.db.pool().ok_or(ApiError::DbUnavailable)?;
+
+    let row = st.db.update_account(id, &body.description, body.credit_limit_uc).await
+        .map_err(|e| ApiError::Db(e.to_string()))?
+        .ok_or_else(|| ApiError::NotFound("account not found".into()))?;
+
+    let _ = st.db.insert_config_history(
+        "api", "update",
+        &format!("balances/{}", row.id),
+        None,
+        &format!("description={}, credit_limit_uc={}", row.description, row.credit_limit_uc),
     ).await;
 
     Ok(Json(row))

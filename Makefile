@@ -56,6 +56,23 @@ else ifeq ($(wildcard $(CONFIG_MK)),)
     $(shell rm -f src/core/builtin_modules.gen.inc)
 endif
 
+# =====================================================================
+# Auto-configure: if config.mk missing and configure script exists, run it.
+# Skip for 'make clean' — cleaning should not regenerate config.
+# =====================================================================
+HAVE_CONFIGURE := $(wildcard ./configure)
+HAVE_CONFIG_MK := $(wildcard $(CONFIG_MK))
+
+ifneq ($(filter clean,$(MAKECMDGOALS)),clean)
+ifeq ($(HAVE_CONFIG_MK),)
+ifeq ($(HAVE_CONFIGURE),./configure)
+$(info [Makefile] $(CONFIG_MK) not found — auto-running ./configure ...)
+_configure_rc := $(shell mkdir -p $(CONFIG_DIR) && ./configure >&2; echo $$?)
+$(if $(filter 0,$(_configure_rc)),,$(error ./configure failed (exit $(_configure_rc)) — fix dependencies or run manually))
+endif
+endif
+endif
+
 -include $(CONFIG_MK)
 
 # =====================================================================
@@ -293,7 +310,7 @@ endif
 
 modules: $(DYNAMIC_SOS)
 
-$(TARGET): $(OBJS) $(MAIN_OBJ)
+$(TARGET): $(OBJS) $(MAIN_OBJ) | $(DYNAMIC_SOS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 	cp -f build/nsbcd .
 	$(POST_BUILD_COPY)

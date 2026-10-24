@@ -17,8 +17,10 @@
 extern "C" {
 #endif
 
-/* 事件：P0 环形留存最近 OBS_EVENT_RING 条，供 control 接口 tail 查询 */
-void obs_event(const char *domain_action, const char *fmt, ...);
+/* 事件：P0 环形留存最近 OBS_EVENT_RING 条，供 control 接口 tail 查询
+ * level: llog 级别（0=EMERG~7=DEBUG），-1=默认 INFO(6)。
+ * 帧格式：2026-10-24T13:02:21.170 [INFO] CALL_INCOMING ... */
+void obs_event(int level, const char *domain_action, const char *fmt, ...);
 
 /* 取最近事件（最多 max 条），以 "\n" 分隔；返回写出长度 */
 int obs_events_tail(char *buf, size_t cap, int max);

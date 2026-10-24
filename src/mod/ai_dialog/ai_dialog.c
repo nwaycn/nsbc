@@ -49,6 +49,7 @@
 #include "b2bua.h"        /* P0-1: b2b_call_destroy_add */
 #include "dp_sleep.h"     /* P0-2: dp_sleep_app_reg() */
 #include "app_registry.h" /* P0-2: app_register / app_desc_t */
+#include "app_ctx.h"      /* struct nsbc_ctx 完整定义（ctx->cfg）*/
 
 #ifdef NSBC_WITH_CURL
 #define HAVE_REAL_ASR_TTS 1
@@ -133,6 +134,7 @@ typedef struct ai_store {
 } ai_store_t;
 
 static ai_store_t g_ai;
+static cfg_t *g_cfg_ptr = NULL;
 
 /* 前向声明：ai_rec_feed 里 pthread_create 要用；ai_session_thread_stub 在文件底部定义 */
 static void *ai_session_thread_stub(void *arg);
@@ -179,7 +181,7 @@ static ai_session_t *ai_session_find_or_create(ai_store_t *st, void *call_key,
 static void cfg_str(const char *key, char *out, size_t outsz, const char *def)
 {
     const char *v = NULL;
-    if (cfg_get_str(cfg(), key, &v, NULL) == NSBC_OK && v && v[0]) {
+    if (cfg_get_str(g_cfg_ptr, key, &v, NULL) == NSBC_OK && v && v[0]) {
         snprintf(out, outsz, "%s", v);
     } else if (def) {
         snprintf(out, outsz, "%s", def);
@@ -236,6 +238,8 @@ static void ai_rec_feed(void *ud, void *call_key,
 
 static char *do_asr(ai_cfg_t *cfg, const char *pcm_path, size_t pcm_len)
 {
+    (void)cfg;
+    (void)pcm_len;
     /* 把 PCMU 临时文件转成 16kHz WAV（Whisper 偏好）——P1 简化：
      * 直接 POST raw PCM16（8kHz mono）；或者落一个最小 .wav 头。
      * 这里选落 .wav 头：44字节 header + PCMU → PCM16 → 写文件
@@ -376,6 +380,9 @@ static char *json_escape_simple(const char *s)
 
 static void do_tts_and_inject(ai_store_t *st, ai_session_t *s, const char *text)
 {
+    (void)st;
+    (void)s;
+    (void)text;
 #ifdef HAVE_REAL_ASR_TTS
     if (!text || !text[0]) return;
 
@@ -667,7 +674,6 @@ static void *ai_session_thread_stub(void *arg)
 
     uint8_t pcmu_chunk[4096]; /* 4KB ≈ 512ms @ 8k */
     FILE *chunk_fp = NULL;
-    char chunk_path[256];
     int chunk_written = 0;
 
     while (s->running) {
@@ -796,6 +802,7 @@ static void ai_on_call_destroy(void *call_key, int a_final, void *ud)
  * thread 检测 enabled=1 后才真正启动 ASR/TTS 管道（之前只攒 ring buffer）。*/
 static app_rc_t ai_app_exec(app_ctx_t *c, const char *data, void *ud)
 {
+    (void)data;
     ai_store_t *st = (ai_store_t *)ud;
     if (!st || !st->cfg.enabled || !c || !c->call_key)
         return APP_RC_FAILED;
@@ -830,17 +837,24 @@ static app_rc_t ai_app_exec(app_ctx_t *c, const char *data, void *ud)
 /* init / fini                                                          */
 /* ================================================================== */
 
-static int ai_init(void)
+static int ai_init(struct nsbc_ctx *ctx)
 {
     memset(&g_ai, 0, sizeof(g_ai));
     pthread_mutex_init(&g_ai.lock, NULL);
+    g_cfg_ptr = ctx->cfg;
 
-    /* 读配置 */
+    /* 读配置（cfg_get_int 第3参数是 long *，第4参数是 cfg_layer_t * 或 NULL）*/
+    g_ai.cfg.enabled   = 0;      /* 默认禁用 */
     g_ai.cfg.target_pt = 0;      /* 默认 PCMU */
     g_ai.cfg.chunk_ms  = 2000;   /* 默认 2s ASR chunk */
-    cfg_get_int(cfg(), "ai_dialog.enabled",   &g_ai.cfg.enabled,   0);
-    cfg_get_int(cfg(), "ai_dialog.target_pt", &g_ai.cfg.target_pt, 0);
-    cfg_get_int(cfg(), "ai_dialog.chunk_ms",  &g_ai.cfg.chunk_ms,  2000);
+    g_ai.cfg.llm_enabled = 0;
+
+    long tmp = 0;
+    if (cfg_get_int(g_cfg_ptr, "ai_dialog.enabled",   &tmp, NULL) == 0) g_ai.cfg.enabled = (int)tmp;
+    tmp = g_ai.cfg.target_pt;
+    if (cfg_get_int(g_cfg_ptr, "ai_dialog.target_pt", &tmp, NULL) == 0) g_ai.cfg.target_pt = (int)tmp;
+    tmp = g_ai.cfg.chunk_ms;
+    if (cfg_get_int(g_cfg_ptr, "ai_dialog.chunk_ms",  &tmp, NULL) == 0) g_ai.cfg.chunk_ms = (int)tmp;
 
     cfg_str("ai_dialog.asr.endpoint",  g_ai.cfg.asr_endpoint,  sizeof(g_ai.cfg.asr_endpoint),
             "https://api.openai.com/v1/audio/transcriptions");
@@ -854,7 +868,8 @@ static int ai_init(void)
     cfg_str("ai_dialog.llm.model",     g_ai.cfg.llm_model,     sizeof(g_ai.cfg.llm_model), "gpt-4o-mini");
     cfg_str("ai_dialog.llm.system_prompt", g_ai.cfg.llm_system_prompt, sizeof(g_ai.cfg.llm_system_prompt),
             "你是一个友好的电话客服，简短回答。");
-    cfg_get_int(cfg(), "ai_dialog.llm.enabled", &g_ai.cfg.llm_enabled, 0);
+    tmp = g_ai.cfg.llm_enabled;
+    if (cfg_get_int(g_cfg_ptr, "ai_dialog.llm.enabled", &tmp, NULL) == 0) g_ai.cfg.llm_enabled = (int)tmp;
 
     cfg_str("ai_dialog.tts.endpoint",  g_ai.cfg.tts_endpoint,  sizeof(g_ai.cfg.tts_endpoint),
             "https://api.elevenlabs.io/v1/text-to-speech");
@@ -940,8 +955,9 @@ static int ai_init(void)
     return NSBC_OK;
 }
 
-static void ai_fini(void)
+static void ai_fini(struct nsbc_ctx *ctx)
 {
+    (void)ctx;
     llog(LOG_INFO, "ai", "ai_dialog fini");
 
     /* P0-1: 卸载 call_destroy hook */

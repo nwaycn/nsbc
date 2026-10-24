@@ -536,7 +536,7 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
     } else {
         snprintf(reg_realm, sizeof(reg_realm), "nsbc.local");
     }
-    llog(LOG_INFO, "reg", "REGISTER aor=%s tenant_realm=%s", aor, reg_realm);
+    llog(LOG_DEBUG, "reg", "REGISTER aor=%s tenant_realm=%s", aor, reg_realm);
 
     /* 三级令牌桶 */
     if (!tb_take(&r->ip[sa_key(src) & (TB_IP_N - 1)], sa_key(src),
@@ -560,26 +560,26 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
 
     /* Digest 鉴权 */
     sip_hdr_t *auth = sip_hdr_get(m, SIP_H_AUTHORIZATION);
-    llog(LOG_INFO, "reg", "REGISTER Authorization hdr ptr=%p", (void*)auth);
+    llog(LOG_DEBUG, "reg", "REGISTER Authorization hdr ptr=%p", (void*)auth);
     if (!auth || sip_hdr_parse_auth(auth) != NSBC_OK) {
         char ch[512], extra[600];
         digest_make_challenge(&dig, 0, ch, sizeof(ch));
         snprintf(extra, sizeof(extra), "WWW-Authenticate: %s\r\n", ch);
-        llog(LOG_INFO, "reg", "REGISTER → 401 challenge (auth=%p)", (void*)auth);
+        llog(LOG_DEBUG, "reg", "REGISTER → 401 challenge (auth=%p)", (void*)auth);
         llog(LOG_WARN, "reg",
              "key=fail2ban src_ip=%s reason=no_auth_header aor=%s",
              src_ip, aor);
         respond(r, proto, src, m, 401, extra, NULL, 0, txn);
         return NSBC_OK;
     }
-    llog(LOG_INFO, "reg", "REGISTER with Authorization header → verifying...");
+    llog(LOG_DEBUG, "reg", "REGISTER with Authorization header → verifying...");
     dig_auth_rc_t ar = digest_verify(&dig, m, &auth->u.auth, now);
-    llog(LOG_INFO, "reg", "digest_verify rc=%d (0=OK)", ar);
+    llog(LOG_DEBUG, "reg", "digest_verify rc=%d (0=OK)", ar);
     if (ar == DIG_AUTH_STALE_NONCE) {
         char ch[512], extra[600];
         digest_make_challenge(&dig, 1, ch, sizeof(ch));
         snprintf(extra, sizeof(extra), "WWW-Authenticate: %s\r\n", ch);
-        llog(LOG_INFO, "reg", "REGISTER → 401 stale nonce");
+        llog(LOG_DEBUG, "reg", "REGISTER → 401 stale nonce");
         respond(r, proto, src, m, 401, extra, NULL, 0, txn);
         return NSBC_OK;
     }
@@ -611,7 +611,7 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
         respond(r, proto, src, m, 403, NULL, NULL, 0, txn);
         return NSBC_OK;
     }
-    llog(LOG_INFO, "reg", "REGISTER auth OK → processing loc_add...");
+    llog(LOG_DEBUG, "reg", "REGISTER auth OK → processing loc_add...");
     b2b_guard_notify(src_ip, B2B_GUARD_AUTH_OK); /* auth OK：通知 security 清零 fail/ratelimit 计数 */
 
     /* ---- RFC 3327 §6.2：Path 头回显 ----
@@ -642,7 +642,7 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
             snprintf(full, sizeof(full), "Path: %s\r\n", path_extra);
             path_extra[0] = '\0';
             snprintf(path_extra, sizeof(path_extra), "%s", full);
-            llog(LOG_INFO, "reg", "REGISTER Path echo: %s", path_extra);
+            llog(LOG_DEBUG, "reg", "REGISTER Path echo: %s", path_extra);
         }
     }
 
@@ -669,7 +669,7 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
             int w = snprintf(hdr_prefix + ho, sizeof(hdr_prefix) - ho,
                              "Service-Route: %s\r\n", generated_service_route);
             if (w > 0 && (size_t)w < sizeof(hdr_prefix) - ho) ho += (size_t)w;
-            llog(LOG_INFO, "reg", "REGISTER Service-Route generated: %s",
+            llog(LOG_DEBUG, "reg", "REGISTER Service-Route generated: %s",
                  generated_service_route);
         }
         if (path_extra[0]) {

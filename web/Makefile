@@ -35,6 +35,20 @@ OFFLINE     := --offline --locked
 VENDOR_CFG  := .cargo/config.toml
 VENDOR_BAK  := .cargo/config.toml.bak
 
+# =====================================================================
+# Auto-Cargo.lock: if Cargo.lock missing and we're not cleaning,
+# generate it so first-time `make` works out of the box.
+# =====================================================================
+HAVE_LOCK := $(wildcard Cargo.lock)
+
+ifneq ($(filter clean fetch fetch-refresh vendor,$(MAKECMDGOALS)),clean fetch fetch-refresh vendor)
+ifeq ($(HAVE_LOCK),)
+$(info [web/Makefile] Cargo.lock not found — running cargo generate-lockfile ...)
+_lock_rc := $(shell $(CARGO) generate-lockfile 2>&1; echo $$?)
+$(if $(filter 0,$(_lock_rc)),,$(error cargo generate-lockfile failed (exit $(_lock_rc)) — run `make fetch` or check network))
+endif
+endif
+
 .PHONY: all fetch vendor build build-acme run run-acme clean check check-acme
 
 # ===== 1. online preparation (first time or after Cargo.toml changes) =====

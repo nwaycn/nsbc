@@ -1,4 +1,4 @@
-﻿//! Auth foundation (REQ-WEB-008 P0, W3a).
+//! Auth foundation (REQ-WEB-008 P0, W3a).
 //!
 //! Composition:
 //!   - [`accounts`]: local accounts (argon2id PHC), env/file config, fail-closed
@@ -107,18 +107,22 @@ impl AuthSvc {
         Self::build_from_parts(secret, accounts)
     }
 
-    /// Construct from WebConfig::AuthSection (env > file > defaults).
+    /// Construct from WebConfig::AuthSection (env > file > cfg > fail-closed).
     pub fn from_config(cfg: &super::config::AuthSection) -> Result<AuthSvc, String> {
-        // JWT secret: env > cfg > fail
-        let secret = env_bytes_or_file("NSBC_JWT_SECRET", "NSBC_JWT_SECRET_FILE")?;
-        let secret = if secret.is_none() && !cfg.jwt_secret.is_empty() {
-            Some(cfg.jwt_secret.as_bytes().to_vec())
-        } else {
-            secret
-        }.ok_or_else(|| {
-            "set NSBC_JWT_SECRET / NSBC_JWT_SECRET_FILE, or web.auth.jwt_secret in config (>=32 bytes)"
-                .to_string()
-        })?;
+        // JWT secret: env/file > cfg.jwt_secret (YAML) > fail-closed
+        // Production: prefer env NSBC_JWT_SECRET; YAML value acceptable but don't commit it.
+        let secret = env_bytes_or_file("NSBC_JWT_SECRET", "NSBC_JWT_SECRET_FILE")?
+            .or_else(|| {
+                if !cfg.jwt_secret.trim().is_empty() {
+                    Some(cfg.jwt_secret.as_bytes().to_vec())
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| {
+                "NSBC_JWT_SECRET / NSBC_JWT_SECRET_FILE or auth.jwt_secret in YAML \
+                 must be set (>=32 bytes). Generate: openssl rand -hex 32".to_string()
+            })?;
 
         // Accounts: env > cfg > defaults
         let accounts_text = env_text_or_file("NSBC_AUTH_ACCOUNTS", "NSBC_AUTH_FILE")

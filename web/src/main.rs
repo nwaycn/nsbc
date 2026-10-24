@@ -176,6 +176,7 @@ fn api_router<C: CoreApi + Clone + 'static>(st: Arc<AppState<C>>) -> Router {
         .merge(routes::cdrs::router())
         .merge(routes::security::router())
         .merge(routes::recordings::router())
+        .merge(routes::recordings::public_file_router(st.clone()))
         .merge(routes::billing::router())
         .merge(routes::transcode::router())
         .merge(routes::tenants::router())
@@ -211,7 +212,6 @@ fn app_router<C: CoreApi + Clone + 'static>(state: Arc<AppState<C>>) -> Router {
     let app = Router::new()
         .nest("/api/v1", api_router(state.clone()))
         .route("/health", axum::routing::get(routes::system::health))
-        .merge(routes::recordings::public_file_router(state.clone()))
         .merge(static_files::router());
 
     // Add security headers layer by layer (SetResponseHeaderLayer overwrites duplicates)
@@ -716,6 +716,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::net::SocketAddr;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
     use axum::body::Body;
     use axum::http::{HeaderName, Method, Request, StatusCode};

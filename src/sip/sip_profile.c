@@ -400,6 +400,12 @@ static void parse_json_object(cJSON *obj, sip_profile_t *p)
         p->enable_update = cJSON_IsTrue(j) ? 1 : 0;
     if ((j = cJSON_GetObjectItemCaseSensitive(obj, "enable_t140")))
         p->enable_t140 = cJSON_IsTrue(j) ? 1 : 0;
+    if ((j = cJSON_GetObjectItemCaseSensitive(obj, "enable_precondition")))
+        p->enable_precondition = cJSON_IsTrue(j) ? 1 : 0;
+    if ((j = cJSON_GetObjectItemCaseSensitive(obj, "enable_timer")))
+        p->enable_timer = cJSON_IsTrue(j) ? 1 : 0;
+    if ((j = cJSON_GetObjectItemCaseSensitive(obj, "enable_gruu")))
+        p->enable_gruu = cJSON_IsTrue(j) ? 1 : 0;
     if ((j = cJSON_GetObjectItemCaseSensitive(obj, "dtmf_mode")) && cJSON_IsString(j)) {
         if      (!strcmp(j->valuestring, "info"))    p->dtmf_mode = PROFILE_DTMF_INFO;
         else if (!strcmp(j->valuestring, "inband")) p->dtmf_mode = PROFILE_DTMF_INBAND;

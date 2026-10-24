@@ -10,10 +10,12 @@
 #define _GNU_SOURCE
 #endif
 #include "media_bridge.h"
-#include "b2bua.h"        /* b2b_call_t.muted[] — uuid_mute 静音标志 */
+#include "b2bua.h"        /* b2b_call_t.muted[] + .ivr_sess — uuid_mute + DTMF→IVR 入口 */
 #include "sip_profile.h"  /* sip_profile_t.enable_precondition — RFC 3312 gate 守卫 */
 #include "sdp.h"
 #include "rtp.h"
+#include "dtmf.h"         /* dtmf_rx_t — RFC4733 去重器，relay_recv_one 喂 */
+#include "ivr.h"          /* ivr_on_dtmf — relay_recv_one 消费 DTMF */
 #include "sip_common.h"   /* sip_ci_eq */
 #include "media_bug.h"
 #include "media_codec.h"   /* codec registry + transcode engine */
@@ -83,6 +85,13 @@ typedef struct cnode {
      * relay_recv_one 转发前检查：precond_active && !precond_met → 丢包。 */
     uint8_t precond_active;
     uint8_t precond_met;
+    /* ★ DTMF RFC4733 — 每侧实际协商的 telephone-event 载荷 PT（0=未协商）。
+     * bridge_confirm 从 answer SDP 的 rtpmap 里提取 enc="telephone-event" 时填入。
+     * relay_recv_one 里 pkt.pt == dtmf_pt[side] 时走 DTMF 专用分支：
+     *   rtp_parse_dtmf → dtmf_rx_on_rfc4733 → ivr_on_dtmf(call->ivr_sess, digit)
+     * 转发 continue（避免对端也收到 RFC4733 包重复解析）。 */
+    uint8_t   dtmf_pt[2];     /* 每侧 telephone-event PT；0=未协商 */
+    void     *dtmf_rx[2];    /* dtmf_rx_t* 每侧去重器；0=未创建 */
 } cnode_t;
 
 typedef struct {
@@ -785,6 +794,36 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
                 ++r->drops;
                 continue;
             }
+
+            /* ★ DTMF RFC4733 拦截：本 side 的 telephone-event PT → 消费不转发。
+             * 位置：SSRC policy 之后（过了合法性校验），PT rewrite/transcode 之前（DTMF 不走 codec 链）。 */
+            if (r->node && r->node->dtmf_pt[side] &&
+                (uint8_t)pkt.pt == r->node->dtmf_pt[side] &&
+                (int)pkt.payload_len >= 4) {  /* RFC4733 最少 4 字节 payload */
+                rtp_dtmf_t d;
+                if (rtp_parse_dtmf(pkt.payload, pkt.payload_len, &d) == NSBC_OK) {
+                    dtmf_rx_t *dx = (dtmf_rx_t *)r->node->dtmf_rx[side];
+                    dtmf_event_t ev;
+                    if (dtmf_rx_on_rfc4733(dx, &d, &ev) == 1) {
+                        /* dtmf_rx 去重通过（首个 end-of-event 包或状态转移）→ 喂 IVR */
+                        if (r->node->call) {
+                            b2b_call_t *call = (b2b_call_t *)r->node->call;
+                            if (call->ivr_sess) {
+                                ivr_action_t act;
+                                int rc = ivr_on_dtmf(call->ivr_sess, ev.digit, &act);
+                                static __thread int di_cnt = 0;
+                                ++di_cnt;
+                                if (di_cnt < 20 || di_cnt % 500 == 0)
+                                    llog(LOG_INFO, "dtmf",
+                                         "★DTMF rx side=%d digit='%c' act=%d ivr_rc=%d call=%p",
+                                         side, ev.digit, (int)act.act, rc, call);
+                            }
+                        }
+                    }
+                }
+                continue;  /* 丢弃 DTMF RTP 包 — 对端不需要收到 RFC4733 */
+            }
+
             /* ★ PT rewrite fast-path：同 codec 不同 PT
              * 例：WebRTC G729 PT=96 → SIP G729 PT=18
              * 只改 RTP header PT 字节，payload 不动，零开销。 */
@@ -2387,10 +2426,13 @@ int bridge_offer_hook(void *call, const char *in, size_t inlen,
     e->precond_active = 0;
     e->precond_met = 0;
     {
-        /* ★ 三层守卫：cfg（无）→ force_precondition (dialplan 三态) → profile.enable_precondition */
-        sip_profile_t *pr = call ? call->prof : NULL;
+        /* ★ 三层守卫：cfg（无）→ force_precondition (dialplan 三态) → profile.enable_precondition
+         * REQ-ARCH-011 注：bridge_confirm 已在本文件 L959 强转过 b2b_call_t，
+         * 同一模式下 call_key 在此处安全强转（signaling 层创建，media 层消费）。 */
+        b2b_call_t *bc = (b2b_call_t *)call;
+        sip_profile_t *pr = bc ? bc->prof : NULL;
         int prof_en = pr && pr->enable_precondition;  /* profile NULL 默认关 */
-        int force_f = call ? call->force_precondition : 0;
+        int force_f = bc ? bc->force_precondition : 0;
         int enabled = (force_f == 1) ? 1 : (force_f == 2 ? 0 : prof_en);
         if (enabled && inlen > 0) {
             sdp_t s; memset(&s, 0, sizeof(s));
@@ -2778,9 +2820,10 @@ int bridge_answer_hook(void *call, const char *in, size_t inlen,
     /* ★ RFC 3312 Precondition met 检测：
      * 三层守卫同 offer_hook：force_precondition (dialplan) → profile.enable_precondition */
     {
-        sip_profile_t *pr = call ? call->prof : NULL;
+        b2b_call_t *bc = (b2b_call_t *)call;
+        sip_profile_t *pr = bc ? bc->prof : NULL;
         int prof_en = pr && pr->enable_precondition;
-        int force_f = call ? call->force_precondition : 0;
+        int force_f = bc ? bc->force_precondition : 0;
         int enabled = (force_f == 1) ? 1 : (force_f == 2 ? 0 : prof_en);
         if (enabled && inlen > 0) {
             sdp_t s; memset(&s, 0, sizeof(s));
@@ -3012,6 +3055,14 @@ void bridge_release_call(bridge_mgr_t *m, void *call)
             /* ★ 转码会话清理（REQ-TRANS-004） */
             if (e->transcode[0]) { transcode_close(e->transcode[0]); e->transcode[0] = NULL; }
             if (e->transcode[1]) { transcode_close(e->transcode[1]); e->transcode[1] = NULL; }
+            /* ★ DTMF RFC4733 去重器清理 */
+            for (int si = 0; si < 2; ++si) {
+                if (e->dtmf_rx[si]) {
+                    dtmf_rx_destroy((dtmf_rx_t *)e->dtmf_rx[si]);
+                    e->dtmf_rx[si] = NULL;
+                }
+                e->dtmf_pt[si] = 0;
+            }
             free(e);
             return;
         }
@@ -3236,6 +3287,28 @@ static codec_id_t find_transcode_dst(codec_id_t src,
     return CODEC_NONE;
 }
 
+/* ★ 顶层 static 辅助：扫描 SDP 找 "a=rtpmap:<PT> telephone-event/..." 行
+ * 返回 telephone-event 的 PT（0=未协商）。bridge_confirm 里调用。 */
+static uint8_t find_dtmf_pt(const char *sdp, size_t len) {
+    const char *p = sdp;
+    const char *end = sdp + len;
+    while ((p = memmem(p, (size_t)(end - p), "a=rtpmap:", 9)) != NULL) {
+        p += 9;
+        if (p >= end) break;
+        const char *pt_start = p;
+        while (pt_start < end && *pt_start >= '0' && *pt_start <= '9') pt_start++;
+        if (pt_start == p) { p = pt_start; continue; }
+        const char *q = pt_start;
+        while (q < end && *q == ' ') q++;
+        if (q + 14 <= end && memcmp(q, "telephone-event", 14) == 0) {
+            unsigned pt = (unsigned)strtoul(p, NULL, 10);
+            if (pt < 256) return (uint8_t)pt;
+        }
+        p = pt_start;
+    }
+    return 0;
+}
+
 int bridge_confirm(bridge_mgr_t *m, void *call, const char *offer,
                    size_t offer_len, const char *answer, size_t answer_len)
 {
@@ -3299,6 +3372,27 @@ int bridge_confirm(bridge_mgr_t *m, void *call, const char *offer,
         memcpy(e->pt_allowed[0], offer_pts, (size_t)offer_n);
         e->pt_allowed_count[1] = answer_n;
         memcpy(e->pt_allowed[1], answer_pts, (size_t)answer_n);
+
+        /* ★ DTMF RFC4733：扫描 offer/answer SDP 提取 telephone-event PT
+         * 顶层 static find_dtmf_pt（函数外定义）负责实际解析 */
+        e->dtmf_pt[0] = find_dtmf_pt(offer, offer_len);
+        e->dtmf_pt[1] = find_dtmf_pt(answer, answer_len);
+        if (e->dtmf_pt[0] || e->dtmf_pt[1]) {
+            llog(LOG_INFO, "media",
+                 "★DTMF call=%p dtmf_pt[0]=%u dtmf_pt[1]=%u",
+                 call, (unsigned)e->dtmf_pt[0], (unsigned)e->dtmf_pt[1]);
+            /* 创建每侧 DTMF 去重器（只创建有 PT 的侧，PT 缺省 0 跳过） */
+            if (e->dtmf_pt[0]) {
+                dtmf_rx_t *rx = NULL;
+                if (dtmf_rx_create((int)e->dtmf_pt[0], &rx) == NSBC_OK)
+                    e->dtmf_rx[0] = rx;
+            }
+            if (e->dtmf_pt[1]) {
+                dtmf_rx_t *rx = NULL;
+                if (dtmf_rx_create((int)e->dtmf_pt[1], &rx) == NSBC_OK)
+                    e->dtmf_rx[1] = rx;
+            }
+        }
 
         if (final_mode == MB_TRANSCODE && e->mode != MB_TRANSCODE) {
             e->mode = MB_TRANSCODE;

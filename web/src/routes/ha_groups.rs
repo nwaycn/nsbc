@@ -16,6 +16,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::coreclient::CoreApi;
 use crate::error::ApiError;
+use crate::sync;
 use crate::AppState;
 
 pub fn router<C>() -> Router<Arc<AppState<C>>>
@@ -66,7 +67,7 @@ pub async fn get_one<C: CoreApi + Clone + Send + Sync>(
     Ok(Json(row))
 }
 
-pub async fn create<C: CoreApi + Clone + Send + Sync>(
+pub async fn create<C: CoreApi + Clone + Send + Sync + 'static>(
     State(st): State<Arc<AppState<C>>>,
     Json(body): Json<crate::db::HaGroupCreate>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -84,10 +85,11 @@ pub async fn create<C: CoreApi + Clone + Send + Sync>(
         "api", "create", &format!("ha-groups/{}", row.id),
         None, &format!("ha_group={} quorum={}", row.name, row.quorum),
     ).await;
+    sync::spawn_push(st.clone(), sync::Kind::HaGroups);
     Ok((StatusCode::CREATED, Json(row)))
 }
 
-pub async fn update<C: CoreApi + Clone + Send + Sync>(
+pub async fn update<C: CoreApi + Clone + Send + Sync + 'static>(
     State(st): State<Arc<AppState<C>>>,
     Path(id): Path<i64>,
     Json(body): Json<crate::db::HaGroupUpdate>,
@@ -100,10 +102,11 @@ pub async fn update<C: CoreApi + Clone + Send + Sync>(
     let _ = st.db.insert_config_history(
         "api", "update", &format!("ha-groups/{}", row.id), None, &format!("ha_group={}", row.name),
     ).await;
+    sync::spawn_push(st.clone(), sync::Kind::HaGroups);
     Ok(Json(row))
 }
 
-pub async fn delete_one<C: CoreApi + Clone + Send + Sync>(
+pub async fn delete_one<C: CoreApi + Clone + Send + Sync + 'static>(
     State(st): State<Arc<AppState<C>>>,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -114,6 +117,7 @@ pub async fn delete_one<C: CoreApi + Clone + Send + Sync>(
     let _ = st.db.insert_config_history(
         "api", "delete", &format!("ha-groups/{id}"), None, "deleted",
     ).await;
+    sync::spawn_push(st.clone(), sync::Kind::HaGroups);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -123,10 +127,8 @@ pub async fn reload<C: CoreApi + Clone + Send + Sync>(
     st.db.pool().ok_or(ApiError::DbUnavailable)?;
     let rows = st.db.list_enabled_ha_groups().await
         .map_err(|e| ApiError::Db(e.to_string()))?;
-    tracing::info!(count = rows.len(), "ha-groups.reload requested — UDS command not yet wired");
-    Ok(Json(json!({
-        "loaded": rows.len(),
-        "uds_wired": false,
-        "message": "ha-groups.reload UDS command will be wired after Linux compile"
-    })))
+    let json = serde_json::to_string(&rows)
+        .map_err(|e| ApiError::Db(e.to_string()))?;
+    st.core.reload_ha_groups(&json).await?;
+    Ok(Json(json!({ "reloaded": rows.len(), "uds_wired": true })))
 }

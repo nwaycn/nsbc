@@ -90,6 +90,22 @@ void ivr_on_prompt_end(ivr_sess_t *s);
 /* 当前缓冲按键串（调试/HTTP 查询参数） */
 const char *ivr_digits(const ivr_sess_t *s);
 
+/* Profile 注册表（sync 推送填充 + 执行时查找） */
+const ivr_profile_t *ivr_profile_find(const char *name, const char *tenant);
+
+/* Web sync 推送入口：完整 IVR 菜单数组 JSON
+ * 格式：[{"name":"...","tenant_id":1,"entry_node":"main",
+ *         "nodes_json":[{"name":"main","prompt":"...","choices":[...],...}]}]
+ * 遍历每条调 ivr_reload_json，填充全局表。 */
+int ivr_menus_reload_json(const char *json, char *err, size_t errsz);
+
+/* 底层单 Profile 填充（同 modules/applications/ivr.c 内部 helper） */
+int ivr_reload_json(const char *name, const char *tenant,
+                    const char *nodes_json, const char *entry_node);
+
+/* 时间轮 hook：检查 sess 是否到 deadline，到了自动走 timeout 逻辑 */
+int ivr_check_timeout(ivr_sess_t *s, uint64_t now_ms);
+
 #ifdef __cplusplus
 }
 #endif

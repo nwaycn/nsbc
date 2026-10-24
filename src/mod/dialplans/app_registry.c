@@ -15,6 +15,7 @@
 #include "b2bua.h"
 #include "dialplan.h"
 #include "dp_sleep.h"
+#include "ivr.h"           /* ivr_session_start / ivr_profile_find */
 #include "log.h"
 #include "playback_engine.h"
 #include "timer_wheel.h"
@@ -509,6 +510,90 @@ static app_rc_t app_read(app_ctx_t *c, const char *data, void *ud)
     return APP_RC_FAILED;
 }
 
+/* ---- §13 ivr（REQ-PBX-IVR-001 P0）----
+ *
+ * data = "<menu_name>" —— IVR 菜单名（ivr_menus 表里的 name 字段）。
+ *
+ * 执行链路：
+ *   1. ivr_profile_find(name, tenant="1") — 从全局 profile 注册表找菜单
+ *   2. ivr_session_start(profile, entry_node, call_key, &g_ivr_ops, &sess)
+ *      — 创建 session，首节点自动播 prompt 开始收号
+ *   3. call->ivr_sess = sess — **关键！** media_bridge relay_recv_one 在收到
+ *      telephone-event RTP 时调 ivr_on_dtmf(call->ivr_sess, digit)
+ *   4. 返回 APP_RC_HANDOFF_SILENT — 挂起 dialplan app_chain，IVR 状态机
+ *      接管后续所有 DTMF 交互；终态动作（TRANSFER/HANGUP）由 ivr_ops
+ *      回调触发，回调内部调 b2b_transfer_call / b2b_hangup_call。 */
+
+/* ivr_ops_t 全局回调：ivr_session_start 需要这个指针。
+ * play → pb_start，transfer → b2b_transfer_call（P1 实装）。
+ * 注意：ivr_ops_t 没有 hangup 字段——终态 HANGUP 动作由 media_bridge
+ * relay_recv_one 消费 ivr_on_dtmf 返回的 ivr_action_t.act 来处理。 */
+static int ivr_ops_play(void *ud, void *call_key,
+                        const char *clip, int loop)
+{
+    (void)ud;
+    if (!clip || !call_key) return NSBC_INVAL;
+    pb_stop_if_playing(call_key);
+    return pb_start(call_key, clip, 0, loop, NULL);
+}
+static int ivr_ops_transfer(void *ud, void *call_key, const char *target)
+{
+    (void)ud;
+    llog(LOG_INFO, "ivr", "★ivr_ops_transfer call=%p target=%s (P1 接 b2b_transfer_call)",
+         call_key, target ? target : "");
+    return NSBC_OK;
+}
+static ivr_ops_t g_ivr_ops = {
+    .play     = ivr_ops_play,
+    .transfer = ivr_ops_transfer,
+    .http_get = NULL,
+    .ud       = NULL,
+};
+
+static app_rc_t app_ivr(app_ctx_t *c, const char *data, void *ud)
+{
+    (void)ud;
+    if (!cv_call_alive(c)) return APP_RC_FAILED;
+    if (!data || data[0] == '\0') {
+        llog(LOG_WARN, "app", "ivr: data is empty (need menu name)");
+        return APP_RC_FAILED;
+    }
+
+    /* 1. 从全局 profile 注册表找菜单（tenant 默认 "1"） */
+    const char *tenant = "1";
+    if (c->vars) {
+        char tbuf[32] = "";
+        if (chan_var_get(c->vars, c->leg, "tenant_id", tbuf, sizeof(tbuf)) == NSBC_OK && tbuf[0])
+            tenant = tbuf;
+    }
+    const ivr_profile_t *p = ivr_profile_find(data, tenant);
+    if (!p) {
+        llog(LOG_WARN, "app", "ivr profile not found: name=%s tenant=%s", data, tenant);
+        return APP_RC_FAILED;
+    }
+
+    /* 2. 创建 IVR session —— entry_node 硬编码默认 "main"
+     * （前端 default nodes_json 首节点名 + reload JSON 默认 entry_node="main"）。
+     * P1 可在 data 里加 ":entry" 后缀让调用方指定入口节点。 */
+    static const char *default_entry = "main";
+    ivr_sess_t *sess = NULL;
+    int rc = ivr_session_start(p, default_entry, c->call_key, &g_ivr_ops, &sess);
+    if (rc != NSBC_OK || !sess) {
+        llog(LOG_WARN, "app", "ivr_session_start FAIL rc=%d (entry='%s')", rc, default_entry);
+        return APP_RC_FAILED;
+    }
+
+    /* 3. ★ 关键：存到 call->ivr_sess —— media_bridge relay_recv_one 靠这个喂 DTMF */
+    b2b_call_t *call = (b2b_call_t *)c->call_key;
+    call->ivr_sess = sess;
+
+    llog(LOG_INFO, "ivr", "★IVR START call=%p menu=%s entry=%s tenant=%s",
+         call, data, default_entry, tenant);
+
+    /* 4. 挂起 dialplan app_chain —— IVR 状态机接管，后续 DTMF 走 media_bridge */
+    return APP_RC_HANDOFF_SILENT;
+}
+
 /* ---- 4. record（P1 接 recording）---- */
 static app_rc_t app_record(app_ctx_t *c, const char *data, void *ud)
 {
@@ -664,6 +749,7 @@ static const app_desc_t builtin_apps[] = {
     { "endless_playback",   "循环播放音频（uuid_break 可中断）",                app_endless_playback,  NULL },
     { "uuid_break",         "打断当前 call 的 playback/sleep（双模：DP app + ESL api）", app_uuid_break, NULL },
     { "read",               "DTMF 收号（P0 占位，P1 实装）",                     app_read,              NULL },
+    { "ivr",                "启动 IVR 菜单 session；data=<menu_name>",          app_ivr,               NULL },
 };
 
 /* 对外暴露：Dialplan 模块 init 时调此函数一次性注册内建 apps。 */

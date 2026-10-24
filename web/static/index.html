@@ -192,9 +192,11 @@
       <rates-live       v-else-if="route === '/rates'"></rates-live>
       <balances-live    v-else-if="route === '/balances'"></balances-live>
       <transcode-live   v-else-if="route === '/transcode'"></transcode-live>
+      <codecs-live      v-else-if="route === '/codecs'"></codecs-live>
       <!-- 系统 -->
       <ha-groups        v-else-if="route === '/ha-groups'"></ha-groups>
       <sip-profiles     v-else-if="route === '/sip-profiles'"></sip-profiles>
+      <config-editor    v-else-if="route === '/config'"></config-editor>
       <!-- 工具 -->
       <webrtc-page      v-else-if="route === '/webrtc'"></webrtc-page>
       <div v-else class="text-center text-gray-500 py-20">
@@ -206,17 +208,19 @@
 </div>
 
 <!-- 应用核心（API、编辑器、工厂、App 创建） -->
-<script src="js/app-core.js?v=20261022a"></script>
+<script src="js/app-core.js?v=20261023d"></script>
 <!-- CRUD 实体页面（extensions/gateways/trunks 等） -->
-<script src="js/pages-crud.js?v=20261022a"></script>
+<script src="js/pages-crud.js?v=20261023d"></script>
 <!-- 实时监控面板（realtime/channels/cdrs 等） -->
-<script src="js/pages-live.js?v=20261022a"></script>
-<script src="js/pages-security.js?v=20261022a"></script>
+<script src="js/pages-live.js?v=20261023d"></script>
+<script src="js/pages-security.js?v=20261023d"></script>
 <!-- JsSIP 3.10.0 UMD — WebRTC 共享电话层（addTrack patch + SDP 工具 + Hold/DTMF） -->
 <script src="js/jssip-3.10.0.min.js"></script>
 <script src="js/nsbc-phone.js?v=20261018b"></script>
 <!-- WebRTC 真实互通页面（Vue 组件 + JsSIP UA + WSS + STUN） -->
-<script src="js/pages-webrtc.js?v=20261022a"></script>
+<script src="js/pages-webrtc.js?v=20261023d"></script>
+<!-- Config hot-editor (standalone component) -->
+<script src="js/pages-config.js?v=20261023d"></script>
 
 <!-- 最后：注册 Element Plus + 图标，挂载 App -->
 <script>
@@ -235,3 +239,4 @@ app.mount('#app');
 
 </body>
 </html>
+

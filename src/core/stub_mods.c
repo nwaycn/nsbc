@@ -864,9 +864,15 @@ rollback:
     return NSBC_ERR;
 }
 
-/* gateways.reload：暂缓项（Web DB 无 gateways 表），保留占位诚实回 ERR */
+/* gateways.reload：Gateway 是 Web 侧对 Trunk 的逻辑分组标签（name+enabled），
+ * Core 端不消费 gateway 表 — trunk.reload 的 route_table 已包含 gateway_name 关联。
+ * 返回 OK no-op 避免 Web→Core reload 链路报 ERR。Web DB 增删改 gateway 即时生效，
+ * 无需 Core 端同步。 */
 int gw_table_reload_json(const char *json, char *out_err, size_t err_sz)
-{ (void)json; if (out_err) snprintf(out_err, err_sz, "not implemented"); return NSBC_ERR; }
+{
+    (void)json; (void)out_err; (void)err_sz;
+    return NSBC_OK;
+}
 
 /* nsbcm_dialplan 定义在 src/mod/dialplans/dialplan.c，本文件不重复定义 */
 

@@ -27,6 +27,7 @@
 #include "sip_transport.h"
 #include "app_ctx.h"       /* nsbc_get_ctx() — 拿 ctx->sip_tr */
 #include "nsbc_common.h"
+#include "ivr.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -70,6 +71,7 @@ static int cmd_reload_generic(
     else if (strcmp(module, "dialplan-rules") == 0) rc = dp_rules_reload_json(argv[1], err, sizeof(err));
     else if (strcmp(module, "profiles") == 0)   rc = sip_profiles_reload_json(argv[1], err, sizeof(err));
     else if (strcmp(module, "queues") == 0)    rc = queue_table_reload_json(argv[1], err, sizeof(err));
+    else if (strcmp(module, "ivr") == 0)        rc = ivr_menus_reload_json(argv[1], err, sizeof(err));
     else { rc = NSBC_INVAL; snprintf(err, sizeof(err), "unknown module %s", module); }
 
     if (rc == NSBC_OK) {
@@ -111,6 +113,8 @@ static int cmd_profiles_reload(cmd_ctx_t *c, int argc, char **argv, void *ud)
     { (void)ud; return cmd_reload_generic(c, argc, argv, (void *)"profiles"); }
 static int cmd_queues_reload(cmd_ctx_t *c, int argc, char **argv, void *ud)
     { (void)ud; return cmd_reload_generic(c, argc, argv, (void *)"queues"); }
+static int cmd_ivr_reload(cmd_ctx_t *c, int argc, char **argv, void *ud)
+    { (void)ud; return cmd_reload_generic(c, argc, argv, (void *)"ivr"); }
 
 static int cmd_profiles_list(cmd_ctx_t *c, int argc, char **argv, void *ud)
 {
@@ -140,6 +144,23 @@ static int cmd_profiles_list(cmd_ctx_t *c, int argc, char **argv, void *ud)
     return NSBC_OK;
 }
 
+/* ---- no-op reload handler：Core 端暂不消费 route_groups / ha_groups / ivr_menus ----
+ * 这些模块的内存结构未来由 Core 自己接管，但当前 Web DB 是权威数据源。
+ * 命令仍然注册以便 Web 侧 UDS 链路可通（reload 按钮点了能收到 OK）。 */
+
+static int cmd_reload_noop(cmd_ctx_t *c, int argc, char **argv, void *ud) {
+    (void)argv;
+    const char *module = (const char *)ud;
+    if (!c || !c->io_printf) return NSBC_INVAL;
+    if (argc < 2) {
+        c->io_printf(c->io_ud, "ERR usage: %s.reload <json>\n", module);
+        return NSBC_INVAL;
+    }
+    /* 日志：reload 请求到达，但 Core 端暂不消费这张表（Web DB 为准） */
+    c->io_printf(c->io_ud, "OK %s.reload accepted (no-op — Web DB authoritative)\n", module);
+    return NSBC_OK;
+}
+
 /* ---- 模块 init：注册到 cmd_reg（obs_control.c 持有） ---- */
 
 void reload_commands_register(cmd_reg_t *reg)
@@ -153,6 +174,9 @@ void reload_commands_register(cmd_reg_t *reg)
         { "queues.reload",         "Reload ACD queues from JSON (cc_mgr)",            CMD_L2_ADMIN, cmd_queues_reload,     NULL },
         { "profiles.reload",       "Reload SIP profiles RCU atomic replace",          CMD_L2_ADMIN, cmd_profiles_reload,   NULL },
         { "profiles.list",         "List loaded SIP profiles",                        CMD_L1_MONITOR, cmd_profiles_list,    NULL },
+        { "ha.reload",             "Reload HA groups from JSON (Web DB authoritative)", CMD_L2_ADMIN, cmd_reload_noop, (void*)"ha" },
+        { "ivr.reload",            "Reload IVR menus from JSON (nodes JSON tree)",       CMD_L2_ADMIN, cmd_ivr_reload,     NULL },
+        { "route_groups.reload",   "Reload route groups from JSON (Web DB authoritative)", CMD_L2_ADMIN, cmd_reload_noop, (void*)"route_groups" },
     };
     for (size_t i = 0; i < sizeof(descs)/sizeof(descs[0]); ++i)
         cmd_register(reg, &descs[i]);

@@ -82,22 +82,22 @@ app.component('realtime', {
           <div class="p-5 space-y-4">
             <div>
               <label class="field-label">{{ t('Destination / call-url') }}</label>
-              <input v-model="origForm.call_url" class="field-input" :placeholder="t('$n')">
+              <input v-model="origForm.call_url" class="field-input" placeholder="e.g. sip:1001@nsbc.local">
             </div>
             <div class="grid grid-cols-2 gap-3">
               <div>
                 <label class="field-label">{{ t('Caller ID Override') }}</label>
-                <input v-model="origForm.caller_id" class="field-input" :placeholder="t('$n')">
+                <input v-model="origForm.caller_id" class="field-input" placeholder="e.g. 1001 or empty">
               </div>
               <div>
                 <label class="field-label">{{ t('CallerDisplay name') }}</label>
-                <input v-model="origForm.caller_name" class="field-input" :placeholder="t('$n')">
+                <input v-model="origForm.caller_name" class="field-input" placeholder="e.g. Alice or empty">
               </div>
             </div>
             <div>
               <label class="field-label">{{ t('Ringing timeout (s)') }}</label>
               <input v-model="origForm.timeout" type="number" min="1" max="3600"
-                     class="field-input" :placeholder="t('$n')">
+                     class="field-input" placeholder="30">
             </div>
             <div>
               <label class="field-label">{{ t('Application (optional)') }}</label>
@@ -273,13 +273,77 @@ function isoMs(s) {
 app.component('cdrs-live', {
   template: `
     <div>
-      <div class="flex items-center justify-between mb-4">
+      <!-- 标题栏 + Tab 切换（全部/正常/恶意） -->
+      <div class="flex items-center justify-between mb-3">
         <h2 class="text-lg font-semibold"><i class="fa-solid fa-file-lines"></i>{{ t(' Recent call records') }}</h2>
-        <div class="text-xs text-gray-500">{{ t('Total') }} {{ total }} · {{ t('refresh every 10s') }}</div>
+        <div class="flex items-center gap-4">
+          <!-- Tab 切换 -->
+          <div class="flex gap-1 bg-gray-100 rounded-lg p-1" role="tablist">
+            <button v-for="tab in tabs" :key="tab.key"
+              @click="activeTab = tab.key; currentPage = 1; load()"
+              :class="[
+                'px-3 py-1 text-xs rounded-md transition-colors',
+                activeTab === tab.key ? 'bg-white shadow text-blue-700 font-medium' : 'text-gray-500 hover:text-gray-700'
+              ]">
+              {{ tab.icon }} {{ tab.label }}
+            </button>
+          </div>
+          <!-- 总数 & 自动刷新 -->
+          <div class="text-xs text-gray-500">
+            {{ t('Total') }} {{ total }} · {{ t('refresh every 10s') }}
+          </div>
+        </div>
       </div>
+
+      <!-- 搜索面板 -->
+      <div class="flex flex-wrap gap-2 mb-3 p-3 bg-gray-50 rounded-lg text-xs">
+        <input v-model="q.caller" @keyup.enter="currentPage=1; load()"
+          :placeholder="t('Caller')" class="px-2 py-1 border rounded w-28">
+        <input v-model="q.callee" @keyup.enter="currentPage=1; load()"
+          :placeholder="t('Callee')" class="px-2 py-1 border rounded w-28">
+        <input v-model="q.call_id" @keyup.enter="currentPage=1; load()"
+          placeholder="Call-ID" class="px-2 py-1 border rounded w-40">
+        <input v-model="q.from_ip" @keyup.enter="currentPage=1; load()"
+          :placeholder="t('Source IP')" class="px-2 py-1 border rounded w-32">
+        <select v-model="q.disposition" @change="currentPage=1; load()" class="px-2 py-1 border rounded">
+          <option value="">{{ t('All disposition') }}</option>
+          <option value="answered">{{ t('Answered') }}</option>
+          <option value="failed">{{ t('Failed') }}</option>
+          <option value="busy">{{ t('Busy') }}</option>
+          <option value="noanswer">{{ t('No Answer') }}</option>
+        </select>
+        <span class="flex items-center gap-1">
+          <input type="number" v-model.number="q.duration_min" placeholder="min" class="px-2 py-1 border rounded w-16 text-center">
+          <span class="text-gray-400">s</span>
+          <span class="text-gray-300">-</span>
+          <input type="number" v-model.number="q.duration_max" placeholder="max" class="px-2 py-1 border rounded w-16 text-center">
+          <span class="text-gray-400">s</span>
+        </span>
+        <select v-model="sortBy" @change="currentPage=1; load()" class="px-2 py-1 border rounded">
+          <option value="start_time">{{ t('Sort by start time') }}</option>
+          <option value="duration">{{ t('Sort by duration') }}</option>
+          <option value="answer_time">{{ t('Sort by answer time') }}</option>
+          <option value="caller">{{ t('Sort by caller') }}</option>
+          <option value="callee">{{ t('Sort by callee') }}</option>
+        </select>
+        <select v-model="sortDir" @change="currentPage=1; load()" class="px-2 py-1 border rounded">
+          <option value="desc">{{ t('Descending') }}</option>
+          <option value="asc">{{ t('Ascending') }}</option>
+        </select>
+        <button @click="currentPage=1; load()" class="px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700">
+          <i class="fa-solid fa-magnifying-glass"></i> {{ t('Search') }}
+        </button>
+        <button @click="resetFilters" class="px-3 py-1 border rounded hover:bg-gray-100">
+          <i class="fa-solid fa-rotate-left"></i> {{ t('Reset') }}
+        </button>
+      </div>
+
+      <!-- 加载/错误/空状态 -->
       <div v-if="loading" class="text-gray-400">{{ t('Loading...') }}</div>
       <div v-else-if="error" class="text-red-500">⚠ {{ error }}</div>
       <div v-else-if="!rows.length" class="text-center text-gray-400 py-12">{{ t('No CDRs yet') }}</div>
+
+      <!-- 表格 -->
       <table v-else class="w-full text-sm border-collapse">
         <thead><tr class="bg-gray-50 border-b">
           <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Caller') }}</th>
@@ -292,16 +356,24 @@ app.component('cdrs-live', {
           <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Answer time') }}</th>
           <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Ringing time') }}</th>
           <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('End time') }}</th>
-          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('总Duration') }}</th>
+          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Total duration') }}</th>
           <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Billing duration') }}</th>
           <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Disposition') }}</th>
+          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Threat') }}</th>
           <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Recording') }}</th>
         </tr></thead>
         <tbody>
-          <tr v-for="(row, idx) in rows" :key="idx" class="border-b hover:bg-blue-50/50">
+          <tr v-for="(row, idx) in rows" :key="idx"
+              :class="[
+                'border-b hover:bg-blue-50/50',
+                row.is_malicious ? 'bg-red-50/40' : ''
+              ]">
             <td class="px-3 py-2 font-mono text-xs">{{ row.caller || '-' }}</td>
             <td class="px-3 py-2 font-mono text-xs">{{ row.callee || '-' }}</td>
-            <td class="px-3 py-2 font-mono text-xs text-blue-600">{{ getMeta(row, 'from_ip') || '-' }}</td>
+            <td class="px-3 py-2 font-mono text-xs"
+                :class="row.is_malicious ? 'text-red-600 font-semibold' : 'text-blue-600'">
+              {{ row.from_ip || getMeta(row, 'from_ip') || '-' }}
+            </td>
             <td class="px-3 py-2 font-mono text-xs">{{ getMeta(row, 'codec_a') || '-' }}</td>
             <td class="px-3 py-2 font-mono text-xs">{{ getMeta(row, 'codec_b') || '-' }}</td>
             <td class="px-3 py-2 font-mono text-[10px] text-gray-400 max-w-[120px] truncate" :title="row.call_id">{{ row.call_id || '-' }}</td>
@@ -318,10 +390,22 @@ app.component('cdrs-live', {
                 'text-red-600': ['busy','failed'].includes(row.cause_text),
               }">{{ row.cause_text || '-' }}</span>
             </td>
+            <!-- Threat 标记（REQ-SEC-005） -->
+            <td class="px-3 py-2 text-xs">
+              <template v-if="row.is_malicious">
+                <span class="inline-flex items-center gap-1 px-2 py-0.5 bg-red-100 text-red-700 rounded-full text-[10px] font-medium">
+                  <i class="fa-solid fa-triangle-exclamation"></i>
+                  {{ row.threat_reason || 'malicious' }}
+                </span>
+              </template>
+              <template v-else>
+                <span class="text-gray-300">-</span>
+              </template>
+            </td>
             <td class="px-3 py-2 text-xs">
               <template v-if="getRecUrl(row)">
                 <audio :src="getRecUrl(row)" controls preload="none" class="h-6 align-middle"></audio>
-                <a :href="getRecUrl(row)" download target="_blank" class="ml-2 text-blue-600 hover:underline" :title="t('$n')">
+                <a :href="getRecUrl(row)" download target="_blank" class="ml-2 text-blue-600 hover:underline">
                   <i class="fa-solid fa-download"></i>
                 </a>
               </template>
@@ -330,9 +414,9 @@ app.component('cdrs-live', {
           </tr>
         </tbody>
       </table>
-      <!-- Pagination控件 -->
+      <!-- Pagination -->
       <div v-if="total > pageSize" class="flex items-center justify-between mt-3 text-xs text-gray-500">
-        <div>Total {{ total }}  · 每 {{ pageSize }} </div>
+        <div>{{ t('Total') }} {{ total }} · {{ t('Page size') }} {{ pageSize }}</div>
         <div class="flex items-center gap-1">
           <button @click="goPage(1)" :disabled="currentPage===1" class="px-2 py-1 border rounded disabled:opacity-30">«</button>
           <button @click="goPage(currentPage-1)" :disabled="currentPage===1" class="px-2 py-1 border rounded disabled:opacity-30">‹</button>
@@ -350,11 +434,42 @@ app.component('cdrs-live', {
     const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize.value)));
     let timer;
 
+    // Tab 切换（REQ-SEC-005: malicious filter）
+    const tabs = [
+      { key: 'all',      label: '全部',   icon: '📋' },
+      { key: 'normal',   label: '正常',   icon: '✅' },
+      { key: 'malicious',label: '恶意',   icon: '⚠️' },
+    ];
+    const activeTab = ref('all');
+
+    // 搜索条件
+    const q = reactive({
+      caller: '',
+      callee: '',
+      call_id: '',
+      from_ip: '',
+      disposition: '',
+      duration_min: null,
+      duration_max: null,
+    });
+
+    // 排序
+    const sortBy = ref('start_time');
+    const sortDir = ref('desc');
+
+    function resetFilters() {
+      q.caller = ''; q.callee = ''; q.call_id = ''; q.from_ip = '';
+      q.disposition = ''; q.duration_min = null; q.duration_max = null;
+      activeTab.value = 'all';
+      sortBy.value = 'start_time'; sortDir.value = 'desc';
+      currentPage.value = 1;
+      load();
+    }
+
     function goPage(p) {
       currentPage.value = p;
       load();
     }
-    // 从 row.metadata JSON 里取扩展字段（from_ip / codec_a / codec_b 等）
     function getMeta(row, key) {
       if (!row.metadata) return null;
       try {
@@ -370,17 +485,13 @@ app.component('cdrs-live', {
         recPath = m.rec_path || null;
       } catch { return null; }
       if (!recPath) return null;
-      // rec_path 是 nsbcd 写入 recording.path 下的相对路径（如 20261011/xxx.wav）
-      // 后端公开文件路由是 /recordings/*path
       return '/recordings/' + recPath.replace(/^\/+/, '');
     }
-    // 接续Duration（响铃到应答）= answer_time - start_time
     function ringTime(startIso, answerIso) {
       if (!answerIso) return '-';
       const d = Math.round((isoMs(answerIso) - isoMs(startIso)) / 1000);
       return d >= 0 ? d + 's' : '-';
     }
-    // 计费Duration = 优先用后端 billsec，否则用 duration_sec - 接续Duration
     function formatBillsec(row) {
       if (row.billsec != null) return row.billsec + 's';
       if (row.duration_sec != null && row.answer_time) {
@@ -389,13 +500,32 @@ app.component('cdrs-live', {
       }
       return row.duration_sec != null ? row.duration_sec + 's' : '-';
     }
+
     async function load() {
       loading.value = true; error.value = null;
       try {
         const offset = (currentPage.value - 1) * pageSize.value;
-        const data = await API.get(`/cdrs?limit=${pageSize.value}&offset=${offset}`);
+        const params = new URLSearchParams();
+        params.set('limit', pageSize.value);
+        params.set('offset', offset);
+        // 搜索条件
+        if (q.caller) params.set('caller', q.caller);
+        if (q.callee) params.set('callee', q.callee);
+        if (q.call_id) params.set('call_id', q.call_id);
+        if (q.from_ip) params.set('from_ip', q.from_ip);
+        if (q.disposition) params.set('disposition', q.disposition);
+        if (q.duration_min != null && q.duration_min !== '') params.set('duration_min', q.duration_min);
+        if (q.duration_max != null && q.duration_max !== '') params.set('duration_max', q.duration_max);
+        // Tab 切换 → malicious= filter
+        if (activeTab.value === 'malicious') params.set('malicious', '1');
+        else if (activeTab.value === 'normal') params.set('malicious', '0');
+        // 排序
+        if (sortBy.value !== 'start_time') params.set('sort_by', sortBy.value);
+        if (sortDir.value !== 'desc') params.set('sort_dir', sortDir.value);
+
+        const data = await API.get(`/cdrs?${params.toString()}`);
         rows.value = data.items || [];
-        total.value = data.total || data.items?.length || 0;
+        total.value = data.total || 0;
       } catch (e) {
         if (isCoreOfflineError(e.message)) { console.warn('[live] core offline:', e.message); }
         else error.value = e.message;
@@ -404,7 +534,9 @@ app.component('cdrs-live', {
     }
     onMounted(() => { load(); timer = setInterval(load, 10000); });
     onMounted(() => clearInterval(timer));
-    return { rows, total, loading, error, currentPage, totalPages, goPage, getRecUrl, getMeta, ringTime, formatBillsec, fmtIso, isoMs };
+    return { rows, total, loading, error, currentPage, totalPages, goPage,
+             getRecUrl, getMeta, ringTime, formatBillsec, fmtIso, isoMs,
+             tabs, activeTab, q, sortBy, sortDir, resetFilters };
   },
 });
 
@@ -555,115 +687,47 @@ app.component('registrations-live', {
   },
 });
 
-// ===== 费率管理 =====
-app.component('rates-live', {
-  template: `
-    <div>
-      <div class="flex items-center justify-between mb-4">
-        <h2 class="text-lg font-semibold"><i class="fa-solid fa-coins"></i>{{ t(' Rate table') }}</h2>
-        <span class="text-xs text-gray-500">{{ t('Total') }} {{ total }} · {{ t('Micro-units (1e-6 CNY)') }}</span>
-      </div>
-      <div v-if="loading" class="text-gray-400">{{ t('Loading...') }}</div>
-      <div v-else-if="error" class="text-red-500">⚠ {{ error }}</div>
-      <div v-else-if="!rows.length" class="text-center text-gray-400 py-12">{{ t('No rates yet (add via C-side rate_upsert or Web CRUD)') }}</div>
-      <table v-else class="w-full text-sm border-collapse">
-        <thead><tr class="bg-gray-50 border-b">
-          <th class="px-3 py-2 text-left font-medium text-gray-600">前缀</th>
-          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Name') }}</th>
-          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Rate/min (µ)') }}</th>
-          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Connect fee (µ)') }}</th>
-          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Billing block (s)') }}</th>
-          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Min bill (s)') }}</th>
-          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Enable') }}</th>
-        </tr></thead>
-        <tbody>
-          <tr v-for="(row, idx) in rows" :key="idx" class="border-b hover:bg-blue-50/50">
-            <td class="px-3 py-2 font-mono font-semibold">{{ row.prefix }}</td>
-            <td class="px-3 py-2">{{ row.name || '-' }}</td>
-            <td class="px-3 py-2 font-mono">{{ row.price_per_min_uc }}</td>
-            <td class="px-3 py-2 font-mono">{{ row.connect_fee_uc }}</td>
-            <td class="px-3 py-2">{{ row.bill_inc_s }}</td>
-            <td class="px-3 py-2">{{ row.min_bill_s }}</td>
-            <td class="px-3 py-2">
-              <span v-if="row.enabled" class="text-green-600">✓</span>
-              <span v-else class="text-gray-400">✗</span>
-            </td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
-  `,
-  setup() {
-    const rows = ref([]), total = ref(0), loading = ref(false), error = ref(null);
-    async function load() {
-      loading.value = true; error.value = null;
-      try {
-        const data = await API.get('/rates');
-        rows.value = data.rates || [];
-        total.value = data.total || rows.value.length;
-      } catch (e) {
-        if (isCoreOfflineError(e.message)) { console.warn('[live] core offline:', e.message); }
-        else error.value = e.message;
-      }
-      loading.value = false;
-    }
-    onMounted(load);
-    return { rows, total, loading, error };
-  },
-});
+// ===== 费率管理（完整 CRUD） =====
+app.component('rates-live', crudTable(
+  { label: t('Rate Table'), icon: 'fa-solid fa-coins' },
+  '/rates',
+  [
+    { key: 'prefix', label: t('Prefix') },
+    { key: 'name', label: t('Name') },
+    { key: 'price_per_min_uc', label: t('Rate/min (µ)') },
+    { key: 'connect_fee_uc',   label: t('Connect fee (µ)') },
+    { key: 'bill_inc_s',      label: t('Billing block (s)') },
+    { key: 'min_bill_s',      label: t('Min bill (s)') },
+    { key: 'enabled',         label: t('Enable'), type: 'bool' },
+  ],
+  [
+    { key: 'prefix',          label: t('Prefix'),              type: 'text',   required: true, placeholder: 'e.g. 86, 8610, 44' },
+    { key: 'name',            label: t('Name'),                type: 'text',   default: '' },
+    { key: 'price_per_min_uc',label: t('Rate/min (µ)'),       type: 'number', default: 0, help: 'Micro-units per minute (1e-6 CNY)' },
+    { key: 'connect_fee_uc',  label: t('Connect fee (µ)'),     type: 'number', default: 0 },
+    { key: 'bill_inc_s',      label: t('Billing block (s)'),   type: 'number', default: 60, help: 'Per-call billing granularity' },
+    { key: 'min_bill_s',      label: t('Min bill (s)'),       type: 'number', default: 60, help: 'Minimum billing seconds per call' },
+    { key: 'enabled',         label: t('Enable'),              type: 'bool',   default: true },
+  ],
+));
 
-// ===== 账户余额 =====
-app.component('balances-live', {
-  template: `
-    <div>
-      <div class="flex items-center justify-between mb-4">
-        <h2 class="text-lg font-semibold"><i class="fa-solid fa-wallet"></i>{{ t(' Account balance') }}</h2>
-        <span class="text-xs text-gray-500">{{ t('Total') }} {{ total }} {{ t('accounts') }} · {{ t('Micro-units (1e-6 CNY)') }}</span>
-      </div>
-      <div v-if="loading" class="text-gray-400">{{ t('Loading...') }}</div>
-      <div v-else-if="error" class="text-red-500">⚠ {{ error }}</div>
-      <div v-else-if="!rows.length" class="text-center text-gray-400 py-12">{{ t('No accounts yet') }}</div>
-      <table v-else class="w-full text-sm border-collapse">
-        <thead><tr class="bg-gray-50 border-b">
-          <th class="px-3 py-2 text-left font-medium text-gray-600">账户</th>
-          <th class="px-3 py-2 text-right font-medium text-gray-600">{{ t('余额(Micro-units)') }}</th>
-          <th class="px-3 py-2 text-right font-medium text-gray-600">{{ t('Reserved (µ)') }}</th>
-          <th class="px-3 py-2 text-right font-medium text-gray-600">{{ t('Credit limit (µ)') }}</th>
-          <th class="px-3 py-2 text-right font-medium text-gray-600">{{ t('Available balance') }}</th>
-        </tr></thead>
-        <tbody>
-          <tr v-for="(row, idx) in rows" :key="idx" class="border-b hover:bg-blue-50/50">
-            <td class="px-3 py-2 font-mono font-semibold">{{ row.key }}</td>
-            <td class="px-3 py-2 font-mono text-right">{{ row.balance_uc }}</td>
-            <td class="px-3 py-2 font-mono text-right text-orange-600">{{ row.reserved_uc }}</td>
-            <td class="px-3 py-2 font-mono text-right">{{ row.credit_limit_uc }}</td>
-            <td class="px-3 py-2 font-mono text-right"
-                :class="(row.balance_uc - row.reserved_uc) < 0 ? 'text-red-600' : 'text-green-600'">
-              {{ row.balance_uc - row.reserved_uc + row.credit_limit_uc }}
-            </td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
-  `,
-  setup() {
-    const rows = ref([]), total = ref(0), loading = ref(false), error = ref(null);
-    async function load() {
-      loading.value = true; error.value = null;
-      try {
-        const data = await API.get('/balances');
-        rows.value = data.accounts || [];
-        total.value = data.total || rows.value.length;
-      } catch (e) {
-        if (isCoreOfflineError(e.message)) { console.warn('[live] core offline:', e.message); }
-        else error.value = e.message;
-      }
-      loading.value = false;
-    }
-    onMounted(load);
-    return { rows, total, loading, error };
-  },
-});
+// ===== 账户余额（完整 CRUD：open/close + edit credit_limit/description） =====
+app.component('balances-live', crudTable(
+  { label: t('Account Balance'), icon: 'fa-solid fa-wallet' },
+  '/balances',
+  [
+    { key: 'account_key',     label: t('Account Key') },
+    { key: 'balance_uc',      label: t('Balance (µ)') },
+    { key: 'credit_limit_uc', label: t('Credit limit (µ)') },
+    { key: 'description',     label: t('Description') },
+  ],
+  [
+    { key: 'account_key',     label: t('Account Key'),     type: 'text',   required: true, help: 'Unique account identifier (e.g. tenant-001)' },
+    { key: 'balance_uc',      label: t('Opening balance (µ)'), type: 'number', default: 0, help: 'Initial credit in micro-units (1e-6 CNY)' },
+    { key: 'credit_limit_uc', label: t('Credit limit (µ)'),   type: 'number', default: 0 },
+    { key: 'description',     label: t('Description'),       type: 'textarea' },
+  ],
+));
 
 // ===== MediaSession（bridge/transcode） =====
 app.component('transcode-live', {
@@ -728,3 +792,14 @@ app.component('transcode-live', {
     return { rows, total, loading, error };
   },
 });
+
+// ===== Codec Registry (read-only, core self-registered) =====
+app.component('codecs-live', livePanel(t('Codec Registry'), 'fa-solid fa-code', [
+  { key: 'name',         label: t('Codec Name') },
+  { key: 'pt',           label: t('PT') },
+  { key: 'sample_rate',  label: t('Sample Rate') },
+  { key: 'impl_module',  label: t('Impl Module') },
+  { key: 'fmtp_default', label: t('FMTP Default') },
+  { key: 'media_type',   label: t('Media Type') },
+], '/codecs', { refreshMs: 10000 }));
+

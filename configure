@@ -90,16 +90,31 @@ scan_file() {
     # ===== phase 1: scan named deps array definitions =====
     /\[\][[:space:]]*=/ && match($0, /[a-zA-Z_][a-zA-Z0-9_]*\[\][[:space:]]*=/) {
         line = $0
-        # extract variable name (strip const char * etc. prefixes)
+        # extract variable name (strip storage class + const char * etc. prefixes)
         sub(/^[[:space:]]*/, "", line)
         sub(/\[\].*/, "", line)
-        sub(/^(const[[:space:]]+)?char[[:space:]]*\*[[:space:]]*/, "", line)
+        sub(/^(static[[:space:]]+)?(const[[:space:]]+)?[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]*\*+[[:space:]]*/, "", line)
         cur_dvar = line
-        in_darr = 1
+        in_darr = 0
         darr_buf = ""
-        # find content after { on same line
         idx = index($0, "{")
         if (idx > 0) darr_buf = substr($0, idx + 1)
+        if (match(darr_buf, /\}/)) {
+            # single-line array: complete parse here, do NOT set in_darr
+            csv = ""
+            while (match(darr_buf, /"[^"]*"/)) {
+                s = substr(darr_buf, RSTART + 1, RLENGTH - 2)
+                if (s != "NULL" && s != "") {
+                    if (csv == "") csv = s; else csv = csv "," s
+                }
+                darr_buf = substr(darr_buf, RSTART + RLENGTH)
+            }
+            if (csv != "") deps_map[cur_dvar] = csv
+            cur_dvar = ""; darr_buf = ""
+        } else {
+            # multi-line array: need continuation scan
+            in_darr = 1
+        }
         next
     }
     in_darr && cur_dvar != "" {
@@ -162,10 +177,20 @@ scan_file() {
                            name, level_num, has_req, has_cp, deps_csv,
                            n, parts, lv, deps_arg, arr_text, inner,
                            is_cat, deps_idx) {
-        # check if NSBC_MOD_CAT / NSBC_MOD0_CAT — check before stripping macro header
-        is_cat = 0
-        if (index(full, "NSBC_MOD_CAT(") > 0 || index(full, "NSBC_MOD0_CAT(") > 0) {
-            is_cat = 1
+        # determine deps index based on exact macro family:
+        #   NSBC_MOD       (9 args) -> deps at [5]
+        #   NSBC_MOD0      (6 args) -> no deps
+        #   NSBC_MOD_CAT  (10 args) -> deps at [6]
+        #   NSBC_MOD0_CAT  (7 args) -> no deps
+        deps_idx = 0
+        if (index(full, "NSBC_MOD_CAT(") > 0) {
+            is_cat = 1; deps_idx = 6
+        } else if (index(full, "NSBC_MOD0_CAT(") > 0) {
+            is_cat = 1; deps_idx = 0
+        } else if (index(full, "NSBC_MOD(") > 0) {
+            is_cat = 0; deps_idx = 5
+        } else {
+            is_cat = 0; deps_idx = 0   # NSBC_MOD0 — no deps
         }
 
         # strip ); suffix + macro header
@@ -191,10 +216,9 @@ scan_file() {
         has_req = index(full, "MOD_F_REQUIRED") > 0 ? 1 : 0
         has_cp  = index(full, "MOD_F_CALL_PATH") > 0 ? 1 : 0
 
-        # deps —— NSBC_MOD(0) is parts[5], NSBC_MOD(0)_CAT has extra cat param in parts[5], deps shifts to parts[6]
+        # deps —— deps_idx already set above based on macro family
         deps_csv = ""
-        deps_idx = is_cat ? 6 : 5
-        if (n >= deps_idx) {
+        if (deps_idx > 0 && n >= deps_idx) {
             deps_arg = strip(parts[deps_idx])
             if (index(deps_arg, "{") > 0) {
                 # inline array: strip (const char *[]) prefix before {
@@ -246,12 +270,12 @@ scan_file() {
 }
 
 # =====================================================================
-# full scan src/**/*.c (exclude 3rd / tests / generated files)
-# =====================================================================
-
-# scan all source files — while read must be in current shell (not pipeline subshell) to call scan_file
+# full scan src/**/*.c (exclude 3rd / tests / generated files / arch-forbidden)
+# arch-forbidden: dbal_module.c — C core does NOT touch DB (REQ-ARCH-012);
+#                  all DB is owned by Web Sidecar via UDS. See Makefile L148-149.
 find src -name '*.c' -type f \
     ! -path 'src/core/stub_mods.c' \
+    ! -path 'src/db/dbal_module.c' \
     | sort > "$TMP/srcfiles.txt"
 
 : > "$MODS_DB"

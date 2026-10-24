@@ -28,6 +28,8 @@
 #include "hep_sink.h"
 #include "vad_engine.h"
 #include "nsbc_common.h"
+#include "obs_sub.h"       /* obs_sub_global + obs_sub_add — siptrace on 自动订阅当前连接 */
+#include "sip_transport.h"
 #include "uDS_client.h"
 #include <cjson/cJSON.h>
 #include <time.h>
@@ -1081,19 +1083,149 @@ static int cmd_status(cmd_ctx_t *c, int argc, char **argv, void *ud)
  * P0 占位：直接返回 ERR not-supported（实际 reloadjson 接口需 JSON 体）。
  * ==================================================================*/
 
+/* ==================================================================
+ * SIP trace on/off — 辅助函数
+ * on=1 时自动做三件事：
+ *   1) sip_tr_set_trace(1)                     — 打开 trace 开关
+ *   2) obs_sub_add 当前连接到 OBS_TOPIC_LOG    — CLI 实时推送
+ *   3) 如果 loglevel < DEBUG 自动升到 DEBUG     — 日志文件也能看到
+ * on=0 时只 sip_tr_set_trace(0)（订阅不自动退，避免误伤其他订阅者）
+ * ==================================================================*/
+static void siptrace_apply(cmd_ctx_t *c, int on, const char *cmd_name)
+{
+    sip_tr_set_trace(on);
+    if (on && c && c->io_ud) {
+        /* 自动让当前 UDS 连接收到 obs_sub_publish_log 推送 */
+        obs_sub_hub_t *hub = obs_sub_global();
+        if (hub) obs_sub_add(hub, c->io_ud, OBS_TOPIC_LOG);
+        /* 自动升 loglevel 到 DEBUG（siptrace 是 DEBUG 级） */
+        if (log_get_level() < LOG_DEBUG) {
+            log_level_t old = log_get_level();
+            log_set_level(LOG_DEBUG);
+            if (c->io_printf)
+                c->io_printf(c->io_ud,
+                             "(auto) loglevel %d(%s) → %d(DEBUG)\n",
+                             (int)old, old <= 7 ? "?" : "?",
+                             (int)LOG_DEBUG);
+        }
+    }
+    if (c && c->io_printf)
+        c->io_printf(c->io_ud,
+                     "OK %s siptrace %s\n", cmd_name, on ? "on" : "off");
+    log_audit("oam", cmd_name, "siptrace=%d", on);
+}
+
 static int cmd_sofia(cmd_ctx_t *c, int argc, char **argv, void *ud)
 {
     (void)ud;
     if (!c || !c->io_printf) return NSBC_INVAL;
-    /* argv[1]=profile / argv[2]=<name> / argv[3]=rescan */
+    /* sofia global siptrace on|off  — 全局 SIP 包 trace 开关 */
+    if (argc >= 4 && argv[1] && strcmp(argv[1], "global") == 0 &&
+        argv[2] && strcmp(argv[2], "siptrace") == 0) {
+        int on = (strcmp(argv[3], "on") == 0 || strcmp(argv[3], "1") == 0 ||
+                  strcasecmp(argv[3], "true") == 0);
+        siptrace_apply(c, on, "sofia global");
+        return NSBC_OK;
+    }
+    /* sofia siptrace on|off  — 简写 */
+    if (argc >= 3 && argv[1] && strcmp(argv[1], "siptrace") == 0) {
+        int on = (strcmp(argv[2], "on") == 0 || strcmp(argv[2], "1") == 0 ||
+                  strcasecmp(argv[2], "true") == 0);
+        siptrace_apply(c, on, "sofia");
+        return NSBC_OK;
+    }
+    /* sofia profile <name> rescan — 沿用 FreeSWITCH 别名，当前 Web DB 是权威 */
     if (argc < 4 || !argv[1] || strcmp(argv[1], "profile") != 0 ||
         !argv[2] || argv[2][0] == '\0' || !argv[3] || strcmp(argv[3], "rescan") != 0) {
-        c->io_printf(c->io_ud, "ERR usage: sofia profile <name> rescan\n");
+        c->io_printf(c->io_ud, "ERR usage: sofia profile <name> rescan | sofia [global] siptrace on|off\n");
         return NSBC_INVAL;
     }
     c->io_printf(c->io_ud, "ERR not-supported (use profiles.reload)\n");
     log_audit("oam", "sofia-profile-rescan", "name=%s result=not-supported", argv[2]);
     return NSBC_NOTSUP;
+}
+
+/* ==================================================================
+ * console loglevel <level> — 动态切换日志级别（类似 FreeSWITCH console loglevel）
+ *   level: 0=EMERG 1=ALERT 2=CRIT 3=ERR 4=WARN 5=NOTICE 6=INFO 7=DEBUG
+ *          或字符串 emerg/alert/crit/err/warn/notice/info/debug
+ *   例：console loglevel 7     — 打开 DEBUG
+ *       console loglevel info  — 切回 INFO
+ *       console loglevel       — 显示当前级别
+ *
+ * console siptrace on|off — 简写（等价 sofia siptrace on|off）
+ * ==================================================================*/
+static int cmd_console(cmd_ctx_t *c, int argc, char **argv, void *ud)
+{
+    (void)ud;
+    if (!c || !c->io_printf) return NSBC_INVAL;
+
+    if (argc < 2) {
+        /* 无参数 — 显示当前状态 */
+        log_level_t cur = log_get_level();
+        const char *names[] = {"EMERG","ALERT","CRIT","ERR","WARN","NOTICE","INFO","DEBUG"};
+        int on = sip_tr_get_trace();
+        c->io_printf(c->io_ud, "console loglevel=%d(%s) siptrace=%s\n",
+                     (int)cur, cur >= 0 && cur <= 7 ? names[cur] : "?",
+                     on ? "on" : "off");
+        return NSBC_OK;
+    }
+
+    /* console siptrace on|off */
+    if (strcmp(argv[1], "siptrace") == 0) {
+        if (argc < 3) {
+            c->io_printf(c->io_ud, "ERR usage: console siptrace on|off\n");
+            return NSBC_INVAL;
+        }
+        int on = (strcmp(argv[2], "on") == 0 || strcmp(argv[2], "1") == 0 ||
+                  strcasecmp(argv[2], "true") == 0);
+        siptrace_apply(c, on, "console");
+        return NSBC_OK;
+    }
+
+    /* console loglevel <level> */
+    if (strcmp(argv[1], "loglevel") == 0) {
+        /* 回显当前 */
+        if (argc < 3) {
+            log_level_t cur = log_get_level();
+            const char *names[] = {"EMERG","ALERT","CRIT","ERR","WARN","NOTICE","INFO","DEBUG"};
+            c->io_printf(c->io_ud, "console loglevel=%d(%s)\n",
+                         (int)cur, cur >= 0 && cur <= 7 ? names[cur] : "?");
+            return NSBC_OK;
+        }
+        int lvl = -1;
+        const char *s = argv[2];
+        /* 纯数字：0-7 */
+        if (*s >= '0' && *s <= '7' && s[1] == '\0') {
+            lvl = *s - '0';
+        } else if (strcasecmp(s, "emerg") == 0 || strcasecmp(s, "emergency") == 0) lvl = 0;
+        else if (strcasecmp(s, "alert") == 0) lvl = 1;
+        else if (strcasecmp(s, "crit") == 0 || strcasecmp(s, "critical") == 0) lvl = 2;
+        else if (strcasecmp(s, "err") == 0 || strcasecmp(s, "error") == 0) lvl = 3;
+        else if (strcasecmp(s, "warn") == 0 || strcasecmp(s, "warning") == 0) lvl = 4;
+        else if (strcasecmp(s, "notice") == 0) lvl = 5;
+        else if (strcasecmp(s, "info") == 0 || strcasecmp(s, "informational") == 0) lvl = 6;
+        else if (strcasecmp(s, "debug") == 0 || strcasecmp(s, "trace") == 0) lvl = 7;
+
+        if (lvl < 0 || lvl > 7) {
+            c->io_printf(c->io_ud,
+                         "ERR invalid level '%s' (0-7 or emerg/alert/crit/err/warn/notice/info/debug)\n", s);
+            return NSBC_INVAL;
+        }
+        log_level_t old = log_get_level();
+        log_set_level((log_level_t)lvl);
+        const char *names[] = {"EMERG","ALERT","CRIT","ERR","WARN","NOTICE","INFO","DEBUG"};
+        c->io_printf(c->io_ud,
+                     "OK console loglevel %d(%s) → %d(%s)\n",
+                     (int)old, old >= 0 && old <= 7 ? names[old] : "?",
+                     lvl, names[lvl]);
+        log_audit("oam", "console-loglevel", "old=%d new=%d", (int)old, lvl);
+        return NSBC_OK;
+    }
+
+    c->io_printf(c->io_ud, "ERR unknown console subcmd: %s (usage: console [loglevel|siptrace])\n",
+                 argv[1]);
+    return NSBC_INVAL;
 }
 
 /* ==================================================================
@@ -1553,8 +1685,10 @@ void call_commands_register(cmd_reg_t *reg, nsbc_ctx_t *ctx)
         /* 全局级（L2） */
         { "originate",     "发起外呼 call-url [&app]（L2，审计）",
           CMD_L2_ADMIN, cmd_originate, ctx },
-        { "sofia",         "sofia profile <name> rescan（L2，审计）",
+        { "sofia",         "sofia [global] siptrace on|off / profile <name> rescan（L2，审计）",
           CMD_L2_ADMIN, cmd_sofia, ctx },
+        { "console",       "console loglevel <0-7|name> / console siptrace on|off（L2，审计）",
+          CMD_L2_ADMIN, cmd_console, ctx },
 
         /* REQ-MEDIA-BUG-001：媒体 bug 命令族 */
         { "uuid_media_bug","附加/媒体 bug start|stop|list（L2，审计）",

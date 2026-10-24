@@ -78,20 +78,30 @@ static cmd_reg_t *g_cmd_reg;  /* CCMD 统一注册表 */
 static obs_sub_hub_t *g_sub_hub;  /* 订阅推送 hub（events/cdr/log/metrics） */
 
 /* obs_sub send 适配：conn = (ctl_conn_t*)，从 c->fd 非阻塞 send。
- * EAGAIN/EWOULDBLOCK 返回 0（订阅者暂时发不出，等下次 flush）；
- * 其他错误返回非 0（订阅者失效，flush 层 break 让 obs_sub_publish 继续
- * 往帧环写——客户端连上来后手动 sub 重订，不阻塞呼叫线程）。 */
+ * obs_sub flush_one_locked 约定：返回 0 = 全部发送成功，
+ * 返回非 0 = break（暂时发不出 / 部分发送 / 连接失效）。
+ * ★ EAGAIN 必须返回非 0（-1）让 flush break，帧留在环里等 EPOLLOUT 再试。
+ *   同时 reactor_mod 加上 EPOLLOUT，避免卡在环里没触发 flush 的机会。 */
 static int obs_control_sub_send(void *conn, const void *data, size_t len)
 {
     ctl_conn_t *c = (ctl_conn_t *)conn;
     if (c == NULL || c->fd < 0) return -1;
     ssize_t w = send(c->fd, data, len, MSG_NOSIGNAL | MSG_DONTWAIT);
     if (w < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
-            return 0;
+        /* EAGAIN/EWOULDBLOCK: kernel buffer 满了 → 帧留在环里 → 加 EPOLLOUT */
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (g_ctx && g_ctx->re)
+                reactor_mod(g_ctx->re, c->fd, EPOLLIN | EPOLLOUT);
+        }
         return -1;
     }
-    return (size_t)w < len ? 1 : 0;
+    if ((size_t)w < len) {
+        /* 部分发送：kernel buffer 即将满 → 也加 EPOLLOUT 保险 */
+        if (g_ctx && g_ctx->re)
+            reactor_mod(g_ctx->re, c->fd, EPOLLIN | EPOLLOUT);
+        return -1;
+    }
+    return 0;  /* 全部发送成功 */
 }
 
 static void ctl_write(ctl_conn_t *c, const char *p, size_t n)
@@ -1556,24 +1566,31 @@ static void on_conn_event(int fd, uint32_t ev, void *arg)
 {
     ctl_conn_t *c = (ctl_conn_t *)arg;
     if (ev & (EPOLLHUP | EPOLLERR)) {
-        llog(LOG_INFO, "oam",
-             "control client fd=%d event=%s", fd,
-             ev & EPOLLHUP ? "EPOLLHUP" : "EPOLLERR");
-        log_audit("oam", "control-disconnect",
-                  "fd=%d reason=%s", fd,
-                  ev & EPOLLHUP ? "hup" : "err");
         ctl_detach_sub(c);
         reactor_del(g_ctx->re, c->fd);
         close(c->fd);
         free(c);
         return;
     }
+
+    /* ★ EPOLLOUT：订阅帧 EAGAIN 后 kernel buffer 变空，flush 积压帧。
+     * flush 到环空 → 减 EPOLLOUT，避免 UDS 永久可写导致 reactor 空转。 */
+    if (ev & EPOLLOUT) {
+        if (g_sub_hub && c->sub_topics) {
+            obs_sub_flush(g_sub_hub, c);
+            if (obs_sub_ring_empty(g_sub_hub, c) && g_ctx && g_ctx->re)
+                reactor_mod(g_ctx->re, c->fd, EPOLLIN);
+        }
+    }
+
+    if (!(ev & EPOLLIN))
+        return;
+
     for (;;) {
         ssize_t n = recv(c->fd, c->buf + c->n, sizeof(c->buf) - c->n, 0);
         if (n <= 0) {
             if (n == 0) {
                 llog(LOG_NOTICE, "oam", "control client fd=%d closed (EOF)", c->fd);
-                log_audit("oam", "control-disconnect", "fd=%d reason=eof", c->fd);
                 ctl_detach_sub(c);
                 reactor_del(g_ctx->re, c->fd);
                 close(c->fd);
@@ -1593,7 +1610,7 @@ static void on_conn_event(int fd, uint32_t ev, void *arg)
             size_t llen = (size_t)(lf - c->buf) + 1;
             *lf = '\0';
             dispatch(c, c->buf);
-            if (c->fd < 0) { /* quit：就地释放——fd 是回调入参，free 后不再碰 c */
+            if (c->fd < 0) { /* quit：就地释放 */
                 ctl_detach_sub(c);
                 reactor_del(g_ctx->re, fd);
                 close(fd);
@@ -1620,6 +1637,9 @@ static void on_accept_event(int fd, uint32_t ev, void *arg)
             return;
         }
         c->fd = cfd;
+        /* ★ 只用 EPOLLIN——UDS 连接永久可写，EPOLLOUT 会让 reactor 空转。
+         * 需要监听可写时由 obs_control_sub_send 的 EAGAIN/partial 路径
+         * reactor_mod 动态加上，flush 到环空后由 EPOLLOUT 回调再减掉。 */
         if (reactor_add(g_ctx->re, cfd, EPOLLIN, on_conn_event, c) !=
             NSBC_OK) {
             close(cfd);

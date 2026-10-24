@@ -89,7 +89,7 @@ static int oam_start(struct nsbc_ctx *ctx)
     }
 #endif
 
-    obs_event("OAM_STARTED", "metrics, control, playback, uds client, and ESL interface up");
+    obs_event(5, "OAM_STARTED", "metrics, control, playback, uds client, and ESL interface up");
     return NSBC_OK;
 }
 

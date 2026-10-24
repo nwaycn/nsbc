@@ -11,18 +11,6 @@ static nsbc_rc_t find_rtpmap(const sdp_attr_t *attrs, int n, int want_pt,
                              sip_tok_t *enc, sip_tok_t *rate,
                              sip_tok_t *channels)
 {
-    /* ★ DIAG：遍历 attrs 时打印每个条目 —— 确认 name/val 里到底是什么 */
-    for (int i = 0; i < n; ++i) {
-        llog(LOG_INFO, "sdp",
-             "find_rtpmap[i=%d/%d] want_pt=%d name.len=%zu name.p=%.*s val.len=%zu val.p=%.*s",
-             i, n, want_pt,
-             attrs[i].name.len,
-             (int)attrs[i].name.len,
-             attrs[i].name.p ? attrs[i].name.p : "(null)",
-             attrs[i].val.len,
-             (int)attrs[i].val.len,
-             attrs[i].val.p ? attrs[i].val.p : "(null)");
-    }
     /* ★ P1 2026-10-16："rtpmap" 是 6 字符 (r-t-p-m-a-p)，原代码写成 7 导致所有
      * rtpmap 名称匹配失败 → build_codecs 里 find_rtpmap 恒返回 -1 → PT=110/126
      * 等无静态映射的 codec 被 SKIP。PT=8 靠 static_lookup 兜底才勉强能用。 */

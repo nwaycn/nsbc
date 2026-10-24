@@ -19,14 +19,19 @@ extern "C" {
 #define OBS_SUB_TOPIC_MAX  24
 #define OBS_TOPIC_MAX      16
 #define OBS_SUBSCRIBER_MAX 256
-#define OBS_SUB_RING       16
+/* ★ 256 槽而不是 16：CALL_INCOMING 被 INVITE 路径上瞬时爆发的 LOG 帧
+ * 挤掉（SDP 解析 + codec 匹配 + resolve + 100 Trying 轻松 >16 帧），
+ * 所有 topic 共享同一个 per-subscriber ring——LOG 洪水直接 EVICT head 处
+ * 的 CALL_INCOMING。提到 256 可容纳任何正常呼叫的瞬时帧爆发。 */
+#define OBS_SUB_RING       256
 #define OBS_FRAME_MAX      2048
 
 typedef enum {
     OBS_TOPIC_METRICS = 0,
     OBS_TOPIC_EVENTS,
     OBS_TOPIC_CDR,
-    OBS_TOPIC_LOG
+    OBS_TOPIC_LOG,
+    OBS_TOPIC_TRACE      /* SIP 原始包 trace（sofia siptrace）— 与 log 独立 */
 } obs_topic_t;
 
 typedef struct obs_sub_hub obs_sub_hub_t;
@@ -50,8 +55,12 @@ int  obs_sub_del(obs_sub_hub_t *h, const void *conn, obs_topic_t t);
 int  obs_sub_publish(obs_sub_hub_t *h, obs_topic_t t,
                      const char *fmt, ...);
 
-/* 连接可写时驱动输出（ reactor 回调）；返回剩余待发字节 */
+/* 连接可写时驱动输出（ reactor 回调）；返回 flush 的字节数 */
 size_t obs_sub_flush(obs_sub_hub_t *h, const void *conn);
+
+/* 订阅者的帧环是否为空？用于 EPOLLOUT 动态加减：EAGAIN 后加 EPOLLOUT，
+ * flush 到环空后减 EPOLLIN only，避免 UDS 永久可写导致 reactor 空转。 */
+int obs_sub_ring_empty(obs_sub_hub_t *h, const void *conn);
 
 /* OAM 只读：丢弃帧计数（慢消费者告警） */
 uint64_t obs_sub_drop_count(obs_sub_hub_t *h);
@@ -68,6 +77,7 @@ int obs_sub_publish_events(const char *fmt, ...);
 int obs_sub_publish_cdr(const char *fmt, ...);
 int obs_sub_publish_log(const char *fmt, ...);
 int obs_sub_publish_metrics(const char *fmt, ...);
+int obs_sub_publish_trace(const char *fmt, ...);
 
 #ifdef __cplusplus
 }

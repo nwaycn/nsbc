@@ -38,7 +38,9 @@ pub fn protected_router<C>() -> Router<Arc<AppState<C>>>
 where
     C: CoreApi + Clone + 'static,
 {
-    Router::new().route("/auth/logout", post(logout::<C>))
+    Router::new()
+        .route("/auth/logout", post(logout::<C>))
+        .route("/auth/change-password", post(change_password::<C>))
 }
 
 #[derive(Deserialize)]
@@ -62,6 +64,13 @@ struct RefreshReq {
 #[serde(deny_unknown_fields)]
 struct LogoutReq {
     refresh_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChangePasswordReq {
+    old_password: String,
+    new_password: String,
 }
 
 /// GET /api/v1/auth/captcha → {captcha_id, svg}
@@ -285,6 +294,79 @@ async fn logout<C: CoreApi + Clone + 'static>(
         json!({"refresh_revoked": revoked_refresh}),
     );
     Ok(Json(json!({ "status": "logged_out" })))
+}
+
+/// POST /api/v1/auth/change-password — authenticated user changes own password.
+/// Validates old password → argon2id-hashes new → UPDATE web_users.
+/// Does NOT revoke existing sessions (token still valid); user must logout/login.
+async fn change_password<C: CoreApi + Clone + 'static>(
+    State(st): State<Arc<AppState<C>>>,
+    Extension(peer): Extension<PeerCtx>,
+    Extension(Identity(access)): Extension<Identity>,
+    Json(req): Json<ChangePasswordReq>,
+) -> ApiResult<Json<Value>> {
+    // Basic policy checks (delegate to PasswordPolicy for actual complexity rules)
+    if req.old_password.is_empty() || req.new_password.is_empty() {
+        return Err(ApiError::BadRequest("old and new password required".into()));
+    }
+    if req.new_password.len() > 256 {
+        return Err(ApiError::BadRequest("new password too long".into()));
+    }
+    if req.old_password == req.new_password {
+        return Err(ApiError::BadRequest("new password must differ from old".into()));
+    }
+
+    // Password policy validation
+    if let Err(e) = st.auth.password.validate(&req.new_password) {
+        return Err(ApiError::BadRequest(format!("new password: {e}")));
+    }
+
+    // Fetch user from DB (authoritative source, same as login path)
+    let Some(u) = st.db.get_web_user(&access.sub).await else {
+        tracing::warn!(user = %access.sub, "change-password: user not in DB");
+        return Err(ApiError::BadCredentials);
+    };
+    if u.enabled != 1 {
+        return Err(ApiError::BadCredentials);
+    }
+
+    // Verify old password (fail-closed: uniform "bad credentials" on any failure)
+    use argon2::{Argon2, PasswordHash, PasswordVerifier};
+    let Ok(parsed) = PasswordHash::new(&u.password_phc) else {
+        tracing::warn!(user = %access.sub, "change-password: invalid stored PHC");
+        return Err(ApiError::ServiceUnavailable("account data corrupted".into()));
+    };
+    if Argon2::default()
+        .verify_password(req.old_password.as_bytes(), &parsed)
+        .is_err()
+    {
+        st.auth.audit.record(
+            "change_password_failed",
+            Some(&access.sub),
+            &peer,
+            json!({"reason": "bad_old_password"}),
+        );
+        return Err(ApiError::BadCredentials);
+    }
+
+    // Hash new password (argon2id, production params)
+    let new_phc = crate::auth::accounts::hash_password_argon2id(&req.new_password)
+        .map_err(|e| ApiError::ServiceUnavailable(format!("hash: {e}")))?;
+
+    // Persist
+    let ok = st.db.update_web_user_password(u.id, &new_phc).await;
+    if !ok {
+        return Err(ApiError::ServiceUnavailable("persist failed".into()));
+    }
+
+    tracing::info!(user = %access.sub, "password changed");
+    st.auth.audit.record(
+        "change_password",
+        Some(&access.sub),
+        &peer,
+        json!({}),
+    );
+    Ok(Json(json!({ "status": "password_changed" })))
 }
 
 fn token_pair(access_token: String, refresh_token: String, expires_in: u64) -> Value {

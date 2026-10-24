@@ -1,4 +1,4 @@
-﻿//! Web→core realtime control channel client (REQ-WEB-004 primary, REQ-WEB-013/014 auxiliary).
+//! Web→core realtime control channel client (REQ-WEB-004 primary, REQ-WEB-013/014 auxiliary).
 //!
 //! The sole real channel: the core's obs_control UNIX domain stream socket
 //! (cfg `oam.control_sock: unix:<path>`, file mode 0600, privileged local account only).
@@ -128,12 +128,12 @@ pub struct CodecInfo {
 
 /// Parse show codecs output:
 ///   codecs=N
-///   NAME        PT  SRATE  IMPL        FMTP                       MEDIA
-///   PCMA        8   8000   mod_codecs  -                          audio
-///   G729        18  8000   mod_codecs  annexb=yes                 audio
-///   G722        9   16000  mod_av      -                          audio
-///   Opus        111 48000  mod_av      maxplaybackrate=16000      audio
-///   H264        96  90000  mod_av      packetization-mode=0        video
+///   g711a PT=8 rate=8000 ch=1 ptime=20ms
+///   g729  PT=18 rate=8000 ch=1 ptime=20ms
+///   g722  PT=9 rate=16000 ch=1 ptime=20ms
+///   opus  PT=111 rate=48000 ch=2 ptime=20ms
+/// (obs_control.c cmd_show_codecs emits k=v tokens per codec line;
+///  legacy 6-column "NAME PT SRATE IMPL FMTP MEDIA" lines are also accepted)
 fn parse_show_codecs(buf: &str) -> Vec<CodecInfo> {
     let mut out = Vec::new();
     for line in buf.lines() {
@@ -148,12 +148,19 @@ fn parse_show_codecs(buf: &str) -> Vec<CodecInfo> {
         let low = trimmed.to_ascii_lowercase();
         if low.starts_with("name") || low.starts_with('(') { continue; }
 
-        // 5+ space-separated columns: NAME PT SRATE IMPL FMTP MEDIA_TYPE
-        // Use split_whitespace then recombine (FMTP can contain spaces like "annexb=yes")
         let parts: Vec<&str> = trimmed.split_whitespace().collect();
-        if parts.len() < 5 { continue; }
-
+        if parts.len() < 2 { continue; }
         let name = parts[0].to_string();
+
+        // Format 1 (current C output): NAME PT=8 rate=8000 ch=1 ptime=20ms
+        if let Some(info) = parse_codec_kv_line(&name, &parts[1..]) {
+            out.push(info);
+            continue;
+        }
+
+        // Format 2 (legacy columns): NAME PT SRATE IMPL FMTP MEDIA_TYPE
+        // (FMTP can contain spaces like "annexb=yes")
+        if parts.len() < 5 { continue; }
         let pt: u8 = match parts[1].parse() { Ok(v) => v, Err(_) => continue };
         let sample_rate: u32 = match parts[2].parse() { Ok(v) => v, Err(_) => continue };
         let impl_module = parts[3].to_string();
@@ -168,6 +175,33 @@ fn parse_show_codecs(buf: &str) -> Vec<CodecInfo> {
         out.push(CodecInfo { name, pt, sample_rate, impl_module, fmtp_default, media_type });
     }
     out
+}
+
+/// Parse k=v tokens of the C-side `show codecs` line, e.g. `PT=8 rate=8000 ch=1 ptime=20ms`.
+/// PT is required; rate defaults to 8000; ch/ptime are informational (not in CodecInfo).
+fn parse_codec_kv_line(name: &str, tokens: &[&str]) -> Option<CodecInfo> {
+    let mut pt: Option<u8> = None;
+    let mut sample_rate: u32 = 8000;
+    let mut has_kv = false;
+    for t in tokens {
+        if let Some(v) = t.strip_prefix("PT=") {
+            pt = v.parse().ok();
+            has_kv = true;
+        } else if let Some(v) = t.strip_prefix("rate=") {
+            if let Ok(r) = v.parse() { sample_rate = r; }
+            has_kv = true;
+        }
+    }
+    let pt = pt?;
+    if !has_kv { return None; }
+    Some(CodecInfo {
+        name: name.to_string(),
+        pt,
+        sample_rate,
+        impl_module: "core".to_string(),
+        fmtp_default: "-".to_string(),
+        media_type: "audio".to_string(),
+    })
 }
 
 /// Parse show apps output: header line apps=N, then each subsequent line "name  help"
@@ -406,6 +440,11 @@ pub struct CdrEvent {
     pub codec_a: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codec_b: Option<String>,
+    /* ---- REQ-SEC-005 threat marking (poller fallback path, aligns with UDS write_cdr) ---- */
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_malicious: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threat_reason: Option<String>,
 }
 
 /// `status` overall status snapshot (L1, REQ-CCMD-001, new command added by core cmd_registry).
@@ -609,6 +648,24 @@ pub trait CoreApi: Send + Sync {
 
     /// `security.blacklist.reload <json>` — full static security blacklist (IP CIDR/UA) table replace.
     fn reload_security_blacklist(
+        &self,
+        json: &str,
+    ) -> impl Future<Output = Result<(), CoreError>> + Send;
+
+    /// `ha.reload <json>` — reload HA groups (Core no-op, Web DB authoritative).
+    fn reload_ha_groups(
+        &self,
+        json: &str,
+    ) -> impl Future<Output = Result<(), CoreError>> + Send;
+
+    /// `ivr.reload <json>` — reload IVR menus (Core no-op, Web DB authoritative).
+    fn reload_ivr_menus(
+        &self,
+        json: &str,
+    ) -> impl Future<Output = Result<(), CoreError>> + Send;
+
+    /// `route_groups.reload <json>` — reload route groups (Core no-op, Web DB authoritative).
+    fn reload_route_groups(
         &self,
         json: &str,
     ) -> impl Future<Output = Result<(), CoreError>> + Send;
@@ -886,6 +943,19 @@ impl CoreApi for RealCore {
     }
     async fn reload_security_blacklist(&self, json: &str) -> Result<(), CoreError> {
         send_cmd(&self.sock_path, self.timeout, &format!("security.blacklist.reload {json}"))
+            .await.and_then(|b| check_rejected(&b))
+    }
+
+    async fn reload_ha_groups(&self, json: &str) -> Result<(), CoreError> {
+        send_cmd(&self.sock_path, self.timeout, &format!("ha.reload {json}"))
+            .await.and_then(|b| check_rejected(&b))
+    }
+    async fn reload_ivr_menus(&self, json: &str) -> Result<(), CoreError> {
+        send_cmd(&self.sock_path, self.timeout, &format!("ivr.reload {json}"))
+            .await.and_then(|b| check_rejected(&b))
+    }
+    async fn reload_route_groups(&self, json: &str) -> Result<(), CoreError> {
+        send_cmd(&self.sock_path, self.timeout, &format!("route_groups.reload {json}"))
             .await.and_then(|b| check_rejected(&b))
     }
 
@@ -1281,9 +1351,18 @@ fn parse_cdr_line(toks: &[&str]) -> Result<CdrEvent, CoreError> {
         duration_s: kvu32("duration_s"),
         cause: kvi64("cause").unwrap_or(0),
         emergency,
-        // codec/IP extension fields: single-line `cdr.recent` output does not include these, use Default for None
-        // Only populated by the full JSON push on UDS SESSION_END (write_cdr path)
-        ..Default::default()
+        /* codec/IP/threat extension fields: fmt_one (cdr.c) emits them since
+         * REQ-CDR-002 completion; "-" placeholder filtered out for absent values.
+         * Cores without these tokens simply yield None (backward compatible). */
+        from_ip: kv_opt(toks.iter().copied(), "from_ip").filter(|v| v != "-"),
+        a_peer_ip: kv_opt(toks.iter().copied(), "a_peer").filter(|v| v != "-"),
+        b_peer_ip: kv_opt(toks.iter().copied(), "b_peer").filter(|v| v != "-"),
+        codec_a: kv_opt(toks.iter().copied(), "codec_a").filter(|v| v != "-"),
+        codec_b: kv_opt(toks.iter().copied(), "codec_b").filter(|v| v != "-"),
+        is_malicious: kv_opt(toks.iter().copied(), "mal")
+            .map(|v| v == "1")
+            .unwrap_or(false),
+        threat_reason: kv_opt(toks.iter().copied(), "threat").filter(|v| v != "-"),
     })
 }
 
@@ -1882,7 +1961,7 @@ mod tests {
     fn registrations_ok_bad() {
         assert_eq!(
             parse_registrations("registrations=42\n").unwrap(),
-            RegistrationSummary { registrations: 42 }
+            RegistrationSummary { bindings: Vec::new(), registrations: 42, truncated: false }
         );
         assert!(parse_registrations("registrations=\n").is_err());
         assert!(parse_registrations("\n").is_err());
@@ -2386,6 +2465,31 @@ leg 0 sdp_offer 50\nabc\n";
             self.calls.lock().unwrap().push(format!("security.blacklist.reload {json}"));
             self.canned
                 .get("security.blacklist.reload")
+                .cloned()
+                .unwrap_or(Ok("OK\n".into()))
+                .and_then(|b| check_rejected(&b))
+        }
+
+        async fn reload_ha_groups(&self, json: &str) -> Result<(), CoreError> {
+            self.calls.lock().unwrap().push(format!("ha.reload {json}"));
+            self.canned
+                .get("ha.reload")
+                .cloned()
+                .unwrap_or(Ok("OK\n".into()))
+                .and_then(|b| check_rejected(&b))
+        }
+        async fn reload_ivr_menus(&self, json: &str) -> Result<(), CoreError> {
+            self.calls.lock().unwrap().push(format!("ivr.reload {json}"));
+            self.canned
+                .get("ivr.reload")
+                .cloned()
+                .unwrap_or(Ok("OK\n".into()))
+                .and_then(|b| check_rejected(&b))
+        }
+        async fn reload_route_groups(&self, json: &str) -> Result<(), CoreError> {
+            self.calls.lock().unwrap().push(format!("route_groups.reload {json}"));
+            self.canned
+                .get("route_groups.reload")
                 .cloned()
                 .unwrap_or(Ok("OK\n".into()))
                 .and_then(|b| check_rejected(&b))

@@ -11,11 +11,13 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 /* ---- mkdir_p 已移至 src/utils/utils.c（通用工具模块） ---- */
@@ -46,6 +48,14 @@ static pthread_t g_thr;
 static nsbc_atomic_t g_dropped;
 static nsbc_atomic_t g_written;
 static int g_write_errs;        /* 连续 write 错误计数；触发 reopen */
+static volatile sig_atomic_t g_reopen_pending;  /* SIGHUP 触发的 reopen 请求 (async-signal-safe) */
+
+/* ---- 自管理 size-based rotate（不依赖外部 logrotate） ----
+ * 每次 logger_main drain 完所有 ring 后检查文件大小，
+ * 超过阈值就把当前文件 → .1，.1 → .2，...，.keep-1 删掉，然后开新文件。 */
+static off_t g_cur_size;          /* 当前日志文件已累计写入字节数 */
+static off_t g_rotate_max = 50 * 1024LL * 1024LL;  /* 默认 50MB 触发 rotate */
+static int   g_rotate_keep = 5;   /* 保留 .1 ~ .4 + .5（共 5 份历史） */
 
 /* ---- per-thread ring（干净布局） ---- */
 typedef struct ring2 {
@@ -130,6 +140,74 @@ void log_thread_detach(void)
     free(r);
 }
 
+/* ---- size-based rotate（自实现，不依赖外部 logrotate） ----
+ * 调用点：logger_main drain 完所有 ring + fsync 之后。
+ * 此时 g_reg_lock 已释放、ring 空、fsync 完成，最安全。
+ *
+ * rotate 策略（g_rotate_keep = 5 时）：
+ *   nsbcd.log.4 → nsbcd.log.5   (最老的 .4 变成 .5，然后 .5 会被下次覆盖)
+ *   nsbcd.log.3 → nsbcd.log.4
+ *   nsbcd.log.2 → nsbcd.log.3
+ *   nsbcd.log.1 → nsbcd.log.2
+ *   nsbcd.log   → nsbcd.log.1
+ *   (新建)      → nsbcd.log     ← 新的当前文件
+ *
+ * 失败回退：如果 open 新文件失败，恢复旧 fd，重置 g_cur_size=0（避免无限重试）。
+ */
+static void do_rotate(void)
+{
+    if (!g_log_path[0]) return;  /* stderr 模式 */
+
+    /* 1. 关旧 fd（已经 fsync 过了） */
+    int old_fd = g_fd;
+    g_fd = -1;
+
+    /* 2. 重命名：.keep-1 删掉，.i → .i+1，当前 → .1 */
+    char src[PATH_MAX], dst[PATH_MAX];
+    /* 先删最老的那份（存在就删，不存在就忽略） */
+    snprintf(dst, sizeof(dst), "%s.%d", g_log_path, g_rotate_keep);
+    unlink(dst);  /* ENOENT 正常，不关心错误 */
+
+    /* 依次 .i → .i+1，从最老往前搬 */
+    for (int i = g_rotate_keep - 1; i >= 1; i--) {
+        snprintf(src, sizeof(src), "%s.%d", g_log_path, i);
+        snprintf(dst, sizeof(dst), "%s.%d", g_log_path, i + 1);
+        rename(src, dst);  /* ENOENT 正常（第一次 rotate 时还没历史） */
+    }
+    /* 当前文件 → .1 */
+    rename(g_log_path, dst);  /* dst 此时 = g_log_path + ".1" */
+
+    /* 3. 开新文件 */
+    int new_fd = open(g_log_path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0640);
+    if (new_fd < 0) {
+        /* 回退：恢复旧 fd，重置 size 计数器避免无限重试 */
+        g_fd = old_fd;
+        g_cur_size = 0;
+        fprintf(stderr,
+                "[log-rotate] open new FAIL errno=%d(%s) path=%s — keeping old fd\n",
+                errno, strerror(errno), g_log_path);
+        return;
+    }
+
+    /* 4. 成功：关旧 fd（如果之前有），重置计数器 */
+    if (old_fd >= 0)
+        close(old_fd);
+    g_fd = new_fd;
+    g_cur_size = 0;
+    g_write_errs = 0;
+
+    fprintf(stderr,
+            "[log-rotate] %s → %s.1 (limit %lld MB, keep %d) at %s\n",
+            g_log_path, g_log_path,
+            (long long)(g_rotate_max / (1024 * 1024)), g_rotate_keep,
+            __TIME__);
+}
+
+static void __attribute__((used)) sig_handler_hup(int sig) {
+    (void)sig;
+    g_reopen_pending = 1;  /* sig_atomic_t assignment — async-signal-safe */
+}
+
 static void wake_logger(void)
 {
     pthread_mutex_lock(&g_wake);
@@ -197,6 +275,7 @@ static void *logger_main(void *arg)
                         /* 跳过这条，继续下一条 */
                     } else {
                         g_write_errs = 0; /* 成功清零 */
+                        g_cur_size += w;  /* 累计已写入字节，供 size-rotate 用 */
                     }
                 } else {
                     fwrite(s->data, 1, s->len, stderr);
@@ -216,6 +295,37 @@ static void *logger_main(void *arg)
                     fprintf(stderr, "[log-flush] fsync FAIL fd=%d errno=%d(%s)\n",
                             g_fd, errno, strerror(errno));
                     last_fsync_warn = now;
+                }
+            }
+            /* ---- size-based rotate 检查 ----
+             * drain 完所有 ring + fsync 完成后才触发：此时 ring 空、磁盘已落、
+             * fd 状态安全。do_rotate 内部 self-close + rename + open，失败回退旧 fd。 */
+            if (g_cur_size >= g_rotate_max) {
+                do_rotate();
+            }
+        }
+        /* SIGHUP-triggered reopen (logrotate postrotate hook compatibility).
+         * Signal handler only sets g_reopen_pending (async-signal-safe).
+         * We do the actual open/close here in the logger thread context. */
+        if (g_reopen_pending) {
+            g_reopen_pending = 0;
+            if (g_log_path[0]) {
+                int nfd = open(g_log_path,
+                               O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC,
+                               0640);
+                if (nfd >= 0) {
+                    int old = g_fd;
+                    g_fd = nfd;
+                    if (old >= 0)
+                        close(old);
+                    g_write_errs = 0;
+                    fprintf(stderr,
+                            "[log-flush] SIGHUP reopen OK fd=%d → %d path=%s\n",
+                            old, nfd, g_log_path);
+                } else {
+                    fprintf(stderr,
+                            "[log-flush] SIGHUP reopen FAIL errno=%d(%s) path=%s\n",
+                            errno, strerror(errno), g_log_path);
                 }
             }
         }
@@ -259,6 +369,11 @@ int log_init(const char *path, log_level_t level, uint32_t ring_slots)
                     path, errno, strerror(errno));
             return NSBC_ERR;
         }
+        /* 初始化 size 计数器：从当前文件已有大小开始（重启后续写） */
+        struct stat st;
+        g_cur_size = (fstat(nfd, &st) == 0) ? st.st_size : 0;
+    } else {
+        g_cur_size = 0;
     }
     if (g_running) {
         /* 两阶段启动：第二次调用仅热切换输出 fd，不重复建日志线程 */
@@ -281,6 +396,14 @@ int log_init(const char *path, log_level_t level, uint32_t ring_slots)
      * 防止 early return 丢失关键日志。atexit 本身是幂等的（log_stop 检查
      * g_running），所以正常停机路径的显式 log_stop() 再调一次也安全。 */
     atexit(log_stop);
+    /* SIGHUP → reopen log file（logrotate postrotate 兼容）。
+     * handler 只设 volatile sig_atomic_t flag，实际 reopen 在 logger 线程里做，
+     * 因为 signal handler 上下文不能安全地用 pthread/heap 操作。 */
+    struct sigaction sa = { 0 };
+    sa.sa_handler = sig_handler_hup;
+    sa.sa_flags = SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGHUP, &sa, NULL);
     return NSBC_OK;
 }
 
@@ -300,6 +423,23 @@ int log_audit_open(const char *path)
 }
 
 void log_set_level(log_level_t level) { g_level = level; }
+log_level_t log_get_level(void) { return g_level; }
+
+/// Configure size-based log rotation.
+/// @param max_bytes  trigger size in bytes; 0 or negative → disable size-rotate
+///                   (SIGHUP reopen still works). Suggested: 50*1024*1024 (50MB) or larger.
+/// @param keep       number of historical copies to keep (1..9). Default 5.
+void log_set_rotate(long long max_bytes, int keep)
+{
+    if (max_bytes <= 0) {
+        g_rotate_max = -1;  /* 禁用 */
+        return;
+    }
+    g_rotate_max = (off_t)max_bytes;
+    if (keep < 1) keep = 1;
+    if (keep > 9) keep = 9;
+    g_rotate_keep = keep;
+}
 
 void log_stop(void)
 {
