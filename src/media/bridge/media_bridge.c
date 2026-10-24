@@ -414,7 +414,7 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
     static int diag_any_seen[4] = {0}; /* 2 side × (rtp + rtcp) */
     int slot = side * 2 + is_rtcp;
     if (diag_any_seen[slot] < 5) {
-        llog(LOG_INFO, "relay",
+        llog(LOG_NOTICE, "relay",
              "★RECV side=%d fd=%d is_rtcp=%d srtp_lane=%d rtp_port=%u",
              side, fd, is_rtcp, srtp_lane, (unsigned)r->rtp_port[side]);
         ++diag_any_seen[slot];
@@ -910,7 +910,7 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
                         int *ts = &r->node->transcode_seen_diag[side];
                         ++(*ts);  /* ★ 无条件先递增，避免 || 短路导致计数器永远停在 0 */
                         if (*ts <= 10 || *ts % 100 == 0) {
-                            llog(LOG_INFO, "relay",
+                            llog(LOG_DEBUG, "relay",
                                  "TRANSCODE side=%d pt_in=%u→%u "
                                  "bytes=%zu call=%p",
                                  side, (unsigned)old_pt, (unsigned)new_pt,
@@ -1061,7 +1061,7 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
                 ssrc = ntohl(ssrc);
             }
             if (diag_sendto_seen[side] < 5) {
-                llog(LOG_INFO, "relay",
+                llog(LOG_NOTICE, "relay",
                      "★ SENDTO side=%d→%d pt=%u ssrc=0x%08x dst=%s:%u send_len=%zu "
                      "latched[other]=%d have_peer[other]=%d srtp_protect=%d",
                      side, other, (unsigned)(buf[1] & 0x7F), ssrc,
@@ -1559,7 +1559,8 @@ static int plen_slim_fmt_list(char *mline, size_t mline_cap)
             size_t cur = strlen(keep);
             if (cur + strlen(tok) + 2 < sizeof(keep)) {
                 if (cur > 0) { keep[cur] = ' '; cur++; }
-                strcpy(keep + cur, tok);
+                strncpy(keep + cur, tok, sizeof(keep) - cur - 1);
+                keep[sizeof(keep) - 1] = '\0';
             }
         }
     }

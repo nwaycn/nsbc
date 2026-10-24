@@ -217,10 +217,13 @@ static void sip_pkt_flush(void)
     if (!first_nl) first_nl = g_sip_pkt + g_sip_pkt_len;
     size_t hdrlen = (size_t)(first_nl - g_sip_pkt);
     char dir_color[16];
-    if (strncmp(g_sip_pkt + 9, "TX->", 4) == 0)
-        strcpy(dir_color, g_use_color ? C_SIP_TX : "");
-    else
-        strcpy(dir_color, g_use_color ? C_SIP_RX : "");
+    if (strncmp(g_sip_pkt + 9, "TX->", 4) == 0) {
+        strncpy(dir_color, g_use_color ? C_SIP_TX : "", sizeof(dir_color) - 1);
+        dir_color[sizeof(dir_color) - 1] = '\0';
+    } else {
+        strncpy(dir_color, g_use_color ? C_SIP_RX : "", sizeof(dir_color) - 1);
+        dir_color[sizeof(dir_color) - 1] = '\0';
+    }
 
     /* 包头：彩色方向 + 灰色元数据 + Call-ID 标签 */
     if (g_use_color && dir_color[0]) {

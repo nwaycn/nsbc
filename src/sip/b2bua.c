@@ -5362,25 +5362,25 @@ void b2b_on_rx(void *ud, sip_tr_proto_t proto, const nsbc_sa_t *src,
 
     if (m.is_request) {
 
-        llog(LOG_INFO, "b2b", "-------- rx REQ %.*s uri=%.*s from %s",
+        llog(LOG_DEBUG, "b2b", "-------- rx REQ %.*s uri=%.*s from %s",
              (int)m.method_str.len, m.method_str.p,
              (int)m.ruri_raw.len, m.ruri_raw.p, src_ip);
         /* ★ 完整 SIP request dump（REGISTER/SUBSCRIBE 等也需要看完整消息体） */
         if (m.buf && m.buflen > 0) {
             size_t show = m.buflen > 1024 ? 1024 : m.buflen;
-            llog(LOG_INFO, "b2b", "★REQ_DUMP %s total=%zu show=%zu",
+            llog(LOG_DEBUG, "b2b", "★REQ_DUMP %s total=%zu show=%zu",
                  m.method_str.p ? m.method_str.p : "?", m.buflen, show);
-            llog(LOG_INFO, "b2b", "★REQ[0..%zu]: %.*s",
+            llog(LOG_DEBUG, "b2b", "★REQ[0..%zu]: %.*s",
                  show, (int)show, m.buf);
         }
     } else {
-        llog(LOG_INFO, "b2b", "----- rx RESP %d %.*s from %s",
+        llog(LOG_DEBUG, "b2b", "----- rx RESP %d %.*s from %s",
              m.status, (int)m.reason.len, m.reason.p, src_ip);
         if (m.buf && m.buflen > 0) {
             size_t show = m.buflen > 1024 ? 1024 : m.buflen;
-            llog(LOG_INFO, "b2b", "★RESP_DUMP %d %s total=%zu show=%zu",
+            llog(LOG_DEBUG, "b2b", "★RESP_DUMP %d %s total=%zu show=%zu",
                  m.status, m.reason.p ? m.reason.p : "?", m.buflen, show);
-            llog(LOG_INFO, "b2b", "★RESP[0..%zu]: %.*s",
+            llog(LOG_DEBUG, "b2b", "★RESP[0..%zu]: %.*s",
                  show, (int)show, m.buf);
         }
     }
@@ -5428,7 +5428,7 @@ void b2b_on_rx(void *ud, sip_tr_proto_t proto, const nsbc_sa_t *src,
         llog(LOG_DEBUG, "b2b", "txn_input msg.buf=%p msg.buflen=%zu txn_mgr=%p src_af=%d",
              m.buf, m.buflen, (void *)co->cfg.txn, src->ss.ss_family);
         int rc = txn_server_input(co->cfg.txn, &m, src, reliable, now_ms());
-        llog(LOG_INFO, "b2b", "txn_srv_input method=%d rc=%d", m.method, rc);
+        llog(LOG_DEBUG, "b2b", "txn_srv_input method=%d rc=%d", m.method, rc);
         if (rc == TXN_STATELESS) {
             /* RFC2543 无 cookie / 2xx ACK（新 branch 不匹配 IST） */
             if (m.method == SIP_M_ACK) {
@@ -7145,7 +7145,11 @@ static void sess_timer_refresh_cb(uint64_t cb_now, void *arg)
             }
         } else {
             /* B 腿 refresher → send_invite_b 朝 Bob 发 re-INVITE */
-            (void)send_invite_b(c, 1, other->offer, other->offer_len, 1, NULL);
+            sip_txn_t *t = send_invite_b(c, 1, other->offer, other->offer_len, 1, NULL);
+            if (!t) {
+                llog(LOG_WARN, "b2bua", "re-INVITE Bob failed call=%p",
+                     (void *)c);
+            }
         }
     }
 

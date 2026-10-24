@@ -1411,7 +1411,7 @@ pub fn parse_status(body: &str) -> Result<StatusInfo, CoreError> {
         let line = line.trim();
         if line.is_empty() { continue; }
         if line.starts_with("ERR") {
-            return Err(CoreError::CoreRejected(line.strip_prefix("ERR").unwrap().trim().to_string()));
+            return Err(CoreError::CoreRejected(line.strip_prefix("ERR").unwrap_or(line).trim().to_string()));
         }
         if let Some(rest) = line.strip_prefix("alive=") {
             saw_alive = rest.starts_with('1');
@@ -1708,13 +1708,12 @@ pub fn parse_call_detail(body: &str) -> Result<CallDetail, CoreError> {
                         .find_map(|t| t.strip_prefix("routes="))
                         .and_then(|v| v.parse::<u32>().ok())
                         .unwrap_or(0);
-                    legs.entry(n).or_insert_with(|| LegDump {
+                    let leg = legs.entry(n).or_insert_with(|| LegDump {
                         leg: n, state: String::new(), proto: String::new(),
                         reliable: false, cseq: 0, routes: 0,
                         local_tag: None, remote_tag: None,
                         offer: None, answer: None, media: LegMedia::default(),
                     });
-                    let leg = legs.get_mut(&n).unwrap();
                     leg.state = state;
                     leg.proto = get("proto").unwrap_or_else(|| "?".into());
                     leg.reliable = reliable;

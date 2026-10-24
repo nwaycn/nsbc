@@ -34,6 +34,7 @@ use std::io::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use axum::{middleware as axmw, Router};
 use axum::http::{HeaderName, HeaderValue};
@@ -346,7 +347,9 @@ fn resolve_db_dsn(cfg: &config::DbSection) -> String {
     // 4. SQLite default (TTY not available OR user picked 1 OR just hit Enter)
     let db_path = std::path::PathBuf::from("data/web.db");
     if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent).ok();
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("warning: create_dir_all {}: {e}", parent.display());
+        }
     }
     let dsn = format!("sqlite:{}", db_path.display());
     tracing::info!("🔧 db: SQLite default → {:?}", dsn);
@@ -654,6 +657,8 @@ async fn handle_tls_stream(
         app.clone().into_service()
     );
     let _ = hyper::server::conn::http1::Builder::new()
+        .keep_alive(true)
+        .header_read_timeout(Duration::from_secs(10))
         .serve_connection(io, svc)
         .await;
 }

@@ -14,10 +14,29 @@
 
 #include <pthread.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 #include <ctype.h>
 
 #include <cjson/cJSON.h>
+
+/* stub_mods.c: out_err 路径 snprintf 截断保护
+ * snprintf 返回值 >= sizeof(dst) 时表示输出被截断，
+ * 这里统一追加 "..." 确保错误消息不被静默截断，影响运维诊断 */
+static inline void _snprintf_err(char *dst, size_t dst_sz, const char *fmt, ...) {
+    if (!dst || dst_sz == 0) return;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(dst, dst_sz, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= dst_sz) {
+        /* 截断或编码错误 → 末尾写 "..." 提示 */
+        size_t keep = dst_sz >= 4 ? dst_sz - 4 : 0;
+        if (keep > 0) snprintf(dst + keep, dst_sz - keep, "...");
+        llog(LOG_WARN, "cfg", "stub_mods: err_msg truncated — original dst=%zu fmt=%.32s",
+             dst_sz, fmt);
+    }
+}
 
 /* dialplan（dialplan.c）、route_table（route_table.c）、endpoints（endpoints.c）
  * 均已入编真实实现（见 Makefile / builtin.c）。 */
@@ -27,7 +46,8 @@ extern dp_ctx_t *sig_dp_ctx(void);
 
 /* —— recording 存根（recording.h + recorder.h 正确签名） ——
  * §17：src/mod/recording/recording.c + src/media/rec/recorder.c 已纳入编译（见 Makefile），
- * 本块存根不再需要，用 #if 0 禁用避免 duplicate symbol 链接错误 */
+ * 本块存根不再需要，用 #if 0 禁用避免 duplicate symbol 链接错误
+ * 保留原因：API 签名参考（未来 recording 模块重构时对照）；稳定后可删除 */
 #if 0
 int recording_apply_dp_action(rec_mgr_t *mgr, uint8_t rec_action,
                               const char *callid, const char *reason,
@@ -106,7 +126,7 @@ static int trunk_json_parse_one(cJSON *obj, trunk_t *tr,
 
     j = cJSON_GetObjectItem(obj, "name");
     if (!j || !cJSON_IsString(j) || !j->valuestring[0]) {
-        snprintf(out_err, err_sz, "trunk[%d] missing name", idx);
+        _snprintf_err(out_err, err_sz, "trunk[%d] missing name", idx);
         return NSBC_ERR;
     }
     snprintf(tr->name, sizeof(tr->name), "%s", j->valuestring);
@@ -131,7 +151,7 @@ static int trunk_json_parse_one(cJSON *obj, trunk_t *tr,
 
     j = cJSON_GetObjectItem(obj, "host");
     if (!j || !cJSON_IsString(j) || !j->valuestring[0]) {
-        snprintf(out_err, err_sz, "trunk[%d]=%s missing host", idx, tr->name);
+        _snprintf_err(out_err, err_sz, "trunk[%d]=%s missing host", idx, tr->name);
         return NSBC_ERR;
     }
     snprintf(tr->host, sizeof(tr->host), "%s", j->valuestring);
@@ -289,26 +309,26 @@ static int group_json_parse_one(cJSON *obj, trunk_group_t *g,
 
     j = cJSON_GetObjectItem(obj, "name");
     if (!j || !cJSON_IsString(j) || !j->valuestring[0]) {
-        snprintf(out_err, err_sz, "group[%d] missing name", idx);
+        _snprintf_err(out_err, err_sz, "group[%d] missing name", idx);
         return NSBC_ERR;
     }
     snprintf(g->name, sizeof(g->name), "%s", j->valuestring);
 
     j = cJSON_GetObjectItem(obj, "members");
     if (!j || !cJSON_IsArray(j)) {
-        snprintf(out_err, err_sz, "group[%d]=%s missing members array", idx, g->name);
+        _snprintf_err(out_err, err_sz, "group[%d]=%s missing members array", idx, g->name);
         return NSBC_ERR;
     }
     int nm = cJSON_GetArraySize(j);
     if (nm <= 0 || nm > RT_GROUP_MAX) {
-        snprintf(out_err, err_sz, "group[%d]=%s members=%d (1..%d)",
+        _snprintf_err(out_err, err_sz, "group[%d]=%s members=%d (1..%d)",
                  idx, g->name, nm, RT_GROUP_MAX);
         return NSBC_ERR;
     }
     for (int i = 0; i < nm; ++i) {
         cJSON *mj = cJSON_GetArrayItem(j, i);
         if (!mj || !cJSON_IsString(mj) || !mj->valuestring[0]) {
-            snprintf(out_err, err_sz, "group[%d]=%s members[%d] invalid", idx, g->name, i);
+            _snprintf_err(out_err, err_sz, "group[%d]=%s members[%d] invalid", idx, g->name, i);
             return NSBC_ERR;
         }
         snprintf(g->members[i], sizeof(g->members[i]), "%s", mj->valuestring);
@@ -324,18 +344,18 @@ static int group_json_parse_one(cJSON *obj, trunk_group_t *g,
 int trunk_table_reload_json(const char *json, char *out_err, size_t err_sz)
 {
     if (!json || !*json) {
-        if (out_err) snprintf(out_err, err_sz, "empty json");
+        if (out_err) _snprintf_err(out_err, err_sz, "empty json");
         return NSBC_INVAL;
     }
     nsbc_ctx_t *ctx = nsbc_get_ctx();
     if (!ctx || !ctx->rt) {
-        if (out_err) snprintf(out_err, err_sz, "route_table not ready");
+        if (out_err) _snprintf_err(out_err, err_sz, "route_table not ready");
         return NSBC_ERR;
     }
 
     cJSON *root = cJSON_Parse(json);
     if (!root) {
-        if (out_err) snprintf(out_err, err_sz, "invalid json: parse failed");
+        if (out_err) _snprintf_err(out_err, err_sz, "invalid json: parse failed");
         return NSBC_INVAL;
     }
 
@@ -352,13 +372,13 @@ int trunk_table_reload_json(const char *json, char *out_err, size_t err_sz)
         trunks_arr = cJSON_GetObjectItem(root, "trunks");
         groups_arr = cJSON_GetObjectItem(root, "groups");
         if (!trunks_arr && !groups_arr) {
-            if (out_err) snprintf(out_err, err_sz,
+            if (out_err) _snprintf_err(out_err, err_sz,
                                   "invalid json: object needs 'trunks' or 'groups'");
             cJSON_Delete(root);
             return NSBC_INVAL;
         }
     } else {
-        if (out_err) snprintf(out_err, err_sz,
+        if (out_err) _snprintf_err(out_err, err_sz,
                               "invalid json: expected array or object");
         cJSON_Delete(root);
         return NSBC_INVAL;
@@ -368,7 +388,7 @@ int trunk_table_reload_json(const char *json, char *out_err, size_t err_sz)
     route_table_t *nrt = NULL;
     if (rt_create(&nrt) != NSBC_OK) {
         cJSON_Delete(root);
-        if (out_err) snprintf(out_err, err_sz, "rt_create OOM");
+        if (out_err) _snprintf_err(out_err, err_sz, "rt_create OOM");
         return NSBC_NOMEM;
     }
 
@@ -386,7 +406,7 @@ int trunk_table_reload_json(const char *json, char *out_err, size_t err_sz)
         for (int i = 0; i < n; ++i) {
             cJSON *obj = cJSON_GetArrayItem(trunks_arr, i);
             if (!obj || !cJSON_IsObject(obj)) {
-                if (out_err) snprintf(out_err, err_sz, "trunk[%d] not object", i);
+                if (out_err) _snprintf_err(out_err, err_sz, "trunk[%d] not object", i);
                 goto rollback;
             }
             trunk_t tr;
@@ -395,7 +415,7 @@ int trunk_table_reload_json(const char *json, char *out_err, size_t err_sz)
             if (!tr.enabled)
                 continue; /* 停用中继不入表 */
             if (rt_trunk_add(nrt, &tr) != NSBC_OK) {
-                if (out_err) snprintf(out_err, err_sz,
+                if (out_err) _snprintf_err(out_err, err_sz,
                                      "trunk[%d]=%s add failed", i, tr.name);
                 goto rollback;
             }
@@ -416,14 +436,14 @@ int trunk_table_reload_json(const char *json, char *out_err, size_t err_sz)
         for (int i = 0; i < ng; ++i) {
             cJSON *obj = cJSON_GetArrayItem(groups_arr, i);
             if (!obj || !cJSON_IsObject(obj)) {
-                if (out_err) snprintf(out_err, err_sz, "group[%d] not object", i);
+                if (out_err) _snprintf_err(out_err, err_sz, "group[%d] not object", i);
                 goto rollback;
             }
             trunk_group_t g;
             if (group_json_parse_one(obj, &g, out_err, err_sz, i) != NSBC_OK)
                 goto rollback;
             if (rt_group_add(nrt, &g) != NSBC_OK) {
-                if (out_err) snprintf(out_err, err_sz,
+                if (out_err) _snprintf_err(out_err, err_sz,
                                      "group[%d]=%s add failed", i, g.name);
                 goto rollback;
             }
@@ -540,14 +560,14 @@ static int dp_json_parse_one(cJSON *obj, dp_rule_t *r, uint32_t rid,
         else if (strcmp(j->valuestring, "out") == 0)
             r->layer = DP_LAYER_OUT;
         else {
-            snprintf(out_err, err_sz, "rule[%d] bad layer '%s'",
+            _snprintf_err(out_err, err_sz, "rule[%d] bad layer '%s'",
                      idx, j->valuestring);
             return NSBC_ERR;
         }
     } else if (j && cJSON_IsNumber(j)) {
         r->layer = (dp_layer_t)j->valueint;
         if (r->layer >= DP_LAYER_CNT) {
-            snprintf(out_err, err_sz, "rule[%d] bad layer %d", idx,
+            _snprintf_err(out_err, err_sz, "rule[%d] bad layer %d", idx,
                      j->valueint);
             return NSBC_ERR;
         }
@@ -555,11 +575,11 @@ static int dp_json_parse_one(cJSON *obj, dp_rule_t *r, uint32_t rid,
 
     j = cJSON_GetObjectItem(obj, "match_expr");
     if (!j || !cJSON_IsString(j) || !j->valuestring[0]) {
-        snprintf(out_err, err_sz, "rule[%d] missing match_expr", idx);
+        _snprintf_err(out_err, err_sz, "rule[%d] missing match_expr", idx);
         return NSBC_ERR;
     }
     if (dp_parse_match(j->valuestring, r) != NSBC_OK) {
-        snprintf(out_err, err_sz, "rule[%d] bad match_expr '%s'",
+        _snprintf_err(out_err, err_sz, "rule[%d] bad match_expr '%s'",
                  idx, j->valuestring);
         return NSBC_ERR;
     }
@@ -769,18 +789,18 @@ static int dp_json_parse_one(cJSON *obj, dp_rule_t *r, uint32_t rid,
 int dp_rules_reload_json(const char *json, char *out_err, size_t err_sz)
 {
     if (!json || !*json) {
-        if (out_err) snprintf(out_err, err_sz, "empty json");
+        if (out_err) _snprintf_err(out_err, err_sz, "empty json");
         return NSBC_INVAL;
     }
     dp_ctx_t *dpc = sig_dp_ctx();
     if (!dpc) {
-        if (out_err) snprintf(out_err, err_sz, "dp ctx not ready");
+        if (out_err) _snprintf_err(out_err, err_sz, "dp ctx not ready");
         return NSBC_ERR;
     }
 
     cJSON *root = cJSON_Parse(json);
     if (!root || !cJSON_IsArray(root)) {
-        if (out_err) snprintf(out_err, err_sz, "invalid json: expected array");
+        if (out_err) _snprintf_err(out_err, err_sz, "invalid json: expected array");
         if (root) cJSON_Delete(root);
         return NSBC_INVAL;
     }
@@ -790,7 +810,7 @@ int dp_rules_reload_json(const char *json, char *out_err, size_t err_sz)
     if (!tbl || dp_table_init(tbl, (size_t)(n > 0 ? n : 1)) != NSBC_OK) {
         free(tbl);
         cJSON_Delete(root);
-        if (out_err) snprintf(out_err, err_sz, "dp table OOM");
+        if (out_err) _snprintf_err(out_err, err_sz, "dp table OOM");
         return NSBC_NOMEM;
     }
 
@@ -799,7 +819,7 @@ int dp_rules_reload_json(const char *json, char *out_err, size_t err_sz)
     for (int i = 0; i < n; ++i) {
         cJSON *obj = cJSON_GetArrayItem(root, i);
         if (!obj || !cJSON_IsObject(obj)) {
-            if (out_err) snprintf(out_err, err_sz, "rule[%d] not object", i);
+            if (out_err) _snprintf_err(out_err, err_sz, "rule[%d] not object", i);
             goto rollback;
         }
         cJSON *jid = cJSON_GetObjectItem(obj, "id");
@@ -821,7 +841,7 @@ int dp_rules_reload_json(const char *json, char *out_err, size_t err_sz)
         /* dp_rule_add 对 PM_REGEX 表内重编译；调用侧副本统一在此释放 */
         pm_fini(&rule.match);
         if (arc != NSBC_OK) {
-            if (out_err) snprintf(out_err, err_sz,
+            if (out_err) _snprintf_err(out_err, err_sz,
                                  "rule[%d] id=%u add failed", i, rule.id);
             goto rollback;
         }
@@ -836,7 +856,7 @@ int dp_rules_reload_json(const char *json, char *out_err, size_t err_sz)
     if (dp_ctx_publish(dpc, tbl, &prev) != NSBC_OK) {
         pthread_mutex_unlock(&g_reload_lock);
         dp_table_free(tbl);
-        if (out_err) snprintf(out_err, err_sz, "dp_ctx_publish failed");
+        if (out_err) _snprintf_err(out_err, err_sz, "dp_ctx_publish failed");
         return NSBC_ERR;
     }
     dp_table_t *dead = g_dp_old[g_dp_old_idx];

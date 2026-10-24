@@ -54,7 +54,9 @@ pub fn start<C: crate::coreclient::CoreApi + Clone + Send + Sync + 'static>(
 ) -> std::io::Result<tokio::task::JoinHandle<()>> {
     if let Some(parent) = sock_path.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).ok();
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                eprintln!("warning: create_dir_all {}: {e}", parent.display());
+            }
         }
     }
     if sock_path.exists() { let _ = std::fs::remove_file(&sock_path); }

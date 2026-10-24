@@ -182,10 +182,18 @@ static void *ha_main(void *arg)
                              (int)__atomic_load_n(&h->role,
                                                   __ATOMIC_RELAXED),
                              h->my_prio, h->node_id);
-            if (h->have_peer)
-                (void)sendto(h->fd, pkt, (size_t)n, MSG_NOSIGNAL,
-                             (struct sockaddr *)&h->peer.ss, h->peer.len);
-            last_send = now;
+            if (h->have_peer) {
+                ssize_t sent = sendto(h->fd, pkt, (size_t)n, MSG_NOSIGNAL,
+                                      (struct sockaddr *)&h->peer.ss, h->peer.len);
+                if (sent < 0) {
+                    llog(LOG_WARN, "ha", "heartbeat sendto failed errno=%d peer=%s",
+                         errno, h->node_id);
+                } else {
+                    last_send = now;
+                }
+            } else {
+                last_send = now;
+            }
         }
         struct timeval tv = {h->hb_ms / 1000,
                              (int)(h->hb_ms % 1000) * 1000};

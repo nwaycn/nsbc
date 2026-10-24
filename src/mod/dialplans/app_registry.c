@@ -638,7 +638,7 @@ static app_rc_t app_set(app_ctx_t *c, const char *data, void *ud)
         /* 纯 "var_name" → set 空串 */
         if (d[0] == '\0') return APP_RC_FAILED;
         key = (char *)alloca(strlen(d) + 1);
-        strcpy(key, d);
+        strncpy(key, d, strlen(d)); key[strlen(d)] = '\0';
         val = "";
     }
     /* ${} 替换（值里的变量） */

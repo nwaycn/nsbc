@@ -395,7 +395,8 @@ int digest_parse_challenge(const char *hdr_value, digest_challenge_t *out)
         }
     }
     if (!out->algorithm[0]) {
-        strcpy(out->algorithm, "MD5");
+        strncpy(out->algorithm, "MD5", sizeof(out->algorithm) - 1);
+        out->algorithm[sizeof(out->algorithm) - 1] = '\0';
     } else if (strcasecmp(out->algorithm, "MD5") != 0) {
         /* MD5-sess / SHA-256 等暂不支持 */
         return NSBC_NOTSUP;

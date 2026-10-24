@@ -2070,7 +2070,7 @@ static void sig_ws_bridge_rx(void *ud, const char *buf, size_t len, void *conn)
      * 不能用 sizeof(*conn) — void* 解引用是 void，sizeof(void)==1！ */
     size_t sz = sizeof(conn);
     memcpy(((char *)ss) + sizeof(struct sockaddr_storage) - sz, &conn, sz);
-    llog(LOG_INFO, "ws-bridge", "rx: conn=%p stored, family=%d, sizeof_ss=%zd",
+    llog(LOG_DEBUG, "ws-bridge", "rx: conn=%p stored, family=%d, sizeof_ss=%zd",
          conn, ss->ss_family, sizeof(*ss));
 
     /* local 填占位 */
