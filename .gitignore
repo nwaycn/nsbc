@@ -9,3 +9,11 @@ SIP方法实现完整性审计.md
 /web/vendor
 /内网测试机.md
 /skills
+/.skills
+/.requires
+/.trae
+/.vscode
+/configs
+/config/
+/examples/event_client/python/__pycache__/
+/发行版/
