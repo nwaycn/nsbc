@@ -192,8 +192,19 @@ pub async fn reload<C: CoreApi + Clone + Send + Sync>(
     let rows = st.db.list_enabled_dialplan_rules(None).await
         .map_err(|e| ApiError::Db(e.to_string()))?;
     let json = serde_json::to_string(&rows).map_err(|e| ApiError::Db(e.to_string()))?;
-    st.core.reload_dialplan_rules(&json).await
-        .map_err(|_| ApiError::CoreUnavailable)?;
+    use crate::coreclient::CoreError;
+    match st.core.reload_dialplan_rules(&json).await {
+        Ok(()) => {}
+        Err(CoreError::CoreRejected(msg)) => {
+            // Core 返回 "ERR dialplan-rules.reload failed: <具体错误>"
+            // 把 msg 透传给前端 — 帮助排障（比如哪条 JSON 字段缺失/格式错误）
+            tracing::warn!("dialplan-rules.reload core rejected: {msg}");
+            return Err(ApiError::BadRequest(
+                format!("core rejected reload: {msg}"),
+            ));
+        }
+        Err(e) => return Err(ApiError::from(e)),
+    }
     tracing::info!(count = rows.len(), "dialplan-rules.reload pushed to core");
     Ok(Json(json!({ "loaded": rows.len() })))
 }

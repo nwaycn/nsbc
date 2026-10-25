@@ -12,6 +12,7 @@
 #include "b2bua.h"
 #include "callctrl.h"
 #include "chan_var.h"
+#include "dialplan.h"        /* dp_execute — 拨号规则预匹配（防扫号器） */
 #include "endpoint_registry.h"  /* Phase 5 XL: INVITE 入站 endpoint_registry 分发 */
 #include "event_bus.h"          /* 白皮书 §10.3: SESSION_CREATE/ANSWER/END 事件触发 */
 #include "ha.h"                 /* REQ-HA-001: 主备角色门控（ha_role，主二进制内符号） */
@@ -3693,6 +3694,84 @@ void handle_new_invite(b2b_core_t *co, sip_txn_t *t,
     tbl_link(co, c, 0);
     add_atomic(&co->total, 1);
 
+    /* ★★★ Dialplan pre-check — 安全加固核心（REQ-SEC-007）★★★
+     *
+     * 在发 100 Trying 之前先跑一轮 dp_execute 预匹配。
+     * 拨号规则不命中 → 号码不存在/未授权，直接静默丢弃，不发任何 SIP 响应。
+     *
+     * 为什么必须在 100 Trying 之前：
+     *   - RFC 3261 规定 stateful proxy/SBC SHOULD 发 100 Trying 停 INVITE 重传
+     *   - 但扫号器（sip scanner）会利用这个特征：先发 INVITE，如果收到 100 Trying
+     *     就知道"此号码后端有 SBC，值得继续尝试"；最终 404 不影响其指纹确认
+     *   - 把 100 Trying 延迟到拨号规则匹配之后，未命中的号码连一条 1xx 都收不到
+     *     → 扫号器只能被动超时，无法确认 SBC 存在
+     *
+     * 为什么这里可以安全插入：
+     *   - dp_execute 是纯内存操作（正则遍历 + 号码变换），无需 DB 查询
+     *   - call_key=NULL：只跑规则匹配，不执行 app 链（transfer/bridge/record 等），
+     *     这些会在后续完整 resolve_cb 里再跑一遍（冗余但安全）
+     *   - Emergency URN 绕过（与 HA 门控同一惯例，备机也接应急呼叫）
+     *   - security fence（b2b_guard_check + security_check_fence）已在更前置做过
+     *
+     * 后续完整 resolve_cb 会再次调用 dp_execute（带真实 call_key），
+     * 并在此基础上做 route_table 查找、recording 启停、rt_acquire 等——
+     * pre-check 只是快速门禁，不替代完整 resolve。
+     */
+    if (!is_emergency) {
+        extern dp_ctx_t *sig_dp_ctx(void);   /* signaling.c 导出 */
+        dp_ctx_t *dpc = sig_dp_ctx();
+        if (dpc && c->prof) {
+            dp_call_t dcall_pre = {0};
+            dp_result_t dres_pre = {0};
+            /* called：INVITE Request-URI user part
+             * ★ 必须拷贝到本地 null-terminated buffer（sip_tok_t 不保证 \0 结尾） */
+            char called_buf[64] = {0};
+            if (m->ruri.user.p && m->ruri.user.len > 0
+                && m->ruri.user.len < sizeof(called_buf)) {
+                memcpy(called_buf, m->ruri.user.p, m->ruri.user.len);
+            }
+            dcall_pre.called = called_buf[0] ? called_buf : "";
+            /* caller：From header 的 user part（c->orig_number 已在 L3622 填好，null-terminated） */
+            dcall_pre.caller = (c->orig_number[0]) ? c->orig_number : "";
+            /* profile_name：sip_profile_match 匹配到的来源 profile */
+            dcall_pre.profile_name = c->prof->name;
+            /* src_ip：INVITE 源 IP（CIDR 白名单/黑名单过滤用） */
+            char ip_buf[INET6_ADDRSTRLEN] = {0};
+            sa_ip_str(src, ip_buf, sizeof(ip_buf));
+            dcall_pre.src_ip = ip_buf;
+            /* perm=0（默认），call_key=NULL（只匹配，不执行 app）
+             * ★ perm 留空 / dry_run=1 —— dp_execute 内部检测到 call_key==NULL 时
+             *   只跑规则匹配，跳过 app 链执行（防止 NULL deref crash） */
+
+            int dp_rc = dp_execute(dpc, &dcall_pre, &dres_pre);
+            /* ★ dp_rc=NSBC_OK 即规则命中（dp_execute 内部 L453 return NSBC_OK）。
+             * 不再额外检查 dres_pre.target 是否为空——target 空是合法场景：
+             *   - internal profile 内部对打（1000 → 1001）：target=""，
+             *     resolve_cb 会 fallback 到 dst_number（原始被叫）
+             *   - 非 capture-group pattern + target=${1}：${1} 被 substitute_groups
+             *     替换为空 → target=""，但 dst_number 是对的
+             * dp_rc != OK 才是真正的"无规则命中"（返回 NSBC_ERR/PERM_DENIED） */
+            if (dp_rc != NSBC_OK) {
+                /* ★ 规则不命中 → silent drop，防 SBC 指纹暴露
+                 * 走 call_destroy 统一清理（tbl_unlink / concurrent_dec / active_calls dec）
+                 * co->total 不撤回：历史累计值，即使 drop 也应计入 */
+                llog(LOG_NOTICE, "b2b",
+                     "dp_precheck: NO RULE MATCHED → silent drop "
+                     "callid=%s called=%s caller=%s prof=%s src_ip=%s dp_rc=%d",
+                     c->leg[0].callid,
+                     dcall_pre.called ? dcall_pre.called : "-",
+                     dcall_pre.caller ? dcall_pre.caller : "-",
+                     c->prof->name,
+                     ip_buf, dp_rc);
+                a->state = LEG_TERMINATED;
+                call_destroy(c);
+                return;
+            }
+            /* dp_ok → 继续正常流程，后续 resolve_cb 会再跑完整 dp_execute
+             * （带真实 call_key，会执行 recording/rt_acquire 等副作用） */
+        }
+    }
+
     /* 白皮书 §5.2 + §10.3：call 正式激活后统一发 SESSION_CREATE 事件。
      * 双通道：event_handler_trigger（同步订阅链）+ nsbc_event_push（异步 Ring）。
      * security 的 SESSION_CREATE handler 可以在这里做 IP 信誉检查。*/
@@ -5261,18 +5340,44 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
         return;
     }
 
-    /* 非对话内的 NOTIFY/SUBSCRIBE/PUBLISH：服务端主动发的（如 FS message-summary），
-     * 我们作为 B2BUA 不处理语音邮件/presence 等，但必须回 200 OK 表示收到
-     * （RFC 3265 §3.2.2 / RFC 3903 §6.1 要求订阅者/接收方回 200）。 */
+    /* 非对话内的 MESSAGE/INFO/SUBSCRIBE/NOTIFY/PUBLISH：silent drop。
+     *
+     * B2BUA 不做 presence server 也不做 IM relay，对话外的这些方法对我们完全无意义：
+     *   - MESSAGE: 非对话内 IM → 没有 dialog 就转发不了，回 200 OK 反而暴露 "SBC 存在"
+     *   - INFO: 非对话内信令承载 → 没 dialog 就没目标 leg
+     *   - SUBSCRIBE/NOTIFY/PUBLISH: B2BUA 不主动订阅 presence，也不发布
+     * 扫号器利用这些方法探测 SBC 存在（比 OPTIONS 更隐蔽、不消耗资源）。
+     * 参考：security fence 已拦 CIDR/UA，但 fence 通过的请求我们依然 silent drop。 */
     if (m->method == SIP_M_NOTIFY || m->method == SIP_M_SUBSCRIBE
         || m->method == SIP_M_PUBLISH
         || m->method == SIP_M_MESSAGE || m->method == SIP_M_INFO) {
-        respond_txn(co, t, 200, NULL, NULL, NULL, 0);
-        return;
+        static unsigned nondlg_drop_n = 0;
+        if (nondlg_drop_n++ % 512 == 0) {
+            const char *mn = "?";
+            switch (m->method) {
+            case SIP_M_MESSAGE: mn = "MESSAGE"; break;
+            case SIP_M_INFO: mn = "INFO"; break;
+            case SIP_M_SUBSCRIBE: mn = "SUBSCRIBE"; break;
+            case SIP_M_NOTIFY: mn = "NOTIFY"; break;
+            case SIP_M_PUBLISH: mn = "PUBLISH"; break;
+            default: break;
+            }
+            llog(LOG_INFO, "b2b",
+                 "silent drop non-dialog %s (n=%u)", mn, nondlg_drop_n);
+        }
+        return;  /* 不回任何响应 */
     }
 
-    /* 未识别的非对话内方法 */
-    respond_txn(co, t, 501, NULL, NULL, NULL, 0);
+    /* 未识别的非对话内方法：silent drop（defense-in-depth）。
+     * 白名单 14 种已在 txn_input L5489 先做 reject，理论上不会到这里；
+     * 但万一有边缘路径或未来改白名单漏了，也不能回 501 暴露 SBC 存在。 */
+    {
+        static unsigned unk_drop_n = 0;
+        if (unk_drop_n++ % 4096 == 0)
+            llog(LOG_INFO, "b2b",
+                 "silent drop unknown non-dialog method=%d (n=%u)",
+                 m->method, unk_drop_n);
+    }
 }
 
 /* ------------------------------------------------------------------ */

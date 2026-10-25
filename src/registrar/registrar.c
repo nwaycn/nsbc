@@ -558,8 +558,37 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
     digest_cfg_t dig = r->dig;
     dig.realm = reg_realm;
 
-    /* Digest 鉴权 */
+    /* ★★★ User-exists pre-check — 安全加固核心（REQ-SEC-008）★★★
+     *
+     * 扫号器发 REGISTER，如果收到 401 WWW-Authenticate 就知道"此用户存在
+     * 但密码不对"。必须先查 HA1 表——用户不存在就 silent drop，
+     * 连 401 challenge 都不发（防止 user enum）。
+     *
+     * 与 INVITE dp_precheck 同理：信息隐藏比友好错误更重要。
+     *
+     * ha1_cb 签名：const char *(*cb)(realm, rlen, user, ulen, ud);
+     * 返回 NULL = user 不存在 → silent drop。
+     * 返回非 NULL（HA1 hex）→ 正常走 401 challenge / digest_verify。 */
     sip_hdr_t *auth = sip_hdr_get(m, SIP_H_AUTHORIZATION);
+    {
+        const char *ha1_found = NULL;
+        if (dig.ha1_cb && u->user.p && u->user.len > 0) {
+            ha1_found = dig.ha1_cb(reg_realm, strlen(reg_realm),
+                                   u->user.p, u->user.len, dig.ha1_ud);
+        }
+        if (!ha1_found) {
+            /* 用户不存在 → silent drop（既不发 401 也不发 403） */
+            llog(LOG_NOTICE, "reg",
+                 "REGISTER → silent drop: user NOT FOUND "
+                 "aor=%s user_len=%zu realm=%s src_ip=%s auth_present=%d",
+                 aor, u->user.len, reg_realm,
+                 src_ip, auth ? 1 : 0);
+            return NSBC_OK;
+        }
+        /* HA1 存在 → 继续正常流程（无论 auth 头有没有） */
+    }
+
+    /* Digest 鉴权 */
     llog(LOG_DEBUG, "reg", "REGISTER Authorization hdr ptr=%p", (void*)auth);
     if (!auth || sip_hdr_parse_auth(auth) != NSBC_OK) {
         char ch[512], extra[600];

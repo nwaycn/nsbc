@@ -4661,7 +4661,6 @@ pub struct DialplanRule {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct DialplanRuleCreate {
     pub tenant_id:  i64,
     pub name:       String,
@@ -4706,7 +4705,6 @@ pub struct DialplanRuleCreate {
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct DialplanRuleUpdate {
     pub tenant_id:  Option<i64>,
     pub name:       Option<String>,

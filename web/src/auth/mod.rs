@@ -85,10 +85,35 @@ pub struct AuthSvc {
 }
 
 impl AuthSvc {
+    /// Default TTL values. Admin console sessions must stay alive long enough
+    /// for real operations — 15min is way too short for an ops engineer editing
+    /// dialplans, reviewing CDRs, then switching to profiles.
+    const DEFAULT_ACCESS_TTL_SECS: u64 = 14_400;   // 4 hours
+    const DEFAULT_REFRESH_TTL_SECS: u64 = 604_800; // 7 days
+
+    /// Resolve TTL: env var > YAML cfg > built-in default.
+    /// Clamped to sensible minima (60s access, 300s refresh) regardless of source.
+    fn resolve_ttl_secs(
+        env_key: &str,
+        cfg_val: Option<u64>,
+        default: u64,
+        min: u64,
+    ) -> Result<u64, String> {
+        if let Ok(v) = std::env::var(env_key) {
+            let n = v.parse::<u64>()
+                .map_err(|_| format!("{env_key} must be a non-negative integer"))?;
+            return Ok(n.max(min));
+        }
+        if let Some(v) = cfg_val {
+            return Ok(v.max(min));
+        }
+        Ok(default)
+    }
+
     /// Environment configuration (fail-closed; refuse to start if any security config is missing/invalid):
     /// - `NSBC_JWT_SECRET` or `NSBC_JWT_SECRET_FILE` (>=32 bytes, one of them required)
     /// - `NSBC_AUTH_ACCOUNTS` or `NSBC_AUTH_FILE` (account text, empty=all logins rejected)
-    /// - `NSBC_ACCESS_TTL_SECS` (default 900), `NSBC_REFRESH_TTL_SECS` (default 28800)
+    /// - `NSBC_ACCESS_TTL_SECS` (default 14400 = 4h), `NSBC_REFRESH_TTL_SECS` (default 604800 = 7d)
     /// - Lockout/rate-limit: `NSBC_LOCKOUT_THRESHOLD`(5)/`NSBC_LOCKOUT_SECS`(900)/
     ///   `NSBC_RL_LOGIN_PER_MIN`(10)/`NSBC_RL_REFRESH_PER_MIN`(30)/
     ///   `NSBC_RL_API_PER_MIN`(120); threshold 0 disables the respective mechanism
@@ -104,7 +129,7 @@ impl AuthSvc {
         } else {
             AccountStore::parse(&accounts_text)?
         };
-        Self::build_from_parts(secret, accounts)
+        Self::build_from_parts(secret, accounts, None, None)
     }
 
     /// Construct from WebConfig::AuthSection (env > file > cfg > fail-closed).
@@ -150,21 +175,40 @@ impl AuthSvc {
             AccountStore::parse(&accounts_text)?
         };
 
-        Self::build_from_parts(secret, accounts)
+        Self::build_from_parts(
+            secret, accounts,
+            cfg.access_ttl_secs, cfg.refresh_ttl_secs,
+        )
     }
 
-    fn build_from_parts(secret: Vec<u8>, accounts: AccountStore) -> Result<AuthSvc, String> {
+    /// Build from resolved components.
+    ///
+    /// TTL resolution chain (per param, independent):
+    ///   env `NSBC_ACCESS_TTL_SECS` / `NSBC_REFRESH_TTL_SECS` >
+    ///   cfg Option<u64> (from YAML) >
+    ///   DEFAULT_ACCESS_TTL_SECS / DEFAULT_REFRESH_TTL_SECS
+    /// Minimum clamped: access ≥ 60s, refresh ≥ 300s.
+    fn build_from_parts(
+        secret: Vec<u8>,
+        accounts: AccountStore,
+        cfg_access_ttl: Option<u64>,
+        cfg_refresh_ttl: Option<u64>,
+    ) -> Result<AuthSvc, String> {
         if accounts.is_empty() {
             tracing::warn!(
                 "no local accounts configured; all logins will fail closed"
             );
         }
-        let access_ttl = Duration::from_secs(
-            env_u64_or("NSBC_ACCESS_TTL_SECS", 900)?.max(60),
-        );
-        let refresh_ttl = Duration::from_secs(
-            env_u64_or("NSBC_REFRESH_TTL_SECS", 28800)?.max(300),
-        );
+        let access_secs = Self::resolve_ttl_secs(
+            "NSBC_ACCESS_TTL_SECS", cfg_access_ttl,
+            Self::DEFAULT_ACCESS_TTL_SECS, 60,
+        )?;
+        let refresh_secs = Self::resolve_ttl_secs(
+            "NSBC_REFRESH_TTL_SECS", cfg_refresh_ttl,
+            Self::DEFAULT_REFRESH_TTL_SECS, 300,
+        )?;
+        let access_ttl = Duration::from_secs(access_secs);
+        let refresh_ttl = Duration::from_secs(refresh_secs);
         let tokens = TokenSvc::new(&secret, access_ttl, refresh_ttl)?;
         let limits = Limits {
             lock_threshold: env_u64_or("NSBC_LOCKOUT_THRESHOLD", 5)? as u32,

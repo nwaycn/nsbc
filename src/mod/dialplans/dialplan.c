@@ -425,11 +425,12 @@ int dp_execute(const dp_ctx_t *ctx, const dp_call_t *call, dp_result_t *res)
          * 号码变换 + 路由已确定 → 按 app_chain 顺序依次执行
          * （pre_answer/playback/sleep/uuid_break/set/answer 等）。
          *
-         * sleep 返回 APP_RC_PENDING → timer_wheel 挂起（dp_sleep_add），
-         * 回调 resume 继续后续 app → 正常流程，非错误。
-         * FAILED/HANGUP → log WARN 但仍 return NSBC_OK（signaling 只管路由，
-         * 应用层失败不影响号码变换结果，可由上层按需处理）。 */
-        if (r->app_chain_n > 0) {
+         * ★ 安全加固：call->call_key == NULL 时跳过 app 链执行
+         * （b2bua.c dp_precheck 用 NULL call_key 跑纯匹配——防扫号器，
+         *  此时不能解引用 NULL b2b_call_t*）。号码变换 + 路由结果
+         *  已在本函数上部填完（res->target/dst_number/layer），
+         *  跳过 app 不影响 pre-check 的判断目的。 */
+        if (r->app_chain_n > 0 && call->call_key != NULL) {
             app_ctx_t actx;
             memset(&actx, 0, sizeof(actx));
             actx.call_key  = (void *)call->call_key;   /* b2b_call_t* 不透明键 */
