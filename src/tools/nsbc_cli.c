@@ -546,6 +546,24 @@ static void process_recv_buffer(void)
                 g_in_sip_pkt = 0;
             }
         } else if (g_in_sip_pkt && g_sip_pkt_len > 0) {
+            /* ★ end-of-packet 检测：如果这行不像 SIP 内容，说明上一个包结束了
+             * SIP 消息的行要么是 SIP/2.0 响应 / 方法名开头的请求，要么是
+             * Key: Value 格式的 header，要么是空行。以下特征明确不是 SIP：
+             *   - 以 '20' 开头（时间戳 YYYY-MM-DD）
+             *   - 以 "nsbc>" 开头（服务端 prompt）
+             *   - 以 "OK " 或 "ERR " 开头（命令响应）
+             * 一旦命中，flush siptrace 包，这行走下面的正常 classify→filter→display */
+            int non_sip = 0;
+            if (body_len >= 2 && body[0] == '2' && body[1] == '0') non_sip = 1;
+            else if (body_len >= 5 && strncmp(body, "nsbc>", 5) == 0) non_sip = 1;
+            else if (body_len >= 3 && strncmp(body, "OK ", 3) == 0) non_sip = 1;
+            else if (body_len >= 4 && strncmp(body, "ERR ", 4) == 0) non_sip = 1;
+            if (non_sip) {
+                sip_pkt_flush();  /* 会置 g_in_sip_pkt=0 和 g_sip_pkt_len=0 */
+                /* fall through 到下面的正常处理（goto label） */
+                goto process_normal_line;
+            }
+            /* 是 SIP 内容，继续吸收到 siptrace 包 */
             size_t add = body_len + 1;
             if (g_sip_pkt_len + add < SIP_PKT_BUF) {
                 memcpy(g_sip_pkt + g_sip_pkt_len, body, body_len);
@@ -555,6 +573,7 @@ static void process_recv_buffer(void)
                 sip_pkt_flush();
             }
         } else if (body_len > 0) {
+        process_normal_line:
             frame_kind_t kind = classify_frame(classify_line, classify_len);
             int lvl = -1; char tag[TAG_MAXLEN] = {0};
             if (kind == FRAME_LOG)
@@ -583,10 +602,15 @@ static int cli_rl_event_hook(void)
 {
     if (!g_recv_alive || g_fd < 0) { sip_pkt_flush_pending(); return 1; }
 
+    /* ⚠️ timeout=5ms 而非 0！这是之前 CPU 飙 260% 的另一根因：
+     * poll(0) 立即返回 → event_hook 每次进来都不阻塞 → readline
+     * 内部 loop 以最高频率反复调 event_hook → 纯 busy-wait 烧 CPU。
+     * 5ms 足够让 UDS 帧及时到达（siptrace 包不会堆积），
+     * 又能让没数据时 poll 短暂阻塞让出 CPU（fs_cli 同写法）。 */
     struct pollfd p = { g_fd, POLLIN, 0 };
-    int np = poll(&p, 1, 0);  /* 非阻塞检查，立即返回 */
+    int np = poll(&p, 1, 5);  /* 5ms 阻塞 */
     if (np < 0) return 0;
-    if (np == 0) return 0;     /* 没数据，继续等用户输入 */
+    if (np == 0) return 0;     /* 超时没数据，继续 readline 等用户输入 */
     if (p.revents & (POLLHUP | POLLERR)) {
         fprintf(stderr, "\n%s[nsbc] socket hangup%s\n",
                 g_use_color ? C_CRIT : "", g_use_color ? C_RESET : "");
@@ -620,9 +644,10 @@ static int cli_rl_event_hook(void)
             process_recv_buffer();
             if (g_recv_pending == 0) break;  /* buffer 空了，poll 再等下一批 */
         }
-        /* 再 poll 一次看有没有更多数据（零成本批处理） */
+        /* 再 poll 一次看有没有更多数据（零成本批处理 — 用 1ms 而非 0
+         * 避免无数据时 while 空转烧 CPU） */
         struct pollfd p2 = { g_fd, POLLIN, 0 };
-        if (poll(&p2, 1, 0) == 0) break;  /* 没了，出去处理 */
+        if (poll(&p2, 1, 1) == 0) break;  /* 没了，出去处理 */
     }
 
     process_recv_buffer();
@@ -1127,6 +1152,20 @@ static char *cmd_compgen(const char *text, int state)
     return NULL;
 }
 
+/* readline 8.x 推荐的 Tab 补全入口 —— 完全接管，不会 fallback 到 history
+ * search / filename completion（旧 rl_completion_entry_function 会让 readline
+ * 在没有匹配候选时偷偷跑 history search，这就是 "输入 h 自动补成 show registrations"
+ * 的根因）。
+ * 返回 NULL 表示"没有候选"（Tab 静默，不触发任何历史/文件名猜测）。 */
+static char **cli_attempted_completion(const char *text, int start, int end)
+{
+    (void)end;
+    /* 只补第一个 token（主命令）或子命令；其他位置返回 NULL */
+    if (start > 0 && rl_line_buffer[start - 1] != ' ')
+        return NULL;
+    return rl_completion_matches(text, cmd_compgen);
+}
+
 /* ================================================================
  * YAML / UDS 辅助
  * ================================================================ */
@@ -1202,8 +1241,18 @@ static void run_repl(int fd)
      * 不再开 pthread — event_hook 在 readline 等待输入时 poll socket，
      * 零线程、零锁、零 race condition（fs_cli 架构）。 */
     rl_readline_name = "nsbc";
-    rl_completion_entry_function = cmd_compgen;
+    /* ★ 关键：用 rl_attempted_completion_function 而非旧式
+     * rl_completion_entry_function —— 前者完全接管 Tab，不会 fallback 到
+     * readline 默认的 history search / filename completion（那就是"输入 h
+     * 自动补全成 show registrations"的根因：readline 内部 history 补全
+     * 抢了命令补全的活）。 */
+    rl_attempted_completion_function = cli_attempted_completion;
     rl_event_hook = cli_rl_event_hook;
+
+    /* 禁用 history expansion（!号展开历史命令）—— CLI 命令里 ! 合法，
+     * 用户输入 !security 不该被 readline 当历史展开 */
+    using_history();
+    stifle_history(500);  /* 内存只保留最近 500 条，防历史膨胀 */
 
     char histpath[PATH_MAX];
     const char *home = getenv("HOME");
