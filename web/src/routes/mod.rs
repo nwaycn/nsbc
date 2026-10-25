@@ -8,6 +8,8 @@ pub mod codecs;
 pub mod config;
 pub mod dialplan_apps;
 pub mod dialplan_rules;
+pub mod ext;
+pub mod ext_admin;
 pub mod extensions;
 pub mod gateways;
 pub mod ha_groups;

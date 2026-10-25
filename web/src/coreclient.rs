@@ -758,6 +758,16 @@ pub trait CoreApi: Send + Sync {
         key: &str,
         delta_uc: i64,
     ) -> impl Future<Output = Result<(), CoreError>> + Send;
+
+    /// REQ-EXT-API-002: 透明代理 —— 把任意控制命令直接发给 core 并返回原始文本输出。
+    /// 等价于 nsbc_cli / fs_cli 的手动 REPL：外部系统可以执行任何已注册命令
+    /// （show / uuid_* / config.* / sofia / dialplan.* / reload.* / originate 等）。
+    /// 命令文本不含换行符；成功返回命令 stdout（纯文本）；core 拒绝返回
+    /// CoreError::CoreRejected 含 "ERR ..." 行内容。
+    fn exec_cmd(
+        &self,
+        cmd: &str,
+    ) -> impl Future<Output = Result<String, CoreError>> + Send;
 }
 
 /// Real core client: short connection (each command is an independent frame on core side), cheap Clone for sharing config.
@@ -1032,6 +1042,16 @@ impl CoreApi for RealCore {
     async fn account_topup(&self, key: &str, delta_uc: i64) -> Result<(), CoreError> {
         send_cmd(&self.sock_path, self.timeout, &format!("account.topup {key} {delta_uc}"))
             .await.and_then(|b| check_rejected(&b))
+    }
+
+    /// REQ-EXT-API-002: 透明代理 —— 任意命令直送 core。
+    /// 不做 check_rejected：ERR 行也是命令输出的一部分（外部调用方自己判断），
+    /// 我们只在 UDS 连接/I/O/超时 三类底层错误上返回 Err。
+    async fn exec_cmd(&self, cmd: &str) -> Result<String, CoreError> {
+        // 防御：去换行 + 限长（避免注入多行命令）
+        let clean: String = cmd.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+        let clean = if clean.len() > 4096 { &clean[..4096] } else { clean.as_str() };
+        send_cmd(&self.sock_path, self.timeout, clean).await
     }
 }
 
@@ -2603,6 +2623,20 @@ leg 0 sdp_offer 50\nabc\n";
                 .cloned()
                 .unwrap_or(Ok("OK\n".into()))
                 .and_then(|b| check_rejected(&b))
+        }
+
+        async fn exec_cmd(&self, cmd: &str) -> Result<String, CoreError> {
+            // 透明代理 stub：先记录命令，查 canned["exec_cmd:<cmd>"] ->
+            // 找不到则返回 canned["exec_cmd"] 默认值 -> 再找不到返回
+            // canned[cmd] 兜底（很多测试已经 can 了完整命令 key）
+            self.calls.lock().unwrap().push(format!("(exec_cmd) {cmd}"));
+            let specific = format!("exec_cmd:{cmd}");
+            self.canned
+                .get(&specific)
+                .or_else(|| self.canned.get("exec_cmd"))
+                .or_else(|| self.canned.get(cmd))
+                .cloned()
+                .unwrap_or_else(|| Ok(format!("(mock exec_cmd: no can for \"{cmd}\")\n")))
         }
     }
 

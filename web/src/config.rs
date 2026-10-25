@@ -30,6 +30,8 @@ pub struct WebSection {
     pub enabled: bool,
     pub bind:    String,
     pub tls:     TlsSection,
+    /// REQ-EXT-API-004: external API surface 配置
+    pub ext:     ExtSection,
 }
 
 impl Default for WebSection {
@@ -38,8 +40,22 @@ impl Default for WebSection {
             enabled: true,
             bind:    "127.0.0.1:8443".into(),
             tls:     TlsSection::default(),
+            ext:     ExtSection::default(),
         }
     }
+}
+
+/// REQ-EXT-API-004: /ext/v1/* 外部 API 部署选项
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ExtSection {
+    /// true → 127.0.0.1 / ::1 也必须 Bearer Token（反代部署强制开）
+    /// false (默认) → loopback 免鉴权，本机脚本零摩擦
+    pub require_loopback_auth: bool,
+}
+
+impl Default for ExtSection {
+    fn default() -> Self { Self { require_loopback_auth: false } }
 }
 
 #[derive(Debug, Clone, Deserialize)]

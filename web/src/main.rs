@@ -127,6 +127,9 @@ pub struct AppState<C: CoreApi + Clone> {
     pub api_major:     u32,
     pub bind:          SocketAddr,
     pub recording_root: std::path::PathBuf,
+    /// REQ-EXT-API-004: true → 即使 127.0.0.1 / ::1 也必须 Bearer Token。
+    /// 默认 false（本机脚本零摩擦）；反代部署必须开（否则反代进来的远程请求 peer 就是 loopback）。
+    pub require_loopback_auth: bool,
     /// C→Web data.sock channel established (set true on UDS connect to let poller skip
     /// polling). Two tasks (uds_server accept loop + poller interval loop) live across
     /// tokio tasks; AtomicBool provides lock-free coordination.
@@ -182,6 +185,7 @@ fn api_router<C: CoreApi + Clone + 'static>(st: Arc<AppState<C>>) -> Router {
         .merge(routes::transcode::router())
         .merge(routes::tenants::router())
         .merge(routes::auth::protected_router())
+        .merge(routes::ext_admin::router())
         .layer(axmw::from_fn_with_state(st.clone(), rbac::require_auth::<C>));
     Router::new()
         .merge(routes::auth::public_router())
@@ -192,8 +196,30 @@ fn api_router<C: CoreApi + Clone + 'static>(st: Arc<AppState<C>>) -> Router {
         .with_state(st)
 }
 
+/// REQ-EXT-API-001: External API surface `/ext/v1/*`.
+///
+/// 和 Web UI 的 `/api/v1/*`（JWT + rbac）**完全隔离** —— 外部系统只需要一个
+/// API Key（Bearer `nsbc_live_<32bytes>`）就能完成控制（originate/hangup）、
+/// 监控（calls/system）、事件接收（SSE stream）三件事。
+/// 走自己的 middleware 链：ext_key（API Key 鉴权）→ ratelimit（限流），
+/// **不走** rbac（Web UI JWT）和 apiversion（Web UI 版本治理）。
+fn ext_router<C: CoreApi + Clone + 'static>(st: Arc<AppState<C>>) -> Router {
+    // 和 api_router 完全相同的内部模式：
+    // Router::new() 被 merge 的 Router<Arc<AppState<C>>> 推断成同样的类型
+    // layer 注入 middleware（from_fn_with_state 捕获 Arc<AppState<C>>）
+    // 最后 .with_state(st) 保持 Router<Arc<AppState<C>>>
+    // 函数签名 -> Router（默认 Router<()>）靠隐式转换匹配 api_router 同模式
+    Router::new()
+        .merge(routes::ext::router::<C>())
+        .layer(axmw::from_fn_with_state(st.clone(), middleware::ext_key::require_ext_key::<C>))
+        .layer(axmw::from_fn_with_state(st.clone(), middleware::ratelimit::enforce::<C>))
+        .with_state(st)
+}
+
 /// Full application: /api/v1 business surface + unauthenticated /health probe +
-/// security response headers.
+/// security response headers. **Plus /ext/v1 external API surface** (REQ-EXT-API-001):
+/// independent from Web UI JWT — uses API Key auth, lets call-centers / CRMs / AI Agents
+/// control + monitor + receive events with zero client deployment.
 fn app_router<C: CoreApi + Clone + 'static>(state: Arc<AppState<C>>) -> Router {
     // Security response headers layer (OWASP baseline, compatible with Vue 3 compile-time
     // template eval). Vue 3 global build uses new Function() for template compilation →
@@ -212,6 +238,7 @@ fn app_router<C: CoreApi + Clone + 'static>(state: Arc<AppState<C>>) -> Router {
 
     let app = Router::new()
         .nest("/api/v1", api_router(state.clone()))
+        .nest("/ext/v1", ext_router(state.clone()))
         .route("/health", axum::routing::get(routes::system::health))
         .merge(static_files::router());
 
@@ -522,6 +549,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         api_major: API_MAJOR,
         bind,
         recording_root: std::path::PathBuf::from(&cfg.recording.path),
+        require_loopback_auth: cfg.web.ext.require_loopback_auth,
         data_pushed: Arc::new(AtomicBool::new(false)),
         calls_tx: tokio::sync::broadcast::channel(256).0,
         vad_tx:   tokio::sync::broadcast::channel(1024).0,
@@ -653,9 +681,22 @@ async fn handle_tls_stream(
         }
     };
     let io = hyper_util::rt::TokioIo::new(tls_stream);
-    let svc = hyper_util::service::TowerToHyperService::new(
-        app.clone().into_service()
-    );
+
+    // ─── REQ-EXT-API-004: 在 TLS 分支也注入 peer ConnectInfo ───
+    // HTTP 分支用 axum::serve + into_make_service_with_connect_info::<SocketAddr>() 自动注入；
+    // TLS 分支是我们手动 accept loop → 必须自己在每个 Request 里塞 ConnectInfo(peer)，
+    // 否则 ext_key middleware 的 loopback 短路永远看不到 peer IP。
+    use tower::ServiceBuilder;
+    let inner = ServiceBuilder::new()
+        .map_request(move |mut req: axum::http::Request<hyper::body::Incoming>| {
+            req.extensions_mut().insert(axum::extract::ConnectInfo(peer));
+            req
+        })
+        .service(app.clone().into_service());
+    // tower::Service → hyper::Service 桥接（MapRequest 只实现 tower trait，
+    // hyper serve_connection 要 hyper::Service trait）
+    let svc = hyper_util::service::TowerToHyperService::new(inner);
+
     let _ = hyper::server::conn::http1::Builder::new()
         .keep_alive(true)
         .serve_connection(io, svc)

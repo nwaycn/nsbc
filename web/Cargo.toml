@@ -73,7 +73,13 @@ certon = { version = "0.3", optional = true }
 acme = ["certon"]
 
 [profile.release]
-lto = true
-codegen-units = 1
+# 低内存服务器 (2-4GB RAM) 必须这样改:
+#   lto="thin" 保留链接优化但比 lto=true 峰值内存低 ~50%
+#   codegen-units=8 多进程并行编译 + 单进程内存降低
+#   strip=true 自动 strip 最终二进制 (磁盘小几十 MB)
+#   panic="abort" 去掉 unwind 表 (二进制更小, 无关编译内存)
+# 注意: lto=true + codegen-units=1 在 VPS 上必被 OOM Killer 杀
+lto = "thin"
+codegen-units = 8
 panic = "abort"
 strip = true
