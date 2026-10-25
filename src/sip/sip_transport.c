@@ -783,6 +783,13 @@ static void on_udp_event(int fd, uint32_t ev, void *arg)
              * 只查 IP，不查 UA/号码前缀（需要 parse 后的头，放 b2bua 层）。
              * 省掉被封 IP 的 sip_parse_ex + b2b_on_rx 调用栈开销。 */
             if (security_is_blocked(&d->peer)) {
+                if (g_sip_trace) {
+                    char dip[INET6_ADDRSTRLEN] = {0};
+                    uint16_t dport = nsbc_sa_port(&d->peer);
+                    nsbc_sa_fmt(&d->peer, dip, sizeof(dip));
+                    sip_trace_dump("UDP", 0, dip, dport,
+                                   (const char *)d->buf, d->len);
+                }
                 static unsigned blk = 0;
                 if (blk++ % 1024 == 0) {
                     char dip[INET6_ADDRSTRLEN] = {0};
@@ -793,12 +800,12 @@ static void on_udp_event(int fd, uint32_t ev, void *arg)
                 }
                 continue;
             }
-            /* SIP trace RX（开关 g_sip_trace=1 时才打） */
+            /* SIP trace RX（开关 g_sip_trace=1 时才打；blocked 路径上面已打） */
             if (g_sip_trace) {
                 char dip[INET6_ADDRSTRLEN] = {0};
                 uint16_t dport = nsbc_sa_port(&d->peer);
                 nsbc_sa_fmt(&d->peer, dip, sizeof(dip));
-                sip_trace_dump("UDP/5060", 0, dip, dport,
+                sip_trace_dump("UDP", 0, dip, dport,
                                (const char *)d->buf, d->len);
             }
             t->cfg.rx(t->cfg.rx_ud, SIP_TR_UDP, &d->peer, &d->local,

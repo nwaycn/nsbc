@@ -211,6 +211,10 @@ struct rtp_relay {
      * 延迟到所有初始化完成后 rtp_relay_arm 才 reactor_add。
      * rtp_relay_stop 里 arm=0 时跳过 reactor_del（fd 还没注册）。 */
     int armed;
+    /* REQ-ORIGINATE-003 &echo 实现：RTP 环回 mode。
+     * 置 1 后 relay_recv_one 把收到的包发回同一侧（side→side），
+     * 而非正常的 side→other。两侧各自环回自己的 peer。 */
+    int echo_mode;
 };
 
 static void relay_rtcp_observe(rtp_relay_t *r, int side, const uint8_t *buf,
@@ -682,6 +686,11 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
         }
 
         int other = side ^ 1;
+        /* REQ-ORIGINATE-003 &echo：环回模式把包发回同一侧（side→side）。
+         * 其余 latch 检查、peer 选择、sendto fd 下标全部复用 other 变量
+         * —— 不引入新变量、不分支，零额外热路径开销。 */
+        if (r->echo_mode)
+            other = side;
         /* REQ-NAT-001 comedia：对侧是否就绪看 latched OR have_peer
          * （have_peer 来自 SDP，可公网直达；latched 来自 comedia 学习） */
         if (!r->latched[other] && !r->have_peer[other]) {
@@ -975,7 +984,11 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
              *   → Chrome 丢弃收到的 RTP/RTCP。
              *   mixed-mode（一端明文 SIP）才需要重写（防两端 SSRC 碰撞）。 */
             uint32_t newssrc;
-            if (r->node && r->node->dtls[side] && r->node->dtls[other]) {
+            if (r->echo_mode) {
+                /* REQ-ORIGINATE-003 &echo 环回：透传原始 SSRC，
+                 * 否则 UA 收到改写后的 SSRC 可能导致 jitter buffer reset 或丢弃 */
+                newssrc = pkt.ssrc;
+            } else if (r->node && r->node->dtls[side] && r->node->dtls[other]) {
                 /* 双 WebRTC：透传原始 SSRC，不重写 */
                 newssrc = pkt.ssrc;
             } else {
@@ -2361,6 +2374,23 @@ uint64_t rtp_relay_pkts(const rtp_relay_t *r)
 uint64_t rtp_relay_drops(const rtp_relay_t *r)
 {
     return r ? r->drops : 0;
+}
+
+/* REQ-ORIGINATE-003 &echo：开启/关闭 RTP 环回。
+ * on=1：relay_recv_one 把 side 收到的 RTP 发回 side 自己（side→side）。
+ *      两侧各自环回自己的 peer，实现"通话方听到自己回声"。
+ * on=0：恢复正常 side→other 转发。
+ * 调用时机：b2b_originate B 腿 LEG_CONFIRMED 之后，OAM 线程调。
+ * 线程安全：echo_mode 是普通 int，仅在外部模块设置一次（B 腿 confirm 后）
+ * + 媒体线程在 relay_recv_one 里读 —— RCU-like 单次写入，原子性不要求，
+ * 允许一两包在"切换瞬间"走错方向（下一个 recv 循环即生效）。 */
+void rtp_relay_set_echo(rtp_relay_t *r, int on)
+{
+    if (!r) return;
+    int want = on ? 1 : 0;
+    if (r->echo_mode == want) return;  /* 幂等 */
+    r->echo_mode = want;
+    llog(LOG_INFO, "relay", "echo_mode %d (call bridge)", want);
 }
 
 /* ------------------------------------------------------------------ */

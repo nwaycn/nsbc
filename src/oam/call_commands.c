@@ -1085,28 +1085,36 @@ static int cmd_status(cmd_ctx_t *c, int argc, char **argv, void *ud)
 
 /* ==================================================================
  * SIP trace on/off — 辅助函数
- * on=1 时自动做三件事：
+ * on=1 时：
  *   1) sip_tr_set_trace(1)                     — 打开 trace 开关
- *   2) obs_sub_add 当前连接到 OBS_TOPIC_LOG    — CLI 实时推送
- *   3) 如果 loglevel < DEBUG 自动升到 DEBUG     — 日志文件也能看到
- * on=0 时只 sip_tr_set_trace(0)（订阅不自动退，避免误伤其他订阅者）
+ *   2) obs_sub_add 当前连接到 OBS_TOPIC_TRACE   — 独立 topic，不污染 log
+ *
+ * on=0 时对称清理：
+ *   1) sip_tr_set_trace(0)                     — 关 trace
+ *   2) obs_sub_del 当前连接的 OBS_TOPIC_TRACE  — 退订（只碰 TRACE，不碰 LOG）
+ *
+ * ⚠️ 不自动升 loglevel！sip_trace_dump 走 obs_sub_publish_trace（独立
+ * TRACE topic），CLI 订阅 trace topic 就能实时收到，完全不依赖 loglevel。
+ * 自动升 loglevel 是之前的严重 bug：全局 DEBUG 让所有模块的 DEBUG 日志
+ * 疯狂产出 → log topic 帧爆炸 → CLI event_hook 疯狂 poll → CPU 飙 200%+。
+ * 需要看 DEBUG 日志的用户自己调 console loglevel。
+ *
+ * ⚠️ 永远不碰 LOG topic！LOG 由 CLI auto-sub 或用户手动 sub 管，
+ * siptrace 只负责 TRACE topic。职责分离，避免影响其他 topic。
  * ==================================================================*/
 static void siptrace_apply(cmd_ctx_t *c, int on, const char *cmd_name)
 {
     sip_tr_set_trace(on);
-    if (on && c && c->io_ud) {
-        /* 自动让当前 UDS 连接收到 obs_sub_publish_log 推送 */
+    if (c && c->io_ud) {
         obs_sub_hub_t *hub = obs_sub_global();
-        if (hub) obs_sub_add(hub, c->io_ud, OBS_TOPIC_LOG);
-        /* 自动升 loglevel 到 DEBUG（siptrace 是 DEBUG 级） */
-        if (log_get_level() < LOG_DEBUG) {
-            log_level_t old = log_get_level();
-            log_set_level(LOG_DEBUG);
-            if (c->io_printf)
-                c->io_printf(c->io_ud,
-                             "(auto) loglevel %d(%s) → %d(DEBUG)\n",
-                             (int)old, old <= 7 ? "?" : "?",
-                             (int)LOG_DEBUG);
+        if (hub) {
+            if (on) {
+                /* 加订 TRACE（幂等；已经订了不会重复加） */
+                obs_sub_add(hub, c->io_ud, OBS_TOPIC_TRACE);
+            } else {
+                /* 退订 TRACE（对称清理；没订过也安全，obs_sub_del 幂等） */
+                obs_sub_del(hub, c->io_ud, OBS_TOPIC_TRACE);
+            }
         }
     }
     if (c && c->io_printf)

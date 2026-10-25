@@ -133,6 +133,11 @@ void rtp_relay_set_peer_b(rtp_relay_t *r, const nsbc_sa_t *sa);
 uint64_t rtp_relay_pkts(const rtp_relay_t *r);
 uint64_t rtp_relay_drops(const rtp_relay_t *r);
 
+/* REQ-ORIGINATE-003 &echo：RTP 环回开关。
+ * on=1 时 relay 把 side 收到的 RTP 发回同一侧（side→side），
+ * 实现"通话方听到自己回声"。调用需在 B 腿 LEG_CONFIRMED 之后。 */
+void rtp_relay_set_echo(rtp_relay_t *r, int on);
+
 /* b2bua 挂接：offer/answer SDP 出口重写；内部完成决策+端口分配+relay 建立。
  * call_key 为 b2b 层传入的不透明呼叫身份键（b2b_call_t*），本层只以其
  * 指针值做 mgr 表键（每呼叫一个），禁止解引用（REQ-ARCH-011 解耦）。 */
