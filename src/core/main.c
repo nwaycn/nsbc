@@ -17,6 +17,7 @@
 #include "nsbcd_signal.h"
 #include "playback_engine.h"
 #include "reactor.h"
+#include "security.h"       /* REQ-EXT-API-005: security_set_yaml_path */
 #include "srtp_session.h"
 
 #include <errno.h>
@@ -443,6 +444,9 @@ int main(int argc, char **argv)
          * 拼到 cfg 文件所在目录。 */
         nsbc_resolve_cfg_paths(cfg, cfgpath);
         llog(LOG_NOTICE, "core", "config loaded: %s", cfgpath);
+        /* REQ-EXT-API-005: 把 yaml 路径注入 security 模块 ——
+         * 后续 Web push → security.blacklist.reload 成功后自动写回 YAML */
+        security_set_yaml_path(cfgpath);
     } else if (cfgpath_probed) {
         fprintf(stderr, "config not found: %s\n", cfgpath);
         return 1;

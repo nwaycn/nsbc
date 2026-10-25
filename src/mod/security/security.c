@@ -35,6 +35,13 @@
 #include <pthread.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
+#include <stdarg.h>          /* va_list — yaml_replace_key */
+#include <unistd.h>
+#include <limits.h>          /* PATH_MAX */
+#include <fcntl.h>           /* open */
+#include <sys/stat.h>        /* fstat */
+#include <errno.h>
 
 /* ---- 前向声明：封禁表核心（sec_reg_cb 先于定义使用） ---- */
 static int  ban_is_banned(const char *ip);
@@ -43,9 +50,14 @@ static int  ban_note_reg_req(const char *ip);
 static int  ban_note_inv_fail(const char *ip);   /* 被动：txn slab 分配失败计数 */
 static int  ban_note_inv_count(const char *ip); /* 主动：per-IP 新 INVITE 频率计数 */
 static uint32_t ban_duration_for_strikes(uint32_t base_s, int strikes);
+static int  security_cfg_save_yaml(void);          /* REQ-EXT-API-005 前向声明 */
 
 /* === 全局配置（init 时从 YAML 加载；简化骨架：默认全 0）=== */
 static security_cfg_t g_cfg;
+
+/* REQ-EXT-API-005: 主配置 YAML 路径（security_set_yaml_path 注入；
+ * security_blacklist.reload 成功后把 fail2ban/fence 参数写回这里） */
+static char g_yaml_path[PATH_MAX] = {0};
 
 /* ==================================================================
  * Phase 4: 纯 C IPv4 CIDR 前缀匹配（替代 libcidr 重依赖）
@@ -593,6 +605,190 @@ void security_blacklist_log_drop(blacklist_result_t r, const char *ip,
     security_fence_log_drop(r, ip, ua, method, NULL, NULL);
 }
 
+/* ==================================================================
+ * REQ-EXT-API-005: Web → C YAML 持久化闭环
+ *
+ *   Web UI 改 Auto-Ban / fence / ratelimit → DB security_config 表
+ *   → spawn_push(Kind::SecurityBlacklist) → JSON 带顶级字段
+ *   → security.blacklist.reload <json> → C 内存 g_cfg.* 立即生效 ✅
+ *   → security_cfg_save_yaml() → 原子写回 conf/nsbc.yaml ✅
+ *                                  重启 nsbcd 也不丢 ✅
+ *
+ * save_yaml 策略（纯 C，零新依赖）：
+ *   1) 读整个 yaml 到堆 buffer
+ *   2) 找到 `security:` 顶层段落（以"security:"开头的缩进=0 的行）
+ *   3) 在段落内逐 key 更新；不存在的 key 在段落末尾追加（缩进 2 空格）
+ *      负责的 key：auto_ban, authfail_threshold, authfail_window_s,
+ *      ban_duration_s, ratelimit_regs, ratelimit_window_s,
+ *      ratelimit_invites, ratelimit_invites_active,
+ *      fence_mode (0/1), method_blocked (uint32 hex)
+ *   4) 原文件里 security.* 其他 key（block_on_register 等）原样保留
+ *   5) tmp 文件写 → chmod 同原文件 → rename 原子替换
+ *
+ * 幂等安全：多次 reload 只更新我们负责的 key，不碰其他段落。
+ * 非致命：yaml 不可写 / 路径没注入 → 仅 WARN log，reload 仍然成功。
+ * ==================================================================*/
+void security_set_yaml_path(const char *path)
+{
+    if (!path || !path[0]) return;
+    strncpy(g_yaml_path, path, sizeof(g_yaml_path) - 1);
+    g_yaml_path[sizeof(g_yaml_path) - 1] = '\0';
+    log_info("security", "yaml path set: %s", g_yaml_path);
+}
+
+/* 辅助：逐 key 替换 security 段落内的一行值。
+ * old_line 指向 yaml 行缓冲起始，返回值是新行起始（可能不同位置）。
+ * 替换格式："  key: value"（security 子段缩进 2 空格） */
+static int yaml_replace_key(char **buf, size_t *bufsz,
+                            const char *key, const char *valfmt, ...)
+{
+    va_list ap;
+    va_start(ap, valfmt);
+    char want_line[512];
+    vsnprintf(want_line, sizeof(want_line), valfmt, ap);
+    va_end(ap);
+
+    /* 在 *buf 里找 "  <key>:" 开头的行（security 子段缩进=2） */
+    char *line = *buf;
+    while (line && *line) {
+        if (strncmp(line, "  ", 2) == 0
+            && strncmp(line + 2, key, strlen(key)) == 0
+            && (line[2 + strlen(key)] == ':' || line[2 + strlen(key)] == ' ')) {
+            /* 替换这一行：找到行末尾 \n */
+            char *eol = strchr(line, '\n');
+            size_t old_len = eol ? (size_t)(eol - line + 1) : strlen(line);
+            size_t new_len = strlen(want_line);
+            size_t line_off = (size_t)(line - *buf);  /* 记录 line 相对 buf 偏移 */
+            if (new_len <= old_len) {
+                /* 原地覆盖 + 右侧 pad 空格防残留注释 */
+                memmove(line, want_line, new_len);
+                /* pad 到 old_len（保留 \n） */
+                for (size_t i = new_len; i < old_len - 1; ++i) line[i] = ' ';
+                line[old_len - 1] = '\n';
+                if (!eol) line[old_len] = '\0';
+            } else {
+                /* 需要扩展 —— realloc 可能搬内存，用 line_off 重算 line */
+                char *newbuf = realloc(*buf, *bufsz + new_len - old_len);
+                if (!newbuf) return -1;
+                *buf = newbuf;
+                *bufsz += new_len - old_len;
+                line = *buf + line_off;  /* ← realloc 后重算指针，消除 use-after-free */
+                memmove(line + new_len, line + old_len,
+                        strlen(line + old_len) + 1);
+                memcpy(line, want_line, new_len);
+            }
+            return 1; /* 替换成功 */
+        }
+        /* 下一行 */
+        char *eol = strchr(line, '\n');
+        if (!eol) break;
+        line = eol + 1;
+    }
+    return 0; /* 没找到 —— 让调用方追加 */
+}
+
+/* REQ-EXT-API-005: 原子写回 YAML security.段落。
+ * 返回 0=成功 / -1=非致命错误（调用方按 WARN 处理）。 */
+static int security_cfg_save_yaml(void)
+{
+    if (!g_yaml_path[0]) {
+        /* 路径未注入（比如 main 直接二进制没调 security_set_yaml_path） */
+        return -1;
+    }
+
+    /* 1) 读原文件 */
+    FILE *fp = fopen(g_yaml_path, "r");
+    if (!fp) {
+        log_warn("security", "yaml save: cannot open %s (%s)",
+                 g_yaml_path, strerror(errno));
+        return -1;
+    }
+    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return -1; }
+    long fsize = ftell(fp);
+    if (fsize < 0) { fclose(fp); return -1; }
+    rewind(fp);
+
+    size_t bufsz = (size_t)fsize + 8192; /* 留追加空间 */
+    char *buf = malloc(bufsz);
+    if (!buf) { fclose(fp); return -1; }
+    size_t got = fread(buf, 1, (size_t)fsize, fp);
+    buf[got] = '\0';
+
+    /* 存原文件权限（tmp 继承） */
+    struct stat st = {0};
+    int orig_mode = 0644;
+    if (stat(g_yaml_path, &st) == 0) orig_mode = st.st_mode & 07777;
+    fclose(fp);
+
+    /* 2) 在 buf 末尾追加 \n（防末尾没换行） */
+    if (got > 0 && buf[got - 1] != '\n') {
+        if (got + 1 >= bufsz) {
+            char *nb = realloc(buf, bufsz + 1024);
+            if (!nb) { free(buf); return -1; }
+            buf = nb; bufsz += 1024;
+        }
+        buf[got++] = '\n';
+        buf[got] = '\0';
+    }
+
+    /* 3) 逐 key 更新 */
+    #define REPLACE_OR_APPEND(key, ...) do { \
+        int did = yaml_replace_key(&buf, &bufsz, key, __VA_ARGS__); \
+        if (did < 0) { free(buf); return -1; } \
+    } while (0)
+    REPLACE_OR_APPEND("auto_ban",                 "  auto_ban: %s\n",
+                      g_cfg.auto_ban ? "true" : "false");
+    REPLACE_OR_APPEND("authfail_threshold",      "  authfail_threshold: %d\n",
+                      g_cfg.authfail_threshold);
+    REPLACE_OR_APPEND("authfail_window_s",       "  authfail_window_s: %d\n",
+                      g_cfg.authfail_window_s);
+    REPLACE_OR_APPEND("ban_duration_s",           "  ban_duration_s: %d\n",
+                      g_cfg.ban_duration_s);
+    REPLACE_OR_APPEND("ratelimit_regs",           "  ratelimit_regs: %d\n",
+                      g_cfg.ratelimit_regs);
+    REPLACE_OR_APPEND("ratelimit_window_s",       "  ratelimit_window_s: %d\n",
+                      g_cfg.ratelimit_window_s);
+    REPLACE_OR_APPEND("ratelimit_invites",        "  ratelimit_invites: %d\n",
+                      g_cfg.ratelimit_invites);
+    REPLACE_OR_APPEND("ratelimit_invites_active", "  ratelimit_invites_active: %d\n",
+                      g_cfg.ratelimit_invites_active);
+
+    /* fence_mode / method_blocked —— 可能在 security 段也可能没有
+     * （硬编码默认值没写进 yaml），用 atomic 当前值 */
+    int fm = __atomic_load_n(&g_fence_mode, __ATOMIC_RELAXED);
+    uint32_t mb = __atomic_load_n(&g_method_blocked, __ATOMIC_RELAXED);
+    REPLACE_OR_APPEND("fence_mode",     "  fence_mode: %d\n", fm);
+    REPLACE_OR_APPEND("method_blocked", "  method_blocked: 0x%x\n", mb);
+    #undef REPLACE_OR_APPEND
+
+    /* 4) 原子写 tmp → chmod → rename */
+    char tmppath[PATH_MAX + 16];
+    snprintf(tmppath, sizeof(tmppath), "%s.tmp.%u",
+             g_yaml_path, (unsigned)getpid());
+    fp = fopen(tmppath, "w");
+    if (!fp) {
+        log_warn("security", "yaml save: cannot create %s (%s)",
+                 tmppath, strerror(errno));
+        free(buf); return -1;
+    }
+    size_t out = fwrite(buf, 1, strlen(buf), fp);
+    fclose(fp);
+    free(buf);
+    if (out == 0) { unlink(tmppath); return -1; }
+    if (chmod(tmppath, orig_mode) != 0) { unlink(tmppath); return -1; }
+    if (rename(tmppath, g_yaml_path) != 0) {
+        log_warn("security", "yaml save: rename failed %s → %s (%s)",
+                 tmppath, g_yaml_path, strerror(errno));
+        unlink(tmppath);
+        return -1;
+    }
+    log_info("security", "yaml saved: %s (auto_ban=%d thr=%d win=%ds ban=%ds rl_regs=%d rl_win=%ds)",
+             g_yaml_path, g_cfg.auto_ban, g_cfg.authfail_threshold,
+             g_cfg.authfail_window_s, g_cfg.ban_duration_s,
+             g_cfg.ratelimit_regs, g_cfg.ratelimit_window_s);
+    return 0;
+}
+
 /* === Web 推送全量替换（文档 §1/§7 + NIP Phase 5） ===
  * JSON schema：
  *   数组模式（兼容）：[{"type","kind"(deny/allow,默认deny),"value","comment","enabled"}, ...]
@@ -799,6 +995,12 @@ int security_blacklist_reload_json(const char *json, char *out_err,
                g_cfg.auto_ban, g_cfg.authfail_threshold, g_cfg.authfail_window_s,
                g_cfg.ban_duration_s, g_cfg.ratelimit_regs, g_cfg.ratelimit_window_s,
                skipped);
+
+    /* REQ-EXT-API-005: 内存态已经生效 ✅；
+     * 再原子写回 YAML —— 让 nsbcd 重启后仍然生效（持久化闭环）。
+     * 非致命：yaml 不可写 → WARN 就行，reload 本身仍然成功。 */
+    (void)security_cfg_save_yaml();
+
     return NSBC_OK;
 
     #undef FILL_CIDR

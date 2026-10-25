@@ -114,9 +114,15 @@ void security_fence_log_drop(blacklist_result_t hit, const char *ip,
  *    "value":"...","comment":"...","enabled":true}
  * 顶级还可带 "fence_mode":0/1 / "method_blocked":位图数字（可选，缺省不变）
  * 单条非法（CIDR 解析失败 / UA 超长 / 未知 type/kind）→ WARN 跳过，不阻断
- * 整体替换（文档 §7：非法配置不阻断启动/更新）；整表原子换（wrlock）。 */
+ * 整体替换（文档 §7：非法配置不阻断启动/更新）；整表原子换（wrlock）。
+ * 成功后自动写回 YAML security.段落（原子 tmp+rename，主配置文件）。 */
 int security_blacklist_reload_json(const char *json, char *out_err,
                                    size_t err_sz);
+
+/* ==== YAML 回写路径注入（REQ-EXT-API-005 持久化闭环） ====
+ * 主程序在 cfg_load_file 成功后调一次 —— 让 security 模块知道自己该
+ * 往哪个文件写回 fail2ban/fence 的 Web UI 实时变更。 */
+void security_set_yaml_path(const char *path);
 
 /* 当前 fence_mode 快照（atomic 读取）——b2bua.c 热路径可能直接查 */
 int security_fence_mode_get(void);

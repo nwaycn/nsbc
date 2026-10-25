@@ -96,13 +96,35 @@ recording:
   format: "wav"                         # wav / opus / g711
   max_concurrent: 128                   # max concurrent recording sessions
 
+# ---- Fail2ban auto-ban (REQ-SEC-005, nsbcd-only) ----
+# C side security module reads these YAML keys; hardcoded defaults below
+# are used when keys are absent. Every auto-ban lands on CDR.is_malicious=1
+# so the Web UI can Tab-separate "正常" vs "恶意" calls.
+security:
+  # master switch: false = 所有 fail2ban 计数不启用（静态 blacklist 仍生效）
+  auto_ban: true                        # 默认 on（src/mod/security/security.c:1716）
+
+  # SIP REGISTER auth-failure trigger（扫号器最常触发的通道）
+  # 60 秒内同一 IP 认证失败 >= threshold → ban ban_duration_s 秒
+  authfail_threshold: 3                 # 3 次就 ban（默认 5；攻击流量阈值建议 2-3）
+  authfail_window_s: 30                 # 30 秒窗口（默认 60）
+  ban_duration_s: 3600                  # ban 1 小时（默认 3600；重犯按 strikes 阶梯加重）
+
+  # SIP REGISTER rate-limit（即使认证通过也拦突发 REGISTER flood）
+  ratelimit_regs: 10                    # window 内最多 REGISTER 次数（默认 10）
+  ratelimit_window_s: 30                # 窗口秒（默认 30）
+
+  # INVITE flood guard（注册完成后同一 IP 狂发 INVITE）
+  ratelimit_invites: 20                 # 全局滑窗内最多 new INVITE（默认 20）
+  ratelimit_invites_active: 5           # 同时活跃 INVITE 数上限（默认 5）
+
 system:
   config_snapshot_dir: "../data/snapshots"
 
 # ---- nsbc-web-only ----
 web:
   enabled: true
-  bind: "0.0.0.0:8443"
+  bind: "0.0.0.0:443"
   tls:
     # ---- basics ----
     enabled: true                        # set false for plain HTTP
@@ -115,7 +137,7 @@ web:
     # 1) both cert_path + key_path exist -> use directly (no renewal, user-managed)
     # 2) public: true               -> public ACME Let's Encrypt (requires certmagic dep; current fallback self-signed)
     # 3) auto_generate: true        -> intranet self-signed + background auto-renew (default)
-    auto_generate: true 
+    auto_generate: true
 
     # ---- intranet self-signed mode ----
     validity_days: 2                     # very short validity (security first), background auto-renew
@@ -140,6 +162,12 @@ web:
     acme_email: "1354608370@qq.com"        # <- expiry/revocation notifications (can be empty but strongly recommended)
     acme_cache_dir: "../acme-cache"      # <- account + cert cache (avoids re-request on restart)
     acme_staging: false                   # <- true for testing, false for production
+
+  # ---- External API (REQ-EXT-API-004: loopback 免鉴权) ----
+  # 默认：127.0.0.1 / ::1 本机请求自动跳过 API Key 检查（本机脚本零摩擦）。
+  # 反代部署（nginx/Apache → 127.0.0.1:8443）必须设 true —— 反代过来的远程请求 peer 也是 loopback。
+  ext:
+    require_loopback_auth: false         # 默认 false（本机免鉴权）；反代必须 true
 
 auth:
   # JWT signing secret (>=32 bytes; production MUST replace with a random value!)

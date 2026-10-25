@@ -15,8 +15,11 @@
 #include "b2bua.h"
 #include "dialplan.h"
 #include "dp_sleep.h"
+
+#include <unistd.h>
 #include "ivr.h"           /* ivr_session_start / ivr_profile_find */
 #include "log.h"
+#include "media_bridge.h"  /* REQ-ORIGINATE-003 &echo as dialplan app: bridge_lookup_relay + rtp_relay_set_echo */
 #include "playback_engine.h"
 #include "timer_wheel.h"
 
@@ -723,6 +726,53 @@ static app_rc_t app_gentones(app_ctx_t *c, const char *data, void *ud)
     return APP_RC_FAILED;
 }
 
+/* ---- 13. echo（REQ-ORIGINATE-003 作为 dialplan app）----
+ *
+ * 把 media bridge 的 relay 切到 RTP 环回模式：
+ * relay_recv_one 收到 side=N 的包不再转发到 side=other，
+ * 而是发回 side=N 自己（两侧各自 side→side），
+ * 让通话方听到自己的回声。
+ *
+ * 调用时机：dialplan 在 A 腿 answer 后执行 app_chain 时。
+ * 要求：两侧 leg 都是 CONFIRMED（relay 已建好）。
+ *        单侧 inbound 还没 answer 时执行 → relay 不存在 → 返回 FAILED。
+ * data 参数：可空；传入时长秒（如 "30"）会在 N 秒后自动关闭 echo 恢复正常转发。
+ *           当前实现忽略 data（全程 echo 直到通话挂断），P1 实装 auto-timeout。 */
+static app_rc_t app_echo(app_ctx_t *c, const char *data, void *ud)
+{
+    (void)ud;
+    if (!cv_call_alive(c)) return APP_RC_FAILED;
+
+    nsbc_ctx_t *ctx = nsbc_get_ctx();
+    if (!ctx || !ctx->bridge) {
+        llog(LOG_WARN, "app", "echo: no bridge_mgr (media bridge not loaded)");
+        return APP_RC_FAILED;
+    }
+
+    bridge_mgr_t *m = (bridge_mgr_t *)ctx->bridge;
+    rtp_relay_t *relay = NULL;
+    nsbc_sa_t peer_unused[2];
+    /* REQ-ORIGINATE-003 race 修复：inbound 来电 answer 后 WebRTC DTLS
+     * async build relay，加重试循环（每 50ms，最多 2s）。 */
+    int lrc = NSBC_NOENT;
+    for (int retry = 0; retry < 40; retry++) {
+        lrc = bridge_lookup_relay(m, c->call_key, &relay, peer_unused);
+        if (lrc == NSBC_OK && relay) break;
+        usleep(50000);
+    }
+    if (lrc != NSBC_OK || !relay) {
+        llog(LOG_WARN, "app",
+             "echo: relay lookup rc=%d (not yet built or bypass mode) call_key=%p",
+             lrc, c->call_key);
+        return APP_RC_FAILED;
+    }
+
+    rtp_relay_set_echo(relay, 1);
+    llog(LOG_INFO, "app", "echo: RTP loopback ON call_key=%p data=%s",
+         c->call_key, data ? data : "(no auto-timeout)");
+    return APP_RC_OK;
+}
+
 /* ================================================================
  * 模块 init：自动注册内建 Application
  *
@@ -750,6 +800,7 @@ static const app_desc_t builtin_apps[] = {
     { "uuid_break",         "打断当前 call 的 playback/sleep（双模：DP app + ESL api）", app_uuid_break, NULL },
     { "read",               "DTMF 收号（P0 占位，P1 实装）",                     app_read,              NULL },
     { "ivr",                "启动 IVR 菜单 session；data=<menu_name>",          app_ivr,               NULL },
+    { "echo",               "RTP 环回（两侧各自 self→self，听自己回声）",        app_echo,              NULL },
 };
 
 /* 对外暴露：Dialplan 模块 init 时调此函数一次性注册内建 apps。 */
