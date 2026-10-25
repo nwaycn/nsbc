@@ -49,7 +49,7 @@ $(if $(filter 0,$(_lock_rc)),,$(error cargo generate-lockfile failed (exit $(_lo
 endif
 endif
 
-.PHONY: all fetch vendor build build-acme run run-acme clean check check-acme
+.PHONY: all fetch vendor build build-acme install run run-acme clean check check-acme
 
 # ===== 1. online preparation (first time or after Cargo.toml changes) =====
 # cargo generate-lockfile auto-parses all deps in Cargo.toml (including optional certon)
@@ -96,23 +96,40 @@ vendor: fetch
 # ===== 2. compile =====
 all: build
 
+# build: 编译 + 便捷 cp 到项目根（开发模式快速 ./nsbc-web 直接跑）
+# 注意: 正式部署请用 `make install` （由根 Makefile 调 web install）
 build:
 	@echo "=== cargo build --release (default intranet mode) ==="
 	$(CARGO) build --release $(OFFLINE)
 	@echo "✅ build done → $(BINARY)"
-	@echo "=== copy to ../ ==="
+	@echo "=== cp to parent directory (dev convenience) ==="
 	cp -f target/release/nsbc-web ../.
 	cp -rf static ../.
-	@echo "✅ install done (binary + static copied to parent directory)"
+	@echo "✅ local copy done (nsbc-web + static → project root)"
 
 build-acme:
 	@echo "=== cargo build --release --features acme (public ACME) ==="
 	$(CARGO) build --release $(OFFLINE) --features acme
-	@echo "✅ build-acme done → $(BINARY)  (certon TLS-ALPN-01 compiled)"
-	@echo "=== copy to ../ ==="
+	@echo "=== cp to parent directory (dev convenience) ==="
 	cp -f target/release/nsbc-web ../.
 	cp -rf static ../.
-	@echo "✅ install done (binary + static copied to parent directory)"
+	@echo "✅ local copy done (nsbc-web + static → project root)"
+
+# install: 正式部署安装（由根 Makefile install 调，或单独调）
+# PREFIX / DESTDIR 从父 Makefile 或环境继承；默认 /usr/local/web
+# 装 $(PREFIX)/web/nsbc-web + $(PREFIX)/web/static/
+PREFIX   ?= /usr/local
+DESTDIR  ?=
+WEB_INSTALL_DIR := $(DESTDIR)$(PREFIX)/web
+
+install:
+	@echo "=== web install → $(WEB_INSTALL_DIR) ==="
+	@mkdir -p $(WEB_INSTALL_DIR)
+	install -m 0755 target/release/nsbc-web $(WEB_INSTALL_DIR)/nsbc-web
+	cp -rf static $(WEB_INSTALL_DIR)/static
+	@echo "✅ web install done:"
+	@echo "   $(WEB_INSTALL_DIR)/nsbc-web"
+	@echo "   $(WEB_INSTALL_DIR)/static/"
 
 # ===== 3. quick check (no binary output) =====
 check:

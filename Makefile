@@ -260,7 +260,7 @@ CLI_CPPFLAGS =
 CLI_LDLIBS   = -lpthread -ledit
 endif
 
-.PHONY: all check clean asan tsan ubsan install cli modules
+.PHONY: all check clean asan tsan ubsan install cli modules web web-acme web-check web-clean build-acme
 
 all: $(TARGET) $(CLI_TARGET) $(DYNAMIC_SOS)
 
@@ -348,6 +348,45 @@ ubsan:
 	$(MAKE) --no-print-directory SANITIZE=ubsan BUILD=$(BUILD)-ubsan -j$(NPROC) check
 
 PREFIX ?= /usr/local
+DESTDIR ?=
+
+# WITH_WEB=1 (default)  → install 同时构建安装 nsbc-web (需要 Rust stable toolchain)
+# WITH_WEB=0             → install 只装 C core (无 Rust 环境的服务器)
+WITH_WEB ?= 1
+
+# ============================================================
+# nsbc-web 快捷目标（根目录直接调 web/Makefile 对应 target）
+#   make web          → cd web && make build         (内网默认)
+#   make web-acme     → cd web && make build-acme     (公网 ACME)
+#   make web-check    → cd web && make check
+#   make web-clean    → cd web && make clean
+#   make build-acme   → C core all + web-acme (一键全编译 + 产物到根目录)
+# 注意: web-acme/build-acme 都会把 nsbc-web + static 复制到项目根，
+#       和 nsbcd/nsbc_cli 并列，这样 ./nsbc-web -c conf/nsbc.yaml 直接跑
+# ============================================================
+web:
+	@echo "=== [nsbc-web] build (intranet mode) ==="
+	$(MAKE) -C web build
+	cp -f web/target/release/nsbc-web .
+	cp -rf web/static .
+	@echo "✅ nsbc-web + static → ./ (和 nsbcd/nsbc_cli 并列)"
+
+web-acme:
+	@echo "=== [nsbc-web] build-acme (public ACME TLS-ALPN-01) ==="
+	$(MAKE) -C web build-acme
+	cp -f web/target/release/nsbc-web .
+	cp -rf web/static .
+	@echo "✅ nsbc-web + static → ./ (和 nsbcd/nsbc_cli 并列)"
+
+web-check:
+	$(MAKE) -C web check
+
+web-clean:
+	$(MAKE) -C web clean
+
+# build-acme: 一键编 C core + web-acme (公网部署最常用)
+build-acme: all web-acme
+
 install: $(TARGET) $(CLI_TARGET)
 	install -d $(DESTDIR)$(PREFIX)/sbin $(DESTDIR)/etc/nsbc
 	install -m 0755 $(TARGET) $(DESTDIR)$(PREFIX)/sbin/nsbcd
@@ -361,6 +400,16 @@ ifeq ($(NSBC_WITH_DLOPEN),1)
 	install -d $(DESTDIR)$(PREFIX)/etc/nsbc/mod
 	@if [ -f build/mod.load ]; then install -m 0644 build/mod.load $(DESTDIR)$(PREFIX)/etc/nsbc/mod/mod.load; fi
 endif
+ifeq ($(WITH_WEB),1)
+	@echo ""
+	@echo "=== WITH_WEB=1 → build + install nsbc-web ==="
+	$(MAKE) -C web build
+	$(MAKE) -C web install PREFIX=$(PREFIX) DESTDIR=$(DESTDIR)
+	@echo "✅ nsbc-web 已安装到 $(DESTDIR)$(PREFIX)/web/  (二进制 + static/)"
+else
+	@echo "WITH_WEB=0 → 跳过 nsbc-web。如需安装: cd web && make install"
+endif
 
 clean:
 	rm -rf build
+	$(MAKE) -C web clean

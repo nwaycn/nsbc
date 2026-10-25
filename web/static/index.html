@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -199,6 +199,10 @@
       <config-editor    v-else-if="route === '/config'"></config-editor>
       <!-- 工具 -->
       <webrtc-page      v-else-if="route === '/webrtc'"></webrtc-page>
+      <!-- 外部 API 平台 (REQ-EXT-API-001) -->
+      <ext-keys         v-else-if="route === '/ext/keys'"></ext-keys>
+      <ext-webhooks     v-else-if="route === '/ext/webhooks'"></ext-webhooks>
+      <ext-api-guide    v-else-if="route === '/ext/guide'"></ext-api-guide>
       <div v-else class="text-center text-gray-500 py-20">
         <i class="fa-solid fa-hand-point-right text-4xl mb-4"></i>
         <p>{{ t('Select a module from the sidebar to start') }}</p>
@@ -214,6 +218,8 @@
 <!-- 实时监控面板（realtime/channels/cdrs 等） -->
 <script src="js/pages-live.js?v=20261023d"></script>
 <script src="js/pages-security.js?v=20261023d"></script>
+<!-- 外部 API 平台: API Key / Webhook 管理 + 使用指南 (REQ-EXT-API-001) -->
+<script src="js/pages-ext.js?v=20261024a"></script>
 <!-- JsSIP 3.10.0 UMD — WebRTC 共享电话层（addTrack patch + SDP 工具 + Hold/DTMF） -->
 <script src="js/jssip-3.10.0.min.js"></script>
 <script src="js/nsbc-phone.js?v=20261018b"></script>

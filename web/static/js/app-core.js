@@ -863,6 +863,10 @@ const app = createApp({
       { path: '/ha-groups',    label: t('HA Groups'), icon: 'fa-solid fa-server' },
       // 工具
       { path: '/webrtc',       label: t('WebRTC Test'), icon: 'fa-solid fa-video' },
+      // REQ-EXT-API-001: 外部 API 平台
+      { path: '/ext/keys',     label: '🔑 API Key 管理', icon: 'fa-solid fa-key' },
+      { path: '/ext/webhooks', label: '🔔 Webhook 回调', icon: 'fa-solid fa-plug' },
+      { path: '/ext/guide',    label: '📡 外部 API 使用指南', icon: 'fa-solid fa-book-open' },
     ];
 
     window.addEventListener('hashchange', () => { route.value = location.hash.replace('#', '') || '/extensions'; });
