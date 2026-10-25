@@ -2094,10 +2094,20 @@ int bridge_rewrite_sdp(const char *in, size_t in_len, char *out,
                     orig_port = orig_port * 10u + (uint32_t)(*q - '0');
 
                 uint16_t this_port;
-                if (orig_port == 0) {
-                    this_port = 0;
-                } else if (!media_port) {
+                if (!media_port) {
+                    /* 没有 relay 要转发（BYPASS）→ 原样保留 orig_port */
                     this_port = (uint16_t)orig_port;
+                } else if (orig_port == 0) {
+                    /* ★ REQ-ORIGINATE-ECHO-002：orig_port=0 通常是 auto_offer
+                     * （originate 构造的最小 SDP）或被上一节点标记为 rejected。
+                     * 但如果我们有 relay（media_port!=0），说明 offer_hook
+                     * 已决定做 SRTP_RELAY 转发 → 必须用 relay 的真实端口，
+                     * 不能保留 0 否则对端收到 m=audio 0 + a=inactive →
+                     * 不回 200 OK 或回 200 但不发音频。 */
+                    this_port = (uint16_t)(media_port + (uint16_t)(media_idx * 2));
+                    llog(LOG_INFO, "media",
+                         "rewrite: orig_port=0 but relay active → force port=%u idx=%d",
+                         this_port, media_idx);
                 } else {
                     /* 所有非 rejected 段都递增 media_idx * 2：
                      *   ASIS   → relay 端口按 idx 偏移（两端 LAN 直连，不改 relay 端口）

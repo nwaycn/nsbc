@@ -1641,15 +1641,33 @@ static void maybe_start_media(b2b_call_t *c)
     b2b_core_t *co = c->core;
     if (c->media_done || !co->cfg.media)
         return;
-    if (!c->leg[0].answer_len && !c->leg[0].offer_len)
+
+    /* ---- bridge 模式（leg[0] 收到 INVITE offer，leg[1] 收 B 腿 2xx answer）---- */
+    if (c->leg[0].offer_len || c->leg[0].answer_len) {
+        if (!c->leg[0].offer_len)
+            return;
+        if (!c->leg[1].answer_len)
+            return;
+        c->media_done = 1;
+        co->cfg.media(c, c->leg[0].offer, c->leg[0].offer_len,
+                      c->leg[1].answer, c->leg[1].answer_len,
+                      co->cfg.media_ud);
         return;
-    /* A 侧 offer 已随 INVITE 收到，B 侧 answer 在 2xx 中 */
-    if (!c->leg[1].answer_len)
-        return;
-    c->media_done = 1;
-    co->cfg.media(c, c->leg[0].offer, c->leg[0].offer_len,
-                  c->leg[1].answer, c->leg[1].answer_len,
-                  co->cfg.media_ud);
+    }
+
+    /* ---- originate 单腿模式（leg[1] offer=我们发出，leg[1] answer=收到 2xx）----
+     *
+     * 之前 bridge_confirm 依赖 leg[0].offer_len → originate 模式 leg[0] 没创建
+     * → bridge_confirm 永不调用 → codec transcode/dtmf/precondition 全没初始化。
+     * echo 只需要 relay+echo_mode，不直接依赖 bridge_confirm，但后续转码、
+     * DTMF、precondition 都需要它来 finalize。 */
+    if (c->leg[1].offer_len && c->leg[1].answer_len) {
+        c->media_done = 1;
+        co->cfg.media(c, c->leg[1].offer, c->leg[1].offer_len,
+                      c->leg[1].answer, c->leg[1].answer_len,
+                      co->cfg.media_ud);
+        llog(LOG_INFO, "media", "maybe_start_media: originate mode confirmed");
+    }
 }
 
 /* B 2xx 后向 B 逐跳发 ACK（含 2xx 重传吸收） */
@@ -2345,6 +2363,13 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                 }
                 } /* closes profile guard block */
                 send_ack_leg(c, 1);
+
+                /* ★ originate 单腿模式：bridge_confirm（maybe_start_media）
+                 * 在 bridge 模式里是 A 腿 ACK 后调（L4400），originate 没有
+                 * A 腿 → respond_a 是 no-op → 必须在这里直接调，
+                 * 否则 bridge_confirm 永不执行 → relay peer/codec/dtmf 全未 finalize。 */
+                maybe_start_media(c);
+
                 if (!reinv) {
                     /* 向 A 透传 2xx，等 A 腿 ACK 后确认 */
                     respond_a(c, st, c->leg[1].answer,
@@ -5829,7 +5854,99 @@ int b2b_originate(b2b_core_t *co, const b2b_orig_t *o, b2b_call_t **out)
         tbl_link(co, c, 1);
         add_atomic(&co->total, 1);
 
-        b->inv_txn = send_invite_b(c, 1, b->offer, b->offer_len, 0, NULL);
+        /* ★ REQ-ORIGINATE-ECHO-001：单腿外呼 offer_hook 链
+         *
+         * 之前模式 1 直接 send_invite_b，完全跳过 offer_hook → relay 永不创建 →
+         * bridge_lookup_relay 在 &echo 后置处理里永远返回 NOENT → echo 无声。
+         *
+         * 修复：与 bridge 模式（L4143-4185）同构走 offer_hook + NAT rewrite。
+         * 如果调用方没带 offer SDP（o->sdp_len=0，常见 CLI originate 场景），
+         * 自动构造最小 PCMU offer（c=0.0.0.0 m=0）—— offer_hook 会创建 relay
+         * 并把 c= 改写成 external_rtp_ip、m= 改写成 relay 实际端口。 */
+        {
+            /* 没带 offer → 构造最小 PCMU SDP（0.0.0.0/port 0，hook 后会被改写） */
+            char auto_offer[B2B_SDP_MAX] = {0};
+            if (b->offer_len == 0) {
+                int n = snprintf(auto_offer, sizeof(auto_offer),
+                    "v=0\r\n"
+                    "o=- 0 0 IN IP4 0.0.0.0\r\n"
+                    "s=-\r\n"
+                    "c=IN IP4 0.0.0.0\r\n"
+                    "t=0 0\r\n"
+                    "m=audio 0 RTP/AVP 0\r\n"
+                    "a=rtpmap:0 PCMU/8000\r\n");
+                if (n > 0 && (size_t)n <= sizeof(auto_offer)
+                    && (size_t)n <= sizeof(b->offer)) {
+                    memcpy(b->offer, auto_offer, (size_t)n);
+                    b->offer_len = (size_t)n;
+                    llog(LOG_INFO, "b2b",
+                         "originate: auto offer SDP generated len=%d", n);
+                } else {
+                    llog(LOG_WARN, "b2b",
+                         "originate: auto offer SDP too long, skip offer_hook");
+                }
+            }
+
+            const char *out_sdp = b->offer;
+            size_t out_sdp_len = b->offer_len;
+            char rewritten[B2B_SDP_MAX]; rewritten[0] = '\0';
+
+            /* offer_hook 多槽链（bridge_offer_hook 等） */
+            if (b->offer_len && g_sdp_hook_n[B2B_SDP_OFFER] > 0) {
+                pthread_mutex_lock(&g_sdp_hook_lock);
+                for (int i = 0; i < g_sdp_hook_n[B2B_SDP_OFFER]; ++i) {
+                    char buf[B2B_SDP_MAX]; buf[0] = '\0';
+                    const char *in = (rewritten[0] ? rewritten : b->offer);
+                    size_t inlen = rewritten[0] ? strlen(rewritten) : b->offer_len;
+                    int n = g_sdp_hooks[B2B_SDP_OFFER][i].fn(c, in, inlen, buf,
+                                                             sizeof(buf),
+                                                             g_sdp_hooks[B2B_SDP_OFFER][i].ud);
+                    if (n >= 0) {
+                        memcpy(rewritten, buf, (size_t)n);
+                        rewritten[n] = '\0';
+                    }
+                }
+                pthread_mutex_unlock(&g_sdp_hook_lock);
+                if (rewritten[0]) {
+                    out_sdp = rewritten;
+                    out_sdp_len = strlen(rewritten);
+                }
+                llog(LOG_INFO, "b2b",
+                     "originate: offer_hook done out_len=%zu rewritten=%d",
+                     out_sdp_len, rewritten[0] ? 1 : 0);
+            }
+
+            /* NAT rewrite：offer SDP c= 私网 IP → external_rtp_ip */
+            const char *prof_rtp = (c->prof && c->prof->external_rtp_ip[0])
+                                   ? c->prof->external_rtp_ip : co->cfg.external_rtp_ip;
+            const char *prof_sip = (c->prof && c->prof->external_sip_ip[0])
+                                   ? c->prof->external_sip_ip : co->cfg.external_sip_ip;
+            const char *nat_rtp_ip = (prof_rtp && prof_rtp[0]) ? prof_rtp
+                                     : (prof_sip && prof_sip[0]) ? prof_sip : NULL;
+            if (nat_rtp_ip && nat_rtp_ip[0] && out_sdp_len) {
+                if (out_sdp != rewritten)
+                    memcpy(rewritten, out_sdp, out_sdp_len);
+                rewritten[out_sdp_len] = '\0';
+                out_sdp_len = nat_sdp_rewrite(rewritten, out_sdp_len, sizeof(rewritten),
+                                              nat_rtp_ip, prof_sip);
+                out_sdp = rewritten;
+                llog(LOG_INFO, "b2b",
+                     "originate: NAT rewrite done nat_rtp=[%s] out_len=%zu",
+                     nat_rtp_ip, out_sdp_len);
+            }
+
+            /* ★ 和 bridge 模式 L4219-4224 对称：把改写+NAT 后的 SDP 存回 leg，
+             * 供 bridge_confirm 后续读取（originate 模式 offer 在 leg[1]，
+             * bridge 模式 offer 在 leg[0]）。 */
+            if (out_sdp_len > 0 && out_sdp_len <= B2B_SDP_MAX) {
+                memcpy(b->offer, out_sdp, out_sdp_len);
+                b->offer_len = out_sdp_len;
+            } else {
+                b->offer_len = 0;
+            }
+
+            b->inv_txn = send_invite_b(c, 1, out_sdp, out_sdp_len, 0, NULL);
+        }
         if (!b->inv_txn) {
             call_destroy(c);
             return NSBC_ERR;
