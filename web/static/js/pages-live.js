@@ -1,4 +1,4 @@
-﻿// =============================================================================
+// =============================================================================
 // NSBC Web — 实时监控 / 只读面板组件
 // 加载顺序：必须在 app-core.js 之后
 // 依赖：app-core.js 中声明的全局 const app, livePanel, API, ref, onMounted
@@ -435,6 +435,7 @@ app.component('cdrs-live', {
     let timer;
 
     // Tab 切换（REQ-SEC-005: malicious filter）
+    // 项目风格：中文硬编码为主 + t() 做通用项翻译
     const tabs = [
       { key: 'all',      label: '全部',   icon: '📋' },
       { key: 'normal',   label: '正常',   icon: '✅' },
@@ -534,9 +535,10 @@ app.component('cdrs-live', {
     }
     onMounted(() => { load(); timer = setInterval(load, 10000); });
     onMounted(() => clearInterval(timer));
-    return { rows, total, loading, error, currentPage, totalPages, goPage,
+    return { rows, total, loading, error, pageSize, currentPage, totalPages, goPage,
              getRecUrl, getMeta, ringTime, formatBillsec, fmtIso, isoMs,
-             tabs, activeTab, q, sortBy, sortDir, resetFilters };
+             tabs, activeTab, q, sortBy, sortDir, resetFilters,
+             load };  // ← load + pageSize 必须都 return，模板 v-if="total > pageSize" 靠它
   },
 });
 

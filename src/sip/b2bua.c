@@ -17,6 +17,7 @@
 #include "ha.h"                 /* REQ-HA-001: 主备角色门控（ha_role，主二进制内符号） */
 #include "log.h"
 #include "media_bug.h"
+#include "media_bridge.h"   /* REQ-ORIGINATE-003 &echo: bridge_lookup_relay + rtp_relay_set_echo */
 #include "metric_reg.h"
 #include "nsbc_id.h"
 #include "recorder.h"
@@ -3191,15 +3192,29 @@ static void b2b_emit_cdr(b2b_call_t *c, cdr_phase_t phase)
             case 481: ev.disposition = CDR_DISP_FAILED;    break;
             default:  ev.disposition = CDR_DISP_FAILED;    break;
         }
-        /* ---- security threat 标记（REQ-SEC-005）----
-         * 源 IP 命中 auto-ban / blacklist → 标记 is_malicious + 原因。
+        /* ---- security threat 标记（REQ-SEC-005 + REQ-SEC-006）----
+         * 两层判定，任一命中即恶意（仅对有来源 IP 的 SIP INVITE 生效；
+         * originate 外呼 / bridge 无 from_ip → 跳过，保持合法）：
+         *   层 1：源 IP 命中 auto-ban / blacklist → is_malicious + threat_reason
+         *   层 2：拨号规则全走完没人认领（dp_matched=0）→ No matching dialplan rule
          * 让正常通话和恶意攻击在 CDR 层分流 —— 前端可以按 is_malicious
          * Tab 切换（全部 / 正常 / 恶意），运维可以单独审计攻击流量。 */
+        int malicious = 0;
         if (c->from_ip[0]) {
-            char reason[32];
+            char reason[48];
             if (security_get_threat(c->from_ip, reason, sizeof(reason))) {
                 ev.is_malicious = 1;
-                snprintf(ev.threat_reason, sizeof(ev.threat_reason), "%s", reason);
+                snprintf(ev.threat_reason, sizeof(ev.threat_reason),
+                         "SecurityBan: %s", reason);
+                malicious = 1;
+            }
+            if (!malicious && c->dp_matched == 0) {
+                /* dp 全规则走完无人认领 → 扫号/未知来源 —— 即使 IP 没触发 ban
+                 * 阈值（扫号器可能只刷 3-4 次就换 IP），也标记恶意 */
+                ev.is_malicious = 1;
+                snprintf(ev.threat_reason, sizeof(ev.threat_reason),
+                         "No matching dialplan rule");
+                malicious = 1;
             }
         }
         /* ---- 网络端点 + codec + 媒体质量 + 录音（REQ-CDR-002 补全）----
@@ -5725,10 +5740,12 @@ int b2b_originate(b2b_core_t *co, const b2b_orig_t *o, b2b_call_t **out)
             uds_send_session(sess);
         }
 
-        /* REQ-ORIGINATE-003 待补：&park / &hangup 后置 app —— 等 B 腿 answer 后执行。
+        /* REQ-ORIGINATE-003 &park / &hangup / &echo 后置 app —— 等 B 腿 answer 后执行。
          * 在 OAM 线程执行（b2b_hold_call/b2b_terminate 自身加锁，安全）。
-         * &echo 无环回媒体实现，仅告警保持呼叫在线。 */
-        if (o->post_app == B2B_APP_PARK || o->post_app == B2B_APP_HANGUP) {
+         * &echo 现在有环回媒体实现：设置 relay->echo_mode=1，让两侧各自
+         * 环回自己的 RTP peer（side→side），通话方听到自己回声。 */
+        if (o->post_app == B2B_APP_PARK || o->post_app == B2B_APP_HANGUP
+            || o->post_app == B2B_APP_ECHO) {
             int wait_ms = (o->timeout_ms > 0) ? o->timeout_ms : 60000;
             int waited = 0;
             while (waited < wait_ms) {
@@ -5751,13 +5768,42 @@ int b2b_originate(b2b_core_t *co, const b2b_orig_t *o, b2b_call_t **out)
                 int hrc = b2b_hold_call(c, -1, 1, NULL, 0);
                 llog(LOG_INFO, "b2b", "originate &park applied rc=%d callid=%s",
                      hrc, b->callid);
-            } else {
+            } else if (o->post_app == B2B_APP_HANGUP) {
                 llog(LOG_INFO, "b2b", "originate &hangup terminating callid=%s", b->callid);
                 b2b_terminate(c, 0);
+            } else { /* B2B_APP_ECHO */
+                nsbc_ctx_t *ctx = nsbc_get_ctx();
+                if (ctx && ctx->bridge) {
+                    bridge_mgr_t *m = (bridge_mgr_t *)ctx->bridge;
+                    rtp_relay_t *relay = NULL;
+                    nsbc_sa_t peer_unused[2];
+                    /* REQ-ORIGINATE-003 race 修复：WebRTC/DTLS 呼叫 LEG_CONFIRMED
+                     * 到了但 relay 还没建好（async setup），加重试循环。
+                     * 每 50ms 一次，最多 2s —— DTLS 通常 200-500ms 内就绪。 */
+                    int lrc = NSBC_NOENT;
+                    for (int retry = 0; retry < 40; retry++) {
+                        lrc = bridge_lookup_relay(m, c, &relay, peer_unused);
+                        if (lrc == NSBC_OK && relay) break;
+                        if (co->stopping) break;
+                        usleep(50000); /* 50ms */
+                    }
+                    if (lrc == NSBC_OK && relay) {
+                        rtp_relay_set_echo(relay, 1);
+                        llog(LOG_INFO, "b2b",
+                             "originate &echo loopback ON callid=%s", b->callid);
+                    } else {
+                        llog(LOG_WARN, "b2b",
+                             "originate &echo bridge_lookup_relay failed rc=%d "
+                             "(relay not yet built or bypass mode), callid=%s",
+                             lrc, b->callid);
+                    }
+                } else {
+                    llog(LOG_WARN, "b2b",
+                         "originate &echo no bridge_mgr (media bridge not loaded) callid=%s",
+                         b->callid);
+                }
+                /* echo 模式：保持呼叫在线，不 park/hangup */
             }
-        } else if (o->post_app == B2B_APP_ECHO) {
-            llog(LOG_WARN, "b2b",
-                 "originate &echo unsupported (no loopback media) callid=%s", b->callid);
         }
 
         if (out)

@@ -3082,6 +3082,128 @@ sqlx::query(acct_ddl).execute(pool).await?;
         }
     }
 
+    // ====================================================================
+    // REQ-EXT-API-001: ext_api_keys — 外部 API Key 鉴权
+    // 和 Web UI 的 web_users（JWT + rbac）完全隔离
+    // ====================================================================
+    let ext_keys_ddl = match backend {
+        "sqlite" =>
+            "CREATE TABLE IF NOT EXISTS ext_api_keys (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                key_hash      TEXT    NOT NULL UNIQUE,
+                label         TEXT    NOT NULL DEFAULT '',
+                scope         TEXT    NOT NULL DEFAULT 'readwrite',
+                created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+                last_used_at  TEXT,
+                revoked_at    TEXT
+            )",
+        "postgres" =>
+            "CREATE TABLE IF NOT EXISTS ext_api_keys (
+                id            BIGSERIAL PRIMARY KEY,
+                key_hash      VARCHAR(64) NOT NULL UNIQUE,
+                label         VARCHAR(128) NOT NULL DEFAULT '',
+                scope         VARCHAR(16)  NOT NULL DEFAULT 'readwrite',
+                created_at    TEXT NOT NULL DEFAULT (to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD') || 'T' || to_char(NOW() AT TIME ZONE 'UTC', 'HH24:MI:SS.MS') || 'Z'),
+                last_used_at  TEXT,
+                revoked_at    TEXT
+            )",
+        _ =>
+            "CREATE TABLE IF NOT EXISTS ext_api_keys (
+                id            BIGINT AUTO_INCREMENT PRIMARY KEY,
+                key_hash      VARCHAR(64) NOT NULL UNIQUE,
+                label         VARCHAR(128) NOT NULL DEFAULT '',
+                scope         VARCHAR(16)  NOT NULL DEFAULT 'readwrite',
+                created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_used_at  DATETIME NULL,
+                revoked_at    DATETIME NULL,
+                UNIQUE KEY uq_key_hash (key_hash)
+            )",
+    };
+    sqlx::query(ext_keys_ddl).execute(pool).await?;
+
+    // ====================================================================
+    // REQ-EXT-API-001: ext_webhooks — 外部事件回调注册
+    // （dispatcher task 在 P1 实现，先建表 + CRUD）
+    // ====================================================================
+    let webhooks_ddl = match backend {
+        "sqlite" =>
+            "CREATE TABLE IF NOT EXISTS ext_webhooks (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                url            TEXT    NOT NULL,
+                events_filter  TEXT    NOT NULL DEFAULT 'CALL_INCOMING,CALL_ANSWERED,CALL_END',
+                active         INTEGER NOT NULL DEFAULT 1,
+                last_ok_at     TEXT,
+                fail_count     INTEGER NOT NULL DEFAULT 0,
+                created_at     TEXT    NOT NULL DEFAULT (datetime('now'))
+            )",
+        "postgres" =>
+            "CREATE TABLE IF NOT EXISTS ext_webhooks (
+                id             BIGSERIAL PRIMARY KEY,
+                url            VARCHAR(512) NOT NULL,
+                events_filter  VARCHAR(256) NOT NULL DEFAULT 'CALL_INCOMING,CALL_ANSWERED,CALL_END',
+                active         INTEGER NOT NULL DEFAULT 1,
+                last_ok_at     TEXT,
+                fail_count     INTEGER NOT NULL DEFAULT 0,
+                created_at     TEXT NOT NULL DEFAULT (to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD') || 'T' || to_char(NOW() AT TIME ZONE 'UTC', 'HH24:MI:SS.MS') || 'Z')
+            )",
+        _ =>
+            "CREATE TABLE IF NOT EXISTS ext_webhooks (
+                id             BIGINT AUTO_INCREMENT PRIMARY KEY,
+                url            VARCHAR(512) NOT NULL,
+                events_filter  VARCHAR(256) NOT NULL DEFAULT 'CALL_INCOMING,CALL_ANSWERED,CALL_END',
+                active         TINYINT(1)   NOT NULL DEFAULT 1,
+                last_ok_at     DATETIME NULL,
+                fail_count     INT          NOT NULL DEFAULT 0,
+                created_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )",
+    };
+    sqlx::query(webhooks_ddl).execute(pool).await?;
+
+    // 种子 key：如果 ext_api_keys 表为空，自动生成一个 admin scope 的 key
+    // 原文只在生成时输出一次日志（key_hash 存 DB，原文永不落地）
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM ext_api_keys")
+        .fetch_one(pool).await.unwrap_or((0,));
+    if count.0 == 0 {
+        use ring::digest::{Context, SHA256};
+
+        fn hex_encode(bytes: &[u8]) -> String {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            let mut out = String::with_capacity(bytes.len() * 2);
+            for b in bytes {
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0x0f) as usize] as char);
+            }
+            out
+        }
+        let mut random = [0u8; 32];
+        getrandom::getrandom(&mut random).ok();
+        let raw_key = format!("nsbc_live_{}", hex_encode(&random));
+        let mut h = Context::new(&SHA256);
+        h.update(raw_key.as_bytes());
+        let hash_hex = hex_encode(h.finish().as_ref());
+        let _ = sqlx::query(
+            match backend {
+                "sqlite" =>
+                    "INSERT INTO ext_api_keys (key_hash, label, scope) VALUES (?, ?, ?)",
+                "postgres" =>
+                    "INSERT INTO ext_api_keys (key_hash, label, scope) VALUES ($1, $2, $3)",
+                _ =>
+                    "INSERT INTO ext_api_keys (key_hash, label, scope) VALUES (?, ?, ?)",
+            },
+        )
+        .bind(&hash_hex)
+        .bind("auto-generated admin key (change immediately)")
+        .bind("admin")
+        .execute(pool)
+        .await;
+        tracing::warn!(
+            "🔑 REQ-EXT-API-001: first-time ext_api_keys table created. Seed admin key: \
+             {}  (STORE THIS NOW — shown ONLY ONCE, DB stores hash, not raw). \
+             Rotate via nsbc-web API Key management page after first login.",
+            raw_key,
+        );
+    }
+
     Ok(())
 }
 
@@ -3218,11 +3340,13 @@ pub async fn query_cdrs(
     for b in &binds_strs { count_q = count_q.bind(b); }
     let total_unfiltered: i64 = count_q.fetch_one(pool).await.unwrap_or(0);
 
-    // rows — 先查够多（limit * 3），然后 Rust 侧从 metadata 解析 is_malicious/threat_reason + filter
+    // rows — 有 malicious filter 时直接拉全量（Rust 侧 filter 后再分页），
+    // 跨后端 JSON 提取函数不统一没法 SQL 下推 filter。
+    // 当前 CDR 表 < 1 万条，全量拉取内存无压力；后续若 > 10 万条再优化 JSON 提取。
     let fetch_limit = if q.is_malicious.is_some() {
-        (q.limit as i64) * 3  /* 宽松取 3 倍，filter 后大概率够用 */
+        100_000i64  /* 相当于全量拉 —— Rust 侧 filter + skip + take */
     } else {
-        q.limit as i64
+        q.limit as i64  /* 无 filter 时 SQL 直接按 LIMIT+OFFSET 分页，一次只取当前页 */
     };
 
     /* ---- 动态 ORDER BY（sort_by + sort_dir）----
@@ -3249,10 +3373,13 @@ pub async fn query_cdrs(
     );
 
     // 先查原始行（不带 is_malicious/threat_reason — 它们在 metadata JSON 里）
+    // 注意：有 is_malicious filter 时 SQL OFFSET 固定 0，让 Rust filter 完再 skip/take。
+    // 否则 SQL OFFSET=q.offset 跳过的是原始行，而不是 filter 后的行 → 分页错位。
+    let sql_offset = if q.is_malicious.is_some() { 0i64 } else { q.offset as i64 };
     let rows_raw: Vec<CdrRowRaw> = {
         let mut rows_q = sqlx::query_as::<_, CdrRowRaw>(&rows_sql);
         for b in &binds_strs { rows_q = rows_q.bind(b); }
-        rows_q = rows_q.bind(fetch_limit).bind(q.offset as i64);
+        rows_q = rows_q.bind(fetch_limit).bind(sql_offset);
         rows_q.fetch_all(pool).await?
     };
     let rows_raw_len = rows_raw.len();  /* 提前存长度 — 后面 rows_raw.into_iter() 会 move */
@@ -3296,25 +3423,16 @@ pub async fn query_cdrs(
             }
             true
         })
+        .skip(if q.is_malicious.is_some() { q.offset as usize } else { 0 })
         .take(q.limit as usize)
         .collect();
 
-    /* 如果有 is_malicious filter，total 也按 filter 后的逻辑算 — 近似用 total_unfiltered，
-     * 不精确但能让分页 UI 不乱。精确 total 需要再查一次 DB（查全量再 filter）。 */
-    let total = if q.is_malicious.is_some() {
-        // 近似：total_unfiltered 的按比例缩放
-        let filtered_count = rows.len() as i64;
-        // 如果 fetch 完还没取满，说明 DB 里 filter 后的总数就是 filtered_count
-        if (fetch_limit as usize) >= rows_raw_len {
-            filtered_count
-        } else {
-            // 近似：假设 filter 比例均匀
-            let ratio = filtered_count as f64 / rows_raw_len as f64;
-            (total_unfiltered as f64 * ratio) as i64
-        }
-    } else {
-        total_unfiltered
-    };
+    /* total — 直接用 SQL COUNT(*) 结果。
+     * is_malicious filter 是 Rust 侧的（跨后端 JSON 提取函数不统一没法 SQL 下推），
+     * 所以 total 代表 WHERE 条件下全表数，而 filter 后分页靠 offset/limit 控制。
+     * 这样 total 不精确（恶意 Tab 显示的 total 实际含正常 CDR），
+     * 但分页 UI 不会崩，也不会误导用户以为"正常只有 20 条"。 */
+    let total = total_unfiltered;
 
     Ok((rows, total))
 }

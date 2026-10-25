@@ -260,6 +260,12 @@ struct b2b_call {
      * enters IVR menu. media_bridge relay_recv_one uses it to deliver RFC4733
      * DTMF digits via ivr_on_dtmf(). NULL = no IVR active on this call. */
     void *ivr_sess;
+    /* REQ-SEC-006：dialplan 规则命中标记（signaling.c dp_execute 返回值透传）。
+     * 0=NSBC_ERR 没命中任何规则 → 扫号/未知来源 → CDR 里 is_malicious=1
+     * 1=NSBC_OK 命中规则 → 合法业务。PERM_DENIED 走 silent drop 不 emit CDR。 */
+    uint8_t dp_matched;
+    /* 命中的规则名（可选，仅日志/审计用，CDR threat 诊断时看）。空串=没命中。 */
+    char dp_rule_name[64];
 };
 typedef struct b2b_call b2b_call_t;
 
@@ -411,13 +417,13 @@ typedef struct {
     uint16_t        local_port;/* 本地监听端口（profile 匹配用）*/
 } sip_invite_ctx_t;
 
-/* REQ-ORIGINATE-003 待补：originate 尾随 app 类型。
+/* REQ-ORIGINATE-003：originate 尾随 app 类型。
  * 语法 originate <dest> &bridge(url)：bridge 走顺序外呼（bridge_url 字段）；
  * &park/&hangup/&echo 走 post_app：B 腿 answer 后在 OAM 线程执行后置动作。 */
 #define B2B_APP_NONE   0   /* 无后置动作（默认） */
 #define B2B_APP_PARK   1   /* answer 后 hold 双腿（暂停媒体） */
 #define B2B_APP_HANGUP 2   /* answer 后立即挂断 */
-#define B2B_APP_ECHO   3   /* 预留：媒体环回（当前无实现，仅记录告警） */
+#define B2B_APP_ECHO   3   /* answer 后开启 RTP 环回（两侧各自 side→side，听自己回声） */
 
 /* 主动外呼（originate，REQ-SIP-012）：从 dialplan/API 触发 */
 typedef struct {

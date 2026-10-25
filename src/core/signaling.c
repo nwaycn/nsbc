@@ -515,6 +515,16 @@ static int resolve_cb(b2b_call_t *call, const char *ruri, size_t ruri_len,
     int dp_ok = dp_rc == NSBC_OK;
     int dp_layer = dp_ok ? (int)dres.layer : -1;
 
+    /* REQ-SEC-006：dialplan 规则命中标记存进 b2b_call_t。
+     * dp_ok=0 (NSBC_ERR) → 全规则走完无人认领 → 扫号/未知来源 → b2b_emit_cdr
+     *   会把 is_malicious=1 + threat_reason="No matching dialplan rule"
+     * dp_ok=1 (NSBC_OK) → 命中规则 → 合法业务。
+     * PERM_DENIED 不走这里（直接 silent drop return 了，call 甚至没创建）。 */
+    if (call) {
+        call->dp_matched = dp_ok ? 1 : 0;
+        call->dp_rule_name[0] = '\0';  /* rule_name 可事后从 rule_id 反查，先留空 */
+    }
+
     /* ---- 第一优先级：rule 级 CIDR reject + dp ACL perm 不足 ----
      * dp_execute 内部遍历 rule 时先 profile 匹配、再 rule 内嵌 CIDR 白名单、
      * 再 pattern match；全部 rule 被 CIDR reject 或 perm 不足 → PERM_DENIED
