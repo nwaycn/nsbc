@@ -17,7 +17,7 @@
 #include "app_ctx.h"     /* nsbc_get_ctx() — END 分支里判 billing 是否启用 */
 #include "obs_sub.h"    /* obs_sub_publish_cdr — CDR END 订阅推送 */
 #include <cjson/cJSON.h>
-
+#include "log.h"
 #include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -29,6 +29,7 @@
 
 /* 前向声明（下面两个 helper 仍为 static，内部用） */
 static void ring_push_locked(cdr_sink_t *s, const cdr_event_t *ev);
+static void cdr_sink_drain_inline(cdr_sink_t *s, unsigned max_batches);
 
 typedef struct {
     int used;
@@ -37,12 +38,18 @@ typedef struct {
 
 struct cdr_sink {
     pthread_mutex_t lock;
+    pthread_mutex_t flush_lock;
+    pthread_cond_t flush_cond;
     cdr_ops_t       ops;
+    worker_job_t    flush_job;
+    int             flush_pending;
+    int             closing;
     cdr_open_t      open[CDR_OPEN_CAP];
     cdr_event_t     ring[CDR_RING_CAP];
     int             ring_head;   /* 最旧槽位（满时被覆盖 → 自动推进）*/
     int             ring_tail;   /* 下一个写位置 */
-    int             flush_tail;  /* 上次 flush 已推送的截止位置（本次从 flush_tail→ring_tail-1 取增量推）*/
+    uint64_t        ring_seq[CDR_RING_CAP];
+    uint64_t        flush_seq;
     uint64_t        total_emitted;
     uint64_t        total_persisted;
     uint64_t        total_spooled;
@@ -76,8 +83,12 @@ int cdr_sink_create(const cdr_ops_t *ops, cdr_sink_t **out)
     if (s == NULL)
         return NSBC_NOMEM;
     pthread_mutex_init(&s->lock, NULL);
+    pthread_mutex_init(&s->flush_lock, NULL);
+    pthread_cond_init(&s->flush_cond, NULL);
     if (ops != NULL)
         s->ops = *ops;
+    s->flush_job.fn = NULL;
+    s->flush_job.arg = s;
     *out = s;
     return NSBC_OK;
 }
@@ -86,7 +97,14 @@ void cdr_sink_destroy(cdr_sink_t *s)
 {
     if (s == NULL)
         return;
-    (void)cdr_sink_flush(s); /* 优雅停机 drain（尽力） */
+    pthread_mutex_lock(&s->lock);
+    s->closing = 1;
+    while (s->flush_pending)
+        pthread_cond_wait(&s->flush_cond, &s->lock);
+    pthread_mutex_unlock(&s->lock);
+    cdr_sink_drain_inline(s, 0); /* 优雅停机 drain（尽力） */
+    pthread_cond_destroy(&s->flush_cond);
+    pthread_mutex_destroy(&s->flush_lock);
     pthread_mutex_destroy(&s->lock);
     free(s);
 }
@@ -116,8 +134,9 @@ static cdr_open_t *open_alloc(cdr_sink_t *s)
 
 /* ---------- spool binary file ---------- */
 
-/* 追加写 batch 到 spool 文件（原子写：写 new 文件 → rename 覆盖）。
- * 任何失败返回非 0；调用方决定是否 drop。 */
+/* C-07 修复：spool 不再覆盖旧批次。
+ * 新逻辑：如果已有 spool 文件，先读出来 → 合并当前 batch → 原子写回。
+ * 这样连续 DB 故障的多批次不会互相覆盖丢失。 */
 static int spool_write(cdr_sink_t *s, const cdr_event_t *batch, int n)
 {
     if (n <= 0 || s->spool_path[0] == '\0')
@@ -126,25 +145,80 @@ static int spool_write(cdr_sink_t *s, const cdr_event_t *batch, int n)
     char tmp[576];
     snprintf(tmp, sizeof(tmp), "%s.tmp", s->spool_path);
 
+    /* 先读现有 spool 内容（如果有） */
+    uint32_t old_cnt = 0;
+    cdr_event_t *old_batch = NULL;
+
+    FILE *existing = fopen(s->spool_path, "rb");
+    if (existing) {
+        uint32_t magic = 0, ver = 0, cnt = 0;
+        if (fread(&magic, 4, 1, existing) == 1 && magic == CDR_SPOOL_MAGIC &&
+            fread(&ver, 4, 1, existing) == 1 && ver == CDR_SPOOL_VER &&
+            fread(&cnt, 4, 1, existing) == 1 && cnt > 0 && cnt <= 65536) {
+            old_batch = (cdr_event_t *)malloc(sizeof(cdr_event_t) * cnt);
+            if (old_batch && fread(old_batch, sizeof(cdr_event_t), cnt, existing) == cnt)
+                old_cnt = cnt;
+            else {
+                /* 读取失败或格式损坏 → 丢弃旧内容（避免无限增长） */
+                free(old_batch); old_batch = NULL;
+            }
+        }
+        fclose(existing);
+    }
+
+    /* 合并：旧 + 新 */
+    /* C-07 修复：合并后加上限，避免 DB 长期故障时 spool 文件无界增长。
+     * CDR_SPOOL_MAX_ENTRIES 作为硬上限，超出时丢弃最旧条目。 */
+#define CDR_SPOOL_MAX_ENTRIES 65536u
+    uint32_t total = old_cnt + (uint32_t)n;
+    uint32_t skip_old = 0;
+    if (total > CDR_SPOOL_MAX_ENTRIES) {
+        skip_old = total - CDR_SPOOL_MAX_ENTRIES;
+        total = CDR_SPOOL_MAX_ENTRIES;
+        if (skip_old > old_cnt) skip_old = old_cnt;  /* 不能丢新的 */
+    }
+
+    cdr_event_t *merged = NULL;
+    if (old_cnt > 0) {
+        merged = (cdr_event_t *)malloc(sizeof(cdr_event_t) * total);
+        if (!merged) {
+            free(old_batch);
+            return NSBC_NOMEM;
+        }
+        /* 先拷贝 old 中未被丢弃的部分（跳过前 skip_old 条） */
+        uint32_t old_kept = old_cnt - skip_old;
+        if (old_kept > 0)
+            memcpy(merged, old_batch + skip_old, sizeof(cdr_event_t) * old_kept);
+        /* 再拷贝新 batch */
+        memcpy(merged + old_kept, batch, sizeof(cdr_event_t) * n);
+    } else {
+        merged = (cdr_event_t *)batch;  /* 直接用当前 batch */
+    }
+
+    /* 原子写 tmp → rename */
     FILE *f = fopen(tmp, "wb");
     if (f == NULL) {
-        perror("cdr_spool fopen");
+        free(old_batch);
+        if (merged != batch) free(merged);
         return NSBC_ERR;
     }
 
-    /* magic + ver + count + batch */
     uint32_t magic = CDR_SPOOL_MAGIC;
     uint32_t ver   = CDR_SPOOL_VER;
-    uint32_t cnt   = (uint32_t)n;
-    if (fwrite(&magic, 4, 1, f) != 1 ||
-        fwrite(&ver, 4, 1, f) != 1 ||
-        fwrite(&cnt, 4, 1, f) != 1 ||
-        fwrite(batch, sizeof(cdr_event_t), n, f) != (size_t)n) {
-        fclose(f); unlink(tmp);
-        return NSBC_ERR;
-    }
+    uint32_t cnt   = total;
+    int wr_ok = fwrite(&magic, 4, 1, f) == 1 &&
+                fwrite(&ver, 4, 1, f) == 1 &&
+                fwrite(&cnt, 4, 1, f) == 1 &&
+                fwrite(merged, sizeof(cdr_event_t), total, f) == total;
     fflush(f); fsync(fileno(f)); fclose(f);
 
+    free(old_batch);
+    if (merged != batch) free(merged);
+
+    if (!wr_ok) {
+        unlink(tmp);
+        return NSBC_ERR;
+    }
     if (rename(tmp, s->spool_path) != 0) {
         unlink(tmp);
         return NSBC_ERR;
@@ -203,7 +277,8 @@ static void ring_push_locked(cdr_sink_t *s, const cdr_event_t *ev)
     }
     s->ring[s->ring_tail] = *ev;
     s->ring_tail = (s->ring_tail + 1) % CDR_RING_CAP;
-    ++s->total_emitted;
+    s->ring_seq[(s->ring_tail + CDR_RING_CAP - 1) % CDR_RING_CAP] =
+        ++s->total_emitted;
 }
 
 static void fill_durations(cdr_event_t *ev)
@@ -214,13 +289,98 @@ static void fill_durations(cdr_event_t *ev)
         ev->billsec = (uint32_t)((ev->end_ms - ev->answer_ms) / 1000u);
 }
 
+static int cdr_sink_has_unflushed_locked(const cdr_sink_t *s)
+{
+    return ring_count(s) > 0 && s->flush_seq < s->total_emitted;
+}
+
+static void cdr_sink_drain_inline(cdr_sink_t *s, unsigned max_batches)
+{
+    unsigned batches = 0;
+    for (;;) {
+        int rc = cdr_sink_flush(s);
+        if (rc <= 0)
+            return;
+        if (max_batches && ++batches >= max_batches)
+            return;
+
+        pthread_mutex_lock(&s->lock);
+        int pending = cdr_sink_has_unflushed_locked(s);
+        pthread_mutex_unlock(&s->lock);
+        if (!pending)
+            return;
+    }
+}
+
+static void cdr_sink_flush_worker(void *arg)
+{
+    cdr_sink_t *s = (cdr_sink_t *)arg;
+    unsigned batches = 0;
+    int rc = 0;
+    for (;;) {
+        rc = cdr_sink_flush(s);
+        ++batches;
+
+        pthread_mutex_lock(&s->lock);
+        int pending = cdr_sink_has_unflushed_locked(s);
+        if (rc < 0 || !pending) {
+            s->flush_pending = 0;
+            pthread_cond_broadcast(&s->flush_cond);
+            pthread_mutex_unlock(&s->lock);
+            if (rc < 0)
+                log_warn("cdr", "background flush failed rc=%d", rc);
+            return;
+        }
+        pthread_mutex_unlock(&s->lock);
+
+        if (batches >= 4) {
+            rc = wpool_submit_any(s->ops.workers, &s->flush_job);
+            if (rc == NSBC_OK)
+                return;
+            log_warn("cdr", "background flush resubmit rejected rc=%d; draining inline", rc);
+            batches = 0;
+        }
+    }
+}
+
+static void cdr_sink_schedule_flush(cdr_sink_t *s)
+{
+    if (!s->ops.workers) {
+        (void)cdr_sink_flush(s);
+        return;
+    }
+
+    pthread_mutex_lock(&s->lock);
+    if (s->closing || s->flush_pending) {
+        pthread_mutex_unlock(&s->lock);
+        return;
+    }
+    s->flush_pending = 1;
+    s->flush_job.fn = cdr_sink_flush_worker;
+    pthread_mutex_unlock(&s->lock);
+
+    int rc = wpool_submit_any(s->ops.workers, &s->flush_job);
+    if (rc == NSBC_OK)
+        return;
+
+    pthread_mutex_lock(&s->lock);
+    s->flush_pending = 0;
+    pthread_cond_broadcast(&s->flush_cond);
+    pthread_mutex_unlock(&s->lock);
+    log_warn("cdr", "background flush rejected rc=%d; flushing synchronously", rc);
+    cdr_sink_drain_inline(s, 4);
+}
+
 void cdr_sink_emit(void *ud, const cdr_event_t *ev)
 {
     cdr_sink_t *s = (cdr_sink_t *)ud;
+    cdr_event_t event;
     cdr_open_t *o;
     if (s == NULL || ev == NULL || ev->call_id[0] == '\0')
         return;
-    fill_durations((cdr_event_t *)ev); /* 不修改调用方——本地副本 */
+    event = *ev;
+    fill_durations(&event);
+    ev = &event;
 
     pthread_mutex_lock(&s->lock);
     switch (ev->phase) {
@@ -252,7 +412,7 @@ void cdr_sink_emit(void *ud, const cdr_event_t *ev)
             fill_durations(&lone);
             ring_push_locked(s, &lone);
             pthread_mutex_unlock(&s->lock);
-            (void)cdr_sink_flush(s);
+            cdr_sink_schedule_flush(s);
             /* ESL CDR event fire（Phase 2 增量） */
             {
                 nsbc_ctx_t *ctx = nsbc_get_ctx();
@@ -321,7 +481,7 @@ void cdr_sink_emit(void *ud, const cdr_event_t *ev)
                 free(json);
             }
         }
-        (void)cdr_sink_flush(s);
+        cdr_sink_schedule_flush(s);
         /* ESL CDR event fire（Phase 2 增量） */
         {
             nsbc_ctx_t *ctx = nsbc_get_ctx();
@@ -395,7 +555,7 @@ char *cdr_event_to_json(const cdr_event_t *ev)
     return json;
 }
 
-/* 增量推送：从 flush_tail 到 ring_tail-1 取新增 CDR → UDS write-through → persist。
+/* 增量推送：按单调序号取尚未处理的 CDR → UDS write-through → persist。
  *
  * 关键设计变化：**flush 不再推进 ring_head 清空 ring**。ring 生命周期完全由
  * ring_push_locked 在 ring 满时自动覆盖最旧数据（推进 ring_head）管理。
@@ -404,9 +564,8 @@ char *cdr_event_to_json(const cdr_event_t *ev)
  * 即使 UDS 断了 write-through 不生效，poller 也能在 UDS 恢复后补上（DB insert
  * 是幂等的 ON CONFLICT DO NOTHING，重复推送不报错）。
  *
- * flush_tail 跟踪本次已推送截止位置：下次只推增量。若 flush_tail 已被 ring 覆盖
- * （不在 ring_head→ring_tail 区间），自动从 ring_head 开始全量推送。*/
-int cdr_sink_flush(cdr_sink_t *s)
+ * 游标被 ring 覆盖时从当前 ring_head 对应序号恢复。*/
+static int cdr_sink_flush_inner(cdr_sink_t *s)
 {
     cdr_event_t batch[CDR_BATCH_MAX];
     int n = 0;
@@ -416,33 +575,28 @@ int cdr_sink_flush(cdr_sink_t *s)
 
     pthread_mutex_lock(&s->lock);
 
-    /* --- 计算起始位置：flush_tail 是否已被覆盖 ---
-     * 环形缓冲中，位置 x 在 [head, tail) 区间内的条件：
-     *   正常（tail >= head）：head <= x < tail
-     *   绕回（tail < head）：x >= head || x < tail
-     * 不在区间 → flush_tail 被覆盖了，从 head 开始全量 */
+    /* Monotonic event sequence numbers distinguish reused ring slots. */
     int ring_n = ring_count(s);
-    int from = s->flush_tail;
     if (ring_n == 0) {
         pthread_mutex_unlock(&s->lock);
         return 0;
     }
-    int head = s->ring_head, tail = s->ring_tail;
-    int in_range;
-    if (tail >= head)
-        in_range = (from >= head && from < tail);
-    else
-        in_range = (from >= head || from < tail);
-    if (!in_range)
-        from = head;
-
-    /* 只读快照：从 from 推到 tail-1，不动 ring_head/ring_tail */
-    int idx = from;
-    while (idx != tail && n < CDR_BATCH_MAX) {
+    uint64_t oldest_seq = s->ring_seq[s->ring_head];
+    uint64_t latest_seq = s->ring_seq[
+        (s->ring_tail + CDR_RING_CAP - 1) % CDR_RING_CAP];
+    uint64_t first_seq = s->flush_seq + 1;
+    if (first_seq < oldest_seq)
+        first_seq = oldest_seq;
+    if (first_seq > latest_seq) {
+        pthread_mutex_unlock(&s->lock);
+        return 0;
+    }
+    int idx = (s->ring_head + (int)(first_seq - oldest_seq)) % CDR_RING_CAP;
+    while (idx != s->ring_tail && n < CDR_BATCH_MAX) {
         batch[n++] = s->ring[idx];
         idx = (idx + 1) % CDR_RING_CAP;
     }
-    s->flush_tail = idx;  /* 更新：推到哪就记到哪 */
+    s->flush_seq = first_seq + (uint64_t)n - 1;
 
     pthread_mutex_unlock(&s->lock);
 
@@ -479,6 +633,16 @@ int cdr_sink_flush(cdr_sink_t *s)
     /* spool 也写不了——真 drop。但 ring 里还有数据，poller 能兜底拉 */
     s->total_dropped += (uint64_t)n;
     return -rc;
+}
+
+int cdr_sink_flush(cdr_sink_t *s)
+{
+    if (!s)
+        return NSBC_INVAL;
+    pthread_mutex_lock(&s->flush_lock);
+    int rc = cdr_sink_flush_inner(s);
+    pthread_mutex_unlock(&s->flush_lock);
+    return rc;
 }
 
 /* ---------- OAM counters ---------- */

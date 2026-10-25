@@ -39,6 +39,7 @@
 #define BR_SHARDS 64
 #define SSRC_MAP_N 16
 #define RELAY_BUF 2048
+#define MB_REC_HOOK_MAX 4
 
 typedef struct cnode {
     struct cnode *next;
@@ -107,13 +108,17 @@ typedef struct {
 typedef struct mb_rec_hook {
     void (*fn)(void *ud, void *call_key, const void *payload, size_t len, int leg, int pt);
     void *ud;
+    unsigned refs; /* protected by bridge_mgr.rec_hook_lock */
     struct mb_rec_hook *next;
 } mb_rec_hook_t;
+
+static __thread unsigned rec_hook_dispatch_depth;
 
 struct bridge_mgr {
     mb_cfg_t cfg;
     br_shard_t sh[BR_SHARDS];
     pthread_mutex_t rec_hook_lock;  /* 保护下方 hook 链表增删 */
+    pthread_cond_t rec_hook_cond;   /* 等待已摘除 hook 的在途回调结束 */
     mb_rec_hook_t *rec_hooks;       /* AI dialog / 未来 transcript 等可选订阅 */
 };
 
@@ -177,6 +182,7 @@ static uint32_t smap_lookup(smap_t *m, uint32_t in)
 /* ------------------------------------------------------------------ */
 struct rtp_relay {
     bridge_mgr_t *m;
+    reactor_t *home_reactor;  /* P3: relay 归属的 reactor（arm 时路由选定，stop 时用） */
     cnode_t *node;
     int fd_rtp[2];
     int fd_rtcp[2];
@@ -958,21 +964,31 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
              * cfg.rec_feed_fn 是 signaling 创建时设的录音主槽；rec_hooks 是
              * 模块 dlopen 后追加的 hook。锁内拷贝 fn+ud 到栈、解锁后执行 ——
              * Phase 0: 锁内执行外部 hook 会嵌套 recording.c 的 sess.lock（之前 P0-2 锁内套锁）。*/
-            if (pkt.payload && pkt.payload_len) {
-                /* hook 数量有上限：recording + ai_dialog + 未来 transcript，4 足够 */
-                struct { mb_rec_hook_fn fn; void *ud; } local[4];
+            if (pkt.payload && pkt.payload_len &&
+                __atomic_load_n(&r->m->rec_hooks, __ATOMIC_ACQUIRE)) {
+                mb_rec_hook_t *local[MB_REC_HOOK_MAX];
                 int nh = 0;
                 pthread_mutex_lock(&r->m->rec_hook_lock);
-                for (mb_rec_hook_t *h = r->m->rec_hooks; h && nh < 4; h = h->next) {
-                    local[nh].fn = h->fn;
-                    local[nh].ud = h->ud;
-                    ++nh;
+                for (mb_rec_hook_t *h =
+                         __atomic_load_n(&r->m->rec_hooks, __ATOMIC_RELAXED);
+                     h && nh < MB_REC_HOOK_MAX; h = h->next) {
+                    ++h->refs;
+                    local[nh++] = h;
                 }
                 pthread_mutex_unlock(&r->m->rec_hook_lock);
                 /* 锁外遍历执行 hook —— 各自内部锁互不嵌套 */
+                ++rec_hook_dispatch_depth;
                 for (int hi = 0; hi < nh; ++hi)
-                    local[hi].fn(local[hi].ud, r->node ? r->node->call : NULL,
-                                 pkt.payload, pkt.payload_len, side, (int)pkt.pt);
+                    local[hi]->fn(local[hi]->ud, r->node ? r->node->call : NULL,
+                                  pkt.payload, pkt.payload_len, side, (int)pkt.pt);
+                --rec_hook_dispatch_depth;
+                if (nh > 0) {
+                    pthread_mutex_lock(&r->m->rec_hook_lock);
+                    for (int hi = 0; hi < nh; ++hi)
+                        --local[hi]->refs;
+                    pthread_cond_broadcast(&r->m->rec_hook_cond);
+                    pthread_mutex_unlock(&r->m->rec_hook_lock);
+                }
             }
             /* 出向 SSRC 重写（固定头偏移 8，4 字节网络序）
              * 之前 Bug：只改 p[3] 一个字节，导致 SSRC 变成 orig[0..2] | (new & 0xFF)。
@@ -1214,6 +1230,7 @@ int bridge_mgr_create(const mb_cfg_t *cfg, bridge_mgr_t **out)
     for (int i = 0; i < BR_SHARDS; ++i)
         pthread_mutex_init(&m->sh[i].lock, NULL);
     pthread_mutex_init(&m->rec_hook_lock, NULL);  /* REQ-AI-001 */
+    pthread_cond_init(&m->rec_hook_cond, NULL);
 
     /* codec 注册由 src/mod/codecs 模块 init 自注册到全局 codec_registry，
      * 本函数只负责 bridge 管理器创建，不硬编码任何 codec。
@@ -1227,9 +1244,16 @@ void bridge_mgr_destroy(bridge_mgr_t *m)
 {
     if (!m)
         return;
-    /* REQ-AI-001：清理 rec_hooks 链表（hook 节点 malloc 在 bridge_add_rec_feed_hook 里） */
-    mb_rec_hook_t *h = m->rec_hooks;
+    pthread_mutex_lock(&m->rec_hook_lock);
+    mb_rec_hook_t *h = __atomic_load_n(&m->rec_hooks, __ATOMIC_RELAXED);
+    __atomic_store_n(&m->rec_hooks, NULL, __ATOMIC_RELEASE);
+    for (mb_rec_hook_t *it = h; it; it = it->next) {
+        while (it->refs > 0)
+            pthread_cond_wait(&m->rec_hook_cond, &m->rec_hook_lock);
+    }
+    pthread_mutex_unlock(&m->rec_hook_lock);
     while (h) { mb_rec_hook_t *nx = h->next; free(h); h = nx; }
+    pthread_cond_destroy(&m->rec_hook_cond);
     pthread_mutex_destroy(&m->rec_hook_lock);
     free(m);
 }
@@ -2303,19 +2327,107 @@ int rtp_relay_start(bridge_mgr_t *m, rtp_relay_t **out,
     return NSBC_OK;
 }
 
-/* ★ RACE-FIX: 延迟 arm — 所有 dtls 创建 + admit_ssrc 完成后才注册 reactor fd。 */
+/* P3: reactor_call 批量 arm/stop 目标函数。
+ *
+ * reactor_add/del 必须在 reactor owner 线程执行（P1 编译开关已防护）。
+ * 批量提交代替 4 次跨线程调用，降低延迟。
+ * 更重要的是：del + 后续 callback/fd close 在同一 owner 线程串行化——
+ * 修复了之前 stop() 从业务线程 free relay 而 relay_cb 还在跑的 race。 */
+/* F-11 修复：检查每次 reactor_add 返回值；部分失败时回滚已成功的 add。
+ * 之前无条件 armed=1 导致部分 fd 注册失败时调用方仍认为 relay 完整 armed。 */
+static int relay_batch_arm_fn(void *arg)
+{
+    rtp_relay_t *r = (rtp_relay_t *)arg;
+    if (!r) return NSBC_INVAL;
+    reactor_t *target = r->home_reactor;
+    if (!target) return NSBC_INVAL;
+
+    int rc;
+    int ok_count = 0;
+    int ok_fds[4] = { -1, -1, -1, -1 };  /* 记录哪些 fd 注册成功用于回滚 */
+
+    rc = reactor_add(target, r->fd_rtp[0], EPOLLIN, relay_cb, r);
+    if (rc != NSBC_OK) goto rollback;
+    ok_fds[ok_count++] = r->fd_rtp[0];
+
+    rc = reactor_add(target, r->fd_rtp[1], EPOLLIN, relay_cb, r);
+    if (rc != NSBC_OK) goto rollback;
+    ok_fds[ok_count++] = r->fd_rtp[1];
+
+    if (r->fd_rtcp[0] >= 0) {
+        rc = reactor_add(target, r->fd_rtcp[0], EPOLLIN, relay_cb, r);
+        if (rc != NSBC_OK) goto rollback;
+        ok_fds[ok_count++] = r->fd_rtcp[0];
+    }
+    if (r->fd_rtcp[1] >= 0) {
+        rc = reactor_add(target, r->fd_rtcp[1], EPOLLIN, relay_cb, r);
+        if (rc != NSBC_OK) goto rollback;
+        ok_fds[ok_count++] = r->fd_rtcp[1];
+    }
+
+    r->armed = 1;
+    return NSBC_OK;
+
+rollback:
+    llog(LOG_WARN, "media",
+         "relay_batch_arm: reactor_add failed rc=%d fd=%d — rolling back %d succeeded",
+         rc, ok_fds[ok_count], ok_count);
+    for (int i = ok_count - 1; i >= 0; --i)
+        reactor_del(target, ok_fds[i]);
+    return rc;
+}
+
+static int relay_batch_stop_fn(void *arg)
+{
+    rtp_relay_t *r = (rtp_relay_t *)arg;
+    if (!r) return NSBC_INVAL;
+    reactor_t *target = r->home_reactor;
+    if (!target) return NSBC_INVAL;
+
+    /* 在 reactor owner 线程里一次性删除所有 fd。
+     * 删除后 epoll 不再触发这些 fd 的事件，已在本次 epoll_wait 里的事件会继续处理
+     * 但 reactor_del 会把 slot 里的回调清除 → 安全。 */
+    reactor_del(target, r->fd_rtp[0]);
+    reactor_del(target, r->fd_rtp[1]);
+    if (r->fd_rtcp[0] >= 0)
+        reactor_del(target, r->fd_rtcp[0]);
+    if (r->fd_rtcp[1] >= 0)
+        reactor_del(target, r->fd_rtcp[1]);
+    return NSBC_OK;
+}
+
+/* ★ RACE-FIX: 延迟 arm — 所有 dtls 创建 + admit_ssrc 完成后才注册 reactor fd。
+ *
+ * P3 多 reactor：按 relay 起始端口 hash 路由到 reactor owner，
+ * 通过 reactor_call 一次性批量注册（比 4 次跨线程调用延迟低）。
+ * reactor_call 同步等待 owner 完成后才返回——arm 完成即表示 fd 已注册完毕。 */
 static void rtp_relay_arm(bridge_mgr_t *m, rtp_relay_t *r)
 {
-    if (!m || !m->cfg.re || !r || r->armed) return;
-    reactor_add(m->cfg.re, r->fd_rtp[0], EPOLLIN, relay_cb, r);
-    reactor_add(m->cfg.re, r->fd_rtp[1], EPOLLIN, relay_cb, r);
-    if (r->fd_rtcp[0] >= 0)
-        reactor_add(m->cfg.re, r->fd_rtcp[0], EPOLLIN, relay_cb, r);
-    if (r->fd_rtcp[1] >= 0)
-        reactor_add(m->cfg.re, r->fd_rtcp[1], EPOLLIN, relay_cb, r);
-    r->armed = 1;
-    llog(LOG_DEBUG, "media", "relay_arm: registered fd0=%d fd1=%d",
-         r->fd_rtp[0], r->fd_rtp[1]);
+    if (!m || !r || r->armed) return;
+
+    reactor_t *target = NULL;
+    if (m->cfg.mgr) {
+        /* P3: 多 reactor 模式——按 rtp_port[0] hash 路由 */
+        uint64_t hk = r->rtp_port[0] + (uint64_t)r->rtp_port[1] * 31;
+        unsigned rid = reactor_mgr_route(m->cfg.mgr, hk);
+        target = reactor_mgr_get(m->cfg.mgr, rid);
+        llog(LOG_DEBUG, "media", "relay_arm: hash_key=%llu → reactor[%u]",
+             (unsigned long long)hk, rid);
+    } else {
+        /* 旧路径：单 reactor */
+        target = m->cfg.re;
+    }
+    if (!target) return;
+
+    r->home_reactor = target;
+    int rc = reactor_call(target, relay_batch_arm_fn, r);
+    if (rc != NSBC_OK) {
+        llog(LOG_WARN, "media", "relay_arm: reactor_call rc=%d", rc);
+        r->home_reactor = NULL;
+    } else {
+        llog(LOG_DEBUG, "media", "relay_arm: fd0=%d fd1=%d reactor_armed",
+             r->fd_rtp[0], r->fd_rtp[1]);
+    }
 }
 
 void rtp_relay_stop(rtp_relay_t *r)
@@ -2323,6 +2435,25 @@ void rtp_relay_stop(rtp_relay_t *r)
     if (!r)
         return;
     bridge_mgr_t *m = r->m;
+
+    /* P3: 通过 reactor_call 在 reactor owner 线程里批量删除所有 fd。
+     * reactor_call 同步等待——owner 执行完 reactor_del 才返回，
+     * 之后 close fd / free relay 安全（reactor 不会再触发 relay_cb）。 */
+    if (r->home_reactor && r->armed) {
+        int rc = reactor_call(r->home_reactor, relay_batch_stop_fn, r);
+        if (rc != NSBC_OK)
+            llog(LOG_WARN, "media", "relay_stop: reactor_call rc=%d", rc);
+    } else if (m && m->cfg.re && r->armed) {
+        /* 旧路径或 reactor_call 失败降级 */
+        for (int i = 0; i < 2; ++i) {
+            if (r->fd_rtp[i] >= 0)
+                reactor_del(m->cfg.re, r->fd_rtp[i]);
+            if (r->fd_rtcp[i] >= 0)
+                reactor_del(m->cfg.re, r->fd_rtcp[i]);
+        }
+    }
+    r->armed = 0;
+
     /* REQ-DTLS-001：释放 SRTP 会话 */
     for (int i = 0; i < 2; ++i) {
         if (r->srtp[i]) {
@@ -2342,14 +2473,12 @@ void rtp_relay_stop(rtp_relay_t *r)
     }
     for (int i = 0; i < 2; ++i) {
         if (r->fd_rtp[i] >= 0) {
-            if (m->cfg.re)
-                reactor_del(m->cfg.re, r->fd_rtp[i]);
             close(r->fd_rtp[i]);
+            r->fd_rtp[i] = -1;
         }
         if (r->fd_rtcp[i] >= 0) {
-            if (m->cfg.re)
-                reactor_del(m->cfg.re, r->fd_rtcp[i]);
             close(r->fd_rtcp[i]);
+            r->fd_rtcp[i] = -1;
         }
         if (r->rtp_port[i])
             ptable_release_pair(m->cfg.ptable, m->cfg.local_ip,
@@ -3163,7 +3292,7 @@ int bridge_send_raw(bridge_mgr_t *m, void *call_key, int leg,
 
 /* REQ-AI-001：rec_feed_fn 动态 hook 注册。
  * add 返回 hook 节点指针（调用方保存，remove 时传同指针）。
- * 线程安全：持 rec_hook_lock 增删；媒体线程遍历前也持同一锁。
+ * 线程安全：持 rec_hook_lock 增删；移除会等待已开始的媒体回调结束。
  * hook 节点 malloc 在 mgr 上，bridge_mgr_destroy 时统一 free。 */
 void *bridge_add_rec_feed_hook(bridge_mgr_t *m, mb_rec_hook_fn fn, void *ud)
 {
@@ -3173,8 +3302,20 @@ void *bridge_add_rec_feed_hook(bridge_mgr_t *m, mb_rec_hook_fn fn, void *ud)
     h->fn = fn;
     h->ud = ud;
     pthread_mutex_lock(&m->rec_hook_lock);
-    h->next = m->rec_hooks;
-    m->rec_hooks = h;
+    unsigned count = 0;
+    for (mb_rec_hook_t *it =
+             __atomic_load_n(&m->rec_hooks, __ATOMIC_RELAXED);
+         it; it = it->next)
+        ++count;
+    if (count >= MB_REC_HOOK_MAX) {
+        pthread_mutex_unlock(&m->rec_hook_lock);
+        free(h);
+        llog(LOG_WARN, "media", "recording hook limit reached (%u)",
+             MB_REC_HOOK_MAX);
+        return NULL;
+    }
+    h->next = __atomic_load_n(&m->rec_hooks, __ATOMIC_RELAXED);
+    __atomic_store_n(&m->rec_hooks, h, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&m->rec_hook_lock);
     return h;
 }
@@ -3182,17 +3323,25 @@ void *bridge_add_rec_feed_hook(bridge_mgr_t *m, mb_rec_hook_fn fn, void *ud)
 int bridge_remove_rec_feed_hook(bridge_mgr_t *m, void *hook_ptr)
 {
     if (!m || !hook_ptr) return -EINVAL;
+    if (rec_hook_dispatch_depth > 0) return -EDEADLK;
     mb_rec_hook_t *target = (mb_rec_hook_t *)hook_ptr;
     pthread_mutex_lock(&m->rec_hook_lock);
-    mb_rec_hook_t **pp = &m->rec_hooks;
-    while (*pp) {
-        if (*pp == target) {
-            *pp = target->next;
+    mb_rec_hook_t *head =
+        __atomic_load_n(&m->rec_hooks, __ATOMIC_RELAXED);
+    mb_rec_hook_t *prev = NULL;
+    for (mb_rec_hook_t *h = head; h; h = h->next) {
+        if (h == target) {
+            if (prev)
+                prev->next = h->next;
+            else
+                __atomic_store_n(&m->rec_hooks, h->next, __ATOMIC_RELEASE);
+            while (target->refs > 0)
+                pthread_cond_wait(&m->rec_hook_cond, &m->rec_hook_lock);
             pthread_mutex_unlock(&m->rec_hook_lock);
             free(target);
             return 0;
         }
-        pp = &(*pp)->next;
+        prev = h;
     }
     pthread_mutex_unlock(&m->rec_hook_lock);
     return -ENOENT;

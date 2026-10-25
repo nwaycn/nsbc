@@ -55,6 +55,7 @@ mod tests {
             api_major: API_MAJOR,
             bind: SocketAddr::from(([127, 0, 0, 1], 0)),
             recording_root: std::path::PathBuf::from("/tmp/nsbc-test-recordings"),
+            require_loopback_auth: false,  /* F-10 修复：测试中 loopback peer 免鉴权 */
             data_pushed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             calls_tx: tokio::sync::broadcast::channel(256).0,
             vad_tx:   tokio::sync::broadcast::channel(1024).0,

@@ -179,6 +179,7 @@ typedef struct tr_conn {
     tls_conn_t *tls;
     int tls_ok;
     nsbc_sa_t peer;
+    reactor_t *home_reactor;  /* P3: 路由归属的 reactor —— accept 时选定，所有 FD 操作必须经此 reactor */
     tcp_framer_t fr;
     uint8_t fbuf[1]; /* 柔性：实际分配 max_msg*2 */
     /* ---- (proto, peer) → conn* 哈希表链 ----
@@ -233,11 +234,18 @@ struct sip_transport {
     int tcp_count;
     int tls_lfds[SIP_TR_FD_MAX];
     int tls_count;
-    net_rx_t rx;
-    net_dgram_t dg[NET_BATCH];
+    /* P3: per-reactor UDP 接收缓冲——原来 t->rx/t->dg 是 per-transport 共享字段，
+     * 多 reactor UDP SO_REUSEPORT 后 N 个 reactor 线程同时跑 on_udp_event 并发写 → data race。
+     * 修复：按 reactor 数量分配 N 组 rx + dg 数组；on_udp_event 里通过 fd 反查 reactor index
+     * 找到对应的组使用。单 reactor（cfg->mgr==NULL）时 n_rx=1，退化成旧行为。 */
+    int n_rx;  /* 数组维度（reactor 数量） */
+    net_rx_t *per_reactor_rx;                 /* [n_rx] */
+    net_dgram_t (*per_reactor_dg)[NET_BATCH]; /* [n_rx][NET_BATCH] */
     tr_conn_t **conns;
     int conns_cap;
     int conns_n;
+    pthread_mutex_t conn_lock; /* P3: 保护 conns[]/conns_n/conns_cap —— conn_accept( reactor[0] )
+                                * 与 conn_close（c->home_reactor 可能 != reactor[0]）在多 reactor 下并发访问 */
     pthread_mutex_t clock; /* worker 外呼发送与 reactor 线程互斥 */
     conn_index_t idx;      /* (proto, peer) → conn* 哈希表 */
     /* per-IP 连接计数：4096 桶，hash(ip) % BUCKETS —— 防单 IP SYN flood 打满全局 conn_max */
@@ -259,11 +267,16 @@ static int conn_idx(sip_transport_t *t, int fd)
 
 static void conn_close(sip_transport_t *t, int fd)
 {
+    /* P3: conn_lock 保护 conns[]/conns_n —— conn_accept(reactor[0]) 与
+     * conn_close(c->home_reactor 可能 != reactor[0]) 多 reactor 并发访问。 */
+    pthread_mutex_lock(&t->conn_lock);
     int i = conn_idx(t, fd);
-    if (i < 0)
-        return;
+    if (i < 0) { pthread_mutex_unlock(&t->conn_lock); return; }
     tr_conn_t *c = t->conns[i];
-    reactor_del(t->cfg.re, fd);
+    pthread_mutex_unlock(&t->conn_lock);
+
+    /* reactor_del 必须在 conn_lock 外——reactor 回调里可能再调 conn_close → 死锁 */
+    reactor_del(c->home_reactor, fd);
     /* ---- 从 (proto, peer) 哈希表摘除 ---- */
     if (t->idx.slots) {
         pthread_mutex_lock(&t->idx.lock);
@@ -307,8 +320,12 @@ static void conn_close(sip_transport_t *t, int fd)
         pthread_mutex_unlock(&t->ip_conn_lock);
     }
     free(c);
+
+    /* 最后清理 conns 数组——需要 conn_lock */
+    pthread_mutex_lock(&t->conn_lock);
     t->conns[i] = NULL;
     --t->conns_n;
+    pthread_mutex_unlock(&t->conn_lock);
 }
 
 /* ------------------------------------------------------------------ */
@@ -325,6 +342,7 @@ static void conn_close(sip_transport_t *t, int fd)
 static int sip_tcp_enqueue(sip_transport_t *t, tr_conn_t *c,
                            const uint8_t *data, size_t len)
 {
+    (void)t;  /* 回调签名要求，实现只操作 conn */
     if (!c || !c->in_use || !data || len == 0) return -1;
 
     pthread_mutex_lock(&c->sbuf_lock);
@@ -361,7 +379,7 @@ static int sip_tcp_enqueue(sip_transport_t *t, tr_conn_t *c,
         c->sbuf_want_epollout = 1;
         int want = c->is_tls ? (EPOLLIN | EPOLLOUT | EPOLLRDHUP)
                              : (EPOLLIN | EPOLLOUT | EPOLLRDHUP);
-        reactor_mod(t->cfg.re, c->fd, want);
+        reactor_mod(c->home_reactor, c->fd, want);
     }
 
     pthread_mutex_unlock(&c->sbuf_lock);
@@ -372,6 +390,7 @@ static int sip_tcp_enqueue(sip_transport_t *t, tr_conn_t *c,
  *  @return 0=全部发完 / EAGAIN 留待下次，-1=致命错误（对端断开）*/
 static int sip_tcp_flush(sip_transport_t *t, tr_conn_t *c)
 {
+    (void)t;  /* 回调签名要求，实现只操作 conn */
     for (;;) {
         pthread_mutex_lock(&c->sbuf_lock);
         size_t used = c->sbuf_tail - c->sbuf_head;
@@ -379,7 +398,7 @@ static int sip_tcp_flush(sip_transport_t *t, tr_conn_t *c)
             /* 队列空 → 关掉 EPOLLOUT，保留 EPOLLIN */
             c->sbuf_want_epollout = 0;
             pthread_mutex_unlock(&c->sbuf_lock);
-            reactor_mod(t->cfg.re, c->fd,
+            reactor_mod(c->home_reactor, c->fd,
                         c->is_tls ? (EPOLLIN | EPOLLRDHUP)
                                   : (EPOLLIN | EPOLLRDHUP));
             return 0;
@@ -395,7 +414,7 @@ static int sip_tcp_flush(sip_transport_t *t, tr_conn_t *c)
             if (n == NSBC_AGAIN) {
                 /* TLS 层需要等 WANT_READ/WRITE — reactor 对应关注位 */
                 uint32_t want_ev = (want == TLS_WANT_WRITE) ? EPOLLOUT : EPOLLIN;
-                reactor_mod(t->cfg.re, c->fd, want_ev | EPOLLRDHUP);
+                reactor_mod(c->home_reactor, c->fd, want_ev | EPOLLRDHUP);
                 return 0; /* 留待下次 */
             }
             if (n <= 0)
@@ -485,15 +504,15 @@ static void on_conn_event(int fd, uint32_t ev, void *arg)
             tls_hs_state_t hs = tls_handshake_step(c->tls);
             if (hs == TLS_HS_OK) {
                 c->tls_ok = 1;
-                reactor_mod(t->cfg.re, fd, EPOLLIN | EPOLLRDHUP);
+                reactor_mod(c->home_reactor, fd, EPOLLIN | EPOLLRDHUP);
                 break;
             }
             if (hs == TLS_HS_WANT_READ) {
-                reactor_mod(t->cfg.re, fd, EPOLLIN | EPOLLRDHUP);
+                reactor_mod(c->home_reactor, fd, EPOLLIN | EPOLLRDHUP);
                 return;
             }
             if (hs == TLS_HS_WANT_WRITE) {
-                reactor_mod(t->cfg.re, fd,
+                reactor_mod(c->home_reactor, fd,
                             EPOLLIN | EPOLLOUT | EPOLLRDHUP);
                 return;
             }
@@ -532,7 +551,7 @@ static void on_conn_event(int fd, uint32_t ev, void *arg)
             int want = 0;
             r = tls_read(c->tls, c->fbuf + off, room, &want);
             if (r == NSBC_AGAIN) {
-                reactor_mod(t->cfg.re, fd,
+                reactor_mod(c->home_reactor, fd,
                             (want == TLS_WANT_WRITE ? EPOLLOUT : EPOLLIN) |
                                 EPOLLRDHUP);
                 break;
@@ -564,6 +583,25 @@ static void on_conn_event(int fd, uint32_t ev, void *arg)
         if (feed_framer(t, c) < 0)
             return;
     }
+}
+
+/* F-04 修复：TCP accept 在 reactor[0] 线程，但新连接的 home_reactor
+ * 可能是 [1..N]。reactor_add 跨 owner 线程不安全（并发读写 slot 表）。
+ * 改为 reactor_call 在 owner 线程执行 reactor_add。 */
+typedef struct {
+    reactor_t *r;
+    int fd;
+    uint32_t events;
+    reactor_cb_fn cb;
+    void *ud;
+    int result;
+} tcp_accept_add_args_t;
+
+static int tcp_accept_add_fn(void *arg)
+{
+    tcp_accept_add_args_t *a = (tcp_accept_add_args_t *)arg;
+    a->result = reactor_add(a->r, a->fd, a->events, a->cb, a->ud);
+    return NSBC_OK;  /* task 本身成功，结果在 a->result 中 */
 }
 
 static tr_conn_t *conn_accept(sip_transport_t *t, int lfd, int is_tls)
@@ -604,12 +642,15 @@ static tr_conn_t *conn_accept(sip_transport_t *t, int lfd, int is_tls)
         t->ip_conn_count[bucket]++;
         pthread_mutex_unlock(&t->ip_conn_lock);
     }
+    /* P3: conn_lock 保护 conns_cap realloc（与 conn_close 并发） */
+    pthread_mutex_lock(&t->conn_lock);
     if (fd >= t->conns_cap) {
         int cap = t->conns_cap ? t->conns_cap * 2 : 256;
         while (cap <= fd)
             cap *= 2;
         tr_conn_t **nv = realloc(t->conns, cap * sizeof(*nv));
         if (!nv) {
+            pthread_mutex_unlock(&t->conn_lock);
             close(fd);
             return NULL;
         }
@@ -618,6 +659,7 @@ static tr_conn_t *conn_accept(sip_transport_t *t, int lfd, int is_tls)
         t->conns = nv;
         t->conns_cap = cap;
     }
+    pthread_mutex_unlock(&t->conn_lock);
     size_t fcap = t->cfg.max_msg * 2 + 16;
     tr_conn_t *c = calloc(1, sizeof(*c) + fcap - 1);
     if (!c) {
@@ -628,6 +670,16 @@ static tr_conn_t *conn_accept(sip_transport_t *t, int lfd, int is_tls)
     c->in_use = 1;
     c->is_tls = is_tls;
     c->peer = peer;
+    /* P3: TCP/TLS 连接按 (proto, peer) hash 路由到 reactor。
+     * 保证同一 peer 的连接落到同一 reactor（减少跨 reactor 同步）。
+     * cfg->mgr == NULL 时退回 reactor[0]（t->cfg.re）。 */
+    if (t->cfg.mgr) {
+        uint64_t h = conn_key_hash(is_tls, &peer);
+        unsigned rid = reactor_mgr_route(t->cfg.mgr, h);
+        c->home_reactor = reactor_mgr_get(t->cfg.mgr, rid);
+    }
+    if (!c->home_reactor)
+        c->home_reactor = t->cfg.re;
     /* TCP socket 选项：防半开连接 / idle 占 fd
      *   SO_KEEPALIVE=1（保活探测，空闲 2h 后 OS 自动探测）
      *   TCP_USER_TIMEOUT=idle_timeout_ms（强制断链，默认 30s）
@@ -673,8 +725,11 @@ static tr_conn_t *conn_accept(sip_transport_t *t, int lfd, int is_tls)
         ++t->idx.n;
         pthread_mutex_unlock(&t->idx.lock);
     }
+    /* P3: conn_lock 保护 conns[] 写入（与 conn_close 并发） */
+    pthread_mutex_lock(&t->conn_lock);
     t->conns[fd] = c;
     ++t->conns_n;
+    pthread_mutex_unlock(&t->conn_lock);
 #ifdef NSBC_WITH_OPENSSL
     if (is_tls) {
         void *tls_ctx = __atomic_load_n(&t->cfg.tls_ctx, __ATOMIC_ACQUIRE);
@@ -693,8 +748,10 @@ static tr_conn_t *conn_accept(sip_transport_t *t, int lfd, int is_tls)
                 }
                 free(c->sbuf); pthread_mutex_destroy(&c->sbuf_lock);
                 free(c);
+                pthread_mutex_lock(&t->conn_lock);
                 t->conns[fd] = NULL;
                 --t->conns_n;
+                pthread_mutex_unlock(&t->conn_lock);
                 close(fd);
                 return NULL;
             }
@@ -721,10 +778,45 @@ static tr_conn_t *conn_accept(sip_transport_t *t, int lfd, int is_tls)
         return NULL;
     }
 #endif
-    reactor_add(t->cfg.re, fd,
-                is_tls ? (EPOLLIN | EPOLLOUT | EPOLLRDHUP)
-                       : (EPOLLIN | EPOLLRDHUP),
-                on_conn_event, t);
+    /* F-04 修复：通过 reactor_call 在 home_reactor owner 线程执行 reactor_add。
+     * 跨线程直接调 reactor_add 会并发写 owner-only 的 callback slot 表。 */
+    {
+        tcp_accept_add_args_t aa;
+        aa.r = c->home_reactor;
+        aa.fd = fd;
+        aa.events = is_tls ? (EPOLLIN | EPOLLOUT | EPOLLRDHUP)
+                           : (EPOLLIN | EPOLLRDHUP);
+        aa.cb = on_conn_event;
+        aa.ud = t;
+        aa.result = NSBC_OK;
+        int rc = reactor_call(c->home_reactor, tcp_accept_add_fn, &aa);
+        if (rc != NSBC_OK || aa.result != NSBC_OK) {
+            llog(LOG_ERR, "sip",
+                 "conn_accept: reactor_add failed rc=%d add_rc=%d fd=%d",
+                 rc, aa.result, fd);
+            /* 回滚：从 conns[] 和哈希表摘除，关闭 fd，释放 conn */
+            if (t->idx.slots) {
+                pthread_mutex_lock(&t->idx.lock);
+                uint64_t h = conn_key_hash(is_tls, &peer);
+                size_t b = h & (CONN_IDX_CAP - 1);
+                tr_conn_t **pp = &t->idx.slots[b];
+                while (*pp && *pp != c) pp = &(*pp)->idx_next;
+                if (*pp) { *pp = c->idx_next; --t->idx.n; }
+                pthread_mutex_unlock(&t->idx.lock);
+            }
+#ifdef NSBC_WITH_OPENSSL
+            if (c->tls) tls_conn_free(c->tls);
+#endif
+            free(c->sbuf); pthread_mutex_destroy(&c->sbuf_lock);
+            pthread_mutex_lock(&t->conn_lock);
+            t->conns[fd] = NULL;
+            --t->conns_n;
+            pthread_mutex_unlock(&t->conn_lock);
+            free(c);
+            close(fd);
+            return NULL;
+        }
+    }
     return c;
 }
 
@@ -750,6 +842,18 @@ static void on_udp_event(int fd, uint32_t ev, void *arg)
 {
     (void)ev;
     sip_transport_t *t = (sip_transport_t *)arg;
+    /* P3: 通过 fd 反查 reactor index —— udp_fds[i] 绑定 reactor[i]（UDP 创建循环 i 次）。
+     * 找到后用对应的 per-reactor rx/dg 组（修复多 reactor 并发写 t->rx/t->dg 的 data race）。 */
+    int rx_idx = -1;
+    for (int i = 0; i < t->udp_fd_count; ++i) {
+        if (t->udp_fds[i] == fd) { rx_idx = i; break; }
+    }
+    if (rx_idx < 0 || rx_idx >= t->n_rx) {
+        llog(LOG_WARN, "sip", "on_udp_event: fd=%d reactor idx not found", fd);
+        return;
+    }
+    net_rx_t *rx = &t->per_reactor_rx[rx_idx];
+    net_dgram_t *dg = t->per_reactor_dg[rx_idx];
     /* 先用 fd 拿监听端口，后面填到每个 dgram 的 local.port 上 */
     uint16_t bind_port = 0;
     {
@@ -758,12 +862,12 @@ static void on_udp_event(int fd, uint32_t ev, void *arg)
             bind_port = ntohs(sin.sin_port);
     }
     for (;;) {
-        net_rx_prepare(&t->rx, t->dg);
-        int n = net_rx_recv(fd, &t->rx, t->dg);
+        net_rx_prepare(rx, dg);
+        int n = net_rx_recv(fd, rx, dg);
         if (n <= 0)
             break;
         for (int i = 0; i < n; ++i) {
-            net_dgram_t *d = &t->dg[i];
+            net_dgram_t *d = &dg[i];
             /* 补上监听端口（IP 来自 IP_PKTINFO，端口来自 getsockname） */
             if (bind_port > 0 && d->local.len > 0 &&
                 d->local.ss.ss_family == AF_INET) {
@@ -833,6 +937,7 @@ int sip_tr_create(const sip_tr_cfg_t *cfg, sip_transport_t **out)
             return NSBC_NOMEM;
         }
     }
+    pthread_mutex_init(&t->conn_lock, NULL);
     pthread_mutex_init(&t->clock, NULL);
     /* per-IP 连接计数表 */
     pthread_mutex_init(&t->ip_conn_lock, NULL);
@@ -846,14 +951,33 @@ int sip_tr_create(const sip_tr_cfg_t *cfg, sip_transport_t **out)
     }
     t->idx.n = 0;
 
-    for (int i = 0; i < NET_BATCH; ++i) {
-        t->dg[i].cap = cfg->max_msg;
-        t->dg[i].buf = malloc(cfg->max_msg);
-        if (!t->dg[i].buf) {
-            sip_tr_destroy(t);
-            return NSBC_NOMEM;
+    /* P3: per-reactor UDP 接收缓冲分配——原来单组 t->rx/t->dg，多 reactor 并发写 race。
+     * 按 reactor 数量分配 N 组 rx + 二维 dg 数组，每组独立 NET_BATCH 个 net_dgram_t。 */
+    t->n_rx = cfg->mgr ? reactor_mgr_count(cfg->mgr) : 1;
+    if (t->n_rx == 0) t->n_rx = 1;
+    if (t->n_rx > SIP_TR_FD_MAX) {
+        llog(LOG_WARN, "sip", "n_rx=%u exceeds SIP_TR_FD_MAX=%d, capping",
+             t->n_rx, SIP_TR_FD_MAX);
+        t->n_rx = SIP_TR_FD_MAX;
+    }
+    t->per_reactor_rx = calloc((size_t)t->n_rx, sizeof(net_rx_t));
+    t->per_reactor_dg = calloc((size_t)t->n_rx, sizeof(net_dgram_t[NET_BATCH]));
+    if (!t->per_reactor_rx || !t->per_reactor_dg) {
+        sip_tr_destroy(t);
+        return NSBC_NOMEM;
+    }
+    /* 初始化每组 dg[i].buf —— reactor 内部各线程独立使用自己的组 */
+    for (int r = 0; r < t->n_rx; ++r) {
+        for (int i = 0; i < NET_BATCH; ++i) {
+            t->per_reactor_dg[r][i].cap = cfg->max_msg;
+            t->per_reactor_dg[r][i].buf = malloc(cfg->max_msg);
+            if (!t->per_reactor_dg[r][i].buf) {
+                sip_tr_destroy(t);
+                return NSBC_NOMEM;
+            }
         }
     }
+    llog(LOG_INFO, "sip", "per-reactor rx/dg allocated n_rx=%d", t->n_rx);
 
     /* 多 fd 数组初始化：全部 -1（sip_tr_destroy / add_listeners 用） */
     t->udp_fd_count = t->tcp_count = t->tls_count = 0;
@@ -869,16 +993,38 @@ int sip_tr_create(const sip_tr_cfg_t *cfg, sip_transport_t **out)
     net_udp_cfg_t uc = {cfg->reuseport, cfg->rcvbuf_kb * 1024,
                         cfg->sndbuf_kb * 1024, 1, 1};
     if (cfg->enable_udp) {
-        int fd = net_udp_open(cfg->listen_ip, cfg->udp_port, &uc);
-        if (fd < 0) {
-            llog(LOG_CRIT, "sip", "udp listen %s:%u failed",
-                 cfg->listen_ip, cfg->udp_port);
-            sip_tr_destroy(t);
-            return NSBC_ERR;
+        /* P3: 多 reactor 时 SO_REUSEPORT 必须强制开启（否则同端口绑多 socket 失败） */
+        unsigned n_udp = 1;
+        if (cfg->mgr) {
+            n_udp = reactor_mgr_count(cfg->mgr);
+            if (!cfg->reuseport) {
+                llog(LOG_WARN, "sip",
+                     "multi-reactor requires SO_REUSEPORT, forcing on");
+                uc.reuseport = 1;
+            }
+            if (n_udp > (unsigned)SIP_TR_FD_MAX) {
+                llog(LOG_WARN, "sip", "reactor count %u exceeds SIP_TR_FD_MAX=%d, capping",
+                     n_udp, SIP_TR_FD_MAX);
+                n_udp = SIP_TR_FD_MAX;
+            }
         }
-        t->udp_fds[0] = fd;
-        t->udp_fd_count = 1;
-        reactor_add(t->cfg.re, fd, EPOLLIN, on_udp_event, t);
+
+        for (unsigned i = 0; i < n_udp; ++i) {
+            int fd = net_udp_open(cfg->listen_ip, cfg->udp_port, &uc);
+            if (fd < 0) {
+                llog(LOG_CRIT, "sip", "udp listen %s:%u [reactor %u] failed",
+                     cfg->listen_ip, cfg->udp_port, i);
+                /* rollback：关闭已创建的 UDP fds */
+                for (int j = 0; j < t->udp_fd_count; ++j)
+                    if (t->udp_fds[j] >= 0) close(t->udp_fds[j]);
+                sip_tr_destroy(t);
+                return NSBC_ERR;
+            }
+            t->udp_fds[t->udp_fd_count++] = fd;
+            reactor_t *r = cfg->mgr ? reactor_mgr_get(cfg->mgr, i) : cfg->re;
+            reactor_add(r, fd, EPOLLIN, on_udp_event, t);
+            llog(LOG_INFO, "sip", "udp fd=%d bound reactor[%u]", fd, i);
+        }
     }
     if (cfg->enable_tcp) {
         int fd = net_tcp_listen(cfg->listen_ip, cfg->tcp_port, 4096,
@@ -956,8 +1102,16 @@ void sip_tr_destroy(sip_transport_t *t)
     /* ---- 释放哈希表 ---- */
     free(t->idx.slots);
     pthread_mutex_destroy(&t->idx.lock);
-    for (int i = 0; i < NET_BATCH; ++i)
-        free(t->dg[i].buf);
+    /* P3: per-reactor rx/dg 清理 */
+    if (t->per_reactor_dg) {
+        for (int r = 0; r < t->n_rx; ++r) {
+            for (int i = 0; i < NET_BATCH; ++i)
+                free(t->per_reactor_dg[r][i].buf);
+        }
+        free(t->per_reactor_dg);
+    }
+    free(t->per_reactor_rx);
+    pthread_mutex_destroy(&t->conn_lock);
     pthread_mutex_destroy(&t->clock);
     pthread_mutex_destroy(&t->ip_conn_lock);
     free((void *)t->cfg.listen_ip);   /* strdup 来的，sip_tr_create 里分配 */

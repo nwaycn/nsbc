@@ -729,8 +729,9 @@ static void call_destroy(b2b_call_t *c)
         uint64_t seq = 0;
         int rc = event_handler_trigger("SESSION_END", end_json, &c->leg[0].callid, &seq);
         if (rc < 0) llog(LOG_WARN, "b2b", "SESSION_END handler rc=%d callid=%s", rc, c->leg[0].callid);
-        /* 同时推异步 Ring Buffer（双通道，白皮书 §5.2）*/
-        nsbc_event_push("SESSION_END", end_json);
+        /* Phase 2 event_bus 双通道设计：SESSION_END 只走同步 event_handler_trigger，
+         * 不再同时 nsbc_event_push。之前双通道会导致 ESL "*" 通配订阅者通过
+         * 同步链和 drain 异步链收到同事件两份。CDR 事件只走异步 push 保留。*/
         /* 同时推 UDS session 通道给 Web 端 */
         uds_send_session(end_json);
     }
@@ -3809,7 +3810,8 @@ void handle_new_invite(b2b_core_t *co, sip_txn_t *t,
             a->ruri, c->prof ? c->prof->name : "unknown", (int)SIP_TR_UDP);
         uint64_t seq = 0;
         event_handler_trigger("SESSION_CREATE", create_json, &c->leg[0].callid, &seq);
-        nsbc_event_push("SESSION_CREATE", create_json);
+        /* Phase 2：SESSION_CREATE 只走同步 event_handler_trigger，
+         * ESL "*" 通配订阅者走同步链已收到，不再额外 nsbc_event_push 避免重复。*/
     }
 
     /* REQ-PBX-CDR-001：START emit — 入呼 INVITE 到达即记账 */
@@ -5649,7 +5651,7 @@ void b2b_on_rx(void *ud, sip_tr_proto_t proto, const nsbc_sa_t *src,
                                     uint64_t seq = 0;
                                     event_handler_trigger("SESSION_ANSWER", ans_json,
                                                          &c->leg[0].callid, &seq);
-                                    nsbc_event_push("SESSION_ANSWER", ans_json);
+                                    /* Phase 2：SESSION_ANSWER 只走同步 trigger，避免 ESL 重复。*/
                                     uds_send_session(ans_json);
                                 }
                             }

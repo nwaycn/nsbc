@@ -1,10 +1,11 @@
-/* event_bus.c — Phase 1 新建：Per-Core 无锁事件总线 + 订阅式 handler
+/* event_bus.c — Phase 1 新建 + P3 per-core seq 分片
  *
  * 白皮书 §3 高性能事件总线：
  *   - Per-Core MPSC 无锁 Ring Buffer（每 core 独立 ring，写竞争零）
  *   - nsbc_event_push: 热路径零锁零 malloc，满时 drop（生产绝对优先）
  *   - event_handler_trigger: 同步订阅式 handler 链（SESSION_CREATE/ANSWER/END）
- *   - 全局单调递增序列号 __atomic_fetch_add（跨 Core 时序追溯）
+ *   - P3：per-core 独立单调递增序列号 — 每核零竞争，ring 本来 per-core 存帧
+ *     消费者按 ring 自身顺序读，per-core 单调完全够语义；无严格跨核全序需求
  *
  * 原子风格：项目约定 __atomic 内置（非 C11 stdatomic.h）
  */
@@ -37,25 +38,32 @@ typedef struct {
     volatile uint64_t write_pos     NSBC_CACHELINE_ALIGNED;
     volatile uint64_t read_pos      NSBC_CACHELINE_ALIGNED;
     volatile uint64_t dropped_count NSBC_CACHELINE_ALIGNED;
+    volatile uint64_t local_seq     NSBC_CACHELINE_ALIGNED;   /* P3: per-core 独立单调递增，零跨核争用 */
     char buffer[RING_SIZE];
 } per_core_ring_t;
 
 static per_core_ring_t *g_rings = NULL;   /* 动态分配：init 时按 CPU 数建 */
 static int g_ring_cores = 0;
-static volatile uint64_t g_global_seq = 0;
 
 int event_bus_init(void)
 {
     int ncores = (int)pcnt_cpus();
     if (ncores <= 0) ncores = 1;
-    if (ncores > RING_MAX_CORES) ncores = RING_MAX_CORES;
+    /* F-06 修复：不再硬限 RING_MAX_CORES=32。
+     * 每 core 一个 ring；CPU 越多 ring 越多，绝不多 CPU 折叠到同一 ring。
+     * ring 上限改为 256（RING_MAX_CORES 提升 + 重命名）。*/
+#define RING_MAX_CORES_HARD 256
+    if (ncores > RING_MAX_CORES_HARD) {
+        log_warn("event_bus", "detected %d cores, limiting to %d rings", ncores, RING_MAX_CORES_HARD);
+        ncores = RING_MAX_CORES_HARD;
+    }
+    /* 同时更新 per_core_ring_stat_t 缓冲区大小限制在 RING_MAX_CORES 以下 */
 
     g_rings = (per_core_ring_t *)calloc((size_t)ncores, sizeof(per_core_ring_t));
     if (!g_rings) return NSBC_NOMEM;
 
     /* posix_memalign 确保 cacheline 对齐更干净，但 calloc 已按 page 对齐 */
     g_ring_cores = ncores;
-    __atomic_store_n(&g_global_seq, 0, __ATOMIC_RELAXED);
 
     log_info("event_bus", "init OK cores=%d ring_size=%d total_mem=%zuKB",
              ncores, RING_SIZE, (size_t)ncores * sizeof(per_core_ring_t) / 1024);
@@ -73,9 +81,22 @@ void event_bus_fini(void)
 
 int event_bus_core_count(void) { return g_ring_cores; }
 
+/* P3：per-core 独立单调递增。
+ * 每核零跨核 cache line 争用；ring 本来 per-core 存事件帧，
+ * 消费者按 ring 自身顺序读，per-core 单调完全够语义。
+ * RELAXED 足够：per-core 单 producer，帧的可见性由 write_pos release store 保证。
+ *
+ * 前置安全：event_handler_trigger() 可能在 event_bus_init() 之前被调用
+ * （早期模块 init 路径），g_rings 此时为 NULL，返回 0 保持安全。 */
 uint64_t event_bus_next_seq(void)
 {
-    return __atomic_fetch_add(&g_global_seq, 1, __ATOMIC_ACQ_REL) + 1;
+    if (!g_rings) return 0;
+    int core_id = pcpt_idx();
+    /* F-06 修复：不折叠到 ring 0，安全 fallback 到最后一个有效 ring */
+    if (core_id < 0 || core_id >= g_ring_cores)
+        core_id = g_ring_cores - 1;
+    per_core_ring_t *rb = &g_rings[core_id];
+    return __atomic_fetch_add(&rb->local_seq, 1, __ATOMIC_RELAXED) + 1;
 }
 
 int event_bus_get_stat(int core_id, per_core_ring_stat_t *out)
@@ -118,31 +139,28 @@ int nsbc_event_push(const char *event_name, const char *payload_json)
 
     /* 1. 找到当前 core 的 ring */
     int core_id = pcpt_idx();  /* percpu.h 已定义 */
-    if (core_id >= g_ring_cores) core_id = 0;
+    /* F-06 修复：不折叠到 ring 0，安全 fallback */
+    if (core_id < 0 || core_id >= g_ring_cores)
+        core_id = g_ring_cores - 1;
     per_core_ring_t *rb = &g_rings[core_id];
 
     /* 2. 构造帧（TLS buffer）：|u16 name_len|name bytes|u32 payload_len|payload|u64 seq|u8 end| */
-    uint16_t name_len = (uint16_t)strlen(event_name);
-    uint32_t payload_len = payload_json ? (uint32_t)strlen(payload_json) : 0;
-    uint64_t seq = event_bus_next_seq();
-
-    size_t frame_size = 2 + name_len + 4 + payload_len + 8 + 1;
-    if (frame_size > sizeof(tls_event_buf)) {
+    size_t name_size = strlen(event_name);
+    size_t payload_size = payload_json ? strlen(payload_json) : 0;
+    const size_t frame_overhead = 2 + 4 + 8 + 1;
+    if (name_size > UINT16_MAX || payload_size > UINT32_MAX ||
+        name_size > sizeof(tls_event_buf) - frame_overhead ||
+        payload_size > sizeof(tls_event_buf) - frame_overhead - name_size) {
         /* 帧太大——不 push（生产绝对优先，不阻塞） */
-        log_warn("event_bus", "event frame too large (%zu > %zu) — skip",
-                 frame_size, sizeof(tls_event_buf));
+        log_warn("event_bus", "event frame too large name=%zu payload=%zu — skip",
+                 name_size, payload_size);
         return NSBC_NOMEM;
     }
+    uint16_t name_len = (uint16_t)name_size;
+    uint32_t payload_len = (uint32_t)payload_size;
+    size_t frame_size = frame_overhead + name_size + payload_size;
 
-    char *p = tls_event_buf;
-    memcpy(p, &name_len, 2); p += 2;
-    memcpy(p, event_name, name_len); p += name_len;
-    memcpy(p, &payload_len, 4); p += 4;
-    if (payload_len) { memcpy(p, payload_json, payload_len); p += payload_len; }
-    memcpy(p, &seq, 8); p += 8;
-    *p++ = 0xFF;  /* end_marker */
-
-    /* 3. 无锁写入 ring buffer */
+    /* 3. Check capacity before taking the globally contended sequence counter. */
     uint64_t wp = __atomic_load_n(&rb->write_pos, __ATOMIC_RELAXED);
     uint64_t rp = __atomic_load_n(&rb->read_pos, __ATOMIC_ACQUIRE);  /* reader 可能在另一核 */
 
@@ -153,6 +171,16 @@ int nsbc_event_push(const char *event_name, const char *payload_json)
         return NSBC_BUSY;
     }
 
+    uint64_t seq = event_bus_next_seq();
+    char *p = tls_event_buf;
+    memcpy(p, &name_len, 2); p += 2;
+    memcpy(p, event_name, name_len); p += name_len;
+    memcpy(p, &payload_len, 4); p += 4;
+    if (payload_len) { memcpy(p, payload_json, payload_len); p += payload_len; }
+    memcpy(p, &seq, 8); p += 8;
+    *p++ = 0xFF;  /* end_marker */
+
+    /* 4. 无锁写入 ring buffer */
     /* 4. 拷贝到 ring（处理 wrap） */
     uint64_t offset = wp & RING_MASK;
     uint64_t first_chunk = RING_SIZE - offset;   /* 到 buffer 末尾的字节数 */
@@ -191,12 +219,14 @@ typedef struct {
     handler_slot_t slots[EVT_HANDLER_MAX];
     int count;
     pthread_mutex_t lock;
+    pthread_mutex_t unregister_lock;
 } handler_reg_t;
 
 #define MAX_EVENTS 16
 static handler_reg_t g_handlers[MAX_EVENTS];
 static pthread_mutex_t g_handlers_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_handlers_ready = 0;
+static __thread unsigned event_dispatch_depth;
 
 static void handlers_init_once(void);   /* 前向声明 */
 
@@ -211,6 +241,7 @@ static void handlers_init_once(void)
     for (int i = 0; i < MAX_EVENTS; ++i) {
         memset(&g_handlers[i], 0, sizeof(g_handlers[i]));
         pthread_mutex_init(&g_handlers[i].lock, NULL);
+        pthread_mutex_init(&g_handlers[i].unregister_lock, NULL);
     }
     g_handlers_ready = 1;
 }
@@ -258,13 +289,17 @@ int event_handler_register(const char *event_name, event_handler_fn fn, void *ud
         }
     }
 
-    if (reg->count >= EVT_HANDLER_MAX) {
+    int idx = 0;
+    while (idx < reg->count && reg->slots[idx].fn)
+        ++idx;
+    if (idx == reg->count && reg->count >= EVT_HANDLER_MAX) {
         pthread_mutex_unlock(&reg->lock);
         log_warn("event_bus", "handler table full for '%s'", event_name);
         return NSBC_NOSPC;
     }
 
-    int idx = reg->count++;
+    if (idx == reg->count)
+        ++reg->count;
     reg->slots[idx].fn = fn;
     reg->slots[idx].ud = ud;
     __atomic_store_n(&reg->slots[idx].refcnt, 0, __ATOMIC_RELAXED);
@@ -279,6 +314,11 @@ int event_handler_register(const char *event_name, event_handler_fn fn, void *ud
 int event_handler_unregister(const char *event_name, event_handler_fn fn, void *ud)
 {
     if (!event_name || !fn) return NSBC_INVAL;
+    if (event_dispatch_depth > 0) {
+        log_warn("event_bus",
+                 "handler unregister from event callback is deferred");
+        return NSBC_BUSY;
+    }
     handlers_init();
 
     handler_reg_t *reg = NULL;
@@ -294,6 +334,7 @@ int event_handler_unregister(const char *event_name, event_handler_fn fn, void *
 
     if (!reg) return NSBC_NOENT;
 
+    pthread_mutex_lock(&reg->unregister_lock);
     pthread_mutex_lock(&reg->lock);
     int target = -1;
     for (int i = 0; i < reg->count; ++i) {
@@ -303,6 +344,7 @@ int event_handler_unregister(const char *event_name, event_handler_fn fn, void *
     }
     if (target < 0) {
         pthread_mutex_unlock(&reg->lock);
+        pthread_mutex_unlock(&reg->unregister_lock);
         return NSBC_NOENT;
     }
 
@@ -320,18 +362,18 @@ int event_handler_unregister(const char *event_name, event_handler_fn fn, void *
                     "unregister '%s' fn=%p timeout (refcnt=%d) — leak but no crash",
                     event_name, (void *)fn,
                     __atomic_load_n(&reg->slots[target].refcnt, __ATOMIC_ACQUIRE));
+            pthread_mutex_unlock(&reg->unregister_lock);
             return NSBC_BUSY;  /* fail-safe：留着泄漏但不 crash */
         }
     }
 
-    /* 安全移除（swap with last + count--）*/
+    /* Keep slot addresses stable: trigger snapshots may reference other slots. */
     pthread_mutex_lock(&reg->lock);
-    if (target != reg->count - 1) {
-        reg->slots[target] = reg->slots[reg->count - 1];
-    }
-    memset(&reg->slots[reg->count - 1], 0, sizeof(handler_slot_t));
-    reg->count--;
+    memset(&reg->slots[target], 0, sizeof(handler_slot_t));
+    while (reg->count > 0 && !reg->slots[reg->count - 1].fn)
+        --reg->count;
     pthread_mutex_unlock(&reg->lock);
+    pthread_mutex_unlock(&reg->unregister_lock);
 
     log_info("event_bus", "handler '%s' fn=%p unregistered (clean)",
              event_name, (void *)fn);
@@ -368,7 +410,11 @@ int event_handler_trigger(const char *event_name, const char *payload,
     int rc = NSBC_OK;
 
     /* 临时槽：最多 EVT_HANDLER_MAX × 2（通配 + 精确）*/
-    struct { event_handler_fn fn; void *ud; } collected[EVT_HANDLER_MAX * 2];
+    struct {
+        event_handler_fn fn;
+        void *ud;
+        handler_slot_t *slot;
+    } collected[EVT_HANDLER_MAX * 2];
     int collected_n = 0;
 
     /* 一次性锁内收集（通配 + 精确）—— 中途绝不解锁 */
@@ -380,10 +426,12 @@ int event_handler_trigger(const char *event_name, const char *payload,
                 strcmp(g_handlers[i].event_name, "*") == 0) {
                 pthread_mutex_lock(&g_handlers[i].lock);
                 for (int k = 0; k < g_handlers[i].count && collected_n < EVT_HANDLER_MAX; ++k) {
-                    if (__atomic_load_n(&g_handlers[i].slots[k].unloading, __ATOMIC_ACQUIRE)) continue;
+                    if (!g_handlers[i].slots[k].fn ||
+                        __atomic_load_n(&g_handlers[i].slots[k].unloading, __ATOMIC_ACQUIRE)) continue;
                     __atomic_fetch_add(&g_handlers[i].slots[k].refcnt, 1, __ATOMIC_ACQ_REL);
                     collected[collected_n].fn = g_handlers[i].slots[k].fn;
                     collected[collected_n].ud = g_handlers[i].slots[k].ud;
+                    collected[collected_n].slot = &g_handlers[i].slots[k];
                     collected_n++;
                 }
                 pthread_mutex_unlock(&g_handlers[i].lock);
@@ -397,10 +445,12 @@ int event_handler_trigger(const char *event_name, const char *payload,
                 strcmp(g_handlers[i].event_name, event_name) == 0) {
                 pthread_mutex_lock(&g_handlers[i].lock);
                 for (int k = 0; k < g_handlers[i].count && collected_n < EVT_HANDLER_MAX * 2; ++k) {
-                    if (__atomic_load_n(&g_handlers[i].slots[k].unloading, __ATOMIC_ACQUIRE)) continue;
+                    if (!g_handlers[i].slots[k].fn ||
+                        __atomic_load_n(&g_handlers[i].slots[k].unloading, __ATOMIC_ACQUIRE)) continue;
                     __atomic_fetch_add(&g_handlers[i].slots[k].refcnt, 1, __ATOMIC_ACQ_REL);
                     collected[collected_n].fn = g_handlers[i].slots[k].fn;
                     collected[collected_n].ud = g_handlers[i].slots[k].ud;
+                    collected[collected_n].slot = &g_handlers[i].slots[k];
                     collected_n++;
                 }
                 pthread_mutex_unlock(&g_handlers[i].lock);
@@ -411,35 +461,351 @@ int event_handler_trigger(const char *event_name, const char *payload,
     pthread_mutex_unlock(&g_handlers_lock);
 
     /* 解锁后逐个调回调（完全无锁，内部再触发事件安全）*/
+    ++event_dispatch_depth;
     for (int i = 0; i < collected_n; ++i) {
         int hrc = collected[i].fn(&ctx, collected[i].ud);
 
-        /* refcnt--：unregister 自旋等待 refcnt→0 才能安全清空，
-         * 这里的 -- 配合上面锁内的 ++，是回调生命周期保护的对称操作 */
-        /* 注：refcnt-- 不直接对 slots[i] 操作（不知道它原来在哪个 handler_reg_t），
-         * 简化处理：我们只负责 ++ 后的对称性，让调用方在 handler 内部保证不触发
-         * unregister 自己（白皮书约束）。实际安全卸载在 unload_wait 自旋阶段处理。*/
+        __atomic_sub_fetch(&collected[i].slot->refcnt, 1, __ATOMIC_RELEASE);
         if (hrc == NSBC_PERM_DENIED) {
             rc = NSBC_PERM_DENIED;
             /* 致命拒绝：已收集的后续回调也要调（让所有订阅者都拿到通知），
              * 但整体返回 PERM_DENIED 让上层知道有致命拦截 */
         }
     }
-
-    /* 注：当前实现简化——refcnt 的对称性由 register/unregister 路径保证：
-     * register 时 refcnt=0，unregister 自旋等 refcnt→0 才清空。
-     * 我们在 trigger 里 ++ 了，但回调内部如果没调 refcnt--，
-     * unregister 可能永远等不到 refcnt→0 而触发 fail-safe 泄漏。
-     * 这是已知权衡：白皮书 §10.2 "宁可泄漏，绝不崩溃" 的体现。
-     * 未来真要严格对称性可以给 collected 每条记录多一份 slot 引用。*/
+    --event_dispatch_depth;
 
     return rc;
 }
 
-/*
-    Author:       李浩 (Li Hao)
-    Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
-    Email:        1354608370@qq.com
-    Licensed:     Apache License 2.0
-    Copyright:    2024-2026
-*/
+/* ============================================================
+ * Part C: Phase 2 — Async Subscriber Chain + Drain Thread
+ *
+ * 独立于同步 event_handler 链——双通道不重复。
+ *
+ * 流程：nsbc_event_push（零锁零 malloc 写 per-core ring）
+ *       → drain 线程约每 50ms 扫所有 ring，解析二进制帧
+ *       → fire 给 async subscriber 链
+ *       → payload/tls buffer 全部在 drain 线程栈上完成，零 malloc
+ *
+ * 帧解析格式（和写入端完全对齐）：
+ *   | uint16 name_len | name bytes | uint32 payload_len | payload bytes | uint64 seq | uint8 end_marker(0xFF) |
+ *   - 从 read_pos 开始；writer 保证连续帧不跨越 ring 边界
+ *   - end_marker=0xFF 表示完整帧末尾（我们用它做完整性校验）
+ *   - 解析一帧后 advance read_pos（atomic RELEASE）
+ * ============================================================ */
+
+/* --- Async subscriber 链（和 g_handlers 完全独立的数组 + 锁）--- */
+
+#define ASYNC_HANDLER_MAX EVT_HANDLER_MAX
+#define MAX_ASYNC_EVENTS  MAX_EVENTS
+
+typedef struct {
+    char event_name[64];
+    event_handler_fn slots[ASYNC_HANDLER_MAX];
+    void            *slots_ud[ASYNC_HANDLER_MAX];
+    int count;
+    pthread_mutex_t lock;
+} async_reg_t;
+
+static async_reg_t g_async_handlers[MAX_ASYNC_EVENTS];
+static pthread_mutex_t g_async_handlers_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_async_handlers_ready = 0;
+
+static void async_handlers_init_once(void)
+{
+    for (int i = 0; i < MAX_ASYNC_EVENTS; ++i) {
+        memset(&g_async_handlers[i], 0, sizeof(g_async_handlers[i]));
+        pthread_mutex_init(&g_async_handlers[i].lock, NULL);
+    }
+    g_async_handlers_ready = 1;
+}
+
+static void async_handlers_init(void)
+{
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, async_handlers_init_once);
+}
+
+static async_reg_t *async_find_or_create(const char *event_name)
+{
+    async_handlers_init();
+    pthread_mutex_lock(&g_async_handlers_lock);
+    for (int i = 0; i < MAX_ASYNC_EVENTS; ++i) {
+        if (g_async_handlers[i].event_name[0] &&
+            strcmp(g_async_handlers[i].event_name, event_name) == 0) {
+            pthread_mutex_unlock(&g_async_handlers_lock);
+            return &g_async_handlers[i];
+        }
+    }
+    for (int i = 0; i < MAX_ASYNC_EVENTS; ++i) {
+        if (g_async_handlers[i].event_name[0] == '\0') {
+            snprintf(g_async_handlers[i].event_name,
+                     sizeof(g_async_handlers[i].event_name), "%s", event_name);
+            pthread_mutex_unlock(&g_async_handlers_lock);
+            return &g_async_handlers[i];
+        }
+    }
+    pthread_mutex_unlock(&g_async_handlers_lock);
+    return NULL;
+}
+
+int event_async_register(const char *event_name, event_handler_fn fn, void *ud)
+{
+    if (!event_name || !event_name[0] || !fn) return NSBC_INVAL;
+    async_reg_t *reg = async_find_or_create(event_name);
+    if (!reg) return NSBC_NOSPC;
+    pthread_mutex_lock(&reg->lock);
+    for (int i = 0; i < reg->count; ++i) {
+        if (reg->slots[i] == fn && reg->slots_ud[i] == ud) {
+            pthread_mutex_unlock(&reg->lock);
+            return NSBC_EXISTS;
+        }
+    }
+    if (reg->count >= ASYNC_HANDLER_MAX) {
+        pthread_mutex_unlock(&reg->lock);
+        log_warn("event_bus", "async handler table full for '%s'", event_name);
+        return NSBC_NOSPC;
+    }
+    reg->slots[reg->count] = fn;
+    reg->slots_ud[reg->count] = ud;
+    reg->count++;
+    pthread_mutex_unlock(&reg->lock);
+    log_info("event_bus", "async handler '%s' registered fn=%p", event_name, (void *)fn);
+    return NSBC_OK;
+}
+
+int event_async_unregister(const char *event_name, event_handler_fn fn, void *ud)
+{
+    if (!event_name || !fn) return NSBC_INVAL;
+    async_handlers_init();
+    async_reg_t *reg = NULL;
+    pthread_mutex_lock(&g_async_handlers_lock);
+    for (int i = 0; i < MAX_ASYNC_EVENTS; ++i) {
+        if (g_async_handlers[i].event_name[0] &&
+            strcmp(g_async_handlers[i].event_name, event_name) == 0) {
+            reg = &g_async_handlers[i];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_async_handlers_lock);
+    if (!reg) return NSBC_NOENT;
+    pthread_mutex_lock(&reg->lock);
+    for (int i = 0; i < reg->count; ++i) {
+        if (reg->slots[i] == fn && reg->slots_ud[i] == ud) {
+            reg->slots[i] = NULL;
+            reg->slots_ud[i] = NULL;
+            while (reg->count > 0 && !reg->slots[reg->count - 1]) --reg->count;
+            pthread_mutex_unlock(&reg->lock);
+            log_info("event_bus", "async handler '%s' fn=%p unregistered",
+                     event_name, (void *)fn);
+            return NSBC_OK;
+        }
+    }
+    pthread_mutex_unlock(&reg->lock);
+    return NSBC_NOENT;
+}
+
+/* drain 线程内 fire 到 async subscriber 链（通配 "*" + 精确匹配）*/
+static void async_fire(const char *event_name, const char *payload, uint64_t seq)
+{
+    if (!event_name) return;
+
+    /* 收集所有匹配的 (fn, ud) 到栈上数组 → 解锁后执行 */
+    struct { event_handler_fn fn; void *ud; } collected[ASYNC_HANDLER_MAX * 2];
+    int n = 0;
+
+    pthread_mutex_lock(&g_async_handlers_lock);
+    for (int i = 0; i < MAX_ASYNC_EVENTS; ++i) {
+        if (!g_async_handlers[i].event_name[0]) continue;
+        int wildcard = strcmp(g_async_handlers[i].event_name, "*") == 0;
+        int exact   = strcmp(g_async_handlers[i].event_name, event_name) == 0;
+        if (!wildcard && !exact) continue;
+        pthread_mutex_lock(&g_async_handlers[i].lock);
+        for (int k = 0; k < g_async_handlers[i].count && n < ASYNC_HANDLER_MAX * 2; ++k) {
+            if (g_async_handlers[i].slots[k]) {
+                collected[n].fn = g_async_handlers[i].slots[k];
+                collected[n].ud = g_async_handlers[i].slots_ud[k];
+                ++n;
+            }
+        }
+        pthread_mutex_unlock(&g_async_handlers[i].lock);
+    }
+    pthread_mutex_unlock(&g_async_handlers_lock);
+
+    if (n == 0) return;
+
+    event_context_t ctx = {
+        .event_name = event_name,
+        .payload    = payload,
+        .call_key   = NULL,
+        .event_seq  = seq,
+    };
+    for (int i = 0; i < n; ++i)
+        collected[i].fn(&ctx, collected[i].ud);
+}
+
+/* --- Per-ring 帧解析器 ---
+ *
+ * 从 ring 的 read_pos 开始，解析出一帧。
+ * 返回帧总长度（含帧内所有字节），或 0 表示：
+ *   - read_pos >= write_pos：ring 空，没有完整帧
+ *   - 帧被截断（writer 还没写完，我们等到下一轮 drain）
+ *   - end_marker 不是 0xFF：损坏，skip 8 字节找下一个帧边界
+ *
+ * frame_buf 必须是至少 2048 字节的 buffer（和 TLS buffer 同大小）。*/
+static size_t ring_parse_one(per_core_ring_t *rb, size_t buf_size, char *frame_buf,
+                             const char **out_name, const char **out_payload,
+                             uint64_t *out_seq)
+{
+    uint64_t rp = __atomic_load_n(&rb->read_pos, __ATOMIC_ACQUIRE);
+    uint64_t wp = __atomic_load_n(&rb->write_pos, __ATOMIC_ACQUIRE);
+
+    if (rp >= wp) return 0;  /* ring 空或 writer 还没写 */
+
+    uint64_t offset = rp & RING_MASK;
+    uint64_t avail = wp - rp;
+
+    /* 先读 u16 name_len（最小 2 字节头部）*/
+    if (avail < 2) return 0;
+
+    uint16_t name_len;
+    if (offset + 2 <= RING_SIZE) {
+        memcpy(&name_len, rb->buffer + offset, 2);
+    } else {
+        size_t first = RING_SIZE - offset;
+        memcpy(&name_len, rb->buffer + offset, first);
+        memcpy(((char *)&name_len) + first, rb->buffer, 2 - first);
+    }
+
+    size_t frame_overhead = 2 + name_len + 4 + 8 + 1;
+    /* Bug fix 1: 防止 stack buffer overflow（frame_buf 只有 4096）*/
+    if (frame_overhead > buf_size) return 8;  /* skip 8 字节继续找帧边界 */
+    if (frame_overhead > avail) return 0;  /* writer 还没写完这帧 */
+    if (name_len == 0 || name_len > 255) return 8;  /* Bug fix 3: corruption 要推进 read_pos */
+
+    /* 整帧拷贝到 frame_buf（绕过 ring wrap 问题）*/
+    if (offset + frame_overhead <= RING_SIZE) {
+        memcpy(frame_buf, rb->buffer + offset, frame_overhead);
+    } else {
+        size_t first = RING_SIZE - offset;
+        memcpy(frame_buf, rb->buffer + offset, first);
+        memcpy(frame_buf + first, rb->buffer, frame_overhead - first);
+    }
+
+    /* 解包（frame_buf 是栈上可写 buffer，p/name/payload 用 char*）*/
+    char *p = frame_buf;
+    uint16_t nl; memcpy(&nl, p, 2); p += 2;
+    char *name = p; p += nl;
+    uint32_t pl; memcpy(&pl, p, 4); p += 4;
+    char *payload = p; p += pl;
+    uint64_t seq; memcpy(&seq, p, 8); p += 8;
+    uint8_t end_marker = *p;
+
+    if (end_marker != 0xFF) {
+        /* 损坏——跳过 8 字节继续找下一个帧边界
+         * （保守处理：损坏很少见，只跳过 seq 字段长度）*/
+        return 8;
+    }
+
+    /* 名称和 payload 都必须 null-terminate（drain 线程内加 null 安全）*/
+    if (nl < sizeof(frame_buf) - frame_overhead) {
+        name[nl] = '\0';
+    } else {
+        return 8;  /* 损坏 */
+    }
+    if (pl > 0 && pl < frame_overhead + sizeof(frame_buf) - frame_overhead) {
+        payload[pl] = '\0';
+    }
+
+    *out_name = name;
+    *out_payload = pl > 0 ? payload : NULL;
+    *out_seq = seq;
+    return frame_overhead;
+}
+
+/* 扫一遍 core_id 指定的 ring：解析所有 pending 帧 → fire 给 async chain */
+static void drain_one_ring(int core_id)
+{
+    if (!g_rings || core_id < 0 || core_id >= g_ring_cores) return;
+    per_core_ring_t *rb = &g_rings[core_id];
+
+    /* drain 线程栈上 buffer：零 malloc */
+    char frame_buf[4096];
+
+    int safety = 0;
+    while (safety++ < 2048) {   /* 单 drain 周期最多处理 2048 帧 */
+        const char *name, *payload;
+        uint64_t seq;
+        size_t frame_len = ring_parse_one(rb, sizeof(frame_buf), frame_buf,
+                                          &name, &payload, &seq);
+        if (frame_len == 0) break;  /* ring 空或 writer 还没写完 */
+        /* Bug fix 2: frame_len >= 16 = 最小完整帧（name=1 字节 → 2+1+4+8+1=16）
+         * frame_len < 16 视为 corruption skip，推进 read_pos 但不 fire async_fire */
+        if (frame_len >= 16) {
+            async_fire(name, payload, seq);
+            uint64_t rp = __atomic_load_n(&rb->read_pos, __ATOMIC_ACQUIRE);
+            __atomic_store_n(&rb->read_pos, rp + frame_len, __ATOMIC_RELEASE);
+        } else {
+            /* corruption skip（返回值是 8，已在 ring_parse_one 里统一）*/
+            uint64_t rp = __atomic_load_n(&rb->read_pos, __ATOMIC_ACQUIRE);
+            __atomic_store_n(&rb->read_pos, rp + frame_len, __ATOMIC_RELEASE);
+        }
+    }
+}
+
+/* --- Drain 线程 --- */
+
+static pthread_t      g_drain_thread = 0;
+static volatile int    g_drain_running = 0;
+static volatile int    g_drain_stop_flag = 0;
+
+static void *drain_thread_fn(void *ud)
+{
+    (void)ud;
+    log_info("event_bus", "drain thread started (cores=%d)", g_ring_cores);
+
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 50 * 1000 * 1000 };  /* 50ms 周期 */
+
+    while (!__atomic_load_n(&g_drain_stop_flag, __ATOMIC_ACQUIRE)) {
+        for (int c = 0; c < g_ring_cores; ++c)
+            drain_one_ring(c);
+        nanosleep(&ts, NULL);
+    }
+
+    /* 退出前 drain 最后一轮——确保 shutdown 期间 push 的帧不丢 */
+    for (int c = 0; c < g_ring_cores; ++c)
+        drain_one_ring(c);
+
+    log_info("event_bus", "drain thread exiting");
+    return NULL;
+}
+
+int event_bus_start_drain_thread(void)
+{
+    /* F-03 配套：先 init（如果还没） */
+    if (!g_rings) {
+        int rc = event_bus_init();
+        if (rc != NSBC_OK) return rc;
+    }
+    if (__atomic_load_n(&g_drain_running, __ATOMIC_ACQUIRE))
+        return NSBC_OK;  /* 已经在跑 */
+
+    __atomic_store_n(&g_drain_stop_flag, 0, __ATOMIC_RELEASE);
+    if (pthread_create(&g_drain_thread, NULL, drain_thread_fn, NULL) != 0) {
+        log_err("event_bus", "failed to create drain thread");
+        return NSBC_ERR;
+    }
+    __atomic_store_n(&g_drain_running, 1, __ATOMIC_RELEASE);
+    return NSBC_OK;
+}
+
+void event_bus_stop_drain_thread(void)
+{
+    if (!__atomic_load_n(&g_drain_running, __ATOMIC_ACQUIRE)) return;
+    __atomic_store_n(&g_drain_stop_flag, 1, __ATOMIC_RELEASE);
+    if (g_drain_thread) {
+        pthread_join(g_drain_thread, NULL);
+        g_drain_thread = 0;
+    }
+    __atomic_store_n(&g_drain_running, 0, __ATOMIC_RELEASE);
+}

@@ -17,6 +17,8 @@
 #include "nsbcd_signal.h"
 #include "playback_engine.h"
 #include "reactor.h"
+#include "reactor_manager.h"
+#include "event_bus.h"        /* Phase 2 event_bus: drain 线程启停 */
 #include "security.h"       /* REQ-EXT-API-005: security_set_yaml_path */
 #include "srtp_session.h"
 
@@ -135,6 +137,23 @@ static void *ticker_main(void *p)
         if (++since_rcu >= 10) { /* ~1s 推进一个 RCU 宽限检测 */
             since_rcu = 0;
             wpool_rcu_advance(t->ctx->wpool);
+
+            /* P3: worker 按需扩缩 —— 每 ~1s 检查 core.workers 配置变化
+             * （CGF_HOT 标记，config.reload/SIGHUP 后配置值变化自动触发）。
+             * ticker 线程做 resize 安全——wpool_resize 内部有 resize_lock 保护。
+             * shutdown 期间跳过（避免与 wpool_destroy 并发——虽然 wpool_destroy 也拿 resize_lock）。 */
+            {
+                static long last_workers = -1;
+                long cur_workers = 0;
+                cfg_get_int(t->ctx->cfg, "core.workers", &cur_workers, NULL);
+                if (cur_workers > 0 && cur_workers != last_workers
+                    && !ctx_stopping(t->ctx)) {
+                    unsigned max = wpool_max_size(t->ctx->wpool);
+                    unsigned target = (unsigned)cur_workers > max ? max : (unsigned)cur_workers;
+                    if (wpool_resize(t->ctx->wpool, target) == NSBC_OK)
+                        last_workers = cur_workers;
+                }
+            }
         }
     }
     pthread_mutex_unlock(&t->lock);
@@ -589,26 +608,50 @@ int main(int argc, char **argv)
         nworkers = sysconf(_SC_NPROCESSORS_ONLN);
     if (nworkers < 1)
         nworkers = 1;
+
+    /* P3 按需扩缩：max_workers 预分配槽位上限（wpool_resize 不能超过此值） */
+    long max_workers = 0;
+    cfg_get_int(cfg, "core.workers_max", &max_workers, NULL);
+    if (max_workers <= 0)
+        max_workers = 64;
+    if (max_workers < nworkers)
+        max_workers = nworkers;
+    if (max_workers > 64)
+        max_workers = 64;
+
     long qcap = 4096;
     cfg_get_int(cfg, "core.worker_queue", &qcap, NULL);
-    if (wpool_create(&ctx.wpool, (unsigned)nworkers, (uint32_t)qcap,
-                     ctx.rcu) != NSBC_OK) {
+    if (wpool_create(&ctx.wpool, (unsigned)nworkers, (unsigned)max_workers,
+                     (uint32_t)qcap, ctx.rcu) != NSBC_OK) {
         llog(LOG_CRIT, "core", "worker pool create failed");
         return 1;
     }
 
     ctx.tw = calloc(1, sizeof(tw_t));
+    if (!ctx.tw) {
+        llog(LOG_CRIT, "core", "timer wheel allocation failed");
+        return 1;
+    }
     tw_init(ctx.tw, 100, nsbc_now_ms());
 
     /* §8 ctx 槽位绑定：playback_engine 注册 pb_stop_if_playing
      * dp_sleep 在 dp_ctx_init 时自行绑 dp_sleep_cancel/dp_sleep_active */
     pb_bind_ctx_slots(&ctx);
 
-    ctx.re = reactor_create(1024);
-    if (!ctx.re) {
-        llog(LOG_CRIT, "core", "reactor create failed");
+    /* P2: reactor manager — 读取 core.reactors 配置，manager 强制当前 n=1 */
+    long nreactors = 1;
+    cfg_get_int(cfg, "core.reactors", &nreactors, NULL);
+    if (nreactors <= 0) nreactors = 1;
+    if (nreactors > 64) nreactors = 64;
+    reactor_mgr_t *mgr = reactor_mgr_create((unsigned)nreactors, 1024);
+    if (!mgr) {
+        llog(LOG_CRIT, "core", "reactor_mgr_create failed");
         return 1;
     }
+    ctx.re = reactor_mgr_get(mgr, 0);
+    ctx.mgr = mgr;  /* P2: 存到 ctx 供阶段 3 多 reactor 路由访问 */
+    /* ctx.re 保持单 reactor 透明路由：所有 sip_transport/media_bridge/oam
+     * 模块继续直接用 ctx.re，零代码改动；多 reactor 时通过 ctx.mgr 路由 */
     int sfd = nsbcd_signal_fd();
     int src = reactor_add(ctx.re, sfd, EPOLLIN, on_signal, NULL);
     llog(LOG_INFO, "core", "signal fd=%d reactor_add rc=%d", sfd, src);
@@ -757,16 +800,61 @@ int main(int argc, char **argv)
         goto shutdown_failed;
     log_audit("system", "boot-complete", "modules started, accepting traffic");
 
-    /* ---- 主事件循环：reactor + 信号；超时由时间轮决定 ---- */
-    while (!ctx_stopping(&ctx)) {
-        uint64_t w = tw_next_wait_ms(ctx.tw);
-        int timeout = (w == UINT64_MAX) ? 1000 : (int)(w > 1000 ? 1000 : w);
-        reactor_wait(ctx.re, timeout);
+    /* P3: 启动 reactor[1..n-1] 的 pthread。
+     * 必须在 modmgr_start_all 之后——所有模块 init 的 reactor_add（sip_transport UDP sockets,
+     * media_bridge 预留等）都在 main 线程执行，slot table 只有单线程访问，无并发竞争。
+     * reactor[0] 留给 main 线程（耦合 ticker 时间轮 + reactor_wait 超时由 tw_next_wait_ms 决定）。 */
+    if (ctx.mgr && reactor_mgr_start_threads(ctx.mgr) != NSBC_OK) {
+        llog(LOG_WARN, "core", "reactor_mgr_start_threads failed, continuing with n=1");
     }
 
-    /* ---- 优雅停机：先摘流量，再 drain ---- */
-    modmgr_stop_all(mm, &ctx);
+    /* Phase 2 event_bus: start drain thread（自动 init event_bus）。
+     * 必须在 reactor start 之后——此时所有模块已 init，push 才不会 NSBC_INVAL。
+     * 失败不致命：drain 线程只是异步 CDR 投递，同步 event_handler 链照常工作。*/
+    if (event_bus_start_drain_thread() != NSBC_OK)
+        llog(LOG_WARN, "event_bus", "drain thread start failed — async CDR path offline");
+    else
+        llog(LOG_INFO, "event_bus", "drain thread running (async CDR ready)");
+
+    /* ---- 主事件循环：reactor[0] + ticker 时间轮耦合 ---- */
+    while (!ctx_stopping(&ctx) && !reactor_stopping(ctx.re)) {
+        uint64_t w = tw_next_wait_ms(ctx.tw);
+        int timeout = (w == UINT64_MAX) ? 1000 : (int)(w > 1000 ? 1000 : w);
+        int wait_rc = reactor_wait(ctx.re, timeout);
+        if (wait_rc < 0) {
+            llog(LOG_CRIT, "core", "reactor_wait failed rc=%d errno=%d",
+                 wait_rc, errno);
+            ctx_request_stop(&ctx);
+        }
+    }
+
+    /* ---- P3 shutdown 顺序（F-03 修复：消除 reactor 提前自 destroy）----
+     *
+     * 原 bug：reactor_mgr_stop_all 置 stop 标志后，reactor[1..n-1] 线程
+     * 立即退出循环并调用 reactor_destroy() free reactor_t，
+     * 但此时 modmgr_stop_all（rtp_relay_stop）还没跑，
+     * reactor_call(r->home_reactor, ...) 会访问已 free 内存。
+     *
+     * F-03 修复（reactor_manager.c）：线程 drain 后只退出不自 destroy，
+     * reactor_mgr_destroy 统一在 main 线程执行——保证所有模块 cleanup
+     * 在 reactor free 之前完成。
+     *
+     * 正确顺序：
+     *   1. reactor_mgr_stop_all   —— 置 stop 标志（线程仍存活，reactor 仍有效）
+     *   2. reactor_stop + drain[0] —— drain reactor[0]
+     *   3. modmgr_stop_all         —— rtp_relay_stop 通过 reactor_call 安全触达
+     *                                仍存活的 reactor[1..n-1]
+     *   4. drain active calls      —— 等待活跃呼叫结束
+     *   5. reactor_mgr_join       —— 线程 drain 后退出（不自 destroy）
+     *   6. reactor_mgr_destroy     —— 此刻才 destroy 所有 reactors[0..n-1]
+     */
+    if (ctx.mgr) reactor_mgr_stop_all(ctx.mgr);
     reactor_stop(ctx.re);
+    int reactor_drain_rc = reactor_wait(ctx.re, 0);
+    if (reactor_drain_rc < 0)
+        llog(LOG_CRIT, "core", "reactor command drain failed rc=%d",
+             reactor_drain_rc);
+    modmgr_stop_all(mm, &ctx);
     long drain_ms = 30000;
     cfg_get_int(cfg, "core.drain_max_ms", &drain_ms, NULL);
     uint64_t deadline = nsbc_now_ms() + (uint64_t)drain_ms;
@@ -776,6 +864,13 @@ int main(int argc, char **argv)
         llog(LOG_WARN, "core", "drain timeout, %ld calls still active",
              (long)sat_read(ctx.active_calls));
     log_audit("system", "shutdown-complete", "drain finished");
+
+    /* P3: 现在再 join reactor[1..n-1] 线程——此时没有 rtp_relay_stop 会触达它们 */
+    if (ctx.mgr) reactor_mgr_join(ctx.mgr);
+
+    /* Phase 2 event_bus: stop drain thread，它会退出前 drain 最后一轮（确保 shutdown
+     * 期间的最后一批 CDR 不丢）。必须在 event_bus_fini 之前。*/
+    event_bus_stop_drain_thread();
 
     modmgr_fini_all(mm, &ctx);
     nsbc_srtp_global_shutdown();
@@ -787,12 +882,17 @@ int main(int argc, char **argv)
     for (int i = 0; i < MEM_DOMAIN__COUNT; ++i)
         mem_arena_destroy(ctx.arena[i]);
     modmgr_destroy(mm);
-    reactor_destroy(ctx.re);
+    int reactor_rc = reactor_mgr_destroy(ctx.mgr);
+    if (reactor_rc != NSBC_OK)
+        llog(LOG_CRIT, "core", "reactor_mgr_destroy failed rc=%d", reactor_rc);
+
+    /* Phase 2 event_bus: 所有 drain + destroy 完成后，再 free rings */
+    event_bus_fini();
     log_thread_detach();
     log_stop();
     cfg_destroy(cfg);
     unlink("/var/run/nsbc/nsbcd.pid");
-    return 0;
+    return reactor_rc == NSBC_OK && reactor_drain_rc >= 0 ? 0 : 1;
 
 shutdown_failed:
     log_audit("system", "boot-failed", "rc=%d", rc);
@@ -807,7 +907,10 @@ shutdown_failed:
     for (int i = 0; i < MEM_DOMAIN__COUNT; ++i)
         mem_arena_destroy(ctx.arena[i]);
     modmgr_destroy(mm);
-    reactor_destroy(ctx.re);
+    int reactor_fail_destroy_rc = reactor_mgr_destroy(ctx.mgr);
+    if (reactor_fail_destroy_rc != NSBC_OK)
+        llog(LOG_CRIT, "core", "reactor_mgr_destroy after boot failure failed rc=%d",
+             reactor_fail_destroy_rc);
     log_thread_detach();
     log_stop();
     cfg_destroy(cfg);

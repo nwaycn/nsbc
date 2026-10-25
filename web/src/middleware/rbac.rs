@@ -58,7 +58,15 @@ fn required_level(method: &Method, path: &str) -> Role {
         (&Method::POST, "validate") => Role::L0,
         // High-risk L2 (resource-level truly dangerous operations)
         (&Method::PUT | &Method::PATCH | &Method::DELETE, "config")
-        | (&Method::POST, "restart") => Role::L2,
+        | (&Method::POST, "restart")
+        // W-02 安全修复：呼叫控制命令端点（REQ-CCMD-001 新增的 L2 命令）
+        // POST /calls/:id/{kill,answer,hold,mute,broadcast,vad-start,vad-stop,
+        //                  transfer,record,send-dtmf,send-msg,originate}
+        // 这些端点之前因为 action 名不在显式 L2 表中，会 fall-through 到默认 L1，
+        // 导致 L1 JWT 可以执行杀通话、转移、录音等高风险操作。
+        | (&Method::POST, "kill" | "answer" | "hold" | "mute" | "broadcast"
+           | "vad-start" | "vad-stop" | "transfer" | "record"
+           | "send-dtmf" | "send-msg" | "originate") => Role::L2,
         // Operational L1; write operations not explicitly annotated default to L1
         // (do NOT default to L0)
         _ => Role::L1,

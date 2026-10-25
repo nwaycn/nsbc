@@ -131,12 +131,9 @@ async fn login<C: CoreApi + Clone + 'static>(
     // enumeration difference).
     if st.auth.guard.lock.is_locked(&req.username, now) {
         tracing::warn!(user = %req.username, "login blocked: account locked");
-        st.auth.audit.record(
-            "login_locked",
-            Some(&req.username),
-            &peer,
-            json!({}),
-        );
+        st.auth
+            .audit
+            .record("login_locked", Some(&req.username), &peer, json!({}));
         return Err(ApiError::AccountLocked);
     }
 
@@ -144,8 +141,20 @@ async fn login<C: CoreApi + Clone + 'static>(
     // (the single authoritative account source). Completely deprecate text-based
     // account sources such as config file auth.accounts / NSBC_AUTH_FILE /
     // NSBC_AUTH_ACCOUNTS — login always goes through the DB.
+    let db_user = match st.db.get_web_user(&req.username).await {
+        Ok(user) => user,
+        Err(error) => {
+            tracing::error!(user = %req.username, error = %error, "web user lookup failed");
+            st.auth.audit.record(
+                "login_unavailable",
+                Some(&req.username),
+                &peer,
+                json!({"reason": "database_query_failed"}),
+            );
+            return Err(ApiError::DbUnavailable);
+        }
+    };
     let verified_role: Option<crate::auth::Role> = {
-        let db_user = st.db.get_web_user(&req.username).await;
         if let Some(u) = db_user {
             if u.enabled != 1 {
                 tracing::warn!(user = %req.username,
@@ -194,6 +203,18 @@ async fn login<C: CoreApi + Clone + 'static>(
                 );
                 None
             }
+            FailOutcome::Capacity => {
+                tracing::error!("login lockout table reached its capacity");
+                st.auth.audit.record(
+                    "login_failed",
+                    Some(&req.username),
+                    &peer,
+                    json!({"reason": "lockout_capacity"}),
+                );
+                return Err(ApiError::ServiceUnavailable(
+                    "authentication temporarily unavailable".into(),
+                ));
+            }
         };
         tracing::warn!(user = %req.username, ?remaining, "login failed: invalid credentials");
         st.auth.audit.record(
@@ -205,13 +226,18 @@ async fn login<C: CoreApi + Clone + 'static>(
         return Err(ApiError::BadCredentials);
     };
     st.auth.guard.lock.clear(&req.username);
-    let (access, refresh) = st
-        .auth
-        .tokens
-        .issue_pair(&req.username, role.as_u8(), now);
-    st.auth
-        .sessions
-        .register_refresh(&refresh.1.jti, refresh.1.sub.clone(), refresh.1.role, refresh.1.exp);
+    let (access, refresh) = st.auth.tokens.issue_pair(&req.username, role.as_u8(), now);
+    if !st.auth.sessions.register_refresh(
+        &refresh.1.jti,
+        refresh.1.sub.clone(),
+        refresh.1.role,
+        refresh.1.exp,
+        now,
+    ) {
+        return Err(ApiError::ServiceUnavailable(
+            "session capacity reached".into(),
+        ));
+    }
     tracing::info!(user = %req.username, role = ?role, "login success");
     st.auth.audit.record(
         "login_success",
@@ -219,7 +245,11 @@ async fn login<C: CoreApi + Clone + 'static>(
         &peer,
         json!({"role": role.as_str()}),
     );
-    Ok(Json(token_pair(access.0, refresh.0, st.auth.tokens.access_ttl_secs())))
+    Ok(Json(token_pair(
+        access.0,
+        refresh.0,
+        st.auth.tokens.access_ttl_secs(),
+    )))
 }
 
 /// POST /api/v1/auth/refresh: refresh is single-use, rotated on success;
@@ -251,19 +281,30 @@ async fn refresh_token<C: CoreApi + Clone + 'static>(
             return Err(ApiError::TokenReplay);
         }
         Err(RefreshError::Unknown) => return Err(ApiError::TokenInvalid),
+        Err(RefreshError::Capacity) => {
+            return Err(ApiError::ServiceUnavailable(
+                "session capacity reached".into(),
+            ))
+        }
     };
-    let (access, refresh) = st
-        .auth
-        .tokens
-        .issue_pair(&entry.sub, entry.role, now);
-    st.auth.sessions.register_refresh(
+    let (access, refresh) = st.auth.tokens.issue_pair(&entry.sub, entry.role, now);
+    if !st.auth.sessions.register_refresh(
         &refresh.1.jti,
         refresh.1.sub.clone(),
         refresh.1.role,
         refresh.1.exp,
-    );
+        now,
+    ) {
+        return Err(ApiError::ServiceUnavailable(
+            "session capacity reached".into(),
+        ));
+    }
     tracing::debug!(user = %entry.sub, "refresh token rotated");
-    Ok(Json(token_pair(access.0, refresh.0, st.auth.tokens.access_ttl_secs())))
+    Ok(Json(token_pair(
+        access.0,
+        refresh.0,
+        st.auth.tokens.access_ttl_secs(),
+    )))
 }
 
 /// POST /api/v1/auth/logout: revoke the current access (until its exp) + optional refresh.
@@ -276,12 +317,20 @@ async fn logout<C: CoreApi + Clone + 'static>(
 ) -> ApiResult<Json<Value>> {
     let now = now_secs();
     let mut revoked_refresh = false;
-    st.auth.sessions.deny_access(&access.jti, access.exp, now);
+    if !st.auth.sessions.deny_access(&access.jti, access.exp, now) {
+        return Err(ApiError::ServiceUnavailable(
+            "session revocation capacity reached".into(),
+        ));
+    }
     if let Some(Json(body)) = payload {
         if let Some(rt) = body.refresh_token.filter(|s| !s.is_empty()) {
             // Expired / forged refresh also does not affect logout success
             if let Ok(c) = st.auth.tokens.verify(&rt, TokenKind::Refresh, now) {
-                st.auth.sessions.revoke_refresh(&c.jti, c.exp, now);
+                if !st.auth.sessions.revoke_refresh(&c.jti, c.exp, now) {
+                    return Err(ApiError::ServiceUnavailable(
+                        "refresh revocation capacity reached".into(),
+                    ));
+                }
                 revoked_refresh = true;
             }
         }
@@ -313,7 +362,9 @@ async fn change_password<C: CoreApi + Clone + 'static>(
         return Err(ApiError::BadRequest("new password too long".into()));
     }
     if req.old_password == req.new_password {
-        return Err(ApiError::BadRequest("new password must differ from old".into()));
+        return Err(ApiError::BadRequest(
+            "new password must differ from old".into(),
+        ));
     }
 
     // Password policy validation
@@ -322,9 +373,22 @@ async fn change_password<C: CoreApi + Clone + 'static>(
     }
 
     // Fetch user from DB (authoritative source, same as login path)
-    let Some(u) = st.db.get_web_user(&access.sub).await else {
-        tracing::warn!(user = %access.sub, "change-password: user not in DB");
-        return Err(ApiError::BadCredentials);
+    let u = match st.db.get_web_user(&access.sub).await {
+        Ok(Some(user)) => user,
+        Ok(None) => {
+            tracing::warn!(user = %access.sub, "change-password: user not in DB");
+            return Err(ApiError::BadCredentials);
+        }
+        Err(error) => {
+            tracing::error!(user = %access.sub, error = %error, "change-password user lookup failed");
+            st.auth.audit.record(
+                "change_password_failed",
+                Some(&access.sub),
+                &peer,
+                json!({"reason": "database_query_failed"}),
+            );
+            return Err(ApiError::DbUnavailable);
+        }
     };
     if u.enabled != 1 {
         return Err(ApiError::BadCredentials);
@@ -334,7 +398,9 @@ async fn change_password<C: CoreApi + Clone + 'static>(
     use argon2::{Argon2, PasswordHash, PasswordVerifier};
     let Ok(parsed) = PasswordHash::new(&u.password_phc) else {
         tracing::warn!(user = %access.sub, "change-password: invalid stored PHC");
-        return Err(ApiError::ServiceUnavailable("account data corrupted".into()));
+        return Err(ApiError::ServiceUnavailable(
+            "account data corrupted".into(),
+        ));
     };
     if Argon2::default()
         .verify_password(req.old_password.as_bytes(), &parsed)
@@ -359,13 +425,19 @@ async fn change_password<C: CoreApi + Clone + 'static>(
         return Err(ApiError::ServiceUnavailable("persist failed".into()));
     }
 
+    // W-07 修复：密码修改后立即撤销该用户所有活跃 refresh session。
+    // 之前的 refresh token 不能再续期，必须用新密码重新登录。
+    let now_secs = crate::auth::tokens::now_secs();
+    let revoked = st.auth.sessions.revoke_all_for_subject(&access.sub, now_secs);
+    if revoked > 0 {
+        tracing::info!(user = %access.sub, revoked,
+            "password changed — revoked {} active refresh sessions", revoked);
+    }
+
     tracing::info!(user = %access.sub, "password changed");
-    st.auth.audit.record(
-        "change_password",
-        Some(&access.sub),
-        &peer,
-        json!({}),
-    );
+    st.auth
+        .audit
+        .record("change_password", Some(&access.sub), &peer, json!({}));
     Ok(Json(json!({ "status": "password_changed" })))
 }
 

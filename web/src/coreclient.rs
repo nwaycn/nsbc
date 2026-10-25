@@ -2410,20 +2410,24 @@ leg 0 sdp_offer 50\nabc\n";
         }
         async fn security_ban_list(&self, filter: &str) -> Result<Vec<BanEntry>, CoreError> {
             self.calls.lock().unwrap().push(format!("security.ban.list {filter}"));
+            // F-10 修复：unwrap_or_else 闭包必须返回 Result<String, CoreError>，
+            // 不能直接返回 String——self.canned 是 BTreeMap<String, Result<String, CoreError>>
             let canned = self
                 .canned
                 .get("security.ban.list")
                 .cloned()
-                .unwrap_or_else(|| "bans=0 shown=0 total=0\n".to_string());
-            parse_ban_list(&canned)
+                .unwrap_or_else(|| Ok("bans=0 shown=0 total=0\n".to_string()));
+            parse_ban_list(&canned?)
         }
         async fn security_ban_unban(&self, ip: &str) -> Result<(), CoreError> {
             self.calls.lock().unwrap().push(format!("security.ban.unban {ip}"));
+            // F-10 修复：同 security_ban_list——闭包返回 Result，后续用 ? 提取
             let canned = self
                 .canned
                 .get("security.ban.unban")
                 .cloned()
-                .unwrap_or_else(|| format!("OK security.ban.unban ip={ip} removed=1\n"));
+                .unwrap_or_else(|| Ok(format!("OK security.ban.unban ip={ip} removed=1\n")));
+            let canned = canned?;
             if canned.trim_start().starts_with("OK") {
                 Ok(())
             } else {

@@ -35,6 +35,15 @@ fn scheme(dsn: &str) -> &str {
     else { "?" }
 }
 
+fn db_error_kind(error: &sqlx::Error) -> &'static str {
+    match error {
+        sqlx::Error::Configuration(_) => "configuration",
+        sqlx::Error::Database(_) => "database",
+        sqlx::Error::Io(_) => "io",
+        _ => "other",
+    }
+}
+
 /// Extract the full DB file path from a sqlite DSN (absolute or relative).
 /// Rules (aligned with resolve_dsn_path):
 ///   total slashes after "sqlite:" >= 3 → absolute path (re-prepend leading /)
@@ -57,12 +66,8 @@ fn sqlite_file_path(dsn: &str) -> Option<std::path::PathBuf> {
 }
 
 fn sqlite_parent_dir(dsn: &str) -> Option<std::path::PathBuf> {
-    tracing::info!("🔧 [sqlite_parent_dir] input dsn = {:?}", dsn);
     let fp = sqlite_file_path(dsn)?;
-    tracing::info!("🔧 [sqlite_parent_dir] → file_path={:?}", fp.display());
-    let parent = fp.parent().map(|d| d.to_path_buf());
-    tracing::info!("🔧 [sqlite_parent_dir] → parent = {:?}", parent.as_ref().map(|d| d.display().to_string()));
-    parent
+    fp.parent().map(|d| d.to_path_buf())
 }
 
 /// SIP Digest HA1 = md5(username:realm:password) — used throughout the module
@@ -91,22 +96,22 @@ impl Db {
     /// Initialize from WebConfig::DbSection (both empty dsn and connection failure degrade).
     pub async fn from_config(cfg: &super::config::DbSection) -> Self {
         let dsn = if let Ok(v) = env::var("NSBC_DB_DSN") {
-            tracing::info!("🔧 [db::from_config] NSBC_DB_DSN env override active: {:?}", v);
+            tracing::info!("database DSN environment override active");
             v
         } else {
-            tracing::info!("🔧 [db::from_config] using cfg.dsn: {:?}", cfg.dsn);
+            tracing::info!(configured = !cfg.dsn.is_empty(), "using database DSN from config");
             cfg.dsn.clone()
         };
         Self::from_dsn(&dsn).await
     }
 
     pub async fn from_dsn(dsn: &str) -> Self {
-        tracing::info!("🔧 [db::from_dsn] final dsn = {:?}", dsn);
         if dsn.is_empty() {
             info!("db dsn not set — persistence disabled");
             return Self { pool: None, backend: None };
         }
         let backend = scheme(dsn).to_string();
+        info!(backend = %backend, "initializing database connection pool");
 
         // SQLite: missing parent dir would give code 14 (unable to open database file);
         // sqlx auto-creates the DB file but does NOT auto-mkdir the parent directory.
@@ -171,12 +176,14 @@ impl Db {
                             connect_and_migrate(dsn).await.ok()
                         }
                         Err(e2) => {
-                            warn!(error = %e2, "auto-create database failed");
+                            warn!(backend = %backend, error_kind = db_error_kind(&e2),
+                                  "auto-create database failed");
                             None
                         }
                     }
                 } else {
-                    warn!(error = %e, "db pool init failed — continuing without persistence");
+                    warn!(backend = %backend, error_kind = db_error_kind(&e),
+                          "db pool init failed — continuing without persistence");
                     None
                 }
             }
@@ -207,29 +214,30 @@ impl Db {
     /// Returns None when DB is not configured (pool=None) or user not found.
     /// On DB query failure → logs a warn and returns None (does not block login;
     /// the caller handles fallback).
-    pub async fn get_web_user(&self, username: &str) -> Option<WebUser> {
-        let pool = self.pool()?;
-        let row = sqlx::query_as::<_, WebUser>(
-            "SELECT id, username, role, password_phc, enabled FROM web_users WHERE username = $1 LIMIT 1"
-        )
+    pub async fn get_web_user(
+        &self,
+        username: &str,
+    ) -> Result<Option<WebUser>, sqlx::Error> {
+        let Some(pool) = self.pool() else {
+            return Ok(None);
+        };
+        // W-05 修复：MySQL 下 $1 不是合法占位符，必须 fix_ph 转成 ?
+        let sql = fix_ph(
+            "SELECT id, username, role, password_phc, enabled FROM web_users WHERE username = $1 LIMIT 1",
+            self.backend(),
+        );
+        sqlx::query_as::<_, WebUser>(&sql)
         .bind(username)
         .fetch_optional(pool)
-        .await;
-        match row {
-            Ok(Some(u)) => Some(u),
-            Ok(None) => None,
-            Err(e) => {
-                tracing::warn!(user = %username, error = %e,
-                    "web_users query failed — falling back to in-memory accounts");
-                None
-            }
-        }
+        .await
     }
 
     /// Update web user password (argon2id PHC string). Returns true if any row affected.
     pub async fn update_web_user_password(&self, id: i64, new_phc: &str) -> bool {
         let Some(pool) = self.pool() else { return false };
-        match sqlx::query("UPDATE web_users SET password_phc = $1 WHERE id = $2")
+        // W-05 修复：MySQL 占位符必须 fix_ph
+        let sql = fix_ph("UPDATE web_users SET password_phc = $1 WHERE id = $2", self.backend());
+        match sqlx::query(&sql)
             .bind(new_phc)
             .bind(id)
             .execute(pool)
@@ -265,10 +273,13 @@ impl Db {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
+        // W-05 修复：ensure_default_web_user 的查询也必须 fix_ph
+        let check_sql = fix_ph(
+            "SELECT id, password_phc FROM web_users WHERE username = $1 LIMIT 1",
+            self.backend(),
+        );
         // Query existing row (checks if phc is empty)
-        let existing: Result<Option<(i64, String)>, _> = sqlx::query_as(
-            "SELECT id, password_phc FROM web_users WHERE username = $1 LIMIT 1"
-        )
+        let existing: Result<Option<(i64, String)>, _> = sqlx::query_as(&check_sql)
         .bind(username)
         .fetch_optional(pool)
         .await;
@@ -842,7 +853,7 @@ async fn auto_create_database(dsn: &str, backend: &str) -> Result<(), sqlx::Erro
         }
     };
 
-    info!(admin_dsn = %admin_dsn, "connecting admin db to create database '{db_name}'");
+    info!(backend = %backend, database = %db_name, "connecting admin database to create database");
     let admin_pool = Pool::<Any>::connect(&admin_dsn).await?;
     // CREATE DATABASE cannot use prepared statements (most backends don't support it)
     let escaped = db_name.replace('`', "").replace('"', "").replace('\'', "");
@@ -3162,7 +3173,8 @@ sqlx::query(acct_ddl).execute(pool).await?;
     // 种子 key：如果 ext_api_keys 表为空，自动生成一个 admin scope 的 key
     // 原文只在生成时输出一次日志（key_hash 存 DB，原文永不落地）
     let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM ext_api_keys")
-        .fetch_one(pool).await.unwrap_or((0,));
+        .fetch_one(pool)
+        .await?;
     if count.0 == 0 {
         use ring::digest::{Context, SHA256};
 
@@ -3176,12 +3188,14 @@ sqlx::query(acct_ddl).execute(pool).await?;
             out
         }
         let mut random = [0u8; 32];
-        getrandom::getrandom(&mut random).ok();
+        getrandom::getrandom(&mut random).map_err(|error| {
+            sqlx::Error::Protocol(format!("failed to generate external API seed key: {error}"))
+        })?;
         let raw_key = format!("nsbc_live_{}", hex_encode(&random));
         let mut h = Context::new(&SHA256);
         h.update(raw_key.as_bytes());
         let hash_hex = hex_encode(h.finish().as_ref());
-        let _ = sqlx::query(
+        sqlx::query(
             match backend {
                 "sqlite" =>
                     "INSERT INTO ext_api_keys (key_hash, label, scope) VALUES (?, ?, ?)",
@@ -3195,7 +3209,7 @@ sqlx::query(acct_ddl).execute(pool).await?;
         .bind("auto-generated admin key (change immediately)")
         .bind("admin")
         .execute(pool)
-        .await;
+        .await?;
         tracing::warn!(
             "🔑 REQ-EXT-API-001: first-time ext_api_keys table created. Seed admin key: \
              {}  (STORE THIS NOW — shown ONLY ONCE, DB stores hash, not raw). \
@@ -3247,9 +3261,9 @@ pub struct CdrRow {
 pub struct CdrQuery {
     pub caller: Option<String>,
     pub callee: Option<String>,
-    /// Call-ID 搜索（精确或 LIKE 前缀/后缀都支持，用 SQL LIKE）
+    /// Call-ID substring search (preserves the existing SQL LIKE behavior).
     pub call_id: Option<String>,
-    /// 源 IP 搜索（从 metadata JSON 提取 → Rust 侧 LIKE filter）
+    /// 源 IP 搜索（从 metadata JSON 提取，在数据库侧执行子串匹配）
     pub from_ip: Option<String>,
     pub from: Option<String>,
     pub to: Option<String>,
@@ -3258,7 +3272,7 @@ pub struct CdrQuery {
     pub duration_max: Option<i64>,
     pub limit: u32,
     pub offset: u32,
-    /* REQ-SEC-005: disposition + is_malicious 过滤（前端 Tab 分流） */
+    /* REQ-SEC-005: disposition + is_malicious filters (front-end tabs). */
     pub disposition: Option<String>,
     pub is_malicious: Option<u8>,  /* Some(0)=正常, Some(1)=恶意, None=全部 */
     /// 排序：默认 start_time DESC；可选 ("duration"|"answer_time") ("asc"|"desc")
@@ -3280,7 +3294,7 @@ impl CdrQuery {
 pub async fn query_cdrs(
     pool: &Pool<Any>,
     q: &CdrQuery,
-    _backend: &str,
+    backend: &str,
 ) -> Result<(Vec<CdrRow>, i64), sqlx::Error> {
     let q = q.clone().normalized();
 
@@ -3324,6 +3338,60 @@ pub async fn query_cdrs(
         where_clauses.push("cause_text = ?".to_string());
         binds.push(d.clone());
     }
+    if let Some(want) = q.is_malicious {
+        let predicate = match backend {
+            "mysql" => {
+                "CASE WHEN JSON_TYPE(JSON_EXTRACT(metadata, '$.is_malicious')) = 'INTEGER' \
+                 THEN CAST(JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.is_malicious')) AS SIGNED) \
+                 ELSE 0 END"
+            }
+            "postgres" => {
+                if want == 1 {
+                    "COALESCE(metadata ~ '\"is_malicious\"[[:space:]]*:[[:space:]]*1([[:space:],}]|$)', FALSE)"
+                } else if want == 0 {
+                    "NOT COALESCE(metadata ~ '\"is_malicious\"[[:space:]]*:[[:space:]]*1([[:space:],}]|$)', FALSE)"
+                } else {
+                    "FALSE"
+                }
+            }
+            _ => {
+                "CASE WHEN json_valid(metadata) THEN \
+                   CASE WHEN json_type(metadata, '$.is_malicious') = 'integer' \
+                     THEN CAST(json_extract(metadata, '$.is_malicious') AS INTEGER) \
+                     ELSE 0 END \
+                 ELSE 0 END"
+            }
+        };
+        if backend == "postgres" {
+            where_clauses.push(predicate.to_string());
+        } else {
+            where_clauses.push(format!("{predicate} = {}", want));
+        }
+    }
+    if let Some(ip) = &q.from_ip {
+        let expression = match backend {
+            "mysql" => {
+                "CASE WHEN JSON_TYPE(JSON_EXTRACT(metadata, '$.from_ip')) = 'STRING' \
+                 THEN JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.from_ip')) ELSE '' END"
+            }
+            "postgres" => {
+                "COALESCE(substring(metadata from '\"from_ip\"[[:space:]]*:[[:space:]]*\"([^\"]*)\"'), '')"
+            }
+            _ => {
+                "CASE WHEN json_valid(metadata) THEN \
+                   CASE WHEN json_type(metadata, '$.from_ip') = 'text' \
+                     THEN json_extract(metadata, '$.from_ip') ELSE '' END \
+                 ELSE '' END"
+            }
+        };
+        let predicate = match backend {
+            "mysql" => format!("LOCATE(LOWER(?), LOWER({expression})) > 0"),
+            "postgres" => format!("strpos(LOWER({expression}), LOWER(?)) > 0"),
+            _ => format!("instr(LOWER({expression}), LOWER(?)) > 0"),
+        };
+        where_clauses.push(predicate);
+        binds.push(ip.clone());
+    }
 
     let where_sql = if where_clauses.is_empty() {
         String::new()
@@ -3333,21 +3401,11 @@ pub async fn query_cdrs(
 
     let binds_strs: Vec<&str> = binds.iter().map(|s| s.as_str()).collect();
 
-    // count — shares WHERE binds (注意：is_malicious filter 在 Rust 侧做，
-    // 因为跨后端 JSON 提取函数不统一，先查足够多再 filter)
+    // Count and pagination use the same backend-aware metadata predicates.
     let count_sql = format!("SELECT COUNT(*) FROM cdr {where_sql}");
     let mut count_q = sqlx::query_scalar::<_, i64>(&count_sql);
     for b in &binds_strs { count_q = count_q.bind(b); }
-    let total_unfiltered: i64 = count_q.fetch_one(pool).await.unwrap_or(0);
-
-    // rows — 有 malicious filter 时直接拉全量（Rust 侧 filter 后再分页），
-    // 跨后端 JSON 提取函数不统一没法 SQL 下推 filter。
-    // 当前 CDR 表 < 1 万条，全量拉取内存无压力；后续若 > 10 万条再优化 JSON 提取。
-    let fetch_limit = if q.is_malicious.is_some() {
-        100_000i64  /* 相当于全量拉 —— Rust 侧 filter + skip + take */
-    } else {
-        q.limit as i64  /* 无 filter 时 SQL 直接按 LIMIT+OFFSET 分页，一次只取当前页 */
-    };
+    let total: i64 = count_q.fetch_one(pool).await?;
 
     /* ---- 动态 ORDER BY（sort_by + sort_dir）----
      * 安全：白名单列名（只允许 start_time/duration_sec/answer_time/caller/callee），
@@ -3372,22 +3430,14 @@ pub async fn query_cdrs(
          FROM cdr {where_sql} {order_by} LIMIT ? OFFSET ?"
     );
 
-    // 先查原始行（不带 is_malicious/threat_reason — 它们在 metadata JSON 里）
-    // 注意：有 is_malicious filter 时 SQL OFFSET 固定 0，让 Rust filter 完再 skip/take。
-    // 否则 SQL OFFSET=q.offset 跳过的是原始行，而不是 filter 后的行 → 分页错位。
-    let sql_offset = if q.is_malicious.is_some() { 0i64 } else { q.offset as i64 };
     let rows_raw: Vec<CdrRowRaw> = {
         let mut rows_q = sqlx::query_as::<_, CdrRowRaw>(&rows_sql);
         for b in &binds_strs { rows_q = rows_q.bind(b); }
-        rows_q = rows_q.bind(fetch_limit).bind(sql_offset);
+        rows_q = rows_q.bind(q.limit as i64).bind(q.offset as i64);
         rows_q.fetch_all(pool).await?
     };
-    let rows_raw_len = rows_raw.len();  /* 提前存长度 — 后面 rows_raw.into_iter() 会 move */
 
-    /* REQ-SEC-005: 从 metadata JSON 解析 is_malicious + threat_reason + from_ip，Rust 侧 filter。
-     * 跨后端 JSON 提取函数不统一 → 全在 Rust 里做，零 schema 改动。 */
-    let q_from_ip = q.from_ip.clone();
-    let mut rows: Vec<CdrRow> = rows_raw.into_iter()
+    let rows: Vec<CdrRow> = rows_raw.into_iter()
         .map(|raw| {
             let (is_mal, threat_reason, from_ip) = parse_meta(&raw.metadata);
             CdrRow {
@@ -3411,28 +3461,7 @@ pub async fn query_cdrs(
                 from_ip,
             }
         })
-        .filter(|r| {
-            if let Some(want) = q.is_malicious {
-                if r.is_malicious != want { return false; }
-            }
-            /* from_ip LIKE filter — 从 metadata JSON 解析的字段，Rust 侧匹配 */
-            if let Some(want_ip) = &q_from_ip {
-                let needle = want_ip.to_lowercase();
-                let hay = r.from_ip.as_deref().unwrap_or("").to_lowercase();
-                if !hay.contains(&needle) { return false; }
-            }
-            true
-        })
-        .skip(if q.is_malicious.is_some() { q.offset as usize } else { 0 })
-        .take(q.limit as usize)
         .collect();
-
-    /* total — 直接用 SQL COUNT(*) 结果。
-     * is_malicious filter 是 Rust 侧的（跨后端 JSON 提取函数不统一没法 SQL 下推），
-     * 所以 total 代表 WHERE 条件下全表数，而 filter 后分页靠 offset/limit 控制。
-     * 这样 total 不精确（恶意 Tab 显示的 total 实际含正常 CDR），
-     * 但分页 UI 不会崩，也不会误导用户以为"正常只有 20 条"。 */
-    let total = total_unfiltered;
 
     Ok((rows, total))
 }
@@ -5900,22 +5929,22 @@ impl Db {
         let backend = self.backend();
         let limit = limit.clamp(1, 500);
         let offset = offset.max(0);
-        let mut where_parts: Vec<&str> = Vec::new();
+        let mut where_parts: Vec<String> = Vec::new();
         let mut binds: Vec<String> = Vec::new();
         if let Some(v) = enabled {
-            where_parts.push("enabled = $1");
+            where_parts.push("enabled = $1".to_string());
             binds.push(if v { "1".to_string() } else { "0".to_string() });
         }
         if let Some(tid) = tenant_id {
             let ph = format!("${}", binds.len() + 1);
-            where_parts.push("tenant_id = {ph}");
+            where_parts.push(format!("tenant_id = {ph}"));  /* F-08 修复：之前是普通字符串，SQL 里出现字面 {ph} */
             binds.push(tid.to_string());
         }
         let where_sql = if where_parts.is_empty() { String::new() } else { format!("WHERE {}", where_parts.join(" AND ")) };
         let count_sql = fix_ph(&format!("SELECT COUNT(*) FROM ivr_menus {where_sql}"), backend);
         let mut cq = sqlx::query_scalar::<_, i64>(&count_sql);
         for b in &binds { cq = cq.bind(b.as_str()); }
-        let total = cq.fetch_one(pool).await.unwrap_or(0);
+        let total: i64 = cq.fetch_one(pool).await?;
         let rows_sql = fix_ph(&format!("SELECT * FROM ivr_menus {where_sql} ORDER BY name LIMIT ${} OFFSET ${}",
             binds.len() + 1, binds.len() + 2), backend);
         let mut q = sqlx::query_as::<_, IvrMenu>(&rows_sql);
@@ -6790,5 +6819,131 @@ impl Db {
         let backend = self.backend();
         let res = sqlx::query(&fix_ph("DELETE FROM tenants WHERE id = $1", backend)).bind(id).execute(pool).await?;
         Ok(res.rows_affected() > 0)
+    }
+}
+
+#[cfg(test)]
+mod cdr_query_tests {
+    use super::{query_cdrs, CdrQuery};
+    use sqlx::{any::AnyPoolOptions, Any};
+
+    async fn test_pool() -> sqlx::Pool<Any> {
+        sqlx::any::install_default_drivers();
+        let pool = AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory SQLite pool");
+        sqlx::query(
+            "CREATE TABLE cdr (
+                call_id TEXT NOT NULL,
+                a_call_id TEXT,
+                b_call_id TEXT,
+                caller TEXT,
+                callee TEXT,
+                start_time TEXT NOT NULL,
+                answer_time TEXT,
+                end_time TEXT,
+                duration_sec INTEGER,
+                billsec INTEGER,
+                cause_code INTEGER,
+                cause_text TEXT,
+                leg_a_final INTEGER,
+                leg_b_final INTEGER,
+                metadata TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create test CDR table");
+
+        let records = [
+            (
+                "malicious-new",
+                "2025-04",
+                r#"{"is_malicious":1,"from_ip":"203.0.113.8"}"#,
+            ),
+            (
+                "malicious-old",
+                "2025-03",
+                r#"{"is_malicious":1,"from_ip":"198.51.100.7"}"#,
+            ),
+            (
+                "normal",
+                "2025-02",
+                r#"{"is_malicious":0,"from_ip":"192.0.2.1"}"#,
+            ),
+            ("invalid-metadata", "2025-01", "not-json"),
+        ];
+        for (call_id, start_time, metadata) in records {
+            sqlx::query("INSERT INTO cdr (call_id, start_time, metadata) VALUES (?, ?, ?)")
+                .bind(call_id)
+                .bind(start_time)
+                .bind(metadata)
+                .execute(&pool)
+                .await
+                .expect("insert test CDR");
+        }
+        pool
+    }
+
+    #[tokio::test]
+    async fn malicious_filter_counts_and_paginates_in_sql() {
+        let pool = test_pool().await;
+        let query = CdrQuery {
+            is_malicious: Some(1),
+            limit: 1,
+            offset: 1,
+            ..CdrQuery::default()
+        };
+
+        let (rows, total) = query_cdrs(&pool, &query, "sqlite")
+            .await
+            .expect("query malicious CDR page");
+
+        assert_eq!(total, 2);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].call_id, "malicious-old");
+        assert_eq!(rows[0].is_malicious, 1);
+    }
+
+    #[tokio::test]
+    async fn malformed_metadata_keeps_default_normal_classification() {
+        let pool = test_pool().await;
+        let query = CdrQuery {
+            is_malicious: Some(0),
+            limit: 1,
+            offset: 1,
+            ..CdrQuery::default()
+        };
+
+        let (rows, total) = query_cdrs(&pool, &query, "sqlite")
+            .await
+            .expect("query normal CDR page");
+
+        assert_eq!(total, 2);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].call_id, "invalid-metadata");
+        assert_eq!(rows[0].is_malicious, 0);
+    }
+
+    #[tokio::test]
+    async fn source_ip_filter_combines_with_malicious_filter() {
+        let pool = test_pool().await;
+        let query = CdrQuery {
+            from_ip: Some("203.0.113".into()),
+            is_malicious: Some(1),
+            limit: 10,
+            ..CdrQuery::default()
+        };
+
+        let (rows, total) = query_cdrs(&pool, &query, "sqlite")
+            .await
+            .expect("query CDR by threat and source IP");
+
+        assert_eq!(total, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].call_id, "malicious-new");
+        assert_eq!(rows[0].from_ip.as_deref(), Some("203.0.113.8"));
     }
 }

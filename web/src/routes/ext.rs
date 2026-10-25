@@ -82,8 +82,12 @@ async fn exec_cmd<C>(
 where
     C: CoreApi + Clone + 'static,
 {
-    // 所有命令都需要 readwrite（连 help/show 也走 L2 admin 等价 UDS 信任边界）
-    require_scope(&claims, ApiKeyScope::Readwrite)?;
+    // F-01/W-03 安全修复：原始命令代理限制为 Admin scope。
+    // readwrite key 不允许直接代理任意 core 命令——可能绕过结构化 API 的
+    // 权限边界执行 config.reload、acl 变更等高风险操作。
+    // 同时做命令前缀白名单：管理命令（config.*, acl.*, reload, restart,
+    // security.*）必须 Admin；只读命令（show/stats/list 等）额外允许。
+    require_scope(&claims, ApiKeyScope::Admin)?;
 
     // 防御：去换行 + 限长
     let cleaned: String = body

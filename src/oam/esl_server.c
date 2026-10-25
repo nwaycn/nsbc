@@ -13,23 +13,12 @@
  *   - 命令哈希优化（当前线性扫描 cmd_registry，256 条内够用）
  */
 
+#include "nsbc.h"               /* Tier 1+2 系统头 + nsbc_* 基础件 + log/module/b2bua */
+#include <sys/un.h>             /* Tier 3: UNIX domain socket 专用 */
 #include "esl.h"
 #include "cmd_registry.h"
-#include "log.h"
-#include "nsbc_common.h"
 #include "reactor.h"
 #include "event_bus.h"
-
-#include <errno.h>
-#include <stdarg.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/un.h>
-#include <unistd.h>
 
 /* ================================================================
  * 常量
@@ -71,6 +60,7 @@ static int   g_own_cmd_reg = 0;  /* 1=内部 self-created，需自己 destroy */
 
 static esl_conn_t *g_conn_head = NULL;
 static int         g_client_count = 0;
+static pthread_mutex_t g_conn_lock = PTHREAD_MUTEX_INITIALIZER;  /* Phase 2: drain 线程也调 esl_event_fire */
 
 static uint64_t g_api_calls = 0;
 static uint64_t g_events_fired = 0;
@@ -110,8 +100,9 @@ static int conn_flush(esl_conn_t *c)
 
 static void conn_close(esl_conn_t *c)
 {
-    esl_conn_t **pp = &g_conn_head;
     if (!c) return;
+    pthread_mutex_lock(&g_conn_lock);
+    esl_conn_t **pp = &g_conn_head;
     while (*pp && *pp != c) pp = &(*pp)->next;
     if (*pp) {
         *pp = c->next;
@@ -119,6 +110,7 @@ static void conn_close(esl_conn_t *c)
         g_client_count--;
         free(c);
     }
+    pthread_mutex_unlock(&g_conn_lock);
 }
 
 /* ================================================================
@@ -298,6 +290,8 @@ void esl_event_fire(const char *name, const char *json_body, size_t json_len)
     if (!bit) return;
     g_events_fired++;
 
+    /* Phase 2: drain 线程也调 esl_event_fire，遍历 g_conn_head 必须加锁 */
+    pthread_mutex_lock(&g_conn_lock);
     esl_conn_t *c = g_conn_head;
     while (c) {
         esl_conn_t *next = c->next;
@@ -315,6 +309,7 @@ void esl_event_fire(const char *name, const char *json_body, size_t json_len)
         }
         c = next;
     }
+    pthread_mutex_unlock(&g_conn_lock);
 }
 
 /* ================================================================
@@ -326,6 +321,7 @@ void esl_event_fire(const char *name, const char *json_body, size_t json_len)
  * ================================================================ */
 
 static int g_esl_bound_evtbus = 0;
+static int g_esl_bound_async = 0;   /* Phase 2 event_bus drain 出来的异步帧 */
 
 /* event_handler_trigger 回调 — 直接转推，不过滤，非阻塞 */
 static int esl_event_bus_cb(const event_context_t *ev, void *ud)
@@ -349,15 +345,34 @@ int esl_bind_event_bus(void)
     } else {
         llog(LOG_WARN, "esl", "event_handler_register '*' failed rc=%d (ESL still works via ctx direct fire)", rc);
     }
+
+    /* Phase 2: 注册 async subscriber '*' — 接收 drain 出来的异步帧（CDR 为主）。
+     * 和同步 event_handler 链**独立**——同事件不会重复 fire，因为：
+     *   SESSION_* 只走同步链（event_handler_trigger），ESL 通配 "*" 通吃
+     *   CDR 只走异步链（nsbc_event_push → drain → async_fire） */
+    int rc2 = event_async_register("*", esl_event_bus_cb, NULL);
+    if (rc2 == NSBC_OK) {
+        g_esl_bound_async = 1;
+        llog(LOG_NOTICE, "esl", "bound event_async '*' — async CDR events fire to ESL");
+    } else if (rc2 != NSBC_EXISTS) {
+        llog(LOG_WARN, "esl", "event_async_register '*' rc=%d", rc2);
+    }
+
     return rc;
 }
 
 void esl_unbind_event_bus(void)
 {
-    if (!g_esl_bound_evtbus) return;
-    event_handler_unregister("*", esl_event_bus_cb, NULL);
-    g_esl_bound_evtbus = 0;
-    llog(LOG_NOTICE, "esl", "unbound event_handler '*'");
+    if (g_esl_bound_evtbus) {
+        event_handler_unregister("*", esl_event_bus_cb, NULL);
+        g_esl_bound_evtbus = 0;
+        llog(LOG_NOTICE, "esl", "unbound event_handler '*'");
+    }
+    if (g_esl_bound_async) {
+        event_async_unregister("*", esl_event_bus_cb, NULL);
+        g_esl_bound_async = 0;
+        llog(LOG_NOTICE, "esl", "unbound event_async '*'");
+    }
 }
 
 /* ================================================================
@@ -445,8 +460,10 @@ static void on_accept_event(int fd, uint32_t ev, void *arg)
             close(cfd); free(c); return;
         }
         c->next = g_conn_head;
+        pthread_mutex_lock(&g_conn_lock);
         g_conn_head = c;
         g_client_count++;
+        pthread_mutex_unlock(&g_conn_lock);
         const char banner[] = "+OK\nContent-Type: command/reply\n\n";
         conn_send(c, banner, sizeof(banner) - 1);
         llog(LOG_INFO, "esl", "client connected (fd=%d total=%d)", cfd, g_client_count);
@@ -569,6 +586,7 @@ nsbc_rc_t esl_start(void *reactor, const esl_cfg_t *cfg, cmd_reg_t *reg)
 void esl_stop(void)
 {
     /* 关所有连接 */
+    pthread_mutex_lock(&g_conn_lock);
     esl_conn_t *c = g_conn_head;
     while (c) {
         esl_conn_t *next = c->next;
@@ -578,6 +596,7 @@ void esl_stop(void)
     }
     g_conn_head = NULL;
     g_client_count = 0;
+    pthread_mutex_unlock(&g_conn_lock);
 
     if (g_uds_fd >= 0) {
         reactor_del(g_reactor, g_uds_fd);
