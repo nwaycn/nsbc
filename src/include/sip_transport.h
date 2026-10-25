@@ -17,6 +17,7 @@
  */
 #include "net_sock.h"
 #include "reactor.h"
+#include "reactor_manager.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -31,7 +32,8 @@ typedef void (*sip_rx_fn)(void *ud, sip_tr_proto_t proto,
                           const char *buf, size_t len);
 
 typedef struct {
-    reactor_t *re;
+    reactor_t *re;        /* reactor[0]（main 线程跑） */
+    reactor_mgr_t *mgr;  /* P3: reactor manager（多 reactor UDP SO_REUSEPORT） */
     const char *listen_ip;
     uint16_t udp_port;
     uint16_t tcp_port;

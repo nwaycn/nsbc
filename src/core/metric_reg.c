@@ -47,6 +47,25 @@ int metric_source_register(const char *name, const char *help,
     return NSBC_OK;
 }
 
+int metric_source_unregister(const char *name, metric_render_fn render,
+                             void *ud)
+{
+    if (!name || !render)
+        return NSBC_INVAL;
+    pthread_mutex_lock(&g_src_lock);
+    for (int i = 0; i < METRIC_SOURCES_MAX; ++i) {
+        metric_source_t *s = &g_src[i];
+        if (s->used && strcmp(s->name, name) == 0 &&
+            s->render == render && s->ud == ud) {
+            memset(s, 0, sizeof(*s));
+            pthread_mutex_unlock(&g_src_lock);
+            return NSBC_OK;
+        }
+    }
+    pthread_mutex_unlock(&g_src_lock);
+    return NSBC_NOENT;
+}
+
 int metric_render_all(char *buf, size_t cap)
 {
     size_t used = 0;

@@ -116,15 +116,20 @@ pub async fn require_ext_key<C: crate::coreclient::CoreApi + Clone + 'static>(
     let key_hash = hash_key(bearer);
 
     // 查 DB (sqlx async)
-    let pool = st.db.pool().ok_or(ApiError::Unauthenticated)?;
+    let pool = st
+        .db
+        .pool()
+        .ok_or_else(|| ApiError::ServiceUnavailable("API key store unavailable".into()))?;
     let row: Option<(String, String)> = sqlx::query_as(
-        "SELECT label, scope FROM ext_api_keys WHERE key_hash = $1 AND revoked_at IS NULL LIMIT 1",
+        "SELECT label, scope FROM ext_api_keys WHERE key_hash = ? AND revoked_at IS NULL LIMIT 1",
     )
     .bind(&key_hash)
     .fetch_optional(pool)
     .await
-    .ok()
-    .flatten();
+    .map_err(|e| {
+        tracing::error!(error = %e, "external API key lookup failed");
+        ApiError::ServiceUnavailable("API key store unavailable".into())
+    })?;
 
     let (label, scope_str) = row.ok_or(ApiError::Unauthenticated)?;
 
@@ -142,12 +147,15 @@ pub async fn require_ext_key<C: crate::coreclient::CoreApi + Clone + 'static>(
     let kh = key_hash.clone();
     tokio::spawn(async move {
         if let Some(pool) = db.pool() {
-            let _ = sqlx::query(
-                "UPDATE ext_api_keys SET last_used_at = now() WHERE key_hash = $1",
+            if let Err(e) = sqlx::query(
+                "UPDATE ext_api_keys SET last_used_at = CURRENT_TIMESTAMP WHERE key_hash = ?",
             )
             .bind(&kh)
             .execute(pool)
-            .await;
+            .await
+            {
+                tracing::warn!(error = %e, "external API key last-used update failed");
+            }
         }
     });
 

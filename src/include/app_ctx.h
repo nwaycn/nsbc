@@ -6,6 +6,7 @@
 #include "cfg.h"
 #include "mem.h"
 #include "reactor.h"
+#include "reactor_manager.h"
 #include "worker.h"
 #include "timer_wheel.h"
 #include "cdr_event.h"
@@ -22,6 +23,7 @@ typedef struct route_table route_table_t;
 typedef struct nsbc_ctx {
     cfg_t *cfg;
     reactor_t *re;
+    reactor_mgr_t *mgr;   /* P2: reactor manager 句柄，供阶段 3 多 reactor 路由访问 */
     worker_pool_t *wpool;
     tw_t *tw;
     mem_rcu_t *rcu;

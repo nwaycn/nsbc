@@ -255,7 +255,7 @@ impl WebConfig {
         // 3. Environment variable overrides (env > file; env values are typically absolute,
         // so no resolve needed)
         let cfg = apply_env_overrides(cfg);
-        tracing::info!("🔧 [resolve] after env override db.dsn = {:?}", cfg.db.dsn);
+        tracing::info!(configured = !cfg.db.dsn.is_empty(), "database DSN configuration resolved");
 
         Ok(cfg)
     }
@@ -375,19 +375,14 @@ fn resolve_uds_path(s: &str, cfg_dir: &std::path::Path) -> String {
 ///
 ///   Unified output: absolute paths get 3-slash format sqlite:///abs/path
 fn resolve_dsn_path(dsn: &str, cfg_dir: &std::path::Path) -> String {
-    tracing::info!("🔧 [resolve_dsn_path] input dsn = {:?}, cfg_dir = {:?}", dsn, cfg_dir.display());
     if dsn.contains(":memory:") {
-        tracing::info!("🔧 [resolve_dsn_path] → :memory: passthrough");
         return dsn.to_string();
     }
     if let Some(rest) = dsn.strip_prefix("sqlite:") {
         let leading_slashes = rest.chars().take_while(|c| *c == '/').count();
         let path_part = rest.trim_start_matches('/');
-        tracing::info!("🔧 [resolve_dsn_path] sqlite rest={:?} leading_slashes={} path_part={:?}",
-                       rest, leading_slashes, path_part);
 
         if path_part.is_empty() {
-            tracing::info!("🔧 [resolve_dsn_path] → path_part empty, passthrough");
             return dsn.to_string();
         }
 
@@ -397,24 +392,16 @@ fn resolve_dsn_path(dsn: &str, cfg_dir: &std::path::Path) -> String {
         let has_dot    = path_part.contains('/') && path_part.contains("./");
         let is_rel     = has_dotdot || has_dot || leading_slashes < 3;
 
-        tracing::info!("🔧 [resolve_dsn_path] has_dotdot={} has_dot={} leading_slashes={} → is_rel={}",
-                       has_dotdot, has_dot, leading_slashes, is_rel);
-
         if is_rel {
             // Resolve relative path to absolute (resolve_string_path returns absolute with
             // leading /)
             let resolved = resolve_string_path(path_part, cfg_dir);
-            let out = format!("sqlite://{}", resolved);
-            tracing::info!("🔧 [resolve_dsn_path] → RELATIVE resolved to {:?}, output = {:?}", resolved, out);
-            out
+            format!("sqlite://{}", resolved)
         } else {
             // Pure absolute → unified 3-slash format
-            let out = format!("sqlite:///{}", path_part);
-            tracing::info!("🔧 [resolve_dsn_path] → ABSOLUTE passthrough, output = {:?}", out);
-            out
+            format!("sqlite:///{}", path_part)
         }
     } else {
-        tracing::info!("🔧 [resolve_dsn_path] → non-sqlite scheme, passthrough");
         dsn.to_string()
     }
 }

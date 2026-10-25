@@ -115,6 +115,7 @@ impl AuthSvc {
     /// - `NSBC_AUTH_ACCOUNTS` or `NSBC_AUTH_FILE` (account text, empty=all logins rejected)
     /// - `NSBC_ACCESS_TTL_SECS` (default 14400 = 4h), `NSBC_REFRESH_TTL_SECS` (default 604800 = 7d)
     /// - Lockout/rate-limit: `NSBC_LOCKOUT_THRESHOLD`(5)/`NSBC_LOCKOUT_SECS`(900)/
+    ///   `NSBC_LOCKOUT_WINDOW_SECS`(900)/
     ///   `NSBC_RL_LOGIN_PER_MIN`(10)/`NSBC_RL_REFRESH_PER_MIN`(30)/
     ///   `NSBC_RL_API_PER_MIN`(120); threshold 0 disables the respective mechanism
     /// - `NSBC_AUDIT_FILE` (audit JSONL; empty=disabled with warn, must be configured for production)
@@ -210,9 +211,14 @@ impl AuthSvc {
         let access_ttl = Duration::from_secs(access_secs);
         let refresh_ttl = Duration::from_secs(refresh_secs);
         let tokens = TokenSvc::new(&secret, access_ttl, refresh_ttl)?;
+        let lock_window_secs = env_u64_or("NSBC_LOCKOUT_WINDOW_SECS", 900)?;
+        if lock_window_secs == 0 {
+            return Err("NSBC_LOCKOUT_WINDOW_SECS must be greater than 0".into());
+        }
         let limits = Limits {
             lock_threshold: env_u64_or("NSBC_LOCKOUT_THRESHOLD", 5)? as u32,
             lock_secs: env_u64_or("NSBC_LOCKOUT_SECS", 900)?,
+            lock_window_secs,
             rl_login: env_u64_or("NSBC_RL_LOGIN_PER_MIN", 10)? as u32,
             rl_refresh: env_u64_or("NSBC_RL_REFRESH_PER_MIN", 30)? as u32,
             rl_api: env_u64_or("NSBC_RL_API_PER_MIN", 120)? as u32,

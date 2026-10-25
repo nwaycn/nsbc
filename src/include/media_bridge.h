@@ -13,6 +13,7 @@
 #include "net_sock.h"
 #include "port_table.h"
 #include "reactor.h"
+#include "reactor_manager.h"
 #include "ssrc_policy.h"
 
 #ifdef __cplusplus
@@ -55,7 +56,8 @@ typedef const char *(*mb_call_external_rtp_ip_fn)(void *ud, void *call_key);
 
 typedef struct {
     ptable_t *ptable;
-    reactor_t *re;
+    reactor_t *re;          /* reactor[0]（main 线程跑） */
+    reactor_mgr_t *mgr;     /* P3: reactor manager（rtp_relay 按 hash 路由） */
     const char *local_ip;   /* 内网 bind 地址 + SDP c= 重写 fallback */
     int allow_bypass;       /* 默认 0：外网 SBC 默认锚定 */
     int trust_private;      /* 可信内网允许 bypass（默认 1） */
@@ -226,9 +228,11 @@ int bridge_send_raw(bridge_mgr_t *m, void *call_key, int leg,
  * signaling 创建 bridge 时设 mb_cfg_t.rec_feed_fn 主槽（录音用），
  * 这里是不碰主槽的独立 hook 链表。媒体线程每次 payload 前先调主槽再遍历 hook。
  * hook 回调签名和 cfg.rec_feed_fn 相同：(ud, call_key, payload, len, leg, pt)。
- * bridge_add_rec_feed_hook / bridge_remove_rec_feed_hook 线程安全（持 rec_hook_lock）。
+ * bridge_add_rec_feed_hook / bridge_remove_rec_feed_hook 线程安全；remove 等待
+ * 最多注册 4 个 hook；达到上限 add 返回 NULL。remove 等待在途回调完成，
+ * 不可从 rec_feed_hook 回调内调用（返回 -EDEADLK）。
  * add 返回 hook 节点指针（调用方持引用，remove 时传同指针）；失败返回 NULL。
- * remove 返回 NSBC_OK/NSBC_ERR。 */
+ * remove 成功返回 0；未找到返回 -ENOENT，非法参数返回 -EINVAL。 */
 typedef void (*mb_rec_hook_fn)(void *ud, void *call_key, const void *payload,
                                size_t len, int leg, int pt);
 void *bridge_add_rec_feed_hook(bridge_mgr_t *m, mb_rec_hook_fn fn, void *ud);

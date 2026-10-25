@@ -11,6 +11,7 @@
  */
 #include "nsbc_common.h"
 #include "cdr_event.h"
+#include "worker.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -24,6 +25,7 @@ typedef struct {
     /* DBAL insert（接线批实现；失败返回非 0，话单留环重试） */
     int (*persist_batch)(void *ud, const cdr_event_t *ev, int n);
     void *ud;
+    worker_pool_t *workers; /* optional bounded pool for persistence flush */
 } cdr_ops_t;
 
 typedef struct cdr_sink cdr_sink_t;

@@ -68,6 +68,7 @@ typedef struct sig_runtime {
     sip_transport_t *tr;
     reg_core_t *reg;
     tls_ctx_t *tls;
+    char *digest_secret;
     dp_ctx_t dp_ctx; /* Dialplan 规则集（热加载） */
     tw_node_t sweep_node;
     char local_host[128]; /* 监听/SDP 广告地址 */
@@ -1371,6 +1372,7 @@ static int sig_init(struct nsbc_ctx *ctx)
     mb_cfg_t mc = {
         .ptable = s->ptable,
         .re = ctx->re,
+        .mgr = ctx->mgr,  /* P3: 多 reactor 路由 */
         .local_ip = s->local_host,
         .allow_bypass = allow_bypass,
         .trust_private = trust_priv,
@@ -1545,6 +1547,7 @@ static int sig_start(struct nsbc_ctx *ctx)
     sip_tr_cfg_t trc;
     memset(&trc, 0, sizeof(trc));
     trc.re = ctx->re;
+    trc.mgr = ctx->mgr;  /* P3: 多 reactor 路由 */
     trc.listen_ip = listen_ip_cpy;
     trc.udp_port = (uint16_t)udp_port;
     trc.tcp_port = (uint16_t)tcp_port;
@@ -1580,8 +1583,15 @@ static int sig_start(struct nsbc_ctx *ctx)
     const char *secret = NULL;
     cfg_get_str(cfg, "sip.digest_secret", &secret, NULL);
     /* cfg_get_str 用 __thread 临时 buffer，后续 cfg_get_int 会覆盖！必须立即 strdup */
-    if (secret) secret = strdup(secret);
-    llog(LOG_INFO, "sig", "registrar cfg: digest_secret=%s", secret ? secret : "(null)");
+    if (secret) {
+        s->digest_secret = strdup(secret);
+        if (!s->digest_secret) {
+            llog(LOG_ERR, "sig", "failed to copy registrar digest secret");
+            return NSBC_NOMEM;
+        }
+    }
+    llog(LOG_INFO, "sig", "registrar cfg: digest_secret_configured=%d",
+         s->digest_secret != NULL);
     long minexp = 60, defexp = 3600, maxexp = 3600;
     long ipcps = 100, aorcps = 10, gcps = 2000;
     cfg_get_int(cfg, "registrar.min_expires", &minexp, NULL);
@@ -1597,7 +1607,7 @@ static int sig_start(struct nsbc_ctx *ctx)
     rc.ha1_cb = ctx->ha1_cb;
     rc.ha1_ud = ctx->ha1_ud;
     rc.realm = s->realm;
-    rc.digest_secret = secret;
+    rc.digest_secret = s->digest_secret;
     rc.nonce_ttl_ms = 300000;
     rc.min_expires = (int)minexp;
     rc.max_expires = (int)maxexp;
@@ -1940,6 +1950,7 @@ static void sig_fini(struct nsbc_ctx *ctx)
     if (s->ptable)
         ptable_destroy(s->ptable);
     dp_ctx_fini(&s->dp_ctx);
+    free(s->digest_secret);
     ctx->sig_rt = NULL;
     ctx->b2b = NULL;
     ctx->loc_db = NULL;

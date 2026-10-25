@@ -36,6 +36,10 @@ typedef struct {
 
 int metric_source_register(const char *name, const char *help,
                            metric_render_fn render, void *ud);
+/* Removes only the matching callback/context. Waits for any render currently
+ * using the registry lock to finish before returning. */
+int metric_source_unregister(const char *name, metric_render_fn render,
+                             void *ud);
 
 /* 输出完整 text exposition 到 buf；返回写出长度 */
 int metric_render_all(char *buf, size_t cap);

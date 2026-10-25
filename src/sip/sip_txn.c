@@ -16,6 +16,7 @@
  * 内嵌节点：重传节点 + 绝对超时节点）。 */
 
 #define TXN_SHARDS 64
+#define TXN_BUCKETS 64
 #define BRANCH_MAX 96
 
 /* 外部 thread-local：sip_transport.c 定义，b2bua.c 写入，txn.c / sip_tr_send 读取 */
@@ -56,7 +57,7 @@ struct sip_txn {
 
 typedef struct {
     pthread_mutex_t lock;
-    nsbc_hnode_t *head;
+    nsbc_hnode_t *buckets[TXN_BUCKETS];
 } txn_shard_t;
 
 struct txn_mgr {
@@ -68,13 +69,29 @@ struct txn_mgr {
     unsigned long rin, rout, tmo;
 };
 
+static uint64_t txn_hash(const char *b, size_t blen, sip_method_t meth,
+                         txn_kind_t kind)
+{
+    uint64_t h = nsbc_hash2(b, blen, &meth, sizeof(meth));
+    h ^= (uint64_t)kind * 0x9E3779B97F4A7C15ULL;
+    return h;
+}
+
+static txn_shard_t *shard_for_hash(txn_mgr_t *m, uint64_t h)
+{
+    return &m->sh[nsbc_hash_shard(h, TXN_SHARDS)];
+}
+
+static nsbc_hnode_t **bucket_for_hash(txn_shard_t *s, uint64_t h)
+{
+    unsigned idx = (unsigned)((h >> 6) & (TXN_BUCKETS - 1));
+    return &s->buckets[idx];
+}
+
 static txn_shard_t *shard_for(txn_mgr_t *m, const char *b, size_t blen,
                               sip_method_t meth, txn_kind_t kind)
 {
-    uint64_t h = nsbc_hash2(b, blen, &meth, sizeof(meth));
-    /* kind 进哈希键 → client/server 天生分桶，避免同 branch 相互干扰 */
-    h ^= (uint64_t)kind * 0x9E3779B97F4A7C15ULL; /* golden-ratio mixer */
-    return &m->sh[nsbc_hash_shard(h, TXN_SHARDS)];
+    return shard_for_hash(m, txn_hash(b, blen, meth, kind));
 }
 
 static long t_ref(sip_txn_t *t)
@@ -119,11 +136,12 @@ static void arm(sip_txn_t *t, tw_node_t *n, uint32_t ms, tw_cb_fn cb,
 static void t_remove_hash(sip_txn_t *t)
 {
     txn_mgr_t *m = t->mgr;
-    txn_shard_t *s = shard_for(m, t->branch, t->blen, t->method, t->kind);
+    uint64_t hash = txn_hash(t->branch, t->blen, t->method, t->kind);
+    txn_shard_t *s = shard_for_hash(m, hash);
     pthread_mutex_lock(&s->lock);
     if (!t->dead) {
         t->dead = 1;
-        nsbc_hnode_t **pp = &s->head;
+        nsbc_hnode_t **pp = bucket_for_hash(s, hash);
         while (*pp) {
             if (*pp == &t->link) {
                 *pp = t->link.next;
@@ -283,17 +301,19 @@ void txn_mgr_destroy(txn_mgr_t *m)
 {
     /* 停机路径：清空残留（worker/timer 已停） */
     for (int i = 0; i < TXN_SHARDS; ++i) {
-        nsbc_hnode_t *h = m->sh[i].head;
-        while (h) {
-            sip_txn_t *t = NSBC_CONTAINER_OF(h, sip_txn_t, link);
-            h = h->next;
-            tw_del(m->cfg.tw, &t->tm_retr);
-            tw_del(m->cfg.tw, &t->tm_dead);
-            if (t->req)
-                mem_arena_free(m->cfg.pkt_arena, t->req);
-            if (t->resp)
-                mem_arena_free(m->cfg.pkt_arena, t->resp);
-            mem_obj_release(t);
+        for (int b = 0; b < TXN_BUCKETS; ++b) {
+            nsbc_hnode_t *h = m->sh[i].buckets[b];
+            while (h) {
+                sip_txn_t *t = NSBC_CONTAINER_OF(h, sip_txn_t, link);
+                h = h->next;
+                tw_del(m->cfg.tw, &t->tm_retr);
+                tw_del(m->cfg.tw, &t->tm_dead);
+                if (t->req)
+                    mem_arena_free(m->cfg.pkt_arena, t->req);
+                if (t->resp)
+                    mem_arena_free(m->cfg.pkt_arena, t->resp);
+                mem_obj_release(t);
+            }
         }
         pthread_mutex_destroy(&m->sh[i].lock);
     }
@@ -367,10 +387,12 @@ sip_txn_t *txn_client_new(txn_mgr_t *m, txn_kind_t kind,
     t->interval = m->cfg.t1_ms;
     t->state = (kind == TXN_ICT) ? TXN_ICT_CALLING : TXN_NICT_TRYING;
 
-    txn_shard_t *s = shard_for(m, t->branch, t->blen, method, kind);
+    uint64_t hash = txn_hash(t->branch, t->blen, method, kind);
+    txn_shard_t *s = shard_for_hash(m, hash);
     pthread_mutex_lock(&s->lock);
-    t->link.next = s->head;
-    s->head = &t->link;
+    nsbc_hnode_t **bucket = bucket_for_hash(s, hash);
+    t->link.next = *bucket;
+    *bucket = &t->link;
     t_ref(t); /* hash 引用 */
     pthread_mutex_unlock(&s->lock);
 
@@ -429,12 +451,12 @@ static size_t via_branch(const sip_msg_t *msg, int *cookie)
     return b.len < BRANCH_MAX ? b.len : BRANCH_MAX - 1;
 }
 
-static sip_txn_t *find_locked(txn_mgr_t *m, txn_shard_t *s,
+static sip_txn_t *find_locked(txn_shard_t *s, uint64_t hash,
                               const char *branch, size_t blen,
                               sip_method_t meth, txn_kind_t kind)
 {
-    (void)m; /* 分片 s 已由调用方选定，管理器本身不参与查找 */
-    for (nsbc_hnode_t *h = s->head; h; h = h->next) {
+    nsbc_hnode_t **bucket = bucket_for_hash(s, hash);
+    for (nsbc_hnode_t *h = *bucket; h; h = h->next) {
         sip_txn_t *t = NSBC_CONTAINER_OF(h, sip_txn_t, link);
         if (t->kind == kind &&
             t->method == meth && t->blen == blen &&
@@ -455,7 +477,8 @@ static void client_on_response(txn_mgr_t *m, sip_txn_t *t,
 {
     int st = status_of(msg);
     int provisional = (st >= 100 && st < 200);
-    txn_shard_t *s = shard_for(m, t->branch, t->blen, t->method, t->kind);
+    uint64_t hash = txn_hash(t->branch, t->blen, t->method, t->kind);
+    txn_shard_t *s = shard_for_hash(m, hash);
     pthread_mutex_lock(&s->lock);
     switch (t->state) {
     case TXN_ICT_CALLING:
@@ -496,7 +519,7 @@ static void client_on_response(txn_mgr_t *m, sip_txn_t *t,
                 now);
         } else {
             t->dead = 1; /* TCP 无 D：立即摘 hash（在锁内安全） */
-            nsbc_hnode_t **pp = &s->head;
+            nsbc_hnode_t **pp = bucket_for_hash(s, hash);
             while (*pp) {
                 if (*pp == &t->link) {
                     *pp = t->link.next;
@@ -541,7 +564,7 @@ static void client_on_response(txn_mgr_t *m, sip_txn_t *t,
             arm(t, &t->tm_dead, m->cfg.t4_ms, cb_dead, now); /* K */
         else {
             t->dead = 1;
-            nsbc_hnode_t **pp = &s->head;
+            nsbc_hnode_t **pp = bucket_for_hash(s, hash);
             while (*pp) {
                 if (*pp == &t->link) {
                     *pp = t->link.next;
@@ -610,9 +633,12 @@ int txn_client_input(txn_mgr_t *m, sip_msg_t *msg, const nsbc_sa_t *src,
     /* INVITE 响应 → 匹配 ICT；非 INVITE (REGISTER/OPTIONS) → 匹配 NICT */
     txn_kind_t client_kind =
         (cs->u.cseq.method == SIP_M_INVITE) ? TXN_ICT : TXN_NICT;
-    txn_shard_t *s = shard_for(m, branch, blen, cs->u.cseq.method, client_kind);
+    uint64_t hash =
+        txn_hash(branch, blen, cs->u.cseq.method, client_kind);
+    txn_shard_t *s = shard_for_hash(m, hash);
     pthread_mutex_lock(&s->lock);
-    sip_txn_t *t = find_locked(m, s, branch, blen, cs->u.cseq.method, client_kind);
+    sip_txn_t *t = find_locked(s, hash, branch, blen, cs->u.cseq.method,
+                               client_kind);
     if (t)
         t_ref(t);
     pthread_mutex_unlock(&s->lock);
@@ -627,7 +653,7 @@ int txn_client_input(txn_mgr_t *m, sip_msg_t *msg, const nsbc_sa_t *src,
 static sip_txn_t *server_create_locked(txn_mgr_t *m, sip_msg_t *msg,
                                        const char *branch, size_t blen,
                                        const nsbc_sa_t *src, int reliable,
-                                       txn_kind_t kind)
+                                       txn_kind_t kind, uint64_t hash)
 {
     sip_txn_t *t = t_alloc(m, kind, msg->method);
     if (!t) {
@@ -650,9 +676,10 @@ static sip_txn_t *server_create_locked(txn_mgr_t *m, sip_msg_t *msg,
         return NULL;
     }
     t->req_len = msg->buflen;
-    txn_shard_t *s = shard_for(m, branch, blen, msg->method, kind);
-    t->link.next = s->head;
-    s->head = &t->link;
+    txn_shard_t *s = shard_for_hash(m, hash);
+    nsbc_hnode_t **bucket = bucket_for_hash(s, hash);
+    t->link.next = *bucket;
+    *bucket = &t->link;
     t_ref(t); /* hash */
     return t;
 }
@@ -708,9 +735,10 @@ int txn_server_input(txn_mgr_t *m, sip_msg_t *msg, const nsbc_sa_t *src,
     /* server 侧 kind：INVITE/ACK→IST，非 INVITE→NIST */
     txn_kind_t server_kind =
         (key_meth == SIP_M_INVITE) ? TXN_IST : TXN_NIST;
-    txn_shard_t *s = shard_for(m, branch, blen, key_meth, server_kind);
+    uint64_t hash = txn_hash(branch, blen, key_meth, server_kind);
+    txn_shard_t *s = shard_for_hash(m, hash);
     pthread_mutex_lock(&s->lock);
-    sip_txn_t *t = find_locked(m, s, branch, blen, key_meth, server_kind);
+    sip_txn_t *t = find_locked(s, hash, branch, blen, key_meth, server_kind);
     if (t)
         t_ref(t);
     if (!t) {
@@ -721,7 +749,8 @@ int txn_server_input(txn_mgr_t *m, sip_msg_t *msg, const nsbc_sa_t *src,
         }
         txn_kind_t kind =
             (msg->method == SIP_M_INVITE) ? TXN_IST : TXN_NIST;
-        t = server_create_locked(m, msg, branch, blen, src, reliable, kind);
+        t = server_create_locked(m, msg, branch, blen, src, reliable, kind,
+                                 hash);
         if (t) {
             t_ref(t); /* 临持给锁外 TU 回调 */
             /* 兜底 Timer：IST/NIST txn 创建后如果后续没走到 server_respond(status>=200)
@@ -763,7 +792,7 @@ int txn_server_input(txn_mgr_t *m, sip_msg_t *msg, const nsbc_sa_t *src,
                 arm(t, &t->tm_dead, m->cfg.t4_ms, cb_dead, now_ms); /* I */
             else {
                 t->dead = 1;
-                nsbc_hnode_t **pp = &s->head;
+                nsbc_hnode_t **pp = bucket_for_hash(s, hash);
                 while (*pp) {
                     if (*pp == &t->link) {
                         *pp = t->link.next;
@@ -867,7 +896,8 @@ int txn_send_response(sip_txn_t *t, const char *buf, size_t len,
     if (status < 100)
         return NSBC_PROTO;
 
-    txn_shard_t *s = shard_for(m, t->branch, t->blen, t->method, t->kind);
+    uint64_t hash = txn_hash(t->branch, t->blen, t->method, t->kind);
+    txn_shard_t *s = shard_for_hash(m, hash);
     pthread_mutex_lock(&s->lock);
     char *nb = copy_buf(m, buf, len);
     if (nb) {
@@ -904,7 +934,7 @@ int txn_send_response(sip_txn_t *t, const char *buf, size_t len,
                     now_ms); /* J */
             } else {
                 t->dead = 1;
-                nsbc_hnode_t **pp = &s->head;
+                nsbc_hnode_t **pp = bucket_for_hash(s, hash);
                 while (*pp) {
                     if (*pp == &t->link) {
                         *pp = t->link.next;

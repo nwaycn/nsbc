@@ -18,8 +18,12 @@ static const cfg_desc_t k_core[] = {
     {"log.ring_slots", CGT_INT, CGF_RESTART, "512", NULL, 128, 8192},
 
     /* ---- 核心运行时 ---- */
-    {"core.workers", CGT_INT, CGF_RESTART, "0", NULL, 0, 256}, /* 0=按 CPU */
+    /* P3: core.workers 改 CGF_HOT——SIGHUP reload 时触发 wpool_resize() 动态扩缩 */
+    {"core.workers", CGT_INT, CGF_HOT, "1", NULL, 0, 64}, /* 0=按 CPU */
+    {"core.workers_max", CGT_INT, CGF_RESTART, "64", NULL, 1, 64}, /* 预分配槽位上限 */
     {"core.worker_queue", CGT_INT, CGF_RESTART, "4096", NULL, 256, 1048576},
+    /* P2/P3: reactor 数量；多 reactor 已实现，保持 CGF_RESTART（reactor 线程启动后不建议热更） */
+    {"core.reactors", CGT_INT, CGF_RESTART, "1", NULL, 1, 64},
     {"core.max_calls", CGT_INT, CGF_RESTART, "100000", NULL, 1, 10000000},
     {"core.timer_tick_ms", CGT_INT, CGF_RESTART, "100", NULL, 10, 1000},
     {"core.drain_max_ms", CGT_INT, CGF_HOT, "30000", NULL, 0, 600000},

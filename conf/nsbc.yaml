@@ -41,7 +41,7 @@ config_version: "1.0"
 # ---- Shared core section ----
 core:
   # read by nsbcd (B2B memory limits, etc.)
-  workers: 0            # 0 = match CPU core count
+  workers: 1            # default one worker; 0 = match CPU core count
   max_calls: 2000      # conservative value of 10K, increase as needed
   timer_tick_ms: 100
 

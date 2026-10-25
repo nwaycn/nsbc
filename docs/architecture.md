@@ -49,13 +49,18 @@ graph TD
             REG[registrar.c<br/>reg_core + tbuckets]
         end
 
-        subgraph ReactorThread["Main Reactor Thread (epoll)"]
+        subgraph ReactorThread["Main Reactor Owner Thread (epoll)"]
             RE[reactor.c<br/>epoll reactor]
-            TW[tw.c<br/>timer wheel]
-            RE -->|tw_next_wait_ms| TW
         end
 
-        subgraph Workers["Worker Pool (N threads, hw-concurrency)"]
+        subgraph TimerThread["Timer Wheel Driver Thread"]
+            TW[timer_wheel.c<br/>timer wheel]
+        end
+
+        RE -.->|wait timeout from tw_next_wait_ms| TW
+        TimerThread -.->|tw_advance; callbacks currently execute here| TW
+
+        subgraph Workers["Worker Pool (default 1 thread; 0 selects online CPU count)"]
             WP["worker.c<br/>wpool (MPSC queues)"]
         end
 
@@ -121,8 +126,8 @@ graph TD
     BRIDGE -.->|bridge_add_rec_feed_hook| REC
     BRIDGE -.->|bridge_add_rec_feed_hook| AI
 
-    WP -.->|wpool_submit| B2B
-    WP -.->|wpool_submit| BRIDGE
+    WP -->|bounded CDR persistence flush| BILL
+    WP -.->|SIP/media state machines remain owner-thread-bound| B2B
 
     REG -->|reg_on_register| TXN
     REG -->|b2b_register_hook_add| B2B
@@ -393,9 +398,9 @@ Key facts from the source:
 ```mermaid
 graph TD
     subgraph NSBCD["nsbcd — C Core"]
-        Main["Main / Reactor Thread (1 epoll loop)<br/>reactor_wait(ctx.re, timeout)<br/>timeout = min(tw_next_wait_ms, 1000ms)"]
+        Main["Main / Reactor Thread (1 epoll loop + stop eventfd)<br/>reactor_wait(ctx.re, timeout)<br/>timeout = min(tw_next_wait_ms, 1000ms)"]
         Ticker["Ticker Thread<br/>pthread_cond_timedwait MONOTONIC<br/>→ tw_advance(ctx.tw, now)<br/>→ wpool_rcu_advance (every ~1s)"]
-        Workers["Worker Pool (N = hw-concurrency)<br/>worker_main spins on mem_mpsc_pop<br/>sched_yield → nanosleep 200us backoff<br/>RCU reader join per thread"]
+        Workers["Worker Pool (default 1; 0 = online CPU count)<br/>worker_main blocks on per-worker semaphore<br/>RCU reader join per thread"]
 
         subgraph RCU["RCU"]
             RCU[mem_rcu_t<br/>reactor is writer<br/>workers are readers]
@@ -418,20 +423,25 @@ graph TD
         Ticker -->|tw_advance| TW
         Ticker -->|wpool_rcu_advance| RCU
 
-        Workers -->|wpool_submit(hash_key)| B2B_shard
-        Workers -->|wpool_submit_any| Bridge_shard
+        Mailbox["Bounded synchronous command mailbox<br/>4096 pending commands"] --> Main
+        Workers -->|bounded CDR WAL/spool flush| CDR_sink
+        CDR_sink["billing CDR sink<br/>one serialized flush job"]
 
         subgraph SHARDS["Sharded Tables (pthread_mutex per shard)"]
             B2B_shard["b2b_core.sh[1024]<br/>call_link_t head"]
-            TXN_shard["txn_mgr.sh[64]<br/>hash chain by branch+method+kind"]
+            TXN_shard["txn_mgr.sh[64] × 64 buckets<br/>branch+method+kind"]
+            DLG_shard["dlg_mgr.sh[1024] × 32 buckets<br/>Call-ID+local-tag"]
             Bridge_shard["bridge_mgr.sh[64]<br/>cnode_t head"]
             Reg_shard["reg_core.tbucket ip[4096]<br/>aor[4096] token-bucket"]
+            Loc_shard["location_db.sh[64] × 64 AoR buckets<br/>per-AoR contact chains"]
         end
 
         Main --> B2B_shard
         Main --> TXN_shard
+        Main --> DLG_shard
         Main --> Bridge_shard
         Main --> Reg_shard
+        Main --> Loc_shard
 
         RCU -->|RCU protected ptrs| RT["ctx->rt<br/>route_table RCU atomic reload"]
         Main -->|RCU writer| RT
@@ -441,23 +451,94 @@ graph TD
     end
 ```
 
+The transaction, dialog, and registrar-location indexes use a hash bucket inside
+each existing lock shard, so lookups and updates traverse only the matching
+bucket (or one AoR's contacts) rather than the full shard chain. The existing
+shard locks and single-Reactor ownership model are unchanged.
+SIP transaction input, insertion, response handling, and hash removal compute
+the branch/method/kind hash once and reuse it for shard and bucket selection;
+lookup key comparisons and transaction locking semantics are unchanged.
+When a registrar AoR is at its contact limit, replacing its earliest-expiring
+binding now reuses that binding node in place. The contact eviction policy and
+per-AoR/global counts are unchanged, while replacement no longer releases a
+slab object and races for a new allocation.
+`reactor_stop()` signals an internal eventfd so a thread blocked in epoll wakes
+immediately; the main loop also observes the stop state, and an unrecoverable
+`reactor_wait()` error is logged and routed through shutdown instead of spinning.
+The owner must let `reactor_wait()` return before destroying the reactor.
+
 Concurrency rules enforced by the source:
 
 | Structure              | Locking                                                 |
 |------------------------|---------------------------------------------------------|
 | `b2b_core.sh[1024]`    | `pthread_mutex_t` per shard (call insert/lookup/delete)  |
-| `txn_mgr.sh[64]`       | `pthread_mutex_t` per shard; txn `refs` atomic          |
+| `txn_mgr.sh[64]`       | `pthread_mutex_t` per shard; 64 hash buckets per shard; txn `refs` atomic |
+| `dlg_mgr.sh[1024]`     | `pthread_mutex_t` per shard; 32 hash buckets per shard  |
+| `location_db.sh[64]`   | `pthread_mutex_t` per shard; 64 AoR buckets per shard   |
 | `bridge_mgr.sh[64]`    | `pthread_mutex_t` per shard                             |
 | `reg_core.tbucket_t`   | `pthread_mutex_t` per bucket, token-bucket rate limit   |
 | `route_table_t *`      | RCU (`mem_rcu_t`), `ctx->rt` atomically swapped          |
 | Event bus ring         | lock-free: single writer per core, atomic pos only       |
-| Workers                | lock-free MPSC queues (one queue per worker thread)      |
+| Reactor command queue | bounded FIFO (4096); owner-thread execution; explicit full/shutdown errors |
+| Workers                | bounded MPSC queue + semaphore wakeup per worker        |
 
+- `reactor_destroy()` is owner-thread-only and returns a status. It closes the
+  mailbox before checking for queued commands, refuses destruction while
+  `reactor_wait()` is active or accepted commands remain (`NSBC_BUSY`), returns
+  `NSBC_PERM_DENIED` to non-owner callers, and requires callers to quiesce
+  concurrent API users before destruction.
+- Normal shutdown checks the owner-thread command drain and destroy results; a
+  failure is logged and makes the process exit nonzero instead of reporting a
+  clean shutdown.
 - All SIP signaling path execution (UDP/TCP/TLS/WS receive → transport → txn →
   b2bua → response) happens **synchronously inside the reactor thread** (REQ-ARCH-015,
   comment in [b2bua.c](../src/sip/b2bua.c): "call link fully synchronous on reactor thread").
-- The worker pool is used for **asynchronous background** tasks (dialplan dp_sleep,
-  recording transcode, VAD engine, outbound originate with sequential bridge wait).
+- `reactor_call()` provides a bounded synchronous mailbox for cross-thread commands.
+  The caller retains its argument until completion and must not hold locks needed by
+  the command; commands queued before stop are drained on the owner thread before
+  modules stop, while later cross-thread submissions return `NSBC_SHUTDOWN`.
+  Owner-thread commands remain available for cleanup. `reactor_wait()` is restricted
+  to the thread that created the Reactor. Timer callbacks still run on the ticker
+  thread, and the mailbox is not yet used by timer callbacks or FD add/del call sites.
+  Those migrations require a lock-order, callback ordering, and object-lifetime audit.
+- The worker pool exposes bounded submission APIs; billing CDR persistence flushes
+  now use `wpool_submit_any()` so WAL/spool I/O normally runs off the call teardown
+  path. Each CDR sink permits one flush job in flight and serializes flushes; a full
+  worker queue logs and falls back to synchronous persistence. Sink shutdown waits
+  for its queued flush before freeing the sink. This is a bounded offload for CDR
+  persistence, not evidence that SIP state-machine work is parallelized; SIP state
+  remains on its existing Reactor until ownership and completion paths are migrated.
+- Idle workers block until a queued job or shutdown.
+- Worker submissions and shutdown are serialized by a pool submission gate.
+  Full bounded queues return `NSBC_NOSPC`; submissions after shutdown starts
+  return `NSBC_SHUTDOWN`; accepted jobs are drained before worker threads exit.
+  Callers must stop and join producer threads before destroying the pool.
+- The worker pool unregisters its `nsbc_worker_threads` metric source after
+  closing submissions but before stopping workers or destroying their queues.
+  Metric rendering holds the registry lock while invoking sources, so unregister
+  waits for an in-flight render and prevents later renders from dereferencing the
+  pool or its queues during shutdown.
+- The `nsbc_worker` metric source exports active/queued/submitted/completed/rejected
+  counts and a queue-wait histogram (`10us`, `100us`, `1ms`, `10ms`, `100ms`, `1s`,
+  `+Inf`). These metrics do not imply SIP work is currently parallelized.
+- `query_cdrs` applies malicious/source-IP predicates in SQL and uses the same
+  predicate set for count and paginated row queries. Caller/callee/Call-ID retain
+  their existing substring-search semantics; leading-wildcard searches are not
+  accelerated by ordinary B-tree indexes.
+- Web session checks inspect only the requested access-token jti in the revocation
+  map; refresh/revocation tables have fixed capacities and return service-unavailable
+  errors rather than growing without bound or claiming a revocation succeeded.
+- The Web per-IP rate limiter caps active IP/bucket windows at 65,536 entries;
+  expired windows are reclaimed at capacity, and new keys receive an observable
+  429 with `Retry-After` until a slot is available.
+- The Web username lockout table also caps at 65,536 entries. Partial failure
+  counters expire after the configurable `NSBC_LOCKOUT_WINDOW_SECS` idle window
+  (default 900 seconds); active account locks keep their separate configured
+  duration. At capacity, new-user failure tracking returns 503 rather than
+  silently allowing untracked failures.
+- Login database query errors return 503 and do not increment username lockout
+  counters; a missing account (or unconfigured database) remains an ordinary
+  invalid-credentials response.
 
 ---
 

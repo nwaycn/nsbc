@@ -116,6 +116,7 @@ static int billing_init(struct nsbc_ctx *ctx)
 
     ops.persist_batch = billing_persist_batch;
     ops.ud = NULL;
+    ops.workers = ctx->wpool;
 
     rc = cdr_sink_create(&ops, &g_sink);
     if (rc != NSBC_OK) return rc;

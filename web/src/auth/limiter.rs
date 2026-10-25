@@ -6,12 +6,16 @@
 //!   - **Rate-limit keyed by source IP x bucket**: fixed window (60s), login/refresh/command execution
 //!         three independent thresholds per bucket; exceeding returns 429 + Retry-After.
 //!   - All thresholds configurable via env, 0=disables the respective mechanism (see [`Limits`]).
-//!   - std::Mutex short critical sections, no lock held across await; counter bounded (lazy-expire when over 1024 keys).
+//!   - std::Mutex short critical sections, no lock held across await; rate-limit entries are capped at 65,536,
+//!     with expired entries reclaimed before new keys are rejected.
 //!   - Per-IP concurrent connection cap (transport-layer counting) and auto-ban are future items, see state §6#5.
 //!   - In-process state: cleared on restart (consistent with sessions).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+
+const MAX_RATE_LIMIT_KEYS: usize = 65_536;
+const MAX_LOCKOUT_USERS: usize = 65_536;
 
 /// Rate-limit buckets: REQ-WEB-009 requires login/refresh/command-exec endpoints to be limited separately.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +59,8 @@ pub struct Limits {
     pub lock_threshold: u32,
     /// Lockout duration in seconds (default 900)
     pub lock_secs: u64,
+    /// Idle window for accumulating failures in seconds (default 900)
+    pub lock_window_secs: u64,
     /// login requests per IP per minute (default 10)
     pub rl_login: u32,
     /// refresh requests per IP per minute (default 30)
@@ -70,6 +76,7 @@ impl Default for Limits {
         Limits {
             lock_threshold: 5,
             lock_secs: 900,
+            lock_window_secs: 900,
             rl_login: 10,
             rl_refresh: 30,
             rl_api: 120,
@@ -84,17 +91,23 @@ struct Window {
     count: u32,
 }
 
-/// Fixed-window per-IP counter.
+/// Fixed-window per-IP counter with a hard memory bound.
 pub struct RateLimiter {
     cfg: Limits,
     wins: Mutex<HashMap<(u8, String), Window>>,
+    max_keys: usize,
 }
 
 impl RateLimiter {
     pub fn new(cfg: Limits) -> RateLimiter {
+        Self::with_key_limit(cfg, MAX_RATE_LIMIT_KEYS)
+    }
+
+    fn with_key_limit(cfg: Limits, max_keys: usize) -> RateLimiter {
         RateLimiter {
             cfg,
             wins: Mutex::new(HashMap::new()),
+            max_keys,
         }
     }
 
@@ -113,27 +126,48 @@ impl RateLimiter {
             return Ok(());
         }
         let mut wins = self.wins.lock().unwrap();
-        // Prevent unbounded key growth (attack/spoofed XFF scenario): when table too large, purge keys that have ended in this window.
-        if wins.len() > 1024 {
+        let key = (b.key(), ip.to_string());
+        if let Some(w) = wins.get_mut(&key) {
+            if now.saturating_sub(w.start) >= self.cfg.window_secs {
+                w.start = now;
+                w.count = 0;
+            }
+            if w.count >= limit {
+                let retry = w
+                    .start
+                    .saturating_add(self.cfg.window_secs)
+                    .saturating_sub(now)
+                    .max(1);
+                return Err(retry);
+            }
+            w.count += 1;
+            return Ok(());
+        }
+
+        if wins.len() >= self.max_keys {
             wins.retain(|_, w| now.saturating_sub(w.start) < self.cfg.window_secs);
         }
-        let w = wins.entry((b.key(), ip.to_string())).or_insert(Window {
-            start: now,
-            count: 0,
-        });
-        if now.saturating_sub(w.start) >= self.cfg.window_secs {
-            w.start = now;
-            w.count = 0;
-        }
-        if w.count >= limit {
-            let retry = w
-                .start
-                .saturating_add(self.cfg.window_secs)
-                .saturating_sub(now)
-                .max(1);
+        if wins.len() >= self.max_keys {
+            let retry = wins
+                .values()
+                .map(|w| {
+                    self.cfg
+                        .window_secs
+                        .saturating_sub(now.saturating_sub(w.start))
+                        .max(1)
+                })
+                .min()
+                .unwrap_or(1);
             return Err(retry);
         }
-        w.count += 1;
+
+        wins.insert(
+            key,
+            Window {
+                start: now,
+                count: 1,
+            },
+        );
         Ok(())
     }
 
@@ -150,39 +184,59 @@ pub enum FailOutcome {
     Remaining(u32),
     /// This failure triggered the lock
     JustLocked { until: u64 },
+    /// The bounded lockout table is full after expired entries were purged.
+    Capacity,
 }
 
-/// Per-username consecutive failure count + lock-expiration table.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LockoutEntry {
+    failures: u32,
+    locked_until: u64,
+    last_failure: u64,
+}
+
+/// Per-username failure counter with idle expiry and a hard memory bound.
 pub struct Lockout {
     threshold: u32,
     secs: u64,
-    /// username -> (failure count, lock-expire UNIX seconds; 0=not locked)
-    m: Mutex<HashMap<String, (u32, u64)>>,
+    window_secs: u64,
+    max_users: usize,
+    m: Mutex<HashMap<String, LockoutEntry>>,
 }
 
 impl Lockout {
     pub fn new(threshold: u32, secs: u64) -> Lockout {
+        Self::with_limits(threshold, secs, secs, MAX_LOCKOUT_USERS)
+    }
+
+    fn with_window(threshold: u32, secs: u64, window_secs: u64) -> Lockout {
+        Self::with_limits(threshold, secs, window_secs, MAX_LOCKOUT_USERS)
+    }
+
+    fn with_limits(threshold: u32, secs: u64, window_secs: u64, max_users: usize) -> Lockout {
         Lockout {
             threshold,
             secs,
+            window_secs: window_secs.max(1),
+            max_users,
             m: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Whether currently in lockout period (also resets expired locks).
+    /// Whether currently in lockout period; expired locks and idle counters are removed.
     pub fn is_locked(&self, user: &str, now: u64) -> bool {
         let mut m = self.m.lock().unwrap();
-        match m.get_mut(user) {
-            Some((_, until)) if *until > now => true,
-            // Lock expired: reset failure count; if not locked (until==0), keep the count.
-            Some((fails, until)) => {
-                if *until != 0 {
-                    *fails = 0;
-                    *until = 0;
-                }
+        match m.get(user).copied() {
+            Some(entry) if entry.locked_until > now => true,
+            Some(entry)
+                if entry.locked_until != 0
+                    || entry.failures == 0
+                    || now.saturating_sub(entry.last_failure) >= self.window_secs =>
+            {
+                m.remove(user);
                 false
             }
-            None => false,
+            _ => false,
         }
     }
 
@@ -192,20 +246,50 @@ impl Lockout {
             return FailOutcome::Remaining(u32::MAX);
         }
         let mut m = self.m.lock().unwrap();
-        let e = m.entry(user.to_string()).or_insert((0, 0));
-        if e.1 > now {
-            return FailOutcome::JustLocked { until: e.1 };
+        let existing = m.get(user).copied();
+        if let Some(entry) = existing {
+            if entry.locked_until > now {
+                return FailOutcome::JustLocked {
+                    until: entry.locked_until,
+                };
+            }
         }
-        if e.1 != 0 {
-*e = (0, 0); // previous lock expired, recount
+
+        let mut entry = existing.unwrap_or_default();
+        if entry.locked_until != 0
+            || (entry.failures > 0 && now.saturating_sub(entry.last_failure) >= self.window_secs)
+        {
+            entry = LockoutEntry::default();
         }
-        e.0 += 1;
-        if e.0 >= self.threshold {
+
+        if existing.is_none() {
+            if m.len() >= self.max_users {
+                m.retain(|_, value| {
+                    if value.locked_until != 0 {
+                        value.locked_until > now
+                    } else {
+                        value.failures > 0
+                            && now.saturating_sub(value.last_failure) < self.window_secs
+                    }
+                });
+            }
+            if m.len() >= self.max_users {
+                return FailOutcome::Capacity;
+            }
+        }
+
+        entry.failures = entry.failures.saturating_add(1);
+        entry.last_failure = now;
+        if entry.failures >= self.threshold {
             let until = now.saturating_add(self.secs);
-            *e = (0, until);
+            entry.failures = 0;
+            entry.locked_until = until;
+            m.insert(user.to_string(), entry);
             return FailOutcome::JustLocked { until };
         }
-        FailOutcome::Remaining(self.threshold - e.0)
+        let remaining = self.threshold - entry.failures;
+        m.insert(user.to_string(), entry);
+        FailOutcome::Remaining(remaining)
     }
 
     /// Login success: clear count and lock.
@@ -224,7 +308,7 @@ impl AbuseGuard {
     pub fn new(cfg: Limits) -> AbuseGuard {
         AbuseGuard {
             rate: RateLimiter::new(cfg),
-            lock: Lockout::new(cfg.lock_threshold, cfg.lock_secs),
+            lock: Lockout::with_window(cfg.lock_threshold, cfg.lock_secs, cfg.lock_window_secs),
         }
     }
 }
@@ -251,6 +335,21 @@ mod tests {
         assert!(g.check(Bucket::Login, "9.9.9.9", 100).is_ok());
         // Recovers after window rolls
         assert!(g.check(Bucket::Login, "1.2.3.4", 160).is_ok());
+    }
+
+    #[test]
+    fn rate_limiter_capacity_rejects_new_keys_until_window_expires() {
+        let g = RateLimiter::with_key_limit(
+            Limits {
+                rl_login: 10,
+                window_secs: 60,
+                ..Limits::default()
+            },
+            1,
+        );
+        assert!(g.check(Bucket::Login, "1.2.3.4", 100).is_ok());
+        assert_eq!(g.check(Bucket::Login, "9.9.9.9", 100), Err(60));
+        assert!(g.check(Bucket::Login, "9.9.9.9", 160).is_ok());
     }
 
     #[test]
@@ -283,6 +382,29 @@ mod tests {
         // Successful login clears
         l.clear("u");
         assert_eq!(l.record_fail("u", 904), FailOutcome::Remaining(2));
+    }
+
+    #[test]
+    fn lockout_failure_window_expires_but_active_lock_is_preserved() {
+        let l = Lockout::with_limits(3, 90, 10, 4);
+        assert_eq!(l.record_fail("u", 100), FailOutcome::Remaining(2));
+        assert_eq!(l.record_fail("u", 109), FailOutcome::Remaining(1));
+        assert_eq!(l.record_fail("u", 119), FailOutcome::Remaining(2));
+        assert_eq!(l.record_fail("u", 120), FailOutcome::Remaining(1));
+        assert_eq!(
+            l.record_fail("u", 121),
+            FailOutcome::JustLocked { until: 211 }
+        );
+        assert!(l.is_locked("u", 210));
+        assert!(!l.is_locked("u", 211));
+    }
+
+    #[test]
+    fn lockout_capacity_reclaims_idle_counters_and_rejects_when_full() {
+        let l = Lockout::with_limits(3, 90, 10, 1);
+        assert_eq!(l.record_fail("first", 100), FailOutcome::Remaining(2));
+        assert_eq!(l.record_fail("second", 101), FailOutcome::Capacity);
+        assert_eq!(l.record_fail("second", 110), FailOutcome::Remaining(2));
     }
 
     #[test]

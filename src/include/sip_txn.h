@@ -12,7 +12,7 @@
  * 匹配键：top Via branch（z9hG4bK magic cookie）+ CSeq 方法 + 对端地址；
  * 无 cookie 的 RFC2543 报文走无状态旁路（txn 返回 TXN_STATELESS）。
  * 事务对象从 SIGNAL 域 slab 取放，重传报文从 PACKET 域 arena 复制，
- * 快路径零 malloc。分片锁 + 引用计数（时间轮线程与 worker 线程并发）。
+ * 快路径零 malloc。双层哈希桶 + 分片锁 + 引用计数。
  */
 #include "mem.h"
 #include "net_sock.h"

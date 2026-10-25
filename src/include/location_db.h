@@ -4,7 +4,8 @@
 /* 注册位置库（REQ-REG，P0）
  *
  * AoR → 多 Contact 绑定。幂等：同 Call-ID 且 CSeq 不回退时刷新；
- * Contact: * 注销整个 AoR。64 分片互斥（P1 读侧换 RCU 无锁），
+ * Contact: * 注销整个 AoR。AoR 哈希目录 + 64 分片互斥，
+ * 每次更新只扫描该 AoR 的联系人；全表过期回收由周期 sweep 执行。
  * 绑定对象从 SIGNAL 域 slab 取放，绝对到期时间 CLOCK_MONOTONIC。
  *
  * P0 不含：GRUU（RFC 5627）、reg-event 同步、多实例持久化/XFR 同步。
