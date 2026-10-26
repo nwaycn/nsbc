@@ -250,7 +250,7 @@ app.component('channels-live', livePanel(t('Live channels'), 'fa-solid fa-phone-
     actionCol: (row) => {
       const callId = row.a_call_id || row.b_call_id || '';
       if (!callId) return '';
-      return `<button onclick="nsbcHangup('${callId}')" class="px-2 py-1 text-xs text-red-600 border border-red-300 rounded hover:bg-red-50 hover:text-red-800"><i class="fa-solid fa-phone-slash"></i>{{ t(' Hang up') }}</button>`;
+      return `<button onclick="nsbcHangup('${callId}')" class="px-2 py-1 text-xs text-red-600 border border-red-300 rounded hover:bg-red-50 hover:text-red-800"><i class="fa-solid fa-phone-slash"></i> ${t('Hang up')}</button>`;
     },
   }));
 

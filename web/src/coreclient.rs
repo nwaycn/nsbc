@@ -297,6 +297,9 @@ pub struct CallSummary {
     pub duration_ms: Option<u64>,
     pub codec_a: Option<String>,
     pub codec_b: Option<String>,
+    pub from_ip: Option<String>,
+    pub a_peer_ip: Option<String>,
+    pub b_peer_ip: Option<String>,
     pub rtp_loss_pct: Option<u32>,
     pub rtp_jitter_ms: Option<u32>,
     pub mos_x1000: Option<i32>,
@@ -1626,6 +1629,9 @@ pub fn parse_call_list(body: &str) -> Result<CallList, CoreError> {
                 duration_ms,
                 codec_a: kv_opt(toks.iter().copied(), "codec_a").filter(|v| v != "-"),
                 codec_b: kv_opt(toks.iter().copied(), "codec_b").filter(|v| v != "-"),
+                from_ip: kv_opt(toks.iter().copied(), "from_ip").filter(|v| v != "-"),
+                a_peer_ip: kv_opt(toks.iter().copied(), "a_peer_ip").filter(|v| v != "-"),
+                b_peer_ip: kv_opt(toks.iter().copied(), "b_peer_ip").filter(|v| v != "-"),
                 rtp_loss_pct: kv_opt(toks.iter().copied(), "rtp_loss_pct")
                     .and_then(|v| if v == "-" || v == "0" { None } else { v.parse::<u32>().ok() }),
                 rtp_jitter_ms: kv_opt(toks.iter().copied(), "rtp_jitter_ms")

@@ -1176,7 +1176,10 @@ function livePanel(title, icon, columns, apiPath, opts = {}) {
             <tr v-for="(row, idx) in pagedRows" :key="idx" class="border-b hover:bg-blue-50/50">
               <td v-for="c in columns" :key="c.key" class="px-3 py-2 font-mono text-xs text-gray-700 whitespace-nowrap">
                 <template v-if="row[c.key] !== undefined && row[c.key] !== null && row[c.key] !== ''">
-                  {{ c.fmt ? c.fmt(row[c.key]) : row[c.key] }}
+                  <template v-if="c.fmt">
+                    <span v-html="c.fmt(row[c.key])"></span>
+                  </template>
+                  <template v-else>{{ row[c.key] }}</template>
                 </template>
                 <template v-else>-</template>
               </td>
