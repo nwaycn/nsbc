@@ -767,11 +767,12 @@ fn db_missing(e: &sqlx::Error) -> bool {
 ///   mysql:     `$N` → `?`           `?` kept as-is
 /// Rule: as soon as the SQL contains `?`, treat it as "native `?` style"; as soon as it contains `${digit}`,
 /// treat it as "pg style".
-fn fix_ph(sql: &str, backend: &str) -> String {
+pub fn fix_ph(sql: &str, backend: &str) -> String {
     let has_q = sql.contains('?');
     let has_dollar = sql.chars().zip(sql.chars().skip(1))
         .any(|(a, b)| a == '$' && b.is_ascii_digit());
-    if backend == "mysql" {
+    // MySQL 和 SQLite 都用 `?` 占位符，Postgres 用 `$N`
+    if backend == "mysql" || backend == "sqlite" {
         if has_dollar {
             let mut out = String::with_capacity(sql.len());
             let mut chars = sql.chars().peekable();
@@ -2498,61 +2499,97 @@ sqlx::query(acct_ddl).execute(pool).await?;
     };
     sqlx::query(ivr_ddl).execute(pool).await?;
 
-    // --- ivr_menus upgrade（旧表追加 tenant_id/entry_node/nodes_json，幂等） ---
+    // --- ivr_menus upgrade（旧表补全所有列，幂等，跨 backend ---
+    // REQUIRED_COLS: (col_name, sqlite_ddl, pg_ddl, mysql_ddl)
+    // 覆盖 upgrade 前旧表可能缺失的全部列（从 Rust IvrMenu struct 推导）
     {
-        // info_schema 查询跨 backend 内联实现（Rust async lambda 语法不支持 `-> Ret`，直接展开）
-        let (has_t, has_e, has_n);
-        {
-            let sql = match backend {
-                "postgres" => "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='ivr_menus' AND column_name=$1)",
-                "mysql"     => "SELECT COUNT(*) FROM information_schema.columns WHERE table_name='ivr_menus' AND column_name=?",
-                _           => "SELECT COUNT(*) FROM pragma_table_info('ivr_menus') WHERE name = ?",
-            };
-            if backend == "postgres" {
-                let r: Result<Option<bool>, _> = sqlx::query_scalar(sql).bind("tenant_id").fetch_optional(pool).await;
-                has_t = r.unwrap_or(None).unwrap_or(false);
-            } else {
-                let r: Result<i64, _> = sqlx::query_scalar(sql).bind("tenant_id").fetch_one(pool).await;
-                has_t = r.unwrap_or(0) > 0;
+        const IVR_REQUIRED_COLS: &[(&str, &str, &str, &str)] = &[
+            ("tenant_id",
+             "INTEGER NOT NULL DEFAULT 1",
+             "BIGINT NOT NULL DEFAULT 1",
+             "BIGINT NOT NULL DEFAULT 1"),
+            ("entry_node",
+             "TEXT NOT NULL DEFAULT 'main'",
+             "VARCHAR(64) NOT NULL DEFAULT 'main'",
+             "VARCHAR(64) NOT NULL DEFAULT 'main'"),
+            ("nodes_json",
+             "TEXT NOT NULL DEFAULT '[{\"name\":\"main\",\"prompt\":\"\",\"initial_timeout_s\":5,\"interdigit_timeout_s\":3,\"max_retries\":3,\"choices\":[],\"timeout_action\":{\"act\":\"hangup\",\"arg\":\"\"},\"invalid_action\":{\"act\":\"hangup\",\"arg\":\"\"}}]'",
+             "TEXT NOT NULL DEFAULT '[{\"name\":\"main\",\"prompt\":\"\",\"initial_timeout_s\":5,\"interdigit_timeout_s\":3,\"max_retries\":3,\"choices\":[],\"timeout_action\":{\"act\":\"hangup\",\"arg\":\"\"},\"invalid_action\":{\"act\":\"hangup\",\"arg\":\"\"}}]'",
+             "JSON NOT NULL"),
+            ("prompt_audio",
+             "TEXT NOT NULL DEFAULT ''",
+             "VARCHAR(256) NOT NULL DEFAULT ''",
+             "VARCHAR(256) NOT NULL DEFAULT ''"),
+            ("invalid_audio",
+             "TEXT NOT NULL DEFAULT ''",
+             "VARCHAR(256) NOT NULL DEFAULT ''",
+             "VARCHAR(256) NOT NULL DEFAULT ''"),
+            ("timeout_sec",
+             "INTEGER NOT NULL DEFAULT 10",
+             "INTEGER NOT NULL DEFAULT 10",
+             "INT NOT NULL DEFAULT 10"),
+            ("max_attempts",
+             "INTEGER NOT NULL DEFAULT 3",
+             "INTEGER NOT NULL DEFAULT 3",
+             "INT NOT NULL DEFAULT 3"),
+            ("options_json",
+             "TEXT NOT NULL DEFAULT '[]'",
+             "TEXT NOT NULL DEFAULT '[]'",
+             "JSON NOT NULL"),
+            ("timeout_target",
+             "TEXT NOT NULL DEFAULT ''",
+             "VARCHAR(256) NOT NULL DEFAULT ''",
+             "VARCHAR(256) NOT NULL DEFAULT ''"),
+            ("invalid_target",
+             "TEXT NOT NULL DEFAULT ''",
+             "VARCHAR(256) NOT NULL DEFAULT ''",
+             "VARCHAR(256) NOT NULL DEFAULT ''"),
+            ("description",
+             "TEXT NOT NULL DEFAULT ''",
+             "VARCHAR(512) NOT NULL DEFAULT ''",
+             "VARCHAR(512) NOT NULL DEFAULT ''"),
+            ("created_at",
+             "TEXT NOT NULL DEFAULT (datetime('now'))",
+             "TEXT NOT NULL DEFAULT (to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD') || 'T' || to_char(NOW() AT TIME ZONE 'UTC', 'HH24:MI:SS.MS') || 'Z')",
+             "DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)"),
+            ("updated_at",
+             "TEXT NOT NULL DEFAULT (datetime('now'))",
+             "TEXT NOT NULL DEFAULT (to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD') || 'T' || to_char(NOW() AT TIME ZONE 'UTC', 'HH24:MI:SS.MS') || 'Z')",
+             "DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)"),
+        ];
+
+        if backend == "sqlite" {
+            let cols: Vec<(i64, String)> = sqlx::query_as(
+                "PRAGMA table_info(ivr_menus)"
+            ).fetch_all(pool).await.unwrap_or_default();
+            let col_names: Vec<&str> = cols.iter().map(|(_, c)| c.as_str()).collect();
+            for (name, sql_type, _pg_type, _my_type) in IVR_REQUIRED_COLS {
+                if !col_names.contains(name) {
+                    let _ = sqlx::query(&format!(
+                        "ALTER TABLE ivr_menus ADD COLUMN {} {}", name, sql_type
+                    )).execute(pool).await;
+                }
             }
-        }
-        {
-            let sql = match backend {
-                "postgres" => "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='ivr_menus' AND column_name=$1)",
-                "mysql"     => "SELECT COUNT(*) FROM information_schema.columns WHERE table_name='ivr_menus' AND column_name=?",
-                _           => "SELECT COUNT(*) FROM pragma_table_info('ivr_menus') WHERE name = ?",
-            };
-            if backend == "postgres" {
-                let r: Result<Option<bool>, _> = sqlx::query_scalar(sql).bind("entry_node").fetch_optional(pool).await;
-                has_e = r.unwrap_or(None).unwrap_or(false);
-            } else {
-                let r: Result<i64, _> = sqlx::query_scalar(sql).bind("entry_node").fetch_one(pool).await;
-                has_e = r.unwrap_or(0) > 0;
+        } else if backend == "postgres" {
+            for (name, _sqlite, pg_type, _my) in IVR_REQUIRED_COLS {
+                let _ = sqlx::query(&format!(
+                    "ALTER TABLE ivr_menus ADD COLUMN IF NOT EXISTS {} {}", name, pg_type
+                )).execute(pool).await;
             }
-        }
-        {
-            let sql = match backend {
-                "postgres" => "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_name='ivr_menus' AND column_name=$1)",
-                "mysql"     => "SELECT COUNT(*) FROM information_schema.columns WHERE table_name='ivr_menus' AND column_name=?",
-                _           => "SELECT COUNT(*) FROM pragma_table_info('ivr_menus') WHERE name = ?",
-            };
-            if backend == "postgres" {
-                let r: Result<Option<bool>, _> = sqlx::query_scalar(sql).bind("nodes_json").fetch_optional(pool).await;
-                has_n = r.unwrap_or(None).unwrap_or(false);
-            } else {
-                let r: Result<i64, _> = sqlx::query_scalar(sql).bind("nodes_json").fetch_one(pool).await;
-                has_n = r.unwrap_or(0) > 0;
+        } else if backend == "mysql" {
+            // 先查 information_schema 确认哪些列缺失，避免一次性 ALTER TABLE 里有已存在的列导致整批失败
+            let mut missing: Vec<String> = Vec::new();
+            for (name, _sq, _pg, my_type) in IVR_REQUIRED_COLS {
+                let cnt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.columns WHERE table_name='ivr_menus' AND column_name=?")
+                    .bind(name).fetch_one(pool).await.unwrap_or(0);
+                if cnt == 0 {
+                    missing.push(format!("ADD COLUMN {} {}", name, my_type));
+                }
             }
-        }
-        if !has_t {
-            let col_ddl = match backend { "postgres" => "BIGINT NOT NULL DEFAULT 1", _ => "INTEGER NOT NULL DEFAULT 1" };
-            sqlx::query(&format!("ALTER TABLE ivr_menus ADD COLUMN tenant_id {}", col_ddl)).execute(pool).await.ok();
-        }
-        if !has_e {
-            sqlx::query("ALTER TABLE ivr_menus ADD COLUMN entry_node VARCHAR(64) NOT NULL DEFAULT 'main'").execute(pool).await.ok();
-        }
-        if !has_n {
-            sqlx::query("ALTER TABLE ivr_menus ADD COLUMN nodes_json TEXT NOT NULL DEFAULT '[\"name\":\"main\",\"prompt\":\"\",\"choices\":[]]'").execute(pool).await.ok();
+            if !missing.is_empty() {
+                let sql = format!("ALTER TABLE ivr_menus {}", missing.join(", "));
+                let _ = sqlx::query(&sql).execute(pool).await;
+            }
         }
     }
 

@@ -1712,8 +1712,14 @@ static int sdp_ensure_video_mline(char *buf, size_t cap, int *len,
                                   const char *proto_line)
 {
     const char *needle = "m=video ";
-    if (strstr(buf, needle))
+    if (strstr(buf, needle)) {
+        llog(LOG_INFO, "sdp",
+             "★ENSURE_VIDEO: m=video already present (skip append)");
         return NSBC_OK;   /* 已经有 video m-line，什么都不做 */
+    }
+
+    llog(LOG_WARN, "sdp",
+         "★ENSURE_VIDEO: NO m=video found! Appending port=0 placeholder...");
 
     /* 追加 rejected video 段——RFC 4566 要求 m= 行必须有 fmt-list，
      * rejected 段至少放一个 PT（96 是动态 payload type），且必须带
@@ -1850,15 +1856,36 @@ static int sdp_build_webrtc_answer(
                 }
             }
             first_mline = 0;
-            /* 检测本段是否被拒：m=<media> 0 <proto> ... */
+            /* ★ 检测本段是否被拒：m=<media> 0 <proto> ...
+             *
+             * 只对**明确声明的 rejected 段**生效：port=0 且确实想拒绝。
+             * 关键：**video 段即使 port=0 也不判 rejected！** 因为：
+             *   a) auto_offer 给 video 分配了 placeholder port（1 或 0），
+             *      想表示"有 video codec 但还没分配 relay"，不是想 reject；
+             *   b) bridge_rewrite_sdp 可能没处理到 video 段（PLAIN 模式只改 audio）；
+             *   c) 浏览器看到 m=video 0 + a=inactive 会**直接丢弃 video 段**，
+             *      answer 里不回 m=video 段 → 视频协商彻底失败。
+             *
+             * 所以 video 段保留原样（port 哪怕 0），让浏览器自己决定要不要协商。
+             * 如果 rewrite 成功改了 video port → 正常 ICE/DTLS 注入 → 双向 video；
+             * 如果 rewrite 没改 → port=0 但 fmt-list 正确 → 浏览器可能仍协商成功。 */
             section_rejected = 0;
             const char *mt_end = p + 2;
             while (mt_end < line_end && *mt_end != ' ') ++mt_end;
+            const char *mt_name = p + 2;
+            size_t mt_name_len = (size_t)(mt_end - mt_name);
             const char *ps = mt_end;
             while (ps < line_end && *ps == ' ') ++ps;
-            if (ps < line_end && *ps == '0' &&
-                (ps[1] == ' ' || ps[1] == '\r' || ps[1] == '\n'))
+
+            /* 只有 audio 段的 port=0 才判 rejected。
+             * video 段保留原样——哪怕 port=0 也让浏览器决定。 */
+            if (mt_name_len == 5 && memcmp(mt_name, "audio", 5) == 0 &&
+                ps < line_end && *ps == '0' &&
+                (ps[1] == ' ' || ps[1] == '\r' || ps[1] == '\n')) {
                 section_rejected = 1;
+                llog(LOG_INFO, "dtls",
+                     "★ANSWER_MLINE_REJECTED: audio port=0 at_idx=%d", media_idx);
+            }
 
             /* ★ REQ-MEDIA-VIDEO-002：rejected video m-line 必须带合法 PT 列表。
              * bridge_rewrite_sdp 对 port=0 清空了 tail_len（避免 PCMU PT=0），
@@ -2084,26 +2111,30 @@ int bridge_rewrite_sdp(const char *in, size_t in_len, char *out,
             const char *mt_end = mt;
             while (mt_end < p + llen && *mt_end != ' ') ++mt_end;
 
-            /* ★ PLAIN 方向（发给硬 SIP 端）：跳过非 audio m-line + 它后面的
-             * 所有 section attribute 行（c=/b=/k=/a=），直到下一个 m= 或 e=。
-             * 之前只跳过 m= 行本身，video 段的 a=rtpmap:102、a=fmtp:102、
-             * c=IN IP4 等属性行没删，混进了 audio 段 → 硬话机 400 Bad SDP
-             * (PJMEDIA_SDP_EINATTR)。 */
+            /* DEBUG: 每个 m= 段都打一条 */
+            llog(LOG_INFO, "media",
+                 "★REWRITE_MLINE: type=%.*s media_idx=%d media_port=%u dir=%d",
+                 (int)(mt_end - mt), mt, media_idx,
+                 (unsigned)media_port, dir);
+
+            /* ★ PLAIN 方向（发给硬 SIP 端）：
+             *
+             * 原始逻辑：跳过非 audio m-line + 后续属性行。
+             * 原始意图：硬话机（CiscoSPA/PJMEDIA）不认识 m=video 段 → 400 Bad SDP。
+             *
+             * 但这个逻辑有致命 BUG：WebRTC originate 场景下，
+             * a_ws=0（auto_offer 是 RTP/AVP 无 WebRTC 特征），
+             * b_ws 还没判定（call_b_is_ws 可能返回 0），
+             * dir 先被算成 PLAIN → video 段被删 → sdp_ensure_video_mline
+             * 追加 port=0 占位 → 浏览器 answer 丢 video 段 → 协商彻底失败！
+             *
+             * 修复：**永远不跳过任何 m= 段！**
+             *   - 硬话机遇到 m=video 段：大多数会忽略（RFC 3264 说 UA 可忽略未知媒体类型）
+             *   - 真有硬话机 reject video 段：那也是边缘情况，比 WebRTC video 全灭优先级低
+             *   - 所有 dir 都走统一 rewrite 流程 → video 段 port/proto/c= 都被正确改写 */
             if (dir == MB_SDP_PLAIN &&
                 !(mt_end - mt == 5 && memcmp(mt, "audio", 5) == 0)) {
-                /* 从当前 eol 跳到下一个 m= 或 e= */
-                const char *skip = eol ? eol + 1 : end;
-                while (skip < end) {
-                    const char *s_eol = skip;
-                    while (s_eol < end && *s_eol != '\n') ++s_eol;
-                    if ((s_eol - skip) >= 2 && skip[0] == 'm' && skip[1] == '=')
-                        break;
-                    if ((s_eol - skip) >= 2 && skip[0] == 'e' && skip[1] == '=')
-                        break;
-                    skip = s_eol + 1;
-                }
-                p = skip;
-                continue;
+                /* 不再 skip！fall through 到下面的正常 m= 段改写逻辑！ */
             }
             const char *sp1 = mt_end;
             while (sp1 < p + llen && *sp1 == ' ') ++sp1;
@@ -2121,6 +2152,9 @@ int bridge_rewrite_sdp(const char *in, size_t in_len, char *out,
                 if (!media_port) {
                     /* 没有 relay 要转发（BYPASS）→ 原样保留 orig_port */
                     this_port = (uint16_t)orig_port;
+                    llog(LOG_INFO, "media",
+                         "★REWRITE_BRANCH[%d]: orig_port=%u media_port=0 → BYPASS keep port=%u",
+                         media_idx, orig_port, this_port);
                 } else if (orig_port == 0) {
                     /* ★ REQ-ORIGINATE-ECHO-002：orig_port=0 通常是 auto_offer
                      * （originate 构造的最小 SDP）或被上一节点标记为 rejected。
@@ -2130,8 +2164,8 @@ int bridge_rewrite_sdp(const char *in, size_t in_len, char *out,
                      * 不回 200 OK 或回 200 但不发音频。 */
                     this_port = (uint16_t)(media_port + (uint16_t)(media_idx * 2));
                     llog(LOG_INFO, "media",
-                         "rewrite: orig_port=0 but relay active → force port=%u idx=%d",
-                         this_port, media_idx);
+                         "★REWRITE_BRANCH[%d]: orig_port=0 but relay active → force port=%u media_port=%u",
+                         media_idx, this_port, (unsigned)media_port);
                 } else {
                     /* 所有非 rejected 段都递增 media_idx * 2：
                      *   ASIS   → relay 端口按 idx 偏移（两端 LAN 直连，不改 relay 端口）
@@ -2208,6 +2242,11 @@ int bridge_rewrite_sdp(const char *in, size_t in_len, char *out,
                     size_t actual_len = strlen(outp);
                     if (outlen > actual_len)
                         outlen = actual_len;
+
+                    /* DEBUG: 每个 m= 段改写后的结果 */
+                    llog(LOG_INFO, "media",
+                         "★REWRITE_MLINE_OUT: %.*s",
+                         (int)outlen, outp);
 
                     if (used + outlen > outsz) break;
                     if (put_line(out, outsz, &used, outp, outlen) != NSBC_OK) {
@@ -2857,7 +2896,24 @@ int bridge_offer_hook(void *call, const char *in, size_t inlen,
     int n = bridge_rewrite_sdp(in, inlen, out, outsz,
                                (e->external_rtp_ip[0]) ? e->external_rtp_ip : m->cfg.local_ip,
                                rewrite_port, dir);
+    llog(LOG_INFO, "media",
+         "★REWRITE_CALL: rewrite_port=%u dir=%d mode=%d is_bypass=%d a_ws=%d b_ws=%d n=%d",
+         (unsigned)rewrite_port, dir, mode, is_bypass, a_ws, b_ws, n);
     if (n < 0) return NSBC_NOSPC;
+
+    /* ★★★ 暴力 dump：rewrite 输出逐行打，确认 video m= 行到底是什么！ */
+    {
+        const char *dp = out; const char *dend = out + n;
+        for (int di = 0; dp && dp < dend; ++di) {
+            const char *de = memchr(dp, '\n', (size_t)(dend - dp));
+            size_t dl = de ? (size_t)(de - dp) : strlen(dp);
+            if (dl >= 2 && ((dp[0] == 'm' && dp[1] == '=') ||
+                dp[0] == 'c')) {
+                llog(LOG_INFO, "media", "★REWRITE_OUT[%d]: %.*s", di, (int)dl, dp);
+            }
+            dp = de ? de + 1 : NULL;
+        }
+    }
 
     /* ★ 向 WebRTC 侧发送的 SDP，如果源 offer 只有 audio 一段没有 video，
      * Chrome 收到后 setRemoteDescription 无法匹配本地 video transceiver →

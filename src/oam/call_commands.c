@@ -677,7 +677,9 @@ static int parse_fs_brace_vars(const char *src, const char **out_buf,
                                 int *opt_timeout,
                                 char *opt_orig_num, size_t opt_orig_num_sz,
                                 char *opt_orig_name, size_t opt_orig_name_sz,
-                                char *opt_realm, size_t opt_realm_sz)
+                                char *opt_realm, size_t opt_realm_sz,
+                                char *opt_audio_codecs, size_t opt_audio_sz,
+                                char *opt_video_codecs, size_t opt_video_sz)
 {
     if (!src || !*src || !out_buf) return NSBC_INVAL;
     /* 跳过开头空白 */
@@ -732,6 +734,16 @@ static int parse_fs_brace_vars(const char *src, const char **out_buf,
              * cmd_originate 会用它把 call-url 重写成 user@realm 格式再调 resolve。 */
             if (opt_realm && opt_realm_sz && !opt_realm[0] && strlen(val) < opt_realm_sz)
                 snprintf(opt_realm, opt_realm_sz, "%s", val);
+        } else if (!strcasecmp(key, "audio_codecs") || !strcasecmp(key, "codecs")) {
+            /* REQ-ORIGINATE-004：自动 SDP 的音频 codec 列表。
+             * 例 {audio_codecs=PCMU,PCMA,G722} → 生成 3 个 a=rtpmap + m=audio 行 PT 列表。 */
+            if (opt_audio_codecs && opt_audio_sz && !opt_audio_codecs[0] && strlen(val) < opt_audio_sz)
+                snprintf(opt_audio_codecs, opt_audio_sz, "%s", val);
+        } else if (!strcasecmp(key, "video_codecs")) {
+            /* REQ-ORIGINATE-004：自动 SDP 的视频 codec 列表。
+             * 例 {video_codecs=H264} → 生成 m=video 行 + a=rtpmap，offer_hook 激活端口。 */
+            if (opt_video_codecs && opt_video_sz && !opt_video_codecs[0] && strlen(val) < opt_video_sz)
+                snprintf(opt_video_codecs, opt_video_sz, "%s", val);
         } else {
             /* 其他 FS 变量（ignore_early_media / export_media / hangup_after_bridge 等）
              * 暂不处理，只 warn */
@@ -757,12 +769,13 @@ static int cmd_originate(cmd_ctx_t *c, int argc, char **argv, void *ud)
     if (argc < 2 || !argv[1] || argv[1][0] == '\0') {
         c->io_printf(c->io_ud, "ERR missing call-url\n"); return NSBC_INVAL;
     }
-
     /* ---- 1. FS 大括号变量块 ---- */
     int opt_timeout = 0;
     char opt_caller[128] = {0};
     char opt_caller_name[128] = {0};
     char opt_realm[128] = {0};
+    char opt_audio_codecs[128] = {0};   /* REQ-ORIGINATE-004 */
+    char opt_video_codecs[128] = {0};   /* REQ-ORIGINATE-004 */
     char bridge_url_buf[512] = {0};  /* 前置：argv[2+] 位置参数先写这里 */
     const char *bridge_url_saved = NULL;
     int post_app = B2B_APP_NONE;
@@ -770,7 +783,9 @@ static int cmd_originate(cmd_ctx_t *c, int argc, char **argv, void *ud)
     int rc = parse_fs_brace_vars(argv[1], &rest, &opt_timeout,
                                   opt_caller, sizeof(opt_caller),
                                   opt_caller_name, sizeof(opt_caller_name),
-                                  opt_realm, sizeof(opt_realm));
+                                  opt_realm, sizeof(opt_realm),
+                                  opt_audio_codecs, sizeof(opt_audio_codecs),
+                                  opt_video_codecs, sizeof(opt_video_codecs));
     if (rc != NSBC_OK) {
         c->io_printf(c->io_ud, "ERR invalid brace-vars\n"); return NSBC_INVAL;
     }
@@ -1020,6 +1035,11 @@ static int cmd_originate(cmd_ctx_t *c, int argc, char **argv, void *ud)
     }
 
     /* ---- 6. 传递参数 ---- */
+    if (opt_audio_codecs[0] || opt_video_codecs[0])
+        llog(LOG_INFO, "oam",
+             "originate: codecs audio=[%s] video=[%s]",
+             opt_audio_codecs[0] ? opt_audio_codecs : "-",
+             opt_video_codecs[0] ? opt_video_codecs : "-");
     if (opt_timeout > 0)
         o.timeout_ms = opt_timeout * 1000;
     if (opt_caller[0])
@@ -1028,6 +1048,16 @@ static int cmd_originate(cmd_ctx_t *c, int argc, char **argv, void *ud)
         o.orig_caller_id_name = opt_caller_name;
     /* REQ-ORIGINATE-003 待补：尾随 app（&park/&hangup/&echo），bridge 模式此值为 NONE */
     o.post_app = post_app;
+
+    /* REQ-ORIGINATE-004：auto SDP codec 控制 */
+    if (opt_audio_codecs[0]) {
+        snprintf(o.audio_codecs, sizeof(o.audio_codecs), "%s", opt_audio_codecs);
+        llog(LOG_INFO, "oam", "originate: audio_codecs='%s'", opt_audio_codecs);
+    }
+    if (opt_video_codecs[0]) {
+        snprintf(o.video_codecs, sizeof(o.video_codecs), "%s", opt_video_codecs);
+        llog(LOG_INFO, "oam", "originate: video_codecs='%s'", opt_video_codecs);
+    }
 
     b2b_call_t *call = NULL;
     rc = b2b_originate(b, &o, &call);

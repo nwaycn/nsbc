@@ -647,80 +647,107 @@ static void async_fire(const char *event_name, const char *payload, uint64_t seq
 /* --- Per-ring 帧解析器 ---
  *
  * 从 ring 的 read_pos 开始，解析出一帧。
- * 返回帧总长度（含帧内所有字节），或 0 表示：
- *   - read_pos >= write_pos：ring 空，没有完整帧
- *   - 帧被截断（writer 还没写完，我们等到下一轮 drain）
- *   - end_marker 不是 0xFF：损坏，skip 8 字节找下一个帧边界
+ * 返回帧总长度（含帧内所有字节），或 0 表示 ring 空/截断/等待 writer。
+ * 返回 1 表示 corruption——逐字节 skip 让 drain 线程重新对齐帧边界。
  *
- * frame_buf 必须是至少 2048 字节的 buffer（和 TLS buffer 同大小）。*/
+ * 帧格式: | u16 name_len | name bytes | u32 payload_len | payload | u64 seq | u8 0xFF |
+ *
+ * 两阶段 parse（修复 2026-10-26 崩溃）:
+ *   Phase 1: 从 ring 头部读 name_len(2B) + payload_len(4B)，计算 total_frame_size
+ *   Phase 2: 校验 total_frame_size <= buf_size 且 <= avail，memcpy 整帧到 frame_buf
+ *   Phase 3: 从完整拷贝里解包 name/payload/seq，校验 end_marker = 0xFF
+ *
+ * 之前的 bug (root cause): 只 memcpy 了 frame_overhead（=2+name_len+4+8+1, 不含 payload）
+ * 然后 p+=pl 跳过未拷贝的 payload → 栈飞越界 → segfault。
+ *
+ * frame_buf 必须 >= 2048 字节（与 TLS buffer 同大小）。*/
 static size_t ring_parse_one(per_core_ring_t *rb, size_t buf_size, char *frame_buf,
                              const char **out_name, const char **out_payload,
                              uint64_t *out_seq)
 {
+    /* ===== Phase 0: 快照 rp/wp，确保整个解析过程用一致的位置 ===== */
     uint64_t rp = __atomic_load_n(&rb->read_pos, __ATOMIC_ACQUIRE);
     uint64_t wp = __atomic_load_n(&rb->write_pos, __ATOMIC_ACQUIRE);
 
-    if (rp >= wp) return 0;  /* ring 空或 writer 还没写 */
+    if (rp >= wp) return 0;  /* ring 空 */
 
     uint64_t offset = rp & RING_MASK;
     uint64_t avail = wp - rp;
 
-    /* 先读 u16 name_len（最小 2 字节头部）*/
-    if (avail < 2) return 0;
+    /* ===== Phase 1: 先读 name_len(2B) + payload_len(4B) ===== */
+    const size_t HDR_SZ = 6;  /* name_len(2) + payload_len(4) */
+    if (avail < HDR_SZ) return 0;  /* 头部还没写完，等下轮 */
 
     uint16_t name_len;
-    if (offset + 2 <= RING_SIZE) {
-        memcpy(&name_len, rb->buffer + offset, 2);
-    } else {
-        size_t first = RING_SIZE - offset;
-        memcpy(&name_len, rb->buffer + offset, first);
-        memcpy(((char *)&name_len) + first, rb->buffer, 2 - first);
+    uint32_t payload_len;
+    {
+        char hdr[6];
+        if (offset + HDR_SZ <= RING_SIZE) {
+            memcpy(hdr, rb->buffer + offset, HDR_SZ);
+        } else {
+            size_t first = RING_SIZE - offset;
+            memcpy(hdr, rb->buffer + offset, first);
+            memcpy(hdr + first, rb->buffer, HDR_SZ - first);
+        }
+        memcpy(&name_len, hdr, 2);
+        memcpy(&payload_len, hdr + 2, 4);
     }
 
-    size_t frame_overhead = 2 + name_len + 4 + 8 + 1;
-    /* Bug fix 1: 防止 stack buffer overflow（frame_buf 只有 4096）*/
-    if (frame_overhead > buf_size) return 8;  /* skip 8 字节继续找帧边界 */
-    if (frame_overhead > avail) return 0;  /* writer 还没写完这帧 */
-    if (name_len == 0 || name_len > 255) return 8;  /* Bug fix 3: corruption 要推进 read_pos */
+    /* name_len sanity: 空事件名非法（writer push 前已拒绝），255 是上限 */
+    if (name_len < 1 || name_len > 255) return 1;
 
-    /* 整帧拷贝到 frame_buf（绕过 ring wrap 问题）*/
-    if (offset + frame_overhead <= RING_SIZE) {
-        memcpy(frame_buf, rb->buffer + offset, frame_overhead);
+    /* payload_len sanity: writer TLS buffer 只有 2048，payload 不可能超过 2000 */
+    if (payload_len > 2000) return 1;
+
+    /* ===== Phase 1b: 计算 total_frame_size 并校验 ===== */
+    const size_t total_frame = 2 + name_len + 4 + payload_len + 8 + 1;
+    if (total_frame > buf_size) return 1;   /* 超过 frame_buf，corruption */
+    if (total_frame > avail) return 0;      /* writer 还没写完 payload，等下轮 */
+
+    /* ===== Phase 2: memcpy 整帧到 frame_buf（含 payload！修复之前的 bug）===== */
+    if (offset + total_frame <= RING_SIZE) {
+        memcpy(frame_buf, rb->buffer + offset, total_frame);
     } else {
         size_t first = RING_SIZE - offset;
         memcpy(frame_buf, rb->buffer + offset, first);
-        memcpy(frame_buf + first, rb->buffer, frame_overhead - first);
+        memcpy(frame_buf + first, rb->buffer, total_frame - first);
     }
 
-    /* 解包（frame_buf 是栈上可写 buffer，p/name/payload 用 char*）*/
-    char *p = frame_buf;
-    uint16_t nl; memcpy(&nl, p, 2); p += 2;
-    char *name = p; p += nl;
-    uint32_t pl; memcpy(&pl, p, 4); p += 4;
-    char *payload = p; p += pl;
-    uint64_t seq; memcpy(&seq, p, 8); p += 8;
-    uint8_t end_marker = *p;
+    /* ===== Phase 3: 从完整拷贝解包（复用 Phase 1 已解出的 nl/pl 局部变量！）=====
+     *
+     * ★ 关键修复：Phase 1 已经用原子快照从 ring buffer 解出了正确的
+     * name_len/payload_len 局部变量。Phase 2 跨 wrap 拷贝时 writer 可能正在
+     * buffer[0] 写新帧覆盖 frame_buf 尾部 → frame_buf 里的 payload_len 字段
+     * 被污染成垃圾值 → 重新解包会飞越界。
+     *
+     * 所以 Phase 3 **绝对不能再 memcpy nl/pl**——直接用 Phase 1 的局部变量！
+     * 只从 frame_buf 里取 name/payload/seq/end_marker 这些偏移量由 nl/pl 决定的字段。 */
+    char *name = frame_buf + 2;
+    char *payload = frame_buf + 2 + name_len + 4;
+    char *seq_ptr = frame_buf + 2 + name_len + 4 + payload_len;
+
+    /* seq: 直接 memcpy 8 字节（不会被 Phase 2 拷贝污染，它在 frame_buf 中部）*/
+    uint64_t seq;
+    memcpy(&seq, seq_ptr, 8);
+
+    /* end_marker: total_frame 最后 1 字节 */
+    uint8_t end_marker = frame_buf[total_frame - 1];
 
     if (end_marker != 0xFF) {
-        /* 损坏——跳过 8 字节继续找下一个帧边界
-         * （保守处理：损坏很少见，只跳过 seq 字段长度）*/
-        return 8;
+        /* corruption —— 逐字节 skip (return 1) 让 drain 线程重新扫描帧边界
+         * 旧代码 return 8 硬跳 8 字节几乎不可能对齐下一帧 → 永久错位 → 反复 crash */
+        return 1;
     }
 
-    /* 名称和 payload 都必须 null-terminate（drain 线程内加 null 安全）*/
-    if (nl < sizeof(frame_buf) - frame_overhead) {
-        name[nl] = '\0';
-    } else {
-        return 8;  /* 损坏 */
-    }
-    if (pl > 0 && pl < frame_overhead + sizeof(frame_buf) - frame_overhead) {
-        payload[pl] = '\0';
-    }
+    /* null-terminate（drain 线程内安全）*/
+    if (name_len < 256) name[name_len] = '\0';
+    if (payload_len > 0 && payload_len < (uint32_t)buf_size)
+        payload[payload_len] = '\0';
 
     *out_name = name;
-    *out_payload = pl > 0 ? payload : NULL;
+    *out_payload = payload_len > 0 ? payload : NULL;
     *out_seq = seq;
-    return frame_overhead;
+    return total_frame;
 }
 
 /* 扫一遍 core_id 指定的 ring：解析所有 pending 帧 → fire 给 async chain */
@@ -739,14 +766,15 @@ static void drain_one_ring(int core_id)
         size_t frame_len = ring_parse_one(rb, sizeof(frame_buf), frame_buf,
                                           &name, &payload, &seq);
         if (frame_len == 0) break;  /* ring 空或 writer 还没写完 */
-        /* Bug fix 2: frame_len >= 16 = 最小完整帧（name=1 字节 → 2+1+4+8+1=16）
-         * frame_len < 16 视为 corruption skip，推进 read_pos 但不 fire async_fire */
+        /* frame_len >= 16 = 完整帧（name=1B+pl=0 → 2+1+4+0+8+1=16）fire
+         * frame_len == 1 = corruption（ring_parse_one 返回值）→ 逐字节 skip 对齐下一帧 */
         if (frame_len >= 16) {
             async_fire(name, payload, seq);
             uint64_t rp = __atomic_load_n(&rb->read_pos, __ATOMIC_ACQUIRE);
             __atomic_store_n(&rb->read_pos, rp + frame_len, __ATOMIC_RELEASE);
         } else {
-            /* corruption skip（返回值是 8，已在 ring_parse_one 里统一）*/
+            /* corruption 逐字节 skip：让 reader 重新对齐帧边界。
+             * 旧代码硬跳 8 字节几乎不可能对齐 → 永久错位 → 反复 crash（2026-10-26 修复）*/
             uint64_t rp = __atomic_load_n(&rb->read_pos, __ATOMIC_ACQUIRE);
             __atomic_store_n(&rb->read_pos, rp + frame_len, __ATOMIC_RELEASE);
         }

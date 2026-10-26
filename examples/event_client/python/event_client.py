@@ -31,14 +31,24 @@ Usage:
     # Originate a specific extension with park (call stays on hold)
     python3 event_client.py --orig-to 2001 --app park
 
+    # Originate with VIDEO (一键视频: H264+VP8)
+    python3 event_client.py --orig-to 7gja30rf --app echo --video
+
+    # Originate with VIDEO + multiple audio codecs (让 WebRTC 自动协商最优)
+    python3 event_client.py --orig-to 7gja30rf --app echo --video --audio
+
+    # 精确控制 codec 列表
+    python3 event_client.py --orig-to 2001 --app echo \\
+        --audio-codecs PCMU,PCMA,G722,OPUS --video-codecs H264,VP8,VP9
+
     # Just watch all events/CDRs (production mode)
     python3 event_client.py --mode subscribe
 
     # Originate only, no subscription
-    python3 event_client.py --mode originate --orig-to 1001
+    python3 event_client.py --mode originate --orig-to 1001 --video
 
     # Webhook every event to your call-center integration
-    python3 event_client.py --webhook-url http://cc.example.com/nsbc/events
+    python3 event_client.py --video --webhook-url http://cc.example.com/nsbc/events
 
     # Custom UDS path and nsbc-web base
     python3 event_client.py --uds /var/run/nsbc/control.sock \\
@@ -926,25 +936,61 @@ def _transport_stream(args):
         sse.close()
 
 
+# ---------------------------------------------------------------------------
+# Originate call_url builder  (REQ-ORIGINATE-004: 统一 codec / vars 拼接)
+# ---------------------------------------------------------------------------
+
+# 默认 codec 列表（WebRTC 分机能协商的主流 codec）
+_DEFAULT_AUDIO_CODECS = "PCMU,PCMA,G722,OPUS"
+_DEFAULT_VIDEO_CODECS = "H264,VP8"
+
+
+def build_call_url(args):
+    """从 argparse Namespace 构建完整的 originate call_url。
+
+    优先级：
+      1. args.call_url 显式传入 → 原样返回（最高优先级）
+      2. 否则拼 FS brace vars + user/<ext> &<app>
+
+    Codec 解析链：
+      --video-codecs XXX  → 显式指定，直接用
+      --video (无 --video-codecs) → 默认 H264,VP8
+      都没传 → 不生成 video m-line
+
+      --audio-codecs XXX → 显式指定
+      --audio (无 --audio-codecs) → 默认 PCMU,PCMA,G722,OPUS
+      都没传 → 后端默认 PCMU 单 codec（最小 offer）
+    """
+    if getattr(args, "call_url", None):
+        return args.call_url
+
+    ext = args.orig_to or "1000"
+    app = args.app or "echo"
+
+    vars_parts = []
+    if args.caller_id:
+        vars_parts.append(f"origination_caller_id_number={args.caller_id}")
+    if args.caller_name:
+        vars_parts.append(f"origination_caller_id_name={args.caller_name}")
+    if args.timeout:
+        vars_parts.append(f"originate_timeout={args.timeout}")
+
+    # ---- REQ-ORIGINATE-004: codec control ----
+    audio = args.audio_codecs or (_DEFAULT_AUDIO_CODECS if args.audio else None)
+    video = args.video_codecs or (_DEFAULT_VIDEO_CODECS if args.video else None)
+    if audio:
+        vars_parts.append(f"audio_codecs={audio}")
+    if video:
+        vars_parts.append(f"video_codecs={video}")
+
+    vars_str = "{" + ",".join(vars_parts) + "}" if vars_parts else ""
+    return f"{vars_str}user/{ext} &{app}"
+
+
 def run_originate_and_subscribe(args):
     """POST /originate, then subscribe events/CDRs (UDS or SSE), correlate and print."""
     # 1. Build call_url
-    call_url = args.call_url  # if user passed explicit call_url, use it
-    if not call_url:
-        ext = args.orig_to or "1000"
-        app = args.app or "echo"
-        vars_parts = []
-        if args.caller_id:
-            vars_parts.append(f"origination_caller_id_number={args.caller_id}")
-        if args.caller_name:
-            vars_parts.append(f"origination_caller_id_name={args.caller_name}")
-        if args.timeout:
-            vars_parts.append(f"originate_timeout={args.timeout}")
-        vars_str = "{" + ",".join(vars_parts) + "}" if vars_parts else ""
-        # echo: RTP loopback ON (两侧各自 side→side，听自己回声)
-        # hangup: answer 后立即挂断
-        # park: answer 后 hold 双腿（保持在线）
-        call_url = f"{vars_str}user/{ext} &{app}"
+    call_url = build_call_url(args)
 
     print(f"{_c(DIM)}[1/2] originate via={args.orig_via}  call_url={call_url}{_c(RESET)}")
 
@@ -1025,20 +1071,7 @@ def run_subscribe_only(args):
 
 def run_originate_only(args):
     """Fire-and-forget originate — just print the response."""
-    if args.call_url:
-        call_url = args.call_url
-    else:
-        ext = args.orig_to or "1000"
-        app = args.app or "echo"
-        vars_parts = []
-        if args.caller_id:
-            vars_parts.append(f"origination_caller_id_number={args.caller_id}")
-        if args.caller_name:
-            vars_parts.append(f"origination_caller_id_name={args.caller_name}")
-        if args.timeout:
-            vars_parts.append(f"originate_timeout={args.timeout}")
-        vars_str = "{" + ",".join(vars_parts) + "}" if vars_parts else ""
-        call_url = f"{vars_str}user/{ext} &{app}"
+    call_url = build_call_url(args)
 
     print(f"{_c(DIM)}originate via={args.orig_via}  call_url={call_url}{_c(RESET)}")
 
@@ -1132,6 +1165,25 @@ Examples:
     ap.add_argument("--caller-name", default=None, help="Origination caller ID name")
     ap.add_argument("--timeout", type=int, default=None,
                     help="Ringing timeout in seconds (originate_timeout var)")
+    # Media codec control (REQ-ORIGINATE-004)
+    # ★ WebRTC 场景默认开视频+多音频 —— 用户不跑 --no-video 就有 H264+VP8
+    # 精确控制：--video-codecs / --audio-codecs 显式指定 codec 列表（覆盖默认值）
+    ap.add_argument("--video", action="store_true", default=True,
+                    help="[默认 True] 开启视频媒体 (默认 codecs: H264,VP8). 等价 --video-codecs H264,VP8")
+    ap.add_argument("--no-video", dest="video", action="store_false",
+                    help="关闭视频 (纯音频 originate)")
+    ap.add_argument("--audio", action="store_true", default=True,
+                    help="[默认 True] 开启多音频 codec (默认: PCMU,PCMA,G722,OPUS).")
+    ap.add_argument("--no-audio", dest="audio", action="store_false",
+                    help="只用单 codec (PCMU) 音频")
+    ap.add_argument("--audio-codecs", default=None,
+                    help="Comma-separated audio codecs, e.g. PCMU,PCMA,G722 "
+                         "(默认: PCMU,PCMA,G722,OPUS). "
+                         "Passed as FS brace var {audio_codecs=...}")
+    ap.add_argument("--video-codecs", default=None,
+                    help="Comma-separated video codecs, e.g. H264,VP8 "
+                         "(默认: H264,VP8 -- WebRTC originate 有视频才合理). "
+                         "Passed as FS brace var {video_codecs=...}")
     # Auth / TLS
     ap.add_argument("--api-token", default=None,
                     help="Bearer API Key for nsbc-web /ext/v1/* endpoints "

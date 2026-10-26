@@ -55,6 +55,7 @@ static inline route_table_t *b2b_rt(b2b_core_t *co)
 extern __thread uint16_t g_rx_local_port;
 
 #include <arpa/inet.h>
+#include <ctype.h>    /* toupper() — codec 名称大小写规范化 */
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <pthread.h>
@@ -196,52 +197,82 @@ static size_t nat_sdp_rewrite(char *sdp, size_t sdp_len, size_t cap,
         return sdp_len;
     (void)cap; (void)new_sip_ip;
 
+    /* REQ-NAT-SDP-001：通用私网 IP → 公网 IP 替换
+     *
+     * 之前只处理 o=/c= 行里的 IN IP4 字段，完全忽略：
+     *   a=candidate:1 1 udp 2113937151 172.27.102.160 59996 typ host  ← ICE candidate
+     *   a=ssrc:12345 cname:...             ← 可能含 IP 的扩展属性
+     *
+     * WebRTC（ICE-lite）场景 SDP 里所有 IP 都应该是公网可达的。
+     * 通用方案：遍历整个 SDP buffer，找出所有 RFC1918/CGNAT/回环私网 IP
+     * 字符串并原地替换（要求 new_ip_len <= old_ip_len，否则跳过）。 */
+
     char *p = sdp;
     char *end = sdp + sdp_len;
-    int changed = 0;
+    size_t new_ip_len = strlen(new_rtp_ip);
+    size_t changed = 0;
 
     while (p < end) {
-        char *line_end = memchr(p, '\n', (size_t)(end - p));
-        if (!line_end) line_end = end;
-        size_t line_sz = (size_t)(line_end - p);
-
-        int is_o = (line_sz >= 2 && p[0] == 'o' && p[1] == '=');
-        int is_c = (line_sz >= 2 && p[0] == 'c' && p[1] == '=');
-
-        if (is_o || is_c) {
-            char *ip4_marker = memmem(p, line_sz, "IN IP4", 6);
-            if (ip4_marker) {
-                char *addr_start = ip4_marker + 6;
-                char *addr_end = addr_start;
-                while (addr_end < line_end && *addr_end != ' ' && *addr_end != '\r')
-                    ++addr_end;
-                size_t addr_len = (size_t)(addr_end - addr_start);
-                if (addr_len > 0 && addr_len < INET_ADDRSTRLEN) {
-                    char old_ip[INET_ADDRSTRLEN] = {0};
-                    memcpy(old_ip, addr_start, addr_len);
-                    if (b2b_is_private_ip(old_ip)) {
-                        size_t new_ip_len = strlen(new_rtp_ip);
-                        if (new_ip_len <= addr_len) {
-                            memcpy(addr_start, new_rtp_ip, new_ip_len);
-                            if (new_ip_len < addr_len)
-                                memset(addr_start + new_ip_len, ' ', addr_len - new_ip_len);
-                            changed = 1;
-                        } else {
-                            llog(LOG_WARN, "b2b", "nat_sdp: new_ip(%zuB) > old_ip(%zuB), skip",
-                                 new_ip_len, addr_len);
-                        }
+        /* 在剩余 buffer 里找 IPv4 候选（点分四段，最长 IPv4 = 15B） */
+        char *ip_start = NULL;
+        int ip_len = 0;
+        for (char *q = p; q + 7 <= end && !ip_start; q++) {
+            /* 粗筛选：必须数字开头且含至少 2 个 '.' */
+            size_t qcap = (size_t)(end - q);
+            if ((q[0] >= '0' && q[0] <= '9')
+                && memchr(q, '.', qcap)
+                && memchr(q + 1, '.', qcap > 1 ? qcap - 1 : 0)) {
+                int dots = 0;
+                int len = 0;
+                for (len = 0; len < 15 && q + len < end
+                     && ((q[len] >= '0' && q[len] <= '9') || q[len] == '.'); len++) {
+                    if (q[len] == '.') dots++;
+                }
+                if (dots == 3 && len >= 7) {
+                    /* 边界检查：IP 前后不能是数字/字母（避免 192.168.1.1000 的 192.168.1.1 被误匹配） */
+                    char prev = (q > p) ? q[-1] : ' ';
+                    char next_ch = (q + len < end) ? q[len] : ' ';
+                    int prev_ok = (prev == ' ' || prev == '\r' || prev == '\n'
+                                   || prev == ':' || prev == ';' || prev == '@'
+                                   || prev == '-' || prev == ',' || prev == '/'
+                                   || prev == '=' || prev == '>' || prev == '"'
+                                   || prev == '<');
+                    int next_ok = (next_ch == ' ' || next_ch == '\r' || next_ch == '\n'
+                                   || next_ch == ':' || next_ch == ';' || next_ch == '-'
+                                   || next_ch == ',' || next_ch == '/' || next_ch == '"');
+                    if (prev_ok && next_ok) {
+                        ip_start = q;
+                        ip_len = len;
                     }
                 }
             }
         }
+        if (!ip_start) break;
 
-        p += line_sz;
-        if (p < end && *p == '\r') ++p;
-        if (p < end && *p == '\n') ++p;
+        /* 提取 IP 字符串做 b2b_is_private_ip 判定 */
+        char ip_str[INET_ADDRSTRLEN] = {0};
+        if (ip_len >= INET_ADDRSTRLEN) ip_len = INET_ADDRSTRLEN - 1;
+        memcpy(ip_str, ip_start, (size_t)ip_len);
+
+        if (b2b_is_private_ip(ip_str)) {
+            if (new_ip_len <= (size_t)ip_len) {
+                memcpy(ip_start, new_rtp_ip, new_ip_len);
+                if (new_ip_len < (size_t)ip_len)
+                    memset(ip_start + new_ip_len, ' ', (size_t)ip_len - new_ip_len);
+                changed++;
+            } else {
+                llog(LOG_WARN, "b2b",
+                     "nat_sdp: new_ip(%zuB) > old_ip(%dB) for '%s', skip",
+                     new_ip_len, ip_len, ip_str);
+            }
+            p = ip_start + ip_len;  /* 不管改没改，推进到 IP 之后 */
+        } else {
+            p = ip_start + 1;  /* 不是私网 IP → 跳过这个位置继续找 */
+        }
     }
 
     if (changed)
-        llog(LOG_INFO, "b2b", "nat_sdp_rewrite: o=/c= private IP → %s", new_rtp_ip);
+        llog(LOG_INFO, "b2b", "nat_sdp_rewrite: %zu private IP(s) → %s", changed, new_rtp_ip);
     return sdp_len;
 }
 
@@ -910,8 +941,14 @@ static int build_dlg_req(b2b_core_t *co, b2b_leg_t *l,
                            ? call_ref->prof->external_sip_ip : co->cfg.external_sip_ip;
     const char *adv_host = (prof_ext && prof_ext[0]) ? prof_ext : co->cfg.local_host;
     const char *ex = extra ? extra : rt;
+    /* REQ-ORIGINATE-WS-003：Via transport 动态选择（包含 WS/WSS）
+     * 之前只有 TCP/TLS/UDP 三分支，WS/WSS 会 fallthrough 到 "UDP"
+     * → dialog 内 BYE/ACK/UPDATE 等请求 Via 头错写为 UDP */
     const char *tr = l->proto == SIP_TR_TCP ? "TCP"
-                    : l->proto == SIP_TR_TLS ? "TLS" : "UDP";
+                    : l->proto == SIP_TR_TLS ? "TLS"
+                    : l->proto == SIP_TR_WSS ? "WSS"
+                    : l->proto == SIP_TR_WS  ? "WS"
+                    : "UDP";
     /* REQ-NAT-003：dialog 内请求也走 per-call profile 的 sip_udp_port */
     char contact[B2B_HDR_MAX];
     uint16_t dlg_port = (call_ref && call_ref->prof && call_ref->prof->sip_udp_port)
@@ -1243,7 +1280,17 @@ static sip_txn_t *send_invite_b(b2b_call_t *c, int leg_idx,
     }
     s.contact = contact; s.callid = b->callid; s.cseq = cseq;
     s.via_host = adv_host; s.via_port = adv_port;
-    s.transport = "UDP"; s.branch = branch; s.max_forwards = 70;
+    /* REQ-NAT-002：Via 头 transport 由 resolve_cb 从 loc_binding.transport_proto 填入 b->proto
+     *
+     * 之前靠 AF_UNSPEC 判断（只能区分 WS vs UDP），遗漏 TCP/TLS/WSS。
+     * 现在 b->proto 已经是完整的 SIP_TR_* 枚举值，直接 switch 出字符串。
+     * 和 build_dlg_req（L940 附近）保持完全一致的分支覆盖。 */
+    s.transport = b->proto == SIP_TR_TCP ? "TCP"
+                  : b->proto == SIP_TR_TLS ? "TLS"
+                  : b->proto == SIP_TR_WSS ? "WSS"
+                  : b->proto == SIP_TR_WS  ? "WS"
+                  : "UDP";
+    s.branch = branch; s.max_forwards = 70;
     s.user_agent = co->cfg.user_agent;
     /* Session Timer (RFC 4028)：把 A-leg 的 SE/Min-SE/Supported:timer 注入 B-leg INVITE */
     char st_extra[256]; st_extra[0] = '\0';
@@ -4157,7 +4204,14 @@ void handle_new_invite(b2b_core_t *co, sip_txn_t *t,
 
     /* --- 4/5. Contact 头构建 + Domain override 统一移到 send_invite_b 里处理 --- */
 
-    nsbc_callid_make(b->callid, sizeof(b->callid), co->cfg.local_host);
+    /* REQ-ORIGINATE-WS-004：Call-ID host_tag 统一用 profile external_sip_ip（bridge 模式）
+     * 和 originate 模式一样的 fallback 链 */
+    {
+        const char *cid_host =
+            (c->prof && c->prof->external_sip_ip[0]) ? c->prof->external_sip_ip
+            : co->cfg.local_host;
+        nsbc_callid_make(b->callid, sizeof(b->callid), cid_host);
+    }
     b->cseq = 1;
     sip_upd_guard_init(&b->guard);
     b->dlg = dlg_uac_new(co->cfg.dlg, b->callid, strlen(b->callid),
@@ -4192,23 +4246,47 @@ void handle_new_invite(b2b_core_t *co, sip_txn_t *t,
             out_sdp_len = strlen(rewritten);
         }
     }
-    /* REQ-NAT-001：出站 SDP o=/c= 私网 IP → external_rtp_ip（FreeSWITCH ext-rtp-ip）
-     * 无论 offer_hook 是否改写过，都需要一份可写 buffer 做 in-place NAT rewrite。
-     * REQ-NAT-002：优先 per-call profile 的 external_rtp_ip，fallback cfg */
-    const char *prof_rtp = (c->prof && c->prof->external_rtp_ip[0])
-                           ? c->prof->external_rtp_ip : co->cfg.external_rtp_ip;
-    const char *prof_sip = (c->prof && c->prof->external_sip_ip[0])
-                           ? c->prof->external_sip_ip : co->cfg.external_sip_ip;
-    const char *nat_rtp_ip = (prof_rtp && prof_rtp[0]) ? prof_rtp
-                             : (prof_sip && prof_sip[0]) ? prof_sip : NULL;
+    /* REQ-NAT-002：NAT rewrite
+     *
+     * bridge 模式：B 腿出站 INVITE 带的是 A 腿收到的 offer SDP，
+     * 需要 rewrite 的是 B 腿目标视角下的公网 IP（resolve_cb 填进
+     * c->leg[1].ext_rtp_ip 的 out_prof.external_rtp_ip）。
+     *
+     * 触发条件和 originate 模式一致：
+     *   leg[1].nat_detected == 1 → loc_binding 说目标 behind NAT
+     *   或 leg[1].ext_rtp_ip 配了（防御性）
+     *
+     * 目标 IP：leg[1].ext_rtp_ip（resolve 时从 out_prof 取）
+     *
+     * 注意：变量 b 在上方 L3994 已定义为 &c->leg[1]，直接复用 */
+    /* REQ-NAT-002：NAT rewrite
+     *
+     * 触发条件：nat_rtp_ip 非空即 rewrite（不看 nat_detected！）
+     *   nat_sdp_rewrite 本身是安全的——只改私网 IP，公网 IP 不动
+     *   所以：profile 配了 ext_rtp_ip → SBC behind NAT → 应该 rewrite
+     *        profile 没配 → SBC 可能直连 → cfg 兜底 → 保守
+     *
+     * 目标 IP fallback 链（从最精确到最保守）：
+     *   leg[1].ext_rtp_ip       → resolve_cb 或 originate 自动关联 profile 填的
+     *   → c->prof->external_rtp_ip  → per-call SIP profile
+     *   → cfg.external_rtp_ip       → 全局 b2b_core.cfg（兼容老配置）
+     *   → cfg.external_sip_ip       → 全局 ext-sip-ip（兼容配置） */
+    const char *nat_rtp_ip =
+        (b->ext_rtp_ip[0]) ? b->ext_rtp_ip
+        : (c->prof && c->prof->external_rtp_ip[0]) ? c->prof->external_rtp_ip
+        : (co->cfg.external_rtp_ip && co->cfg.external_rtp_ip[0]) ? co->cfg.external_rtp_ip
+        : co->cfg.external_sip_ip;  /* 允许 NULL */
     if (nat_rtp_ip && nat_rtp_ip[0] && a->offer_len) {
         /* 确保 rewritten 有当前 out_sdp 的完整拷贝（offer_hook 可能没写 rewritten） */
         if (out_sdp != rewritten)
             memcpy(rewritten, out_sdp, out_sdp_len);
         rewritten[out_sdp_len] = '\0';
         out_sdp_len = nat_sdp_rewrite(rewritten, out_sdp_len, sizeof(rewritten),
-                                      nat_rtp_ip, prof_sip);
+                                      nat_rtp_ip, NULL);
         out_sdp = rewritten;
+        llog(LOG_INFO, "b2b",
+             "bridge: NAT rewrite nat=[%s] detected=%d out_len=%zu",
+             nat_rtp_ip, b->nat_detected, out_sdp_len);
     }
 
     /* --- 6. 拼 extra 头块（PID + invite_params + CLIR Privacy） --- */
@@ -5800,6 +5878,56 @@ int b2b_originate(b2b_core_t *co, const b2b_orig_t *o, b2b_call_t **out)
     sip_upd_guard_init(&c->leg[0].guard);
     sip_upd_guard_init(&c->leg[1].guard);
 
+    /* REQ-NAT-003：originate 自动关联 SIP profile
+     *
+     * bridge 模式（入站 INVITE → resolve_cb）里 c->prof 由 sip_profile_match_src 赋值，
+     * resolve_cb 再填 out_prof + leg[1].ext_rtp_ip。originate 模式 1 没有 INVITE 入口，
+     * c->prof 永远是 NULL → profile 的 external_rtp_ip 拿不到 → NAT rewrite 被跳过！
+     *
+     * 修复：在 originate 入口找一个合适的 SIP profile 关联。
+     *   策略：找第一个 enabled 且有 external_rtp_ip 或 external_sip_ip 的 profile
+     *   优先级：名为 "external" > "internal" > 第一个 enabled 的
+     *
+     *   找到后：
+     *     c->prof = prof（后续 CALL_END 也能有 prof 名）
+     *     c->out_prof = prof（resolve_cb 也是 out_prof = prof 默认）
+     *     leg[1].ext_rtp_ip = prof->external_rtp_ip（NAT rewrite 直接能从 leg 读）
+     *
+     *   为什么找有 NAT 配置的？如果所有 profile 都没配 NAT → 不关联也无妨（rewrite 本来就没意义）。
+     *   为什么同时用 external 和 internal？originate 可能外呼内部分机也可能外呼 trunk，
+     *   internal profile 通常配了 NAT（内部分机 behind NAT），external profile 也可能配。
+     *   随便哪个有 ext_rtp_ip 的都行——nat_sdp_rewrite 只改私网 IP，公网 IP 不会被误改。 */
+    {
+        sip_profile_t *target = NULL;
+        sip_profile_t *first_enabled = NULL;
+        sip_profile_t *first_with_nat = NULL;
+        unsigned n = sip_profile_count();
+        for (unsigned i = 0; i < n; ++i) {
+            sip_profile_t *p = sip_profile_at(i);
+            if (!p || !p->enabled) continue;
+            if (!first_enabled) first_enabled = p;
+            const char *nat_ip = (p->external_rtp_ip[0] ? p->external_rtp_ip
+                                  : (p->external_sip_ip[0] ? p->external_sip_ip : NULL));
+            if (!first_with_nat && nat_ip) first_with_nat = p;
+            if (!target) {
+                if (!strcmp(p->name, "external") || !strcmp(p->name, "internal")) {
+                    target = p;
+                }
+            }
+        }
+        if (!target) target = first_with_nat;
+        if (!target) target = first_enabled;
+        if (target) {
+            c->prof = target;
+            c->out_prof = target;
+            llog(LOG_DEBUG, "b2b",
+                 "originate: auto-linked prof='%s' external_rtp=%s external_sip=%s",
+                 target->name[0] ? target->name : "(unnamed)",
+                 target->external_rtp_ip[0] ? target->external_rtp_ip : "(none)",
+                 target->external_sip_ip[0] ? target->external_sip_ip : "(none)");
+        }
+    }
+
     /* REQ-ORIGINATE-001：per-call noanswer override（>0 覆盖全局，否则走全局）
      * 在 alloc 之后立即设，方便 bridge 模式两次 arm_noanswer_timer 复用 */
     c->noanswer_ms_override = o->timeout_ms;
@@ -5820,25 +5948,85 @@ int b2b_originate(b2b_core_t *co, const b2b_orig_t *o, b2b_call_t **out)
     if (!o->bridge_url || !o->bridge_url[0]) {
         b2b_leg_t *b = &c->leg[1];
         b->state = LEG_CALLING;
-        b->proto = SIP_TR_UDP;
+        /* REQ-NAT-002：transport / NAT 元数据由 resolve_cb 填充
+         *
+         * resolve_cb 查到 loc_binding 后会把 binding.transport_proto / nat_detected
+         * / out_prof.external_rtp_ip 全链路传进 call->leg[1]
+         *   proto      → send_invite_b Via transport / build_dlg_req
+         *   reliable   → 禁止 ICT Timer A 重发（TCP/TLS/WS/WSS 可靠）
+         *   nat_detected → 是否需要 SDP rewrite（0=跳过，1=改 o=/c=/a=candidate IP）
+         *   ext_rtp_ip  → SDP rewrite 目标 IP（来自 sip_profile.external_rtp_ip）
+         *
+         * originate 这里只负责：
+         *   1. 设 dst（resolve 已经根据 nat_detected 选了 public_contact 或 ws_conn）
+         *   2. 补默认 port（resolve 有时不填）
+         *   3. 如果 resolve_cb 没填（trunk 外呼 / DNS 直连 非 loc_binding 路径），
+         *      根据 dst.ss_family fallback 到最保守的默认值 */
         b->dst = o->dst;
         if (nsbc_sa_port(&b->dst) == 0)
             nsbc_sa_set_port(&b->dst, 5060);
+        if (b->proto == 0) {
+            /* resolve 没填 proto（非 loc_binding 路径）→ 从 dst.ss_family 兜底 */
+            b->proto = (o->dst.ss.ss_family == AF_UNSPEC)
+                       ? SIP_TR_WS : SIP_TR_UDP;
+            b->reliable = (b->proto == SIP_TR_WS || b->proto == SIP_TR_WSS
+                           || b->proto == SIP_TR_TLS || b->proto == SIP_TR_TCP) ? 1 : 0;
+        }
+        /* REQ-NAT-003：从 auto-linked profile 填 leg[1].ext_rtp_ip
+         *
+         * 之前 ext_rtp_ip 全靠 resolve_cb 从 loc_binding 传，
+         * originate 模式 1 不走 resolve_cb → 默认空 → NAT rewrite 被跳过！
+         *
+         * 现在：c->prof 已经在入口自动关联好了，从它的 external_rtp_ip / external_sip_ip 取。
+         *
+         * 关键设计决策：
+         *   - 不强制设置 nat_detected = 1！
+         *     Advisor 警告：内部分机对打（SBC 私网→内部分机私网）也会 rewrite → 内部 media 绕路
+         *     正确做法：nat_sdp_rewrite 本身就是安全的（只改私网 IP，公网 IP 不动）
+         *     所以触发条件只要 nat_rtp_ip 非空就 rewrite，rewrite 自然会处理：
+         *       (a) SBC behind NAT + 任何目标 → SBC 私网 IP 改成 ext_rtp_ip ✅
+         *       (b) SBC 直连公网 + 内部 target → SDP 里没有私网 IP → rewrite 啥都不改 ✅
+         *       (c) SBC 直连公网 + 公网 trunk → SDP 里没有私网 IP → rewrite 啥都不改 ✅
+         *
+         *   - profile 自动关联仅用于：
+         *       1) 从 profile 拿 external_rtp_ip（NAT rewrite 目标）
+         *       2) CALL_END 事件里 prof/oprof 不再是 -（日志可读性）
+         */
+        if (c->prof) {
+            if (c->prof->external_rtp_ip[0])
+                snprintf(b->ext_rtp_ip, sizeof(b->ext_rtp_ip), "%s",
+                         c->prof->external_rtp_ip);
+            else if (c->prof->external_sip_ip[0])
+                snprintf(b->ext_rtp_ip, sizeof(b->ext_rtp_ip), "%s",
+                         c->prof->external_sip_ip);
+        }
         nsbc_rand_token(b->loc_tag, sizeof(b->loc_tag), 16);
+
+        /* REQ-ORIGINATE-WS-004：From host / Call-ID host_tag
+         *
+         * 和 Via/Contact 的 adv_host 保持一致：profile external_sip_ip 优先
+         * 之前硬编码 co->cfg.local_host（172.27.102.160 私网）→ 所有头 host 不一致！
+         *   Via/Contact → 39.105.3.177（公网）
+         *   From/Call-ID → 172.27.102.160（私网）
+         *
+         * WebRTC SIP.js 可能会看 From host 做路由判断，必须统一！ */
+        const char *orig_host =
+            (c->prof && c->prof->external_sip_ip[0]) ? c->prof->external_sip_ip
+            : co->cfg.local_host;
 
         /* From 头：有显示名 → "\"name\" <sip:user@host>"；否则退化为 user@host */
         if (cname) {
             snprintf(b->from, sizeof(b->from), "\"%s\" <sip:%s@%s>;tag=%s",
-                     cname, caller ? caller : "", co->cfg.local_host, b->loc_tag);
+                     cname, caller ? caller : "", orig_host, b->loc_tag);
         } else {
             snprintf(b->from, sizeof(b->from), "\"%s\" <sip:%s@%s>;tag=%s",
                      caller ? caller : "", caller ? caller : "",
-                     co->cfg.local_host, b->loc_tag);
+                     orig_host, b->loc_tag);
         }
         snprintf(b->to, sizeof(b->to), "%s", o->to_uri);
         snprintf(b->ruri, sizeof(b->ruri), "%s", o->to_uri);
         snprintf(b->target, sizeof(b->target), "%s", o->to_uri);
-        nsbc_callid_make(b->callid, sizeof(b->callid), co->cfg.local_host);
+        nsbc_callid_make(b->callid, sizeof(b->callid), orig_host);
         b->cseq = 1;
         if (o->sdp_len) {
             if (o->sdp_len > B2B_SDP_MAX) {
@@ -5866,27 +6054,161 @@ int b2b_originate(b2b_core_t *co, const b2b_orig_t *o, b2b_call_t **out)
          * 自动构造最小 PCMU offer（c=0.0.0.0 m=0）—— offer_hook 会创建 relay
          * 并把 c= 改写成 external_rtp_ip、m= 改写成 relay 实际端口。 */
         {
-            /* 没带 offer → 构造最小 PCMU SDP（0.0.0.0/port 0，hook 后会被改写） */
+            /* 没带 offer → 根据 o->audio_codecs / o->video_codecs 动态生成 SDP
+             * 默认 audio_codecs="" → PCMU 单 codec；video_codecs="" → 不生成 video 行。
+             * 所有 m= 行端口=0，offer_hook 会创建 relay 并改写端口 + 加 ICE/DTLS/SSRC。 */
             char auto_offer[B2B_SDP_MAX] = {0};
             if (b->offer_len == 0) {
-                int n = snprintf(auto_offer, sizeof(auto_offer),
+                /* 先扫一遍 codec 列表，为每个 codec 分配 PT 号，存本地表 */
+                char audio_list[6][24]; int audio_pt[6]; int audio_n = 0;
+                char video_list[6][24]; int video_pt[6]; int video_n = 0;
+
+                /* ---- audio codecs ---- */
+                if (o && o->audio_codecs[0]) {
+                    char tmp[256]; snprintf(tmp, sizeof(tmp), "%s", o->audio_codecs);
+                    char *tok = strtok(tmp, ",");
+                    while (tok && audio_n < 6) {
+                        /* trim 前后空白 */
+                        while (*tok == ' ') tok++;
+                        char *end = tok + strlen(tok);
+                        while (end > tok && *(end-1) == ' ') *(--end) = '\0';
+                        /* 大小写规范化：转大写方便匹配 */
+                        char up[24]; int ui = 0;
+                        for (; tok[ui] && ui < 23; ui++) up[ui] = (char)toupper(tok[ui]);
+                        up[ui] = '\0';
+                        strncpy(audio_list[audio_n], up, 23); audio_list[audio_n][23] = '\0';
+                        /* 标准 PT 映射 */
+                        if      (!strcasecmp(up, "PCMU")  || !strcasecmp(up, "G711U")) audio_pt[audio_n] = 0;
+                        else if (!strcasecmp(up, "PCMA")  || !strcasecmp(up, "G711A")) audio_pt[audio_n] = 8;
+                        else if (!strcasecmp(up, "G722"))  audio_pt[audio_n] = 9;
+                        else if (!strcasecmp(up, "G729"))  audio_pt[audio_n] = 18;
+                        else if (!strcasecmp(up, "OPUS"))  audio_pt[audio_n] = 111;
+                        else if (!strcasecmp(up, "ILBC"))  audio_pt[audio_n] = 112;
+                        else audio_pt[audio_n] = 100 + audio_n; /* 动态 PT */
+                        audio_n++;
+                        tok = strtok(NULL, ",");
+                    }
+                }
+                /* 默认：没指定 audio_codecs → PCMU 单 codec */
+                if (audio_n == 0) {
+                    strcpy(audio_list[0], "PCMU"); audio_pt[0] = 0; audio_n = 1;
+                }
+
+                /* ---- video codecs ---- */
+                if (o && o->video_codecs[0]) {
+                    char tmp[256]; snprintf(tmp, sizeof(tmp), "%s", o->video_codecs);
+                    char *tok = strtok(tmp, ",");
+                    int dyn = 96;  /* video 动态 PT 起始 96 */
+                    while (tok && video_n < 6) {
+                        while (*tok == ' ') tok++;
+                        char *end = tok + strlen(tok);
+                        while (end > tok && *(end-1) == ' ') *(--end) = '\0';
+                        char up[24]; int ui = 0;
+                        for (; tok[ui] && ui < 23; ui++) up[ui] = (char)toupper(tok[ui]);
+                        up[ui] = '\0';
+                        strncpy(video_list[video_n], up, 23); video_list[video_n][23] = '\0';
+                        if      (!strcasecmp(up, "H264")) video_pt[video_n] = 96;
+                        else if (!strcasecmp(up, "VP8"))  video_pt[video_n] = 97;
+                        else if (!strcasecmp(up, "VP9"))  video_pt[video_n] = 98;
+                        else if (!strcasecmp(up, "H265")) video_pt[video_n] = 99;
+                        else video_pt[video_n] = dyn++;
+                        video_n++;
+                        tok = strtok(NULL, ",");
+                    }
+                }
+
+                /* ---- 生成 SDP ---- */
+                char *p = auto_offer;
+                size_t cap = sizeof(auto_offer);
+                int left;
+
+                left = snprintf(p, cap,
                     "v=0\r\n"
                     "o=- 0 0 IN IP4 0.0.0.0\r\n"
                     "s=-\r\n"
                     "c=IN IP4 0.0.0.0\r\n"
-                    "t=0 0\r\n"
-                    "m=audio 0 RTP/AVP 0\r\n"
-                    "a=rtpmap:0 PCMU/8000\r\n");
-                if (n > 0 && (size_t)n <= sizeof(auto_offer)
-                    && (size_t)n <= sizeof(b->offer)) {
-                    memcpy(b->offer, auto_offer, (size_t)n);
-                    b->offer_len = (size_t)n;
-                    llog(LOG_INFO, "b2b",
-                         "originate: auto offer SDP generated len=%d", n);
-                } else {
-                    llog(LOG_WARN, "b2b",
-                         "originate: auto offer SDP too long, skip offer_hook");
+                    "t=0 0\r\n");
+                if (left <= 0 || (size_t)left >= cap) goto _sdp_too_long;
+                p += left; cap -= (size_t)left;
+
+                /* m=audio 行：codec PT 列表 */
+                {
+                    left = snprintf(p, cap, "m=audio 0 RTP/AVP");
+                    if (left <= 0 || (size_t)left >= cap) goto _sdp_too_long;
+                    p += left; cap -= (size_t)left;
+                    for (int i = 0; i < audio_n && cap > 8; i++) {
+                        left = snprintf(p, cap, " %d", audio_pt[i]);
+                        if (left <= 0 || (size_t)left >= cap) goto _sdp_too_long;
+                        p += left; cap -= (size_t)left;
+                    }
+                    left = snprintf(p, cap, "\r\n");
+                    if (left <= 0 || (size_t)left >= cap) goto _sdp_too_long;
+                    p += left; cap -= (size_t)left;
+
+                    /* 每个 audio codec 的 a=rtpmap 行 */
+                    for (int i = 0; i < audio_n && cap > 16; i++) {
+                        int rate = 8000;
+                        if (!strcasecmp(audio_list[i], "G722")) rate = 8000;
+                        else if (!strcasecmp(audio_list[i], "OPUS")) rate = 48000;
+                        left = snprintf(p, cap, "a=rtpmap:%d %s/%d\r\n",
+                                        audio_pt[i], audio_list[i], rate);
+                        if (left <= 0 || (size_t)left >= cap) goto _sdp_too_long;
+                        p += left; cap -= (size_t)left;
+                    }
                 }
+
+                /* m=video 行（仅当 video_n > 0 时生成）
+                 * ★ REQ-VIDEO-PORT-001：port 硬编码 0 会导致 bridge_rewrite_sdp
+                 * 里 orig_port==0，而 sdp_build_webrtc_answer 看到 port=0 就判
+                 * rejected → 硬编码替换 VIDEO_REJECT_MLINE + a=inactive → 浏览器
+                 * 丢 video 段。这里用 port=1 作 placeholder（非零，表示"有 video"
+                 * 但还没分配 relay 端口），rewrite 会识别非零 orig_port 然后
+                 * 用 relay 真实端口替换（media_port + media_idx * 2）。
+                 * BYPASS 模式下 1 会被保留（两端直连不需要 SBC relay）——但
+                 * BYPASS 早退路径（L2737-2742）不会走到 rewrite，所以没问题。 */
+                if (video_n > 0 && cap > 16) {
+                    left = snprintf(p, cap, "m=video 1 RTP/AVP");
+                    if (left <= 0 || (size_t)left >= cap) goto _sdp_too_long;
+                    p += left; cap -= (size_t)left;
+                    for (int i = 0; i < video_n && cap > 8; i++) {
+                        left = snprintf(p, cap, " %d", video_pt[i]);
+                        if (left <= 0 || (size_t)left >= cap) goto _sdp_too_long;
+                        p += left; cap -= (size_t)left;
+                    }
+                    left = snprintf(p, cap, "\r\n");
+                    if (left <= 0 || (size_t)left >= cap) goto _sdp_too_long;
+                    p += left; cap -= (size_t)left;
+
+                    /* 每个 video codec 的 a=rtpmap + a=fmtp 行 */
+                    for (int i = 0; i < video_n && cap > 32; i++) {
+                        left = snprintf(p, cap, "a=rtpmap:%d %s/90000\r\n",
+                                        video_pt[i], video_list[i]);
+                        if (left <= 0 || (size_t)left >= cap) goto _sdp_too_long;
+                        p += left; cap -= (size_t)left;
+                        /* H264 需要 fmtp:packetization-mode=1;profile-level-id=42e01f */
+                        if (!strcasecmp(video_list[i], "H264") && cap > 64) {
+                            left = snprintf(p, cap,
+                                "a=fmtp:%d packetization-mode=1;profile-level-id=42e01f\r\n",
+                                video_pt[i]);
+                            if (left <= 0 || (size_t)left >= cap) goto _sdp_too_long;
+                            p += left; cap -= (size_t)left;
+                        }
+                    }
+                }
+
+                {
+                    size_t n = (size_t)(p - auto_offer);
+                    if (n <= sizeof(b->offer)) {
+                        memcpy(b->offer, auto_offer, n);
+                        b->offer_len = n;
+                        llog(LOG_INFO, "b2b",
+                             "originate: auto offer SDP audio_n=%d video_n=%d len=%zu",
+                             audio_n, video_n, n);
+                    } else {
+                        llog(LOG_WARN, "b2b", "originate: SDP too long for b->offer");
+                    }
+                }
+            _sdp_too_long:;
             }
 
             const char *out_sdp = b->offer;
@@ -5918,23 +6240,37 @@ int b2b_originate(b2b_core_t *co, const b2b_orig_t *o, b2b_call_t **out)
                      out_sdp_len, rewritten[0] ? 1 : 0);
             }
 
-            /* NAT rewrite：offer SDP c= 私网 IP → external_rtp_ip */
-            const char *prof_rtp = (c->prof && c->prof->external_rtp_ip[0])
-                                   ? c->prof->external_rtp_ip : co->cfg.external_rtp_ip;
-            const char *prof_sip = (c->prof && c->prof->external_sip_ip[0])
-                                   ? c->prof->external_sip_ip : co->cfg.external_sip_ip;
-            const char *nat_rtp_ip = (prof_rtp && prof_rtp[0]) ? prof_rtp
-                                     : (prof_sip && prof_sip[0]) ? prof_sip : NULL;
+            /* REQ-NAT-002：NAT rewrite
+             *
+             * 触发条件：nat_rtp_ip 非空即 rewrite（不看 nat_detected！）
+             *   nat_sdp_rewrite 本身是安全的——只改私网 IP，公网 IP 不动
+             *
+             * 目标 IP fallback 链（从最精确到最保守）：
+             *   leg[1].ext_rtp_ip         → originate 自动关联 profile 填的
+             *   → c->prof->external_rtp_ip  → per-call SIP profile
+             *   → cfg.external_rtp_ip       → 全局 b2b_core.cfg（兼容老配置）
+             *   → cfg.external_sip_ip       → 全局 ext-sip-ip（兼容配置） */
+            const char *nat_rtp_ip =
+                (b->ext_rtp_ip[0]) ? b->ext_rtp_ip
+                : (c->prof && c->prof->external_rtp_ip[0]) ? c->prof->external_rtp_ip
+                : (co->cfg.external_rtp_ip && co->cfg.external_rtp_ip[0]) ? co->cfg.external_rtp_ip
+                : co->cfg.external_sip_ip;  /* 允许 NULL */
             if (nat_rtp_ip && nat_rtp_ip[0] && out_sdp_len) {
                 if (out_sdp != rewritten)
                     memcpy(rewritten, out_sdp, out_sdp_len);
                 rewritten[out_sdp_len] = '\0';
                 out_sdp_len = nat_sdp_rewrite(rewritten, out_sdp_len, sizeof(rewritten),
-                                              nat_rtp_ip, prof_sip);
+                                              nat_rtp_ip, NULL);
                 out_sdp = rewritten;
                 llog(LOG_INFO, "b2b",
-                     "originate: NAT rewrite done nat_rtp=[%s] out_len=%zu",
-                     nat_rtp_ip, out_sdp_len);
+                     "originate: NAT rewrite nat=[%s] detected=%d out_len=%zu",
+                     nat_rtp_ip, b->nat_detected, out_sdp_len);
+            } else {
+                llog(LOG_DEBUG, "b2b",
+                     "originate: skip NAT rewrite detected=%d rtp_ip=%s have_sdp=%zu",
+                     b->nat_detected,
+                     nat_rtp_ip ? nat_rtp_ip : "(none)",
+                     out_sdp_len);
             }
 
             /* ★ 和 bridge 模式 L4219-4224 对称：把改写+NAT 后的 SDP 存回 leg，

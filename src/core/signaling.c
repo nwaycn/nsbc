@@ -717,6 +717,35 @@ static int resolve_cb(b2b_call_t *call, const char *ruri, size_t ruri_len,
                         snprintf(call->leg[1].service_route,
                                  sizeof(call->leg[1].service_route),
                                  "%s", b.service_route);
+                    /* REQ-NAT-002：loc_binding → call->leg[1] transport/NAT 元数据
+                     * 全链路统一：send_invite_b Via transport / build_dlg_req / nat_sdp_rewrite 都从 leg 读
+                     *
+                     * proto = transport_proto（UDP/TCP/TLS/WS/WSS）
+                     *   resolve_cb 之前只靠 AF_UNSPEC 判断 WS，遗漏 TCP/TLS/WSS
+                     *   现在直接用 registrar 存的 binding.transport_proto
+                     * reliable = 传输层是否可靠
+                     *   TCP/TLS/WS/WSS 可靠（ICT 不该 Timer A 重发 INVITE）
+                     *   UDP 不可靠
+                     * nat_detected = loc_binding.nat_detected（Contact host 私网 or Via received 与 Contact 不同）
+                     *   1 → NAT rewrite SDP（o=/c=/a=candidate IP → ext_rtp_ip）
+                     *   0 → 跳过 rewrite（公网直连 Contact IP 本身可达；内网部署也不需要）
+                     * ext_rtp_ip = sip_profile.external_rtp_ip（SDP rewrite 目标 IP）
+                     *   从 call->out_prof 取（resolve 前面已经根据 dp_layer 算好了 B 腿 profile）
+                     *   out_prof=NULL fallback call->prof；prof=NULL（originate 无 ACL 场景）保持空串 */
+                    if (call) {
+                        call->leg[1].proto = b.transport_proto;
+                        call->leg[1].reliable =
+                            (b.transport_proto == SIP_TR_TCP || b.transport_proto == SIP_TR_TLS
+                             || b.transport_proto == SIP_TR_WS || b.transport_proto == SIP_TR_WSS)
+                            ? 1 : 0;
+                        call->leg[1].nat_detected = b.nat_detected;
+                        const sip_profile_t *prof = call->out_prof ? call->out_prof : call->prof;
+                        if (prof && prof->external_rtp_ip[0])
+                            snprintf(call->leg[1].ext_rtp_ip, sizeof(call->leg[1].ext_rtp_ip),
+                                     "%s", prof->external_rtp_ip);
+                        else
+                            call->leg[1].ext_rtp_ip[0] = '\0';
+                    }
                     /* REQ-NAT-001：优先 NAT 改写后的 public_contact（可达）
                      * NAT 场景 public_contact != b.contact；公网直连两者相同 */
                     const char *route_contact =
@@ -853,6 +882,21 @@ static int resolve_cb(b2b_call_t *call, const char *ruri, size_t ruri_len,
         if (n <= 0) {
             llog(LOG_WARN, "sig", "resolve: queue member '%s' (internal) not registered", ext_user);
             return NSBC_NOENT;
+        }
+        /* REQ-NAT-002：同 dp_ext 主路径一致 — loc_binding → call->leg[1] 元数据 */
+        if (call) {
+            call->leg[1].proto = b.transport_proto;
+            call->leg[1].reliable =
+                (b.transport_proto == SIP_TR_TCP || b.transport_proto == SIP_TR_TLS
+                 || b.transport_proto == SIP_TR_WS || b.transport_proto == SIP_TR_WSS)
+                ? 1 : 0;
+            call->leg[1].nat_detected = b.nat_detected;
+            const sip_profile_t *prof = call->out_prof ? call->out_prof : call->prof;
+            if (prof && prof->external_rtp_ip[0])
+                snprintf(call->leg[1].ext_rtp_ip, sizeof(call->leg[1].ext_rtp_ip),
+                         "%s", prof->external_rtp_ip);
+            else
+                call->leg[1].ext_rtp_ip[0] = '\0';
         }
         const char *contact = (b.nat_detected && b.public_contact[0])
                               ? b.public_contact : b.contact;
@@ -995,6 +1039,21 @@ static int resolve_cb(b2b_call_t *call, const char *ruri, size_t ruri_len,
             snprintf(call->leg[1].service_route,
                      sizeof(call->leg[1].service_route),
                      "%s", b.service_route);
+        /* REQ-NAT-002：同 dp_ext 主路径一致 — loc_binding → call->leg[1] 元数据 */
+        if (call) {
+            call->leg[1].proto = b.transport_proto;
+            call->leg[1].reliable =
+                (b.transport_proto == SIP_TR_TCP || b.transport_proto == SIP_TR_TLS
+                 || b.transport_proto == SIP_TR_WS || b.transport_proto == SIP_TR_WSS)
+                ? 1 : 0;
+            call->leg[1].nat_detected = b.nat_detected;
+            const sip_profile_t *prof = call->out_prof ? call->out_prof : call->prof;
+            if (prof && prof->external_rtp_ip[0])
+                snprintf(call->leg[1].ext_rtp_ip, sizeof(call->leg[1].ext_rtp_ip),
+                         "%s", prof->external_rtp_ip);
+            else
+                call->leg[1].ext_rtp_ip[0] = '\0';
+        }
         /* Loop detection（用原始 contact 看——NAT 改写后的 public_contact 不可能等于 local_host） */
         size_t cl = strlen(b.contact);
         nsbc_sa_t contact_sa;

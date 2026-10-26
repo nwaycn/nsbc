@@ -262,9 +262,9 @@ async fn revoke_ext_key<C: crate::coreclient::CoreApi + Clone + 'static>(
         "postgres" | "mysql" => "CURRENT_TIMESTAMP",
         _ => "datetime('now')",
     };
-    let sql = format!(
+    let sql = crate::db::fix_ph(&format!(
         "UPDATE ext_api_keys SET revoked_at = {now_expr} WHERE id = $1 AND revoked_at IS NULL"
-    );
+    ), backend);
 
     let rc = sqlx::query(&sql).bind(id).execute(pool).await
         .map_err(|_| ApiError::Db("revoke failed".into()))?;
@@ -282,8 +282,10 @@ async fn delete_ext_key<C: crate::coreclient::CoreApi + Clone + 'static>(
 ) -> ApiResult<StatusCode> {
     require_l2(&identity)?;
     let pool = st.db.pool().ok_or(ApiError::DbUnavailable)?;
+    let backend = st.db.backend();
 
-    let rc = sqlx::query("DELETE FROM ext_api_keys WHERE id = $1").bind(id).execute(pool).await
+    let sql = crate::db::fix_ph("DELETE FROM ext_api_keys WHERE id = $1", backend);
+    let rc = sqlx::query(&sql).bind(id).execute(pool).await
         .map_err(|_| ApiError::Db("delete failed".into()))?;
 
     if rc.rows_affected() == 0 { return Err(ApiError::NotFound("ext_api_key".into())); }
@@ -389,8 +391,10 @@ async fn delete_webhook<C: crate::coreclient::CoreApi + Clone + 'static>(
 ) -> ApiResult<StatusCode> {
     require_l2(&identity)?;
     let pool = st.db.pool().ok_or(ApiError::DbUnavailable)?;
+    let backend = st.db.backend();
 
-    let rc = sqlx::query("DELETE FROM ext_webhooks WHERE id = $1").bind(id).execute(pool).await
+    let sql = crate::db::fix_ph("DELETE FROM ext_webhooks WHERE id = $1", backend);
+    let rc = sqlx::query(&sql).bind(id).execute(pool).await
         .map_err(|_| ApiError::Db("delete failed".into()))?;
 
     if rc.rows_affected() == 0 { return Err(ApiError::NotFound("webhook".into())); }

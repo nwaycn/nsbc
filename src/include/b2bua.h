@@ -65,6 +65,18 @@ typedef struct b2b_leg {
     sip_tr_proto_t proto;
     int reliable;
     nsbc_sa_t dst;
+    /* === NAT / Transport 元数据（REQ-NAT-002：resolve_cb 从 loc_binding 传入）===
+     * 为什么不在 resolve_cb 里用 loc_binding_t 的 public_contact 替代？
+     * 因为 public_contact 只改了 host:port，SDP 里的 a=candidate ICE candidate
+     * 也需要 rewrite——那用的是 ext_rtp_ip（sip_profile 里的公网 RTP IP）。
+     *
+     * nat_detected=0 + Contact 也是私网 → 内网部署内网注册（如 10.0.0.x），
+     * 不走 NAT rewrite，dst 直接用 Contact 转 sockaddr。
+     * nat_detected=1 → 公网 SBC + 私网分机注册，dst 用 public_contact，
+     * SDP 里的 o=/c=/a=candidate IP 用 ext_rtp_ip 改写。
+     * nat_detected=0 + Contact 是公网 IP → 公网直连注册，都不用 rewrite。 */
+    int nat_detected;
+    char ext_rtp_ip[INET6_ADDRSTRLEN];   /* sip_profile.external_rtp_ip（NAT rewrite 用） */
     char callid[DLG_CALLID_MAX];
     char from[B2B_HDR_MAX];
     char to[B2B_HDR_MAX];
@@ -458,6 +470,18 @@ typedef struct {
      * 与 bridge_url 互斥（语法只有一个 app）：bridge_url 非空时走 bridge 顺序外呼；
      * 否则按 post_app 在 B 腿 answer 后执行 park(hold 双腿)/hangup(terminate)。 */
     int post_app;
+    /* REQ-ORIGINATE-004：originate 自动 SDP 的 codec 控制。
+     * 由 cmd_originate 从 FS brace vars {audio_codecs=PCMU,G722} /
+     * {video_codecs=H264} 解析填入；空串 = 用默认（PCMU 单音频，无 video）。
+     * b2b_originate auto_offer 生成时根据这两个字段决定：
+     *   - audio_codecs 非空 → 生成多个 a=rtpmap + m=audio 行的 PT 列表
+     *   - video_codecs 非空 → 生成 m=video 行（端口 0 + video RTCP mux inactive 模式，
+     *     offer_hook 会自动把端口改成非 0 并加 ICE/DTLS/SSRC）
+     *
+     * 约束：最多 4 个 codec，每个 codec 名 ≤ 16 字节（避免 auto_offer snprintf 溢出）。
+     * 只对 o.sdp_len==0（auto_offer 路径）生效；调用方自带完整 o.sdp 时这两个字段被忽略。 */
+    char audio_codecs[128];
+    char video_codecs[128];
 } b2b_orig_t;
 int b2b_originate(b2b_core_t *c, const b2b_orig_t *o, b2b_call_t **out);
 

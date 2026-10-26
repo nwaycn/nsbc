@@ -848,12 +848,45 @@ static void on_udp_event(int fd, uint32_t ev, void *arg)
     for (int i = 0; i < t->udp_fd_count; ++i) {
         if (t->udp_fds[i] == fd) { rx_idx = i; break; }
     }
-    if (rx_idx < 0 || rx_idx >= t->n_rx) {
-        llog(LOG_WARN, "sip", "on_udp_event: fd=%d reactor idx not found", fd);
+    if (rx_idx < 0) {
+        /* 真 ghost：udp_fds[] 完全找不到这个 fd
+         * （不是 add_listeners 的问题，是 close race / fd 复用）
+         *
+         * 修复：降级 LOG_DEBUG + reactor_del 摘掉僵尸 fd
+         * （注意：跨 reactor callback 里 reactor_del 会触发 reactor_mgr 遍历，
+         *   在 reactor callback 上下文里调 reactor_del 对 owner reactor 安全） */
+        static __thread uint64_t ghost_count = 0;
+        ghost_count++;
+        if (ghost_count % 500 == 1) {
+            llog(LOG_DEBUG, "sip", "on_udp_event: ghost fd=%d (no udp_fds match) "
+                 "reactor_del, total_ghost=%lu", fd, ghost_count);
+        }
+        if (t->cfg.mgr) {
+            unsigned n = reactor_mgr_count(t->cfg.mgr);
+            for (unsigned k = 0; k < n; ++k) {
+                reactor_t *rk = reactor_mgr_get(t->cfg.mgr, k);
+                if (rk) reactor_del(rk, fd);
+            }
+        } else if (t->cfg.re) {
+            reactor_del(t->cfg.re, fd);
+        }
+        /* 注意：不 close(fd) —— 无法确认是不是合法 listener。reactor_del
+         * 已经阻止 reactor 继续触发 EPOLLIN，不会再空转。close 可能杀掉
+         * 合法 UDP listener（虽然 udp_fds[] 找不到） */
         return;
     }
-    net_rx_t *rx = &t->per_reactor_rx[rx_idx];
-    net_dgram_t *dg = t->per_reactor_dg[rx_idx];
+
+    /* REQ-FIX: sip_tr_add_listeners 加 UDP fd 时只增 udp_fd_count 不增 n_rx
+     * 这些 fd 全部加到 reactor[0] 上（L1270: reactor_add(t->cfg.re, fd, ...)），
+     * 所以 udp_fds[rx_idx] 有效但 rx_idx >= n_rx（n_rx=reactor 数量）。
+     *
+     * 修复：对这些动态添加的 listener，用 rx_idx % n_rx 复用已有的 per_reactor_rx/dg 槽位
+     * （因为 add_listeners 的 fd 都加在 reactor[0] 上，rx_idx % n_rx 也会落到 reactor[0] 槽位）
+     *
+     * 这比扩展 per_reactor 数组安全——不会 realloc 已在 reactor 回调里使用的数组。 */
+    int effective_rx_idx = (rx_idx >= t->n_rx) ? (rx_idx % t->n_rx) : rx_idx;
+    net_rx_t *rx = &t->per_reactor_rx[effective_rx_idx];
+    net_dgram_t *dg = t->per_reactor_dg[effective_rx_idx];
     /* 先用 fd 拿监听端口，后面填到每个 dgram 的 local.port 上 */
     uint16_t bind_port = 0;
     {

@@ -47,7 +47,10 @@ app.component('ext-keys', {
     <div class="p-4">
       <div class="flex items-center justify-between mb-4">
         <h2 class="text-xl font-bold">🔑 API Key 管理</h2>
-        <el-button type="primary" @click="showCreate">+ 创建 API Key</el-button>
+        <div>
+          <el-button @click="load" :loading="loading">🔄 刷新</el-button>
+          <el-button type="primary" @click="showCreate">+ 创建 API Key</el-button>
+        </div>
       </div>
 
       <el-table :data="rows" v-loading="loading" stripe style="width:100%">
@@ -147,7 +150,7 @@ app.component('ext-keys', {
         this.formVisible = false;
         this.createdData = res;
         this.createdVisible = true;
-        this.load();
+        await this.load();
       } catch (e) {
         this.$message.error(e.message || '创建失败');
       }
@@ -159,7 +162,7 @@ app.component('ext-keys', {
           '确认吊销', { type: 'warning' });
         await API.post(`/ext-keys/${row.id}/revoke`);
         this.$message.success('已吊销');
-        this.load();
+        await this.load();
       } catch (e) {
         if (e !== 'cancel') this.$message.error(e.message || '操作失败');
       }
@@ -171,7 +174,7 @@ app.component('ext-keys', {
           '确认删除', { type: 'warning' });
         await API.delete(`/ext-keys/${row.id}`);
         this.$message.success('已删除');
-        this.load();
+        await this.load();
       } catch (e) {
         if (e !== 'cancel') this.$message.error(e.message || '操作失败');
       }
@@ -188,7 +191,10 @@ app.component('ext-webhooks', {
     <div class="p-4">
       <div class="flex items-center justify-between mb-4">
         <h2 class="text-xl font-bold">🔔 Webhook 回调管理</h2>
-        <el-button type="primary" @click="showCreate">+ 注册 Webhook</el-button>
+        <div>
+          <el-button @click="load" :loading="loading">🔄 刷新</el-button>
+          <el-button type="primary" @click="showCreate">+ 注册 Webhook</el-button>
+        </div>
       </div>
 
       <el-alert v-if="!rows.length" type="info" :closable="false" style="margin-bottom:16px">
@@ -277,7 +283,7 @@ app.component('ext-webhooks', {
         await API.post('/webhooks', this.form);
         this.formVisible = false;
         this.$message.success('已注册');
-        this.load();
+        await this.load();
       } catch (e) {
         this.$message.error(e.message || '注册失败');
       }
@@ -288,7 +294,7 @@ app.component('ext-webhooks', {
         await this.$confirm(`删除 Webhook "${row.url}"？`, '确认', { type: 'warning' });
         await API.delete(`/webhooks/${row.id}`);
         this.$message.success('已删除');
-        this.load();
+        await this.load();
       } catch (e) {
         if (e !== 'cancel') this.$message.error(e.message || '操作失败');
       }
