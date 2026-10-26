@@ -66,6 +66,7 @@ typedef struct {
     char  kind[16];       /* "call" / "cdr" / "register" / "cmd" / "other" */
     char  body[NSBC_BODY_LEN];
     char  raw[NSBC_BODY_LEN];
+    char  source[16];      /* "uds" | "sse" | "http" */
 } nsbc_frame_t;
 
 /* Callback for iter_frames. userdata opaque. */

@@ -389,7 +389,7 @@ int main(int argc, char **argv)
     /* Resolve transport: "auto" → prefer SSE if no UDS path explicitly given */
     const char *actual_transport = transport;
     if (!strcmp(transport, "auto")) {
-        if (!access(uds_path, F_OK) == 0) {
+        if (access(uds_path, F_OK) == 0) {
             actual_transport = "uds";
         } else {
             actual_transport = "sse";
@@ -405,8 +405,13 @@ int main(int argc, char **argv)
     }
     if (webhook_url) {
         state.wh = nsbc_webhook_new(webhook_url, 5, 2);
-        if (!state.wh) fprintf(stderr, "[WARN] webhook init failed (need -DNSBC_WITH_CURL)\n");
-        else banner("webhook enabled → POST " + webhook_url);
+        if (!state.wh) {
+            fprintf(stderr, "[WARN] webhook init failed (need -DNSBC_WITH_CURL)\n");
+        } else {
+            char msg[512];
+            snprintf(msg, sizeof(msg), "webhook enabled → POST %s", webhook_url);
+            banner(msg);
+        }
     }
 
     /* ---- UDS path (local-debug) ---- */

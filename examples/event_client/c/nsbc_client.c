@@ -245,6 +245,7 @@ int nsbc_parse_frame(const char *line, nsbc_frame_t *frame)
     frame->raw[rl] = '\0';
 
     classify(frame->domain, frame->kind, sizeof(frame->kind));
+    snprintf(frame->source, sizeof(frame->source), "uds");
 
     return 1;
 }
@@ -882,6 +883,7 @@ int nsbc_sse_event_to_frame(const char *sse_json, nsbc_frame_t *frame)
     }
     snprintf(frame->domain, sizeof(frame->domain), "%s", domain);
     classify(frame->domain, frame->kind, sizeof(frame->kind));
+    snprintf(frame->source, sizeof(frame->source), "sse");
 
     /* ts */
     cJSON *tsj = cJSON_GetObjectItemCaseSensitive(payload, "ts");
