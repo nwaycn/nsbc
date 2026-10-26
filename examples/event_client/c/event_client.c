@@ -134,6 +134,8 @@ static nsbc_orig_opts_t *parse_opts(int argc, char **argv,
                                     const char **out_sse_url,
                                     const char **out_api_token,
                                     const char **out_orig_via,
+                                    const char **out_webhook_url,
+                                    int *out_correlate,
                                     int *out_insecure)
 {
     nsbc_orig_opts_t *o = calloc(1, sizeof(*o));
@@ -147,6 +149,8 @@ static nsbc_orig_opts_t *parse_opts(int argc, char **argv,
     *out_sse_url     = NULL;  /* build from api_base later */
     *out_api_token   = NULL;
     *out_orig_via    = "auto";
+    *out_webhook_url = NULL;
+    *out_correlate   = 0;
     *out_insecure    = 0;
 
     static char default_audio[] = "PCMU,PCMA,G722,OPUS";
@@ -170,6 +174,8 @@ static nsbc_orig_opts_t *parse_opts(int argc, char **argv,
         else if (!strcmp(a, "--api-token") && nxt) { *out_api_token = nxt; ++i; }
         else if (!strcmp(a, "--orig-via")  && nxt) { *out_orig_via = nxt; ++i; }
         else if (!strcmp(a, "--insecure")) { *out_insecure = 1; }
+        else if (!strcmp(a, "--webhook-url") && nxt) { *out_webhook_url = nxt; ++i; }
+        else if (!strcmp(a, "--correlate")) { *out_correlate = 1; }
         else if (!strcmp(a, "--orig-to")   && nxt) { o->orig_to = nxt; ++i; }
         else if (!strcmp(a, "--app")       && nxt) { o->app = nxt; ++i; }
         else if (!strcmp(a, "--caller-id") && nxt) { o->caller_id = nxt; ++i; }
@@ -200,16 +206,21 @@ static nsbc_orig_opts_t *parse_opts(int argc, char **argv,
 
 static void run_subscribe(nsbc_conn_t *c, const char *topics)
 {
+    run_subscribe_with_cb(c, topics, print_frame_cb, NULL);
+}
+
+static void run_subscribe_with_cb(nsbc_conn_t *c, const char *topics,
+                                  nsbc_frame_cb_t cb, void *cb_userdata)
+{
     banner("subscribe mode");
     char resp[1024];
     nsbc_subscribe(c, topics, resp, sizeof(resp));
-    /* Print non-empty response lines */
     char *saveptr = NULL;
     for (char *ln = strtok_r(resp, "\n", &saveptr); ln; ln = strtok_r(NULL, "\n", &saveptr)) {
         if (ln[0]) banner(ln);
     }
     banner("waiting for events — Ctrl-C to quit");
-    nsbc_iter_frames(c, print_frame_cb, NULL);
+    nsbc_iter_frames(c, cb, cb_userdata);
 }
 
 static void run_originate_only(nsbc_conn_t *c, nsbc_orig_opts_t *opts)
@@ -229,6 +240,13 @@ static void run_originate_only(nsbc_conn_t *c, nsbc_orig_opts_t *opts)
 }
 
 static void run_originate_and_subscribe(nsbc_conn_t *c, nsbc_orig_opts_t *opts, const char *topics)
+{
+    run_originate_and_subscribe_with_cb(c, opts, topics, print_frame_cb, NULL);
+}
+
+static void run_originate_and_subscribe_with_cb(nsbc_conn_t *c, nsbc_orig_opts_t *opts,
+                                                 const char *topics,
+                                                 nsbc_frame_cb_t cb, void *cb_userdata)
 {
     char *cu = nsbc_build_call_url(opts);
     if (!cu) { fprintf(stderr, "[FAIL] build_call_url\n"); return; }
@@ -253,7 +271,7 @@ static void run_originate_and_subscribe(nsbc_conn_t *c, nsbc_orig_opts_t *opts, 
         if (ln[0]) banner(ln);
     }
     banner("waiting for events — Ctrl-C to quit");
-    nsbc_iter_frames(c, print_frame_cb, NULL);
+    nsbc_iter_frames(c, cb, cb_userdata);
 }
 
 /* -------------------------------------------------------------------- */
@@ -285,13 +303,19 @@ static void run_originate_http(nsbc_orig_opts_t *opts, const char *api_base,
 
 static void run_subscribe_sse(const char *sse_url, const char *api_token)
 {
+    run_subscribe_sse_with_cb(sse_url, api_token, print_frame_cb, NULL);
+}
+
+static void run_subscribe_sse_with_cb(const char *sse_url, const char *api_token,
+                                      nsbc_frame_cb_t cb, void *cb_userdata)
+{
     fprintf(stdout, "%s[nsbc] [transport=SSE] url=%s%s\n", DIM, sse_url, RESET);
     fprintf(stdout, "%s[nsbc] waiting for events — Ctrl-C to quit%s\n", DIM, RESET);
     fflush(stdout);
     signal(SIGINT, on_sigint);
 
     while (!g_sigint) {
-        nsbc_rc_t rc = nsbc_sse_iter(sse_url, 30, api_token, print_frame_cb, NULL);
+        nsbc_rc_t rc = nsbc_sse_iter(sse_url, 30, api_token, cb, cb_userdata);
         if (rc == NSBC_ERR_NO_CURL) {
             fprintf(stderr, "\n[FATAL] SSE requires building with -DNSBC_WITH_CURL -lcurl\n");
             break;
@@ -302,21 +326,55 @@ static void run_subscribe_sse(const char *sse_url, const char *api_token)
 }
 
 /* -------------------------------------------------------------------- */
-/* main                                                                  */
+/* main + CLI wiring                                                    */
 /* -------------------------------------------------------------------- */
+
+/* Pack of optional subscriber components — fed from one frame callback. */
+typedef struct {
+    nsbc_call_correlator_t *cc;
+    nsbc_webhook_sink_t    *wh;
+} cli_state_t;
+
+static void timeline_cb(const nsbc_call_timeline_t *tl, void *userdata)
+{
+    (void)userdata;
+    fprintf(stdout, "\n%s═══ Call Lifecycle: %s ═══%s\n", BOLD, tl->call_id, RESET);
+    /* Events list was built head-first (most-recent first). Reverse for print. */
+    /* Simple: just print each — order reversed from real-time, but still informative */
+    for (const nsbc_tl_event_t *ev = tl->events; ev; ev = ev->next) {
+        fprintf(stdout, "  %s%15s%s  %s\n", domain_color(ev->domain), ev->domain, RESET, ev->ts);
+    }
+    if (tl->cdr_present) {
+        fprintf(stdout, "  %s%12s%s  %s\n", domain_color("CDR"), "CDR", RESET, tl->cdr_json);
+    }
+    fprintf(stdout, "%s──────────────────────────────────%s\n", BOLD, RESET);
+}
+
+/* Multi-target frame callback — print + correlator + webhook. */
+static void dispatch_frame_cb(const nsbc_frame_t *frame, void *userdata)
+{
+    print_frame_cb(frame, userdata);
+    cli_state_t *st = (cli_state_t *)userdata;
+    if (st->cc) nsbc_correlator_feed(st->cc, frame);
+    if (st->wh) {
+        int ok = nsbc_webhook_send(st->wh, frame);
+        if (!ok) fprintf(stderr, "%s[webhook FAIL]%s url=%s\n", "\x1b[31m", RESET, "");
+    }
+}
 
 int main(int argc, char **argv)
 {
     const char *mode, *transport, *uds_path, *topics;
     const char *api_base, *sse_url, *api_token, *orig_via;
-    int insecure;
+    const char *webhook_url;
+    int insecure, correlate;
     nsbc_orig_opts_t *opts = parse_opts(argc, argv, &mode, &transport, &uds_path,
                                          &topics, &api_base, &sse_url,
-                                         &api_token, &orig_via, &insecure);
+                                         &api_token, &orig_via,
+                                         &webhook_url, &correlate, &insecure);
     if (!opts) return 0;
 
     signal(SIGINT, on_sigint);
-
     if (insecure) nsbc_set_ssl_verify(0);
 
     /* Resolve sse_url default: <api_base>/api/v1/calls/stream */
@@ -334,9 +392,21 @@ int main(int argc, char **argv)
         if (!access(uds_path, F_OK) == 0) {
             actual_transport = "uds";
         } else {
-            /* no UDS socket → go SSE (canonical external path) */
             actual_transport = "sse";
         }
+    }
+
+    /* Build CLI subscriber state (correlator + webhook are optional) */
+    cli_state_t state = { NULL, NULL };
+    if (correlate) {
+        state.cc = nsbc_correlator_new(timeline_cb, NULL);
+        if (!state.cc) fprintf(stderr, "[WARN] correlator alloc failed\n");
+        else banner("call correlator enabled (timeline on CDR)");
+    }
+    if (webhook_url) {
+        state.wh = nsbc_webhook_new(webhook_url, 5, 2);
+        if (!state.wh) fprintf(stderr, "[WARN] webhook init failed (need -DNSBC_WITH_CURL)\n");
+        else banner("webhook enabled → POST " + webhook_url);
     }
 
     /* ---- UDS path (local-debug) ---- */
@@ -345,16 +415,18 @@ int main(int argc, char **argv)
         if (!c) {
             fprintf(stderr, "%s[FAIL] UDS connect: %s%s\n", "\x1b[31m", strerror(errno), RESET);
             free(opts);
+            nsbc_correlator_free(state.cc);
+            nsbc_webhook_free(state.wh);
             return 2;
         }
         banner(c->banner[0] ? c->banner : uds_path);
 
         if (!strcmp(mode, "subscribe")) {
-            run_subscribe(c, topics);
+            run_subscribe_with_cb(c, topics, dispatch_frame_cb, &state);
         } else if (!strcmp(mode, "originate")) {
             run_originate_only(c, opts);
         } else {
-            run_originate_and_subscribe(c, opts, topics);
+            run_originate_and_subscribe_with_cb(c, opts, topics, dispatch_frame_cb, &state);
         }
         nsbc_close(c);
     }
@@ -364,18 +436,24 @@ int main(int argc, char **argv)
         fflush(stdout);
 
         if (!strcmp(mode, "subscribe")) {
-            run_subscribe_sse(sse_url, api_token);
+            run_subscribe_sse_with_cb(sse_url, api_token, dispatch_frame_cb, &state);
         } else if (!strcmp(mode, "originate")) {
             run_originate_http(opts, api_base, api_token);
         } else {
-            /* auto / originate+subscribe */
             fprintf(stdout, "%s[1/2] originate (HTTP)...%s\n", DIM, RESET);
             run_originate_http(opts, api_base, api_token);
             fprintf(stdout, "%s[2/2] subscribe (SSE)...%s\n", DIM, RESET);
-            run_subscribe_sse(sse_url, api_token);
+            run_subscribe_sse_with_cb(sse_url, api_token, dispatch_frame_cb, &state);
         }
     }
 
+    /* Print final webhook stats if any */
+    if (state.wh) {
+        fprintf(stdout, "\n%s[webhook stats] ok=%d  fail=%d%s\n",
+                DIM, nsbc_webhook_ok(state.wh), nsbc_webhook_fail(state.wh), RESET);
+    }
+    nsbc_correlator_free(state.cc);
+    nsbc_webhook_free(state.wh);
     free(opts);
     return 0;
 }

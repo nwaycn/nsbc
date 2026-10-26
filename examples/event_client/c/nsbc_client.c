@@ -364,6 +364,175 @@ int nsbc_originate(nsbc_conn_t *c, const char *call_url,
 }
 
 /* ===================================================================== */
+/* CallCorrelator — groups frames by call_id → timeline on CDR            */
+/* Pure data-structure, zero deps, works in BOTH build paths.            */
+/* ===================================================================== */
+
+#define NSBC_CC_MAX_ACTIVE 256  /* upper bound on concurrent active calls */
+
+struct nsbc_call_correlator {
+    nsbc_correlator_cb_t on_complete;
+    void *userdata;
+    struct nsbc_cc_entry {
+        char call_id[128];
+        nsbc_tl_event_t *events;
+        char cdr_json[4096];
+        int  cdr_present;
+        struct nsbc_cc_entry *next;
+    } *entries; /* singly-linked list (fast enough; active << 256) */
+    int active_count;
+};
+
+nsbc_call_correlator_t *nsbc_correlator_new(nsbc_correlator_cb_t on_complete,
+                                            void *userdata)
+{
+    nsbc_call_correlator_t *cc = calloc(1, sizeof(*cc));
+    if (!cc) return NULL;
+    cc->on_complete = on_complete;
+    cc->userdata = userdata;
+    return cc;
+}
+
+void nsbc_correlator_free(nsbc_call_correlator_t *cc)
+{
+    if (!cc) return;
+    struct nsbc_cc_entry *e = cc->entries;
+    while (e) {
+        struct nsbc_cc_entry *next = e->next;
+        nsbc_tl_event_t *ev = e->events;
+        while (ev) {
+            nsbc_tl_event_t *enext = ev->next;
+            free(ev);
+            ev = enext;
+        }
+        free(e);
+        e = next;
+    }
+    free(cc);
+}
+
+/* Extract call_id from frame body. Scan for "call_id":"..." pattern.
+ * Caller-provided buf must be >= 128 bytes. Returns 1 if found. */
+static int extract_call_id(const nsbc_frame_t *frame, char *out, size_t out_cap)
+{
+    out[0] = '\0';
+    const char *search = frame->body[0] ? frame->body : frame->raw;
+    if (!search || !*search) return 0;
+
+    const char *key = "\"call_id\"";
+    const char *p = strstr(search, key);
+    if (!p) return 0;
+    p += strlen(key);
+    while (*p && (*p == ' ' || *p == ':' || *p == '\t')) ++p;
+    if (*p == '"') {
+        ++p;
+        size_t i = 0;
+        while (*p && *p != '"' && i + 1 < out_cap) {
+            if (*p == '\\' && *(p + 1)) {
+                char c = *(p + 1);
+                switch (c) {
+                    case 'n': out[i++] = '\n'; break;
+                    case 'r': out[i++] = '\r'; break;
+                    case 't': out[i++] = '\t'; break;
+                    default: out[i++] = c;
+                }
+                p += 2;
+            } else {
+                out[i++] = *p++;
+            }
+        }
+        out[i] = '\0';
+    } else {
+        /* unquoted value */
+        size_t i = 0;
+        while (*p && *p != ',' && *p != '}' && *p != ' ' && i + 1 < out_cap) {
+            out[i++] = *p++;
+        }
+        out[i] = '\0';
+    }
+    return out[0] != '\0';
+}
+
+void nsbc_correlator_feed(nsbc_call_correlator_t *cc, const nsbc_frame_t *frame)
+{
+    if (!cc || !frame) return;
+
+    char call_id[128];
+    if (!extract_call_id(frame, call_id, sizeof(call_id))) return;
+
+    /* Find existing entry or create new (drop oldest if over cap) */
+    struct nsbc_cc_entry *e = cc->entries;
+    while (e) {
+        if (!strcmp(e->call_id, call_id)) break;
+        e = e->next;
+    }
+    if (!e) {
+        if (cc->active_count >= NSBC_CC_MAX_ACTIVE) {
+            /* Drop oldest (remove head) — keeps memory bounded */
+            struct nsbc_cc_entry *old = cc->entries;
+            cc->entries = old->next;
+            nsbc_tl_event_t *ev = old->events;
+            while (ev) { nsbc_tl_event_t *n = ev->next; free(ev); ev = n; }
+            free(old);
+            cc->active_count--;
+        }
+        e = calloc(1, sizeof(*e));
+        if (!e) return;
+        snprintf(e->call_id, sizeof(e->call_id), "%s", call_id);
+        e->next = cc->entries;
+        cc->entries = e;
+        cc->active_count++;
+    }
+
+    /* Append event to timeline */
+    nsbc_tl_event_t *ev = calloc(1, sizeof(*ev));
+    if (!ev) return;
+    snprintf(ev->domain, sizeof(ev->domain), "%s", frame->domain ? frame->domain : "?");
+    snprintf(ev->ts, sizeof(ev->ts), "%s", frame->ts ? frame->ts : "");
+    ev->next = e->events;
+    e->events = ev;
+
+    /* CDR → complete! fire callback + cleanup */
+    if (!strcmp(frame->domain, "CDR")) {
+        if (frame->body[0]) snprintf(e->cdr_json, sizeof(e->cdr_json), "%s", frame->body);
+        e->cdr_present = 1;
+
+        /* Build timeline for callback */
+        nsbc_call_timeline_t tl;
+        memset(&tl, 0, sizeof(tl));
+        snprintf(tl.call_id, sizeof(tl.call_id), "%s", e->call_id);
+        tl.events = e->events;
+        snprintf(tl.cdr_json, sizeof(tl.cdr_json), "%s", e->cdr_json);
+        tl.cdr_present = e->cdr_present;
+
+        if (cc->on_complete) cc->on_complete(&tl, cc->userdata);
+
+        /* Remove from active list + free events (head was at most-recent;
+         * timeline.events is the same linked list we just passed in) */
+        struct nsbc_cc_entry **pp = &cc->entries;
+        while (*pp && *pp != e) pp = &(*pp)->next;
+        if (*pp) *pp = e->next;
+        cc->active_count--;
+
+        /* Walk events from oldest-to-newest (reverse the list we built head-first)
+         * — free each after reversing. But timeline.events is already the list
+         * pointer; after callback returns we own it again. */
+        nsbc_tl_event_t *cur = e->events;
+        while (cur) {
+            nsbc_tl_event_t *n = cur->next;
+            free(cur);
+            cur = n;
+        }
+        free(e);
+    }
+}
+
+int nsbc_correlator_active(const nsbc_call_correlator_t *cc)
+{
+    return cc ? cc->active_count : 0;
+}
+
+/* ===================================================================== */
 /* HTTP + SSE (canonical external integration surface — requires curl)   */
 /* ===================================================================== */
 
@@ -749,6 +918,101 @@ int nsbc_sse_event_to_frame(const char *sse_json, nsbc_frame_t *frame)
 }
 
 /* ===================================================================== */
+/* WebhookSink — synchronous POST every frame (requires curl + cJSON)     */
+/* ===================================================================== */
+
+struct nsbc_webhook_sink {
+    char url[512];
+    int  timeout_s;
+    int  retries;
+    int  ok_count;
+    int  fail_count;
+};
+
+/* Build JSON body from frame — uses cJSON for safety.
+ * Caller frees returned string. */
+static char *frame_to_json(const nsbc_frame_t *frame)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return NULL;
+
+    cJSON_AddStringToObject(root, "ts", frame->ts);
+    cJSON_AddStringToObject(root, "domain", frame->domain);
+    cJSON_AddStringToObject(root, "kind", frame->kind);
+    cJSON_AddStringToObject(root, "body", frame->body);
+    cJSON_AddStringToObject(root, "raw", frame->raw);
+    cJSON_AddStringToObject(root, "source", frame->source[0] ? frame->source : "");
+
+    char *s = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    return s;
+}
+
+nsbc_webhook_sink_t *nsbc_webhook_new(const char *url, int timeout_s, int retries)
+{
+    if (!url) return NULL;
+    nsbc_webhook_sink_t *wh = calloc(1, sizeof(*wh));
+    if (!wh) return NULL;
+    snprintf(wh->url, sizeof(wh->url), "%s", url);
+    wh->timeout_s = timeout_s > 0 ? timeout_s : 5;
+    wh->retries = retries > 0 ? retries : 1;
+    return wh;
+}
+
+void nsbc_webhook_free(nsbc_webhook_sink_t *wh)
+{
+    free(wh);
+}
+
+int nsbc_webhook_send(nsbc_webhook_sink_t *wh, const nsbc_frame_t *frame)
+{
+    if (!wh || !frame) return 0;
+
+    char *body = frame_to_json(frame);
+    if (!body) { wh->fail_count++; return 0; }
+
+    int max_attempts = wh->retries + 1;
+    int ok = 0;
+    for (int attempt = 0; attempt < max_attempts; attempt++) {
+        CURL *h = curl_common(wh->url, wh->timeout_s);
+        if (!h) break;
+
+        curl_slist *hdrs = NULL;
+        hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
+        char evhdr[128];
+        snprintf(evhdr, sizeof(evhdr), "X-NSBC-Event: %s", frame->domain);
+        hdrs = curl_slist_append(hdrs, evhdr);
+        curl_easy_setopt(h, CURLOPT_HTTPHEADER, hdrs);
+        curl_easy_setopt(h, CURLOPT_POSTFIELDS, body);
+        curl_easy_setopt(h, CURLOPT_POSTFIELDSIZE, (long)strlen(body));
+        curl_easy_setopt(h, CURLOPT_CUSTOMREQUEST, "POST");
+
+        struct buf resp = { NULL, 0 };
+        curl_easy_setopt(h, CURLOPT_WRITEDATA, &resp);
+
+        CURLcode rc = curl_easy_perform(h);
+        long http_code = 0;
+        curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &http_code);
+        curl_easy_cleanup(h);
+        curl_slist_free_all(hdrs);
+        free(resp.data);
+
+        if (rc == CURLE_OK && http_code >= 200 && http_code < 300) {
+            ok = 1;
+            break;
+        }
+        if (attempt < max_attempts - 1) sleep(1);
+    }
+
+    free(body);
+    if (ok) wh->ok_count++; else wh->fail_count++;
+    return ok;
+}
+
+int nsbc_webhook_ok(const nsbc_webhook_sink_t *wh)   { return wh ? wh->ok_count : 0; }
+int nsbc_webhook_fail(const nsbc_webhook_sink_t *wh) { return wh ? wh->fail_count : 0; }
+
+/* ===================================================================== */
 /* Stub implementations when compiled WITHOUT libcurl                    */
 /* ===================================================================== */
 
@@ -809,5 +1073,22 @@ int nsbc_sse_event_to_frame(const char *sse_json, nsbc_frame_t *frame)
     fprintf(stderr, "[nsbc] SSE JSON parsing requires building with -DNSBC_WITH_CURL\n");
     return 0;
 }
+
+/* WebhookSink stubs — all fail with clear error */
+nsbc_webhook_sink_t *nsbc_webhook_new(const char *url, int timeout_s, int retries)
+{
+    (void)url; (void)timeout_s; (void)retries;
+    fprintf(stderr, "[nsbc] WebhookSink requires building with -DNSBC_WITH_CURL -lcurl\n");
+    return NULL;
+}
+void nsbc_webhook_free(nsbc_webhook_sink_t *wh) { (void)wh; }
+int nsbc_webhook_send(nsbc_webhook_sink_t *wh, const nsbc_frame_t *frame)
+{
+    (void)wh; (void)frame;
+    fprintf(stderr, "[nsbc] WebhookSink requires building with -DNSBC_WITH_CURL -lcurl\n");
+    return 0;
+}
+int nsbc_webhook_ok(const nsbc_webhook_sink_t *wh)   { (void)wh; return 0; }
+int nsbc_webhook_fail(const nsbc_webhook_sink_t *wh) { (void)wh; return 0; }
 
 #endif /* NSBC_WITH_CURL */

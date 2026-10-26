@@ -318,8 +318,8 @@ wh.stop();
 |------------------------|--------|-------|------|------------------------|-------|-----------------------------------------------|
 | UDS subscribe + iter  | ✅      | ✅     | ✅    | ✅                       | ❌     | Java 8 stdlib has no Unix Socket API            |
 | Originate dual-path    | ✅      | ✅     | ✅    | ⚠️ conditional          | ⚠️ HTTP only | C: HTTP path needs -DNSBC_WITH_CURL             |
-| CallCorrelator         | ✅      | ✅     | ✅    | ❌                       | ✅     | C: pure event_client scope, no aggregation     |
-| WebhookSink (HTTP)     | ✅      | ✅     | ✅    | ❌                       | ✅     | C: pure event_client scope, fire-and-forget    |
+| CallCorrelator         | ✅      | ✅     | ✅    | ✅                       | ✅     | C: pure data structure, zero-dep, common path |
+| WebhookSink (HTTP)     | ✅      | ✅     | ✅    | ✅ conditional          | ✅     | C: needs -DNSBC_WITH_CURL -lcurl              |
 | SSE transport (remote) | ✅      | ✅     | ✅    | ✅ conditional           | ✅     | C: needs -DNSBC_WITH_CURL -lcurl              |
 | TLS verify toggle      | ✅      | ✅     | ✅    | ✅ conditional           | ✅     | C: TLS via libcurl, skip with nsbc_set_ssl_verify(0) |
 | Non-Unix (Windows)     | ✅      | ✅ stub | stub | stub (no AF_UNIX)       | ✅     | UnixStream / AF_UNIX are platform-only; C libcurl path works on Windows |

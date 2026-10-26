@@ -160,6 +160,49 @@ int          nsbc_originate(nsbc_conn_t *c, const char *call_url,
                             char *response_out, size_t resp_cap);
 
 /* -------------------------------------------------------------------- */
+/* CallCorrelator — groups frames by call_id → timeline on CDR           */
+/* Pure data-structure logic — no deps, works in BOTH build paths.      */
+/* -------------------------------------------------------------------- */
+
+/* Event in a call timeline. */
+typedef struct nsbc_tl_event {
+    char domain[32];
+    char ts[32];
+    struct nsbc_tl_event *next;
+} nsbc_tl_event_t;
+
+/* Completed call timeline — passed to on_complete callback.
+ * Caller owns this pointer ONLY during the callback; correlator frees
+ * it immediately after callback returns. */
+typedef struct nsbc_call_timeline {
+    char call_id[128];
+    nsbc_tl_event_t *events;    /* linked list */
+    char cdr_json[4096];        /* CDR record as compact JSON (if any) */
+    int  cdr_present;
+} nsbc_call_timeline_t;
+
+/* Opaque correlator handle. */
+typedef struct nsbc_call_correlator nsbc_call_correlator_t;
+
+/* Callback signature: called when a call's CDR arrives.
+ * timeline is valid for the duration of the callback only — do NOT hold
+ * onto the pointer beyond it. */
+typedef void (*nsbc_correlator_cb_t)(const nsbc_call_timeline_t *timeline,
+                                     void *userdata);
+
+nsbc_call_correlator_t *nsbc_correlator_new(nsbc_correlator_cb_t on_complete,
+                                            void *userdata);
+void nsbc_correlator_free(nsbc_call_correlator_t *cc);
+
+/* Feed a frame into the correlator. Extracts call_id from frame->body
+ * (searching for "call_id":"..." pattern). Silently ignores frames with
+ * no call_id. */
+void nsbc_correlator_feed(nsbc_call_correlator_t *cc, const nsbc_frame_t *frame);
+
+/* Snapshot of active (not-yet-completed) call count. */
+int  nsbc_correlator_active(const nsbc_call_correlator_t *cc);
+
+/* -------------------------------------------------------------------- */
 /* HTTP originate + SSE (canonical external integration surface)          */
 /* Enabled only when compiled with -DNSBC_WITH_CURL -lcurl              */
 /* -------------------------------------------------------------------- */
@@ -196,6 +239,27 @@ nsbc_rc_t nsbc_sse_iter(const char *sse_url, int timeout_s,
 /* Convert raw SSE event JSON → canonical frame (source="sse").
  * Requires -DNSBC_WITH_CURL for full cJSON parsing; fallback returns 0. */
 int   nsbc_sse_event_to_frame(const char *sse_json, nsbc_frame_t *frame);
+
+/* -------------------------------------------------------------------- */
+/* WebhookSink — fire-and-forget POST every frame to external URL       */
+/* Requires -DNSBC_WITH_CURL -lcurl.                                    */
+/* In single-threaded C: send() is synchronous (blocks briefly per frame);
+ * this is deliberate — simplicity over concurrency. Callers can run
+ * send() from a dedicated thread if they need true non-blocking.       */
+/* -------------------------------------------------------------------- */
+
+typedef struct nsbc_webhook_sink nsbc_webhook_sink_t;
+
+nsbc_webhook_sink_t *nsbc_webhook_new(const char *url, int timeout_s, int retries);
+void nsbc_webhook_free(nsbc_webhook_sink_t *wh);
+
+/* Send one frame as JSON POST. Blocks until success or retries exhausted.
+ * Returns 1 on HTTP 2xx, 0 otherwise. */
+int nsbc_webhook_send(nsbc_webhook_sink_t *wh, const nsbc_frame_t *frame);
+
+/* Stats counters — atomic reads (not thread-safe, but informative in CLI). */
+int nsbc_webhook_ok(const nsbc_webhook_sink_t *wh);
+int nsbc_webhook_fail(const nsbc_webhook_sink_t *wh);
 
 #ifdef __cplusplus
 }
