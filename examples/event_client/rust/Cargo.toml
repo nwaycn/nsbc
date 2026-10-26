@@ -2,9 +2,18 @@
 name = "nsbc-event-client"
 version = "0.1.0"
 edition = "2021"
+description = "NSBC Event/CDR subscription & originate client with SDK library"
 
-description = "NSBC Unix Domain Socket realtime event/CDR subscription client"
-
-# Zero third-party deps: UnixStream + BufRead + hand-written parsing; CDR body is not JSON-parsed.
-# If you want CDR JSON parsing, add serde_json = "1" under [dependencies].
+# reqwest with rustls-tls — pure Rust TLS (no system OpenSSL dep)
+# blocking feature gives synchronous API that mirrors Python/Go's originate_via_web
 [dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+serde_json = "1"
+
+[lib]
+name = "nsbc_sdk"
+path = "src/lib.rs"
+
+[[bin]]
+name = "event_client"
+path = "src/main.rs"

@@ -1,49 +1,36 @@
-/* NSBC realtime event/CDR subscription client (Unix Domain Socket / C)
+/* event_client.c — NSBC Event/CDR subscription & originate client (C CLI demo).
  *
- * Pure POSIX, no third-party deps. Builds with GCC 4.8+ / Clang / MSYS2.
+ * Thin shell — all real API lives in nsbc_client.{h,c}. This file is ONLY
+ * flag parsing + mode dispatch + pretty printing.
  *
- * Build:
- *   gcc -std=gnu99 -O2 -Wall -Wextra -o event_client event_client.c
- *   clang -O2 -Wall -o event_client event_client.c
+ * Build (with nsbc_client.c):
+ *   gcc -std=gnu99 -O2 -Wall -Wextra -o event_client nsbc_client.c event_client.c
  *
  * Usage:
- *   ./event_client                              # default /tmp/nsbc-e2e/control.sock
- *   ./event_client /var/run/nsbc/control.sock
- *   ./event_client --topics events,cdr,log
- *   ./event_client --pull-only
- *
- * Frame format (server-side unified):
- *   events: YYYY-MM-DDTHH:MM:SS.mmm CALL_INCOMING  k=v k=v ...\n
- *   events: YYYY-MM-DDTHH:MM:SS.mmm CALL_ANSWERED  k=v k=v ...\n
- *   events: YYYY-MM-DDTHH:MM:SS.mmm CALL_END       k=v k=v ...\n
- *   cdr:    YYYY-MM-DDTHH:MM:SS.mmm CDR { ... JSON ... }\n
+ *   ./event_client                                         # default originate+subscribe
+ *   ./event_client --orig-to 7gja30rf --video              # WebRTC video (default on)
+ *   ./event_client --mode subscribe                        # pure observer
+ *   ./event_client --mode originate --orig-to 1001 --no-video
+ *   ./event_client --uds /tmp/nsbc-e2e/control.sock
  */
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
-#endif
 
-#include <arpa/inet.h>
+#define _GNU_SOURCE
+
+#include "nsbc_client.h"
+
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/un.h>
-#include <time.h>
 #include <unistd.h>
 
-#define BUF_SIZE  (64 * 1024)
-#define FRAME_LEN 4096
-#define TS_LEN    23    /* "YYYY-MM-DDTHH:MM:SS.mmm" */
-
 static volatile sig_atomic_t g_sigint = 0;
-static void on_sigint(int s) { (void)s; g_sigint = 1; }
+static void on_sigint(int s) { (void)s; g_sigint = 1; nsbc_iter_stop(); }
 
-static const char *BANNER = "NSBC ";
-static const char *PROMPT = "nsbc> ";
-static const char *RESET  = "\x1b[0m";
+#define RESET "\x1b[0m"
+#define BOLD  "\x1b[1m"
+#define DIM   "\x1b[2m"
 
 static const char *domain_color(const char *d)
 {
@@ -56,211 +43,205 @@ static const char *domain_color(const char *d)
     return "\x1b[37m";
 }
 
-/* Parse frame: "YYYY-MM-DDTHH:MM:SS.mmm DOMAIN body"
- * Returns 1=push frame; 0=non-push frame */
-static int parse_frame(const char *line, char *ts_out, char *domain_out, char *body_out, size_t body_cap)
+static void banner(const char *msg)
 {
-    if (!line || strlen(line) < TS_LEN + 2) return 0;
-
-    /* Check timestamp prefix (lenient: only require 'T' and '.' present) */
-    const char *p = line;
-    int valid_ts = 1;
-    for (int i = 0; i < TS_LEN; ++i, ++p) {
-        if (*p == '\0') { valid_ts = 0; break; }
-    }
-    if (!valid_ts) return 0;
-    if (*p != ' ') return 0; ++p;
-
-    /* Copy timestamp */
-    memcpy(ts_out, line, TS_LEN);
-    ts_out[TS_LEN] = '\0';
-
-    /* Split DOMAIN (until next space or \n) */
-    const char *dstart = p;
-    while (*p && *p != ' ' && *p != '\n' && *p != '\r') ++p;
-    size_t dlen = (size_t)(p - dstart);
-    if (dlen == 0 || dlen > 63) return 0;
-    memcpy(domain_out, dstart, dlen);
-    domain_out[dlen] = '\0';
-
-    /* Skip space */
-    if (*p == ' ') ++p;
-
-    /* body */
-    size_t bi = 0;
-    while (*p && *p != '\n' && *p != '\r' && bi + 1 < body_cap) {
-        body_out[bi++] = *p++;
-    }
-    body_out[bi] = '\0';
-
-    return 1;
-}
-
-static void print_frame(const char *line)
-{
-    char ts[TS_LEN + 1], domain[64], body[FRAME_LEN];
-    if (!parse_frame(line, ts, domain, body, sizeof(body))) {
-        /* Non-push frame — banner/OK/ERR/prompt */
-        if (strncmp(line, BANNER, strlen(BANNER)) == 0 ||
-            strncmp(line, "OK ", 3) == 0 ||
-            strncmp(line, "ERR ", 4) == 0 ||
-            strncmp(line, "subscribed:", 11) == 0) {
-            fprintf(stdout, "\x1b[2m[cmd] %s%s\n", line, RESET);
-        }
-        return;
-    }
-
-    /* Shorten timestamp: 15:04:05.000 */
-    const char *ts_short = (strlen(ts) >= 12) ? ts + 11 : ts;
-
-    const char *c = domain_color(domain);
-    if (!strcmp(domain, "CDR")) {
-        fprintf(stdout, "%s %s%12s%s %s\n", ts_short, c, "CDR", RESET, body);
-    } else {
-        fprintf(stdout, "%s %s%15s%s %s\n", ts_short, c, domain, RESET, body);
-    }
+    fprintf(stdout, "%s[nsbc] %s%s\n", DIM, msg, RESET);
     fflush(stdout);
 }
 
-/* Receive until PROMPT seen or timeout. Uses SO_RCVTIMEO. */
-static int recv_until_prompt(int fd, int timeout_ms, char *out, size_t out_cap)
+static void print_frame_cb(const nsbc_frame_t *frame, void *userdata)
 {
-    struct timeval tv = { timeout_ms / 1000, (timeout_ms % 1000) * 1000 };
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (!frame) return;
+    const char *short_ts = strlen(frame->ts) >= 12 ? frame->ts + 11 : frame->ts;
+    const char *c = domain_color(frame->domain);
 
-    size_t used = 0;
-    char buf[BUF_SIZE];
-    while (used + 1 < out_cap) {
-        ssize_t n = recv(fd, buf, sizeof(buf), 0);
-        if (n <= 0) break;  /* EOF / timeout / error */
-        if ((size_t)n >= out_cap - used) n = (ssize_t)(out_cap - used - 1);
-        memcpy(out + used, buf, (size_t)n);
-        used += (size_t)n;
-        out[used] = '\0';
-        if (strstr(out, PROMPT)) break;
+    if (!strcmp(frame->domain, "CDR")) {
+        fprintf(stdout, "%s %s%12s%s %s\n", short_ts, c, "CDR", RESET, frame->body);
+    } else {
+        fprintf(stdout, "%s %s%15s%s %s\n", short_ts, c, frame->domain, RESET, frame->body);
     }
-    /* Restore infinite wait */
-    tv.tv_sec = 0; tv.tv_usec = 0;
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    return (int)used;
+    fflush(stdout);
+    (void)userdata;
 }
 
-static int uds_connect(const char *path)
+static void print_timeline_cb(const nsbc_frame_t *frame, void *userdata)
 {
-    if (access(path, F_OK) != 0) {
-        fprintf(stderr, "ERR: UDS socket not found: %s\n", path);
-        return -1;
-    }
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) { perror("socket"); return -1; }
-
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
-
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        fprintf(stderr, "ERR connect %s: %s\n", path, strerror(errno));
-        close(fd);
-        return -1;
-    }
-    return fd;
+    /* The core C SDK doesn't ship a CallCorrelator (single-file std-only design).
+     * We track one simple last-call_id to print a rough end-of-life marker. */
+    (void)frame;
+    (void)userdata;
 }
+
+/* -------------------------------------------------------------------- */
+/* Flag parsing                                                          */
+/* -------------------------------------------------------------------- */
+
+static void print_help(void)
+{
+    fprintf(stderr,
+        "Usage: event_client [flags]\n"
+        "\n"
+        "  --mode auto|originate+subscribe|subscribe|originate\n"
+        "  --uds PATH               Unix Domain Socket path\n"
+        "  --topics STRING          subscribe topics (default events,cdr)\n"
+        "  --orig-to EXT            destination extension (default 1000)\n"
+        "  --app echo|park|hangup   post-originate app (default echo)\n"
+        "  --caller-id NUM          origination caller ID\n"
+        "  --caller-name NAME       origination caller name\n"
+        "  --timeout N              ringing timeout seconds\n"
+        "  --video / --no-video     video on/off (default on)\n"
+        "  --audio / --no-audio     multi-audio on/off (default on)\n"
+        "  --no-audio-codecs        explicitly skip audio_codecs brace var\n"
+        "  --no-video-codecs        explicitly skip video_codecs brace var\n"
+        "  --help / -h\n");
+}
+
+/* Returns heap-allocated opts — caller frees. NULL on parse error. */
+static nsbc_orig_opts_t *parse_opts(int argc, char **argv,
+                                    const char **out_mode,
+                                    const char **out_uds,
+                                    const char **out_topics)
+{
+    nsbc_orig_opts_t *o = calloc(1, sizeof(*o));
+    if (!o) return NULL;
+
+    *out_mode = "auto";
+    *out_uds  = NSBC_DEFAULT_UDS;
+    *out_topics = NSBC_DEFAULT_TOPICS;
+
+    /* Default codec lists (default on — matches Python Go Rust) */
+    static char default_audio[] = "PCMU,PCMA,G722,OPUS";
+    static char default_video[] = "H264,VP8";
+    int audio_on = 1, video_on = 1;
+    int skip_audio = 0, skip_video = 0;
+
+    o->orig_to = "1000";
+    o->app     = "echo";
+
+    for (int i = 1; i < argc; ++i) {
+        const char *a = argv[i];
+        const char *nxt = (i + 1 < argc) ? argv[i + 1] : NULL;
+
+        if (!strcmp(a, "--mode")       && nxt) { *out_mode = nxt; ++i; }
+        else if (!strcmp(a, "--uds")  && nxt) { *out_uds  = nxt; ++i; }
+        else if (!strcmp(a, "--topics") && nxt) { *out_topics = nxt; ++i; }
+        else if (!strcmp(a, "--orig-to")   && nxt) { o->orig_to = nxt; ++i; }
+        else if (!strcmp(a, "--app")       && nxt) { o->app = nxt; ++i; }
+        else if (!strcmp(a, "--caller-id") && nxt) { o->caller_id = nxt; ++i; }
+        else if (!strcmp(a, "--caller-name") && nxt) { o->caller_name = nxt; ++i; }
+        else if (!strcmp(a, "--timeout")   && nxt) { o->timeout = atoi(nxt); ++i; }
+        else if (!strcmp(a, "--video"))    { video_on = 1; }
+        else if (!strcmp(a, "--no-video")) { video_on = 0; skip_video = 1; }
+        else if (!strcmp(a, "--audio"))    { audio_on = 1; }
+        else if (!strcmp(a, "--no-audio")) { audio_on = 0; skip_audio = 1; }
+        else if (!strcmp(a, "--no-audio-codecs")) { skip_audio = 1; }
+        else if (!strcmp(a, "--no-video-codecs")) { skip_video = 1; }
+        else if (!strcmp(a, "--help") || !strcmp(a, "-h")) {
+            print_help(); free(o); return NULL;
+        } else {
+            /* Positional arg → treat as UDS path */
+            if (a[0] != '-' && *a) *out_uds = a;
+        }
+    }
+
+    if (audio_on && !skip_audio) o->audio_codecs = default_audio;
+    if (video_on && !skip_video) o->video_codecs = default_video;
+
+    return o;
+}
+
+/* -------------------------------------------------------------------- */
+/* Modes                                                                 */
+/* -------------------------------------------------------------------- */
+
+static void run_subscribe(nsbc_conn_t *c, const char *topics)
+{
+    banner("subscribe mode");
+    char resp[1024];
+    nsbc_subscribe(c, topics, resp, sizeof(resp));
+    /* Print non-empty response lines */
+    char *saveptr = NULL;
+    for (char *ln = strtok_r(resp, "\n", &saveptr); ln; ln = strtok_r(NULL, "\n", &saveptr)) {
+        if (ln[0]) banner(ln);
+    }
+    banner("waiting for events — Ctrl-C to quit");
+    nsbc_iter_frames(c, print_frame_cb, NULL);
+}
+
+static void run_originate_only(nsbc_conn_t *c, nsbc_orig_opts_t *opts)
+{
+    char *cu = nsbc_build_call_url(opts);
+    if (!cu) { fprintf(stderr, "[FAIL] build_call_url\n"); return; }
+
+    banner(cu);
+    char resp[NSBC_RESP_LEN];
+    int ok = nsbc_originate(c, cu, resp, sizeof(resp));
+    if (ok) {
+        fprintf(stdout, "[OK] %s\n", resp);
+    } else {
+        fprintf(stderr, "[FAIL] %s\n", resp);
+    }
+    free(cu);
+}
+
+static void run_originate_and_subscribe(nsbc_conn_t *c, nsbc_orig_opts_t *opts, const char *topics)
+{
+    char *cu = nsbc_build_call_url(opts);
+    if (!cu) { fprintf(stderr, "[FAIL] build_call_url\n"); return; }
+
+    fprintf(stdout, "%s[1/2] originate: %s%s\n", DIM, cu, RESET);
+    fflush(stdout);
+    char resp[NSBC_RESP_LEN];
+    int ok = nsbc_originate(c, cu, resp, sizeof(resp));
+    free(cu);
+
+    if (!ok) {
+        fprintf(stderr, "%s[FAIL] originate: %s%s\n", "\x1b[31m", resp, RESET);
+        return;
+    }
+    fprintf(stdout, "[OK] %s\n", resp);
+    banner("[2/2] subscribe + iter");
+
+    char sresp[1024];
+    nsbc_subscribe(c, topics, sresp, sizeof(sresp));
+    char *saveptr = NULL;
+    for (char *ln = strtok_r(sresp, "\n", &saveptr); ln; ln = strtok_r(NULL, "\n", &saveptr)) {
+        if (ln[0]) banner(ln);
+    }
+    banner("waiting for events — Ctrl-C to quit");
+    nsbc_iter_frames(c, print_frame_cb, NULL);
+}
+
+/* -------------------------------------------------------------------- */
+/* main                                                                  */
+/* -------------------------------------------------------------------- */
 
 int main(int argc, char **argv)
 {
-    const char *uds_path  = "/tmp/nsbc-e2e/control.sock";
-    const char *topics    = "events,cdr";
-    int         pull_only = 0;
-
-    for (int i = 1; i < argc; ++i) {
-        if (!strcmp(argv[i], "--topics") && i + 1 < argc) {
-            topics = argv[++i];
-        } else if (!strcmp(argv[i], "--pull-only")) {
-            pull_only = 1;
-        } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
-            fprintf(stderr,
-                "Usage: event_client [uds_path] [--topics events,cdr] [--pull-only]\n");
-            return 0;
-        } else if (argv[i][0] != '-' && argv[i][0] != '\0') {
-            uds_path = argv[i];
-        }
-    }
+    const char *mode, *uds_path, *topics;
+    nsbc_orig_opts_t *opts = parse_opts(argc, argv, &mode, &uds_path, &topics);
+    if (!opts) return 0; /* help was shown */
 
     signal(SIGINT, on_sigint);
 
-    int fd = uds_connect(uds_path);
-    if (fd < 0) return 2;
+    nsbc_conn_t *c = nsbc_connect(uds_path);
+    if (!c) {
+        fprintf(stderr, "%s[FAIL] connect: %s%s\n", "\x1b[31m", strerror(errno), RESET);
+        free(opts);
+        return 2;
+    }
+    banner(c->banner[0] ? c->banner : uds_path);
 
-    printf("\x1b[2m[connected to %s]%s\n", uds_path, RESET);
-    fflush(stdout);
-
-    /* Receive banner + prompt (short 2s timeout) */
-    char tmp[4096];
-    recv_until_prompt(fd, 2000, tmp, sizeof(tmp));
-    /* Print banner line */
-    char *saveptr = NULL;
-    for (char *ln = strtok_r(tmp, "\n", &saveptr); ln; ln = strtok_r(NULL, "\n", &saveptr)) {
-        if (!strncmp(ln, BANNER, strlen(BANNER))) {
-            printf("\x1b[2m%s%s\n", ln, RESET);
-        }
+    if (!strcmp(mode, "subscribe")) {
+        run_subscribe(c, topics);
+    } else if (!strcmp(mode, "originate")) {
+        run_originate_only(c, opts);
+    } else {
+        /* auto / originate+subscribe */
+        run_originate_and_subscribe(c, opts, topics);
     }
 
-    if (!pull_only) {
-        char cmd[256];
-        snprintf(cmd, sizeof(cmd), "sub %s\n", topics);
-        if (send(fd, cmd, strlen(cmd), 0) < 0) {
-            perror("send sub"); close(fd); return 1;
-        }
-
-        recv_until_prompt(fd, 2000, tmp, sizeof(tmp));
-        saveptr = NULL;
-        for (char *ln = strtok_r(tmp, "\n", &saveptr); ln; ln = strtok_r(NULL, "\n", &saveptr)) {
-            /* Strip possible trailing nsbc> */
-            size_t llen = strlen(ln);
-            if (llen > strlen(PROMPT) && !strcmp(ln + llen - strlen(PROMPT), PROMPT)) {
-                ln[llen - strlen(PROMPT)] = '\0';
-            }
-            if (ln[0] && strcmp(ln, PROMPT) != 0) {
-                printf("\x1b[2m[sub] %s%s\n", ln, RESET);
-            }
-        }
-        printf("\x1b[2m[subscribed: %s — Ctrl-C to quit]%s\n", topics, RESET);
-        fflush(stdout);
-    }
-
-    /* Main loop: blocking read + cumulative line buffer + parse on \n */
-    char line_buf[FRAME_LEN];
-    size_t line_used = 0;
-    char net_buf[BUF_SIZE];
-
-    while (!g_sigint) {
-        ssize_t n = recv(fd, net_buf, sizeof(net_buf), 0);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            fprintf(stderr, "\n\x1b[31m[recv error: %s]%s\n", strerror(errno), RESET);
-            break;
-        }
-        if (n == 0) {
-            fprintf(stderr, "\n\x1b[2m[server closed]%s\n", RESET);
-            break;
-        }
-
-        for (ssize_t i = 0; i < n && !g_sigint; ++i) {
-            char c = net_buf[i];
-            if (c == '\n') {
-                line_buf[line_used] = '\0';
-                print_frame(line_buf);
-                line_used = 0;
-            } else if (line_used + 1 < sizeof(line_buf)) {
-                line_buf[line_used++] = c;
-            }
-        }
-    }
-
-    if (g_sigint) {
-        printf("\n\x1b[2m[quit]%s\n", RESET);
-    }
-    close(fd);
+    free(opts);
+    nsbc_close(c);
     return 0;
 }

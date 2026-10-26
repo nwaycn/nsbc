@@ -1,138 +1,252 @@
-# NSBC Event/CDR Realtime Subscription Client (Multi-language)
+# NSBC Event Client — Multi-Language SDK
 
-This directory contains **four language implementations** of the NSBC control socket
-(Unix Domain Socket) realtime event/CDR subscription client; all four behave
-identically:
+Reference client libraries and CLI demos for NSBC realtime event/CDR
+subscription + originate over **Unix Domain Socket** (same-host) and
+**nsbc-web HTTP API** (remote deployments).
 
-| Language | Directory | Dependencies | Compile / Run |
-|---|---|---|---|
-| **Python** | `python/` | stdlib only | `python3 event_client.py` |
-| **Go** | `go/` | stdlib only | `go run main.go` or `go build -o event_client .` |
-| **Rust** | `rust/` | stdlib only | `cargo run --release --` |
-| **C** | `c/` | POSIX only | `gcc -O2 -Wall -o event_client event_client.c && ./event_client` |
+## Architecture — Library vs Application (every language)
 
-Default socket path is `/tmp/nsbc-e2e/control.sock`; override with `--topics` or a
-positional argument.
+Every language here ships **two** artifacts:
 
----
+| Artifact          | Role                                                                   |
+|-------------------|------------------------------------------------------------------------|
+| **Library / SDK** | Pure API, no print-to-terminal, no argparse, main program agnostic     |
+| **CLI demo**      | argparse + mode dispatch + pretty printing — *consumes* the library     |
 
-## Protocol (server frame format)
-
-All frames pushed by nsbcd through `obs_sub` are **single-line text terminated by
-`\n`** — clients just `readline`.
-
-### Event frames (`sub events`)
+**Caller-facing contract (the SDK part)** — every language implements these
+building blocks. See [API contract](#api-contract) below.
 
 ```
-YYYY-MM-DDTHH:MM:SS.mmm CALL_INCOMING  call_id=... orig=1001 to=1002 src_ip=10.0.0.50 trunk=
-YYYY-MM-DDTHH:MM:SS.mmm CALL_ANSWERED  call_id=... orig=1001 to=1002 trunk=
-YYYY-MM-DDTHH:MM:SS.mmm CALL_END       call_id=... orig=1001 to=1002 trunk= disp=ANSWERED cause=200 duration_s=120 billsec=116
-YYYY-MM-DDTHH:MM:SS.mmm REGISTER       ...
+python/
+├── nsbc_client.py        # Library (NsbccClient, NsbccClientSse, originate(),
+│                         #          build_call_url(), parse_frame(),
+│                         #          CallCorrelator, WebhookSink)
+└── event_client.py       # CLI demo — imports nsbc_client
+
+go/
+├── nsbc_sdk/sdk.go       # Library (Client, Originate, parse_frame, CallCorrelator, WebhookSink)
+├── go.mod
+└── main.go               # CLI demo — imports ./nsbc_sdk
+
+rust/
+├── Cargo.toml            # [lib] nsbc_sdk + [[bin]] event_client
+├── src/lib.rs            # Library (ClientUds, Originate, parse_frame, CallCorrelator)
+└── src/main.rs           # CLI demo
+
+c/
+├── nsbc_client.h         # Public C API (opaque nsbc_conn_t, nsbc_build_call_url, …)
+├── nsbc_client.c         # Implementation
+└── event_client.c        # CLI demo — #include "nsbc_client.h"
 ```
 
-Format: `ISO8601-timestamp  DOMAIN  k=v k=v ...\n`
+## API Contract
 
-### CDR frames (`sub cdr`)
+### 1. Connection
 
+| Python               | Go                      | Rust               | C                          |
+|----------------------|-------------------------|--------------------|----------------------------|
+| `uds = NsbccClientUds(path).connect()` | `c := nsbc_sdk.NewClientUds(path).Connect()` | `ClientUds::new(path)?.connect()?` | `nsbc_conn_t *c = nsbc_connect(path);` |
+| `uds.close()`        | `c.Close()`             | `c.close()`        | `nsbc_close(c);`           |
+
+### 2. Subscribe + receive frames
+
+| Python                     | Go                      | Rust                 | C                               |
+|----------------------------|-------------------------|----------------------|---------------------------------|
+| `uds.subscribe("events,cdr")` | `c.Subscribe("events,cdr")` | `c.subscribe("events,cdr")?` | `nsbc_subscribe(c, "events,cdr", resp, sizeof(resp));` |
+| `for f in uds.iter_frames():` | `ch := make(chan *Frame); go c.IterFrames(ch); for f := range ch { ... }` | `for f in c.iter_frames() { ... }` | `nsbc_iter_frames(c, my_cb, userdata);` |
+
+### 3. Build call_url
+
+| Python | Go | Rust | C |
+|--------|----|------|---|
+| `build_call_url(orig_to="7gja30rf", app="echo", audio=["PCMU",…], video=["H264",…])` | `BuildCallUrl(OriginateOpts{…})` | `build_call_url(OriginateOpts{…})` | `char *cu = nsbc_build_call_url(&(nsbc_orig_opts_t){…}); free(cu);` |
+
+Output:
 ```
-YYYY-MM-DDTHH:MM:SS.mmm CDR {"call_id":"...","from":"1001","to":"1002","phase":"end",
-                             "disposition":"ANSWERED","duration_s":120,"billsec":116,...}
-```
-
-Format: `ISO8601-timestamp CDR <JSON>\n`
-
-The JSON contract matches the Web REST response exactly (see `cdr_event_to_json` in
-[signaling.c](../../../src/core/signaling.c#L892)).
-
-### Log / Metrics frames (`sub log` / `sub metrics`)
-
-- `log`: direct passthrough of the log ring buffer line
-- `metrics`: periodic Prometheus exposition (default 5s)
-
-### Command protocol
-
-After the client connects, nsbcd sends a banner + prompt:
-
-```
-NSBC 2.6.0 control interface (try 'help')
-nsbc> 
-```
-
-Commands are terminated by `\n`; the prompt `nsbc> ` indicates the command has finished.
-
-Realtime subscribe commands:
-
-| Command | Description |
-|---|---|
-| `sub <topics>` | Subscribe to topics (comma-separated: events,cdr,log,metrics) |
-| `unsub [topics]` | Unsubscribe (no arg = unsubscribe all) |
-| `sub.stat` | Inspect subscription state for this connection |
-
-Common pull commands (available in `pull-only` mode):
-
-| Command | Description |
-|---|---|
-| `events [N]` | Pull the most recent N events (default 20) |
-| `show calls` | Active call table |
-| `cdr.recent [N]` | Pull the most recent N completed CDRs (default 500) |
-| `show cdr` | CDR sink aggregate counters |
-
----
-
-## Server-side performance design
-
-| Item | Strategy |
-|---|---|
-| **Zero back-pressure on call thread** | `obs_sub_publish` memcpy frames into each subscriber's independent frame ring (`OBS_SUB_RING=16` per subscriber) inside the lock, drop oldest on full — **never block** |
-| **Slow consumer** | Per-connection independent frame ring; `obs_sub_publish` does an immediate `try flush` (non-blocking `send`, `EAGAIN` → frame ring) |
-| **Frame truncation** | Single frame capped at `OBS_FRAME_MAX=2048` bytes — avoids huge JSON blowing buffers |
-| **Subscriber cap** | `OBS_SUBSCRIBER_MAX=256` concurrent subscribers |
-| **Pull mode** | `obs_event` also writes a ring buffer (`OBS_EVENT_RING=1024`) to support `events N` pull |
-
-### Lock order (deadlock-free)
-
-```
-call_lock (b2bua shard)
-  → obs_event: g_ev.lock → obs_sub_hub.lock
-s->lock (cdr sink) — unlock before publish —
-  → obs_sub_hub.lock
+{audio_codecs=PCMU,PCMA,G722,OPUS,video_codecs=H264,VP8}user/7gja30rf &echo
 ```
 
-The send_fn callback only does `send()`, never recurses into b2b/cdr code — lock order
-is one-directional and safe.
+### 4. Originate (dual path — UDS preferred, HTTP fallback)
 
----
+| Python | Go | Rust | C |
+|--------|----|------|---|
+| `ok, payload, via = originate(call_url, via="auto", uds_path=…, api_base=…)` | `result := nsbc_sdk.Originate(call_url, "auto", uds_path, api_base, token)` | `originate(call_url, "auto", uds, api_base, token)` | `nsbc_originate(c, call_url, resp, sizeof(resp))` — UDS path only |
 
-## Running steps
+### 5. Frame parsing
 
+| Python | Go | Rust | C |
+|--------|----|------|---|
+| `frame = parse_frame(line)` | `f := ParseFrame(line)` | `parse_frame(line)` | `nsbc_frame_t f; nsbc_parse_frame(line, &f);` |
+
+Every language produces a struct/dict with these fields:
+
+| Field   | Type      | Meaning                                                  |
+|---------|-----------|----------------------------------------------------------|
+| `ts`    | string    | `YYYY-MM-DDTHH:MM:SS.mmm`                                |
+| `domain`| string    | `CALL_INCOMING / CALL_ANSWERED / CALL_END / CDR / REGISTER / ERR / OK / subscribed:` |
+| `kind`  | string    | `call / cdr / register / cmd / other`                    |
+| `fields`| dict/struct | `domain == "CDR"` → full JSON; else `k=v` pairs          |
+| `raw`   | string    | original line                                             |
+
+### 6. Correlator / WebhookSink (Python + Go + Rust)
+
+| Python                 | Go                              | Rust                          | C |
+|------------------------|---------------------------------|-------------------------------|---|
+| `c = CallCorrelator(on_complete=timeline_cb)` | `c := nsbc_sdk.NewCallCorrelator(timeline_cb)` | `CallCorrelator::new(timeline_cb)` | (zero-dep design choice) |
+| `c.feed(frame)`        | `c.Feed(f)`                     | `c.feed(&frame)`              |   |
+
+| Python                | Go                            | Rust                                    | C |
+|-----------------------|-------------------------------|-----------------------------------------|---|
+| `w = WebhookSink(url, timeout=5, retries=2)` | `w := nsbc_sdk.NewWebhookSink(url, 5, 2)` | `WebhookSink::new(url, 5, 2)` | (zero-dep design choice) |
+| `w.send(frame)`       | `w.Send(f)`                   | `w.send(&frame)`                        |   |
+
+### 7. HTTP-only features (Python + Go + Rust)
+
+| Feature       | Python | Go | Rust | C  |
+|---------------|--------|----|------|----|
+| `originate_via_web()` | ✅     | ✅  | ✅   | ❌ |
+| `WebhookSink`          | ✅     | ✅  | ✅   | ❌ |
+| `NsbccClientSse` / `SseClient` | ✅ | ✅  | ✅   | ❌ |
+| `sse_event_to_frame()` | ✅   | ✅  | ✅   | ❌ |
+
+All three now cover SSE remote deployments — same Python SSE protocol spec
+(empty-line dispatch, `data:` leading-space trim, multi-line join, auto-reconnect).
+
+## Codec Defaults
+
+The Python / Go / Rust CLI demos all default to **WebRTC-safe** codec sets
+— `--video` and `--audio` default *on* (matching real-world WebRTC originate).
+
+| Flag              | Python default | Go default | Rust default | C default |
+|-------------------|----------------|------------|--------------|-----------|
+| `--video`         | True (H264,VP8)| True       | True         | True      |
+| `--audio`         | True (PCMU,PCMA,G722,OPUS) | True | True | True |
+| `--no-video`      | off            | off        | off          | off       |
+| `--no-audio`      | off            | off        | off          | off       |
+
+Explicit codec lists override via `--video-codecs H264,VP8` / `--audio-codecs PCMU,PCMA`
+(Python only — Go/Rust/C CLI flags follow the CLI args you give).
+
+## Build + Run
+
+### Python (stdlib only, no install)
 ```bash
-# 1. start nsbcd
-nsbcd -c /tmp/nsbc-e2e/nsbc.yaml
-
-# 2. pick any client (on the same machine or forward UDS over TCP across hosts)
-cd examples/event_client/python   && python3 event_client.py
-cd examples/event_client/go       && go run main.go
-cd examples/event_client/rust     && cargo run --release --
-cd examples/event_client/c        && gcc -O2 -o event_client event_client.c && ./event_client
-
-# 3. register a soft phone with nsbcd and place a call
-#    alice (10.0.0.50) → dial bob
-#    client should see CALL_INCOMING → CALL_ANSWERED → CDR → CALL_END
+python3 event_client.py --orig-to 7gja30rf --app echo           # default video on
+python3 event_client.py --mode subscribe                          # pure observer
+python3 event_client.py --mode originate --orig-to 1001 --no-video
+python3 event_client.py --mode subscribe --transport sse \
+    --sse-url http://nsbc-web:8080/calls/stream --webhook-url ...
 ```
 
----
+### Go
+```bash
+cd go && go build ./...
+./main --orig-to 7gja30rf                                        # Linux
+```
 
-## Comparison with FreeSWITCH event_socket
+### Rust
+```bash
+cd rust && cargo run --release -- --orig-to 7gja30rf
+```
+Note: Rust binary compiles on Windows (Cargo verifies), but Unix stream
+transport only functions on Linux / macOS / WSL.
 
-| Item | FreeSWITCH | NSBC |
-|---|---|---|
-| Transport | TCP (TLS optional) | **Unix Domain Socket** (P0); TCP later |
-| Auth | `auth <password>` | File permissions 0600 (root-only socket); TCP later adds token |
-| Subscribe command | `event plain ALL` | `sub events,cdr` |
-| Push frame format | `Content-Type: ... \n\nBODY` | Single-line `YYYY..SS.mmm DOMAIN body\n` |
-| Slow-consumer policy | Back-pressure (blocks call thread) | **Drop-oldest frame ring, never back-pressure** |
-| Event set | CHANNEL_CREATE/BEGIN/ANSWER/HANGUP/HANGUP_COMPLETE + 200+ | **Minimal set** CALL_INCOMING/ANSWERED/END + REGISTER |
-| CDR | Separate CDR socket or `cdr_csv` | **Same channel** `sub cdr`, with ISO8601 timestamp header |
+### C
+```bash
+cd c
+gcc -std=gnu99 -O2 -Wall -Wextra -o event_client nsbc_client.c event_client.c
+./event_client --orig-to 7gja30rf                                # Linux only (UnixStream)
+```
 
-NSBC intentionally keeps the event set minimal — 99% of real operations only need the
-three call-lifecycle events + final CDR record.
+## Write Your Own Caller — Example Snippets
+
+### Python — own minimal integration (library-only, no CLI)
+```python
+from nsbc_client import NsbccClientUds, parse_frame, CallCorrelator, originate, build_call_url
+
+uds = NsbccClientUds("/var/run/nsbc/control.sock").connect()
+uds.subscribe("events,cdr")
+
+cu = build_call_url(orig_to="7gja30rf", app="echo", video=["H264","VP8"])
+ok, payload, via = originate(cu)
+print(f"dispatched via={via}: {payload}")
+
+corr = CallCorrelator(on_complete=lambda tl: print(tl))
+for raw in uds.iter_frames():
+    f = parse_frame(raw)
+    corr.feed(f)
+uds.close()
+```
+
+### Go — own minimal integration
+```go
+import "event_client/nsbc_sdk"
+
+c, _ := nsbc_sdk.NewClientUds("/var/run/nsbc/control.sock").Connect()
+c.Subscribe("events,cdr")
+
+cu := nsbc_sdk.BuildCallUrl(nsbc_sdk.OriginateOpts{
+    OrigTo: "7gja30rf", App: "echo",
+    Video: []string{"H264", "VP8"},
+})
+r := nsbc_sdk.Originate(cu, "auto", "/var/run/nsbc/control.sock",
+                        "https://127.0.0.1:443", "")
+fmt.Printf("ok=%v via=%s\n", r.OK, r.Via)
+
+corr := nsbc_sdk.NewCallCorrelator(timelineCb)
+frameCh := make(chan *nsbc_sdk.Frame)
+go c.IterFrames(frameCh)
+for f := range frameCh { corr.Feed(f) }
+```
+
+### C — own minimal integration
+```c
+#include "nsbc_client.h"
+
+nsbc_conn_t *c = nsbc_connect("/var/run/nsbc/control.sock");
+nsbc_subscribe(c, "events,cdr", NULL, 0);
+
+nsbc_orig_opts_t opts = {
+    .orig_to = "7gja30rf", .app = "echo",
+    .video_codecs = "H264,VP8", .audio_codecs = "PCMU,PCMA,G722,OPUS",
+};
+char *cu = nsbc_build_call_url(&opts);
+char resp[1024];
+nsbc_originate(c, cu, resp, sizeof(resp)); free(cu);
+
+nsbc_iter_frames(c, my_frame_cb, NULL);
+nsbc_close(c);
+```
+
+## Known Limits
+
+| Item                   | Python | Go    | Rust | C     | Root cause                                    |
+|------------------------|--------|-------|------|-------|-----------------------------------------------|
+| UDS subscribe + frame iter | ✅    | ✅     | ✅    | ✅    |                                               |
+| Originate dual-path (UDS+HTTP) | ✅  | ✅     | ✅    | ⚠️ UDS | C: zero-dep design choice                      |
+| CallCorrelator         | ✅      | ✅     | ✅    | ❌    | C: zero-dep design choice                      |
+| WebhookSink (HTTP)     | ✅      | ✅     | ✅    | ❌    | C: zero-dep design choice                      |
+| SSE transport (remote) | ✅      | ✅     | ✅    | ❌    | C: zero-dep design choice                      |
+| TLS verify toggle      | ✅      | ✅     | ✅    | ❌    | C: no TLS layer                               |
+| Non-Unix (Windows)     | ✅      | ✅ stub | stub | stub | UnixStream is Unix-only; stubs return clear err |
+| Third-party deps       | 0       | 0      | reqwest+serde_json | 0      | Rust opts into reqwest for HTTP               |
+
+### Root-cause legend
+
+- **"❌" = deliberately omitted** (C zero-dep design, changes the build story from `gcc single-file` to `pkg-config -lcurl`).
+- **"❌" = fundamental platform constraint** (UnixStream on Windows — std doesn't ship it).
+
+Python / Go / Rust all provide the full **dual-path originate → UDS preferred, HTTP fallback**
+stack + SSE remote deployments + CallCorrelator + WebhookSink + TLS verify toggle. C stays lean.
+
+**Unix Domain Socket**: `AF_UNIX` stream. Text protocol:
+- connect → nsbcd sends banner + `nsbc> ` prompt
+- send `sub <topics>\n` → server echoes, then `nsbc> `
+- server pushes `YYYY-MM-DDTHH:MM:SS.mmm <DOMAIN> <body>\n` lines
+- any other command follows `cmd\n` → response lines → `nsbc> `
+
+**nsbc-web HTTP**: `POST {api_base}/ext/v1/originate` JSON `{"call_url":"..."}`.
+SSE stream: `GET {api_base}/calls/stream` emits `event: session` JSON payloads.
+
+Frame body is either `k=v k=v ...` (events) or full JSON (CDR). Every SDK
+parses both into the same `Frame` struct.
