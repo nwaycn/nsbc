@@ -362,3 +362,452 @@ int nsbc_originate(nsbc_conn_t *c, const char *call_url,
     if (strncmp(r, "ERR", 3) == 0 || strstr(r, "ERR ")) return 0;
     return 1; /* no OK/ERR but also no timeout → treat as dispatched (async) */
 }
+
+/* ===================================================================== */
+/* HTTP + SSE (canonical external integration surface — requires curl)   */
+/* ===================================================================== */
+
+#ifdef NSBC_WITH_CURL
+
+#include <curl/curl.h>
+#include "cJSON.h"
+
+/* Global TLS verify toggle */
+static int g_ssl_verify = 1;
+
+void nsbc_set_ssl_verify(int verify) { g_ssl_verify = verify; }
+
+/* -------------------------------------------------------------------- */
+/* libcurl helpers — write callbacks for HTTP originate + SSE streaming  */
+/* -------------------------------------------------------------------- */
+
+struct buf { char *data; size_t len; };
+
+static size_t buf_write_cb(void *ptr, size_t size, size_t nmemb, void *userdata)
+{
+    size_t n = size * nmemb;
+    struct buf *b = (struct buf *)userdata;
+    char *p = realloc(b->data, b->len + n + 1);
+    if (!p) return 0;
+    b->data = p;
+    memcpy(b->data + b->len, ptr, n);
+    b->len += n;
+    b->data[b->len] = '\0';
+    return n;
+}
+
+/* Set common curl opts (URL, TLS verify, timeouts). Caller sets method/body. */
+static CURL *curl_common(const char *url, int timeout_s)
+{
+    CURL *h = curl_easy_init();
+    if (!h) return NULL;
+    curl_easy_setopt(h, CURLOPT_URL, url);
+    curl_easy_setopt(h, CURLOPT_TIMEOUT, (long)timeout_s);
+    curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT, (long)(timeout_s > 10 ? 10 : timeout_s));
+    curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, buf_write_cb);
+    if (!g_ssl_verify) {
+        curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_easy_setopt(h, CURLOPT_SSL_VERIFYHOST, 0L);
+    }
+    return h;
+}
+
+/* -------------------------------------------------------------------- */
+/* HTTP originate                                                        */
+/* -------------------------------------------------------------------- */
+
+int nsbc_originate_via_web(const char *api_base, const char *call_url,
+                            int timeout_s, const char *api_token,
+                            char **payload_out)
+{
+    if (!api_base || !call_url) return 0;
+    if (payload_out) *payload_out = NULL;
+
+    /* Build URL: api_base + /ext/v1/originate */
+    size_t alen = strlen(api_base);
+    while (alen > 0 && api_base[alen - 1] == '/') --alen;
+    char url[512];
+    snprintf(url, sizeof(url), "%.*s/ext/v1/originate", (int)alen, api_base);
+
+    /* Build JSON body: {"call_url": "..."} */
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "call_url", call_url);
+    char *body = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!body) return 0;
+
+    CURL *h = curl_common(url, timeout_s);
+    if (!h) { free(body); return 0; }
+
+    curl_slist *hdrs = NULL;
+    hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
+    hdrs = curl_slist_append(hdrs, "Accept: application/json");
+    if (api_token && *api_token) {
+        char auth[512];
+        snprintf(auth, sizeof(auth), "Authorization: Bearer %s", api_token);
+        hdrs = curl_slist_append(hdrs, auth);
+    }
+    curl_easy_setopt(h, CURLOPT_HTTPHEADER, hdrs);
+    curl_easy_setopt(h, CURLOPT_POSTFIELDS, body);
+    curl_easy_setopt(h, CURLOPT_POSTFIELDSIZE, (long)strlen(body));
+    curl_easy_setopt(h, CURLOPT_CUSTOMREQUEST, "POST");
+
+    struct buf resp = { NULL, 0 };
+    curl_easy_setopt(h, CURLOPT_WRITEDATA, &resp);
+
+    CURLcode rc = curl_easy_perform(h);
+    long http_code = 0;
+    curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_easy_cleanup(h);
+    curl_slist_free_all(hdrs);
+    free(body);
+
+    if (rc != CURLE_OK) {
+        free(resp.data);
+        return 0;
+    }
+    if (http_code >= 400) {
+        free(resp.data);
+        return 0;
+    }
+
+    if (payload_out) *payload_out = resp.data; else free(resp.data);
+    return 1;
+}
+
+/* -------------------------------------------------------------------- */
+/* Dual-path originate                                                   */
+/* -------------------------------------------------------------------- */
+
+int nsbc_originate_dual(const char *call_url, const char *via,
+                        const char *uds_path, const char *api_base,
+                        const char *api_token, char **via_out)
+{
+    if (!call_url) return 0;
+    if (via_out) *via_out = NULL;
+
+    int ok = 0;
+    const char *used_via = "web";
+
+    if (!via || !strcmp(via, "auto") || !strcmp(via, "uds")) {
+        /* Try UDS first */
+        if (uds_path && !access(uds_path, F_OK)) {
+            nsbc_conn_t *c = nsbc_connect(uds_path);
+            if (c) {
+                char resp[NSBC_RESP_LEN];
+                ok = nsbc_originate(c, call_url, resp, sizeof(resp));
+                nsbc_close(c);
+                used_via = "uds";
+            }
+        }
+        /* UDS failed → HTTP fallback (unless via was explicitly "uds") */
+        if (!ok && (!via || !strcmp(via, "auto"))) {
+            char *pl = NULL;
+            ok = nsbc_originate_via_web(api_base, call_url, 10, api_token, &pl);
+            free(pl);
+            used_via = "web";
+        }
+    } else if (!strcmp(via, "web")) {
+        char *pl = NULL;
+        ok = nsbc_originate_via_web(api_base, call_url, 10, api_token, &pl);
+        free(pl);
+        used_via = "web";
+    }
+
+    if (via_out) *via_out = strdup(used_via);
+    return ok;
+}
+
+/* -------------------------------------------------------------------- */
+/* SSE stream consumer (auto-reconnect, callback per frame)             */
+/* -------------------------------------------------------------------- */
+
+/* Accumulated SSE parse state across multiple curl write callback invocations */
+struct sse_state {
+    char *buf;                /* growing line buffer */
+    size_t len;
+    char event_name[64];      /* "message" is default */
+    char *data_lines[32];     /* up to 32 data lines */
+    int   data_line_count;
+    int   retry_ms;
+    int   retry_set;
+    nsbc_frame_cb_t cb;
+    void *userdata;
+};
+
+static void sse_state_init(struct sse_state *s)
+{
+    memset(s, 0, sizeof(*s));
+    s->event_name[0] = '\0';
+}
+
+static void sse_state_free(struct sse_state *s)
+{
+    free(s->buf);
+    for (int i = 0; i < s->data_line_count; i++) free(s->data_lines[i]);
+}
+
+static void sse_state_reset_event(struct sse_state *s)
+{
+    s->event_name[0] = '\0';
+    for (int i = 0; i < s->data_line_count; i++) free(s->data_lines[i]);
+    s->data_line_count = 0;
+    s->retry_set = 0;
+}
+
+/* Parse one complete SSE event and call cb. data_lines joined by "\n". */
+static void sse_dispatch_event(struct sse_state *s)
+{
+    char ev_name[64] = "message";
+    if (s->event_name[0]) snprintf(ev_name, sizeof(ev_name), "%s", s->event_name);
+
+    if (s->cb && (s->data_line_count > 0 || strcmp(ev_name, "message") != 0)) {
+        /* Join data lines */
+        size_t total = 0;
+        for (int i = 0; i < s->data_line_count; i++) total += strlen(s->data_lines[i]) + 1;
+        char *joined = malloc(total + 1);
+        if (joined) {
+            joined[0] = '\0';
+            for (int i = 0; i < s->data_line_count; i++) {
+                if (i > 0) strcat(joined, "\n");
+                strcat(joined, s->data_lines[i]);
+            }
+            nsbc_frame_t f;
+            if (nsbc_sse_event_to_frame(joined, &f) && s->cb) s->cb(&f, s->userdata);
+            free(joined);
+        }
+    }
+    sse_state_reset_event(s);
+}
+
+/* Write callback for SSE stream — line-buffers, dispatches on empty line */
+static size_t sse_write_cb(void *ptr, size_t size, size_t nmemb, void *userdata)
+{
+    size_t n = size * nmemb;
+    struct sse_state *s = (struct sse_state *)userdata;
+
+    /* Append to line buffer */
+    char *p = realloc(s->buf, s->len + n + 1);
+    if (!p) return 0;
+    s->buf = p;
+    memcpy(s->buf + s->len, ptr, n);
+    s->len += n;
+    s->buf[s->len] = '\0';
+
+    /* Process complete lines (those terminated by \n or \r\n) */
+    char *start = s->buf;
+    char *eol;
+    while ((eol = strchr(start, '\n')) != NULL) {
+        *eol = '\0';
+        size_t ll = (size_t)(eol - start);
+        /* Strip trailing \r */
+        if (ll > 0 && start[ll - 1] == '\r') start[ll - 1] = '\0';
+
+        if (start[0] == '\0') {
+            /* Empty line → dispatch if we accumulated anything */
+            sse_dispatch_event(s);
+        } else if (start[0] == ':') {
+            /* SSE comment → skip */
+        } else if (!strncmp(start, "event:", 6)) {
+            const char *v = start + 6;
+            while (*v == ' ') ++v;
+            snprintf(s->event_name, sizeof(s->event_name), "%s", *v ? v : "message");
+        } else if (!strncmp(start, "data:", 5)) {
+            const char *v = start + 5;
+            if (*v == ' ') ++v;
+            if (s->data_line_count < 32) {
+                s->data_lines[s->data_line_count++] = strdup(v);
+            }
+        } else if (!strncmp(start, "retry:", 6)) {
+            const char *v = start + 6;
+            while (*v == ' ') ++v;
+            s->retry_ms = (int)atol(v);
+            s->retry_set = 1;
+        }
+        start = eol + 1;
+    }
+    /* Remove consumed bytes from buffer */
+    if (start > s->buf) {
+        size_t consumed = (size_t)(start - s->buf);
+        memmove(s->buf, start, s->len - consumed + 1);
+        s->len -= consumed;
+    }
+    return n;
+}
+
+nsbc_rc_t nsbc_sse_iter(const char *sse_url, int timeout_s,
+                        const char *api_token,
+                        nsbc_frame_cb_t cb, void *userdata)
+{
+    if (!sse_url || !cb) return NSBC_ERR_INVALID_ARG;
+    if (timeout_s <= 0) timeout_s = 30;
+
+    signal(SIGINT, on_sigint);
+
+    while (!g_stop) {
+        /* One connection — run until disconnect or signal */
+        CURL *h = curl_common(sse_url, timeout_s);
+        if (!h) return NSBC_ERR_HTTP;
+
+        curl_slist *hdrs = NULL;
+        hdrs = curl_slist_append(hdrs, "Accept: text/event-stream");
+        hdrs = curl_slist_append(hdrs, "Cache-Control: no-cache");
+        if (api_token && *api_token) {
+            char auth[512];
+            snprintf(auth, sizeof(auth), "Authorization: Bearer %s", api_token);
+            hdrs = curl_slist_append(hdrs, auth);
+        }
+        curl_easy_setopt(h, CURLOPT_HTTPHEADER, hdrs);
+        curl_easy_setopt(h, CURLOPT_CUSTOMREQUEST, "GET");
+
+        struct sse_state s;
+        sse_state_init(&s);
+        s.cb = cb;
+        s.userdata = userdata;
+        curl_easy_setopt(h, CURLOPT_WRITEDATA, &s);
+        curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, sse_write_cb);
+
+        CURLcode rc = curl_easy_perform(h);
+        curl_easy_cleanup(h);
+        curl_slist_free_all(hdrs);
+        sse_state_free(&s);
+
+        if (g_stop) break;
+        if (rc != CURLE_OK) {
+            fprintf(stderr, "[sse] curl error: %s — reconnecting in 3s\n", curl_easy_strerror(rc));
+        }
+        sleep(3);
+    }
+    return NSBC_OK;
+}
+
+/* -------------------------------------------------------------------- */
+/* SSE event JSON → canonical frame                                       */
+/* -------------------------------------------------------------------- */
+
+int nsbc_sse_event_to_frame(const char *sse_json, nsbc_frame_t *frame)
+{
+    if (!sse_json || !frame) return 0;
+    memset(frame, 0, sizeof(*frame));
+
+    cJSON *root = cJSON_Parse(sse_json);
+    if (!root) return 0;
+
+    cJSON *kind_outer = cJSON_GetObjectItemCaseSensitive(root, "kind");
+    cJSON *payload = cJSON_GetObjectItemCaseSensitive(root, "payload");
+    if (!payload) payload = root; /* some deployments put payload directly */
+
+    /* Map sse event → domain */
+    cJSON *evt = cJSON_GetObjectItemCaseSensitive(payload, "event");
+    const char *sse_evt = (evt && evt->valuestring) ? evt->valuestring : "";
+    const char *domain_map[] = { "ring","CALL_INCOMING", "answer","CALL_ANSWERED",
+                                  "hangup","CALL_END", "originate","CALL_OUTGOING", NULL };
+    const char *domain = NULL;
+    for (int i = 0; domain_map[i]; i += 2) {
+        if (!strcasecmp(sse_evt, domain_map[i])) { domain = domain_map[i + 1]; break; }
+    }
+    if (!domain) {
+        if (sse_evt[0]) domain = sse_evt;
+        else if (kind_outer && kind_outer->valuestring) domain = kind_outer->valuestring;
+        else domain = "EVENT";
+    }
+    snprintf(frame->domain, sizeof(frame->domain), "%s", domain);
+    classify(frame->domain, frame->kind, sizeof(frame->kind));
+
+    /* ts */
+    cJSON *tsj = cJSON_GetObjectItemCaseSensitive(payload, "ts");
+    if (!tsj) tsj = cJSON_GetObjectItemCaseSensitive(payload, "timestamp");
+    if (tsj && tsj->valuestring && strlen(tsj->valuestring) >= 23) {
+        memcpy(frame->ts, tsj->valuestring, 23);
+        frame->ts[23] = '\0';
+    } else {
+        time_t now = time(NULL);
+        struct tm tm;
+        gmtime_r(&now, &tm);
+        snprintf(frame->ts, sizeof(frame->ts),
+                 "%04d-%02d-%02dT%02d:%02d:%02d.000",
+                 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                 tm.tm_hour, tm.tm_min, tm.tm_sec);
+    }
+
+    /* body = compact payload JSON */
+    char *pstr = cJSON_PrintUnformatted(payload);
+    if (pstr) {
+        snprintf(frame->body, sizeof(frame->body), "%s", pstr);
+        free(pstr);
+    }
+
+    /* raw = full SSE JSON */
+    char *rstr = cJSON_PrintUnformatted(root);
+    if (rstr) {
+        snprintf(frame->raw, sizeof(frame->raw), "%s", rstr);
+        free(rstr);
+    }
+
+    cJSON_Delete(root);
+    return 1;
+}
+
+/* ===================================================================== */
+/* Stub implementations when compiled WITHOUT libcurl                    */
+/* ===================================================================== */
+
+#else /* !NSBC_WITH_CURL */
+
+void nsbc_set_ssl_verify(int verify) { (void)verify; /* no-op without curl */ }
+
+int nsbc_originate_via_web(const char *api_base, const char *call_url,
+                            int timeout_s, const char *api_token,
+                            char **payload_out)
+{
+    (void)api_base; (void)call_url; (void)timeout_s;
+    (void)api_token; (void)payload_out;
+    fprintf(stderr, "[nsbc] HTTP path requires building with -DNSBC_WITH_CURL -lcurl\n");
+    return 0;
+}
+
+int nsbc_originate_dual(const char *call_url, const char *via,
+                        const char *uds_path, const char *api_base,
+                        const char *api_token, char **via_out)
+{
+    if (!call_url) return 0;
+    if (via_out) *via_out = NULL;
+
+    /* Without curl: only UDS path works. "web" or "auto-without-uds" fails. */
+    if (via && !strcmp(via, "web")) {
+        fprintf(stderr, "[nsbc] HTTP path requires building with -DNSBC_WITH_CURL -lcurl\n");
+        return 0;
+    }
+    if (!uds_path || access(uds_path, F_OK) != 0) {
+        fprintf(stderr, "[nsbc] no UDS at %s and no curl built in\n",
+                uds_path ? uds_path : "(null)");
+        return 0;
+    }
+
+    nsbc_conn_t *c = nsbc_connect(uds_path);
+    if (!c) return 0;
+    char resp[NSBC_RESP_LEN];
+    int ok = nsbc_originate(c, call_url, resp, sizeof(resp));
+    nsbc_close(c);
+    if (via_out) *via_out = strdup("uds");
+    return ok;
+}
+
+nsbc_rc_t nsbc_sse_iter(const char *sse_url, int timeout_s,
+                        const char *api_token,
+                        nsbc_frame_cb_t cb, void *userdata)
+{
+    (void)sse_url; (void)timeout_s; (void)api_token;
+    (void)cb; (void)userdata;
+    fprintf(stderr, "[nsbc] SSE requires building with -DNSBC_WITH_CURL -lcurl\n");
+    return NSBC_ERR_NO_CURL;
+}
+
+int nsbc_sse_event_to_frame(const char *sse_json, nsbc_frame_t *frame)
+{
+    (void)sse_json; (void)frame;
+    fprintf(stderr, "[nsbc] SSE JSON parsing requires building with -DNSBC_WITH_CURL\n");
+    return 0;
+}
+
+#endif /* NSBC_WITH_CURL */

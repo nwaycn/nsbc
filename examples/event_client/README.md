@@ -314,25 +314,42 @@ wh.stop();
 
 ## Known Limits
 
-| Item                   | Python | Go    | Rust | C     | Java  | Root cause                                    |
-|------------------------|--------|-------|------|-------|-------|-----------------------------------------------|
-| UDS subscribe + iter  | ✅      | ✅     | ✅    | ✅     | ❌     | Java 8 stdlib has no Unix Socket API            |
-| Originate dual-path    | ✅      | ✅     | ✅    | ⚠️ UDS | ⚠️ HTTP only | C/Java: each picks path matching its target    |
-| CallCorrelator         | ✅      | ✅     | ✅    | ❌     | ✅     | C: zero-dep design choice                      |
-| WebhookSink (HTTP)     | ✅      | ✅     | ✅    | ❌     | ✅     | C: zero-dep design choice                      |
-| SSE transport (remote) | ✅      | ✅     | ✅    | ❌     | ✅     | C: zero-dep design choice                      |
-| TLS verify toggle      | ✅      | ✅     | ✅    | ❌     | ✅     | C: no TLS layer; Java: Trust-all trustmanager |
-| Non-Unix (Windows)     | ✅      | ✅ stub | stub | stub   | ✅    | UnixStream / AF_UNIX are platform-only; Java no UDS so clean |
-| Third-party deps       | 0       | 0      | reqwest+serde_json | 0 | 0 | Rust opts into reqwest for HTTP/TLS           |
+| Item                   | Python | Go    | Rust | C                      | Java  | Root cause                                    |
+|------------------------|--------|-------|------|------------------------|-------|-----------------------------------------------|
+| UDS subscribe + iter  | ✅      | ✅     | ✅    | ✅                       | ❌     | Java 8 stdlib has no Unix Socket API            |
+| Originate dual-path    | ✅      | ✅     | ✅    | ⚠️ conditional          | ⚠️ HTTP only | C: HTTP path needs -DNSBC_WITH_CURL             |
+| CallCorrelator         | ✅      | ✅     | ✅    | ❌                       | ✅     | C: pure event_client scope, no aggregation     |
+| WebhookSink (HTTP)     | ✅      | ✅     | ✅    | ❌                       | ✅     | C: pure event_client scope, fire-and-forget    |
+| SSE transport (remote) | ✅      | ✅     | ✅    | ✅ conditional           | ✅     | C: needs -DNSBC_WITH_CURL -lcurl              |
+| TLS verify toggle      | ✅      | ✅     | ✅    | ✅ conditional           | ✅     | C: TLS via libcurl, skip with nsbc_set_ssl_verify(0) |
+| Non-Unix (Windows)     | ✅      | ✅ stub | stub | stub (no AF_UNIX)       | ✅     | UnixStream / AF_UNIX are platform-only; C libcurl path works on Windows |
+| Third-party deps       | 0       | 0      | reqwest+serde_json | 0 / libcurl (opt-in) | 0 | Rust opts into reqwest for HTTP/TLS; C opts into libcurl via -DNSBC_WITH_CURL |
 
 ### Root-cause legend
 
-- **"❌" = deliberately omitted** (C stays zero-dep `gcc single-file`; Java targets call-center integrations that use nsbc-web HTTP/SSE exclusively — no host filesystem access to UDS).
+- **"❌" = deliberately omitted / out of scope** (C event_client is focused on UDS + CLI demo; CallCorrelator/WebhookSink are useful building blocks but not required for a working client).
+- **"⚠️ conditional" = opt-in compile flag required** (`-DNSBC_WITH_CURL -lcurl` + vendored `cJSON.c`). Without the flag, the C client builds zero-dep and UDS-only; with it, full HTTP/SSE surface.
 - **"❌" = platform constraint** (Unix Domain Socket is Unix kernel feature, not available on Windows; Java 16+ added std UnixDomainSocketAddress but Java 8 LTS is still the most common deployment target).
 
-**Python / Go / Rust** cover both local-debug (UDS) and remote-integration (HTTP/SSE) paths.
-**C** covers local-debug / embedded same-host (UDS only, zero-dep build story).
-**Java** covers the correct production interface for external call-center integrations (HTTP/SSE only, zero third-party deps). All three languages share the nsbc-web HTTP + SSE surface that external integrations actually use.
+### Two build paths for C
+
+```bash
+# Path 1: Zero-dep UDS only (local-debug, same-host nsbcd)
+gcc -std=gnu99 -O2 -Wall -Wextra -o event_client nsbc_client.c event_client.c
+./event_client --uds /var/run/nsbc/control.sock --mode subscribe
+
+# Path 2: Full HTTP + SSE (canonical external surface — libcurl)
+sudo apt-get install libcurl4-openssl-dev   # Debian/Ubuntu
+gcc -DNSBC_WITH_CURL -std=gnu99 -O2 -Wall -Wextra \
+    cJSON.c nsbc_client.c event_client.c \
+    -o event_client -lcurl
+./event_client --transport sse --api-base https://nsbc-web:443 \
+    --api-token YOUR_BEARER --insecure --mode subscribe
+```
+
+Python / Go / Rust cover both local-debug (UDS) and remote-integration (HTTP/SSE) paths.
+**C** offers both paths — zero-dep UDS for embedded same-host tooling, and full HTTP/SSE when linked with libcurl for external call-center integrations.
+**Java** covers the correct production interface for external call-center integrations (HTTP/SSE only, zero third-party deps).
 
 **Unix Domain Socket**: `AF_UNIX` stream. Text protocol:
 - connect → nsbcd sends banner + `nsbc> ` prompt

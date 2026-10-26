@@ -1,25 +1,28 @@
 /* nsbc_client.h — NSBC Unified Client Library (C)
  *
- * Public API for NSBC realtime event/CDR subscription + originate over
- * Unix Domain Socket. Pure POSIX, no third-party deps.
+ * Public API for NSBC realtime event/CDR subscription + originate.
  *
- * Build:
- *   gcc -std=gnu99 -O2 -Wall -Wextra -c nsbc_client.c -o nsbc_client.o
- *   gcc -std=gnu99 -O2 -Wall -Wextra -c event_client.c -o event_client.o
- *   gcc nsbc_client.o event_client.o -o event_client
+ * Two build paths:
+ *
+ *   1) ZERO-DEP (UDS only, local-debug same-host):
+ *      gcc -std=gnu99 -O2 -Wall -Wextra nsbc_client.c event_client.c -o event_client
+ *      No external deps. Works on any Unix with AF_UNIX.
+ *
+ *   2) HTTP/SSE (full canonical surface — requires libcurl):
+ *      sudo apt-get install libcurl4-openssl-dev   # Debian/Ubuntu
+ *      gcc -DNSBC_WITH_CURL -std=gnu99 -O2 -Wall -Wextra \
+ *          cJSON.c nsbc_client.c event_client.c \
+ *          -o event_client -lcurl
+ *      cJSON (public-domain single-file JSON parser) is vendored in c/.
+ *      libcurl provides HTTPS + SSE. Build on any OS with libcurl (Unix + Windows).
  *
  * Thread model: single-threaded. Callbacks fire on the iter loop thread.
  * No mutexes, no async I/O, no closures — plain C.
  *
- * Usage (library-only, no CLI):
- *   #include "nsbc_client.h"
- *   nsbc_conn_t *c = nsbc_connect("/var/run/nsbc/control.sock");
- *   nsbc_subscribe(c, "events,cdr");
- *   char *cu = nsbc_build_call_url(&opts);
- *   nsbc_originate(c, cu);   // synchronous, waits until nsbc> prompt
- *   nsbc_iter_frames(c, my_frame_cb, NULL);  // blocking
- *   nsbc_close(c);
- *   free(cu);
+ * Architecture: HTTP/SSE via nsbc-web HTTPS + Bearer token is the canonical
+ * external integration surface. UDS (path 1) is a local-debug convenience for
+ * operators on the nsbcd host. All external call-center integrations should
+ * use path 2.
  */
 
 #ifndef NSBC_CLIENT_H
@@ -97,7 +100,11 @@ typedef enum {
     NSBC_ERR_TIMEOUT      = -5,
     NSBC_ERR_INVALID_ARG  = -6,
     NSBC_ERR_PARSE        = -7,
-    NSBC_ERR_NO_UDS       = -8, /* Non-Unix platform — HTTP path not implemented */
+    NSBC_ERR_NO_UDS       = -8, /* Non-Unix platform — UDS path unavailable */
+    NSBC_ERR_NO_CURL      = -9, /* Built without -DNSBC_WITH_CURL — HTTP path unavailable */
+    NSBC_ERR_HTTP         = -10,
+    NSBC_ERR_TLS          = -11,
+    NSBC_ERR_JSON         = -12,
 } nsbc_rc_t;
 
 /* -------------------------------------------------------------------- */
@@ -153,9 +160,42 @@ int          nsbc_originate(nsbc_conn_t *c, const char *call_url,
                             char *response_out, size_t resp_cap);
 
 /* -------------------------------------------------------------------- */
-/* HTTP originate — intentionally not implemented (std-only library).
- * Python / Go clients provide the full dual-path stack.                */
+/* HTTP originate + SSE (canonical external integration surface)          */
+/* Enabled only when compiled with -DNSBC_WITH_CURL -lcurl              */
 /* -------------------------------------------------------------------- */
+
+/* TLS verify toggle — default on (secure). */
+void  nsbc_set_ssl_verify(int verify);
+
+/* Originate via nsbc-web HTTPS POST /ext/v1/originate.
+ * *payload_out: malloc'd JSON response (caller frees with free()).
+ * Returns 1 on OK, 0 on HTTP error / network error. */
+int   nsbc_originate_via_web(const char *api_base, const char *call_url,
+                              int timeout_s, const char *api_token,
+                              char **payload_out);
+
+/* Unified originate — picks path by 'via'.
+ *   "auto" → try UDS first, HTTP fallback (requires -DNSBC_WITH_CURL for fallback)
+ *   "uds"  → nsbc_originate on a UDS conn (requires caller to have open UDS conn)
+ *   "web"  → nsbc_originate_via_web (requires -DNSBC_WITH_CURL)
+ * Returns 1 on OK, 0 otherwise. *via_out tells you which path was used. */
+int   nsbc_originate_dual(const char *call_url, const char *via,
+                          const char *uds_path, const char *api_base,
+                          const char *api_token, char **via_out);
+
+/* SSE stream client — consumes nsbc-web /api/v1/calls/stream forever.
+ * cb fires per parsed frame (source="sse"). Auto-reconnects on disconnect.
+ * Requires -DNSBC_WITH_CURL. Returns NSBC_ERR_NO_CURL otherwise.
+ *
+ *   nsbc_sse_iter(url, timeout_s, api_token, cb, userdata);
+ *   ← blocks forever; SIGINT handler calls nsbc_iter_stop() to exit. */
+nsbc_rc_t nsbc_sse_iter(const char *sse_url, int timeout_s,
+                        const char *api_token,
+                        nsbc_frame_cb_t cb, void *userdata);
+
+/* Convert raw SSE event JSON → canonical frame (source="sse").
+ * Requires -DNSBC_WITH_CURL for full cJSON parsing; fallback returns 0. */
+int   nsbc_sse_event_to_frame(const char *sse_json, nsbc_frame_t *frame);
 
 #ifdef __cplusplus
 }
