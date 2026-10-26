@@ -1,8 +1,48 @@
 # NSBC Event Client — Multi-Language SDK
 
 Reference client libraries and CLI demos for NSBC realtime event/CDR
-subscription + originate over **Unix Domain Socket** (same-host) and
-**nsbc-web HTTP API** (remote deployments).
+subscription + originate.
+
+## Canonical Integration Surface (architectural decision — do not deviate)
+
+**All external language SDKs MUST communicate with nsbc-web over HTTPS.**
+
+```
+Call-Center (any language)     nsbc-web (Rust sidecar)      nsbcd (C core)
+    │                                │                              │
+    │── HTTPS POST /ext/v1/originate ─►│                              │
+    │── HTTPS GET  /api/v1/calls/stream (SSE) ─►│                     │
+    │                                ├── UDS /control.sock ─────────►│
+    │                                ├── UDS /data.sock ◄─────────────┤
+    │                                │  UDS is nsbc-web INTERNAL      │
+```
+
+**Why this is non-negotiable:**
+- nsbc-web HTTPS + Bearer token is the *only* documented, stable, versioned external API.
+- UDS (`/var/run/nsbc/control.sock`) has permissions `0600` — only works as
+  **same-host same-user**. External call-center integrations live on different
+  hosts and cannot reach it.
+- UDS is nsbc-web's *internal* transport to nsbcd. nsbc-web itself translates
+  HTTP → UDS. SDKs should not skip the sidecar — it exists for a reason
+  (TLS termination, auth, rate-limiting, payload normalization).
+
+**UDS remains in Python/Go/Rust SDKs as a LOCAL DEBUG convenience only**
+(`--transport uds`). It lets operators on the nsbcd host subscribe to events
+without starting the nsbc-web sidecar. This is a debugging tool, not an
+integration path.
+
+**For any new language SDK: implement HTTP + SSE only.**
+Use this Java SDK as the template — zero deps, stdlib only, correct production interface.
+
+## Which transport should you use?
+
+| Who you are                 | Path                 | Notes                                                    |
+|-----------------------------|----------------------|----------------------------------------------------------|
+| **External integration**    | **HTTPS + SSE**     | ✅ Canonical surface. Every new language MUST implement. |
+| (call-center, CRM, etc.)    | HTTP POST originate  |                                                          |
+| Same-host operator debug    | UDS (Python/Go/Rust) | ⚠️ Local debug only. `--transport uds` CLI flag.        |
+|                             |                      | Zero-auth, socket perms = system trust.                  |
+| nsbc-web → nsbcd (internal) | UDS always           | nsbc-web implementation detail, not a public path.        |
 
 ## Architecture — Library vs Application (every language)
 
@@ -18,25 +58,29 @@ building blocks. See [API contract](#api-contract) below.
 
 ```
 python/
-├── nsbc_client.py        # Library (NsbccClient, NsbccClientSse, originate(),
-│                         #          build_call_url(), parse_frame(),
-│                         #          CallCorrelator, WebhookSink)
-└── event_client.py       # CLI demo — imports nsbc_client
+├── nsbc_client.py        # Library (stdlib only)
+└── event_client.py       # CLI demo
 
 go/
-├── nsbc_sdk/sdk.go       # Library (Client, Originate, parse_frame, CallCorrelator, WebhookSink)
+├── nsbc_sdk/sdk.go       # Library (stdlib only)
 ├── go.mod
-└── main.go               # CLI demo — imports ./nsbc_sdk
+└── main.go               # CLI demo
 
 rust/
 ├── Cargo.toml            # [lib] nsbc_sdk + [[bin]] event_client
-├── src/lib.rs            # Library (ClientUds, Originate, parse_frame, CallCorrelator)
+├── src/lib.rs            # Library (reqwest+serde_json for HTTP)
 └── src/main.rs           # CLI demo
 
 c/
-├── nsbc_client.h         # Public C API (opaque nsbc_conn_t, nsbc_build_call_url, …)
-├── nsbc_client.c         # Implementation
-└── event_client.c        # CLI demo — #include "nsbc_client.h"
+├── nsbc_client.h         # Public C API (opaque nsbc_conn_t)
+├── nsbc_client.c         # Implementation (UDS only, zero-dep embedded)
+└── event_client.c        # CLI demo
+
+java/                     # HTTP/SSE ONLY (Java 8 stdlib; UDS needs jnr-unixsocket)
+├── src/nsbc/NsbcClient.java   # Library (hand-rolled JSON parser, no deps)
+├── src/nsbc/EventClient.java # CLI demo
+├── build.sh              # Unix compile: javac -source 1.8 -target 1.8
+└── build.bat             # Windows compile
 ```
 
 ## API Contract
@@ -158,6 +202,19 @@ gcc -std=gnu99 -O2 -Wall -Wextra -o event_client nsbc_client.c event_client.c
 ./event_client --orig-to 7gja30rf                                # Linux only (UnixStream)
 ```
 
+### Java (Java 8 LTS+, pure stdlib — no external deps)
+```bash
+cd java
+bash build.sh                          # Linux / macOS
+# or: build.bat                        # Windows
+java -cp out nsbc.EventClient --mode subscribe \
+    --transport sse --insecure \
+    --api-token YOUR_BEARER_TOKEN \
+    --api-base https://nsbc-web:443
+java -cp out nsbc.EventClient --orig-to 7gja30rf --insecure
+```
+Compiled with `javac -source 1.8 -target 1.8`. Works on every host (Unix + Windows).
+
 ## Write Your Own Caller — Example Snippets
 
 ### Python — own minimal integration (library-only, no CLI)
@@ -218,26 +275,64 @@ nsbc_iter_frames(c, my_frame_cb, NULL);
 nsbc_close(c);
 ```
 
+### Java — own minimal integration (library-only, no CLI — external call-center pattern)
+```java
+import nsbc.NsbcClient.*;
+import java.util.*;
+
+// 1. Originate
+OriginateOpts opts = new OriginateOpts();
+opts.origTo = "7gja30rf"; opts.app = "echo";
+opts.videoCodecs = "H264,VP8";
+String callUrl = NsbcClient.buildCallUrl(opts);
+OriginateResult r = NsbcClient.originate(callUrl, "web",
+                         "https://nsbc-web:443", "YOUR_BEARER_TOKEN");
+System.out.println("ok=" + r.ok + " via=" + r.via);
+
+// 2. Subscribe events via SSE (reconnects forever on disconnect)
+CallCorrelator cc = new CallCorrelator(tl -> {
+    System.out.println("Call completed: " + tl.callId);
+    for (Map<String, Object> ev : tl.events) System.out.println("  " + ev);
+});
+
+Map<String, String> headers = new HashMap<>();
+headers.put("Authorization", "Bearer YOUR_BEARER_TOKEN");
+SseClient sse = new SseClient("https://nsbc-web:443/api/v1/calls/stream",
+                              30, headers);
+NsbcClient.setSslVerify(false); // for self-signed cert
+
+sse.runForeach(frame -> {
+    if (frame.domain.equals("CDR")) cc.feed(frame);
+    System.out.println(frame.ts + " " + frame.domain + " " + frame.fields);
+});
+
+// 3. Forward every event to external webhook
+WebhookSink wh = new WebhookSink("http://cc.example.com/nsbc", 5, 2);
+wh.send(frame);
+wh.stop();
+```
+
 ## Known Limits
 
-| Item                   | Python | Go    | Rust | C     | Root cause                                    |
-|------------------------|--------|-------|------|-------|-----------------------------------------------|
-| UDS subscribe + frame iter | ✅    | ✅     | ✅    | ✅    |                                               |
-| Originate dual-path (UDS+HTTP) | ✅  | ✅     | ✅    | ⚠️ UDS | C: zero-dep design choice                      |
-| CallCorrelator         | ✅      | ✅     | ✅    | ❌    | C: zero-dep design choice                      |
-| WebhookSink (HTTP)     | ✅      | ✅     | ✅    | ❌    | C: zero-dep design choice                      |
-| SSE transport (remote) | ✅      | ✅     | ✅    | ❌    | C: zero-dep design choice                      |
-| TLS verify toggle      | ✅      | ✅     | ✅    | ❌    | C: no TLS layer                               |
-| Non-Unix (Windows)     | ✅      | ✅ stub | stub | stub | UnixStream is Unix-only; stubs return clear err |
-| Third-party deps       | 0       | 0      | reqwest+serde_json | 0      | Rust opts into reqwest for HTTP               |
+| Item                   | Python | Go    | Rust | C     | Java  | Root cause                                    |
+|------------------------|--------|-------|------|-------|-------|-----------------------------------------------|
+| UDS subscribe + iter  | ✅      | ✅     | ✅    | ✅     | ❌     | Java 8 stdlib has no Unix Socket API            |
+| Originate dual-path    | ✅      | ✅     | ✅    | ⚠️ UDS | ⚠️ HTTP only | C/Java: each picks path matching its target    |
+| CallCorrelator         | ✅      | ✅     | ✅    | ❌     | ✅     | C: zero-dep design choice                      |
+| WebhookSink (HTTP)     | ✅      | ✅     | ✅    | ❌     | ✅     | C: zero-dep design choice                      |
+| SSE transport (remote) | ✅      | ✅     | ✅    | ❌     | ✅     | C: zero-dep design choice                      |
+| TLS verify toggle      | ✅      | ✅     | ✅    | ❌     | ✅     | C: no TLS layer; Java: Trust-all trustmanager |
+| Non-Unix (Windows)     | ✅      | ✅ stub | stub | stub   | ✅    | UnixStream / AF_UNIX are platform-only; Java no UDS so clean |
+| Third-party deps       | 0       | 0      | reqwest+serde_json | 0 | 0 | Rust opts into reqwest for HTTP/TLS           |
 
 ### Root-cause legend
 
-- **"❌" = deliberately omitted** (C zero-dep design, changes the build story from `gcc single-file` to `pkg-config -lcurl`).
-- **"❌" = fundamental platform constraint** (UnixStream on Windows — std doesn't ship it).
+- **"❌" = deliberately omitted** (C stays zero-dep `gcc single-file`; Java targets call-center integrations that use nsbc-web HTTP/SSE exclusively — no host filesystem access to UDS).
+- **"❌" = platform constraint** (Unix Domain Socket is Unix kernel feature, not available on Windows; Java 16+ added std UnixDomainSocketAddress but Java 8 LTS is still the most common deployment target).
 
-Python / Go / Rust all provide the full **dual-path originate → UDS preferred, HTTP fallback**
-stack + SSE remote deployments + CallCorrelator + WebhookSink + TLS verify toggle. C stays lean.
+**Python / Go / Rust** cover both local-debug (UDS) and remote-integration (HTTP/SSE) paths.
+**C** covers local-debug / embedded same-host (UDS only, zero-dep build story).
+**Java** covers the correct production interface for external call-center integrations (HTTP/SSE only, zero third-party deps). All three languages share the nsbc-web HTTP + SSE surface that external integrations actually use.
 
 **Unix Domain Socket**: `AF_UNIX` stream. Text protocol:
 - connect → nsbcd sends banner + `nsbc> ` prompt

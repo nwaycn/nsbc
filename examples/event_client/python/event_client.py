@@ -349,12 +349,16 @@ Examples:
     ap.add_argument("--topics", default=None,
                     help=f"obs_sub topics for UDS (default: {DEFAULT_TOPICS})")
     ap.add_argument("--transport", choices=["auto", "uds", "sse"], default="auto",
-                    help="Event stream transport: auto/uds/sse (default: auto)")
+                    help="Event stream transport: auto/uds/sse (default: auto). "
+                         "Note: 'uds' is local-debug only (same host as nsbcd). "
+                         "External integrations MUST use 'sse'.")
     ap.add_argument("--sse-url", default=None,
                     help="Full SSE URL (default: {api-base}/calls/stream)")
 
     # Originate params
-    ap.add_argument("--orig-via", choices=["auto", "uds", "web"], default="auto")
+    ap.add_argument("--orig-via", choices=["auto", "uds", "web"], default="auto",
+                    help="Originate path: auto/uds/web (default: auto). "
+                         "Note: 'uds' is local-debug only. External integrations MUST use 'web'.")
     ap.add_argument("--call-url", default=None, help="Explicit call_url (overrides orig-to/app/vars)")
     ap.add_argument("--orig-to", default="1000", help="Destination extension (default: 1000)")
     ap.add_argument("--app", default="echo", choices=["park", "hangup", "echo"],

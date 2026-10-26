@@ -139,9 +139,11 @@ func main() {
 	uds := flag.String("uds", nsbc_sdk.DefaultUds, "Unix Domain Socket path")
 	apiBase := flag.String("api-base", nsbc_sdk.DefaultApiBase, "nsbc-web HTTP base URL")
 	sseUrl := flag.String("sse-url", nsbc_sdk.DefaultSseUrl, "SSE stream URL (for --transport sse)")
-	transport := flag.String("transport", "uds", "subscribe transport: uds|sse")
+	transport := flag.String("transport", "uds",
+		"subscribe transport: uds|sse (note: uds is local-debug only; external integrations must use sse)")
 	topics := flag.String("topics", nsbc_sdk.DefaultTopics, "subscribe topics (comma-separated)")
-	origVia := flag.String("orig-via", "auto", "originate path: auto|uds|web")
+	origVia := flag.String("orig-via", "auto",
+		"originate path: auto|uds|web (note: uds is local-debug only; external integrations must use web)")
 	callUrl := flag.String("call-url", "", "explicit call_url (overrides orig-to/app)")
 	origTo := flag.String("orig-to", "1000", "destination extension")
 	app := flag.String("app", "echo", "post-originate app: echo|park|hangup")

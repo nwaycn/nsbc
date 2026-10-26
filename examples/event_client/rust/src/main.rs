@@ -97,9 +97,13 @@ fn print_help() {
     println!();
     println!("Usage:");
     println!("  cargo run --release -- --orig-to 7gja30rf --video    # WebRTC video (default on)");
-    println!("  cargo run --release -- --mode subscribe              # pure UDS observer");
     println!("  cargo run --release -- --mode subscribe --transport sse --insecure");
     println!("  cargo run --release -- --mode originate --orig-to 1001 --no-video");
+    println!();
+    println!("Canonical transport: HTTPS + SSE via nsbc-web.");
+    println!("  --transport sse (default for all external integrations)");
+    println!("  --transport uds  local-debug only (same host as nsbcd)");
+    println!("  --orig-via web   default. uds is local-debug only.");
 }
 
 // ---------------------------------------------------------------------------
