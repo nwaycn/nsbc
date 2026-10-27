@@ -226,6 +226,9 @@ git clone https://github.com/nsbc/nsbc.git
 # 国内镜像：git clone https://gitee.com/nwaycn/nsbc.git
 
 cd nsbc
+
+chmod +x configure
+
 ./configure                 # 扫描 src/，读取 conf/modules.conf
 
 # 可选：./configure --without-modules=hello,ai_dialog
@@ -236,8 +239,23 @@ make -j$(nproc)
 
 ### 3. 构建 nsbc-web（Rust 边车）
 
+***中国大陆用户可能代理下更好,添加或更新~/.cargo/config.toml文件***
+```bash
+[source.crates-io]
+replace-with = 'ustc'
+
+[source.ustc]
+registry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"
+```
+
+
 ```bash
 cd web
+
+rm Cargo.lock # 按自己的依赖版本管理
+
+make vendor
+
 make build-acme
 # 会自动把 static/ 和 target/release/nsbc-web 复制到上级目录
 cd ..

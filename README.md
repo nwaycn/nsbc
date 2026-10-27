@@ -225,6 +225,9 @@ git clone https://github.com/nsbc/nsbc.git
 # China mirror: git clone https://gitee.com/nwaycn/nsbc.git
 
 cd nsbc
+
+chmod +x configure
+
 ./configure                 # scans src/, reads conf/modules.conf
 
 # Optional: ./configure --without-modules=hello,ai_dialog
@@ -237,6 +240,11 @@ make -j$(nproc)
 
 ```bash
 cd web
+
+rm Cargo.lock # 按自己的依赖版本管理
+
+make vendor
+
 make build-acme
 # This copies static/ and target/release/nsbc-web to the parent directory automatically
 cd ..
