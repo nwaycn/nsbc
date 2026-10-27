@@ -112,10 +112,11 @@ pub enum Kind {
     IvrMenus,
     RouteGroups,
     Rates,
+    Accounts,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 11] = [
+    pub const ALL: [Kind; 12] = [
         Kind::Extensions,
         Kind::Trunks,
         Kind::DialplanRules,
@@ -127,6 +128,7 @@ impl Kind {
         Kind::IvrMenus,
         Kind::RouteGroups,
         Kind::Rates,
+        Kind::Accounts,
     ];
     fn name(self) -> &'static str {
         match self {
@@ -141,6 +143,7 @@ impl Kind {
             Kind::IvrMenus          => "ivr-menus",
             Kind::RouteGroups       => "route-groups",
             Kind::Rates             => "rates",
+            Kind::Accounts          => "accounts",
         }
     }
 }
@@ -260,6 +263,16 @@ async fn snapshot<C: CoreApi + Clone + Send + Sync>(
             let n = rows.len();
             serde_json::to_string(&rows).map(|j| (j, n)).map_err(|e| e.to_string())
         }
+        Kind::Accounts => {
+            /* accounts.reload 全量 upsert — DB 里所有账户。
+             * C 侧 account_reload_json 是 upsert-only（不删 JSON 外账户，
+             * 因为 resv[] 活跃 reservation 要结算），所以空数组=无新账户，
+             * 已存在账户完全保留。 */
+            let (rows, _total) = st.db.list_accounts(None, i64::MAX, 0).await
+                .map_err(|e| format!("db: {e}"))?;
+            let n = rows.len();
+            serde_json::to_string(&rows).map(|j| (j, n)).map_err(|e| e.to_string())
+        }
     }
 }
 
@@ -295,6 +308,7 @@ async fn push_kind<C: CoreApi + Clone + Send + Sync>(
             Kind::IvrMenus          => st.core.reload_ivr_menus(&json).await,
             Kind::RouteGroups       => st.core.reload_route_groups(&json).await,
             Kind::Rates             => st.core.reload_rates(&json).await,
+            Kind::Accounts          => st.core.reload_accounts(&json).await,
         };
         match r {
             Ok(()) => {

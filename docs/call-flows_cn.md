@@ -16,7 +16,7 @@
 ```mermaid
 flowchart TD
     subgraph NET["网络 I/O"]
-        EPOLL[epoll 事件循环<br/>main.c]
+        EPOLL[Reactor 管理器<br/>reactor_manager.c（N 个 epoll reactor）]
     end
 
     subgraph TRANS["SIP 传输层 — src/sip/transport.c"]
@@ -74,6 +74,8 @@ sequenceDiagram
     participant DP as dialplan.c
     participant BR as media_bridge.c
     participant UAS as SIP 被叫
+    participant WP as Worker 线程池<br/>worker.c
+    participant BILL as billing/cdr.c
 
     UAC->>TR: INVITE (UDP/TCP/TLS)
     TR->>B2: b2b_on_rx() :4685
@@ -101,6 +103,14 @@ sequenceDiagram
 
     B2-->>UAC: 200 OK（A-leg 应答）
     Note over UAC,UAS: RTP 经 rtp_relay fd 转发<br/>每包走 relay_recv_one() :376
+
+    Note over B2: BYE 路径 — CDR flush offload
+    UAS-->>B2: BYE
+    B2-->>UAS: 200 OK
+    B2->>B2: billing_cdr（呼叫内内存态）
+    B2->>WP: wpool_submit_any(hash_key, cdr_flush_job)<br/>reactor 线程立即返回
+    WP->>WP: CDR WAL/spool flush（异步）
+    WP->>BILL: billing CDR sink 持久化
 ```
 
 ### 1.3 函数速查表
@@ -121,6 +131,9 @@ sequenceDiagram
 | 中继 | `rtp_relay_start` | src/media/bridge/media_bridge.c:2144 | 每侧分配 RTP/RTCP fd 对 |
 | 中继循环 | `relay_recv_one` | src/media/bridge/media_bridge.c:376 | 逐包转发（需要时 SRTP 解密） |
 | 出站 | `send_invite_b` | src/sip/b2bua.c:3820（路径） | 构造并发送 B-leg INVITE |
+| **Worker 卸载** | `wpool_submit_any` | src/core/worker.c:590 | Worker 池任意 worker 投递（RR + slot_ready 跳过死槽）|
+| **Worker 卸载** | `wpool_submit` | src/core/worker.c:551 | Worker 池固定 shard 投递（hash_key % n_active）|
+| **BYE → CDR** | `billing_cdr`（呼叫内）→ wpool_submit_any → WAL flush | src/mod/billing/cdr.c | 呼叫拆除时 reactor 线程投递，Worker 异步持久化 |
 
 ---
 

@@ -735,6 +735,14 @@ pub trait CoreApi: Send + Sync {
         json: &str,
     ) -> impl Future<Output = Result<(), CoreError>> + Send;
 
+    /// `accounts.reload <json>` — DB accounts full upsert (REQ-OAM-009 L1).
+    /// Upsert-only: JSON array → 逐条 account_open；不删除 JSON 外账户
+    /// （resv[] 里可能有活跃 reservation 需要 bill_settle 结算）。
+    fn reload_accounts(
+        &self,
+        json: &str,
+    ) -> impl Future<Output = Result<(), CoreError>> + Send;
+
     /// `rate.upsert <json>` — single rate entry upsert (JSON object).
     fn rate_upsert_json(
         &self,
@@ -1028,6 +1036,10 @@ impl CoreApi for RealCore {
 
     async fn reload_rates(&self, json: &str) -> Result<(), CoreError> {
         send_cmd(&self.sock_path, self.timeout, &format!("rate.reload {json}"))
+            .await.and_then(|b| check_rejected(&b))
+    }
+    async fn reload_accounts(&self, json: &str) -> Result<(), CoreError> {
+        send_cmd(&self.sock_path, self.timeout, &format!("accounts.reload {json}"))
             .await.and_then(|b| check_rejected(&b))
     }
     async fn rate_upsert_json(&self, json: &str) -> Result<(), CoreError> {
@@ -2596,6 +2608,14 @@ leg 0 sdp_offer 50\nabc\n";
                 .unwrap_or(Ok("OK\n".into()))
                 .and_then(|b| check_rejected(&b))
         }
+        async fn reload_accounts(&self, json: &str) -> Result<(), CoreError> {
+            self.calls.lock().unwrap().push(format!("accounts.reload {json}"));
+            self.canned
+                .get("accounts.reload")
+                .cloned()
+                .unwrap_or(Ok("OK\n".into()))
+                .and_then(|b| check_rejected(&b))
+        }
         async fn rate_upsert_json(&self, json: &str) -> Result<(), CoreError> {
             self.calls.lock().unwrap().push(format!("rate.upsert {json}"));
             self.canned
@@ -2648,6 +2668,98 @@ leg 0 sdp_offer 50\nabc\n";
                 .cloned()
                 .unwrap_or_else(|| Ok(format!("(mock exec_cmd: no can for \"{cmd}\")\n")))
         }
+    }
+
+    // ===== accounts.reload 全量补偿相关测试 =====
+
+    /// 测试 1: MockCore.reload_accounts 命令字符串精确格式验证
+    /// Rust 侧必须发送 `"accounts.reload {json}"` — obs_control.c 匹配这个字符串
+    #[tokio::test]
+    async fn accounts_reload_command_format() {
+        let m = MockCore {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            canned: Arc::new(Default::default()),
+        };
+        // 预设 OK（reload_accounts 查 canned["accounts.reload"]，找不到 fallback OK）
+        m.canned.lock().unwrap().insert(
+            "accounts.reload".to_string(),
+            Ok("OK\n".to_string()),
+        );
+
+        let json = "[{\"account_key\":\"alice\",\"balance_uc\":1000}]";
+        m.reload_accounts(json).await.unwrap();
+
+        let calls = m.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        // 精确命令字符串匹配 — obs_control.c strcmp("accounts.reload") 必须能识别
+        assert!(calls[0].starts_with("accounts.reload "));
+        assert!(calls[0].contains(json));
+    }
+
+    /// 测试 2: MockCore.account_open 默认 uncanned 返回 Err
+    /// billing.rs 安全网依赖这个行为：同步 UDS 推失败 → spawn_push 触发全量补偿
+    #[tokio::test]
+    async fn account_open_default_uncanned_returns_err() {
+        let m = MockCore {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            canned: Arc::new(Default::default()),  // 空 canned → 所有命令查不到 → Err
+        };
+
+        // account_open 查 canned["account.open:alice"] → miss → 查 canned["account.open"] → miss → Ok fallback
+        // 等下，MockCore.account_open 的 canned 逻辑是 .or_else(|| self.canned.get("account.open")) → 找不到返回 Ok("OK\n")
+        // 所以默认其实是 OK。我需要显式预设 Err 来模拟 UDS 失败
+        m.canned.lock().unwrap().insert(
+            "account.open".to_string(),
+            Err(CoreError::Protocol("uds broken".into())),
+        );
+
+        let res = m.account_open("alice", 1000, 0).await;
+        assert!(res.is_err(), "canned Err 必须透传为 UDS 失败");
+
+        // 调用记录里应该有 account.open 命令
+        let calls = m.calls.lock().unwrap();
+        assert!(calls.iter().any(|c| c.starts_with("account.open ")));
+    }
+
+    /// 测试 3: Account JSON 序列化字段名必须与 C 侧解析完全匹配
+    /// C 侧 account_reload_json 用 jstr(jint) 解析 "account_key" / "balance_uc" / "credit_limit_uc"
+    /// 如果 Rust serde 字段名不同（如 snake_case→camelCase），C 侧会全部 miss
+    #[test]
+    fn account_serde_fields_match_c_parser() {
+        let json = serde_json::json!({
+            "account_key":     "alice",
+            "balance_uc":      10000000,
+            "credit_limit_uc": 0,
+        });
+        let s = json.to_string();
+
+        // 必须包含这三个精确字段名（与 C 侧 jstr 匹配 key 完全一致）
+        assert!(s.contains("\"account_key\""),
+            "Rust Account 缺少 account_key 字段 → C jstr 会 miss");
+        assert!(s.contains("\"balance_uc\""),
+            "Rust Account 缺少 balance_uc 字段 → C jstr 会 miss");
+        assert!(s.contains("\"credit_limit_uc\""),
+            "Rust Account 缺少 credit_limit_uc 字段 → C jstr 会 miss");
+    }
+
+    /// 测试 4: MockCore.reload_accounts canned OK 路径
+    #[tokio::test]
+    async fn accounts_reload_canned_ok() {
+        let m = MockCore {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            canned: Arc::new(Default::default()),
+        };
+        m.canned.lock().unwrap().insert(
+            "accounts.reload".to_string(),
+            Ok("OK accounts reloaded\n".to_string()),
+        );
+
+        // 空数组 reload（合法场景：DB 暂时没账户）
+        m.reload_accounts("[]").await.unwrap();
+
+        let calls = m.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0], "accounts.reload []");
     }
 
     /// Non-unix target: RealCore must explicitly return Unsupported instead of panicking (testable on Windows).

@@ -16,7 +16,7 @@ with [architecture.md](architecture.md) (module-level view).
 ```mermaid
 flowchart TD
     subgraph NET["Network I/O"]
-        EPOLL[epoll event loop<br/>main.c]
+        EPOLL[Reactor Manager<br/>reactor_manager.c (N epoll reactors)]
     end
 
     subgraph TRANS["SIP Transport — src/sip/transport.c"]
@@ -74,6 +74,8 @@ sequenceDiagram
     participant DP as dialplan.c
     participant BR as media_bridge.c
     participant UAS as SIP Callee
+    participant WP as Worker Pool<br/>worker.c
+    participant BILL as billing/cdr.c
 
     UAC->>TR: INVITE (UDP/TCP/TLS)
     TR->>B2: b2b_on_rx() :4685
@@ -101,6 +103,14 @@ sequenceDiagram
 
     B2-->>UAC: 200 OK (A-leg answer)
     Note over UAC,UAS: RTP flows through rtp_relay fds<br/>relay_recv_one() :376 per packet
+
+    Note over B2: BYE path — CDR flush offload
+    UAS-->>B2: BYE
+    B2-->>UAS: 200 OK
+    B2->>B2: billing_cdr (in-call memory)
+    B2->>WP: wpool_submit_any(hash_key, cdr_flush_job)<br/>reactor thread returns immediately
+    WP->>WP: CDR WAL/spool flush (async)
+    WP->>BILL: billing CDR sink persistence
 ```
 
 ### 1.3 Function reference table
@@ -121,6 +131,9 @@ sequenceDiagram
 | Relay | `rtp_relay_start` | src/media/bridge/media_bridge.c:2144 | Allocate RTP/RTCP fd pairs per side |
 | Relay loop | `relay_recv_one` | src/media/bridge/media_bridge.c:376 | Per-packet forward (SRTP decrypt if needed) |
 | Outbound | `send_invite_b` | src/sip/b2bua.c:3820 (path) | Build + send B-leg INVITE |
+| **Worker offload** | `wpool_submit_any` | src/core/worker.c:590 | Worker Pool 任意 worker 投递（RR + slot_ready skip）|
+| **Worker offload** | `wpool_submit` | src/core/worker.c:551 | Worker Pool 固定 shard 投递（hash_key % n_active）|
+| **BYE → CDR** | `billing_cdr` (in-call) → wpool_submit_any → WAL flush | src/mod/billing/cdr.c | 呼叫拆除时 reactor 线程投递，Worker 异步持久化 |
 
 ---
 

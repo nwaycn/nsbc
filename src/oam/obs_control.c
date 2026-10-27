@@ -166,6 +166,7 @@ static void ctl_help(ctl_conn_t *c)
         "  rate.delete <prefix> remove one rate entry (L1, audited)\n"
         "  account.open <key> <balance_uc> <credit_limit_uc> (L1, audited)\n"
         "  account.topup <key> <delta_uc>  top up balance (L1, audited)\n"
+        "  accounts.reload <json>  DB accounts full upsert (L1, audited)\n"
         "  uuid_dump <call-id>  per-leg diagnostic dump (L0)\n"
         "  cdr.recent [N]       last N finished CDRs from in-memory ring (default 500, L0)\n"
         "  cdr.flush            flush pending CDR ring to persist/spool (L1, audited)\n"
@@ -1316,6 +1317,25 @@ static void dispatch(ctl_conn_t *c, char *line)
         /* 如果 newb 没成功挂到 g_ctx->billing（RCU 未执行），释放它 */
         if (newb && g_ctx && g_ctx->billing != newb)
             bill_destroy(newb);
+
+    } else if (strcmp(line, "accounts.reload") == 0) {
+        /* ---- accounts.reload <json>：DB 全量账户 upsert 推入核心（REQ-OAM-009 L1）----
+         *
+         * 与 rate.reload 不同：upsert-only，不删除 JSON 里没有的账户
+         * （那些账户在 resv[] 里可能有活跃 reservation，bill_settle 还要找）。
+         * 命令分发层已识别 ".reload" 后缀，argv[1] 是整段 JSON 数组不空格切分。*/
+        billing_t *bil = g_ctx ? (billing_t *)g_ctx->billing : NULL;
+        if (!arg || !*arg) { ctl_printf(c, "ERR missing json payload\n"); goto acc_done; }
+        if (!bil) { ctl_printf(c, "ERR billing not initialized\n"); goto acc_done; }
+
+        int rc = account_reload_json(bil, arg);
+        if (rc == NSBC_OK) {
+            ctl_printf(c, "OK accounts reloaded\n");
+            log_audit("oam", "accounts.reload", "ok");
+        } else {
+            ctl_printf(c, "ERR reload failed\n");
+        }
+    acc_done:
 
     } else if (strcmp(line, "rate.upsert") == 0) {
         /* ---- rate.upsert <json>：单条费率 upsert（REQ-OAM-009 L1）---- */

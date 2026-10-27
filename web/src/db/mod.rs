@@ -5105,6 +5105,7 @@ pub struct SipProfileCreate {
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SipProfileUpdate {
+    pub name:            Option<String>,
     pub enabled:         Option<bool>,
     pub sip_ip:          Option<String>,
     pub external_sip_ip: Option<String>,
@@ -6250,6 +6251,7 @@ impl Db {
             }};
         }
 
+        set_s!("name", u.name);
         set_b!("enabled", u.enabled);
         set_s!("sip_ip", u.sip_ip);
         set_s!("external_sip_ip", u.external_sip_ip);

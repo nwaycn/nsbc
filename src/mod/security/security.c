@@ -89,8 +89,7 @@ static int parse_cidr(const char *cidr_str, uint32_t *out_net, int *out_prefix)
     if (!cidr_str || !out_net || !out_prefix) return -1;
 
     char buf[INET_ADDRSTRLEN + 16];  /* CIDR 串：最大 "255.255.255.255/32" = 18 字节 */
-    strncpy(buf, cidr_str, sizeof(buf) - 1);
-    buf[sizeof(buf) - 1] = '\0';
+    snprintf(buf, sizeof(buf), "%s", cidr_str);
 
     /* trim 前后空格 */
     char *start = buf;
@@ -113,8 +112,7 @@ static int parse_cidr(const char *cidr_str, uint32_t *out_net, int *out_prefix)
         ip_part[ip_len] = '\0';
         prefix = atoi(slash + 1);
     } else {
-        strncpy(ip_part, start, sizeof(ip_part) - 1);
-        ip_part[sizeof(ip_part) - 1] = '\0';
+        snprintf(ip_part, sizeof(ip_part), "%s", start);
         prefix = 32;  /* 默认：单 IP 精确匹配 */
     }
 
@@ -149,8 +147,7 @@ int security_check_ip(const char *ip, const security_cfg_t *cfg)
 
     /* 按逗号分隔遍历每个 CIDR 条目 */
     char cidrs[1024];  /* 复制一份避免修改 cfg 常量 */
-    strncpy(cidrs, cfg->blacklist_cidrs, sizeof(cidrs) - 1);
-    cidrs[sizeof(cidrs) - 1] = '\0';
+    snprintf(cidrs, sizeof(cidrs), "%s", cfg->blacklist_cidrs);
 
     char *saveptr = NULL;
     char *token = strtok_r(cidrs, ",", &saveptr);
@@ -631,60 +628,93 @@ void security_blacklist_log_drop(blacklist_result_t r, const char *ip,
 void security_set_yaml_path(const char *path)
 {
     if (!path || !path[0]) return;
-    strncpy(g_yaml_path, path, sizeof(g_yaml_path) - 1);
-    g_yaml_path[sizeof(g_yaml_path) - 1] = '\0';
+    snprintf(g_yaml_path, sizeof(g_yaml_path), "%s", path);
     log_info("security", "yaml path set: %s", g_yaml_path);
 }
 
-/* 辅助：逐 key 替换 security 段落内的一行值。
- * old_line 指向 yaml 行缓冲起始，返回值是新行起始（可能不同位置）。
- * 替换格式："  key: value"（security 子段缩进 2 空格） */
+/* 辅助：在 YAML security: 段内按 key 替换一行值。
+ * - 仅处理顶级段 "security:" 下的 2 空格缩进子 key
+ * - 遇到下一个顶级段时自动停止（不会跳到 server/media 等其他段）
+ * - valfmt 必须自带 \n（调用点格式统一为 "  key: value\n"）
+ * - 扩展分支用独立 realloc + 后搜索，完全切断 GCC 对 *buf 派生指针的 use-after-free 跟踪
+ * 返回 1=替换成功 / 0=未找到 / -1=错误 */
 static int yaml_replace_key(char **buf, size_t *bufsz,
                             const char *key, const char *valfmt, ...)
 {
     va_list ap;
     va_start(ap, valfmt);
     char want_line[512];
-    vsnprintf(want_line, sizeof(want_line), valfmt, ap);
+    int vret = vsnprintf(want_line, sizeof(want_line), valfmt, ap);
     va_end(ap);
+    if (vret < 0 || (size_t)vret >= sizeof(want_line)) {
+        return -1;
+    }
 
-    /* 在 *buf 里找 "  <key>:" 开头的行（security 子段缩进=2） */
+    size_t klen = strlen(key);
+    /* 构造精确 key 前缀 "  key:" 用于搜索 */
+    char kprefix[64];
+    int kpret = snprintf(kprefix, sizeof(kprefix), "  %s:", key);
+    if (kpret <= 0 || (size_t)kpret >= sizeof(kprefix)) return -1;
+
     char *line = *buf;
+    int in_security = 0;
+
     while (line && *line) {
-        if (strncmp(line, "  ", 2) == 0
-            && strncmp(line + 2, key, strlen(key)) == 0
-            && (line[2 + strlen(key)] == ':' || line[2 + strlen(key)] == ' ')) {
-            /* 替换这一行：找到行末尾 \n */
+        /* 顶级段检测：行首非空白、非注释 */
+        if (line[0] != ' ' && line[0] != '\t' && line[0] != '#') {
+            if (strncmp(line, "security:", 9) == 0) {
+                in_security = 1;
+            } else if (in_security) {
+                break;
+            }
+        }
+
+        if (in_security
+            && strncmp(line, "  ", 2) == 0
+            && strncmp(line + 2, key, klen) == 0
+            && line[2 + klen] == ':') {
+
             char *eol = strchr(line, '\n');
             size_t old_len = eol ? (size_t)(eol - line + 1) : strlen(line);
             size_t new_len = strlen(want_line);
-            size_t line_off = (size_t)(line - *buf);  /* 记录 line 相对 buf 偏移 */
+
             if (new_len <= old_len) {
-                /* 原地覆盖 + 右侧 pad 空格防残留注释 */
+                /* 收缩分支 —— 无 realloc，保持原样 */
                 memmove(line, want_line, new_len);
-                /* pad 到 old_len（保留 \n） */
                 for (size_t i = new_len; i < old_len - 1; ++i) line[i] = ' ';
                 line[old_len - 1] = '\n';
                 if (!eol) line[old_len] = '\0';
             } else {
-                /* 需要扩展 —— realloc 可能搬内存，用 line_off 重算 line */
-                char *newbuf = realloc(*buf, *bufsz + new_len - old_len);
+                /* ==== 扩展分支 ====
+                 * 关键：realloc 路径上绝对不能出现任何从 *buf 派生的
+                 * 指针表达式（包括 line、line - *buf 等）。
+                 * 先存所有纯值，realloc 后用 memmem 重新搜索定位。
+                 * 这样 GCC 的 -Wuse-after-free 就跟踪不到任何从 *buf
+                 * 派生的指针身份变更链。 */
+                size_t needed = *bufsz + new_len - old_len;
+                char *newbuf = realloc(*buf, needed);
                 if (!newbuf) return -1;
                 *buf = newbuf;
-                *bufsz += new_len - old_len;
-                line = *buf + line_off;  /* ← realloc 后重算指针，消除 use-after-free */
-                memmove(line + new_len, line + old_len,
-                        strlen(line + old_len) + 1);
-                memcpy(line, want_line, new_len);
+                *bufsz = needed;
+
+                /* realloc 后用 memmem 纯值搜索重新定位目标行 ——
+                 * 完全不依赖 realloc 前的任何派生指针 */
+                char *found = memmem(*buf, strlen(*buf),
+                                     kprefix, (size_t)kpret);
+                if (!found) return -1;  /* 理论上不会发生 */
+
+                memmove(found + new_len, found + old_len,
+                        strlen(found + old_len) + 1);
+                memcpy(found, want_line, new_len);
             }
-            return 1; /* 替换成功 */
+            return 1;
         }
-        /* 下一行 */
+
         char *eol = strchr(line, '\n');
         if (!eol) break;
         line = eol + 1;
     }
-    return 0; /* 没找到 —— 让调用方追加 */
+    return 0;
 }
 
 /* REQ-EXT-API-005: 原子写回 YAML security.段落。
@@ -1656,25 +1686,8 @@ static int cmd_ban_list(cmd_ctx_t *c, int argc, char **argv, void *ud)
     int n_out = 0, n_banned = 0, total = 0;
 
     pthread_mutex_lock(&g_ban_lock);
-    int nb = 0, sum = 0;
-    /* ★ DIAG: 先无条件 dump 所有 bucket 条目（锁内，不管 filter） */
-    for (int b = 0; b < BAN_HASH_BUCKETS; ++b) {
-        for (ban_ent_t *e = g_ban_tab[b]; e; e = e->next) {
-            sum++;
-            if (g_ban_tab[b]) nb++;
-        }
-    }
     if (g_ban_count > 0)
         snaps = calloc((size_t)g_ban_count, sizeof(*snaps));
-    /* ★ DIAG: 直接遍历打 ip，跟下面的 snaps 循环对比 */
-    c->io_printf(c->io_ud, "DIAG_RAW buckets=%d sum=%d g_ban_count=%d\n",
-                 nb, sum, g_ban_count);
-    for (int b = 0; b < BAN_HASH_BUCKETS; ++b) {
-        for (ban_ent_t *e = g_ban_tab[b]; e; e = e->next) {
-            c->io_printf(c->io_ud, "DIAG_RAW ip=%s banned=%d\n",
-                         e->ip, e->ban_until > now);
-        }
-    }
     if (snaps) {
         for (int b = 0; b < BAN_HASH_BUCKETS; ++b) {
             for (ban_ent_t *e = g_ban_tab[b]; e; e = e->next) {
@@ -1692,15 +1705,6 @@ static int cmd_ban_list(cmd_ctx_t *c, int argc, char **argv, void *ud)
     }
     total = g_ban_count;
     pthread_mutex_unlock(&g_ban_lock);
-
-    /* 诊断行（仅当异常时显示，帮定位 total/shown 不一致） */
-    if (!snaps || n_out != total || sum != total) {
-        c->io_printf(c->io_ud,
-                     "DIAG g_ban_count=%d bucket_sum=%d nonempty_buckets=%d "
-                     "snaps_null=%d n_out=%d filter=%s\n",
-                     total, sum, nb, snaps == NULL, n_out,
-                     filter ? filter : "(null)");
-    }
 
     for (int i = 0; i < n_out; ++i)
         c->io_printf(c->io_ud,
@@ -1732,11 +1736,9 @@ static int cmd_ban_unban(cmd_ctx_t *c, int argc, char **argv, void *ud)
     const char *cmd = "security.ban.unban";
     size_t cmdlen = strlen(cmd);
     if (strncmp(argv[0], cmd, cmdlen) == 0) {
-        strncpy(ip, argv[0] + cmdlen, sizeof(ip) - 1);
-        ip[sizeof(ip) - 1] = '\0';
+        snprintf(ip, sizeof(ip), "%s", argv[0] + cmdlen);
     } else {
-        strncpy(ip, argv[0], sizeof(ip) - 1);
-        ip[sizeof(ip) - 1] = '\0';
+        snprintf(ip, sizeof(ip), "%s", argv[0]);
     }
     /* trim 空白 */
     char *p = ip;

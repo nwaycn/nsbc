@@ -59,8 +59,15 @@ graph TD
         end
 
         subgraph Core["核心"]
-            RE["Reactor 事件循环<br/>reactor.c"]
-            WK["Worker 线程池<br/>worker.c"]
+            RE_MGR["Reactor 管理器<br/>reactor_manager.c"]
+            direction LR
+            RE0["reactor[0]<br/>（主线程）"]
+            RE1["reactor[1]<br/>（pthread）"]
+            RE2["reactor[N-1]<br/>（pthread）"]
+            RE_MGR --> RE0
+            RE_MGR --> RE1
+            RE_MGR --> RE2
+            WK["Worker 线程池<br/>worker.c<br/>min→max 动态扩缩"]
             SIP["SIP 事务栈<br/>sip_txn.c / sip_transport.c"]
             B2B["B2BUA 引擎<br/>b2bua.c"]
         end
@@ -97,8 +104,8 @@ graph TD
 
     Phone --> TP
     WebRTC -->|DTLS| TP
-    TP --> RE
-    RE --> SIP
+    TP --> RE_MGR
+    RE_MGR --> SIP
     SIP --> B2B
     B2B --> LOC
     B2B --> STATIC
@@ -109,6 +116,9 @@ graph TD
     B2B --> HEP
     B2B --> PSTN
     B2B --> Trunk
+
+    %% === Reactor ↔ Worker 交互 ===
+    RE_MGR -->|"wpool_submit_any<br/>CDR flush 卸载<br/>reactor 不阻塞 I/O"| WK
 
     Admin -.->|HTTPS 8443| AX
     AX --> SPA

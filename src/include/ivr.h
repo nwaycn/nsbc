@@ -93,6 +93,21 @@ const char *ivr_digits(const ivr_sess_t *s);
 /* Profile 注册表（sync 推送填充 + 执行时查找） */
 const ivr_profile_t *ivr_profile_find(const char *name, const char *tenant);
 
+/* ---- IVR 模块内部通用 JSON 解析工具（公开供单元测试 + 其他模块复用） ----
+ * 简化版手写 JSON 解析器：支持字符串值、整数值、顶级数组切分、
+ * 嵌套对象/数组跳过。不处理转义字符以外的 JSON 语法。 */
+
+/* 从 json 里找 key 的字符串值，输出到 dst（需预分配 cap）。
+ * 成功返回 0，未找到返回 -1。支持转义引号还原。 */
+int jstr(const char *json, const char *key, char *dst, size_t cap);
+
+/* 从 json 里找 key 的整数值。缺失或非法返回 dflt。 */
+int jint(const char *json, const char *key, int dflt);
+
+/* 从 json 里找第 idx 个顶级数组元素，返回元素起始指针 + 长度。
+ * 空数组/越界/格式错误返回 NULL。正确处理 [[...],[...]] 嵌套。 */
+const char *jarray_at(const char *json, int idx, size_t *out_len);
+
 /* Web sync 推送入口：完整 IVR 菜单数组 JSON
  * 格式：[{"name":"...","tenant_id":1,"entry_node":"main",
  *         "nodes_json":[{"name":"main","prompt":"...","choices":[...],...}]}]

@@ -53,6 +53,7 @@ extern "C" {
 #include <time.h>
 #include <ctype.h>
 #include <limits.h>
+#include "log.h"
 
 /* ----------------------------------------------------------------------------
  * nsbc 自有基础件（底层无依赖，所有其他 nsbc_* 头安全依赖它们）

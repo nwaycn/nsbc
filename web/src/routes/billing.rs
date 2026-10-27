@@ -265,7 +265,7 @@ async fn get_account<C: CoreApi + Clone + Send + Sync>(
 }
 
 /// POST /balances — open account (DB + core UDS account.open)
-async fn open_account<C: CoreApi + Clone + Send + Sync>(
+async fn open_account<C: CoreApi + Clone + Send + Sync + 'static>(
     State(st): State<Arc<AppState<C>>>,
     Json(body): Json<AccountCreate>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -281,14 +281,16 @@ async fn open_account<C: CoreApi + Clone + Send + Sync>(
         ApiError::Db(e.to_string())
     })?;
 
-    // Sync push to core (failure does not roll back DB — next reload will override;
-    // but return 207 Mixed to inform)
+    // Sync push to core（快速路径：立即生效）
     let core_res = st.core.account_open(
         &body.account_key, body.balance_uc, body.credit_limit_uc,
     ).await;
     if let Err(e) = &core_res {
         tracing::warn!(error = %e, key = %body.account_key,
-            "account.open core failed — DB row created but core skipped");
+            "account.open core failed → spawning accounts.reload safety net");
+        // 安全网：300ms debounce + 5 级退避重试 + 60s periodic + HELLO 重连
+        // 全量 reload 用 DB 里的绝对余额覆盖，幂等自愈 divergence
+        sync::spawn_push(st.clone(), sync::Kind::Accounts);
     }
 
     let _ = st.db.insert_config_history(
@@ -301,7 +303,7 @@ async fn open_account<C: CoreApi + Clone + Send + Sync>(
 }
 
 /// POST /balances/:id/topup — top up (DB + core UDS account.topup)
-async fn topup_account<C: CoreApi + Clone + Send + Sync>(
+async fn topup_account<C: CoreApi + Clone + Send + Sync + 'static>(
     State(st): State<Arc<AppState<C>>>,
     Path(id): Path<i64>,
     Json(body): Json<TopupBody>,
@@ -320,11 +322,13 @@ async fn topup_account<C: CoreApi + Clone + Send + Sync>(
         }
     })?;
 
-    // Sync push to core
+    // Sync push to core（快速路径：立即生效）
     let core_res = st.core.account_topup(&acct.account_key, body.delta_uc).await;
     if let Err(e) = &core_res {
         tracing::warn!(error = %e, key = %acct.account_key, delta = body.delta_uc,
-            "account.topup core failed — DB updated but core skipped");
+            "account.topup core failed → spawning accounts.reload safety net");
+        // 安全网：accounts.reload 用 DB 里的绝对余额覆盖，幂等自愈 divergence
+        sync::spawn_push(st.clone(), sync::Kind::Accounts);
     }
 
     let _ = st.db.insert_config_history(

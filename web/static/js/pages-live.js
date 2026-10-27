@@ -534,7 +534,7 @@ app.component('cdrs-live', {
       loading.value = false;
     }
     onMounted(() => { load(); timer = setInterval(load, 10000); });
-    onMounted(() => clearInterval(timer));
+    onBeforeUnmount(() => clearInterval(timer));
     return { rows, total, loading, error, pageSize, currentPage, totalPages, goPage,
              getRecUrl, getMeta, ringTime, formatBillsec, fmtIso, isoMs,
              tabs, activeTab, q, sortBy, sortDir, resetFilters,
@@ -571,7 +571,7 @@ app.component('metrics-live', {
       loading.value = false;
     }
     onMounted(() => { load(); timer = setInterval(load, 10000); });
-    onMounted(() => clearInterval(timer));
+    onBeforeUnmount(() => clearInterval(timer));
     return { metrics, loading, error };
   },
 });
@@ -684,7 +684,7 @@ app.component('registrations-live', {
       loading.value = false;
     }
     onMounted(() => { load(); timer = setInterval(load, 5000); });
-    onMounted(() => clearInterval(timer));
+    onBeforeUnmount(() => clearInterval(timer));
     return { data, rows, total, shown, truncated, loading, error, fmtDur, renewClass };
   },
 });
@@ -790,7 +790,7 @@ app.component('transcode-live', {
       loading.value = false;
     }
     onMounted(() => { load(); timer = setInterval(load, 3000); });
-    onMounted(() => clearInterval(timer));
+    onBeforeUnmount(() => clearInterval(timer));
     return { rows, total, loading, error };
   },
 });

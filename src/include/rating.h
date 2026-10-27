@@ -92,6 +92,15 @@ int bill_foreach_account(billing_t *b, acct_iter_cb cb, void *ud);
 int bill_rate_count(billing_t *b);
 int bill_account_count(billing_t *b);
 
+/* accounts.reload <json> — OAM 全量账户同步（REQ-OAM-009 L1）。
+ * JSON 数组元素：{account_key|"key", balance_uc|"balance",
+ *                 credit_limit_uc|"credit_limit"}。
+ * upsert-only：存在则覆盖 balance/credit，不存在则新建；**不删除**
+ *              JSON 里没有的账户（resv[] 活跃 reservation 可能要结算）。
+ * resv[] 表不动（在途 reserve/settle 继续生效）。
+ * 复用 ivr.h 公开的 jstr/jint/jarray_at 手写 JSON 工具。*/
+int account_reload_json(billing_t *b, const char *json);
+
 #ifdef __cplusplus
 }
 #endif

@@ -108,5 +108,11 @@ pub async fn reload<C: CoreApi + Clone + Send + Sync>(
     let json = serde_json::to_string(&rows)
         .map_err(|e| ApiError::Db(e.to_string()))?;
     st.core.reload_ivr_menus(&json).await?;
+
+    let _ = st.db.insert_config_history(
+        "api", "reload", "ivr-menus", None,
+        &format!("loaded {} enabled IVR menus (full replace)", rows.len()),
+    ).await;
+
     Ok(Json(json!({ "reloaded": rows.len(), "uds_wired": true })))
 }
