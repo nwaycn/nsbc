@@ -194,28 +194,69 @@ sudo apt-get install -y build-essential pkg-config \
 
 ## Quick Start
 
+### 1. Install dependencies (Debian/Ubuntu)
+
 ```bash
-# 1. Clone and configure
+apt-get update && apt-get install -y \
+    build-essential pkg-config \
+    libssl-dev libsrtp2-dev libpcre2-dev libedit-dev \
+    libsqlite3-dev libpq-dev libmysqlclient-dev libopus-dev
+
+# Rust toolchain (for nsbc-web sidecar)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source $HOME/.cargo/env
+
+# Optional: sipp for SIP stress testing
+apt-get install -y sipp
+```
+
+### 2. Clone, configure and build
+
+```bash
 git clone https://github.com/nsbc/nsbc.git
+# China mirror: git clone https://gitee.com/nwaycn/nsbc.git
+
 cd nsbc
-./configure                 # scans src/ for modules, reads conf/modules.conf
+./configure                 # scans src/, reads conf/modules.conf
 
 # Optional: ./configure --without-modules=hello,ai_dialog
 # Optional: ./configure --prefix=/opt/nsbc
 
-# 2. Build
 make -j$(nproc)
-
-# 3. Run unit tests
-make check                 # or make asan / make tsan / make ubsan
-
-# 4. Install (optional)
-sudo make install          # installs nsbcd + nsbc_cli under PREFIX/sbin, config under /etc/nsbc
-
-# 5. Run
-./nsbcd -f                 # foreground
-# or after install: sudo systemctl start nsbc   (example systemd unit not included)
 ```
+
+### 3. Build nsbc-web (Rust sidecar)
+
+```bash
+cd web
+make build-acme
+# This copies static/ and target/release/nsbc-web to the parent directory automatically
+cd ..
+```
+
+### 4. Run
+
+```bash
+# nsbc-web MUST start FIRST — it auto-creates SQLite DB and self-signed TLS cert
+nohup ./nsbc-web &
+sleep 3
+
+# Then start nsbcd
+nohup ./nsbcd &
+```
+
+### 5. Open and test
+
+Open `https://<your-ip>:443/webrtc.html` in your browser.
+Register with default extensions:
+
+| Field | Value |
+|-------|-------|
+| Username | 1000 – 1019 |
+| Password | `876876` |
+| Realm | `nsbc.local` |
+
+Two registered extensions (e.g. `1001` and `1002`) can call each other directly.
 
 ---
 

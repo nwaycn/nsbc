@@ -194,28 +194,68 @@ sudo apt-get install -y build-essential pkg-config \
 
 ## 快速上手
 
+### 1. 安装依赖（Debian/Ubuntu）
+
 ```bash
-# 1. 克隆并配置
+apt-get update && apt-get install -y \
+    build-essential pkg-config \
+    libssl-dev libsrtp2-dev libpcre2-dev libedit-dev \
+    libsqlite3-dev libpq-dev libmysqlclient-dev libopus-dev
+
+# Rust 工具链（用于 nsbc-web 边车）
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source $HOME/.cargo/env
+
+# 可选：sipp 用于 SIP 压测
+apt-get install -y sipp
+```
+
+### 2. 克隆、配置与构建
+
+```bash
 git clone https://github.com/nsbc/nsbc.git
+# 国内镜像：git clone https://gitee.com/nwaycn/nsbc.git
+
 cd nsbc
-./configure                 # 扫描 src/ 下所有 NSBC_MOD()，读取 conf/modules.conf
+./configure                 # 扫描 src/，读取 conf/modules.conf
 
 # 可选：./configure --without-modules=hello,ai_dialog
 # 可选：./configure --prefix=/opt/nsbc
 
-# 2. 构建
 make -j$(nproc)
-
-# 3. 跑单元测试
-make check                 # 或 make asan check / make tsan check / make ubsan check
-
-# 4. 安装（可选）
-sudo make install          # 安装 nsbcd + nsbc_cli 到 PREFIX/sbin，配置到 /etc/nsbc
-
-# 5. 运行
-./nsbcd -f                 # 前台运行
-# 安装后：sudo systemctl start nsbc   （示例 systemd unit 未附带）
 ```
+
+### 3. 构建 nsbc-web（Rust 边车）
+
+```bash
+cd web
+make build-acme
+# 会自动把 static/ 和 target/release/nsbc-web 复制到上级目录
+cd ..
+```
+
+### 4. 运行
+
+```bash
+# 必须先启动 nsbc-web —— 它会自动创建 SQLite DB 和自签 TLS 证书
+nohup ./nsbc-web &
+sleep 3
+
+# 再启动 nsbcd
+nohup ./nsbcd &
+```
+
+### 5. 打开并测试
+
+浏览器访问 `https://<your-ip>:443/webrtc.html`，注册默认分机：
+
+| 项 | 值 |
+|----|----|
+| 用户名 | 1000 – 1019 |
+| 密码 | `876876` |
+| Realm | `nsbc.local` |
+
+两个已注册的分机（例如 `1001` 和 `1002`）即可直接互拨。
 
 ---
 
