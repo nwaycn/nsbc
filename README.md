@@ -12,25 +12,39 @@
 
 ## Table of Contents
 
-- [Architecture Overview](#architecture-overview)
-  - [System Architecture](#system-architecture)
-  - [B2BUA Call Flow](#b2bua-call-flow)
-- [Key Features](#key-features)
-- [System Requirements](#system-requirements)
-- [Quick Start](#quick-start)
-- [Configuration](#configuration)
-- [Web Management Console](#web-management-console)
-- [Architecture](#architecture)
-  - [Core Components](#core-components)
-  - [Module System](#module-system)
-- [Module List](#module-list)
-- [Observability](#observability)
-- [API Reference](#api-reference)
-- [Performance Benchmarks](#performance-benchmarks)
-- [Roadmap](#roadmap)
-- [Contributing](#contributing)
-- [License](#license)
-- [Acknowledgements](#acknowledgements)
+- [NSBC — The All-in-One SIP Powerhouse](#nsbc--the-all-in-one-sip-powerhouse)
+  - [Table of Contents](#table-of-contents)
+  - [Architecture Overview](#architecture-overview)
+    - [System Architecture](#system-architecture)
+    - [B2BUA Call Flow](#b2bua-call-flow)
+  - [Key Features](#key-features)
+  - [System Requirements](#system-requirements)
+  - [Quick Start](#quick-start)
+    - [1. Install dependencies (Debian/Ubuntu)](#1-install-dependencies-debianubuntu)
+    - [2. Clone, configure and build](#2-clone-configure-and-build)
+    - [3. Build nsbc-web (Rust sidecar)](#3-build-nsbc-web-rust-sidecar)
+    - [4. Run](#4-run)
+    - [5. Open and test](#5-open-and-test)
+  - [Configuration](#configuration)
+  - [Web Management Console](#web-management-console)
+  - [Architecture](#architecture)
+    - [Core Components](#core-components)
+    - [Module System](#module-system)
+  - [Module List](#module-list)
+    - [Statically linked (built into `nsbcd`)](#statically-linked-built-into-nsbcd)
+    - [Dynamically loaded (`mod_*.so`)](#dynamically-loaded-mod_so)
+  - [Observability](#observability)
+    - [Prometheus metrics](#prometheus-metrics)
+    - [Structured logging](#structured-logging)
+    - [HEPv3 capture](#hepv3-capture)
+  - [API Reference](#api-reference)
+    - [`nsbc_cli` (local Esl/JSON-RPC)](#nsbc_cli-local-esljson-rpc)
+    - [Web management API](#web-management-api)
+  - [Performance Benchmarks](#performance-benchmarks)
+  - [Roadmap](#roadmap)
+  - [Contributing](#contributing)
+  - [License](#license)
+  - [Acknowledgements](#acknowledgements)
 
 > In-depth docs: [Architecture Reference](docs/architecture.md) ·
 > [Call-Flow Reference (SIP & WebRTC)](docs/call-flows.md) ·
@@ -183,12 +197,6 @@ sequenceDiagram
 | libedit           | -               | optional, for interactive `nsbc_cli` |
 | bcg729            | vendored        | G.729 Annex B codec (shipped under `3rd/`) |
 
-### Package names (Debian/Ubuntu)
-
-```bash
-sudo apt-get install -y build-essential pkg-config \
-    libssl-dev libsrtp2-dev libpcre2-dev libedit-dev
-```
 
 ---
 
@@ -198,7 +206,7 @@ sudo apt-get install -y build-essential pkg-config \
 
 ```bash
 apt-get update && apt-get install -y \
-    build-essential pkg-config \
+    build-essential pkg-config git cmake \
     libssl-dev libsrtp2-dev libpcre2-dev libedit-dev \
     libsqlite3-dev libpq-dev libmysqlclient-dev libopus-dev
 

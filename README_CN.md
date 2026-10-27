@@ -12,25 +12,39 @@
 
 ## 目录
 
-- [架构总览](#架构总览)
-  - [系统架构](#系统架构)
-  - [B2BUA 呼叫流程](#b2bua-呼叫流程)
-- [核心特性](#核心特性)
-- [系统要求](#系统要求)
-- [快速上手](#快速上手)
-- [配置说明](#配置说明)
-- [Web 管理控制台](#web-管理控制台)
-- [内部架构](#内部架构)
-  - [核心组件](#核心组件)
-  - [模块系统](#模块系统)
-- [模块清单](#模块清单)
-- [可观测性](#可观测性)
-- [API 参考](#api-参考)
-- [性能基准](#性能基准)
-- [路线图](#路线图)
-- [贡献指南](#贡献指南)
-- [许可证](#许可证)
-- [致谢](#致谢)
+- [NSBC — 一体化 SIP 全栈平台](#nsbc--一体化-sip-全栈平台)
+  - [目录](#目录)
+  - [架构总览](#架构总览)
+    - [系统架构](#系统架构)
+    - [B2BUA 呼叫流程](#b2bua-呼叫流程)
+  - [核心特性](#核心特性)
+  - [系统要求](#系统要求)
+  - [快速上手](#快速上手)
+    - [1. 安装依赖（Debian/Ubuntu）](#1-安装依赖debianubuntu)
+    - [2. 克隆、配置与构建](#2-克隆配置与构建)
+    - [3. 构建 nsbc-web（Rust 边车）](#3-构建-nsbc-webrust-边车)
+    - [4. 运行](#4-运行)
+    - [5. 打开并测试](#5-打开并测试)
+  - [配置说明](#配置说明)
+  - [Web 管理控制台](#web-管理控制台)
+  - [内部架构](#内部架构)
+    - [核心组件](#核心组件)
+    - [模块系统](#模块系统)
+  - [模块清单](#模块清单)
+    - [静态链接（内置 nsbcd）](#静态链接内置-nsbcd)
+    - [动态加载（`mod_*.so`）](#动态加载mod_so)
+  - [可观测性](#可观测性)
+    - [Prometheus 指标](#prometheus-指标)
+    - [结构化日志](#结构化日志)
+    - [HEPv3 抓包](#hepv3-抓包)
+  - [API 参考](#api-参考)
+    - [`nsbc_cli`（本地 Esl / JSON-RPC）](#nsbc_cli本地-esl--json-rpc)
+    - [Web 管理 API](#web-管理-api)
+  - [性能基准](#性能基准)
+  - [路线图](#路线图)
+  - [贡献指南](#贡献指南)
+  - [许可证](#许可证)
+  - [致谢](#致谢)
 
 > 深入文档：[架构参考](docs/architecture.md) ·
 > [调用链参考（SIP 与 WebRTC）](docs/call-flows_cn.md) ·
@@ -183,12 +197,7 @@ sequenceDiagram
 | libedit          | —              | 可选，用于交互 `nsbc_cli` |
 | bcg729           | 已打包 vendored| G.729 Annex B 编解码（位于 `3rd/`） |
 
-### Debian / Ubuntu 安装命令
 
-```bash
-sudo apt-get install -y build-essential pkg-config \
-    libssl-dev libsrtp2-dev libpcre2-dev libedit-dev
-```
 
 ---
 
@@ -198,7 +207,7 @@ sudo apt-get install -y build-essential pkg-config \
 
 ```bash
 apt-get update && apt-get install -y \
-    build-essential pkg-config \
+    build-essential pkg-config git cmake \
     libssl-dev libsrtp2-dev libpcre2-dev libedit-dev \
     libsqlite3-dev libpq-dev libmysqlclient-dev libopus-dev
 
