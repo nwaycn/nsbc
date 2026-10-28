@@ -191,7 +191,7 @@ sequenceDiagram
 | 操作系统         | Linux x86_64   | kernel 4.15+；暂不支持 Windows / macOS |
 | GCC              | 8+             | 需 `-Werror -std=gnu99` |
 | Rust 工具链      | stable         | 仅 `web/` 边车需要；C 核心可独立构建 |
-| OpenSSL          | 1.1.1+         | SIP TLS + DTLS-SRTP（硬依赖，不可选） |
+| OpenSSL          | 3.0.0+         | SIP TLS + DTLS-SRTP（硬依赖，不可选, chrome必须要） |
 | libsrtp          | 2.x            | 媒体加密（硬依赖） |
 | libpcre2         | 8+             | 拨号计划正则 |
 | libedit          | —              | 可选，用于交互 `nsbc_cli` |
@@ -350,8 +350,8 @@ Web 控制台是独立的 Rust 边车（`web/` 目录），**不运行在 nsbcd 
 
 ```bash
 cd web
-cargo build --release      # 或 cargo build --features acme 启用 Let's Encrypt
-./target/release/nsbc-web  # HTTPS :8443
+make build-acme      # 或 这里已由makefile将必须的文件复制到上一级../
+cd .. && ./nsbc-web  # HTTPS :443
 ```
 
 边车职责：
