@@ -191,7 +191,7 @@ sequenceDiagram
 | OS                | Linux x86_64    | kernel 4.15+; no Windows/macOS support yet |
 | GCC               | 8+              | required `-Werror -std=gnu99` build |
 | Rust toolchain    | stable          | only for `web/` sidecar; C core builds without Rust |
-| OpenSSL           | 1.1.1+          | SIP TLS + DTLS-SRTP (hard requirement, not optional) |
+| OpenSSL           | 3.0.0+          | SIP TLS + DTLS-SRTP (hard requirement, not optional, chrome required) |
 | libsrtp           | 2.x             | media encryption (hard requirement) |
 | libpcre2          | 8+              | dialplan regex |
 | libedit           | -               | optional, for interactive `nsbc_cli` |
@@ -339,8 +339,8 @@ The web console is a **separate Rust sidecar** (`web/` directory). It does not r
 
 ```bash
 cd web
-cargo build --release      # or cargo build --features acme for Let's Encrypt support
-./target/release/nsbc-web  # binds HTTPS on :8443
+make build-acme        
+cd .. && ./nsbc-web  # removed it to ../. with makefile ,binds HTTPS on :443
 ```
 
 The sidecar:
@@ -349,7 +349,7 @@ The sidecar:
 - Serves an embedded SPA (no Node.js runtime required)
 - Uses rustls for HTTPS; can auto-generate self-signed certificates on first run
 
-Open `https://<host>:8443` in your browser.
+Open `https://<host>:443` in your browser.
 
 ---
 
