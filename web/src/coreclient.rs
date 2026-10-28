@@ -28,6 +28,20 @@
 //! under `cfg(unix)`, Windows development builds return [`CoreError::Unsupported`].
 use std::collections::BTreeMap;
 use std::fmt;
+
+/// RW-H1 hardening: sanitize a command argument before injecting into obs_control
+/// line-text protocol. Reject spaces / newlines / control chars that would be split
+/// into multiple commands by the core's whitespace tokenizer. Replace disallowed
+/// chars with underscore to keep the command well-formed.
+fn sanitize_arg(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "-_.:/@+=,;".contains(c) { c }
+            else { '_' }
+        })
+        .collect()
+}
+
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -864,13 +878,13 @@ impl CoreApi for RealCore {
     }
     async fn call_detail(&self, call_id: &str) -> Result<CallDetail, CoreError> {
         // Same as hangup: notfound must map to 404; use send_cmd, skip the unified ERR pre-check.
-        let cmd = format!("uuid_dump {call_id}");
+        let cmd = format!("uuid_dump {}", sanitize_arg(call_id));
         let body = send_cmd(&self.sock_path, self.timeout, &cmd).await?;
         parse_call_detail(&body)
     }
     async fn config_get(&self, key: &str) -> Result<ConfigValue, CoreError> {
         // Read-only but must self-dispatch notfound -> 404 (invalid key is blocked earlier by routing layer).
-        let cmd = format!("config.get {key}");
+        let cmd = format!("config.get {}", sanitize_arg(key));
         let body = send_cmd(&self.sock_path, self.timeout, &cmd).await?;
         parse_config_value(&body)
     }
@@ -883,7 +897,7 @@ impl CoreApi for RealCore {
     async fn hangup(&self, call_id: &str) -> Result<(), CoreError> {
         // Build command string as owned first so we do not borrow input params across await; call_id validity
         // (length/charset) is validated twice by routing layer and core; transport layer only sends faithfully.
-        let cmd = format!("hangup {call_id}");
+        let cmd = format!("hangup {}", sanitize_arg(call_id));
         let body = send_cmd(&self.sock_path, self.timeout, &cmd).await?;
         parse_hangup(&body)
     }
@@ -903,12 +917,12 @@ impl CoreApi for RealCore {
     async fn config_set(&self, key: &str, value: &str) -> Result<ConfigSetResult, CoreError> {
         // split_kv splits key from value at first space; value may contain spaces;
         // Empty value (deletion) is expressed by a trailing space in `config.set <key> `.
-        let cmd = format!("config.set {key} {value}");
+        let cmd = format!("config.set {} {}", sanitize_arg(key), sanitize_arg(value));
         let body = send_cmd(&self.sock_path, self.timeout, &cmd).await?;
         parse_config_set(&body, key)
     }
     async fn config_validate(&self, key: &str, value: &str) -> Result<(), CoreError> {
-        let cmd = format!("config.validate {key} {value}");
+        let cmd = format!("config.validate {} {}", sanitize_arg(key), sanitize_arg(value));
         let body = send_cmd(&self.sock_path, self.timeout, &cmd).await?;
         parse_config_validate(&body)
     }
@@ -927,7 +941,7 @@ impl CoreApi for RealCore {
         parse_ban_list(&body)
     }
     async fn security_ban_unban(&self, ip: &str) -> Result<(), CoreError> {
-        let cmd = format!("security.ban.unban {ip}");
+        let cmd = format!("security.ban.unban {}", sanitize_arg(ip));
         let body = send_cmd(&self.sock_path, self.timeout, &cmd).await?;
         if body.trim_start().starts_with("OK") {
             Ok(())
@@ -1004,13 +1018,13 @@ impl CoreApi for RealCore {
     async fn send_message(&self, call_id: &str, body: &str) -> Result<(), CoreError> {
         // send_msg command format: send_msg <call-id> <body>, body may contain spaces,
         // so just concatenate directly (call_id charset already validated by routing layer).
-        let cmd = format!("send_msg {call_id} {body}");
+        let cmd = format!("send_msg {} {}", sanitize_arg(call_id), sanitize_arg(body));
         let resp = send_cmd(&self.sock_path, self.timeout, &cmd).await?;
         parse_call_action_ok_err(&resp, call_id)
     }
 
     async fn originate(&self, call_url: &str) -> Result<(), CoreError> {
-        let cmd = format!("originate {call_url}");
+        let cmd = format!("originate {}", sanitize_arg(call_url));
         let body = send_cmd(&self.sock_path, self.timeout, &cmd).await?;
         parse_call_action_ok_err(&body, call_url)
     }
@@ -2561,7 +2575,7 @@ leg 0 sdp_offer 50\nabc\n";
         }
 
         async fn send_message(&self, call_id: &str, body: &str) -> Result<(), CoreError> {
-            let cmd = format!("send_msg {call_id} {body}");
+            let cmd = format!("send_msg {} {}", sanitize_arg(call_id), sanitize_arg(body));
             self.calls.lock().unwrap().push(cmd.clone());
             let key = format!("send_msg:{call_id}");
             let canned = self
@@ -2574,7 +2588,7 @@ leg 0 sdp_offer 50\nabc\n";
         }
 
         async fn originate(&self, call_url: &str) -> Result<(), CoreError> {
-            let cmd = format!("originate {call_url}");
+            let cmd = format!("originate {}", sanitize_arg(call_url));
             self.calls.lock().unwrap().push(cmd.clone());
             let canned = self
                 .canned

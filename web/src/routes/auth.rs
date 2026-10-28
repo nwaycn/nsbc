@@ -41,6 +41,14 @@ where
     Router::new()
         .route("/auth/logout", post(logout::<C>))
         .route("/auth/change-password", post(change_password::<C>))
+        .route("/auth/step-up", post(step_up::<C>))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)] // REQ-WEB-009
+struct StepUpReq {
+    /// Fresh password re-entry — secondary authorization (RW-C3 hardening).
+    password: String,
 }
 
 #[derive(Deserialize)]
@@ -439,6 +447,80 @@ async fn change_password<C: CoreApi + Clone + 'static>(
         .audit
         .record("change_password", Some(&access.sub), &peer, json!({}));
     Ok(Json(json!({ "status": "password_changed" })))
+}
+
+/// POST /api/v1/auth/step-up — RW-C3 hardening: authenticated user re-enters
+/// password to obtain a short-lived (60s) step-up token, which must be presented
+/// as X-Nsbc-Step-Up header on any subsequent L2-risky operation (kill/transfer/
+/// restart/...). The endpoint itself only requires L1 (default protected role),
+/// the actual L2 guard is rbac middleware.
+async fn step_up<C: CoreApi + Clone + 'static>(
+    State(st): State<Arc<AppState<C>>>,
+    Extension(peer): Extension<PeerCtx>,
+    Extension(Identity(access)): Extension<Identity>,
+    Json(req): Json<StepUpReq>,
+) -> ApiResult<Json<Value>> {
+    if req.password.is_empty() || req.password.len() > 256 {
+        return Err(ApiError::BadRequest("password required".into()));
+    }
+
+    // Fetch user from DB (same authoritative source as login path)
+    let u = match st.db.get_web_user(&access.sub).await {
+        Ok(Some(user)) => user,
+        Ok(None) => {
+            tracing::warn!(user = %access.sub, "step-up: user not in DB");
+            return Err(ApiError::BadCredentials);
+        }
+        Err(error) => {
+            tracing::error!(user = %access.sub, error = %error, "step-up user lookup failed");
+            st.auth.audit.record(
+                "step_up_failed",
+                Some(&access.sub),
+                &peer,
+                json!({"reason": "database_query_failed"}),
+            );
+            return Err(ApiError::DbUnavailable);
+        }
+    };
+    if u.enabled != 1 {
+        return Err(ApiError::BadCredentials);
+    }
+
+    // Verify password — same argon2id logic as login/change-password
+    use argon2::{Argon2, PasswordHash, PasswordVerifier};
+    let Ok(parsed) = PasswordHash::new(&u.password_phc) else {
+        tracing::warn!(user = %access.sub, "step-up: invalid stored PHC");
+        return Err(ApiError::ServiceUnavailable("account data corrupted".into()));
+    };
+    if Argon2::default()
+        .verify_password(req.password.as_bytes(), &parsed)
+        .is_err()
+    {
+        st.auth.audit.record(
+            "step_up_failed",
+            Some(&access.sub),
+            &peer,
+            json!({"reason": "bad_password"}),
+        );
+        return Err(ApiError::BadCredentials);
+    }
+
+    // Role is extracted from the existing access token claims (already validated by rbac),
+    // re-issue as StepUp kind with 60s ttl.
+    let now = now_secs();
+    let (tok, claims) = st.auth.tokens.issue_step_up(&access.sub, access.role, now);
+    st.auth.audit.record(
+        "step_up_issued",
+        Some(&access.sub),
+        &peer,
+        json!({"iat": now, "exp": claims.exp}),
+    );
+    tracing::info!(user = %access.sub, "step-up token issued (60s)");
+    Ok(Json(json!({
+        "step_up_token": tok,
+        "token_type": "X-Nsbc-Step-Up",
+        "expires_in": 60,
+    })))
 }
 
 fn token_pair(access_token: String, refresh_token: String, expires_in: u64) -> Value {

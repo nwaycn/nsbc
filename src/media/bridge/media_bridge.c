@@ -217,6 +217,11 @@ struct rtp_relay {
      * 延迟到所有初始化完成后 rtp_relay_arm 才 reactor_add。
      * rtp_relay_stop 里 arm=0 时跳过 reactor_del（fd 还没注册）。 */
     int armed;
+    /* ★ P0-2 RACE-FIX: rtp_relay_stop 置 dead=1，relay_recv_one 循环每次检查
+     * 并立即退出。解决 "reactor_call del fd 返回后，已进入 relay_recv_one 的
+     * for(;;) 循环还在内核队列剩余数据包 → bridge_release_call free(r) 时
+     * relay_recv_one 还在访问 r→node → UAF"。ARMED 置 0 在 reactor_call 之前。 */
+    _Atomic int dead;
     /* REQ-ORIGINATE-003 &echo 实现：RTP 环回 mode。
      * 置 1 后 relay_recv_one 把收到的包发回同一侧（side→side），
      * 而非正常的 side→other。两侧各自环回自己的 peer。 */
@@ -317,7 +322,10 @@ static int rx_classify(const uint8_t *buf, size_t len)
     if (len < 2) return -1;
     uint16_t t = (uint16_t)((buf[0] << 8) | buf[1]);
     if ((t & 0xC000) == 0x0000 && len >= 20) {
-        uint32_t ck = ntohl(*(const uint32_t *)(buf + 4));
+        /* 用 memcpy 避免 ARM/SPARC 严格对齐平台 SIGBUS (CVE-style 防御) */
+        uint32_t ck_raw;
+        memcpy(&ck_raw, buf + 4, sizeof(ck_raw));
+        uint32_t ck = ntohl(ck_raw);
         if (ck == 0x2112A442u) return 1;
     }
     if (buf[0] >= 20 && buf[0] <= 25) return 2;
@@ -430,6 +438,12 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
         ++diag_any_seen[slot];
     }
     for (;;) {
+        /* ★ P0-2 RACE-FIX: 每次循环开头检查 dead flag。rtp_relay_stop
+         * 置 dead=1 后，即使 reactor_call 返回时本回调还在跑（内核队列
+         * 有残留数据包），也会在这里立即退出，不会在 bridge_release_call
+         * free(r/e) 后继续访问 r→node 等成员。 */
+        if (__atomic_load_n(&r->dead, __ATOMIC_ACQUIRE))
+            return;
         nsbc_sa_t src;
         struct sockaddr_storage ss;
         socklen_t sl = sizeof(ss);
@@ -2161,19 +2175,34 @@ int bridge_rewrite_sdp(const char *in, size_t in_len, char *out,
                      * 但如果我们有 relay（media_port!=0），说明 offer_hook
                      * 已决定做 SRTP_RELAY 转发 → 必须用 relay 的真实端口，
                      * 不能保留 0 否则对端收到 m=audio 0 + a=inactive →
-                     * 不回 200 OK 或回 200 但不发音频。 */
-                    this_port = (uint16_t)(media_port + (uint16_t)(media_idx * 2));
+                     * 不回 200 OK 或回 200 但不发音频。
+                     *
+                     * ★ BUNDLE 规则（RFC 8843）：
+                     *   dir == WS（WebRTC/BUNDLE）→ 所有 m= 段共用同一 transport，
+                     *     端口统一 = media_port，不加 idx 偏移。
+                     *   dir == PLAIN/ASIS → 硬 SIP 端无 BUNDLE，audio/video 独立 relay，
+                     *     用 media_port + media_idx*2 分端口。 */
+                    if (dir == MB_SDP_WS)
+                        this_port = (uint16_t)media_port;
+                    else
+                        this_port = (uint16_t)(media_port + (uint16_t)(media_idx * 2));
                     llog(LOG_INFO, "media",
-                         "★REWRITE_BRANCH[%d]: orig_port=0 but relay active → force port=%u media_port=%u",
-                         media_idx, this_port, (unsigned)media_port);
+                         "★REWRITE_BRANCH[%d]: orig_port=0 relay active → %s port=%u media_port=%u",
+                         media_idx,
+                         dir == MB_SDP_WS ? "BUNDLE-unified" : "idx-offset",
+                         this_port, (unsigned)media_port);
                 } else {
-                    /* 所有非 rejected 段都递增 media_idx * 2：
-                     *   ASIS   → relay 端口按 idx 偏移（两端 LAN 直连，不改 relay 端口）
-                     *   PLAIN  → relay 端口按 idx 偏移（SBC 媒体中继，audio/video 分端口）
-                     *   WS     → relay 端口按 idx 偏移（同 PLAIN）
-                     * 之前只 ASIS 递增、PLAIN/WS 用同一端口 → mixed_ws 场景
-                     * audio=video=59998 → SIP 端两个 m= 段同端口 → 无法区分 → drop。 */
-                    this_port = (uint16_t)(media_port + (uint16_t)(media_idx * 2));
+                    /* ★ BUNDLE 规则（RFC 8843）：
+                     *   WS 方向（WebRTC answer）→ audio/video 共用同一 transport，
+                     *     所有 m= 段统一用 media_port，不加 idx 偏移。
+                     *     Browser offer 有 a=group:BUNDLE → 我们的 answer 也必须
+                     *     audio/video 同端口，否则 ICE connectivity check 只成功
+                     *     audio 那个端口，video 端口没 ICE → DTLS 不通 → 全丢。
+                     *   PLAIN/ASIS → 硬 SIP 端无 BUNDLE，audio/video 分端口独立 relay。 */
+                    if (dir == MB_SDP_WS)
+                        this_port = (uint16_t)media_port;
+                    else
+                        this_port = (uint16_t)(media_port + (uint16_t)(media_idx * 2));
                 }
 
                 const char *ps = port_end;
@@ -2301,6 +2330,7 @@ int rtp_relay_start(bridge_mgr_t *m, rtp_relay_t **out,
     rtp_relay_t *r = calloc(1, sizeof(*r));
     if (!r)
         return NSBC_NOMEM;
+    /* calloc 已把 dead/armed 等全部清零 → dead=0, armed=0 天然正确 */
     r->m = m;
     for (int i = 0; i < 2; ++i) {
         r->fd_rtp[i] = r->fd_rtcp[i] = -1;
@@ -2474,6 +2504,13 @@ void rtp_relay_stop(rtp_relay_t *r)
     if (!r)
         return;
     bridge_mgr_t *m = r->m;
+
+    /* ★ P0-2 RACE-FIX: 先置 dead=1 再 reactor_call。
+     * relay_recv_one for(;;) 循环每次迭代检查 dead，检测到立即 return。
+     * 这样 reactor_call 返回时即使已进入的 relay_recv_one 还在内核队列里有
+     * 残留数据包，也会在下一次迭代迅速退出，不会在 bridge_release_call free(r/e)
+     * 后继续访问 r->node 等成员。 */
+    __atomic_store_n(&r->dead, 1, __ATOMIC_RELEASE);
 
     /* P3: 通过 reactor_call 在 reactor owner 线程里批量删除所有 fd。
      * reactor_call 同步等待——owner 执行完 reactor_del 才返回，
@@ -2933,7 +2970,6 @@ int bridge_offer_hook(void *call, const char *in, size_t inlen,
             int ne = snprintf(ice_extra, sizeof(ice_extra),
                      "a=ice-ufrag:%s\r\n"
                      "a=ice-pwd:%s\r\n"
-                     "a=ice-lite\r\n"
                      "a=fingerprint:sha-256 %s\r\n"
                      "a=setup:actpass\r\n"
                      "a=candidate:1 1 udp 2113937151 %s %u typ host\r\n",
@@ -3188,7 +3224,6 @@ int bridge_answer_hook(void *call, const char *in, size_t inlen,
         int ne = snprintf(ice_extra, sizeof(ice_extra),
                  "a=ice-ufrag:%s\r\n"
                  "a=ice-pwd:%s\r\n"
-                 "a=ice-lite\r\n"
                  "a=fingerprint:sha-256 %s\r\n"
                  "a=setup:passive\r\n"
                  "a=candidate:1 1 udp 2113937151 %s %u typ host\r\n",

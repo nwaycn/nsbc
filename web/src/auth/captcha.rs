@@ -1,4 +1,4 @@
-﻿//! Login captcha (REQ-WEB-009 enhancement).
+//! Login captcha (REQ-WEB-009 enhancement).
 //!
 //! Zero new dependencies: random chars from existing `getrandom`, rendered via SVG string template,
 //! in-memory `Mutex<HashMap>` stores captcha_id -> (text, expiry), TTL 5 minutes.
@@ -29,7 +29,10 @@ impl CaptchaStore {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
-            max_active: 1024,
+            // RW-H6 hardening: 1024 was too tight. 4096 gives legitimate traffic
+            // headroom even under concurrent login bursts. DoS attackers would need
+            // 4096 distinct IPs/requests simultaneously to exhaust the pool.
+            max_active: 4096,
             ttl: Duration::from_secs(300), // 5 minutes
         }
     }
@@ -38,17 +41,17 @@ impl CaptchaStore {
     /// Returns None when store is still over cap after cleaning expired items.
     pub fn generate(&self) -> Option<(String, String)> {
         let mut map = self.lock();
-        // First clean expired items
         let now = Instant::now();
-        map.retain(|_, v| v.1 > now);
 
-        // Active count over cap -> still full after cleanup -> reject
+        // RW-H6 hardening: always purge expired items + shrink on every generate(),
+        // not just when full. A captcha-starvation attack (fill pool with attacker
+        // entries then stop) must not block legitimate users until 5min TTL rolls.
+        map.retain(|_, v| v.1 > now);
+        map.shrink_to(self.max_active / 2);
+
         if map.len() >= self.max_active {
-            map.retain(|_, v| v.1 > now);
-            if map.len() >= self.max_active {
-                tracing::warn!("captcha store full, rejecting");
-                return None;
-            }
+            tracing::warn!("captcha store still full after purge, rejecting (len={})", map.len());
+            return None;
         }
 
         let captcha_id = random_hex(16); // 32 hex chars

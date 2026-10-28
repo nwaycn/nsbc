@@ -1,3 +1,10 @@
+/* Architectural constraint guard — C core nsbcd does NOT touch DB.
+ * Rust web side (sqlx Any driver) is the sole persistence layer.
+ * Enabling: comment out "#define NSBC_NO_DBAL" below AND remove
+ * src/db/%.c from Makefile filter-out. */
+#ifndef NSBC_NO_DBAL
+#define NSBC_NO_DBAL
+
 /* dbal 模块描述符（REQ-DB-001/005）：进程启动期建异步 worker，
  * 关键路径只入队；默认 sqlite WAL，未编入驱动时降级为 none 不阻断启动。 */
 #include "app_ctx.h"
@@ -41,6 +48,8 @@ static void dbal_mod_fini(struct nsbc_ctx *ctx)
 }
 
 NSBC_MOD0_CAT(dbal, 1, MOD_L_EARLY, 0, MOD_CAT_CORE, dbal_mod_init, dbal_mod_fini);
+
+#endif /* NSBC_NO_DBAL — end of dead-code DBAL guard */
 
 /*
     Author:       李浩 (Li Hao)

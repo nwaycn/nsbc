@@ -376,11 +376,17 @@ int log_init(const char *path, log_level_t level, uint32_t ring_slots)
         g_cur_size = 0;
     }
     if (g_running) {
-        /* 两阶段启动：第二次调用仅热切换输出 fd，不重复建日志线程 */
+        /* 两阶段启动：第二次调用仅热切换输出 fd，不重复建日志线程
+         * ★ P0 RACE-FIX: close(old) 必须在 g_reg_lock 内。
+         * logger_main 只在持 g_reg_lock 时 write(g_fd)，因此 close 争用
+         * 同一把锁就不会和 write 并发 — 不会 close 一个正在被 write 的 fd。 */
         int old = g_fd;
         g_fd = nfd;
-        if (old >= 0)
+        if (old >= 0) {
+            pthread_mutex_lock(&g_reg_lock);
             close(old);
+            pthread_mutex_unlock(&g_reg_lock);
+        }
         return NSBC_OK;
     }
     g_fd = nfd;

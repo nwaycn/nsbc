@@ -188,8 +188,12 @@ static app_rc_t app_record_exec(app_ctx_t *c, const char *data, void *ud)
         if (sess) {
             char final_path[512]; uint64_t bytes = 0;
             reg_del(call->leg[0].callid, leg);
+            /* ★ R2 P0 fix: 先 atomic_exchange(NULL) 再 rec_stop(free)。
+             * 如果 feed 还在跑，exchange 让 call->rec[leg] 立刻变 NULL，
+             * 后续 feed 从 call->rec[leg] 取 sess 会拿到 NULL → 跳过。
+             * 已经在跑的 feed 因 closing=1 快路径 skip，不会碰 sess。 */
+            (void)__atomic_exchange_n((void **)&call->rec[leg], NULL, __ATOMIC_RELEASE);
             rec_stop(sess, final_path, sizeof(final_path), &bytes);
-            __atomic_store_n((void **)&call->rec[leg], NULL, __ATOMIC_RELEASE);
             llog(LOG_INFO, "rec", "app_record STOP callid=%s leg=%d path=%s bytes=%llu",
                  call->leg[0].callid, leg, final_path, (unsigned long long)bytes);
         }

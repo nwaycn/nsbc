@@ -64,11 +64,50 @@ pub fn start<C: crate::coreclient::CoreApi + Clone + Send + Sync + 'static>(
     tracing::info!(path = %sock_path.display(), "UDS Data Service bound (unified frame protocol)");
 
     Ok(tokio::spawn(async move {
+        // audit RW-C1 hardening: resolve our own effective UID once (startup 时取)
+        // 纯 Rust 读 /proc/self/status 的 Uid 行拿 euid（避免引入 libc crate）
+        #[cfg(unix)]
+        let our_euid: u32 = std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("Uid:"))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|v| v.parse::<u32>().ok())
+            })
+            .unwrap_or(0); // fallback 0 (假设 root)
+        #[cfg(not(unix))]
+        let our_euid: u32 = 0;
         loop {
-            let (mut stream, _) = match listener.accept().await {
+            let (mut stream, _peer_addr) = match listener.accept().await {
                 Ok(v) => v,
                 Err(e) => { tracing::warn!(error = %e, "UDS accept failed"); continue; }
             };
+
+            // --- RW-C1: peer_cred 鉴权 ---
+            // tokio: peer_cred() -> Result<UCred, io::Error>
+            match stream.peer_cred() {
+                Ok(cred) => {
+                    let caller_uid = cred.uid() as u32;
+                    tracing::debug!(caller_uid, "UDS accepted");
+                    // 加固：uid != 0 且 != 自身 euid → 拒绝
+                    if caller_uid != 0 && caller_uid != our_euid {
+                        tracing::warn!(
+                            caller_uid, our_euid,
+                            "UDS rejected: caller uid {} not 0/self (RW-C1)",
+                            caller_uid
+                        );
+                        drop(stream);
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "UDS rejected: peer_cred() failed (RW-C1)");
+                    drop(stream);
+                    continue;
+                }
+            }
+
             let state = state.clone();
             tokio::spawn(async move {
                 if let Err(e) = handle_conn(&mut stream, &state).await {

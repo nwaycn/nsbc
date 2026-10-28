@@ -13,6 +13,9 @@
 #include "log.h"
 #include "percpu.h"
 #include <pthread.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -39,6 +42,13 @@ typedef struct {
     volatile uint64_t read_pos      NSBC_CACHELINE_ALIGNED;
     volatile uint64_t dropped_count NSBC_CACHELINE_ALIGNED;
     volatile uint64_t local_seq     NSBC_CACHELINE_ALIGNED;   /* P3: per-core 独立单调递增，零跨核争用 */
+    /* ★ P0-2.2 RACE-FIX: push_lock.
+     * 注释声称 "Per-Core，producer 只有一个线程"，但 pcpt_idx() 返回
+     * sched_getcpu() 不绑核——两个线程可能分时跑在同一核，并发 push
+     * 到同一 ring 时 write_pos load→memcpy→store 非原子 → 帧覆盖损坏。
+     * 用 test_and_set 自旋锁保护 push 的临界区（memcpy + store）。
+     * consumer drain 侧只读 atomic rp/wp，不受此锁影响。 */
+    nsbc_atomic_t push_lock         NSBC_CACHELINE_ALIGNED;
     char buffer[RING_SIZE];
 } per_core_ring_t;
 
@@ -160,17 +170,7 @@ int nsbc_event_push(const char *event_name, const char *payload_json)
     uint32_t payload_len = (uint32_t)payload_size;
     size_t frame_size = frame_overhead + name_size + payload_size;
 
-    /* 3. Check capacity before taking the globally contended sequence counter. */
-    uint64_t wp = __atomic_load_n(&rb->write_pos, __ATOMIC_RELAXED);
-    uint64_t rp = __atomic_load_n(&rb->read_pos, __ATOMIC_ACQUIRE);  /* reader 可能在另一核 */
-
-    uint64_t ring_avail = RING_SIZE - (wp - rp);  /* 当前 ring 剩余空间（字节）*/
-    if (ring_avail < frame_size) {
-        /* 满了——drop，不阻塞生产 */
-        __atomic_fetch_add(&rb->dropped_count, 1, __ATOMIC_RELAXED);
-        return NSBC_BUSY;
-    }
-
+    /* 3. 构造帧（纯 TLS 内存操作，无共享状态 → 锁外安全） */
     uint64_t seq = event_bus_next_seq();
     char *p = tls_event_buf;
     memcpy(p, &name_len, 2); p += 2;
@@ -180,21 +180,36 @@ int nsbc_event_push(const char *event_name, const char *payload_json)
     memcpy(p, &seq, 8); p += 8;
     *p++ = 0xFF;  /* end_marker */
 
-    /* 4. 无锁写入 ring buffer */
-    /* 4. 拷贝到 ring（处理 wrap） */
+    /* 4. ★ P0-2.2 RACE-FIX: push 临界区 — 拿锁、check capacity、memcpy、store */
+    {
+        unsigned long expected = 0;
+        while (!__atomic_compare_exchange_n(&rb->push_lock, &expected, 1,
+                                             false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+            expected = 0;
+            sched_yield();
+        }
+    }
+
+    uint64_t wp = __atomic_load_n(&rb->write_pos, __ATOMIC_RELAXED);
+    uint64_t rp = __atomic_load_n(&rb->read_pos, __ATOMIC_ACQUIRE);
+    uint64_t ring_avail = RING_SIZE - (wp - rp);
+    if (ring_avail < frame_size) {
+        __atomic_store_n(&rb->push_lock, 0, __ATOMIC_RELEASE);
+        __atomic_fetch_add(&rb->dropped_count, 1, __ATOMIC_RELAXED);
+        return NSBC_BUSY;
+    }
+
     uint64_t offset = wp & RING_MASK;
-    uint64_t first_chunk = RING_SIZE - offset;   /* 到 buffer 末尾的字节数 */
+    uint64_t first_chunk = RING_SIZE - offset;
     if (frame_size <= first_chunk) {
-        /* 单次写入 */
         memcpy(rb->buffer + offset, tls_event_buf, frame_size);
     } else {
-        /* 跨 wrap：先写 first_chunk，再写剩下的到 buffer[0] */
         memcpy(rb->buffer + offset, tls_event_buf, (size_t)first_chunk);
         memcpy(rb->buffer, tls_event_buf + first_chunk, frame_size - first_chunk);
     }
 
-    /* 5. release store 发布新 write_pos */
     __atomic_store_n(&rb->write_pos, wp + frame_size, __ATOMIC_RELEASE);
+    __atomic_store_n(&rb->push_lock, 0, __ATOMIC_RELEASE);
     return NSBC_OK;
 }
 

@@ -225,15 +225,17 @@ async fn snapshot<C: CoreApi + Clone + Send + Sync>(
             let cfg = st.db.get_security_config().await
                 .map_err(|e| format!("db: {e}"))?;
             let obj = serde_json::json!({
-                "fence_mode":         cfg.fence_mode,
-                "method_blocked":     cfg.method_blocked,
-                "auto_ban":           cfg.auto_ban,
-                "authfail_threshold": cfg.authfail_threshold,
-                "authfail_window_s":  cfg.authfail_window_s,
-                "ban_duration_s":     cfg.ban_duration_s,
-                "ratelimit_regs":     cfg.ratelimit_regs,
-                "ratelimit_window_s": cfg.ratelimit_window_s,
-                "rules":              dtos,
+                "fence_mode":                cfg.fence_mode,
+                "method_blocked":            cfg.method_blocked,
+                "auto_ban":                  cfg.auto_ban,
+                "authfail_threshold":        cfg.authfail_threshold,
+                "authfail_window_s":         cfg.authfail_window_s,
+                "ban_duration_s":            cfg.ban_duration_s,
+                "ratelimit_regs":            cfg.ratelimit_regs,
+                "ratelimit_window_s":        cfg.ratelimit_window_s,
+                "ratelimit_invites":         cfg.ratelimit_invites,
+                "ratelimit_invites_active":  cfg.ratelimit_invites_active,
+                "rules":                     dtos,
             });
             serde_json::to_string(&obj).map(|j| (j, n)).map_err(|e| e.to_string())
         }

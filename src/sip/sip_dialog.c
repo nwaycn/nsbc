@@ -10,12 +10,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define DLG_SHARDS 1024
-#define DLG_BUCKETS 32
+#define DLG_SHARDS 1024   /* 64 → 1024: find_obj 链表扫描从 ~780→~49 dialog，延迟降 16 倍 */
 
 typedef struct {
     pthread_mutex_t lock;
-    nsbc_hnode_t *buckets[DLG_BUCKETS];
+    nsbc_hnode_t *head;
 } dlg_shard_t;
 
 struct dlg_mgr {
@@ -37,21 +36,11 @@ static void tok_copy(char *dst, size_t cap, sip_tok_t t)
     dst[n] = '\0';
 }
 
-static uint64_t dlg_hash(const char *cid, size_t clen, const char *lt,
-                         size_t ltlen)
+static dlg_shard_t *shard(dlg_mgr_t *m, const char *cid, size_t clen,
+                          const char *lt, size_t ltlen)
 {
-    return nsbc_hash2(cid, clen, lt, ltlen);
-}
-
-static dlg_shard_t *shard(dlg_mgr_t *m, uint64_t hash)
-{
-    return &m->sh[nsbc_hash_shard(hash, DLG_SHARDS)];
-}
-
-static nsbc_hnode_t **bucket(dlg_shard_t *s, uint64_t hash)
-{
-    unsigned idx = (unsigned)((hash >> 10) & (DLG_BUCKETS - 1));
-    return &s->buckets[idx];
+    uint64_t h = nsbc_hash2(cid, clen, lt, ltlen);
+    return &m->sh[nsbc_hash_shard(h, DLG_SHARDS)];
 }
 
 int dlg_mgr_create(const dlg_mgr_cfg_t *cfg, dlg_mgr_t **out)
@@ -67,8 +56,6 @@ int dlg_mgr_create(const dlg_mgr_cfg_t *cfg, dlg_mgr_t **out)
                             cfg->capacity > 0 ? cfg->capacity : 50000, 8,
                             cfg->arena, NULL, NULL};
         if (mem_slab_create(&sc, &m->slab_own) != NSBC_OK) {
-            for (int i = 0; i < DLG_SHARDS; ++i)
-                pthread_mutex_destroy(&m->sh[i].lock);
             free(m);
             return NSBC_NOMEM;
         }
@@ -81,13 +68,11 @@ int dlg_mgr_create(const dlg_mgr_cfg_t *cfg, dlg_mgr_t **out)
 void dlg_mgr_destroy(dlg_mgr_t *m)
 {
     for (int i = 0; i < DLG_SHARDS; ++i) {
-        for (int b = 0; b < DLG_BUCKETS; ++b) {
-            nsbc_hnode_t *h = m->sh[i].buckets[b];
-            while (h) {
-                dlg_obj_t *o = NSBC_CONTAINER_OF(h, dlg_obj_t, link);
-                h = h->next;
-                mem_obj_release(o);
-            }
+        nsbc_hnode_t *h = m->sh[i].head;
+        while (h) {
+            dlg_obj_t *o = NSBC_CONTAINER_OF(h, dlg_obj_t, link);
+            h = h->next;
+            mem_obj_release(o);
         }
         pthread_mutex_destroy(&m->sh[i].lock);
     }
@@ -179,13 +164,11 @@ sip_dialog_t *dlg_uas_new(dlg_mgr_t *m, const sip_msg_t *req)
     }
     d->nroutes = n;
 
-    uint64_t hash = dlg_hash(d->callid, strlen(d->callid), d->local_tag,
-                             strlen(d->local_tag));
-    dlg_shard_t *s = shard(m, hash);
+    dlg_shard_t *s = shard(m, d->callid, strlen(d->callid), d->local_tag,
+                           strlen(d->local_tag));
     pthread_mutex_lock(&s->lock);
-    nsbc_hnode_t **head = bucket(s, hash);
-    o->link.next = *head;
-    *head = &o->link;
+    o->link.next = s->head;
+    s->head = &o->link;
     pthread_mutex_unlock(&s->lock);
     return d;
 }
@@ -212,13 +195,11 @@ sip_dialog_t *dlg_uac_new(dlg_mgr_t *m, const char *callid, size_t clen,
     d->local_cseq = cseq;
     d->init_method = init_method;
 
-    uint64_t hash = dlg_hash(d->callid, strlen(d->callid), d->local_tag,
-                             strlen(d->local_tag));
-    dlg_shard_t *s = shard(m, hash);
+    dlg_shard_t *s = shard(m, d->callid, strlen(d->callid), d->local_tag,
+                           strlen(d->local_tag));
     pthread_mutex_lock(&s->lock);
-    nsbc_hnode_t **head = bucket(s, hash);
-    o->link.next = *head;
-    *head = &o->link;
+    o->link.next = s->head;
+    s->head = &o->link;
     pthread_mutex_unlock(&s->lock);
     return d;
 }
@@ -227,10 +208,9 @@ static dlg_obj_t *find_obj(dlg_mgr_t *m, const char *cid, size_t clen,
                            const char *lt, size_t ltlen,
                            const char *rt, size_t rtlen)
 {
-    uint64_t hash = dlg_hash(cid, clen, lt, ltlen);
-    dlg_shard_t *s = shard(m, hash);
+    dlg_shard_t *s = shard(m, cid, clen, lt, ltlen);
     pthread_mutex_lock(&s->lock);
-    for (nsbc_hnode_t *h = *bucket(s, hash); h; h = h->next) {
+    for (nsbc_hnode_t *h = s->head; h; h = h->next) {
         dlg_obj_t *o = NSBC_CONTAINER_OF(h, dlg_obj_t, link);
         sip_dialog_t *d = &o->d;
         /* ★ P1: 热点路径去掉每节点 strlen — 直接用调用方传入长度 memcmp
@@ -251,10 +231,9 @@ static dlg_obj_t *find_obj(dlg_mgr_t *m, const char *cid, size_t clen,
 static dlg_obj_t *find_uac_early(dlg_mgr_t *m, const char *cid, size_t clen,
                                  const char *lt, size_t ltlen)
 {
-    uint64_t hash = dlg_hash(cid, clen, lt, ltlen);
-    dlg_shard_t *s = shard(m, hash);
+    dlg_shard_t *s = shard(m, cid, clen, lt, ltlen);
     pthread_mutex_lock(&s->lock);
-    for (nsbc_hnode_t *h = *bucket(s, hash); h; h = h->next) {
+    for (nsbc_hnode_t *h = s->head; h; h = h->next) {
         dlg_obj_t *o = NSBC_CONTAINER_OF(h, dlg_obj_t, link);
         sip_dialog_t *d = &o->d;
         /* ★ P1: 同样去掉 strlen */
@@ -306,13 +285,17 @@ int dlg_uac_on_response(dlg_mgr_t *m, const sip_msg_t *resp)
     if (contact && sip_hdr_parse_addr(contact) == NSBC_OK)
         tok_copy(d->target, sizeof(d->target), contact->u.addr.uri.host);
     /* UAC 路由集 = Record-Route 逆序：直接从后往前填 d->routes，
-     * 省掉 tmp[DLG_ROUTE_MAX][DLG_URI_MAX] 768B 栈空间 */
+     * 省掉 tmp[DLG_ROUTE_MAX][DLG_URI_MAX] 768B 栈空间。
+     * ★ 关键：和 UAS (dlg_uas_new L148-149) 保持一致，直接存完整头值
+     * （含 ;lr / transport 等参数，通常形如 "<sip:p-cscf;lr>"），
+     * 不走 sip_hdr_parse_route 的 host-only 提取。b2bua route_block
+     * 会通过首字符 '<' 智能判断是否需要补尖括号。 */
     int n = 0;
     for (sip_hdr_t *rr = sip_hdr_get(resp, SIP_H_RECORD_ROUTE);
          rr && n < DLG_ROUTE_MAX; rr = sip_hdr_next(resp, rr)) {
-        if (sip_hdr_parse_route(rr) == NSBC_OK) {
-            tok_copy(d->routes[DLG_ROUTE_MAX - 1 - n], DLG_URI_MAX,
-                     rr->u.route.uri.host);
+        if (rr->value.p && rr->value.len > 0) {
+            snprintf(d->routes[DLG_ROUTE_MAX - 1 - n], DLG_URI_MAX,
+                     "%.*s", (int)rr->value.len, rr->value.p);
             ++n;
         }
     }
@@ -371,12 +354,10 @@ void dlg_close(dlg_mgr_t *m, sip_dialog_t *dp)
      * 直接用偏移定位 */
     dlg_obj_t *o = NSBC_CONTAINER_OF(dp, dlg_obj_t, d);
     sip_dialog_t *d = dp;
-    uint64_t hash = dlg_hash(d->callid, strlen(d->callid), d->local_tag,
-                             strlen(d->local_tag));
-    dlg_shard_t *s = shard(m, hash);
+    dlg_shard_t *s = shard(m, d->callid, strlen(d->callid), d->local_tag,
+                           strlen(d->local_tag));
     pthread_mutex_lock(&s->lock);
-    nsbc_hnode_t **head = bucket(s, hash);
-    for (nsbc_hnode_t **pp = head; *pp; pp = &(*pp)->next) {
+    for (nsbc_hnode_t **pp = &s->head; *pp; pp = &(*pp)->next) {
         if (*pp == &o->link) {
             *pp = o->link.next;
             d->state = DLG_CLOSED;

@@ -27,10 +27,31 @@ use crate::auth::{Identity, PeerCtx, Role};
 use crate::coreclient::CoreApi;
 use crate::error::ApiError;
 use crate::AppState;
+/// RW-H3: canonicalize a URL path segment (resolve `..`, `.`, collapse `//`).
+/// Prevents `..%2f` / `..` / `//` path traversal bypass of RBAC level checks.
+fn canonicalize_path(path: &str) -> String {
+    let mut segs: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}                         // skip empty & current-dir
+            ".." => { segs.pop(); }                // parent-dir: drop prev segment
+            s => segs.push(s),
+        }
+    }
+    let mut out = String::with_capacity(path.len());
+    for s in segs {
+        out.push('/');
+        out.push_str(s);
+    }
+    if out.is_empty() { out.push('/'); }
+    out
+}
 
 /// Declare required level by request method + path (P0 minimal set; complete table is
 /// pushed by the core command registry).
 fn required_level(method: &Method, path: &str) -> Role {
+    // RW-H3 hardening: canonicalize path before matching to defeat traversal tricks
+    let path = canonicalize_path(path);
     let item = path.trim_start_matches('/').trim_end_matches('/');
     let action = item.rsplit('/').next().unwrap_or(item);
     // GET last-segment is a literal resource rather than a fixed-action read-only nested
@@ -106,6 +127,39 @@ pub async fn require_auth<C: CoreApi + Clone + 'static>(
                 Role::L2 => "L2",
             },
         });
+    }
+
+    // --- RW-C3 hardening: L2 operations require secondary step-up token ---
+    // The step-up token is a very short-lived (≤60s) JWT of kind StepUp, bound to
+    // the same subject as the access token. Frontend must obtain one via
+    // POST /auth/step-up (requires fresh password re-entry) before executing
+    // any L2 action (kill/transfer/restart/...).
+    if need == Role::L2 {
+        let step_tok = req
+            .headers()
+            .get("x-nsbc-step-up")
+            .and_then(|v| v.to_str().ok())
+            .ok_or(ApiError::Forbidden { required: "L2+step-up" })?;
+        match st.auth.tokens.verify(step_tok, TokenKind::StepUp, now) {
+            Ok(step_claims) => {
+                if step_claims.sub != claims.sub {
+                    tracing::warn!(
+                        access_sub = %claims.sub, step_sub = %step_claims.sub,
+                        "RBAC step-up token subject mismatch"
+                    );
+                    return Err(ApiError::Forbidden { required: "L2+step-up" });
+                }
+                // Max age 60s — reject if older
+                if now.saturating_sub(step_claims.iat) > 60 {
+                    tracing::warn!(iat = step_claims.iat, now, "RBAC step-up token too old");
+                    return Err(ApiError::Forbidden { required: "L2+step-up-expired" });
+                }
+            }
+            Err(_) => {
+                tracing::warn!("RBAC step-up token invalid");
+                return Err(ApiError::Forbidden { required: "L2+step-up" });
+            }
+        }
     }
     // REQ-WEB-010: write operations (L1/L2, i.e. non-safe methods) have Web-side
     // independent audit records, including actor / source / method / path / response

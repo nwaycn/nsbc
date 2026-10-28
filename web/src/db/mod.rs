@@ -3037,7 +3037,8 @@ sqlx::query(acct_ddl).execute(pool).await?;
     // fence_mode: 1=security (full fence, default) / 0=performance (all off)
     // method_blocked: bitmap (1<<(method-1)), uint32
     // auto_ban=1/0, authfail_threshold=1-1000, authfail_window_s=1-86400,
-    // ban_duration_s=1-604800(7d), ratelimit_regs=1-1000, ratelimit_window_s=1-3600
+    // ban_duration_s=1-604800(7d), ratelimit_regs=1-1000, ratelimit_window_s=1-3600,
+    // ratelimit_invites=0-1000, ratelimit_invites_active=0-1000 (INVITE 速率限制, 可选)
     let sc_ddl = match backend {
         "sqlite" => r#"
             CREATE TABLE IF NOT EXISTS security_config (
@@ -3049,7 +3050,9 @@ sqlx::query(acct_ddl).execute(pool).await?;
                 authfail_window_s     INTEGER NOT NULL DEFAULT 60,
                 ban_duration_s        INTEGER NOT NULL DEFAULT 3600,
                 ratelimit_regs        INTEGER NOT NULL DEFAULT 20,
-                ratelimit_window_s    INTEGER NOT NULL DEFAULT 60
+                ratelimit_window_s    INTEGER NOT NULL DEFAULT 60,
+                ratelimit_invites     INTEGER NOT NULL DEFAULT 0,
+                ratelimit_invites_active INTEGER NOT NULL DEFAULT 0
             )
         "#,
         "postgres" => r#"
@@ -3062,7 +3065,9 @@ sqlx::query(acct_ddl).execute(pool).await?;
                 authfail_window_s     INTEGER NOT NULL DEFAULT 60,
                 ban_duration_s        INTEGER NOT NULL DEFAULT 3600,
                 ratelimit_regs        INTEGER NOT NULL DEFAULT 20,
-                ratelimit_window_s    INTEGER NOT NULL DEFAULT 60
+                ratelimit_window_s    INTEGER NOT NULL DEFAULT 60,
+                ratelimit_invites     INTEGER NOT NULL DEFAULT 0,
+                ratelimit_invites_active INTEGER NOT NULL DEFAULT 0
             )
         "#,
         _ => r#"
@@ -3075,7 +3080,9 @@ sqlx::query(acct_ddl).execute(pool).await?;
                 authfail_window_s     INT NOT NULL DEFAULT 60,
                 ban_duration_s        INT NOT NULL DEFAULT 3600,
                 ratelimit_regs        INT NOT NULL DEFAULT 20,
-                ratelimit_window_s    INT NOT NULL DEFAULT 60
+                ratelimit_window_s    INT NOT NULL DEFAULT 60,
+                ratelimit_invites     INT NOT NULL DEFAULT 0,
+                ratelimit_invites_active INT NOT NULL DEFAULT 0
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         "#,
     };
@@ -3093,6 +3100,8 @@ sqlx::query(acct_ddl).execute(pool).await?;
         ("ban_duration_s",     "INTEGER NOT NULL DEFAULT 3600"),
         ("ratelimit_regs",     "INTEGER NOT NULL DEFAULT 20"),
         ("ratelimit_window_s", "INTEGER NOT NULL DEFAULT 60"),
+        ("ratelimit_invites",        "INTEGER NOT NULL DEFAULT 0"),
+        ("ratelimit_invites_active", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         match backend {
             "sqlite" => {
@@ -3118,6 +3127,8 @@ sqlx::query(acct_ddl).execute(pool).await?;
                             "ban_duration_s"     => "3600",
                             "ratelimit_regs"     => "20",
                             "ratelimit_window_s" => "60",
+                            "ratelimit_invites"  => "0",
+                            "ratelimit_invites_active" => "0",
                             _                    => "0",
                         }
                     )
@@ -5245,6 +5256,9 @@ pub struct SecurityConfig {
     pub ban_duration_s:       i64, // base ban duration in seconds (progressive ban baseline), default 3600
     pub ratelimit_regs:       i64, // REGISTER pure frequency threshold, default 20/60s
     pub ratelimit_window_s:   i64, // ratelimit window seconds, default 60
+    // INVITE 速率限制（可选, 默认 0=不限制, aligns with C side g_cfg）
+    pub ratelimit_invites:         i64, // 全局 INVITE CPS 上限, 0=关闭
+    pub ratelimit_invites_active:  i64, // 活动 INVITE 并发上限, 0=关闭
 }
 
 // ================ accounts structs ================
@@ -6579,7 +6593,7 @@ pub async fn get_security_config(&self) -> Result<SecurityConfig, sqlx::Error> {
     let Some(pool) = self.pool() else { return Ok(SecurityConfig::default()); };
     let backend = self.backend();
     let row = sqlx::query_as::<_, SecurityConfig>(&fix_ph(
-        "SELECT fence_mode, method_blocked, auto_ban, authfail_threshold, authfail_window_s, ban_duration_s, ratelimit_regs, ratelimit_window_s FROM security_config WHERE id = 1", backend))
+        "SELECT fence_mode, method_blocked, auto_ban, authfail_threshold, authfail_window_s, ban_duration_s, ratelimit_regs, ratelimit_window_s, ratelimit_invites, ratelimit_invites_active FROM security_config WHERE id = 1", backend))
         .fetch_optional(pool).await?;
     Ok(row.unwrap_or_default())
 }
@@ -6591,37 +6605,40 @@ pub async fn upsert_security_config(&self, cfg: &SecurityConfig) -> Result<Secur
     };
     let backend = self.backend();
     let is_mysql = backend == "mysql";
+    let cols = "fence_mode, method_blocked, auto_ban, authfail_threshold, authfail_window_s, ban_duration_s, ratelimit_regs, ratelimit_window_s, ratelimit_invites, ratelimit_invites_active";
+    let vals = "VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)";
     let upsert_sql = if is_mysql {
-        "INSERT INTO security_config (id, fence_mode, method_blocked, auto_ban, authfail_threshold, authfail_window_s, ban_duration_s, ratelimit_regs, ratelimit_window_s) VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8) \
-         ON DUPLICATE KEY UPDATE fence_mode=VALUES(fence_mode), method_blocked=VALUES(method_blocked), auto_ban=VALUES(auto_ban), authfail_threshold=VALUES(authfail_threshold), authfail_window_s=VALUES(authfail_window_s), ban_duration_s=VALUES(ban_duration_s), ratelimit_regs=VALUES(ratelimit_regs), ratelimit_window_s=VALUES(ratelimit_window_s)"
+        format!("INSERT INTO security_config (id, {cols}) {vals} \
+         ON DUPLICATE KEY UPDATE fence_mode=VALUES(fence_mode), method_blocked=VALUES(method_blocked), auto_ban=VALUES(auto_ban), authfail_threshold=VALUES(authfail_threshold), authfail_window_s=VALUES(authfail_window_s), ban_duration_s=VALUES(ban_duration_s), ratelimit_regs=VALUES(ratelimit_regs), ratelimit_window_s=VALUES(ratelimit_window_s), ratelimit_invites=VALUES(ratelimit_invites), ratelimit_invites_active=VALUES(ratelimit_invites_active)")
     } else if backend == "postgres" {
-        "INSERT INTO security_config (id, fence_mode, method_blocked, auto_ban, authfail_threshold, authfail_window_s, ban_duration_s, ratelimit_regs, ratelimit_window_s) VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8) \
-         ON CONFLICT (id) DO UPDATE SET fence_mode=EXCLUDED.fence_mode, method_blocked=EXCLUDED.method_blocked, auto_ban=EXCLUDED.auto_ban, authfail_threshold=EXCLUDED.authfail_threshold, authfail_window_s=EXCLUDED.authfail_window_s, ban_duration_s=EXCLUDED.ban_duration_s, ratelimit_regs=EXCLUDED.ratelimit_regs, ratelimit_window_s=EXCLUDED.ratelimit_window_s \
-         RETURNING fence_mode, method_blocked, auto_ban, authfail_threshold, authfail_window_s, ban_duration_s, ratelimit_regs, ratelimit_window_s"
+        format!("INSERT INTO security_config (id, {cols}) {vals} \
+         ON CONFLICT (id) DO UPDATE SET fence_mode=EXCLUDED.fence_mode, method_blocked=EXCLUDED.method_blocked, auto_ban=EXCLUDED.auto_ban, authfail_threshold=EXCLUDED.authfail_threshold, authfail_window_s=EXCLUDED.authfail_window_s, ban_duration_s=EXCLUDED.ban_duration_s, ratelimit_regs=EXCLUDED.ratelimit_regs, ratelimit_window_s=EXCLUDED.ratelimit_window_s, ratelimit_invites=EXCLUDED.ratelimit_invites, ratelimit_invites_active=EXCLUDED.ratelimit_invites_active \
+         RETURNING {cols}")
     } else {
-        "INSERT OR REPLACE INTO security_config (id, fence_mode, method_blocked, auto_ban, authfail_threshold, authfail_window_s, ban_duration_s, ratelimit_regs, ratelimit_window_s) VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8)"
+        format!("INSERT OR REPLACE INTO security_config (id, {cols}) {vals}")
     };
-    let ph = fix_ph(upsert_sql, backend);
-    let q = sqlx::query(&ph)
-        .bind(cfg.fence_mode).bind(cfg.method_blocked)
-        .bind(cfg.auto_ban).bind(cfg.authfail_threshold).bind(cfg.authfail_window_s)
-        .bind(cfg.ban_duration_s).bind(cfg.ratelimit_regs).bind(cfg.ratelimit_window_s);
+    let ph = fix_ph(&upsert_sql, backend);
+    let bind_all = || {
+        let mut q = sqlx::query(&ph);
+        q = q.bind(cfg.fence_mode).bind(cfg.method_blocked)
+             .bind(cfg.auto_ban).bind(cfg.authfail_threshold).bind(cfg.authfail_window_s)
+             .bind(cfg.ban_duration_s).bind(cfg.ratelimit_regs).bind(cfg.ratelimit_window_s)
+             .bind(cfg.ratelimit_invites).bind(cfg.ratelimit_invites_active);
+        q
+    };
     if is_mysql {
-        q.execute(pool).await?;
+        bind_all().execute(pool).await?;
         return self.get_security_config().await;
     }
     if backend == "postgres" {
-        return sqlx::query_as::<_, SecurityConfig>(&ph)
-            .bind(cfg.fence_mode).bind(cfg.method_blocked)
-            .bind(cfg.auto_ban).bind(cfg.authfail_threshold).bind(cfg.authfail_window_s)
-            .bind(cfg.ban_duration_s).bind(cfg.ratelimit_regs).bind(cfg.ratelimit_window_s)
-            .fetch_one(pool).await;
+        let mut q = sqlx::query_as::<_, SecurityConfig>(&ph);
+        q = q.bind(cfg.fence_mode).bind(cfg.method_blocked)
+             .bind(cfg.auto_ban).bind(cfg.authfail_threshold).bind(cfg.authfail_window_s)
+             .bind(cfg.ban_duration_s).bind(cfg.ratelimit_regs).bind(cfg.ratelimit_window_s)
+             .bind(cfg.ratelimit_invites).bind(cfg.ratelimit_invites_active);
+        return q.fetch_one(pool).await;
     }
-    sqlx::query(&ph)
-        .bind(cfg.fence_mode).bind(cfg.method_blocked)
-        .bind(cfg.auto_ban).bind(cfg.authfail_threshold).bind(cfg.authfail_window_s)
-        .bind(cfg.ban_duration_s).bind(cfg.ratelimit_regs).bind(cfg.ratelimit_window_s)
-        .execute(pool).await?;
+    bind_all().execute(pool).await?;
     self.get_security_config().await
 }
 

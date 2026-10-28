@@ -88,10 +88,14 @@ typedef struct ws_conn {
     int            worker_idx;   /* 所属 worker 下标 */
     ws_conn_state_t state;
 
-    /* 统一 per-conn 读缓冲 — 根治 overread silent corruption（Advisor fix）*/
-    uint8_t        read_buf[WS_MAX_PAYLOAD + 128];  /* 64KB + 128B header 余量 */
-    size_t         read_pos;     /* 已消费位置 */
-    size_t         read_len;     /* 缓冲里有效数据长度 */
+    /* 统一 per-conn 读缓冲 — 动态分配（按需扩到 WS_MAX_PAYLOAD + 128）
+     * 默认 accept 时只 malloc WS_READ_BUF + 128 ≈ 16KB，
+     * 大 payload（>16KB）触发 realloc 到 WS_MAX_PAYLOAD + 128 ≈ 64KB。
+     * 几百 WS 连接场景省几十 MB 固定内存。*/
+    uint8_t        *read_buf;
+    size_t         read_buf_cap;   /* 当前分配容量（动态）*/
+    size_t         read_pos;       /* 已消费位置 */
+    size_t         read_len;       /* 缓冲里有效数据长度 */
 
     /* WS frame header 解析状态 */
     uint8_t        ws_opcode;
@@ -449,8 +453,18 @@ static int ws_conn_step(ws_conn_t *c, int events)
         /* compact 一下腾出空间 */
         ws_compact_read_buf(c);
 
-        /* 读进 read_buf 尾部（留 256B 余量防溢出）*/
-        size_t room = sizeof(c->read_buf) - c->read_len - 256;
+        /* 容量不够 → realloc 到 WS_MAX_PAYLOAD + 128B（上限）*/
+        size_t room = c->read_buf_cap - c->read_len - 256;
+        if (room == 0) {
+            if (c->read_buf_cap < WS_MAX_PAYLOAD + 128) {
+                size_t new_cap = WS_MAX_PAYLOAD + 128;
+                uint8_t *nb = (uint8_t *)realloc(c->read_buf, new_cap);
+                if (!nb) return -1;
+                c->read_buf = nb;
+                c->read_buf_cap = new_cap;
+                room = c->read_buf_cap - c->read_len - 256;
+            }
+        }
         if (room > 0) {
             ssize_t n = ws_nb_read(c, c->read_buf + c->read_len, room);
             if (n == -1) return -1;
@@ -509,7 +523,7 @@ static int ws_conn_step(ws_conn_t *c, int events)
                 /* 不 return 0 了——让它 fall through 到 READ_FRAME */
             } else {
                 /* Slowloris guard — 缓冲快满还没 terminator → drop */
-                if (sizeof(c->read_buf) - c->read_pos < 512) return -1;
+                if (c->read_buf_cap - c->read_pos < 512) return -1;
                 return 0;  /* 还没读完 headers，等下次 EPOLLIN */
             }
         }
@@ -652,7 +666,7 @@ static void ws_close_conn(int epfd, ws_conn_t *c)
         c->rbio = NULL;
     }
     if (c->fd >= 0) { close(c->fd); c->fd = -1; }
-    /* read_buf 是 ws_conn_t 内联字段，无需 free */
+    if (c->read_buf) { free(c->read_buf); c->read_buf = NULL; c->read_buf_cap = 0; }
     pthread_mutex_lock(&c->send_mtx);
     while (c->send_q_count > 0) {
         ws_send_item_t *item = &c->send_q[c->send_q_head];
@@ -810,6 +824,25 @@ static void *ws_accept_thread(void *ud)
         c->rbio = rbio;
         c->state = CS_HANDSHAKE;
         pthread_mutex_init(&c->send_mtx, NULL);
+
+        /* ★ P4 fix: 动态 read_buf —— 默认只 malloc WS_READ_BUF + 128B ≈ 16KB，
+         * 大 payload 触发 realloc 到 WS_MAX_PAYLOAD + 128B ≈ 64KB。
+         * 几百 WS 连接省 (64-16)KB × 1000 = ~48MB 固定内存。 */
+        c->read_buf_cap = WS_READ_BUF + 128;
+        c->read_buf = (uint8_t *)malloc(c->read_buf_cap);
+        if (!c->read_buf) {
+            pthread_mutex_destroy(&c->send_mtx);
+            if (ssl) {
+#ifdef NSBC_WITH_OPENSSL
+                SSL_free(ssl);
+#endif
+            }
+            close(fd);
+            free(c);
+            continue;
+        }
+        c->read_pos = 0;
+        c->read_len = 0;
 
         /* 选 worker (round robin) */
         c->worker_idx = worker_round_robin % g_ws.worker_count;
@@ -1045,7 +1078,7 @@ void ws_listener_shutdown(void)
     ws_conn_t *c = g_ws.conn_head;
     while (c) {
         ws_conn_t *next = c->next;
-        /* read_buf 是内联字段，无需 free */
+        if (c->read_buf) { free(c->read_buf); c->read_buf = NULL; }
         if (c->ssl) {
 #ifdef NSBC_WITH_OPENSSL
             SSL_free((SSL *)c->ssl);   /* 连带 free BIO — 不要 double free */

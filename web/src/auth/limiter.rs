@@ -1,4 +1,4 @@
-﻿//! Login failure lockout + three-endpoint per-IP rate limiting (REQ-WEB-004/008 failure lockout, REQ-WEB-009).
+//! Login failure lockout + three-endpoint per-IP rate limiting (REQ-WEB-004/008 failure lockout, REQ-WEB-009).
 //!
 //! Design tradeoffs (P0 minimal implementation, management-plane low frequency):
 //!   - **Lockout keyed by username**: prevents credential spraying/brute force against single accounts, independent of source IP;
@@ -126,6 +126,14 @@ impl RateLimiter {
             return Ok(());
         }
         let mut wins = self.wins.lock().unwrap();
+
+        // RW-H4 hardening: always purge expired entries + shrink_to on every check(),
+        // not just when the map is full. Low-traffic / post-attack idle scenarios
+        // must still be able to reclaim stale entries so legitimate users are not
+        // rejected until the map hits 65536.
+        wins.retain(|_, w| now.saturating_sub(w.start) < self.cfg.window_secs);
+        wins.shrink_to(self.max_keys / 2);
+
         let key = (b.key(), ip.to_string());
         if let Some(w) = wins.get_mut(&key) {
             if now.saturating_sub(w.start) >= self.cfg.window_secs {
@@ -144,9 +152,6 @@ impl RateLimiter {
             return Ok(());
         }
 
-        if wins.len() >= self.max_keys {
-            wins.retain(|_, w| now.saturating_sub(w.start) < self.cfg.window_secs);
-        }
         if wins.len() >= self.max_keys {
             let retry = wins
                 .values()

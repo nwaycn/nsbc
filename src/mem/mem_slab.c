@@ -169,9 +169,9 @@ void *mem_slab_alloc_direct(mem_slab_t *s)
     void *obj = pop_one(s);
     pthread_mutex_unlock(&s->lock);
     if (obj) {
-        s->nalloc++;
+        __atomic_add_fetch(&s->nalloc, 1, __ATOMIC_RELAXED);
     } else {
-        s->nfail++;
+        __atomic_add_fetch(&s->nfail, 1, __ATOMIC_RELAXED);
     }
     return obj;
 }
@@ -188,7 +188,7 @@ void mem_obj_release(void *obj)
     if (s->nfree < s->capacity)
         s->stack[s->nfree++] = (int)h->slot;
     pthread_mutex_unlock(&s->lock);
-    s->nrelease++;
+    __atomic_add_fetch(&s->nrelease, 1, __ATOMIC_RELAXED);
 }
 
 int mem_slab_capacity(mem_slab_t *s)
@@ -250,13 +250,13 @@ void *mem_mag_alloc(mem_mag_t *m, mem_slab_t *s)
             c->ptrs[c->n++] = pop_one(s);
         pthread_mutex_unlock(&s->lock);
         if (c->n == 0) {
-            s->nfail++;
+            __atomic_add_fetch(&s->nfail, 1, __ATOMIC_RELAXED);
             return NULL;
         }
     }
 
     void *obj = c->ptrs[--c->n]; /* 快路径：无锁无原子 */
-    s->nalloc++;
+    __atomic_add_fetch(&s->nalloc, 1, __ATOMIC_RELAXED);
     return obj;
 }
 
@@ -283,7 +283,7 @@ void mem_mag_free(mem_mag_t *m, void *obj)
             mem_obj_hdr_t *ch = obj_hdr(p);
             if (s->nfree < s->capacity)
                 s->stack[s->nfree++] = (int)ch->slot;
-            s->nrelease++;
+            __atomic_add_fetch(&s->nrelease, 1, __ATOMIC_RELAXED);
         }
         pthread_mutex_unlock(&s->lock);
     }
@@ -305,7 +305,7 @@ void mem_mag_destroy(mem_mag_t *m)
             mem_obj_hdr_t *ch = obj_hdr(p);
             if (s->nfree < s->capacity)
                 s->stack[s->nfree++] = (int)ch->slot;
-            s->nrelease++;
+            __atomic_add_fetch(&s->nrelease, 1, __ATOMIC_RELAXED);
         }
         pthread_mutex_unlock(&s->lock);
     }

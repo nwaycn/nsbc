@@ -1,3 +1,15 @@
+/* Architectural constraint guard — C core nsbcd does NOT touch DB.
+ * Rust web side (sqlx Any driver) is the sole persistence layer.
+ *
+ * Enabling: comment out "#define NSBC_NO_DBAL" below AND remove src/db/%.c
+ *           from Makefile filter-out (L131-173). Intended for future
+ *           MySQL/PG driver (REQ-DB-002) when C side truly needs DB access.
+ *
+ * Default behaviour (NSBC_NO_DBAL defined → skip entire file):
+ *   C core compiles clean with zero DB linkage — confirmed by audit P3. */
+#define NSBC_NO_DBAL
+#ifndef NSBC_NO_DBAL
+
 /* 异步 DBAL + group commit 实现（REQ-DB-001/003/005，P0）。
  * SQLite 路径需 -DNSBC_WITH_SQLITE -lsqlite3；否则 mysql/postgres
  * 返回 NSBC_NOTSUP（P1），none 静默丢弃（CDR 缓存降级，可观测计数）。 */
@@ -297,6 +309,8 @@ void dbal_destroy(dbal_t *d)
     pthread_mutex_destroy(&d->lock);
     free(d);
 }
+
+#endif /* NSBC_NO_DBAL — end of dead-code DBAL guard */
 
 /*
     Author:       李浩 (Li Hao)

@@ -186,24 +186,28 @@ static int stun_resp_binding(const uint8_t *req_tid, const uint8_t *src4,
     return (int)(p - out);
 }
 
-/* STUN CRC32（IEEE 802.3） */
+/* STUN CRC32（IEEE 802.3）
+ * ★ P1-3.8 fix: 多 reactor 线程并发首次调用时 if(!inited) 非原子 → 数据竞争。
+ * 改用 pthread_once — C 标准一次性初始化，线程安全。 */
+static uint32_t g_stun_crc32_tbl[256];
+static pthread_once_t g_stun_crc32_once = PTHREAD_ONCE_INIT;
+static void g_stun_crc32_init(void) {
+    for (uint32_t i = 0; i < 256; i++) {
+        uint32_t c = i;
+        for (int j = 0; j < 8; j++)
+            c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+        g_stun_crc32_tbl[i] = c;
+    }
+}
+
 static uint32_t stun_crc32_poly(const uint8_t *data, size_t len,
                                 const uint8_t *extra, size_t extra_len)
 {
-    static uint32_t tbl[256];
-    static int inited = 0;
-    if (!inited) {
-        for (uint32_t i = 0; i < 256; i++) {
-            uint32_t c = i;
-            for (int j = 0; j < 8; j++)
-                c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-            tbl[i] = c;
-        }
-        inited = 1;
-    }
+    pthread_once(&g_stun_crc32_once, g_stun_crc32_init);
+
     uint32_t crc = 0xFFFFFFFFu;
-    for (size_t i = 0; i < len; i++) crc = tbl[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
-    for (size_t i = 0; i < extra_len; i++) crc = tbl[(crc ^ extra[i]) & 0xFF] ^ (crc >> 8);
+    for (size_t i = 0; i < len; i++) crc = g_stun_crc32_tbl[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+    for (size_t i = 0; i < extra_len; i++) crc = g_stun_crc32_tbl[(crc ^ extra[i]) & 0xFF] ^ (crc >> 8);
     return crc ^ 0xFFFFFFFFu;
 }
 

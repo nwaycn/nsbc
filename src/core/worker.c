@@ -22,6 +22,12 @@ typedef struct {
     pthread_t thr;
     int started;           /* thread 已创建并在运行 */
     nsbc_atomic_t slot_ready;  /* F-02 修复：原子，submitter 无锁读验证 slot 存活 */
+    /* ★ P0-2.3 RACE-FIX: q_refcnt. 保护 w->q 生命周期。
+     * submit 侧 fetch_add 在 double-check slot_ready 后、mem_mpsc_push 前；
+     * push 完 fetch_sub。scale-down 在 mem_mpsc_destroy 前 while(refcnt>0) yield。
+     * 否则 submit double-check(slot_ready=1) → break → mem_mpsc_push 之间
+     * scale-down 可能 destroy q 并置 NULL → submit 访问已 free queue → UAF。 */
+    nsbc_atomic_t q_refcnt;
     sem_t ready;
     int ready_initialized;
     mem_mag_t *mag;
@@ -265,6 +271,7 @@ static int worker_slot_init(worker_pool_t *p, unsigned idx, uint32_t queue_cap)
     w->id = idx;
     w->pool = p;
     __atomic_store_n(&w->draining, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&w->q_refcnt, 0, __ATOMIC_RELAXED);
 
     if (sem_init(&w->ready, 0, 0) != 0)
         return NSBC_ERR;
@@ -474,6 +481,18 @@ int wpool_resize(worker_pool_t *p, unsigned new_n)
             }
             /* 清理 slot 资源（slot_ready 已在上一步置 0，submitter 不会再用 q） */
             if (w->mag) { mem_mag_destroy(w->mag); w->mag = NULL; }
+            /* ★ P0-2.3 RACE-FIX: 等所有 in-flight submitter 释放 q_refcnt 再 destroy */
+            {
+                unsigned spins = 0;
+                while (__atomic_load_n(&w->q_refcnt, __ATOMIC_ACQUIRE) != 0) {
+                    sched_yield();
+                    if (++spins > 100000) {
+                        log_warn("worker", "resize: worker[%u] q_refcnt stuck=%u, force destroy",
+                                 i, (unsigned)__atomic_load_n(&w->q_refcnt, __ATOMIC_RELAXED));
+                        break;
+                    }
+                }
+            }
             if (w->q)   { mem_mpsc_destroy(w->q);   w->q = NULL; }
             if (w->ready_initialized) { sem_destroy(&w->ready); w->ready_initialized = 0; }
             if (w->rd)  { w->rd = NULL; }
@@ -527,6 +546,14 @@ void wpool_destroy(worker_pool_t *p)
         }
         /* join 后清理 slot 资源 */
         if (w->mag) { mem_mag_destroy(w->mag); w->mag = NULL; }
+        /* ★ P0-2.3 RACE-FIX: 同 wpool_resize — 等 q_refcnt 归零 */
+        {
+            unsigned spins = 0;
+            while (__atomic_load_n(&w->q_refcnt, __ATOMIC_ACQUIRE) != 0) {
+                sched_yield();
+                if (++spins > 100000) break;
+            }
+        }
         if (w->q)   { mem_mpsc_destroy(w->q);   w->q = NULL; }
         if (w->ready_initialized) { sem_destroy(&w->ready); w->ready_initialized = 0; }
         if (w->rd)  { w->rd = NULL; }
@@ -573,12 +600,19 @@ int wpool_submit(worker_pool_t *p, uint64_t hash_key, worker_job_t *job)
             break;  /* slot 存活，安全 */
         /* slot 已死（concurrent scale-down/up）— 重试 */
     }
+
+    /* ★ P0-2.3 RACE-FIX: double-check 后 fetch_add q_refcnt，
+     * 阻止 scale-down 在 mem_mpsc_push 前 destroy q。 */
+    __atomic_fetch_add(&p->w[idx].q_refcnt, 1, __ATOMIC_ACQUIRE);
     job->enqueued_ns = worker_now_ns();
     if (mem_mpsc_push(p->w[idx].q, job) != NSBC_OK) {
+        __atomic_fetch_sub(&p->w[idx].q_refcnt, 1, __ATOMIC_RELEASE);
         __atomic_add_fetch(&p->rejected, 1, __ATOMIC_RELAXED);
         worker_submit_leave(p);
         return NSBC_NOSPC;
     }
+    __atomic_fetch_sub(&p->w[idx].q_refcnt, 1, __ATOMIC_RELEASE);
+
     __atomic_add_fetch(&p->submitted, 1, __ATOMIC_RELAXED);
     if (sem_post(&p->w[idx].ready) != 0)
         log_warn("worker", "sem_post after submit failed worker=%u errno=%d",
@@ -608,7 +642,10 @@ int wpool_submit_any(worker_pool_t *p, worker_job_t *job)
         /* slot 死了（被 concurrent resize tear down）→ 跳过 */
         if (!__atomic_load_n(&p->w[idx].slot_ready, __ATOMIC_ACQUIRE))
             continue;
+        /* ★ P0-2.3 RACE-FIX: 同 wpool_submit — 引用保护 q 生命周期 */
+        __atomic_fetch_add(&p->w[idx].q_refcnt, 1, __ATOMIC_ACQUIRE);
         if (mem_mpsc_push(p->w[idx].q, job) == NSBC_OK) {
+            __atomic_fetch_sub(&p->w[idx].q_refcnt, 1, __ATOMIC_RELEASE);
             __atomic_add_fetch(&p->submitted, 1, __ATOMIC_RELAXED);
             if (sem_post(&p->w[idx].ready) != 0)
                 log_warn("worker", "sem_post after submit failed worker=%u errno=%d",
@@ -616,6 +653,8 @@ int wpool_submit_any(worker_pool_t *p, worker_job_t *job)
             worker_submit_leave(p);
             return NSBC_OK;
         }
+        __atomic_fetch_sub(&p->w[idx].q_refcnt, 1, __ATOMIC_RELEASE);
+        /* push 失败（queue 满）→ 换下一个 slot 重试 */
     }
     __atomic_add_fetch(&p->rejected, 1, __ATOMIC_RELAXED);
     worker_submit_leave(p);

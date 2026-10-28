@@ -1,4 +1,9 @@
-#ifndef NSBC_DBAL_H
+/* Architectural constraint guard — C core nsbcd does NOT touch DB.
+ * Rust web side (sqlx Any driver) is the sole persistence layer.
+ *
+ * Enabling: comment out "#define NSBC_NO_DBAL" below AND remove src/db/%.c
+ *           from Makefile filter-out. */
+#ifndef NSBC_NO_DBAL
 #define NSBC_DBAL_H
 
 /* 数据库访问抽象层（REQ-DB-003/005，P0）
@@ -45,7 +50,8 @@ uint64_t dbal_dropped(dbal_t *d);
 #ifdef __cplusplus
 }
 #endif
-#endif
+#endif /* NSBC_DBAL_H */
+#endif /* NSBC_NO_DBAL — end of dead-code DBAL guard */
 
 /*
     Author:       李浩 (Li Hao)

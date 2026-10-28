@@ -180,6 +180,26 @@ impl SessionStore {
             denied_limit: denied,
         }
     }
+
+    /// RW-H5 hardening: background purge. Drop all entries whose exp <= now
+    /// from all three tables. Called by a 60s tokio interval task in AuthSvc.
+    /// Returns (active_remaining, used_remaining, denied_remaining) snapshot.
+    pub fn purge_expired(&self, now: u64) -> (usize, usize, usize) {
+        let mut active = self.active.lock().unwrap();
+        active.retain(|_, e| e.exp > now);
+        let mut used = self.used.lock().unwrap();
+        used.retain(|_, exp| *exp > now);
+        let mut denied = self.denied.lock().unwrap();
+        denied.retain(|_, exp| *exp > now);
+        // shrink_to 避免长时间运行后 bucket 过度膨胀
+        active.shrink_to(self.active_limit / 2);
+        used.shrink_to(self.used_limit / 2);
+        denied.shrink_to(self.denied_limit / 2);
+        let a = active.len();
+        let u = used.len();
+        let d = denied.len();
+        (a, u, d)
+    }
 }
 
 impl Default for SessionStore {

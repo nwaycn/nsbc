@@ -766,6 +766,16 @@ static int security_cfg_save_yaml(void)
         int did = yaml_replace_key(&buf, &bufsz, key, __VA_ARGS__); \
         if (did < 0) { free(buf); return -1; } \
     } while (0)
+    /* ==== 只持久化安全行为参数（fail2ban 五维），不回写 ratelimit ====
+     *
+     * ratelimit_* 是运行时调优旋钮（注册/INVITE 速率限制），属于压测/运维
+     * 场景下动态调节的参数，由 DB security_config 表作为 authoritative
+     * 源。每次 fence reload 调 security_cfg_save_yaml() 时**不应该**
+     * 把 DB 默认值覆盖回用户手动 sed 改过的 yaml。
+     *
+     * 如果用户确实需要 yaml 方式持久化 ratelimit，直接写 security 段
+     * 下的 ratelimit_* 键即可（YAML 解析器会加载），reload 不会覆盖。
+     */
     REPLACE_OR_APPEND("auto_ban",                 "  auto_ban: %s\n",
                       g_cfg.auto_ban ? "true" : "false");
     REPLACE_OR_APPEND("authfail_threshold",      "  authfail_threshold: %d\n",
@@ -774,14 +784,8 @@ static int security_cfg_save_yaml(void)
                       g_cfg.authfail_window_s);
     REPLACE_OR_APPEND("ban_duration_s",           "  ban_duration_s: %d\n",
                       g_cfg.ban_duration_s);
-    REPLACE_OR_APPEND("ratelimit_regs",           "  ratelimit_regs: %d\n",
-                      g_cfg.ratelimit_regs);
-    REPLACE_OR_APPEND("ratelimit_window_s",       "  ratelimit_window_s: %d\n",
-                      g_cfg.ratelimit_window_s);
-    REPLACE_OR_APPEND("ratelimit_invites",        "  ratelimit_invites: %d\n",
-                      g_cfg.ratelimit_invites);
-    REPLACE_OR_APPEND("ratelimit_invites_active", "  ratelimit_invites_active: %d\n",
-                      g_cfg.ratelimit_invites_active);
+    /* ratelimit_regs / ratelimit_window_s / ratelimit_invites /
+     * ratelimit_invites_active —— 跳过，不写回 yaml，DB security_config 为准 */
 
     /* fence_mode / method_blocked —— 可能在 security 段也可能没有
      * （硬编码默认值没写进 yaml），用 atomic 当前值 */
@@ -841,14 +845,17 @@ int security_blacklist_reload_json(const char *json, char *out_err,
         return NSBC_ERR;
     }
 
-    static bl_cidr_t  n_dc[BL_CIDR_MAX];
-    static bl_ua_t    n_du[BL_UA_MAX];
-    static bl_prefix_t n_dc2[BL_PREFIX_MAX];
-    static bl_prefix_t n_dcr[BL_PREFIX_MAX];
-    static bl_cidr_t  n_ac[BL_CIDR_MAX];
-    static bl_ua_t    n_au[BL_UA_MAX];
-    static bl_prefix_t n_ac2[BL_PREFIX_MAX];
-    static bl_prefix_t n_acr[BL_PREFIX_MAX];
+    /* ★ R1 P0: 去掉 static — 函数内 static 临时数组被并发 reload 同时写 → 数据错乱。
+     * 改成栈上：单 reload 调用独占栈帧，并发 reload 各自独立副本。
+     * 总大小 ≈ 220KB — 默认 8MB 线程栈完全够。 */
+    bl_cidr_t  n_dc[BL_CIDR_MAX];
+    bl_ua_t    n_du[BL_UA_MAX];
+    bl_prefix_t n_dc2[BL_PREFIX_MAX];
+    bl_prefix_t n_dcr[BL_PREFIX_MAX];
+    bl_cidr_t  n_ac[BL_CIDR_MAX];
+    bl_ua_t    n_au[BL_UA_MAX];
+    bl_prefix_t n_ac2[BL_PREFIX_MAX];
+    bl_prefix_t n_acr[BL_PREFIX_MAX];
     memset(n_dc, 0, sizeof(n_dc));
     memset(n_du, 0, sizeof(n_du));
     memset(n_dc2, 0, sizeof(n_dc2));
@@ -897,16 +904,19 @@ int security_blacklist_reload_json(const char *json, char *out_err,
         if (cJSON_IsNumber(jbd) && jbd->valueint >= 1 && jbd->valueint <= 604800)
             new_ban_duration_s = jbd->valueint;
         cJSON *jrr = cJSON_GetObjectItem(root, "ratelimit_regs");
-        if (cJSON_IsNumber(jrr) && jrr->valueint >= 1 && jrr->valueint <= 1000)
+        /* 0 = 禁用 REGISTER 令牌桶; 1..100000 有效 CPS */
+        if (cJSON_IsNumber(jrr) && jrr->valueint >= 0 && jrr->valueint <= 100000)
             new_ratelimit_regs = jrr->valueint;
         cJSON *jrw = cJSON_GetObjectItem(root, "ratelimit_window_s");
         if (cJSON_IsNumber(jrw) && jrw->valueint >= 1 && jrw->valueint <= 3600)
             new_ratelimit_window_s = jrw->valueint;
         cJSON *jri = cJSON_GetObjectItem(root, "ratelimit_invites");
-        if (cJSON_IsNumber(jri) && jri->valueint >= 0 && jri->valueint <= 1000)
+        /* 0 = 禁用 INVITE 被动限频; 1..100000 有效阈值 */
+        if (cJSON_IsNumber(jri) && jri->valueint >= 0 && jri->valueint <= 100000)
             new_ratelimit_invites = jri->valueint;
         cJSON *jria = cJSON_GetObjectItem(root, "ratelimit_invites_active");
-        if (cJSON_IsNumber(jria) && jria->valueint >= 0 && jria->valueint <= 1000)
+        /* 0 = 禁用 INVITE 主动限频; 1..100000 有效 CPS */
+        if (cJSON_IsNumber(jria) && jria->valueint >= 0 && jria->valueint <= 100000)
             new_ratelimit_invites_active = jria->valueint;
     }
     if (!arr) {
@@ -1539,10 +1549,12 @@ int security_get_threat(const char *ip, char *reason_out, size_t reason_sz)
     if (!ip || !ip[0]) return 0;
 
     /* 1. 动态封禁表（优先级最高 — 已被 auto_ban 判定为恶意） */
+    uint64_t ban_until = 0;   /* ★ P0 fix: lock 内拷贝值，lock 外只读栈变量 */
     pthread_mutex_lock(&g_ban_lock);
     ban_ent_t *be = ban_find_locked(ip);
+    if (be) ban_until = be->ban_until;
     pthread_mutex_unlock(&g_ban_lock);
-    if (be && be->ban_until > nsbc_now_ms()) {
+    if (ban_until > 0 && ban_until > nsbc_now_ms()) {
         snprintf(reason_out, reason_sz, "ban");
         return 1;
     }
@@ -1888,7 +1900,7 @@ static int cmd_cfg_reload(cmd_ctx_t *c, int argc, char **argv, void *ud)
     if (cfg_get_int(ctx->cfg, "security.ban_duration_s", &v, NULL) == NSBC_OK
             && v >= 1 && v <= 604800) g_cfg.ban_duration_s = (int)v;
     if (cfg_get_int(ctx->cfg, "security.ratelimit_regs", &v, NULL) == NSBC_OK
-            && v >= 1 && v <= 1000) g_cfg.ratelimit_regs = (int)v;
+            && v >= 0 && v <= 100000) g_cfg.ratelimit_regs = (int)v;
     if (cfg_get_int(ctx->cfg, "security.ratelimit_window_s", &v, NULL) == NSBC_OK
             && v >= 1 && v <= 3600) g_cfg.ratelimit_window_s = (int)v;
 
@@ -1963,10 +1975,10 @@ static int security_init(struct nsbc_ctx *ctx)
                         NULL) == NSBC_OK && v >= 1 && v <= 3600)
             g_cfg.ratelimit_window_s = (int)v;
         if (cfg_get_int(ctx->cfg, "security.ratelimit_invites", &v,
-                        NULL) == NSBC_OK && v >= 0 && v <= 1000)
+                        NULL) == NSBC_OK && v >= 0 && v <= 100000)
             g_cfg.ratelimit_invites = (int)v;
         if (cfg_get_int(ctx->cfg, "security.ratelimit_invites_active", &v,
-                        NULL) == NSBC_OK && v >= 0 && v <= 1000)
+                        NULL) == NSBC_OK && v >= 0 && v <= 100000)
             g_cfg.ratelimit_invites_active = (int)v;
     }
 

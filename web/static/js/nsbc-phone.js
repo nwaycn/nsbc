@@ -1,4 +1,4 @@
-﻿/* global JsSIP */
+/* global JsSIP */
 // =============================================================================
 // nsbc-phone.js — NSBC WebRTC Total享电话层
 // -----------------------------------------------------------------------------
@@ -252,7 +252,12 @@ function sdpCodecWhitelist(description) {
 function log(cls, msg) {
   const ts = new Date().toLocaleTimeString();
   const div = document.createElement('div');
-  div.innerHTML = `<span class="ts">[${ts}]</span> <span class="${cls}">${msg}</span>`;
+  // 安全：msg 来自 SIP 远端 reason_phrase/cause 等，必须 textContent 防 XSS
+  const tsSpan = document.createElement('span');
+  tsSpan.className = 'ts'; tsSpan.textContent = `[${ts}]`;
+  const msgSpan = document.createElement('span');
+  msgSpan.className = cls; msgSpan.textContent = msg;
+  div.appendChild(tsSpan); div.appendChild(msgSpan);
   const box = $('sipLog');
   if (box) { box.appendChild(div); box.scrollTop = box.scrollHeight;
     while (box.children.length > 500) box.removeChild(box.firstChild); }

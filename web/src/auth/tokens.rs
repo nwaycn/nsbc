@@ -1,4 +1,4 @@
-﻿//! Compact JWT (HS256) sign/verify (REQ-WEB-008 P0, self-implemented W3a, no third-party JWT lib).
+//! Compact JWT (HS256) sign/verify (REQ-WEB-008 P0, self-implemented W3a, no third-party JWT lib).
 //!
 //! On-wire format: `b64url(header).b64url(claims).b64url(HMAC-SHA256("header.claims"))`.
 //! header is fixed to `{"alg":"HS256","typ":"JWT"}`:
@@ -25,6 +25,8 @@ pub enum TokenKind {
     Access,
     /// Refresh token (long-lived, presented only at /auth/refresh, stateful on server side)
     Refresh,
+    /// Step-up token (very short-lived, only for L2 high-risk ops; RW-C3 hardening)
+    StepUp,
 }
 
 impl TokenKind {
@@ -32,6 +34,7 @@ impl TokenKind {
         match self {
             TokenKind::Access => "a",
             TokenKind::Refresh => "r",
+            TokenKind::StepUp => "s",
         }
     }
 }
@@ -114,10 +117,16 @@ impl TokenSvc {
         )
     }
 
+    /// RW-C3 hardening: issue a short-lived step-up token (60s) for L2 ops.
+    pub fn issue_step_up(&self, sub: &str, role: u8, now: u64) -> (String, Claims) {
+        self.issue(sub, role, TokenKind::StepUp, now)
+    }
+
     fn issue(&self, sub: &str, role: u8, kind: TokenKind, now: u64) -> (String, Claims) {
         let ttl = match kind {
             TokenKind::Access => self.access_ttl,
             TokenKind::Refresh => self.refresh_ttl,
+            TokenKind::StepUp => std::time::Duration::from_secs(60), // RW-C3: step-up 只活 60 秒
         };
         let claims = Claims {
             sub: sub.to_string(),

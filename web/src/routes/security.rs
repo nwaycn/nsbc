@@ -395,9 +395,19 @@ async fn put_config<C: CoreApi + Clone + Send + Sync + 'static>(
         return Err(ApiError::BadRequest("ratelimit_window_s must be 1-3600".into()));
     }
 
+    let ratelimit_invites = body.get("ratelimit_invites").and_then(|v| v.as_i64()).unwrap_or(0);
+    if ratelimit_invites < 0 || ratelimit_invites > 1000 {
+        return Err(ApiError::BadRequest("ratelimit_invites must be 0-1000".into()));
+    }
+    let ratelimit_invites_active = body.get("ratelimit_invites_active").and_then(|v| v.as_i64()).unwrap_or(0);
+    if ratelimit_invites_active < 0 || ratelimit_invites_active > 1000 {
+        return Err(ApiError::BadRequest("ratelimit_invites_active must be 0-1000".into()));
+    }
+
     let cfg = SecurityConfig {
         fence_mode, method_blocked, auto_ban, authfail_threshold, authfail_window_s,
         ban_duration_s, ratelimit_regs, ratelimit_window_s,
+        ratelimit_invites, ratelimit_invites_active,
     };
     let saved = st.db.upsert_security_config(&cfg).await
         .map_err(|e| ApiError::Db(e.to_string()))?;
