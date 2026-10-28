@@ -250,9 +250,50 @@ make build-acme
 cd ..
 ```
 
-### 4. Run
+### 4. Obtain a Digital TLS Certificate (Optional but Recommended)
+By default, nsbc-web generates a self-signed TLS certificate on first startup. For production use, you should replace it with a trusted certificate from Let’s Encrypt using acme.sh.
+#### 4.1 Install acme.sh
+##### Install acme.sh (automatically sets up a cron job for renewal)
+curl https://get.acme.sh | sh
 
-```bash
+##### Or install manually
+
+wget -O - https://get.acme.sh | bash
+
+##### Verify the installation
+
+acme.sh --version
+
+#### 4.2 Issue a Certificate
+##### Issue a certificate for your domain using the Let's Encrypt staging server
+##### (Use the production server https://acme-v02.api.letsencrypt.org/directory for real certificates)
+```
+acme.sh --issue \
+  --domain nsbc.opensips.net.cn \
+  --server https://acme-staging-v02.api.letsencrypt.org/directory \
+  --standalone
+Command parameter breakdown:
+Parameter	Description
+--issue	Issue a new certificate
+--domain <domain>	The domain name to issue the certificate for
+--server <URL>	The ACME server to use (staging for testing, production for real certs)
+--standalone	Use standalone mode (starts a temporary HTTP server on port 80 for domain validation)
+```
+
+### 4.3 Deploy the Certificate
+After the certificate is issued, copy the generated cert.pem and key.pem files into your nsbc TLS directory (e.g., $NSBC/tls/):
+```
+# Check the contents of the tls directory
+ll tls
+total 12
+
+-rw-r--r-- 1 root root 652 Oct 28 10:17 cert.pem
+-rw------- 1 root root 241 Oct 28 10:17 key.pem
+Make sure to configure nsbc-web to use these certificates instead of the self-signed ones.
+```
+
+### 5. Run
+```
 # nsbc-web MUST start FIRST — it auto-creates SQLite DB and self-signed TLS cert
 nohup ./nsbc-web &
 sleep 3
@@ -260,8 +301,7 @@ sleep 3
 # Then start nsbcd
 nohup ./nsbcd &
 ```
-
-### 5. Open and test
+### 6. Open and test
 
 Open `https://<your-ip>:443/webrtc.html` in your browser.
 Register with default extensions:
