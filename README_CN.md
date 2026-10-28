@@ -260,8 +260,49 @@ make build-acme
 # 会自动把 static/ 和 target/release/nsbc-web 复制到上级目录
 cd ..
 ```
+### 4. 获取数字 TLS 证书（可选但推荐）
+默认情况下，nsbc-web 在首次启动时会自动创建 SQLite 数据库和自签名 TLS 证书。对于生产环境，建议使用 acme.sh 从 Let’s Encrypt 获取受信任的证书来替换自签名证书。
+#### 4.1 安装 acme.sh
+```bash
+# 使用 curl 安装 acme.sh（自动创建 cron 任务）
+curl https://get.acme.sh | sh
 
-### 4. 运行
+# 或手动安装
+wget -O - https://get.acme.sh | bash
+
+# 验证安装
+acme.sh --version
+```
+
+#### 4.2 签发证书
+```bash
+# 使用 Let's Encrypt 测试服务器签发证书
+#（生产环境请使用 https://acme-v02.api.letsencrypt.org/directory）
+acme.sh --issue \
+  --domain nsbc.opensips.net.cn \
+  --server https://acme-staging-v02.api.letsencrypt.org/directory \
+  --standalone
+命令参数逐行解析：
+参数	说明
+--issue	签发新证书
+--domain <域名>	要签发证书的域名
+--server <URL>	使用的 ACME 服务器地址（staging 用于测试，production 用于正式证书）
+--standalone	使用独立模式（启动临时 HTTP 服务器在 80 端口进行域名验证）
+```
+
+#### 4.3 部署证书
+证书签发后，将生成的 cert.pem 和 key.pem 文件复制到 nsbc 的 TLS 目录中（例如 $NSBC/tls/）：
+# 查看 tls 目录内容
+```bash
+ll tls
+total 12
+
+-rw-r--r-- 1 root root 652 Oct 28 10:17 cert.pem
+-rw------- 1 root root 241 Oct 28 10:17 key.pem
+```
+请确保配置 nsbc-web 使用这些证书，而非自签名证书。
+
+### 5. 运行
 
 ```bash
 # 必须先启动 nsbc-web —— 它会自动创建 SQLite DB 和自签 TLS 证书
@@ -272,7 +313,7 @@ sleep 3
 nohup ./nsbcd &
 ```
 
-### 5. 打开并测试
+### 6. 打开并测试
 
 浏览器访问 `https://<your-ip>:443/webrtc.html`，注册默认分机：
 
