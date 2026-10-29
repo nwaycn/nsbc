@@ -23,6 +23,9 @@ const API = {
     if (this.token()) h['Authorization'] = 'Bearer ' + this.token();
     return h;
   },
+  // GET 请求 per-path in-flight 去重：同一 URL 正在请求时复用同一个 Promise，
+  // 避免 SSE 事件 + setInterval 双路径叠加导致同一 API 瞬间并发 N 个请求打爆后端。
+  _inflight: new Map(),
   async req(method, path, body) {
     const hasBody = body !== undefined;
     const opts = { method, headers: this.headers(hasBody) };
@@ -37,49 +40,81 @@ const API = {
         finalPath = path + sep + 'tenant_id=' + tid;
       }
     }
-    const res = await fetch(this.base + finalPath, opts);
-    if (res.status === 401) {
-      // === Session 缓存：自动用 refresh_token 续期 ===
-      const refreshToken = localStorage.getItem('nsbc_refresh_token');
-      const isRefreshReq = path === '/auth/refresh';
-      if (refreshToken && !isRefreshReq && !this._refreshing) {
-        try {
-          this._refreshing = true;
-          const refreshRes = await fetch(this.base + '/auth/refresh', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ refresh_token: refreshToken }),
-          });
-          if (refreshRes.ok) {
-            const rd = await refreshRes.json();
-            localStorage.setItem('nsbc_token', rd.access_token);
-            if (rd.refresh_token) localStorage.setItem('nsbc_refresh_token', rd.refresh_token);
-            try { window.__auth && (window.__auth.token = rd.access_token); } catch(_) {}
-            // 重放原Request（token 已Update）
-            const retryRes = await fetch(this.base + path, opts);
-            if (retryRes.status === 401) {
-              // 还是 401 → 真没救了
-              localStorage.clear();
-              location.hash = '#/login';
-              throw new Error('Unauthorized');
-            }
-            const retryText = await retryRes.text();
-            if (!retryRes.ok) throw new Error(retryText || retryRes.statusText);
-            return retryText ? JSON.parse(retryText) : null;
-          }
-        } catch (refreshErr) { /* refresh 失败走下面清 localStorage */ }
-        finally { this._refreshing = false; }
-      }
-      // refresh 也失败 → 清 session 跳登录
-      localStorage.clear();
-      try { window.__auth && (window.__auth.token = null, window.__auth.user = null, window.__auth.role = null); } catch(_) {}
-      location.hash = '#/login';
-      throw new Error('Unauthorized');
+    // GET in-flight 去重（只对 GET 做，POST/PUT/DELETE 必须每次独立发送）
+    const dedupKey = method + ' ' + finalPath;
+    if (method === 'GET' && this._inflight.has(dedupKey)) {
+      return this._inflight.get(dedupKey);
     }
-    const text = await res.text();
-    const data = text ? JSON.parse(text) : null;
-    if (!res.ok) throw new Error((data && data.detail) || res.statusText);
-    return data;
+    const promise = this._doReq(method, path, body, finalPath, opts, dedupKey);
+    if (method === 'GET') this._inflight.set(dedupKey, promise);
+    try {
+      return await promise;
+    } finally {
+      if (method === 'GET') this._inflight.delete(dedupKey);
+    }
+  },
+  async _doReq(method, path, body, finalPath, opts, dedupKey) {
+    const MAX_429_RETRY = 2;
+    let delay = 500; // 初始退避 500ms
+    for (let attempt = 0; attempt <= MAX_429_RETRY; attempt++) {
+      if (attempt > 0) {
+        await new Promise(r => setTimeout(r, delay));
+        delay *= 2; // 指数退避
+      }
+      const res = await fetch(this.base + finalPath, opts);
+      if (res.status === 429) {
+        // 读取 Retry-After 头（秒），没有则用指数退避
+        const retryAfter = parseInt(res.headers.get('Retry-After'), 10);
+        if (!isNaN(retryAfter) && retryAfter > 0) delay = retryAfter * 1000;
+        console.warn(`[API] 429 Too Many Requests on ${finalPath}, retry ${attempt+1}/${MAX_429_RETRY+1} after ${delay}ms`);
+        // 必须消费 body 否则连接可能泄漏
+        try { await res.text(); } catch (_) {}
+        continue;
+      }
+      if (res.status === 401) {
+        // === Session 缓存：自动用 refresh_token 续期 ===
+        const refreshToken = localStorage.getItem('nsbc_refresh_token');
+        const isRefreshReq = path === '/auth/refresh';
+        if (refreshToken && !isRefreshReq && !this._refreshing) {
+          try {
+            this._refreshing = true;
+            const refreshRes = await fetch(this.base + '/auth/refresh', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ refresh_token: refreshToken }),
+            });
+            if (refreshRes.ok) {
+              const rd = await refreshRes.json();
+              localStorage.setItem('nsbc_token', rd.access_token);
+              if (rd.refresh_token) localStorage.setItem('nsbc_refresh_token', rd.refresh_token);
+              try { window.__auth && (window.__auth.token = rd.access_token); } catch(_) {}
+              // 重放原Request（token 已Update）
+              const retryRes = await fetch(this.base + path, opts);
+              if (retryRes.status === 401) {
+                localStorage.clear();
+                location.hash = '#/login';
+                throw new Error('Unauthorized');
+              }
+              const retryText = await retryRes.text();
+              if (!retryRes.ok) throw new Error(retryText || retryRes.statusText);
+              return retryText ? JSON.parse(retryText) : null;
+            }
+          } catch (refreshErr) { /* refresh 失败走下面清 localStorage */ }
+          finally { this._refreshing = false; }
+        }
+        localStorage.clear();
+        try { window.__auth && (window.__auth.token = null, window.__auth.user = null, window.__auth.role = null); } catch(_) {}
+        location.hash = '#/login';
+        throw new Error('Unauthorized');
+      }
+      // 正常响应：解析并返回
+      const text = await res.text();
+      const data = text ? JSON.parse(text) : null;
+      if (!res.ok) throw new Error((data && data.detail) || res.statusText);
+      return data;
+    } // end of retry for loop
+    // 循环耗尽（全部 429），抛出最后一次错误
+    throw new Error('Too Many Requests (429) — please slow down');
   },
   get:    (p) => API.req('GET', p),
   post:   (p, b) => API.req('POST', p, b),
@@ -1210,6 +1245,8 @@ function livePanel(title, icon, columns, apiPath, opts = {}) {
       const lastUpdated = ref('');
       const currentPage = ref(1);
       let timer = null;
+      let inflight = false;          // in-flight 互斥：上一个 load 没回来不再发新请求
+      let refreshTimer = null;       // SSE 去抖 timer
 
       const totalPages = computed(() => Math.max(1, Math.ceil(allRows.value.length / pageSize)));
       const pagedRows = computed(() => {
@@ -1218,6 +1255,8 @@ function livePanel(title, icon, columns, apiPath, opts = {}) {
       });
 
       async function load(silent) {
+        if (inflight) return;        // 上一个还没回来，跳过
+        inflight = true;
         if (silent !== true) loading.value = true;
         error.value = null;
         try {
@@ -1236,7 +1275,10 @@ function livePanel(title, icon, columns, apiPath, opts = {}) {
           if (currentPage.value > totalPages.value) currentPage.value = totalPages.value;
           lastUpdated.value = new Date().toLocaleTimeString();
         } catch (e) { error.value = e.message; }
-        finally { if (silent !== true) loading.value = false; }
+        finally {
+          inflight = false;
+          if (silent !== true) loading.value = false;
+        }
       }
 
       function extractRows(data) {
@@ -1247,13 +1289,24 @@ function livePanel(title, icon, columns, apiPath, opts = {}) {
             || (Array.isArray(data) ? data : []);
       }
 
-      onMounted(() => { load(); if (refreshMs > 0) timer = setInterval(load, refreshMs); });
+      function scheduleRefresh() {
+        if (refreshTimer) return;
+        refreshTimer = setTimeout(() => {
+          refreshTimer = null;
+          load(true);
+        }, 300);
+      }
+
+      onMounted(() => { load(); if (refreshMs > 0) timer = setInterval(() => load(true), refreshMs); });
       // nsbc-esl-web §8#1：SSE 推送触发静默Refresh（不闪 loading），与 refreshMs
-      // 轮询构成 push+pull 双路径。修复：清定时器须在卸载时（原误用 onMounted，
-      // 导致 setInterval 刚建即被清除，轮询实际不生效）。
-      const onSseRefresh = () => load(true);
-      onMounted(() => document.addEventListener('nsbc-refresh', onSseRefresh));
-      onBeforeUnmount(() => { if (timer) clearInterval(timer); document.removeEventListener('nsbc-refresh', onSseRefresh); });
+      // 轮询构成 push+pull 双路径。300ms 去抖对齐全局 scheduleRefresh，
+      // 避免 session 事件密集时各面板同时重拉打爆后端。
+      onMounted(() => document.addEventListener('nsbc-refresh', scheduleRefresh));
+      onBeforeUnmount(() => {
+        if (timer) clearInterval(timer);
+        clearTimeout(refreshTimer);
+        document.removeEventListener('nsbc-refresh', scheduleRefresh);
+      });
       return { allRows, loading, error, lastUpdated, load, columns, icon, currentPage, totalPages, pagedRows, actionCol };
     },
   };

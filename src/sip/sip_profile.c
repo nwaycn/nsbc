@@ -540,8 +540,9 @@ rollback:
  * 公共字符串 CIDR API（兼容语义，供手工填充字段/溢出回退路径使用）
  * ======================================================================*/
 
-/* RFC1918 私网网段（与 stub_mods.c 默认值 + db/mod.rs DEFAULT 保持一致） */
-#define RFC1918_CIDR_STR "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8"
+/* 默认放行所有源。安全边界前移到 auth/profile 层，CIDR 仅做额外 IP 准入闸门。
+ * 生产部署如需收紧，在 Web UI 里给具体 rule 单独填 src_ip_cidr 即可。 */
+#define RFC1918_CIDR_STR "0.0.0.0/0"
 
 /* §15 性能优化：RFC1918 私网快速判定
  * 热点路径（规则级 CIDR 检查默认就是 RFC1918）跳过 strtok_r + inet_pton + cidr_match_one
@@ -566,8 +567,14 @@ int sip_ip_in_cidr_list(const char *cidr_list, const char *src_ip)
 {
     if (!cidr_list || !*cidr_list || !src_ip || !*src_ip) return -1;
 
-    /* §15 fast path：默认 RFC1918 私网列表 → O(1) 范围比较，跳过 strtok_r + inet_pton */
+    /* fast path：全通配 "0.0.0.0/0" — 直接放行，跳过 strtok_r + inet_pton + cidr_match_one */
     if (strcmp(cidr_list, RFC1918_CIDR_STR) == 0) {
+        return 1;  /* 0.0.0.0/0 匹配任意 IPv4 src_ip */
+    }
+
+    /* 兼容老默认值：完整 RFC1918+回环私网列表 — O(1) 范围比较 */
+    static const char *legacy_rfc1918 = "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8";
+    if (strcmp(cidr_list, legacy_rfc1918) == 0) {
         return is_rfc1918_fast(src_ip) ? 1 : 0;
     }
 

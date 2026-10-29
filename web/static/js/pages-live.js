@@ -165,9 +165,19 @@ app.component('realtime', {
     }
 
     let timer;
-    function onSseRefresh() { load(); }
-    async function load() {
-      loading.value = true; error.value = null;
+    let refreshTimer = null;       // SSE 去抖 timer（对齐 app-core.js 全局 scheduleRefresh）
+    let inflight = false;          // in-flight 互斥：上一个 load 没回来不再发新请求
+    function scheduleRefresh() {
+      if (refreshTimer) return;    // 已有计划中，跳过
+      refreshTimer = setTimeout(() => {
+        refreshTimer = null;
+        load(true);                // silent=true，不闪 loading
+      }, 300);
+    }
+    async function load(silent) {
+      if (inflight) return;        // 上一个还没回来，跳过
+      inflight = true;
+      if (silent !== true) loading.value = true; error.value = null;
       try {
         const [c, r] = await Promise.all([API.get('/calls'), API.get('/registrations')]);
         calls.value = c; regs.value = r;
@@ -175,14 +185,16 @@ app.component('realtime', {
       } catch (e) {
         if (isCoreOfflineError(e.message)) { console.warn('[live] core offline:', e.message); }
         else error.value = e.message;
+      } finally {
+        inflight = false;
+        if (silent !== true) loading.value = false;
       }
-      loading.value = false;
     }
-    onMounted(() => { load(); timer = setInterval(load, 5000); });
-    // 修复：清定时器须在卸载时（原误用 onMounted 会在建表后立即清除，5s 轮询失效）；
-    // 同时挂 SSE 推送（nsbc-refresh）构成 push+pull 双路径。
-    onMounted(() => document.addEventListener('nsbc-refresh', onSseRefresh));
-    onBeforeUnmount(() => { clearInterval(timer); document.removeEventListener('nsbc-refresh', onSseRefresh); });
+    onMounted(() => { load(); timer = setInterval(() => load(true), 5000); });
+    // 修复：SSE 推送用 300ms 去抖 + silent 模式，避免 session 事件密集时
+    // 瞬间同时发 /calls + /registrations 打爆后端。
+    onMounted(() => document.addEventListener('nsbc-refresh', scheduleRefresh));
+    onBeforeUnmount(() => { clearInterval(timer); clearTimeout(refreshTimer); document.removeEventListener('nsbc-refresh', scheduleRefresh); });
     return { calls, regs, loading, error, lastUpdated,
              showOrigDlg, origForm, origLoading, origMsg, origOk, submitOriginate };
   },
@@ -433,6 +445,7 @@ app.component('cdrs-live', {
     const currentPage = ref(1);
     const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize.value)));
     let timer;
+    let inflight = false;          // in-flight 互斥
 
     // Tab 切换（REQ-SEC-005: malicious filter）
     // 项目风格：中文硬编码为主 + t() 做通用项翻译
@@ -502,8 +515,10 @@ app.component('cdrs-live', {
       return row.duration_sec != null ? row.duration_sec + 's' : '-';
     }
 
-    async function load() {
-      loading.value = true; error.value = null;
+    async function load(silent) {
+      if (inflight) return;
+      inflight = true;
+      if (silent !== true) loading.value = true; error.value = null;
       try {
         const offset = (currentPage.value - 1) * pageSize.value;
         const params = new URLSearchParams();
@@ -530,10 +545,12 @@ app.component('cdrs-live', {
       } catch (e) {
         if (isCoreOfflineError(e.message)) { console.warn('[live] core offline:', e.message); }
         else error.value = e.message;
+      } finally {
+        inflight = false;
+        if (silent !== true) loading.value = false;
       }
-      loading.value = false;
     }
-    onMounted(() => { load(); timer = setInterval(load, 10000); });
+    onMounted(() => { load(); timer = setInterval(() => load(true), 10000); });
     onBeforeUnmount(() => clearInterval(timer));
     return { rows, total, loading, error, pageSize, currentPage, totalPages, goPage,
              getRecUrl, getMeta, ringTime, formatBillsec, fmtIso, isoMs,
@@ -560,17 +577,22 @@ app.component('metrics-live', {
   setup() {
     const metrics = ref({}), loading = ref(false), error = ref(null);
     let timer;
-    async function load() {
-      loading.value = true; error.value = null;
+    let inflight = false;
+    async function load(silent) {
+      if (inflight) return;
+      inflight = true;
+      if (silent !== true) loading.value = true; error.value = null;
       try {
         metrics.value = await API.get('/metrics');
       } catch (e) {
         if (isCoreOfflineError(e.message)) { console.warn('[live] core offline:', e.message); }
         else error.value = e.message;
+      } finally {
+        inflight = false;
+        if (silent !== true) loading.value = false;
       }
-      loading.value = false;
     }
-    onMounted(() => { load(); timer = setInterval(load, 10000); });
+    onMounted(() => { load(); timer = setInterval(() => load(true), 10000); });
     onBeforeUnmount(() => clearInterval(timer));
     return { metrics, loading, error };
   },
@@ -662,6 +684,7 @@ app.component('registrations-live', {
     const shown = computed(() => rows.value.length);
     const truncated = computed(() => data.value?.truncated || false);
     let timer;
+    let inflight = false;
 
     function fmtDur(sec) {
       if (sec == null) return '-';
@@ -677,13 +700,18 @@ app.component('registrations-live', {
       return 'text-gray-600';
     }
 
-    async function load() {
-      loading.value = true; error.value = null;
+    async function load(silent) {
+      if (inflight) return;
+      inflight = true;
+      if (silent !== true) loading.value = true; error.value = null;
       try { data.value = await API.get('/registrations'); }
       catch (e) { error.value = e.message; }
-      loading.value = false;
+      finally {
+        inflight = false;
+        if (silent !== true) loading.value = false;
+      }
     }
-    onMounted(() => { load(); timer = setInterval(load, 5000); });
+    onMounted(() => { load(); timer = setInterval(() => load(true), 5000); });
     onBeforeUnmount(() => clearInterval(timer));
     return { data, rows, total, shown, truncated, loading, error, fmtDur, renewClass };
   },
@@ -777,8 +805,11 @@ app.component('transcode-live', {
   setup() {
     const rows = ref([]), total = ref(0), loading = ref(false), error = ref(null);
     let timer;
-    async function load() {
-      loading.value = true; error.value = null;
+    let inflight = false;
+    async function load(silent) {
+      if (inflight) return;
+      inflight = true;
+      if (silent !== true) loading.value = true; error.value = null;
       try {
         const data = await API.get('/transcode');
         rows.value = data.sessions || [];
@@ -786,10 +817,12 @@ app.component('transcode-live', {
       } catch (e) {
         if (isCoreOfflineError(e.message)) { console.warn('[live] core offline:', e.message); }
         else error.value = e.message;
+      } finally {
+        inflight = false;
+        if (silent !== true) loading.value = false;
       }
-      loading.value = false;
     }
-    onMounted(() => { load(); timer = setInterval(load, 3000); });
+    onMounted(() => { load(); timer = setInterval(() => load(true), 3000); });
     onBeforeUnmount(() => clearInterval(timer));
     return { rows, total, loading, error };
   },

@@ -2036,7 +2036,7 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
                 layer         TEXT    NOT NULL DEFAULT 'ext',  -- §15: preserved but deprecated, inferred automatically from target prefix
                 /* ====== §15 additions ====== */
                 profile_name  TEXT    NOT NULL DEFAULT 'internal',
-                src_ip_cidr   TEXT    NOT NULL DEFAULT '10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8',
+                src_ip_cidr   TEXT    NOT NULL DEFAULT '0.0.0.0/0',
                 /* ===================== */
                 match_expr    TEXT    NOT NULL,
                 caller_match  TEXT    NOT NULL DEFAULT '',
@@ -2067,7 +2067,7 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
                 layer         TEXT    NOT NULL DEFAULT 'ext',  -- §15: preserved but deprecated, inferred automatically from target prefix
                 /* ====== §15 additions ====== */
                 profile_name  TEXT    NOT NULL DEFAULT 'internal',
-                src_ip_cidr   TEXT    NOT NULL DEFAULT '10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8',
+                src_ip_cidr   TEXT    NOT NULL DEFAULT '0.0.0.0/0',
                 /* ===================== */
                 match_expr    TEXT    NOT NULL,
                 caller_match  TEXT    NOT NULL DEFAULT '',
@@ -2098,7 +2098,7 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
                 layer         VARCHAR(16)  NOT NULL DEFAULT 'ext',  -- §15: preserved but deprecated, inferred automatically from target prefix
                 /* ====== §15 additions ====== */
                 profile_name  VARCHAR(32)  NOT NULL DEFAULT 'internal',
-                src_ip_cidr   VARCHAR(128) NOT NULL DEFAULT '10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8',
+                src_ip_cidr   VARCHAR(128) NOT NULL DEFAULT '0.0.0.0/0',
                 /* ===================== */
                 match_expr    VARCHAR(256) NOT NULL,
                 caller_match  VARCHAR(256) NOT NULL DEFAULT '',
@@ -2147,7 +2147,7 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
     let dp_alter = match backend {
         "mysql" => "ALTER TABLE dialplan_rules \
                     ADD COLUMN profile_name VARCHAR(32) NOT NULL DEFAULT 'internal' AFTER layer, \
-                    ADD COLUMN src_ip_cidr  VARCHAR(128) NOT NULL DEFAULT '10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8' AFTER profile_name, \
+                    ADD COLUMN src_ip_cidr  VARCHAR(128) NOT NULL DEFAULT '0.0.0.0/0' AFTER profile_name, \
                     ADD COLUMN rec_action  INT NOT NULL DEFAULT 0 AFTER target, \
                     ADD COLUMN rec_path_template VARCHAR(256) NOT NULL DEFAULT '' AFTER rec_action, \
                     ADD COLUMN force_prack        TINYINT NOT NULL DEFAULT 0 AFTER rec_path_template, \
@@ -2159,7 +2159,7 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
             // SQLite / PostgreSQL each get their own statements
             sqlx::query("ALTER TABLE dialplan_rules ADD COLUMN profile_name TEXT NOT NULL DEFAULT 'internal'")
                 .execute(pool).await.ok();  // ignore error if column already exists
-            sqlx::query("ALTER TABLE dialplan_rules ADD COLUMN src_ip_cidr TEXT NOT NULL DEFAULT '10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8'")
+            sqlx::query("ALTER TABLE dialplan_rules ADD COLUMN src_ip_cidr TEXT NOT NULL DEFAULT '0.0.0.0/0'")
                 .execute(pool).await.ok();
             sqlx::query("ALTER TABLE dialplan_rules ADD COLUMN rec_action INTEGER NOT NULL DEFAULT 0")
                 .execute(pool).await.ok();
@@ -2610,7 +2610,7 @@ sqlx::query(acct_ddl).execute(pool).await?;
                 sip_tls_port         INTEGER NOT NULL DEFAULT 5061,
                 enable_udp           INTEGER NOT NULL DEFAULT 1,
                 enable_tcp           INTEGER NOT NULL DEFAULT 1,
-                enable_tls           INTEGER NOT NULL DEFAULT 0,
+                enable_tls           INTEGER NOT NULL DEFAULT 1,
                 rtp_port_start       INTEGER NOT NULL DEFAULT 10000,
                 rtp_port_end         INTEGER NOT NULL DEFAULT 59999,
                 enable_prack         INTEGER NOT NULL DEFAULT 0,
@@ -2644,7 +2644,7 @@ sqlx::query(acct_ddl).execute(pool).await?;
                 sip_tls_port         INTEGER NOT NULL DEFAULT 5061,
                 enable_udp           INTEGER NOT NULL DEFAULT 1,
                 enable_tcp           INTEGER NOT NULL DEFAULT 1,
-                enable_tls           INTEGER NOT NULL DEFAULT 0,
+                enable_tls           INTEGER NOT NULL DEFAULT 1,
                 rtp_port_start       INTEGER NOT NULL DEFAULT 10000,
                 rtp_port_end         INTEGER NOT NULL DEFAULT 59999,
                 enable_prack         INTEGER NOT NULL DEFAULT 0,
@@ -2678,7 +2678,7 @@ sqlx::query(acct_ddl).execute(pool).await?;
                 sip_tls_port         INT          NOT NULL DEFAULT 5061,
                 enable_udp           TINYINT(1)   NOT NULL DEFAULT 1,
                 enable_tcp           TINYINT(1)   NOT NULL DEFAULT 1,
-                enable_tls           TINYINT(1)   NOT NULL DEFAULT 0,
+                enable_tls           TINYINT(1)   NOT NULL DEFAULT 1,
                 rtp_port_start       INT          NOT NULL DEFAULT 10000,
                 rtp_port_end         INT          NOT NULL DEFAULT 59999,
                 enable_prack         TINYINT(1)   NOT NULL DEFAULT 0,
@@ -4714,7 +4714,7 @@ pub struct DialplanRule {
     pub layer:          String,
     /* §15 new: forced partition key + per-rule IP admission */
     pub profile_name:   String,  /* DEFAULT 'internal' */
-    pub src_ip_cidr:    String,  /* DEFAULT '10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8' */
+    pub src_ip_cidr:    String,  /* DEFAULT '0.0.0.0/0' — default open, per-rule tighten in UI */
     pub match_expr:     String,
     pub caller_match:   String,
     pub prio:           i64,
@@ -4817,7 +4817,8 @@ fn default_ivr_nodes_json() -> String {
 fn default_one() -> i64 { 1 }
 fn default_empty_array() -> String { "[]".to_string() }
 /* §15 RFC1918 intranet subnets (default IP admission, toll fraud prevention) */
-const RFC1918_CIDR_DEFAULT: &str = "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8";
+/* 默认放行所有源 IP。安全边界在 auth/profile 层，CIDR 仅做额外闸门。 */
+const RFC1918_CIDR_DEFAULT: &str = "0.0.0.0/0";
 fn default_ext() -> String { "ext".to_string() }
 /* default_internal() already defined at L2633 */
 /* §15 RFC1918 intranet subnets default IP admission (toll fraud prevention) */

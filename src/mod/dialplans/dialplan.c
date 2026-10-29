@@ -430,6 +430,8 @@ int dp_execute(const dp_ctx_t *ctx, const dp_call_t *call, dp_result_t *res)
          *  此时不能解引用 NULL b2b_call_t*）。号码变换 + 路由结果
          *  已在本函数上部填完（res->target/dst_number/layer），
          *  跳过 app 不影响 pre-check 的判断目的。 */
+        llog(LOG_INFO, "dp", "  app_chain_check: rule_id=%u app_chain_n=%zu call_key=%p",
+             r->id, r->app_chain_n, (void *)call->call_key);
         if (r->app_chain_n > 0 && call->call_key != NULL) {
             app_ctx_t actx;
             memset(&actx, 0, sizeof(actx));

@@ -212,7 +212,7 @@ app.component('route-groups', crudTable(
 ));
 
 /* §15 Dialplan Rules：带 internal/external Profile Tab 分区（= FreeSWITCH default.xml vs public.xml）
- * CIDR DefaultValue：internal → RFC1918 内网网段（防盗打）；external → 0.0.0.0/0（外部Gateway IP 不固定，用户按需Config） */
+ * CIDR DefaultValue：internal/external 都默认 0.0.0.0/0 放行（安全边界在 auth/profile 层，CIDR 是额外闸门） */
 app.component('dialplan-rules', {
   template: `
     <div class="space-y-4">
@@ -354,8 +354,8 @@ app.component('dialplan-rules', {
             </el-select>
             <div class="text-xs text-slate-400 mt-1">internal = default.xml；external = public.xml，两个 context 规则完全隔离</div>
           </el-form-item>
-          <el-form-item :label="'源 IP 准入 CIDR（多网段逗号分隔）' + (form.profile_name === 'external' ? ' — 外部Gateway请填运营商 IP' : ' — Default RFC1918 内网防盗打')">
-            <el-input v-model="form.src_ip_cidr" placeholder="10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"></el-input>
+          <el-form-item :label="'源 IP 准入 CIDR（多网段逗号分隔）' + (form.profile_name === 'external' ? ' — 外部Gateway请填运营商 IP' : ' — 默认 0.0.0.0/0 放行，生产建议按规则收紧')">
+            <el-input v-model="form.src_ip_cidr" placeholder="0.0.0.0/0 或 10.0.0.0/8,192.168.0.0/16 等"></el-input>
           </el-form-item>
           <el-form-item label="CalleeMatch Expression">
             <div class="flex gap-2 items-start w-full">
@@ -541,7 +541,7 @@ app.component('dialplan-rules', {
   `,
   setup() {
     const API_PATH = '/dialplan-rules';
-    const RFC1918 = '10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8';
+    const RFC1918 = '0.0.0.0/0';
     const { ref, computed, onMounted } = Vue;
 
     const items = ref([]);
@@ -932,5 +932,3 @@ app.component('sip-profiles', crudTable(
     { key: 'description', label: t('Notes'), type: 'textarea' },
   ],
 ));
-
-

@@ -637,10 +637,11 @@ static int dp_json_parse_one(cJSON *obj, dp_rule_t *r, uint32_t rid,
     /* ====== §15 新增：profile_name（强制分区键）+ src_ip_cidr（规则级 IP 准入）======
      * 默认值保证旧 reload JSON（没有这两个 key）自动继承：
      *   profile_name  = "internal"  （旧规则全是 internal 语义）
-     *   src_ip_cidr   = RFC1918 内网网段合集（防盗打：只允许内部注册源） */
-#define RFC1918_CIDR "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8"
+     *   src_ip_cidr   = 0.0.0.0/0   （默认放行，具体 rule 再收紧）
+     * 安全边界在 auth/profile 层，CIDR 是额外闸门而非主闸门。 */
+#define DEFAULT_SRC_IP_CIDR "0.0.0.0/0"
     snprintf(r->profile_name, sizeof(r->profile_name), "internal");
-    snprintf(r->src_ip_cidr,  sizeof(r->src_ip_cidr),  RFC1918_CIDR);
+    snprintf(r->src_ip_cidr,  sizeof(r->src_ip_cidr),  DEFAULT_SRC_IP_CIDR);
     j = cJSON_GetObjectItem(obj, "profile_name");
     if (j && cJSON_IsString(j) && j->valuestring[0]) {
         snprintf(r->profile_name, sizeof(r->profile_name), "%s", j->valuestring);
@@ -731,58 +732,50 @@ static int dp_json_parse_one(cJSON *obj, dp_rule_t *r, uint32_t rid,
                 snprintf(r->hdr_rw.sip_from_uri, sizeof(r->hdr_rw.sip_from_uri), "%s", _cf->valuestring);
         }
 
-        /* ====== REQ-DP-APP-001：app_chain（Application 链）JSON 数组解析 ======
-         * 放在 cJSON_Delete(aj) 之前，因为 fallback 路径需要用 aj（action_json 嵌套 app_chain）。
-         * 支持两种形态：
-         *   a) top-level "app_chain": [{"app":"playback","data":"welcome.wav"}, ...]
-         *   b) action_json 嵌套 "app_chain": [...]
-         * 优先级：top-level 优先（显式配置 > 隐式嵌套）
-         *
-         * 内存：calloc 分配 → dp_rule_set_app_chain 只存指针不拷贝
-         * dp_table_free 会释放 app_chain（见 dialplan.c） */
-        {
-            cJSON *chain_j = NULL;
-            cJSON *alt = cJSON_GetObjectItem(obj, "app_chain");
-            if (alt && cJSON_IsArray(alt) && cJSON_GetArraySize(alt) > 0) {
-                chain_j = alt;                              /* top-level 命中 */
-            } else if (aj) {
-                /* fallback：action_json 里嵌套（aj 还没 delete，安全） */
-                cJSON *nest = cJSON_GetObjectItem(aj, "app_chain");
-                if (nest && cJSON_IsArray(nest) && cJSON_GetArraySize(nest) > 0)
-                    chain_j = nest;
-            }
-            if (chain_j) {
-                int nn = cJSON_GetArraySize(chain_j);
-                dp_app_action_t *chain =
-                    (dp_app_action_t *)calloc((size_t)nn, sizeof(*chain));
-                if (chain) {
-                    int valid = 0;
-                    for (int k = 0; k < nn; ++k) {
-                        cJSON *item = cJSON_GetArrayItem(chain_j, k);
-                        if (!item || !cJSON_IsObject(item)) continue;
-                        cJSON *app = cJSON_GetObjectItem(item, "app");
-                        if (!app || !cJSON_IsString(app) || !app->valuestring[0])
-                            continue;                    /* 必须有 app 名 */
-                        snprintf(chain[valid].app,
-                                 sizeof(chain[valid].app), "%s", app->valuestring);
-                        cJSON *data = cJSON_GetObjectItem(item, "data");
-                        if (data && cJSON_IsString(data) && data->valuestring[0])
-                            snprintf(chain[valid].data,
-                                     sizeof(chain[valid].data), "%s", data->valuestring);
-                        ++valid;
-                    }
-                    if (valid > 0) {
-                        dp_rule_set_app_chain(r, chain, (size_t)valid);
-                    } else {
-                        free(chain);                      /* 全无效 → 不挂链 */
-                    }
-                }
-            }
-        }
-
         if (aj != j)
             cJSON_Delete(aj);
     }
+
+    /* ====== REQ-DP-APP-001：app_chain（Application 链）JSON 数组解析 ======
+     * 移到 if (aj) 外面！这样 top-level "app_chain" 无论有没有 "action_json" 都能解析。
+     * 支持两种形态：
+     *   a) top-level "app_chain": [{"app":"playback","data":"welcome.wav"}, ...]
+     *   b) action_json 嵌套 "app_chain": [...]（aj 已 delete，不再 fallback）
+     * 优先级：top-level 优先（显式配置 > 隐式嵌套）
+     *
+     * 内存：calloc 分配 → dp_rule_set_app_chain 只存指针不拷贝
+     * dp_table_free 会释放 app_chain（见 dialplan.c） */
+    {
+        cJSON *alt = cJSON_GetObjectItem(obj, "app_chain");
+        if (alt && cJSON_IsArray(alt) && cJSON_GetArraySize(alt) > 0) {
+            int nn = cJSON_GetArraySize(alt);
+            dp_app_action_t *chain =
+                (dp_app_action_t *)calloc((size_t)nn, sizeof(*chain));
+            if (chain) {
+                int valid = 0;
+                for (int k = 0; k < nn; ++k) {
+                    cJSON *item = cJSON_GetArrayItem(alt, k);
+                    if (!item || !cJSON_IsObject(item)) continue;
+                    cJSON *app = cJSON_GetObjectItem(item, "app");
+                    if (!app || !cJSON_IsString(app) || !app->valuestring[0])
+                        continue;                        /* 必须有 app 名 */
+                    snprintf(chain[valid].app,
+                             sizeof(chain[valid].app), "%s", app->valuestring);
+                    cJSON *data = cJSON_GetObjectItem(item, "data");
+                    if (data && cJSON_IsString(data) && data->valuestring[0])
+                        snprintf(chain[valid].data,
+                                 sizeof(chain[valid].data), "%s", data->valuestring);
+                    ++valid;
+                }
+                if (valid > 0) {
+                    dp_rule_set_app_chain(r, chain, (size_t)valid);
+                } else {
+                    free(chain);                          /* 全无效 → 不挂链 */
+                }
+            }
+        }
+    }
+
     return NSBC_OK;
 }
 
@@ -872,9 +865,9 @@ int dp_rules_reload_json(const char *json, char *out_err, size_t err_sz)
     for (size_t i = 0; i < tbl->count; ++i) {
         const dp_rule_t *r = &tbl->rules[i];
         llog(LOG_INFO, "dialplan",
-             "rule[%zu] id=%u prio=%d prof=%s match='%s' target=%s rec_action=%d",
+             "rule[%zu] id=%u prio=%d prof=%s match='%s' target=%s rec_action=%d app_chain_n=%zu",
              i, r->id, r->prio, r->profile_name,
-             r->match.pattern, r->target, r->rec_action);
+             r->match.pattern, r->target, r->rec_action, r->app_chain_n);
     }
     return NSBC_OK;
 

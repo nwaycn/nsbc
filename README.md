@@ -23,8 +23,18 @@
     - [1. Install dependencies (Debian/Ubuntu)](#1-install-dependencies-debianubuntu)
     - [2. Clone, configure and build](#2-clone-configure-and-build)
     - [3. Build nsbc-web (Rust sidecar)](#3-build-nsbc-web-rust-sidecar)
-    - [4. Run](#4-run)
-    - [5. Open and test](#5-open-and-test)
+    - [4. Obtain a Digital TLS Certificate (Optional but Recommended)](#4-obtain-a-digital-tls-certificate-optional-but-recommended)
+      - [4.1 Install acme.sh](#41-install-acmesh)
+        - [Install acme.sh (automatically sets up a cron job for renewal)](#install-acmesh-automatically-sets-up-a-cron-job-for-renewal)
+        - [Or install manually](#or-install-manually)
+        - [Verify the installation](#verify-the-installation)
+      - [4.2 Issue a Certificate](#42-issue-a-certificate)
+        - [Issue a certificate for your domain using the Let's Encrypt staging server](#issue-a-certificate-for-your-domain-using-the-lets-encrypt-staging-server)
+        - [(Use the production server https://acme-v02.api.letsencrypt.org/directory for real certificates)](#use-the-production-server-httpsacme-v02apiletsencryptorgdirectory-for-real-certificates)
+    - [4.3 Deploy the Certificate](#43-deploy-the-certificate)
+    - [5. Run](#5-run)
+    - [6. Open and test](#6-open-and-test)
+  - [For the management platform, the default database uses SQLite. The account is admin:Admin123, and you can access the management platform at https://:443.](#for-the-management-platform-the-default-database-uses-sqlite-the-account-is-adminadmin123-and-you-can-access-the-management-platform-at-https443)
   - [Configuration](#configuration)
   - [Web Management Console](#web-management-console)
   - [Architecture](#architecture)
@@ -314,6 +324,8 @@ Register with default extensions:
 
 Two registered extensions (e.g. `1001` and `1002`) can call each other directly.
 
+If you're using an IP phone or softphone, you'll need to fill in similar settings. Specifically for tools like MicroSIP that require a domain, enter nsbc.local. Otherwise, you need to change the default domain to your current machine's IP address.
+For the management platform, the default database uses SQLite. The account is admin:Admin123, and you can access the management platform at https://:443.
 ---
 
 ## Configuration
@@ -339,7 +351,7 @@ The web console is a **separate Rust sidecar** (`web/` directory). It does not r
 
 ```bash
 cd web
-make build-acme        
+make build-acme
 cd .. && ./nsbc-web  # removed it to ../. with makefile ,binds HTTPS on :443
 ```
 
