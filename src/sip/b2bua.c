@@ -603,8 +603,13 @@ static int tr_send_leg(b2b_leg_t *l, const char *buf, size_t len,
 
 static void detach_txn(sip_txn_t *t)
 {
-    if (t)
-        txn_set_ud(t, NULL);
+    if (!t)
+        return;
+    /* BYE→200 OK 后主动 teardown：停 Timer H/B/F + 摘链 + 置 TERMINATED。
+     * 根因修复：旧代码只做 txn_set_ud(NULL)，txn 还靠 32s Timer H 自然清理，
+     * 压测后 txn_active 堆积到 12-45 万。 */
+    txn_force_terminate(t);
+    txn_set_ud(t, NULL);
 }
 
 /* 呼叫销毁：摘除表、关对话、断开关联后归还 slab */
@@ -1582,6 +1587,8 @@ static void respond_a(b2b_call_t *c, int status, const char *body,
     b2b_core_t *co = c->core;
     b2b_leg_t *a = &c->leg[0];
     sip_txn_t *t = a->srv_txn ? a->srv_txn : a->inv_txn;
+    llog(LOG_INFO, "b2b", "respond_a: st=%d bodylen=%zu a.srv_txn=%p a.inv_txn=%p → t=%p reinv=%d a_final=%d",
+         status, bodylen, a->srv_txn, a->inv_txn, t, c->leg[1].reinv, c->a_final);
     if (!t)
         return;
     /* REQ-NAT-001：respond_a 里构造的 Contact 也走 external_sip_ip
@@ -1680,7 +1687,8 @@ static void respond_a(b2b_call_t *c, int status, const char *body,
                                body, bodylen);
     if (n < 0)
         return;
-    txn_send_response(t, out, (size_t)n, now_ms());
+    int trc = txn_send_response(t, out, (size_t)n, now_ms());
+    llog(LOG_INFO, "b2b", "respond_a: txn_send_response rc=%d n=%zu t=%p status=%d", trc, (size_t)n, t, status);
 }
 
 /* 媒体决策一次 */
@@ -4647,6 +4655,12 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
             return;
         }
         b2b_leg_t *target = &c->leg[leg >= 0 ? leg : 0];
+        /* 存储 CANCEL 入站 NIST → call_destroy 时 detach_txn(cancel_txn) 清理，
+         * 避免 Timer J (32s) 自然超时堆积。用 cancel_txn 字段，不占 srv_txn
+         * （srv_txn 是 re-INVITE/MESSAGE/INFO 用的）。 */
+        if (target->cancel_txn && target->cancel_txn != t)
+            detach_txn(target->cancel_txn);
+        target->cancel_txn = t;
         if (target->srv_txn) {
             /* re-INVITE 取消：487 该 re-INVITE，呼叫保留 */
             respond_txn(co, target->srv_txn, 487, NULL, NULL, NULL, 0);
@@ -4689,6 +4703,12 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
             call_unlock(c);
             return;
         }
+        /* 存储 BYE 入站 NIST 事务 → call_destroy 时 detach_txn 会 force_terminate。
+         * 旧代码不存，BYE NIST 靠 Timer J (64*T1=32s) 自然 cb_dead→t_remove_hash，
+         * 压测 60 通 → 60 条残留，10s 后仍有 21 条未到期。 */
+        if (c->leg[leg].srv_txn && c->leg[leg].srv_txn != t)
+            detach_txn(c->leg[leg].srv_txn);
+        c->leg[leg].srv_txn = t;
         c->leg[leg].state = LEG_TERMINATING;
         /* ★ 记录谁发起的挂断：leg=0→A腿(主叫)发BYE，leg=1→B腿(被叫)发BYE */
         c->hangup_by = leg + 1;

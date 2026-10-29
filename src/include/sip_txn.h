@@ -139,6 +139,11 @@ void txn_set_ud(sip_txn_t *t, void *ud);
 void txn_set_tu(sip_txn_t *t, txn_tu_fn tu);
 const char *txn_state_name(txn_state_t s);
 
+/* 主动终止事务（不等 Timer H/B/F 超时）。用于 BYE→200 OK 后
+ * call_destroy 立即释放 INVITE txn，避免 txn_active 堆积。
+ * 幂等：已 dead 的 txn 直接返回。 */
+void txn_force_terminate(sip_txn_t *t);
+
 /* 统计（OBS） */
 uint64_t txn_mgr_active(txn_mgr_t *m);
 uint64_t txn_mgr_retrans_in(txn_mgr_t *m);

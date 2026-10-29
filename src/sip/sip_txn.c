@@ -987,6 +987,20 @@ const char *txn_state_name(txn_state_t s)
     }
 }
 
+/* BYE→200 OK 后主动 teardown txn，不等 Timer H/B/F 自然超时。
+ * 幂等：t_remove_hash 内部已检查 t->dead，多次调用安全。 */
+void txn_force_terminate(sip_txn_t *t)
+{
+    if (!t || t->dead)
+        return;
+    /* 跳过 cb_dead 的 TU 回调（call 已销毁，不需要再通知），
+     * 直接置 TERMINATED + t_remove_hash 做：tw_del Timer G/H/B/F + 摘链 + unref */
+    t->state = (t->kind == TXN_ICT) ? TXN_ICT_TERMINATED
+             : (t->kind == TXN_IST) ? TXN_IST_TERMINATED
+             : TXN_NICT_TERMINATED;
+    t_remove_hash(t);
+}
+
 uint64_t txn_mgr_active(txn_mgr_t *m)
 {
     return __atomic_load_n(&m->active, __ATOMIC_RELAXED);
