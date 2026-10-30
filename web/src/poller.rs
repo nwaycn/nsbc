@@ -62,40 +62,33 @@ where
                     let mut seen = HashSet::with_capacity(cdrs.len());
                     for c in cdrs {
                         if !seen.insert(c.call_id.clone()) { continue; }
-                        if let Err(e) = state
-                            .db
-                            .insert_cdr(
-                                &c.call_id,
-                                c.tenant.as_deref(),
-                                &c.from_num,
-                                &c.to_num,
-                                c.trunk.as_deref(),
-                                c.rec_path.as_deref(),
-                                &c.dir,
-                                &c.phase,
-                                &c.disposition,
-                                c.start_ms,
-                                c.answer_ms,
-                                c.end_ms,
-                                c.billsec,
-                                c.duration_s,
-                                c.cause,
-                                c.emergency,
-                                c.from_ip.as_deref(),
-                                c.codec_a.as_deref(),
-                                c.codec_b.as_deref(),
-                                c.a_peer_ip.as_deref(),
-                                c.b_peer_ip.as_deref(),
-                                c.is_malicious as u8,
-                                c.threat_reason.as_deref(),
-                            )
-                            .await
-                        {
-                            // Single insert failed (unique-key conflicts already filtered;
-                            // real failure is backend write error): warn once, don't interrupt
-                            // the batch.
-                            warn!(error = %e, call_id = %c.call_id, "cdr insert failed");
-                        }
+                        // Phase 1: 走异步批量路径 submit_cdr（非阻塞入队），
+                        // 不再逐条 .await insert_cdr。DB 后端错误由 batch consumer 处理。
+                        state.db.submit_cdr(
+                            c.call_id,
+                            c.tenant,
+                            c.from_num,
+                            c.to_num,
+                            c.trunk,
+                            c.rec_path,
+                            c.dir,
+                            c.phase,
+                            c.disposition,
+                            c.start_ms,
+                            c.answer_ms,
+                            c.end_ms,
+                            c.billsec,
+                            c.duration_s,
+                            c.cause,
+                            c.emergency,
+                            c.from_ip,
+                            c.codec_a,
+                            c.codec_b,
+                            c.a_peer_ip,
+                            c.b_peer_ip,
+                            c.is_malicious as u8,
+                            c.threat_reason,
+                        );
                     }
                 }
                 Err(CoreError::Unsupported(reason)) => {

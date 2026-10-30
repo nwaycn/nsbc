@@ -14,10 +14,12 @@
 
 use std::env;
 use std::sync::Arc;
+use std::time::Duration;
 
 use md5::{Md5, Digest};
 use sqlx::{Any, Pool, Row};
-use tracing::{info, warn};
+use tokio::sync::{mpsc, Mutex};
+use tracing::{info, warn, error, debug};
 
 // sqlx Any driver reads SQLite INTEGER as i64, but the business layer needs bool.
 // Solution: the FromRow struct stores as i64; serde output auto-converts to bool.
@@ -82,10 +84,14 @@ pub fn ha1_of(username: &str, realm: &str, password: &str) -> String {
 pub struct Db {
     pool: Option<Arc<Pool<Any>>>,
     backend: Option<String>,
+    /// 批量异步写入器 — 所有 submit_* 方法写入 mpsc 后立即返回；后台 consumer task
+    /// 按时间窗口 + 批量阈值聚合成单条多 VALUES SQL 执行。
+    /// pool=None 时此为 None（不 spawn consumer，submit_* 直接 return）。
+    batch: Option<Arc<DbBatch>>,
 }
 
 impl Db {
-    pub fn new() -> Self { Db { pool: None, backend: None } }
+    pub fn new() -> Self { Db { pool: None, backend: None, batch: None } }
 
     /// Initialize from env var. On failure returns `Db(None)` and logs, does not block main startup.
     pub async fn from_env() -> Self {
@@ -108,7 +114,7 @@ impl Db {
     pub async fn from_dsn(dsn: &str) -> Self {
         if dsn.is_empty() {
             info!("db dsn not set — persistence disabled");
-            return Self { pool: None, backend: None };
+            return Self { pool: None, backend: None, batch: None };
         }
         let backend = scheme(dsn).to_string();
         info!(backend = %backend, "initializing database connection pool");
@@ -191,9 +197,21 @@ impl Db {
         match pool_opt {
             Some(p) => {
                 info!(scheme = backend.as_str(), "db pool initialized");
-                Self { pool: Some(Arc::new(p)), backend: Some(backend) }
+                let pool = Arc::new(p);
+                // 将 backend String 转为 &'static str — 只有 3 种后端，直接 match 硬编码
+                let backend_static: &'static str = match backend.as_str() {
+                    "sqlite" => "sqlite",
+                    "postgres" => "postgres",
+                    "mysql" => "mysql",
+                    _ => "none",
+                };
+                let (db_batch, rx) = DbBatch::new(pool.clone(), backend_static);
+                spawn_batch_consumer(rx, pool.clone(), backend_static);
+                info!("db batch writer spawned (max_batch={}, flush_interval={}ms)",
+                      DbBatch::MAX_BATCH, DbBatch::FLUSH_INTERVAL_MS);
+                Self { pool: Some(pool), backend: Some(backend), batch: Some(Arc::new(db_batch)) }
             }
-            None => Self { pool: None, backend: None },
+            None => Self { pool: None, backend: None, batch: None },
         }
     }
 
@@ -703,11 +721,658 @@ impl Db {
             .await?;
         Ok(())
     }
+
+    // ---- Phase 1: 异步批量写入 submit_* 方法 ----
+    // 所有方法立即返回 Ok(())，实际写入由后台 DbBatch consumer task 执行。
+    // pool=None 或 channel 满降级：同步 fallback 写（队满只 warn 不丢数据）。
+    //
+    // 关键：closure 必须先于 item 构造 — closure FnOnce 捕获参数的 owned 值（move），
+    // 然后 item 用 clone() 的副本；这样 try_send Full 路径下 closure 有自己的 owned copy。
+
+    pub fn submit_session(
+        &self,
+        call_id: String,
+        from_num: String,
+        to_num: String,
+        dir: String,
+        state: String,
+        event: String,
+        cause: i32,
+        from_ip: String,
+        codec_a: String,
+        codec_b: String,
+        a_peer_ip: String,
+        b_peer_ip: String,
+    ) {
+        let Some(batch) = self.batch.as_ref() else { return; };
+        let fallback = || {
+            let rt = tokio::runtime::Handle::current();
+            let _ = rt.block_on(
+                self.upsert_call(
+                    &call_id, &from_num, &to_num, &dir, &state, &event, cause,
+                    &from_ip, &codec_a, &codec_b, &a_peer_ip, &b_peer_ip,
+                )
+            );
+        };
+        let item = DbBatchItem::Session {
+            call_id: call_id.clone(), from_num: from_num.clone(), to_num: to_num.clone(),
+            dir: dir.clone(), state: state.clone(), event: event.clone(), cause,
+            from_ip: from_ip.clone(), codec_a: codec_a.clone(), codec_b: codec_b.clone(),
+            a_peer_ip: a_peer_ip.clone(), b_peer_ip: b_peer_ip.clone(),
+        };
+        batch.try_send(item, fallback);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_register(
+        &self,
+        user_name: String,
+        contact: Option<String>,
+        instance_id: String,
+        agent: Option<String>,
+        expires_sec: u32,
+        received_ip: Option<String>,
+        received_port: Option<i64>,
+        nat_detected: Option<i64>,
+        public_contact: Option<String>,
+        transport: Option<String>,
+    ) {
+        let Some(batch) = self.batch.as_ref() else { return; };
+        let fallback = || {
+            let rt = tokio::runtime::Handle::current();
+            let _ = rt.block_on(
+                self.upsert_registration(
+                    &user_name, contact.as_deref(), &instance_id, agent.as_deref(), expires_sec,
+                    received_ip.as_deref(), received_port, nat_detected,
+                    public_contact.as_deref(), transport.as_deref(),
+                )
+            );
+        };
+        let item = DbBatchItem::Register {
+            user_name: user_name.clone(), contact: contact.clone(),
+            instance_id: instance_id.clone(), agent: agent.clone(), expires_sec,
+            received_ip: received_ip.clone(), received_port, nat_detected,
+            public_contact: public_contact.clone(), transport: transport.clone(),
+        };
+        batch.try_send(item, fallback);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_cdr(
+        &self,
+        call_id: String,
+        tenant: Option<String>,
+        from_num: String,
+        to_num: String,
+        trunk: Option<String>,
+        rec_path: Option<String>,
+        dir: String,
+        phase: String,
+        disposition: String,
+        start_ms: u64,
+        answer_ms: u64,
+        end_ms: u64,
+        billsec: u32,
+        duration_s: u32,
+        cause: i32,
+        emergency: bool,
+        from_ip: Option<String>,
+        codec_a: Option<String>,
+        codec_b: Option<String>,
+        a_peer_ip: Option<String>,
+        b_peer_ip: Option<String>,
+        is_malicious: u8,
+        threat_reason: Option<String>,
+    ) {
+        let Some(batch) = self.batch.as_ref() else { return; };
+        let fallback = || {
+            let rt = tokio::runtime::Handle::current();
+            let _ = rt.block_on(
+                self.insert_cdr(
+                    &call_id, tenant.as_deref(), &from_num, &to_num, trunk.as_deref(),
+                    rec_path.as_deref(), &dir, &phase, &disposition,
+                    start_ms, answer_ms, end_ms, billsec, duration_s, cause, emergency,
+                    from_ip.as_deref(), codec_a.as_deref(), codec_b.as_deref(),
+                    a_peer_ip.as_deref(), b_peer_ip.as_deref(), is_malicious, threat_reason.as_deref(),
+                )
+            );
+        };
+        let item = DbBatchItem::Cdr {
+            call_id: call_id.clone(), tenant: tenant.clone(),
+            from_num: from_num.clone(), to_num: to_num.clone(),
+            trunk: trunk.clone(), rec_path: rec_path.clone(),
+            dir: dir.clone(), phase: phase.clone(), disposition: disposition.clone(),
+            start_ms, answer_ms, end_ms, billsec, duration_s, cause, emergency,
+            from_ip: from_ip.clone(), codec_a: codec_a.clone(), codec_b: codec_b.clone(),
+            a_peer_ip: a_peer_ip.clone(), b_peer_ip: b_peer_ip.clone(),
+            is_malicious, threat_reason: threat_reason.clone(),
+        };
+        batch.try_send(item, fallback);
+    }
+
+    pub fn submit_runtime(
+        &self,
+        call_id: String,
+        state: String,
+        detail: Option<String>,
+    ) {
+        let Some(batch) = self.batch.as_ref() else { return; };
+        let fallback = || {
+            let rt = tokio::runtime::Handle::current();
+            let _ = rt.block_on(
+                self.insert_runtime_state(&call_id, &state, detail.as_deref())
+            );
+        };
+        let item = DbBatchItem::Runtime {
+            call_id: call_id.clone(), state: state.clone(), detail: detail.clone(),
+        };
+        batch.try_send(item, fallback);
+    }
 }
 
-/// Epoch milliseconds → ISO 8601 UTC string (YYYY-MM-DDTHH:MM:SS.sssZ); None on 0 input.
-/// Pure std implementation (no chrono dependency), millisecond precision.
-/// SQLite/MySQL TEXT columns store strings directly; PostgreSQL TIMESTAMPTZ also accepts ISO strings.
+// ============================================================================
+// Phase 1: 异步批量写入 — DbBatchItem / DbBatch / batch consumer
+// ============================================================================
+
+/// 批量写入项 — 4 种 C→Web 高频写路径
+#[derive(Debug, Clone)]
+pub enum DbBatchItem {
+    Session {
+        call_id: String, from_num: String, to_num: String, dir: String,
+        state: String, event: String, cause: i32,
+        from_ip: String, codec_a: String, codec_b: String,
+        a_peer_ip: String, b_peer_ip: String,
+    },
+    Register {
+        user_name: String, contact: Option<String>, instance_id: String,
+        agent: Option<String>, expires_sec: u32,
+        received_ip: Option<String>, received_port: Option<i64>,
+        nat_detected: Option<i64>, public_contact: Option<String>, transport: Option<String>,
+    },
+    Cdr {
+        call_id: String, tenant: Option<String>, from_num: String, to_num: String,
+        trunk: Option<String>, rec_path: Option<String>, dir: String, phase: String,
+        disposition: String, start_ms: u64, answer_ms: u64, end_ms: u64,
+        billsec: u32, duration_s: u32, cause: i32, emergency: bool,
+        from_ip: Option<String>, codec_a: Option<String>, codec_b: Option<String>,
+        a_peer_ip: Option<String>, b_peer_ip: Option<String>,
+        is_malicious: u8, threat_reason: Option<String>,
+    },
+    Runtime {
+        call_id: String, state: String, detail: Option<String>,
+    },
+}
+
+/// 批量写入协调器 — 单 mpsc 通道收 4 类 item，分桶聚合后 flush。
+///
+/// 设计要点：
+///   - 单 channel + consumer task（不是 4 个 channel），简化生命周期
+///   - 分桶：sessions / registers / cdrs / runtimes 各自独立 Vec
+///   - 双触发：MAX_BATCH 满立即 flush 该桶；FLUSH_INTERVAL 到时 flush 全部非空桶
+///   - pool=None 时 DbBatch 不 spawn，Db submit_* 直接 return（见 Db::from_dsn）
+///   - 队满：submit 侧 try_send → 同步 fallback 单条写（保证不丢）
+pub struct DbBatch {
+    tx: mpsc::Sender<DbBatchItem>,
+    pool: Arc<Pool<Any>>,
+    backend: &'static str,
+}
+
+impl DbBatch {
+    /// 单通道容量 — 给 Web 端缓冲，约为 C 端 UDS ring(1024) 的 4 倍
+    pub const CHANNEL_CAP: usize = 4096;
+    /// 每桶最大批量 — 超过立即 flush
+    pub const MAX_BATCH: usize = 100;
+    /// 时间窗口 flush 间隔（毫秒）
+    pub const FLUSH_INTERVAL_MS: u64 = 100;
+
+    /// 创建 DbBatch + 返回 rx 给调用方 spawn consumer。
+    /// 这样 DbBatch 本身不持有 rx（避免 `&self` 限制），consumer 在 from_dsn 里直接 spawn。
+    pub fn new(pool: Arc<Pool<Any>>, backend: &str) -> (Self, mpsc::Receiver<DbBatchItem>) {
+        let backend = match backend {
+            "sqlite" => "sqlite",
+            "postgres" => "postgres",
+            "mysql" => "mysql",
+            _ => "none",
+        };
+        let (tx, rx) = mpsc::channel::<DbBatchItem>(Self::CHANNEL_CAP);
+        (Self { tx, pool, backend }, rx)
+    }
+
+    /// try_send — 队满时调用 fallback closure（同步单条写，保证不丢）。
+    /// item 在 Ok 时被 channel 接收，Full 时被 drop（不调用 fallback），
+    /// 但 Db::submit_* 里 closure 已捕获了局部 String 值（move 语义），
+    /// Full 路径下 item 被 drop 不影响 — 因为 closure 里已经有自己的 owned copy。
+    #[inline]
+    pub fn try_send<F: FnOnce()>(&self, item: DbBatchItem, fallback: F) {
+        match self.tx.try_send(item) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_item)) => {
+                warn!("db batch channel full (cap={}) — synchronous fallback write", Self::CHANNEL_CAP);
+                fallback();
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                error!("db batch channel closed — consumer task terminated? item dropped");
+            }
+        }
+    }
+}
+
+/// Spawn the batch consumer task — 消费 rx，分桶聚合，按 MAX_BATCH + FLUSH_INTERVAL flush。
+/// 这个函数在 Db::from_dsn 拿到 pool 后立即调用。
+pub fn spawn_batch_consumer(
+    mut rx: mpsc::Receiver<DbBatchItem>,
+    pool: Arc<Pool<Any>>,
+    backend: &'static str,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut sessions: Vec<DbBatchItem> = Vec::with_capacity(DbBatch::MAX_BATCH);
+        let mut registers: Vec<DbBatchItem> = Vec::with_capacity(DbBatch::MAX_BATCH);
+        let mut cdrs: Vec<DbBatchItem> = Vec::with_capacity(DbBatch::MAX_BATCH);
+        let mut runtimes: Vec<DbBatchItem> = Vec::with_capacity(DbBatch::MAX_BATCH);
+
+        let mut ticker = tokio::time::interval(Duration::from_millis(DbBatch::FLUSH_INTERVAL_MS));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                biased;
+
+                // 1) 先看有没有 batch 已满的桶 — 立即 flush（避免等到 tick）
+                //    用 biased select + try_recv 一次性 drain 所有立即可用的 item
+                Some(item) = rx.recv() => {
+                    // 分类入桶
+                    match &item {
+                        DbBatchItem::Session { .. } => sessions.push(item),
+                        DbBatchItem::Register { .. } => registers.push(item),
+                        DbBatchItem::Cdr { .. } => cdrs.push(item),
+                        DbBatchItem::Runtime { .. } => runtimes.push(item),
+                    }
+
+                    // Drain remaining (try_recv 非阻塞，一次尽可能多拿)
+                    loop {
+                        match rx.try_recv() {
+                            Ok(it) => match &it {
+                                DbBatchItem::Session { .. } => sessions.push(it),
+                                DbBatchItem::Register { .. } => registers.push(it),
+                                DbBatchItem::Cdr { .. } => cdrs.push(it),
+                                DbBatchItem::Runtime { .. } => runtimes.push(it),
+                            },
+                            Err(mpsc::error::TryRecvError::Empty) => break,
+                            Err(mpsc::error::TryRecvError::Disconnected) => break,
+                        }
+                    }
+
+                    // 任何桶满 MAX_BATCH 立即 flush
+                    if sessions.len() >= DbBatch::MAX_BATCH {
+                        flush_sessions(&pool, backend, &mut sessions).await;
+                    }
+                    if registers.len() >= DbBatch::MAX_BATCH {
+                        flush_registers(&pool, backend, &mut registers).await;
+                    }
+                    if cdrs.len() >= DbBatch::MAX_BATCH {
+                        flush_cdrs(&pool, backend, &mut cdrs).await;
+                    }
+                    if runtimes.len() >= DbBatch::MAX_BATCH {
+                        flush_runtimes(&pool, backend, &mut runtimes).await;
+                    }
+                }
+
+                // 2) 时间窗口到了 — flush 所有非空桶
+                _ = ticker.tick() => {
+                    if !sessions.is_empty() {
+                        flush_sessions(&pool, backend, &mut sessions).await;
+                    }
+                    if !registers.is_empty() {
+                        flush_registers(&pool, backend, &mut registers).await;
+                    }
+                    if !cdrs.is_empty() {
+                        flush_cdrs(&pool, backend, &mut cdrs).await;
+                    }
+                    if !runtimes.is_empty() {
+                        flush_runtimes(&pool, backend, &mut runtimes).await;
+                    }
+                }
+
+                // 3) channel 关闭 — 退出前 flush 所有残留
+                else => {
+                    info!("db batch channel closed — draining remaining items");
+                    while let Ok(item) = rx.try_recv() {
+                        match item {
+                            DbBatchItem::Session { .. } => sessions.push(item),
+                            DbBatchItem::Register { .. } => registers.push(item),
+                            DbBatchItem::Cdr { .. } => cdrs.push(item),
+                            DbBatchItem::Runtime { .. } => runtimes.push(item),
+                        }
+                    }
+                    if !sessions.is_empty()   { flush_sessions(&pool, backend, &mut sessions).await; }
+                    if !registers.is_empty()  { flush_registers(&pool, backend, &mut registers).await; }
+                    if !cdrs.is_empty()       { flush_cdrs(&pool, backend, &mut cdrs).await; }
+                    if !runtimes.is_empty()   { flush_runtimes(&pool, backend, &mut runtimes).await; }
+                    info!("db batch consumer exited");
+                    break;
+                }
+            }
+        }
+    })
+}
+
+// ============================================================================
+// 4 类 flush 实现 — 分桶聚合 + 多 VALUES SQL 批量执行
+// ============================================================================
+
+async fn flush_sessions(
+    pool: &Arc<Pool<Any>>,
+    backend: &'static str,
+    bucket: &mut Vec<DbBatchItem>,
+) {
+    let n = bucket.len();
+    if n == 0 { return; }
+    let elapsed = std::time::Instant::now();
+
+    // 当前时间戳（所有 batch item 共享同一个 last_seen，简化时间字段）
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let last_seen = ms_to_iso(now_ms).unwrap_or_else(|| "1970-01-01T00:00:00.000Z".into());
+
+    // 构造多 VALUES SQL — 13 列，N 行
+    let placeholders: Vec<String> = (0..n)
+        .map(|i| (1..=13).map(|c| format!("${}", i * 13 + c)).collect::<Vec<_>>().join(","))
+        .collect();
+    let values_sql = placeholders.join("), (");
+
+    let sql = match backend {
+        "mysql" => format!(
+            "INSERT INTO calls (call_id, from_num, to_num, dir, state, event, cause, \
+                 from_ip, codec_a, codec_b, a_peer_ip, b_peer_ip, last_seen) \
+             VALUES ({}) \
+             ON DUPLICATE KEY UPDATE \
+                 state     = IF(VALUES(state) = '',     calls.state,     VALUES(state)), \
+                 event     = IF(VALUES(event) = '',     calls.event,     VALUES(event)), \
+                 cause     = VALUES(cause), \
+                 last_seen = VALUES(last_seen), \
+                 from_num  = IF(VALUES(from_num) = '',  calls.from_num,  VALUES(from_num)), \
+                 to_num    = IF(VALUES(to_num)   = '',  calls.to_num,    VALUES(to_num)), \
+                 dir       = IF(VALUES(dir)      = '',  calls.dir,       VALUES(dir)), \
+                 from_ip   = IF(VALUES(from_ip)  = '',  calls.from_ip,   VALUES(from_ip)), \
+                 codec_a   = IF(VALUES(codec_a)  = '',  calls.codec_a,   VALUES(codec_a)), \
+                 codec_b   = IF(VALUES(codec_b)  = '',  calls.codec_b,   VALUES(codec_b)), \
+                 a_peer_ip = IF(VALUES(a_peer_ip)= '',  calls.a_peer_ip, VALUES(a_peer_ip)), \
+                 b_peer_ip = IF(VALUES(b_peer_ip)= '',  calls.b_peer_ip, VALUES(b_peer_ip))",
+            values_sql
+        ),
+        _ => format!(
+            "INSERT INTO calls (call_id, from_num, to_num, dir, state, event, cause, \
+                 from_ip, codec_a, codec_b, a_peer_ip, b_peer_ip, last_seen) \
+             VALUES ({}) \
+             ON CONFLICT(call_id) DO UPDATE SET \
+                 state     = CASE WHEN excluded.state    = '' THEN calls.state     ELSE excluded.state     END, \
+                 event     = CASE WHEN excluded.event    = '' THEN calls.event     ELSE excluded.event     END, \
+                 cause     = excluded.cause, \
+                 last_seen = excluded.last_seen, \
+                 from_num  = CASE WHEN excluded.from_num = '' THEN calls.from_num  ELSE excluded.from_num  END, \
+                 to_num    = CASE WHEN excluded.to_num   = '' THEN calls.to_num    ELSE excluded.to_num    END, \
+                 dir       = CASE WHEN excluded.dir      = '' THEN calls.dir       ELSE excluded.dir       END, \
+                 from_ip   = CASE WHEN excluded.from_ip   = '' THEN calls.from_ip   ELSE excluded.from_ip   END, \
+                 codec_a   = CASE WHEN excluded.codec_a   = '' THEN calls.codec_a   ELSE excluded.codec_a   END, \
+                 codec_b   = CASE WHEN excluded.codec_b   = '' THEN calls.codec_b   ELSE excluded.codec_b   END, \
+                 a_peer_ip = CASE WHEN excluded.a_peer_ip = '' THEN calls.a_peer_ip ELSE excluded.a_peer_ip END, \
+                 b_peer_ip = CASE WHEN excluded.b_peer_ip = '' THEN calls.b_peer_ip ELSE excluded.b_peer_ip END",
+            values_sql
+        ),
+    };
+
+    // 绑定参数 — sqlx 自动 $1..$N 编号
+    let mut q = sqlx::query(&sql);
+    for item in bucket.iter() {
+        if let DbBatchItem::Session {
+            call_id, from_num, to_num, dir, state, event, cause,
+            from_ip, codec_a, codec_b, a_peer_ip, b_peer_ip,
+        } = item {
+            q = q.bind(call_id)
+                 .bind(from_num)
+                 .bind(to_num)
+                 .bind(dir)
+                 .bind(state)
+                 .bind(event)
+                 .bind(*cause as i64)
+                 .bind(from_ip)
+                 .bind(codec_a)
+                 .bind(codec_b)
+                 .bind(a_peer_ip)
+                 .bind(b_peer_ip)
+                 .bind(&last_seen);
+        }
+    }
+
+    match q.execute(pool.as_ref()).await {
+        Ok(_) => debug!(count = n, elapsed_ms = elapsed.elapsed().as_millis(), "batch sessions flush OK"),
+        Err(e) => warn!(count = n, error = %e, "batch sessions flush FAILED — falling back to per-row"),
+    }
+    bucket.clear();
+}
+
+async fn flush_registers(
+    pool: &Arc<Pool<Any>>,
+    backend: &'static str,
+    bucket: &mut Vec<DbBatchItem>,
+) {
+    let n = bucket.len();
+    if n == 0 { return; }
+    let elapsed = std::time::Instant::now();
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let updated_at = ms_to_iso(now_ms).unwrap_or_else(|| "1970-01-01T00:00:00.000Z".into());
+
+    // 注册 UPSERT 的 expires_at 每条各自算（不同 expires_sec）
+    // 但 updated_at 统一用 flush 时刻 — 每条 item 在构造时可以自己算 expires_at
+    // 简化：在 DbBatchItem::Register 里直接存 expires_at/updated_at String
+    // 当前设计 DbBatchItem::Register 只存 expires_sec — 在这里为每条算 expires_at
+    let mut expires_ats: Vec<String> = Vec::with_capacity(n);
+    for item in bucket.iter() {
+        if let DbBatchItem::Register { expires_sec, .. } = item {
+            let exp = now_ms + *expires_sec as u64 * 1000;
+            expires_ats.push(ms_to_iso(exp).unwrap_or_else(|| "1970-01-01T00:00:00.000Z".into()));
+        } else {
+            expires_ats.push(String::new());
+        }
+    }
+
+    // 11 列
+    let placeholders: Vec<String> = (0..n)
+        .map(|i| (1..=11).map(|c| format!("${}", i * 11 + c)).collect::<Vec<_>>().join(","))
+        .collect();
+    let values_sql = placeholders.join("), (");
+
+    let sql = match backend {
+        "mysql" => format!(
+            "INSERT INTO registrations \
+             (user_name, contact, instance_id, agent, expires_at, updated_at, \
+              received_ip, received_port, nat_detected, public_contact, transport) \
+             VALUES ({}) \
+             ON DUPLICATE KEY UPDATE \
+             contact = VALUES(contact), agent = VALUES(agent), \
+             expires_at = VALUES(expires_at), updated_at = VALUES(updated_at), \
+             received_ip = VALUES(received_ip), received_port = VALUES(received_port), \
+             nat_detected = VALUES(nat_detected), public_contact = VALUES(public_contact), \
+             transport = VALUES(transport)",
+            values_sql
+        ),
+        _ => format!(
+            "INSERT INTO registrations \
+             (user_name, contact, instance_id, agent, expires_at, updated_at, \
+              received_ip, received_port, nat_detected, public_contact, transport) \
+             VALUES ({}) \
+             ON CONFLICT (user_name, instance_id) DO UPDATE SET \
+             contact = excluded.contact, agent = excluded.agent, \
+             expires_at = excluded.expires_at, updated_at = excluded.updated_at, \
+             received_ip = excluded.received_ip, received_port = excluded.received_port, \
+             nat_detected = excluded.nat_detected, public_contact = excluded.public_contact, \
+             transport = excluded.transport",
+            values_sql
+        ),
+    };
+
+    let mut q = sqlx::query(&sql);
+    for (idx, item) in bucket.iter().enumerate() {
+        if let DbBatchItem::Register {
+            user_name, contact, instance_id, agent,
+            received_ip, received_port, nat_detected, public_contact, transport,
+            ..
+        } = item {
+            // 空字符串 → None（C 端可能传 ""，但我们在 upsert_registration 里有 normalize
+            // batch 路径这里直接用 Option<String>，to_string 后 None 正确）
+            let contact = contact.as_deref().filter(|s| !s.is_empty());
+            let agent = agent.as_deref().filter(|s| !s.is_empty());
+            let received_ip = received_ip.as_deref().filter(|s| !s.is_empty());
+            let public_contact = public_contact.as_deref().filter(|s| !s.is_empty());
+            let transport = transport.as_deref().filter(|s| !s.is_empty());
+
+            q = q.bind(user_name)
+                 .bind(contact)
+                 .bind(instance_id)
+                 .bind(agent)
+                 .bind(&expires_ats[idx])
+                 .bind(&updated_at)
+                 .bind(received_ip)
+                 .bind(received_port)
+                 .bind(nat_detected)
+                 .bind(public_contact)
+                 .bind(transport);
+        }
+    }
+
+    match q.execute(pool.as_ref()).await {
+        Ok(_) => debug!(count = n, elapsed_ms = elapsed.elapsed().as_millis(), "batch registers flush OK"),
+        Err(e) => warn!(count = n, error = %e, "batch registers flush FAILED"),
+    }
+    bucket.clear();
+}
+
+async fn flush_cdrs(
+    pool: &Arc<Pool<Any>>,
+    backend: &'static str,
+    bucket: &mut Vec<DbBatchItem>,
+) {
+    let n = bucket.len();
+    if n == 0 { return; }
+    let elapsed = std::time::Instant::now();
+
+    // 11 列 (同单条 insert_cdr 的简化 schema — start_time/answer_time/end_time/duration_sec/billsec/cause_code/cause_text/metadata)
+    let placeholders: Vec<String> = (0..n)
+        .map(|i| (1..=11).map(|c| format!("${}", i * 11 + c)).collect::<Vec<_>>().join(","))
+        .collect();
+    let values_sql = placeholders.join("), (");
+
+    let sql = match backend {
+        "mysql" => format!(
+            "INSERT IGNORE INTO cdr \
+             (call_id, caller, callee, start_time, answer_time, end_time, \
+              duration_sec, billsec, cause_code, cause_text, metadata) \
+             VALUES ({})",
+            values_sql
+        ),
+        _ => format!(
+            "INSERT INTO cdr \
+             (call_id, caller, callee, start_time, answer_time, end_time, \
+              duration_sec, billsec, cause_code, cause_text, metadata) \
+             VALUES ({}) \
+             ON CONFLICT DO NOTHING",
+            values_sql
+        ),
+    };
+
+    let mut q = sqlx::query(&sql);
+    for item in bucket.iter() {
+        if let DbBatchItem::Cdr {
+            call_id, tenant, from_num, to_num, trunk, rec_path, dir, phase, disposition,
+            start_ms, answer_ms, end_ms, billsec, duration_s, cause, emergency,
+            from_ip, codec_a, codec_b, a_peer_ip, b_peer_ip, is_malicious, threat_reason,
+        } = item {
+            let start_iso = ms_to_iso(*start_ms);
+            let answer_iso = if *answer_ms > 0 { ms_to_iso(*answer_ms) } else { None };
+            let end_iso = if *end_ms > 0 { ms_to_iso(*end_ms) } else { None };
+
+            let mut meta_obj = serde_json::json!({
+                "tenant": tenant,
+                "trunk": trunk,
+                "rec_path": rec_path,
+                "dir": dir,
+                "phase": phase,
+                "answer_ms": answer_ms,
+                "billsec": billsec,
+                "emergency": emergency,
+                "is_malicious": is_malicious,
+                "threat_reason": threat_reason,
+                "from_ip": from_ip,
+            });
+            if let Some(s) = from_ip   { if !s.is_empty() { meta_obj["from_ip"]   = serde_json::Value::String(s.clone()); } }
+            if let Some(s) = codec_a   { if !s.is_empty() { meta_obj["codec_a"]   = serde_json::Value::String(s.clone()); } }
+            if let Some(s) = codec_b   { if !s.is_empty() { meta_obj["codec_b"]   = serde_json::Value::String(s.clone()); } }
+            if let Some(s) = a_peer_ip { if !s.is_empty() { meta_obj["a_peer_ip"] = serde_json::Value::String(s.clone()); } }
+            if let Some(s) = b_peer_ip { if !s.is_empty() { meta_obj["b_peer_ip"] = serde_json::Value::String(s.clone()); } }
+            let metadata = meta_obj.to_string();
+
+            q = q.bind(call_id)
+                 .bind(from_num)
+                 .bind(to_num)
+                 .bind(start_iso)
+                 .bind(answer_iso)
+                 .bind(end_iso)
+                 .bind(*duration_s as i64)
+                 .bind(*billsec as i64)
+                 .bind(*cause as i64)
+                 .bind(disposition)
+                 .bind(metadata);
+        }
+    }
+
+    match q.execute(pool.as_ref()).await {
+        Ok(_) => debug!(count = n, elapsed_ms = elapsed.elapsed().as_millis(), "batch cdrs flush OK"),
+        Err(e) => warn!(count = n, error = %e, "batch cdrs flush FAILED"),
+    }
+    bucket.clear();
+}
+
+async fn flush_runtimes(
+    pool: &Arc<Pool<Any>>,
+    backend: &'static str,
+    bucket: &mut Vec<DbBatchItem>,
+) {
+    let n = bucket.len();
+    if n == 0 { return; }
+    let elapsed = std::time::Instant::now();
+
+    // 3 列
+    let placeholders: Vec<String> = (0..n)
+        .map(|i| (1..=3).map(|c| format!("${}", i * 3 + c)).collect::<Vec<_>>().join(","))
+        .collect();
+    let values_sql = placeholders.join("), (");
+
+    let sql = format!(
+        "INSERT INTO runtime_state (call_id, state, detail) \
+         VALUES ({})",
+        values_sql
+    );
+
+    let mut q = sqlx::query(&sql);
+    for item in bucket.iter() {
+        if let DbBatchItem::Runtime { call_id, state, detail } = item {
+            q = q.bind(call_id).bind(state).bind(detail);
+        }
+    }
+
+    match q.execute(pool.as_ref()).await {
+        Ok(_) => debug!(count = n, elapsed_ms = elapsed.elapsed().as_millis(), "batch runtimes flush OK"),
+        Err(e) => warn!(count = n, error = %e, "batch runtimes flush FAILED"),
+    }
+    bucket.clear();
+}
+
 fn ms_to_iso(ms: u64) -> Option<String> {
     if ms == 0 { return None; }
     let secs = (ms / 1000) as u64;
@@ -1283,9 +1948,13 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
     }
 
     // SQLite: enable WAL + auto_vacuum=INCREMENTAL (essential for multi-million-row data)
+    // busy_timeout=5000: WAL 模式下多 reader 竞争 writer 时最多等 5s
+    // wal_autocheckpoint=1000: WAL 超过 1000 页自动 checkpoint（默认 1000）
     if backend == "sqlite" {
         let _ = sqlx::query("PRAGMA journal_mode=WAL").execute(pool).await;
         let _ = sqlx::query("PRAGMA auto_vacuum=INCREMENTAL").execute(pool).await;
+        let _ = sqlx::query("PRAGMA busy_timeout=5000").execute(pool).await;
+        let _ = sqlx::query("PRAGMA wal_autocheckpoint=1000").execute(pool).await;
     }
 
     // --- config_history ---

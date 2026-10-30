@@ -264,30 +264,22 @@ async fn dispatch_push<C: crate::coreclient::CoreApi + Clone + Send + Sync + 'st
     tracing::debug!(kind, "UDS frame received, payload_len={}", payload.len());
 
     let ok = match kind {
-        "cdr" => write_cdr(&state.db, &body).await,
-        "register" => upsert_registration(&state.db, &body).await,
-        "runtime" => insert_runtime(&state.db, &body).await,
+        "cdr" => submit_cdr(&state.db, &body),
+        "register" => submit_register(&state.db, &body),
+        "runtime" => submit_runtime(&state.db, &body),
         "audit" => insert_audit(&state.db, &body).await,
         "session" => {
-            let r = dispatch_session_push(&state.db, &body).await;
+            let r = submit_session(&state.db, &body);
             if r.is_ok() {
                 // nsbc-esl-web §8#1: SESSION event fan-out to /calls/stream (SSE)
-                // subscribers. send returns Err only when no subscribers (ignored);
-                // if the ring buffer is full we drop the oldest — we NEVER block —
-                // keeping UDS dispatch hot path back-pressure free (project hard constraint).
                 let evt = serde_json::json!({"kind": "session", "payload": body}).to_string();
                 let _ = state.calls_tx.send(evt);
             }
             r
         }
         "vad_event" => {
-            // REQ-AI-BARGEIN-001: VAD state change (SILENCE↔SPEECH) fan-out to ai_agent
-            // module for barge-in decision. payload = {event:"VAD_EVENT",call_key:"0x...",
-            // leg:0|1, state:"SPEECH|SILENCE", rms:N, ts_ns:N}.
             let evt = serde_json::json!({"kind": "vad_event", "payload": body}).to_string();
             let _ = state.vad_tx.send(evt);
-            // VAD events don't write to DB (high-frequency, transient state; CDR covers
-            // the final result), return Ok directly
             Ok(())
         },
         "" => return Err("missing kind".into()),
@@ -354,9 +346,11 @@ async fn dispatch_cmd_req<C: crate::coreclient::CoreApi + Clone + Send + Sync + 
     }
 }
 
-// --- DB helpers ---
+// --- DB helpers (Phase 1: 异步批量写入 submit_*，不再 .await DB 操作) ---
 
-async fn write_cdr(db: &crate::db::Db, v: &serde_json::Value) -> Result<(), String> {
+/// submit_cdr — 解析 JSON 后调用 db.submit_cdr（mpsc 入队后立即返回）。
+/// 返回 Ok 表示入队成功或 fallback 同步写成功；Err 表示 JSON 缺关键字段。
+fn submit_cdr(db: &crate::db::Db, v: &serde_json::Value) -> Result<(), String> {
     let call_id = v.get("call_id").and_then(|x| x.as_str()).unwrap_or("");
     if call_id.is_empty() {
         return Err("missing call_id".into());
@@ -364,26 +358,23 @@ async fn write_cdr(db: &crate::db::Db, v: &serde_json::Value) -> Result<(), Stri
     let req = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
     let ms = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
     let num = |k: &str| v.get(k).and_then(|x| x.as_i64()).unwrap_or(0) as u32;
-    // codec / IP extension fields (C-side CDR END fills fully; early START/ANSWER events
-    // may be empty)
     let from_ip   = opt_str(v, "from_ip");
     let codec_a   = opt_str(v, "codec_a");
     let codec_b   = opt_str(v, "codec_b");
     let a_peer_ip = opt_str(v, "a_peer_ip");
     let b_peer_ip = opt_str(v, "b_peer_ip");
-    /* REQ-SEC-005: 从 C 端 event_json 读 is_malicious + threat_reason */
     let is_malicious = v.get("is_malicious").and_then(|x| x.as_u64()).unwrap_or(0) as u8;
     let threat_reason = opt_str(v, "threat_reason");
-    db.insert_cdr(
-        call_id,
-        opt_str(v, "tenant").as_deref(),
-        &req("from"),
-        &req("to"),
-        opt_str(v, "trunk").as_deref(),
-        opt_str(v, "rec_path").as_deref(),
-        &req("dir"),
-        &req("phase"),
-        &req("disposition"),
+    db.submit_cdr(
+        call_id.to_string(),
+        opt_str(v, "tenant"),
+        req("from"),
+        req("to"),
+        opt_str(v, "trunk"),
+        opt_str(v, "rec_path"),
+        req("dir"),
+        req("phase"),
+        req("disposition"),
         ms("start_ms"),
         ms("answer_ms"),
         ms("end_ms"),
@@ -391,59 +382,81 @@ async fn write_cdr(db: &crate::db::Db, v: &serde_json::Value) -> Result<(), Stri
         num("duration_s"),
         v.get("cause").and_then(|x| x.as_i64()).unwrap_or(0) as i32,
         v.get("emergency").and_then(|x| x.as_bool()).unwrap_or(false),
-        from_ip.as_deref(),
-        codec_a.as_deref(),
-        codec_b.as_deref(),
-        a_peer_ip.as_deref(),
-        b_peer_ip.as_deref(),
+        from_ip,
+        codec_a,
+        codec_b,
+        a_peer_ip,
+        b_peer_ip,
         is_malicious,
-        threat_reason.as_deref(),
-    )
-    .await
-    .map_err(|e| e.to_string())
+        threat_reason,
+    );
+    Ok(())
 }
 
-async fn upsert_registration(db: &crate::db::Db, v: &serde_json::Value) -> Result<(), String> {
+fn submit_register(db: &crate::db::Db, v: &serde_json::Value) -> Result<(), String> {
     let user = v.get("user").and_then(|x| x.as_str()).unwrap_or("");
     if user.is_empty() {
         return Err("missing user".into());
     }
     let contact = opt_str(v, "contact");
-    let instance_id = v.get("instance_id").and_then(|x| x.as_str()).unwrap_or("");
+    let instance_id = v.get("instance_id").and_then(|x| x.as_str()).unwrap_or("").to_string();
     let agent = opt_str(v, "agent");
     let expires_sec = v.get("expires_sec").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
-    // NAT metadata (REQ-NAT-001): pushed by C-side registrar.c
     let received_ip    = opt_str(v, "received_ip");
     let received_port  = v.get("received_port").and_then(|x| x.as_i64());
     let nat_detected   = v.get("nat_detected").and_then(|x| x.as_i64());
     let public_contact = opt_str(v, "public_contact");
     let transport      = opt_str(v, "transport");
-    db.upsert_registration(
-        user,
-        contact.as_deref(),
+    db.submit_register(
+        user.to_string(),
+        contact,
         instance_id,
-        agent.as_deref(),
+        agent,
         expires_sec,
-        received_ip.as_deref(),
+        received_ip,
         received_port,
         nat_detected,
-        public_contact.as_deref(),
-        transport.as_deref(),
-    ).await.map_err(|e| e.to_string())
+        public_contact,
+        transport,
+    );
+    Ok(())
 }
 
-async fn insert_runtime(db: &crate::db::Db, v: &serde_json::Value) -> Result<(), String> {
+fn submit_runtime(db: &crate::db::Db, v: &serde_json::Value) -> Result<(), String> {
     let call_id = v.get("call_id").and_then(|x| x.as_str()).unwrap_or("");
     let state_name = v.get("state").and_then(|x| x.as_str()).unwrap_or("");
     if call_id.is_empty() || state_name.is_empty() {
         return Err("missing call_id/state".into());
     }
     let detail = opt_str(v, "detail");
-    db.insert_runtime_state(call_id, state_name, detail.as_deref())
-        .await
-        .map_err(|e| e.to_string())
+    db.submit_runtime(call_id.to_string(), state_name.to_string(), detail);
+    Ok(())
 }
 
+fn submit_session(db: &crate::db::Db, v: &serde_json::Value) -> Result<(), String> {
+    let call_id = v.get("call_id").and_then(|x| x.as_str()).unwrap_or("");
+    if call_id.is_empty() {
+        return Err("missing call_id".into());
+    }
+    let event = opt_str(v, "event").unwrap_or_default();
+    let state = opt_str(v, "state").unwrap_or_default();
+    let from  = opt_str(v, "from").unwrap_or_default();
+    let to    = opt_str(v, "to").unwrap_or_default();
+    let cause = v.get("cause").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+    let dir   = opt_str(v, "dir").unwrap_or_else(|| "inbound".to_string());
+    let from_ip   = opt_str(v, "from_ip").unwrap_or_default();
+    let codec_a   = opt_str(v, "codec_a").unwrap_or_default();
+    let codec_b   = opt_str(v, "codec_b").unwrap_or_default();
+    let a_peer_ip = opt_str(v, "a_peer_ip").unwrap_or_default();
+    let b_peer_ip = opt_str(v, "b_peer_ip").unwrap_or_default();
+    db.submit_session(
+        call_id.to_string(), from, to, dir, state, event, cause,
+        from_ip, codec_a, codec_b, a_peer_ip, b_peer_ip,
+    );
+    Ok(())
+}
+
+/// insert_audit — 保持同步 await（低频，不走 batch）。
 async fn insert_audit(db: &crate::db::Db, v: &serde_json::Value) -> Result<(), String> {
     let event = v.get("event").and_then(|x| x.as_str()).unwrap_or("");
     if event.is_empty() {
@@ -455,44 +468,6 @@ async fn insert_audit(db: &crate::db::Db, v: &serde_json::Value) -> Result<(), S
     let status = opt_str(v, "status");
     let detail = opt_str(v, "detail");
     db.insert_audit_event(event, actor.as_deref(), ip.as_deref(), target.as_deref(), status.as_deref(), detail.as_deref())
-        .await
-        .map_err(|e| e.to_string())
-}
-
-/// session.write: SESSION events pushed by C-side data.sock → UPSERT into calls table.
-/// payload fields: call_id (required) / event / state / from / to / cause / dir
-///
-/// Empty-string protection (REQUIRE-DATA-001): some C-side events (record_start/stop,
-/// dtmf, early originate path) have payload missing state/event/dir fields. Passing
-/// empty strings directly into upsert_call would hard-overwrite existing state/event
-/// in the calls table with empty values (from/to already have empty-string protection,
-/// state/event did not). Uniformly here: empty-string fields → don't update, keep
-/// existing calls table values. dir default inbound is still retained (originate path
-/// payload always explicitly sends "outbound"; inbound always explicitly sends "inbound";
-/// default value is only a fallback).
-async fn dispatch_session_push(db: &crate::db::Db, v: &serde_json::Value) -> Result<(), String> {
-    let call_id = v.get("call_id").and_then(|x| x.as_str()).unwrap_or("");
-    if call_id.is_empty() {
-        return Err("missing call_id".into());
-    }
-    // Empty string → special sentinel "''" (matched in SQL CASE for empty string),
-    // non-empty → original value
-    let event = opt_str(v, "event").unwrap_or_default();
-    let state = opt_str(v, "state").unwrap_or_default();
-    let from  = opt_str(v, "from").unwrap_or_default();
-    let to    = opt_str(v, "to").unwrap_or_default();
-    let cause = v.get("cause").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
-    let dir   = opt_str(v, "dir").unwrap_or_else(|| "inbound".to_string());
-    // REQ-CDR-002 extension fields: from_ip / codec_a / codec_b / a_peer_ip / b_peer_ip
-    // C-side CDR END chain (signaling.c + cdr_event_to_json) fills completely; early
-    // START/ANSWER events may be empty → SQL CASE WHEN keeps existing values.
-    let from_ip   = opt_str(v, "from_ip").unwrap_or_default();
-    let codec_a   = opt_str(v, "codec_a").unwrap_or_default();
-    let codec_b   = opt_str(v, "codec_b").unwrap_or_default();
-    let a_peer_ip = opt_str(v, "a_peer_ip").unwrap_or_default();
-    let b_peer_ip = opt_str(v, "b_peer_ip").unwrap_or_default();
-    db.upsert_call(call_id, &from, &to, &dir, &state, &event, cause,
-                   &from_ip, &codec_a, &codec_b, &a_peer_ip, &b_peer_ip)
         .await
         .map_err(|e| e.to_string())
 }
