@@ -80,7 +80,8 @@ static int g_end_hook_n = 0;
 static pthread_mutex_t g_end_hook_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* SDP hook 多槽链：offer + answer 分开两张表 */
-static struct { b2b_sdp_hook_fn fn; void *ud; } g_sdp_hooks[2][B2B_SDP_HOOK_MAX];
+typedef struct { b2b_sdp_hook_fn fn; void *ud; } b2b_sdp_hook_slot_t;
+static b2b_sdp_hook_slot_t g_sdp_hooks[2][B2B_SDP_HOOK_MAX];
 static int g_sdp_hook_n[2] = {0, 0};
 static pthread_mutex_t g_sdp_hook_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -2327,23 +2328,35 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                     call_unlock(c);
                     return;
                 }
-                /* answer_hook 多槽链：各模块依次改写 */
+                /* answer_hook 多槽链：各模块依次改写
+                 * ★ DEADLOCK-FIX (2026-11-02): 锁只保护回调数组快照，释放锁后再调。
+                 *   原因：bridge_offer_hook → rtp_relay_arm → reactor_call 内部有
+                 *   pthread_cond_wait（跨线程转任务并等待）。如果 g_sdp_hook_lock
+                 *   跨这个 cond_wait 持有，reactor_call 的目标 reactor 线程恰好
+                 *   也在 handle_new_invite 里等同一锁 → ABBA 死锁（3 线程全部
+                 *   futex_wait 在 g_sdp_hook_lock，holder Thread 33 卡在 cond_wait）。
+                 *   hook 回调指针在 init 时注册一次、shutdown 时 rm，运行期稳定，
+                 *   快照语义完全安全。 */
                 if (m->body.len && g_sdp_hook_n[B2B_SDP_ANSWER] > 0) {
                     char buf[B2B_SDP_MAX]; buf[0] = '\0';
+                    b2b_sdp_hook_slot_t hsnap[B2B_SDP_HOOK_MAX];
+                    int hn;
                     pthread_mutex_lock(&g_sdp_hook_lock);
-                    for (int i = 0; i < g_sdp_hook_n[B2B_SDP_ANSWER]; ++i) {
+                    hn = g_sdp_hook_n[B2B_SDP_ANSWER];
+                    if (hn > B2B_SDP_HOOK_MAX) hn = B2B_SDP_HOOK_MAX;
+                    for (int i = 0; i < hn; ++i) hsnap[i] = g_sdp_hooks[B2B_SDP_ANSWER][i];
+                    pthread_mutex_unlock(&g_sdp_hook_lock);
+                    for (int i = 0; i < hn; ++i) {
                         char tbuf[B2B_SDP_MAX]; tbuf[0] = '\0';
                         const char *in = buf[0] ? buf : m->body.p;
                         size_t inlen = buf[0] ? strlen(buf) : m->body.len;
-                        int n = g_sdp_hooks[B2B_SDP_ANSWER][i].fn(c, in, inlen, tbuf,
-                                                                   sizeof(tbuf),
-                                                                   g_sdp_hooks[B2B_SDP_ANSWER][i].ud);
+                        int n = hsnap[i].fn(c, in, inlen, tbuf,
+                                            sizeof(tbuf), hsnap[i].ud);
                         if (n >= 0) {
                             memcpy(buf, tbuf, (size_t)n);
                             buf[n] = '\0';
                         }
                     }
-                    pthread_mutex_unlock(&g_sdp_hook_lock);
                     if (buf[0]) { ab = buf; abl = strlen(buf); }
                 }
                 if (abl) {
@@ -4233,22 +4246,28 @@ void handle_new_invite(b2b_core_t *co, sip_txn_t *t,
     const char *out_sdp = a->offer;
     size_t out_sdp_len = a->offer_len;
     char rewritten[B2B_SDP_MAX]; rewritten[0] = '\0';
-    /* offer_hook 多槽链：各模块（media_bridge/security/...）依次改写 */
+    /* offer_hook 多槽链：各模块（media_bridge/security/...）依次改写
+     * ★ DEADLOCK-FIX (2026-11-02): 锁只保护回调数组快照，释放锁后再调。
+     *   根因：g_sdp_hook_lock 跨 bridge_offer_hook → reactor_call(cond_wait)
+     *   持有，目标 reactor 线程也在等同一锁 → ABBA 死锁。详见 answer_hook。 */
     if (a->offer_len && g_sdp_hook_n[B2B_SDP_OFFER] > 0) {
+        b2b_sdp_hook_slot_t hsnap[B2B_SDP_HOOK_MAX];
+        int hn;
         pthread_mutex_lock(&g_sdp_hook_lock);
-        for (int i = 0; i < g_sdp_hook_n[B2B_SDP_OFFER]; ++i) {
+        hn = g_sdp_hook_n[B2B_SDP_OFFER];
+        if (hn > B2B_SDP_HOOK_MAX) hn = B2B_SDP_HOOK_MAX;
+        for (int i = 0; i < hn; ++i) hsnap[i] = g_sdp_hooks[B2B_SDP_OFFER][i];
+        pthread_mutex_unlock(&g_sdp_hook_lock);
+        for (int i = 0; i < hn; ++i) {
             char buf[B2B_SDP_MAX]; buf[0] = '\0';
             const char *in = (rewritten[0] ? rewritten : a->offer);
             size_t inlen = rewritten[0] ? strlen(rewritten) : a->offer_len;
-            int n = g_sdp_hooks[B2B_SDP_OFFER][i].fn(c, in, inlen, buf,
-                                                     sizeof(buf),
-                                                     g_sdp_hooks[B2B_SDP_OFFER][i].ud);
+            int n = hsnap[i].fn(c, in, inlen, buf, sizeof(buf), hsnap[i].ud);
             if (n >= 0) {
                 memcpy(rewritten, buf, (size_t)n);
                 rewritten[n] = '\0';
             }
         }
-        pthread_mutex_unlock(&g_sdp_hook_lock);
         if (rewritten[0]) {
             out_sdp = rewritten;
             out_sdp_len = strlen(rewritten);
@@ -6235,22 +6254,28 @@ int b2b_originate(b2b_core_t *co, const b2b_orig_t *o, b2b_call_t **out)
             size_t out_sdp_len = b->offer_len;
             char rewritten[B2B_SDP_MAX]; rewritten[0] = '\0';
 
-            /* offer_hook 多槽链（bridge_offer_hook 等） */
+            /* offer_hook 多槽链（bridge_offer_hook 等）
+             * ★ DEADLOCK-FIX (2026-11-02): 锁只保护回调数组快照，释放锁后再调。
+             *   根因同 handle_new_invite 和 b2b_server_tu 的两处：g_sdp_hook_lock
+             *   跨 reactor_call(cond_wait) 持有 → ABBA 死锁。详见 answer_hook。 */
             if (b->offer_len && g_sdp_hook_n[B2B_SDP_OFFER] > 0) {
+                b2b_sdp_hook_slot_t hsnap[B2B_SDP_HOOK_MAX];
+                int hn;
                 pthread_mutex_lock(&g_sdp_hook_lock);
-                for (int i = 0; i < g_sdp_hook_n[B2B_SDP_OFFER]; ++i) {
+                hn = g_sdp_hook_n[B2B_SDP_OFFER];
+                if (hn > B2B_SDP_HOOK_MAX) hn = B2B_SDP_HOOK_MAX;
+                for (int i = 0; i < hn; ++i) hsnap[i] = g_sdp_hooks[B2B_SDP_OFFER][i];
+                pthread_mutex_unlock(&g_sdp_hook_lock);
+                for (int i = 0; i < hn; ++i) {
                     char buf[B2B_SDP_MAX]; buf[0] = '\0';
                     const char *in = (rewritten[0] ? rewritten : b->offer);
                     size_t inlen = rewritten[0] ? strlen(rewritten) : b->offer_len;
-                    int n = g_sdp_hooks[B2B_SDP_OFFER][i].fn(c, in, inlen, buf,
-                                                             sizeof(buf),
-                                                             g_sdp_hooks[B2B_SDP_OFFER][i].ud);
+                    int n = hsnap[i].fn(c, in, inlen, buf, sizeof(buf), hsnap[i].ud);
                     if (n >= 0) {
                         memcpy(rewritten, buf, (size_t)n);
                         rewritten[n] = '\0';
                     }
                 }
-                pthread_mutex_unlock(&g_sdp_hook_lock);
                 if (rewritten[0]) {
                     out_sdp = rewritten;
                     out_sdp_len = strlen(rewritten);
