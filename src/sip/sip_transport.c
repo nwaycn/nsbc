@@ -8,6 +8,7 @@
 #include "tcp_framer.h"
 #include "tls_io.h"
 #include "log.h"
+#include "nsbc_atomic.h"  /* sat_add / sat_sub — tr_conn_t refcount */
 #include "obs_sub.h"       /* obs_sub_publish_log — siptrace 同时推送给 UDS 订阅者 */
 #include "sip_profile.h"   /* sip_profile_at / sip_profile_count */
 #include "ws_listener.h"
@@ -175,6 +176,8 @@ udp_cl_rc_t sip_udp_cl_check(const char *buf, size_t len, size_t max_msg)
 typedef struct tr_conn {
     int fd;
     int in_use;
+    int dead;                  /* 置 1 = conn_close 已执行独占清理，禁止新路径访问 */
+    nsbc_atomic_t refcount;    /* 引用计数；free(c) 延迟到 refcount==0 */
     int is_tls;
     tls_conn_t *tls;
     int tls_ok;
@@ -265,19 +268,50 @@ static int conn_idx(sip_transport_t *t, int fd)
     return (c && c->in_use) ? fd : -1;
 }
 
+/* ------------------------------------------------------------------ */
+/* conn 生命周期管理 —— dead 标记 + refcount 延迟释放                    */
+/*                                                                      */
+/* conn_close() 在 home_reactor 线程被调用（EPOLLHUP / recv=0 /         */
+/* feed_framer FRAME_OVERFLOW/PROTO），它执行独占清理：                  */
+/*   dead=1 → conns[]=NULL → reactor_del → 摘 idx → close(fd)          */
+/* 然后把 refcount 从 1 减到 0（若无并发持有者则立即 free）。           */
+/*                                                                      */
+/* 跨 reactor 的使用者（如 sip_tr_send TCP 路径）必须：                 */
+/*   idx.lock 内 sat_add(c->refcount, 1) → 解锁 → 用完 → conn_release */
+/* 确保 conn_close 的独占清理不会 free 还在被用的指针。                 */
+/* ------------------------------------------------------------------ */
+
+/** 释放一个 conn 引用 —— refcount--，归零时 free 所有资源 */
+static void conn_release(tr_conn_t *c)
+{
+    if (!c) return;
+    if (sat_sub(c->refcount, 1) == 0) {
+        free(c->sbuf);
+        pthread_mutex_destroy(&c->sbuf_lock);
+        free(c);
+    }
+}
+
 static void conn_close(sip_transport_t *t, int fd)
 {
     /* P3: conn_lock 保护 conns[]/conns_n —— conn_accept(reactor[0]) 与
-     * conn_close(c->home_reactor 可能 != reactor[0]) 多 reactor 并发访问。 */
+     * conn_close(c->home_reactor 可能 != reactor[0]) 多 reactor 并发访问。
+     * 立即把 conns[i] = NULL —— 防止并发 on_conn_event 通过 conn_idx 再看到 */
     pthread_mutex_lock(&t->conn_lock);
     int i = conn_idx(t, fd);
     if (i < 0) { pthread_mutex_unlock(&t->conn_lock); return; }
     tr_conn_t *c = t->conns[i];
+    t->conns[i] = NULL;
+    --t->conns_n;
     pthread_mutex_unlock(&t->conn_lock);
+
+    /* dead=1 先置 —— 任何跨 reactor 路径（sip_tr_send 查 idx 时）能看到，
+     * 不再把这个 conn 当作有效目标 */
+    c->dead = 1;
 
     /* reactor_del 必须在 conn_lock 外——reactor 回调里可能再调 conn_close → 死锁 */
     reactor_del(c->home_reactor, fd);
-    /* ---- 从 (proto, peer) 哈希表摘除 ---- */
+    /* ---- 从 (proto, peer) 哈希表摘除 —— 阻止后续 sip_tr_send 查到 ---- */
     if (t->idx.slots) {
         pthread_mutex_lock(&t->idx.lock);
         uint64_t h = conn_key_hash(c->is_tls, &c->peer);
@@ -298,8 +332,6 @@ static void conn_close(sip_transport_t *t, int fd)
         tls_conn_free(c->tls);
 #endif
     close(fd);
-    free(c->sbuf);             /* 发送缓冲（可能还有残留数据，对端已断，直接丢） */
-    pthread_mutex_destroy(&c->sbuf_lock);
     c->in_use = 0;
     /* per-IP 计数减一（必须在 free(c) 之前，否则 use-after-free） */
     {
@@ -319,13 +351,8 @@ static void conn_close(sip_transport_t *t, int fd)
             t->ip_conn_count[bucket]--;
         pthread_mutex_unlock(&t->ip_conn_lock);
     }
-    free(c);
-
-    /* 最后清理 conns 数组——需要 conn_lock */
-    pthread_mutex_lock(&t->conn_lock);
-    t->conns[i] = NULL;
-    --t->conns_n;
-    pthread_mutex_unlock(&t->conn_lock);
+    /* 释放初始 refcount=1；如无人并发持有 → 立即 free */
+    conn_release(c);
 }
 
 /* ------------------------------------------------------------------ */
@@ -343,7 +370,9 @@ static int sip_tcp_enqueue(sip_transport_t *t, tr_conn_t *c,
                            const uint8_t *data, size_t len)
 {
     (void)t;  /* 回调签名要求，实现只操作 conn */
-    if (!c || !c->in_use || !data || len == 0) return -1;
+    /* dead=1 表示 conn_close 已执行独占清理（close fd / 清 sbuf 等），
+     * 跨 reactor 路径持有的 conn 引用可能已经被清理，必须拒绝入队 */
+    if (!c || c->dead || !data || len == 0) return -1;
 
     pthread_mutex_lock(&c->sbuf_lock);
     size_t used = c->sbuf_tail - c->sbuf_head;
@@ -668,6 +697,8 @@ static tr_conn_t *conn_accept(sip_transport_t *t, int lfd, int is_tls)
     }
     c->fd = fd;
     c->in_use = 1;
+    c->dead = 0;
+    c->refcount = 1;          /* idx 表 + reactor 回调各持一份 — 接受即 1 */
     c->is_tls = is_tls;
     c->peer = peer;
     /* P3: TCP/TLS 连接按 (proto, peer) hash 路由到 reactor。
@@ -1230,8 +1261,12 @@ int sip_tr_send(sip_transport_t *t, sip_tr_proto_t proto,
     uint64_t h = conn_key_hash(want_tls, dst);
     size_t bucket = h & (CONN_IDX_CAP - 1);
     for (tr_conn_t *c = t->idx.slots[bucket]; c; c = c->idx_next) {
-        if (c->in_use && (c->is_tls == want_tls) && nsbc_sa_eq(&c->peer, dst)) {
+        /* dead=1 的 conn 可能还没从 idx 表摘掉（conn_close 先 dead=1 再摘链），
+         * 必须跳过；同时 sat_add 持引用，保护解锁后 conn 不会被 free */
+        if (!c->dead && c->in_use &&
+            (c->is_tls == want_tls) && nsbc_sa_eq(&c->peer, dst)) {
             found = c;
+            sat_add(c->refcount, 1);  /* 持有跨 reactor 引用 */
             break;
         }
     }
@@ -1240,8 +1275,10 @@ int sip_tr_send(sip_transport_t *t, sip_tr_proto_t proto,
         return NSBC_NOTSUP;
     /* 入队发送 —— 解决 EAGAIN 部分写入时的字节流损坏炸弹。
      * sip_tcp_enqueue 返回 0 表示数据已安全落发送缓冲，
-     * 稍后 reactor EPOLLOUT 会驱动 flush。 */
+     * 稍后 reactor EPOLLOUT 会驱动 flush。
+     * conn_release 释放上面的引用；enqueue 内部还会再查 dead 做最后防线。 */
     int rc = sip_tcp_enqueue(t, found, (const uint8_t *)buf, len);
+    conn_release(found);
     if (rc < 0)
         return NSBC_ERR;
     return NSBC_OK;

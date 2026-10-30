@@ -362,8 +362,12 @@ static void parse_json_object(cJSON *obj, sip_profile_t *p)
     cJSON *j;
     if ((j = cJSON_GetObjectItemCaseSensitive(obj, "name")) && cJSON_IsString(j))
         snprintf(p->name, sizeof(p->name), "%s", j->valuestring);
-    if ((j = cJSON_GetObjectItemCaseSensitive(obj, "enabled")))
-        p->enabled = cJSON_IsTrue(j) ? 1 : 0;
+    if ((j = cJSON_GetObjectItemCaseSensitive(obj, "enabled"))) {
+        /* 兼容 JSON true/false 和 整数 1/0 */
+        if (cJSON_IsTrue(j))        p->enabled = 1;
+        else if (cJSON_IsFalse(j))  p->enabled = 0;
+        else if (cJSON_IsNumber(j)) p->enabled = j->valueint ? 1 : 0;
+    }
 
     /* SIP 监听 */
     if ((j = cJSON_GetObjectItemCaseSensitive(obj, "sip_ip")) && cJSON_IsString(j))
@@ -376,12 +380,21 @@ static void parse_json_object(cJSON *obj, sip_profile_t *p)
         p->sip_tcp_port = (uint16_t)j->valueint;
     if ((j = cJSON_GetObjectItemCaseSensitive(obj, "sip_tls_port")) && cJSON_IsNumber(j))
         p->sip_tls_port = (uint16_t)j->valueint;
-    if ((j = cJSON_GetObjectItemCaseSensitive(obj, "enable_udp")))
-        p->enable_udp = cJSON_IsTrue(j) ? 1 : 0;
-    if ((j = cJSON_GetObjectItemCaseSensitive(obj, "enable_tcp")))
-        p->enable_tcp = cJSON_IsTrue(j) ? 1 : 0;
-    if ((j = cJSON_GetObjectItemCaseSensitive(obj, "enable_tls")))
-        p->enable_tls = cJSON_IsTrue(j) ? 1 : 0;
+    if ((j = cJSON_GetObjectItemCaseSensitive(obj, "enable_udp"))) {
+        if (cJSON_IsTrue(j))        p->enable_udp = 1;
+        else if (cJSON_IsFalse(j))  p->enable_udp = 0;
+        else if (cJSON_IsNumber(j)) p->enable_udp = j->valueint ? 1 : 0;
+    }
+    if ((j = cJSON_GetObjectItemCaseSensitive(obj, "enable_tcp"))) {
+        if (cJSON_IsTrue(j))        p->enable_tcp = 1;
+        else if (cJSON_IsFalse(j))  p->enable_tcp = 0;
+        else if (cJSON_IsNumber(j)) p->enable_tcp = j->valueint ? 1 : 0;
+    }
+    if ((j = cJSON_GetObjectItemCaseSensitive(obj, "enable_tls"))) {
+        if (cJSON_IsTrue(j))        p->enable_tls = 1;
+        else if (cJSON_IsFalse(j))  p->enable_tls = 0;
+        else if (cJSON_IsNumber(j)) p->enable_tls = j->valueint ? 1 : 0;
+    }
 
     /* RTP */
     if ((j = cJSON_GetObjectItemCaseSensitive(obj, "rtp_ip")) && cJSON_IsString(j))
@@ -394,18 +407,36 @@ static void parse_json_object(cJSON *obj, sip_profile_t *p)
         p->rtp_port_end = (uint16_t)j->valueint;
 
     /* 协议特性 */
-    if ((j = cJSON_GetObjectItemCaseSensitive(obj, "enable_prack")))
-        p->enable_prack = cJSON_IsTrue(j) ? 1 : 0;
-    if ((j = cJSON_GetObjectItemCaseSensitive(obj, "enable_update")))
-        p->enable_update = cJSON_IsTrue(j) ? 1 : 0;
-    if ((j = cJSON_GetObjectItemCaseSensitive(obj, "enable_t140")))
-        p->enable_t140 = cJSON_IsTrue(j) ? 1 : 0;
-    if ((j = cJSON_GetObjectItemCaseSensitive(obj, "enable_precondition")))
-        p->enable_precondition = cJSON_IsTrue(j) ? 1 : 0;
-    if ((j = cJSON_GetObjectItemCaseSensitive(obj, "enable_timer")))
-        p->enable_timer = cJSON_IsTrue(j) ? 1 : 0;
-    if ((j = cJSON_GetObjectItemCaseSensitive(obj, "enable_gruu")))
-        p->enable_gruu = cJSON_IsTrue(j) ? 1 : 0;
+    if ((j = cJSON_GetObjectItemCaseSensitive(obj, "enable_prack"))) {
+        if (cJSON_IsTrue(j))        p->enable_prack = 1;
+        else if (cJSON_IsFalse(j))  p->enable_prack = 0;
+        else if (cJSON_IsNumber(j)) p->enable_prack = j->valueint ? 1 : 0;
+    }
+    if ((j = cJSON_GetObjectItemCaseSensitive(obj, "enable_update"))) {
+        if (cJSON_IsTrue(j))        p->enable_update = 1;
+        else if (cJSON_IsFalse(j))  p->enable_update = 0;
+        else if (cJSON_IsNumber(j)) p->enable_update = j->valueint ? 1 : 0;
+    }
+    if ((j = cJSON_GetObjectItemCaseSensitive(obj, "enable_t140"))) {
+        if (cJSON_IsTrue(j))        p->enable_t140 = 1;
+        else if (cJSON_IsFalse(j))  p->enable_t140 = 0;
+        else if (cJSON_IsNumber(j)) p->enable_t140 = j->valueint ? 1 : 0;
+    }
+    if ((j = cJSON_GetObjectItemCaseSensitive(obj, "enable_precondition"))) {
+        if (cJSON_IsTrue(j))        p->enable_precondition = 1;
+        else if (cJSON_IsFalse(j))  p->enable_precondition = 0;
+        else if (cJSON_IsNumber(j)) p->enable_precondition = j->valueint ? 1 : 0;
+    }
+    if ((j = cJSON_GetObjectItemCaseSensitive(obj, "enable_timer"))) {
+        if (cJSON_IsTrue(j))        p->enable_timer = 1;
+        else if (cJSON_IsFalse(j))  p->enable_timer = 0;
+        else if (cJSON_IsNumber(j)) p->enable_timer = j->valueint ? 1 : 0;
+    }
+    if ((j = cJSON_GetObjectItemCaseSensitive(obj, "enable_gruu"))) {
+        if (cJSON_IsTrue(j))        p->enable_gruu = 1;
+        else if (cJSON_IsFalse(j))  p->enable_gruu = 0;
+        else if (cJSON_IsNumber(j)) p->enable_gruu = j->valueint ? 1 : 0;
+    }
     if ((j = cJSON_GetObjectItemCaseSensitive(obj, "dtmf_mode")) && cJSON_IsString(j)) {
         if      (!strcmp(j->valuestring, "info"))    p->dtmf_mode = PROFILE_DTMF_INFO;
         else if (!strcmp(j->valuestring, "inband")) p->dtmf_mode = PROFILE_DTMF_INBAND;

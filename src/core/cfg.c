@@ -289,11 +289,11 @@ static int under_dir(const char *dir, const char *child)
 }
 
 static int parse_file(cfg_t *cfg, const char *path, int depth,
-                      visit_t *visited, int nvisited, cfg_node_t *root,
+                      visit_t **visited, int nvisited, cfg_node_t *root,
                       char *err_path);
 
 static int do_include(cfg_t *cfg, const char *inc, const char *parent,
-                      int depth, visit_t *visited, int nvisited,
+                      int depth, visit_t **visited, int nvisited,
                       cfg_node_t *root, char *err_path)
 {
     char child[PATH_MAX * 2 + 1];
@@ -320,7 +320,7 @@ static int do_include(cfg_t *cfg, const char *inc, const char *parent,
         return NSBC_PERM_DENIED;
     }
     for (int i = 0; i < nvisited; ++i)
-        if (visited[i].dev == st.st_dev && visited[i].ino == st.st_ino) {
+        if ((*visited)[i].dev == st.st_dev && (*visited)[i].ino == st.st_ino) {
             char sc[220];
             strncpy(sc, child, sizeof(sc) - 1); sc[sizeof(sc) - 1] = '\0';
             snprintf(err_path, 256, "include loop: %s", sc);
@@ -331,7 +331,7 @@ static int do_include(cfg_t *cfg, const char *inc, const char *parent,
 }
 
 static int parse_file(cfg_t *cfg, const char *path, int depth,
-                      visit_t *visited, int nvisited, cfg_node_t *root,
+                      visit_t **visited, int nvisited, cfg_node_t *root,
                       char *err_path)
 {
     if (depth > 3) {
@@ -341,12 +341,12 @@ static int parse_file(cfg_t *cfg, const char *path, int depth,
     struct stat st;
     if (stat(path, &st) != 0)
         return NSBC_NOENT;
-    visit_t *nv = realloc(visited, (size_t)(nvisited + 1) * sizeof(visit_t));
+    visit_t *nv = realloc(*visited, (size_t)(nvisited + 1) * sizeof(visit_t));
     if (!nv)
         return NSBC_NOMEM;
-    visited = nv;
-    visited[nvisited].dev = st.st_dev;
-    visited[nvisited].ino = st.st_ino;
+    *visited = nv;
+    (*visited)[nvisited].dev = st.st_dev;
+    (*visited)[nvisited].ino = st.st_ino;
 
     FILE *fp = fopen(path, "re");
     if (!fp)
@@ -546,7 +546,7 @@ int cfg_load_file(cfg_t *c, const char *path)
     char err[256] = {0};
     visit_t *visited = NULL;
     cfg_node_t *tmp = node_new(N_MAP, NULL);
-    int rc = parse_file(c, path, 0, visited, 0, tmp, err);
+    int rc = parse_file(c, path, 0, &visited, 0, tmp, err);
     free(visited);
     if (rc != NSBC_OK) {
         node_free(tmp);
@@ -853,7 +853,7 @@ int cfg_reload_file(cfg_t *c, const char *path, const char **bad_key)
     char err[256] = {0};
     cfg_node_t *tmp = node_new(N_MAP, NULL);
     visit_t *visited = NULL;
-    int rc = parse_file(c, path, 0, visited, 0, tmp, err);
+    int rc = parse_file(c, path, 0, &visited, 0, tmp, err);
     free(visited);
     if (rc != NSBC_OK) {
         node_free(tmp);
@@ -1585,7 +1585,7 @@ int cfg_migrate_file(cfg_t *c, const char *path, const char *from,
     }
     char err[256] = {0};
     visit_t *visited = NULL;
-    int prc = parse_file(c, path, 0, visited, 0, probe, err);
+    int prc = parse_file(c, path, 0, &visited, 0, probe, err);
     free(visited);
     node_free(probe);
     if (prc != NSBC_OK) {

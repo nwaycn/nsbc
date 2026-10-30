@@ -889,6 +889,28 @@ int gw_table_reload_json(const char *json, char *out_err, size_t err_sz)
 
 /* nsbcm_dialplan 定义在 src/mod/dialplans/dialplan.c，本文件不重复定义 */
 
+/* ---- fini 清理：drain reload 链留下的两代 route_table / dp_table ----
+ *
+ * reload 用"两代保留"（g_rt_old[2] / g_dp_old[2]）：当前代换表后上一代存
+ * g_rt_old[idx]，等下次 reload 才 destroy 上上代。进程退出时如果只 reload
+ * 过 0-1 次，g_rt_old[] 里还有活着的表没人 destroy → LSan 泄漏 22MB。
+ * main.c fini 在 modmgr_fini_all 之后调本函数，统一 drain 所有残留。 */
+void stub_mods_reload_fini(void)
+{
+    pthread_mutex_lock(&g_reload_lock);
+    for (int i = 0; i < 2; ++i) {
+        if (g_rt_old[i]) {
+            rt_destroy(g_rt_old[i]);
+            g_rt_old[i] = NULL;
+        }
+        if (g_dp_old[i]) {
+            dp_table_free(g_dp_old[i]);
+            g_dp_old[i] = NULL;
+        }
+    }
+    pthread_mutex_unlock(&g_reload_lock);
+}
+
 /*
     Author:       李浩 (Li Hao)
     Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)

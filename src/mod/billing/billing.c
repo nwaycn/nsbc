@@ -166,14 +166,18 @@ static void billing_fini(struct nsbc_ctx *ctx)
         cdr_wal_destroy(g_wal);
         g_wal = NULL;
     }
-    if (g_billing != NULL) {
-        bill_destroy(g_billing);
-        g_billing = NULL;
+    /* ctx->billing 是最终真相来源 —— rate.reload 会把它 RCU 替换成新对象，
+     * 同时 bill_destroy 旧对象（即最初的 g_billing），但 g_billing 不会同步置空。
+     * 因此 fini 必须以 ctx->billing 为准 destroy，然后置 g_billing = NULL 清悬挂指针。
+     * 如果从未 reload，ctx->billing == g_billing 是同一对象，只 destroy 一次。 */
+    if (ctx != NULL && ctx->billing != NULL) {
+        bill_destroy(ctx->billing);
+        ctx->billing = NULL;
     }
+    g_billing = NULL;  /* 清悬挂指针；不 destroy（已由 ctx->billing 覆盖） */
     if (ctx != NULL) {
         ctx->cdr_emit = NULL;
         ctx->cdr_ud = NULL;
-        ctx->billing = NULL;
     }
 }
 

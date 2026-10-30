@@ -2,6 +2,7 @@
 #include "mem.h"
 
 #include <sys/mman.h>
+#include <pthread.h>
 
 #define MEM_ALIGN 16u
 #define MEM_PAGE 4096u
@@ -33,6 +34,7 @@ struct mem_arena {
     size_t bytes;
     mem_blk_t *fl_head;
     mem_stats_t st;
+    pthread_mutex_t lock;  /* free list 互斥：多 reactor 线程并发 alloc/free 时保护 fl_head + st */
 };
 
 const char *mem_domain_name(mem_domain_t d)
@@ -105,6 +107,7 @@ nsbc_rc_t mem_arena_create(const mem_arena_cfg_t *cfg, mem_arena_t **out)
     if (!a)
         return NSBC_NOMEM;
     a->cfg = *cfg;
+    pthread_mutex_init(&a->lock, NULL);
 
     size_t want = cfg->bytes ? cfg->bytes : MEM_DEFAULT_BYTES;
     a->bytes = align_up(want, MEM_PAGE);
@@ -146,7 +149,9 @@ void mem_arena_destroy(mem_arena_t *a)
 {
     if (!a)
         return;
-    munmap(a->base, a->bytes);
+    if (a->base)
+        munmap(a->base, a->bytes);
+    pthread_mutex_destroy(&a->lock);
     free(a);
 }
 
@@ -155,16 +160,28 @@ void *mem_arena_alloc(mem_arena_t *a, size_t n)
     if (!a || n == 0)
         return NULL;
 
+    pthread_mutex_lock(&a->lock);
+
     size_t need = align_up(n, MEM_ALIGN);
 
     /* first-fit 空闲块 */
     mem_blk_t *b = a->fl_head;
-    while (b && b->psize < need)
+    while (b && b->psize < need) {
+        /* Always-on sanity check：free list 被并发写坏 → magic 变 0 或乱码，
+         * 不等到 segfault 才 crash。 */
+        if (b->magic != MEM_HDR_MAGIC ||
+            (uint8_t *)b < a->base ||
+            (uint8_t *)b >= a->base + a->bytes) {
+            break;
+        }
         b = b->free_next;
+    }
 
-    if (!b) {
+    if (!b || b->magic != MEM_HDR_MAGIC ||
+        (uint8_t *)b < a->base || (uint8_t *)b >= a->base + a->bytes) {
         a->st.nfail++;
-        return NULL; /* 耗尽：调用方按 7.1.2 降级，不越域抢占 */
+        pthread_mutex_unlock(&a->lock);
+        return NULL; /* 耗尽或链表损坏 */
     }
     fl_unlink(a, b);
 
@@ -174,18 +191,25 @@ void *mem_arena_alloc(mem_arena_t *a, size_t n)
     if (b->psize - need >= MEM_HDR_SIZE + (size_t)g + MEM_ALIGN) {
         uint32_t rem = (uint32_t)(b->psize - need - MEM_HDR_SIZE - (size_t)g);
         mem_blk_t *r = (mem_blk_t *)(payload_of(b) + need + g);
-        r->magic = MEM_HDR_MAGIC;
-        r->psize = rem;
-        r->used = 0;
-        r->p_phys = b;
-        r->n_phys = b->n_phys;
-        if (b->n_phys)
-            b->n_phys->p_phys = r;
-        b->n_phys = r;
-        r->free_next = NULL;
-        guard_fill(a, r);
-        fl_push(a, r);
-        b->psize = (uint32_t)need;
+        /* sanity：新块必须完全在 arena 范围内 */
+        uint8_t *r_end = (uint8_t *)r + MEM_HDR_SIZE + (size_t)g + rem;
+        if (r_end > a->base + a->bytes) {
+            /* 不应发生 —— 防御性：放弃切分，整块交出 */
+            b->psize = (uint32_t)need;
+        } else {
+            r->magic = MEM_HDR_MAGIC;
+            r->psize = rem;
+            r->used = 0;
+            r->p_phys = b;
+            r->n_phys = b->n_phys;
+            if (b->n_phys)
+                b->n_phys->p_phys = r;
+            b->n_phys = r;
+            r->free_next = NULL;
+            guard_fill(a, r);
+            fl_push(a, r);
+            b->psize = (uint32_t)need;
+        }
     }
 
     b->used = 1;
@@ -195,6 +219,8 @@ void *mem_arena_alloc(mem_arena_t *a, size_t n)
     if (a->st.used_bytes > a->st.peak_bytes)
         a->st.peak_bytes = a->st.used_bytes;
     a->st.nalloc++;
+
+    pthread_mutex_unlock(&a->lock);
     return payload_of(b);
 }
 
@@ -203,18 +229,23 @@ void mem_arena_free(mem_arena_t *a, void *p)
     if (!a || !p)
         return;
 
+    pthread_mutex_lock(&a->lock);
+
     mem_blk_t *b = (mem_blk_t *)((uint8_t *)p - MEM_HDR_SIZE);
     if (b->magic != MEM_HDR_MAGIC || (uint8_t *)b < a->base ||
         (uint8_t *)b >= a->base + a->bytes) {
         a->st.nbadfree++;
+        pthread_mutex_unlock(&a->lock);
         return;
     }
     if (!b->used) { /* 双重释放 */
         a->st.nbadfree++;
+        pthread_mutex_unlock(&a->lock);
         return;
     }
     if (!guard_ok(a, b)) { /* canary 越界写：不回收，避免破坏空闲链 */
         a->st.nbadfree++;
+        pthread_mutex_unlock(&a->lock);
         return;
     }
 
@@ -226,7 +257,9 @@ void mem_arena_free(mem_arena_t *a, void *p)
 
     /* 向后合并（物理后继空闲） */
     mem_blk_t *n = b->n_phys;
-    if (n && !n->used) {
+    if (n && !n->used &&
+        n->magic == MEM_HDR_MAGIC &&
+        (uint8_t *)n >= a->base && (uint8_t *)n < a->base + a->bytes) {
         fl_unlink(a, n);
         b->psize += (uint32_t)(MEM_HDR_SIZE + (size_t)g + n->psize);
         b->n_phys = n->n_phys;
@@ -236,7 +269,9 @@ void mem_arena_free(mem_arena_t *a, void *p)
 
     /* 向前合并（物理前驱空闲） */
     mem_blk_t *pr = b->p_phys;
-    if (pr && !pr->used) {
+    if (pr && !pr->used &&
+        pr->magic == MEM_HDR_MAGIC &&
+        (uint8_t *)pr >= a->base && (uint8_t *)pr < a->base + a->bytes) {
         fl_unlink(a, pr);
         pr->psize += (uint32_t)(MEM_HDR_SIZE + (size_t)g + b->psize);
         pr->n_phys = b->n_phys;
@@ -247,6 +282,8 @@ void mem_arena_free(mem_arena_t *a, void *p)
 
     guard_fill(a, b);
     fl_push(a, b);
+
+    pthread_mutex_unlock(&a->lock);
 }
 
 int mem_arena_check(const mem_arena_t *a)

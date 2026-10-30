@@ -1236,7 +1236,11 @@ void outreg_fini(nsbc_ctx_t *ctx)
     g_ctx = NULL;
     g_tr  = NULL;
     if (g_self_rt) {
-        rt_destroy(g_self_rt);
+        /* route_table 所有权已提升到 main.c —— 统一在 modmgr_fini_all 之后
+         * destroy ctx->rt + drain stub_mods.c 的 g_rt_old[] 两代残留。
+         * outreg 只负责自举创建（当 ctx->rt 为 NULL 时），从不主动 destroy。
+         * reload 时 stub_mods.c 会把旧表存入 g_rt_old[] 两代保留，下下次
+         * reload 才 destroy；若进程退出时还没触发，main.c fini 统一 drain。 */
         g_self_rt = NULL;
     }
     pthread_mutex_unlock(&g_lock);

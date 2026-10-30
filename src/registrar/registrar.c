@@ -398,6 +398,7 @@ void reg_core_destroy(reg_core_t *r)
 {
     if (!r)
         return;
+    digest_free(&r->dig);
     for (int i = 0; i < TB_IP_N; ++i)
         pthread_mutex_destroy(&r->ip[i].lock);
     for (int i = 0; i < TB_AOR_N; ++i)

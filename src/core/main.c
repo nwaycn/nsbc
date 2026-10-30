@@ -21,6 +21,7 @@
 #include "event_bus.h"        /* Phase 2 event_bus: drain 线程启停 */
 #include "security.h"       /* REQ-EXT-API-005: security_set_yaml_path */
 #include "srtp_session.h"
+#include "route_table.h"     /* route_table 统一销毁 */
 
 #include <errno.h>
 #include <getopt.h>
@@ -873,6 +874,15 @@ int main(int argc, char **argv)
     event_bus_stop_drain_thread();
 
     modmgr_fini_all(mm, &ctx);
+    /* route_table 所有权统一在 main.c：destroy 当前代 ctx.rt + drain reload 链残留 */
+    if (ctx.rt) {
+        rt_destroy(ctx.rt);
+        ctx.rt = NULL;
+    }
+    {
+        extern void stub_mods_reload_fini(void);
+        stub_mods_reload_fini();
+    }
     nsbc_srtp_global_shutdown();
     ticker_stop(&tick);
     tw_fini(ctx.tw);
@@ -898,6 +908,15 @@ shutdown_failed:
     log_audit("system", "boot-failed", "rc=%d", rc);
     modmgr_stop_all(mm, &ctx); /* 已 STARTED 的模块先摘流量 */
     modmgr_fini_all(mm, &ctx);
+    /* route_table 所有权统一在 main.c：destroy 当前代 ctx.rt + drain reload 链残留 */
+    if (ctx.rt) {
+        rt_destroy(ctx.rt);
+        ctx.rt = NULL;
+    }
+    {
+        extern void stub_mods_reload_fini(void);
+        stub_mods_reload_fini();
+    }
     nsbc_srtp_global_shutdown();
     ticker_stop(&tick);
     tw_fini(ctx.tw);

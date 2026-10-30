@@ -43,7 +43,7 @@ extern int queue_table_reload_json(const char *json, char *out_err, size_t err_s
 
 /* ---- 通用 reload handler（5 个命令共享） ---- */
 
-#define RELOAD_JSON_MAX (256 * 1024)  /* 单表最大 JSON：256KB 足够 1000 条 */
+#define RELOAD_JSON_MAX (32 * 1024 * 1024)  /* 32MB — 支持 90000+ extensions 全量 reload */
 
 static int cmd_reload_generic(
     cmd_ctx_t *c,

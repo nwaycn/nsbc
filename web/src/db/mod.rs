@@ -2821,13 +2821,13 @@ sqlx::query(acct_ddl).execute(pool).await?;
         }
     }
 
-    // Default extensions seed: 1000-1019, uniform password 876876, realm=nsbc.local
+    // Default extensions seed: 10000-99999, uniform password 876876, realm=nsbc.local
     // HA1 = md5(extension:realm:password), used for SIP Digest auth
     let default_realm = "nsbc.local";
     let default_pass  = "876876";
-    for n in 1000..1020u32 {
+    for n in 10000..100000u32 {
         let ext = format!("{n}");
-        let clip = format!("2{:03}", n % 1000);
+        let clip = format!("{n}");
         let password = default_pass;
         let ha1  = ha1_of(&ext, default_realm, default_pass);
         let ha1b = ha1.clone();
@@ -2855,8 +2855,8 @@ sqlx::query(acct_ddl).execute(pool).await?;
     //
     // Rule design:
     // 1. Internal extension-to-extension (prio=10, highest priority)
-    //    layer=ext, match=^1[01]\d{2}$  -> directly route to extension `${1}`
-    //    matches 1000-1099 / 1100-1199 (room for future expansion to thousands)
+    //    layer=ext, match=^\d{5}$  -> directly route to extension `${1}`
+    //    matches 5-digit extensions (10000-99999)
     //    ⚠️ External profile does not accept REGISTER (silent drop), so no separate ext-layer rule needed.
     // 2. Default outbound placeholder (prio=99)
     //    layer=out, match=^\d{5,}$      -> send to default gateway (configure gateway later to enable)
@@ -2864,7 +2864,7 @@ sqlx::query(acct_ddl).execute(pool).await?;
     // run_migrations already knows the backend (postgresql/mysql/sqlite), match directly
     let rules: &[(&str, &str, &str, i64, i64, &str, &str, i64, &str)] = &[
         // name, layer, match_expr, prio, strip, target, action_json, enabled, description
-        ("Internal extension-to-extension",  "ext",  "^1[01]\\d{2}$", 10, 0, "${1}", "{}", 1, "Internal profile: 1000-1199 extensions call each other directly"),
+        ("Internal extension-to-extension",  "ext",  "^\\d{5}$",      10, 0, "${1}", "{}", 1, "Internal profile: 10000-99999 extensions call each other directly"),
         ("Default outbound placeholder",     "out",  "^\\d{5,}$",     99, 0, "gateway:default", "{}", 0, "Match 5+ digit called numbers; disabled by default, enable after gateway is configured"),
     ];
     for (name, layer, mx, prio, strip, target, action, en, desc) in rules {
