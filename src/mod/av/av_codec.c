@@ -141,8 +141,12 @@ static int av_codec_open(struct codec_sess *sess, int is_decoder)
         ctx->sample_fmt  = AV_SAMPLE_FMT_S16;
         ctx->sample_rate = (sess->id == CODEC_OPUS) ? 48000 :
                            (sess->id == CODEC_G722) ? 16000 : 8000;
-        /* FFmpeg 6.x: ctx->channels removed, use ch_layout */
+#if LIBAVCODEC_VERSION_MAJOR >= 59
+        /* FFmpeg 5.1+: channels → ch_layout */
         av_channel_layout_default(&ctx->ch_layout, 1);
+#else
+        ctx->channels = 1;
+#endif
     }
 
     /* 打开 codec */
@@ -165,8 +169,14 @@ static int av_codec_open(struct codec_sess *sess, int is_decoder)
 
         if (ctx->sample_fmt != target_fmt ||
             ctx->sample_rate != target_rate ||
+#ifdef LIBSWRESAMPLE_VERSION_MAJOR
             ctx->ch_layout.nb_channels != target_ch) {
+#else
+            ctx->channels != target_ch) {
+#endif
 
+#if defined(LIBSWRESAMPLE_VERSION_MAJOR) && LIBSWRESAMPLE_VERSION_MINOR >= 6
+            /* libswresample 4.6+ (FFmpeg 6.1+): swr_alloc_set_opts2 + AVChannelLayout* */
             SwrContext *swr = swr_alloc_set_opts2(
                 NULL,
                 /* out */
@@ -178,15 +188,39 @@ static int av_codec_open(struct codec_sess *sess, int is_decoder)
                 ctx->sample_fmt,
                 ctx->sample_rate,
                 0, NULL);
+#else
+            /* 旧版 libswresample (<4.6): swr_alloc_set_opts + channel mask */
+            uint64_t in_mask =
+#if LIBAVCODEC_VERSION_MAJOR >= 59
+                ctx->ch_layout.u.mask;
+#else
+                ctx->channel_layout;
+#endif
+            SwrContext *swr = swr_alloc_set_opts(
+                NULL,
+                AV_CH_LAYOUT_MONO,
+                target_fmt,
+                target_rate,
+                in_mask,
+                ctx->sample_fmt,
+                ctx->sample_rate,
+                0, NULL);
+#endif
             if (swr) {
                 swr_init(swr);
                 sess->swr = swr;
-                sess->swr_out_rate = target_rate; /* FFmpeg 6.x swr opaque, cache locally */
+#if defined(LIBSWRESAMPLE_VERSION_MAJOR) && LIBSWRESAMPLE_VERSION_MINOR >= 6
+                sess->swr_out_rate = target_rate; /* swr opaque in new libswresample, cache locally */
+#endif
                 llog(LOG_DEBUG, "av",
                      "swr init: codec sample_fmt=%d→%d rate=%d→%d ch=%d→%d",
                      ctx->sample_fmt, target_fmt,
                      ctx->sample_rate, target_rate,
+#ifdef LIBSWRESAMPLE_VERSION_MAJOR
                      ctx->ch_layout.nb_channels, target_ch);
+#else
+                     ctx->channels, target_ch);
+#endif
             }
         }
     }
@@ -265,7 +299,11 @@ static int av_codec_decode(struct codec_sess *sess,
     pkt->size = 0;
 
     out->samples  = 0;
+#if LIBAVCODEC_VERSION_MAJOR >= 59
     out->channels = sess->dec_ctx->ch_layout.nb_channels;
+#else
+    out->channels = sess->dec_ctx->channels;
+#endif
     out->rate     = sess->dec_ctx->sample_rate;
     if (sess->id == CODEC_OPUS) out->rate = 48000; /* Opus 强制 48k 输出 */
 
@@ -297,13 +335,22 @@ static int av_codec_decode(struct codec_sess *sess,
                 int16_t *dst = (int16_t *)(out->pcm + out->samples);
                 memcpy(dst, swr_out, converted * sizeof(int16_t));
                 out->samples += converted;
-                /* FFmpeg 6.x: swr->out_sample_rate opaque, use cached value */
+#if defined(LIBSWRESAMPLE_VERSION_MAJOR) && LIBSWRESAMPLE_VERSION_MINOR >= 6
+                /* 新版 libswresample opaque swr, use cached value */
                 out->rate = sess->swr_out_rate;
+#else
+                out->rate = sess->swr->out_sample_rate;
+#endif
             }
         } else if (frame->format == AV_SAMPLE_FMT_S16) {
             /* 非重采样路径：codec 输出已是 interleaved S16 + 匹配 sample_rate/channels */
+#if LIBAVCODEC_VERSION_MAJOR >= 59
+            int frame_ch = frame->ch_layout.nb_channels;
+#else
+            int frame_ch = frame->channels;
+#endif
             size_t frame_bytes = av_samples_get_buffer_size(
-                NULL, frame->ch_layout.nb_channels, frame->nb_samples,
+                NULL, frame_ch, frame->nb_samples,
                 AV_SAMPLE_FMT_S16, 1);
             if (frame_bytes > (out->samples * sizeof(int16_t) * 2)) {
                 size_t cap = 1500 * sizeof(int16_t) * 2; /* 与 transcode 缓冲对齐 */
@@ -344,7 +391,12 @@ static int av_codec_encode(struct codec_sess *sess,
     frame->nb_samples     = in->samples;
     frame->sample_rate    = in->rate;
     frame->format         = sess->enc_ctx->sample_fmt;
+#if LIBAVCODEC_VERSION_MAJOR >= 59
     frame->ch_layout      = sess->enc_ctx->ch_layout;
+#else
+    frame->channel_layout = sess->enc_ctx->channel_layout;
+    frame->channels       = sess->enc_ctx->channels;
+#endif
 
     size_t samples_size = in->samples * in->channels * sizeof(int16_t);
     int rc = avcodec_fill_audio_frame(frame, in->channels,
