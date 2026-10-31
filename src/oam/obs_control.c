@@ -1081,16 +1081,7 @@ static void dispatch(ctl_conn_t *c, char *line)
             }
         }
     } else if (strcmp(line, "show") == 0 && strcmp(arg, "modules") == 0) {
-        /* ---- show modules：按 category 分组列出全部模块（Phase 5）----
-         *
-         * 输出格式：
-         *   total=N
-         *   [core] signaling (STARTED) oam (STARTED) dbal (STARTED) ...
-         *   [codec] codecs (STARTED) av (REG)
-         *   [security] security (REG)
-         *   [observability] event_handlers (REG)
-         *   ...
-         */
+        /* ---- show modules：按 category 分组列出全部模块 ---- */
         nsbc_modmgr_t *mm = modmgr_get_global();
         if (!mm) {
             ctl_printf(c, "ERR module manager not initialized\n");
@@ -1098,48 +1089,42 @@ static void dispatch(ctl_conn_t *c, char *line)
             unsigned total = modmgr_count(mm);
             ctl_printf(c, "modules=%u\n", total);
 
-            /* 按 category 分组收集 */
-            int counts[MOD_CAT__COUNT] = {0};
-            char *cat_buf = malloc(CTL_OUT_MAX);
-            if (!cat_buf) { ctl_printf(c, "ERR oom\n"); }
-            else {
-                /* 为每个 category 预留一块 buffer（简单：一个大 buffer 内部分段）*/
-                size_t offset = 0;
-                char *segments[MOD_CAT__COUNT] = {0};
+            /* 两轮遍历：先按 category 分组计数，再逐类输出。
+             * 每个 category 单独 ctl_printf，无 buffer 拼接 bug。*/
 
-                /* 先按 category 顺序扫一遍（排序后看起来规整）*/
+            /* pass 1: 统计每个 category 的模块数 */
+            int counts[MOD_CAT__COUNT] = {0};
+            for (unsigned idx = 0; idx < total; idx++) {
+                const nsbc_module_t *d = modmgr_get_nth(mm, idx);
+                if (!d) continue;
+                mod_category_t cat = d->category;
+                if (cat >= MOD_CAT__COUNT) cat = MOD_CAT_UNKNOWN;
+                counts[cat]++;
+            }
+
+            /* pass 2: 按 category 顺序输出。先打 category 标题行，
+             * 再扫一遍找出该类的模块逐个打印 */
+            for (int ci = 0; ci < MOD_CAT__COUNT; ci++) {
+                if (counts[ci] == 0) continue;
+                ctl_printf(c, "  [%s]\n", mod_category_name((mod_category_t)ci));
                 for (unsigned idx = 0; idx < total; idx++) {
                     const nsbc_module_t *d = modmgr_get_nth(mm, idx);
-                    mod_state_t st = modmgr_get_state_at(mm, idx);
                     if (!d) continue;
-
                     mod_category_t cat = d->category;
                     if (cat >= MOD_CAT__COUNT) cat = MOD_CAT_UNKNOWN;
-
-                    /* 每个 category 自己追加一行 "name (ST)" */
-                    if (!segments[cat]) {
-                        segments[cat] = cat_buf + offset;
-                        offset += (size_t)snprintf(cat_buf + offset,
-                            CTL_OUT_MAX - offset, "[%s] ", mod_category_name(cat));
-                    }
-                    if (offset < CTL_OUT_MAX - 256) {
-                        offset += (size_t)snprintf(cat_buf + offset,
-                            CTL_OUT_MAX - offset, "%s(%s) ",
-                            d->name,
-                            st == MOD_ST_STARTED ? "STARTED" :
-                            st == MOD_ST_INITED  ? "INITED" :
-                            st == MOD_ST_DISABLED ? "DISABLED" : "REG");
-                    }
-                    counts[cat]++;
+                    if ((int)cat != ci) continue;
+                    mod_state_t st = modmgr_get_state_at(mm, idx);
+                    const char *st_name =
+                        st == MOD_ST_STARTED  ? "STARTED"  :
+                        st == MOD_ST_INITED   ? "INITED"   :
+                        st == MOD_ST_DISABLED ? "DISABLED" : "REG";
+                    unsigned flags = d->flags;
+                    const char *fl =
+                        (flags & MOD_F_CALL_PATH) ? " [CALL_PATH]" :
+                        (flags & MOD_F_REQUIRED)  ? " [REQUIRED]"  : "";
+                    ctl_printf(c, "    %-20s %-8s %s\n",
+                               d->name, st_name, fl);
                 }
-
-                /* 输出：跳过空 category，按枚举值顺序 */
-                for (int ci = 0; ci < MOD_CAT__COUNT; ci++) {
-                    if (segments[ci] && counts[ci] > 0) {
-                        ctl_printf(c, "%s\n", segments[ci]);
-                    }
-                }
-                free(cat_buf);
             }
         }
     } else if (strcmp(line, "show") == 0 && strcmp(arg, "event_bus") == 0) {
