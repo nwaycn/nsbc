@@ -484,17 +484,18 @@ fi
 HAVE_FFMPEG=0
 AV_CPPFLAGS=""
 AV_LDLIBS=""
-# 需要 libswresample >= 4.6 (FFmpeg >= 6.1) 才能用 swr_alloc_set_opts2 + AVChannelLayout
+# 需要 FFmpeg 6.x (libavcodec >= 59) + libswresample >= 4.5
+# 4.5 = opaque SwrContext（需缓存 out_sample_rate）+ swr_alloc_set_opts2 已存在 (Debian 12 6.0 backport)
 if command -v pkg-config >/dev/null 2>&1 \
    && pkg-config --exists libavcodec libavutil libswresample libswscale 2>/dev/null \
-   && pkg-config --atleast-version 4.6 libswresample 2>/dev/null \
+   && pkg-config --atleast-version 4.5 libswresample 2>/dev/null \
    && pkg-config --atleast-version 59   libavcodec 2>/dev/null; then
     HAVE_FFMPEG=1
     AV_CPPFLAGS=$(pkg-config --cflags libavcodec libavutil libswresample libswscale 2>/dev/null)
     AV_LDLIBS=$(pkg-config --libs   libavcodec libavutil libswresample libswscale 2>/dev/null)
-    echo "  ↑ FFmpeg detected (avcodec+avutil+swresample+swscale, swresample>=4.6)" >&2
+    echo "  ↑ FFmpeg detected (avcodec+avutil+swresample+swscale)" >&2
 else
-    echo "  ↑ FFmpeg NOT compatible — need libavcodec>=59 (FFmpeg 6.x) + libswresample>=4.6" >&2
+    echo "  ↑ FFmpeg NOT compatible — need libavcodec>=59 (FFmpeg 6.x) + libswresample>=4.5" >&2
     echo "    apt install libavcodec-dev libavutil-dev libswresample-dev libswscale-dev" >&2
     HAVE_FFMPEG=0
 fi
