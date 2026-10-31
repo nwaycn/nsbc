@@ -955,7 +955,16 @@ const app = createApp({
       old_password: [{ required: true, message: () => t('Please enter current password'), trigger: 'blur' }],
       new_password: [
         { required: true, message: () => t('Please enter new password'), trigger: 'blur' },
-        { min: 6, message: () => t('Password must be at least 6 characters'), trigger: 'blur' },
+        { min: 12, message: () => t('Password must be at least 12 characters'), trigger: 'blur' },
+        { validator: (_, v, cb) => {
+          if (!v) return cb();
+          let c = 0;
+          if (/[a-z]/.test(v)) c++;
+          if (/[A-Z]/.test(v)) c++;
+          if (/\d/.test(v)) c++;
+          if (/[^a-zA-Z0-9]/.test(v)) c++;
+          c >= 3 ? cb() : cb(new Error(t('Password must contain at least 3 of: uppercase, lowercase, digit, symbol')));
+        }, trigger: 'blur' },
       ],
       confirm_password: [
         { required: true, message: () => t('Please confirm new password'), trigger: 'blur' },
