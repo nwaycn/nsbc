@@ -25,9 +25,11 @@
 #include "log.h"
 #include "sip_profile.h"
 #include "sip_transport.h"
-#include "app_ctx.h"       /* nsbc_get_ctx() — 拿 ctx->sip_tr */
+#include "app_ctx.h"       /* nsbc_get_ctx() — 拿 ctx->sip_tr / ctx->rt */
 #include "nsbc_common.h"
 #include "ivr.h"
+#include "route_table.h"   /* rt_trunk_count / rt_trunk_at — trunks.list */
+#include "dialplan.h"      /* dp_oam_get_active — dialplan.show */
 
 #include <stdio.h>
 #include <string.h>
@@ -144,6 +146,108 @@ static int cmd_profiles_list(cmd_ctx_t *c, int argc, char **argv, void *ud)
     return NSBC_OK;
 }
 
+/* ---- trunks.list：遍历 route_table，输出所有已加载 trunk ----
+ * 列：NAME / KIND / HOST:PORT / ENABLED / OPEN / IN_USE / PROFILE
+ * route_table 由 trunk_table_reload_json 原子替换，OAM 命令读 ctx->rt 即可
+ * （命令执行期间不会被替换——reload 走同一条 control.sock 串行命令通道）。 */
+static int cmd_trunks_list(cmd_ctx_t *c, int argc, char **argv, void *ud)
+{
+    (void)argc; (void)argv; (void)ud;
+    if (!c || !c->io_printf) return NSBC_INVAL;
+
+    nsbc_ctx_t *ctx = nsbc_get_ctx();
+    if (!ctx || !ctx->rt) {
+        c->io_printf(c->io_ud, "trunks=0 (no route_table)\n");
+        return NSBC_OK;
+    }
+
+    int n = rt_trunk_count(ctx->rt);
+    if (n == 0) {
+        c->io_printf(c->io_ud, "trunks=0\n");
+        return NSBC_OK;
+    }
+
+    c->io_printf(c->io_ud,
+                 "%-24s %-12s %-32s %-8s %-6s %-8s %-16s\n",
+                 "NAME", "KIND", "HOST:PORT", "ENABLED", "OPEN", "IN_USE", "PROFILE");
+    for (int i = 0; i < n; ++i) {
+        const trunk_t *tr = rt_trunk_at(ctx->rt, i);
+        if (!tr) continue;
+        const char *kind = (tr->kind == TRUNK_STATIC_PEER) ? "static" :
+                           (tr->kind == TRUNK_REGISTER)    ? "register" :
+                           (tr->kind == TRUNK_AUTH_OUT)    ? "auth_out" : "?";
+        c->io_printf(c->io_ud,
+                     "%-24s %-12s %-16s:%-5u %-8d %-6s %-8lu %-16s\n",
+                     tr->name, kind, tr->host, tr->port,
+                     tr->enabled,
+                     rt_trunk_is_open(ctx->rt, i) ? "open" : "CLOSED",
+                     (unsigned long)rt_trunk_in_use(ctx->rt, i),
+                     tr->profile_name[0] ? tr->profile_name : "-");
+    }
+    c->io_printf(c->io_ud, "-- %d trunks\n", n);
+
+    /* 同时列出 trunk groups（如有） */
+    int ng = rt_group_count(ctx->rt);
+    if (ng > 0) {
+        c->io_printf(c->io_ud, "\n%-24s %-8s %s\n", "GROUP", "MEMBERS", "STICKY");
+        for (int i = 0; i < ng; ++i) {
+            const trunk_group_t *g = rt_group_at(ctx->rt, i);
+            if (!g) continue;
+            c->io_printf(c->io_ud, "%-24s %-8d %s\n",
+                         g->name, g->nmembers,
+                         g->sticky_by_caller ? "sticky" : "hash");
+        }
+        c->io_printf(c->io_ud, "-- %d groups\n", ng);
+    }
+    return NSBC_OK;
+}
+
+/* ---- dialplan.show：遍历 dp_ctx.active，输出所有已加载规则 ----
+ * 列：ID / PRIO / PROFILE / MATCH / LAYER / TARGET / STRIP / ADD_PREFIX / ENABLED
+ * active 表 RCU 原子读，所有权属 signaling —— 只读不 free。 */
+static int cmd_dialplan_show(cmd_ctx_t *c, int argc, char **argv, void *ud)
+{
+    (void)argc; (void)argv; (void)ud;
+    if (!c || !c->io_printf) return NSBC_INVAL;
+
+    dp_table_t *tbl = dp_oam_get_active();
+    if (!tbl || tbl->count == 0) {
+        c->io_printf(c->io_ud, "dialplan_rules=0 (no active table)\n");
+        return NSBC_OK;
+    }
+
+    c->io_printf(c->io_ud,
+                 "%-6s %-6s %-12s %-20s %-6s %-24s %-6s %-12s %-8s\n",
+                 "ID", "PRIO", "PROFILE", "MATCH", "LAYER", "TARGET", "STRIP", "ADD_PREFIX", "PERM");
+    for (size_t i = 0; i < tbl->count; ++i) {
+        const dp_rule_t *r = &tbl->rules[i];
+        const char *layer = (r->layer == DP_LAYER_EXT) ? "EXT" :
+                            (r->layer == DP_LAYER_OUT) ? "OUT" :
+                            (r->layer == DP_LAYER_BIZ) ? "BIZ" : "?";
+        /* match pattern：按 pm_type_t 类型加前缀（PREFIX/EXACT/RANGE/DIGIT/REGEX） */
+        char match_str[32];
+        const char *type_tag =
+            (r->match.type == PM_REGEX) ? "re" :
+            (r->match.type == PM_PREFIX) ? "pre" :
+            (r->match.type == PM_EXACT) ? "eq" :
+            (r->match.type == PM_RANGE) ? "rng" :
+            (r->match.type == PM_DIGIT) ? "dig" : "?";
+        snprintf(match_str, sizeof(match_str), "%s:%s",
+                 type_tag, r->match.pattern[0] ? r->match.pattern : "");
+        c->io_printf(c->io_ud,
+                     "%-6u %-6d %-12s %-20s %-6s %-24s %-6d %-12s %-8u\n",
+                     r->id, r->prio,
+                     r->profile_name[0] ? r->profile_name : "-",
+                     match_str, layer,
+                     r->target[0] ? r->target : "-",
+                     r->strip,
+                     r->add_prefix[0] ? r->add_prefix : "-",
+                     r->perm);
+    }
+    c->io_printf(c->io_ud, "-- %zu rules (active)\n", tbl->count);
+    return NSBC_OK;
+}
+
 /* ---- no-op reload handler：Core 端暂不消费 route_groups / ha_groups / ivr_menus ----
  * 这些模块的内存结构未来由 Core 自己接管，但当前 Web DB 是权威数据源。
  * 命令仍然注册以便 Web 侧 UDS 链路可通（reload 按钮点了能收到 OK）。 */
@@ -177,6 +281,9 @@ void reload_commands_register(cmd_reg_t *reg)
         { "ha.reload",             "Reload HA groups from JSON (Web DB authoritative)", CMD_L2_ADMIN, cmd_reload_noop, (void*)"ha" },
         { "ivr.reload",            "Reload IVR menus from JSON (nodes JSON tree)",       CMD_L2_ADMIN, cmd_ivr_reload,     NULL },
         { "route_groups.reload",   "Reload route groups from JSON (Web DB authoritative)", CMD_L2_ADMIN, cmd_reload_noop, (void*)"route_groups" },
+        /* ---- P0 新增诊断命令 ---- */
+        { "trunks.list",           "List loaded trunks and groups from route_table",  CMD_L1_MONITOR, cmd_trunks_list,      NULL },
+        { "dialplan.show",         "List active dialplan rules",                      CMD_L1_MONITOR, cmd_dialplan_show,    NULL },
     };
     for (size_t i = 0; i < sizeof(descs)/sizeof(descs[0]); ++i)
         cmd_register(reg, &descs[i]);

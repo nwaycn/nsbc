@@ -493,14 +493,18 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
     /* P2-XX External profile REGISTER guard：
      * external profile (auth_calls=0) 设计用途是接 SIP 中继/DID 的 INVITE，
      * 不接受 USER-Agent 的 REGISTER（类似 FreeSWITCH public.xml）。
-     * 命中 external profile 的 REGISTER 一律 silent drop，省掉后续 Digest 流程，
-     * 也防止外部扫描通过 public profile 探测分机 HA1。 */
+     * 返回 403 Forbidden（不是 silent drop），让 UA 立即放弃，
+     * 避免客户端等 32s 超时；同时 403 明确告知"此 profile 不接受注册"，
+     * 与"真的没这个用户"的场景（401/403 auth fail）区分开。 */
     {
         const sip_profile_t *prof = sip_profile_match_src(src_ip, NULL);
         if (prof && prof->auth_calls == 0) {
             llog(LOG_WARN, "reg",
-                 "REGISTER silent-drop: external profile '%s' does not accept registrations, src=%s",
+                 "REGISTER 403: external profile '%s' does not accept registrations, src=%s",
                  prof->name, src_ip);
+            respond(r, proto, src, m, 403,
+                    "External profile does not accept registrations",
+                    NULL, 0, txn);
             return NSBC_OK;
         }
     }

@@ -43,6 +43,7 @@
 #include "oam_internal.h"
 #include "rating.h"
 #include "reactor.h"
+#include "cfg_sync.h"     /* P0: cfg_sync_after_reload — plain reload 后拉 DB 同步 */
 
 #include <errno.h>
 #include <stdarg.h>
@@ -636,6 +637,19 @@ static void cmd_reload(ctl_conn_t *c)
         ctl_printf(c, "OK reload success %s\n", g_ctx->config_file);
         log_audit("oam", "control-reload", "result=ok file=%s",
                   g_ctx->config_file);
+
+        /* P0: YAML reload 成功后，主动从 nsbc-web DB 拉全量配置同步。
+         * 解决两套 reload 通道（YAML vs DB）互不关联的架构问题——
+         * DBA 手工 INSERT 后 plain reload 也能同步 route_table/dialplan/sip_profiles。
+         * 如果 web 侧 data.sock 还没 ready（超时 2s），这里只打 WARN 不中断。 */
+        int sync_rc = cfg_sync_after_reload();
+        if (sync_rc != NSBC_OK) {
+            ctl_printf(c, "WARN YAML reloaded but DB sync failed (web not ready?)\n");
+            log_audit("oam", "control-reload", "db_sync=fail");
+        } else {
+            ctl_printf(c, "OK DB config synced from web\n");
+            log_audit("oam", "control-reload", "db_sync=ok");
+        }
     } else if (rc == NSBC_PERM_DENIED) {
         ctl_printf(c, "ERR need-restart %s\n", bad ? bad : "E_NEED_RESTART");
         log_audit("oam", "control-reload",

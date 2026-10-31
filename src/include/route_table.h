@@ -146,6 +146,18 @@ void rt_mark_fail(route_table_t *t, const char *name);
 void rt_mark_ok(route_table_t *t, const char *name);
 int  rt_is_open(route_table_t *t, const char *name);
 
+/* OAM 遍历接口（trunks.list 诊断命令用）：
+ * rt_trunk_count 返回当前 route_table 中的 trunk 数量；
+ * rt_trunk_at 按索引返回 trunk 指针（0..count-1），越界返回 NULL。
+ * 注意：route_table 是 RCU 原子替换的——调用前应由调用方保证
+ * ctx->rt 在遍历期间不被替换（或持有 snapshot）。 */
+int  rt_trunk_count(const route_table_t *t);
+const trunk_t *rt_trunk_at(const route_table_t *t, int idx);
+int  rt_group_count(const route_table_t *t);
+const trunk_group_t *rt_group_at(const route_table_t *t, int idx);
+uint64_t rt_trunk_in_use(const route_table_t *t, int idx);
+int  rt_trunk_is_open(const route_table_t *t, int idx);
+
 #ifdef __cplusplus
 }
 #endif

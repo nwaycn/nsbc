@@ -270,6 +270,46 @@ int rt_is_open(route_table_t *t, const char *name)
     return i < 0 ? 0 : t->open[i];
 }
 
+/* ---- OAM 遍历接口 ---- */
+
+int rt_trunk_count(const route_table_t *t)
+{
+    return t ? t->n_trunks : 0;
+}
+
+const trunk_t *rt_trunk_at(const route_table_t *t, int idx)
+{
+    if (!t || idx < 0 || idx >= t->n_trunks)
+        return NULL;
+    return &t->trunks[idx];
+}
+
+int rt_group_count(const route_table_t *t)
+{
+    return t ? t->n_groups : 0;
+}
+
+const trunk_group_t *rt_group_at(const route_table_t *t, int idx)
+{
+    if (!t || idx < 0 || idx >= t->n_groups)
+        return NULL;
+    return &t->groups[idx];
+}
+
+uint64_t rt_trunk_in_use(const route_table_t *t, int idx)
+{
+    if (!t || idx < 0 || idx >= t->n_trunks)
+        return 0;
+    return t->in_use[idx];
+}
+
+int rt_trunk_is_open(const route_table_t *t, int idx)
+{
+    if (!t || idx < 0 || idx >= t->n_trunks)
+        return 0;
+    return t->open[idx];
+}
+
 /*
     Author:       李浩 (Li Hao)
     Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)

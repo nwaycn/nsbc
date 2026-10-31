@@ -90,6 +90,8 @@ static dp_layer_t dp_infer_layer_from_target(const char *target)
     if (strncmp(target, "vm:", 3) == 0)              return DP_LAYER_BIZ;
     if (strncmp(target, "conference:", 11) == 0)     return DP_LAYER_BIZ;
     if (strncmp(target, "hangup", 6) == 0)           return DP_LAYER_BIZ;  /* hangup 算 BIZ 业务动作 */
+    if (strncmp(target, "sip:", 4) == 0)             return DP_LAYER_OUT;  /* 字面量直连 sip:host:port */
+    if (strncmp(target, "sips:", 5) == 0)            return DP_LAYER_OUT;  /* 字面量 TLS */
     if (strncmp(target, "gateway:", 8) == 0)         return DP_LAYER_OUT;
     if (strncmp(target, "route:", 6) == 0)           return DP_LAYER_OUT;
     if (strncmp(target, "trunk:", 6) == 0)           return DP_LAYER_OUT;
@@ -483,6 +485,20 @@ static int dialplan_mod_init(struct nsbc_ctx *ctx)
 }
 
 NSBC_MOD0_CAT(dialplan, 1, MOD_L_WORKER_READY, 0, MOD_CAT_APPLICATION, dialplan_mod_init, NULL);
+
+/* ---- OAM 诊断接口 ---- */
+static dp_ctx_t *g_oam_dp_ctx = NULL;
+
+void dp_oam_register_ctx(dp_ctx_t *ctx)
+{
+    g_oam_dp_ctx = ctx;
+}
+
+dp_table_t *dp_oam_get_active(void)
+{
+    if (!g_oam_dp_ctx) return NULL;
+    return __atomic_load_n(&g_oam_dp_ctx->active, __ATOMIC_ACQUIRE);
+}
 
 /*
     Author:       李浩 (Li Hao)

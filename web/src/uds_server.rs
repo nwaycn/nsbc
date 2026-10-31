@@ -338,6 +338,30 @@ async fn dispatch_cmd_req<C: crate::coreclient::CoreApi + Clone + Send + Sync + 
                 "max_contacts": x.max_contacts,
             }).to_string())
         }
+        /* ---- cfg.pull_all：C core 启动/reload 时拉全量 enabled 配置表 ----
+         * C 侧发 {"cmd":"cfg.pull_all"}，返回所有需要 reload 的 enabled 行 JSON。
+         * Rust 侧直接复用 list_enabled_* 函数（已有 REST reload 在同样用）。
+         * C 侧收到后分别调 trunk_table_reload_json / dp_rules_reload_json / sip_profiles_reload_json。 */
+        "cfg.pull_all" => {
+            if state.db.pool().is_none() {
+                return Ok(serde_json::json!({"ok": false, "reason": "db_not_ready"}).to_string());
+            }
+            let trunks = state.db.list_enabled_trunks().await.unwrap_or_default();
+            let dprules = state.db.list_enabled_dialplan_rules(None).await.unwrap_or_default();
+            let profiles = state.db.list_enabled_sip_profiles().await.unwrap_or_default();
+            tracing::info!(
+                trunks = trunks.len(),
+                dprules = dprules.len(),
+                profiles = profiles.len(),
+                "cfg.pull_all requested by C core"
+            );
+            Ok(serde_json::json!({
+                "ok": true,
+                "trunks": trunks,
+                "dialplan_rules": dprules,
+                "sip_profiles": profiles,
+            }).to_string())
+        }
         "" => Ok(serde_json::json!({"ok": false, "reason": "bad_request"}).to_string()),
         _ => {
             tracing::warn!(cmd, "unknown CMD_REQ");

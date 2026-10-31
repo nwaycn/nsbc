@@ -925,7 +925,45 @@ static int resolve_cb(b2b_call_t *call, const char *ruri, size_t ruri_len,
     }
 
     if (dp_ok && dres.layer == DP_LAYER_OUT) {
-        /* ---- DP_LAYER_OUT 完整实现（REQ-PBX-ROUTE-002 中继选路）----
+        /* ---- 先拦截 sip: / sips: 字面量直连（不依赖 route_table）----
+         * 让测试/运维可以临时用 dialplan target='sip:10.0.0.25:5080' 直接出站，
+         * 不用先在 Web UI 建 trunk。uri_to_sa 已在本文件定义，直接复用。 */
+        if (!strncmp(dres.target, "sip:", 4) || !strncmp(dres.target, "sips:", 5)) {
+            size_t tlen = strlen(dres.target);
+            if (uri_to_sa(dres.target, tlen, dst) != NSBC_OK) {
+                llog(LOG_WARN, "sig", "dp out literal: bad sip URI '%s'", dres.target);
+                return NSBC_INVAL;
+            }
+            /* out_ruri：sip:<变换后被叫>@<host:port> */
+            if (out_ruri && outsz) {
+                const char *uri_body = dres.target;
+                if (!strncmp(uri_body, "sip:", 4)) uri_body += 4;
+                else if (!strncmp(uri_body, "sips:", 5)) uri_body += 5;
+                /* uri_body 现在可能是 user@host:port / host:port / [ipv6]:port */
+                int n = snprintf(out_ruri, outsz, "sip:%s@%s",
+                                 dres.dst_number[0] ? dres.dst_number : user,
+                                 uri_body);
+                if (n < 0 || (size_t)n >= outsz) return NSBC_NOMEM;
+            }
+            /* out_to：<sip:<变换后被叫>@<host>> */
+            if (out_to && out_to_sz) {
+                size_t hlen = 0; uint16_t port = 0; int ip6 = 0;
+                const char *h = uri_hostport(dres.target, tlen, &hlen, &port, &ip6);
+                if (h && hlen > 0) {
+                    char host[128];
+                    if (hlen >= sizeof(host)) return NSBC_INVAL;
+                    memcpy(host, h, hlen); host[hlen] = '\0';
+                    int n = snprintf(out_to, out_to_sz, "<sip:%s@%s>",
+                                     dres.dst_number[0] ? dres.dst_number : user, host);
+                    if (n < 0 || (size_t)n >= out_to_sz) return NSBC_NOMEM;
+                }
+            }
+            if (call) snprintf(call->b_key, sizeof(call->b_key), "literal:%s", dres.target);
+            llog(LOG_INFO, "sig", "dp out literal: %s → %s", user, dres.target);
+            return NSBC_OK;
+        }
+
+        /* ---- DP_LAYER_OUT 中继选路（REQ-PBX-ROUTE-002）----
          * dres.target = trunk name（dialplan rule 配置的中继名，cfg 格式：
          *   "match_pattern:2:trunk_name[:strip][:add_prefix]"）。
          * rt_trunk_get → trunk_t → 构造 dst_sa + out_ruri + out_to。 */
@@ -1485,6 +1523,7 @@ static int sig_init(struct nsbc_ctx *ctx)
     ctx->ptable = s->ptable;
     ctx->sig_rt = s;
     dp_ctx_init(&s->dp_ctx);
+    dp_oam_register_ctx(&s->dp_ctx);   /* OAM 诊断接口注册，供 dialplan.show 命令遍历 */
     return NSBC_OK;
 
 fail:

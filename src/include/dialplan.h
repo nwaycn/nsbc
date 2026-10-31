@@ -193,6 +193,13 @@ int dp_execute(const dp_ctx_t *ctx, const dp_call_t *call, dp_result_t *res);
 /* DigitMap 辅助：是否存在 immediate 的精确命中 */
 const dp_rule_t *dp_find_immediate(const dp_ctx_t *ctx, const char *digits);
 
+/* ---- OAM 诊断接口（dialplan.show 命令用）----
+ * dialplan 模块不持有全局 dp_ctx（它是 sig_runtime_t 的成员），
+ * signaling init 时通过 dp_oam_register_ctx 注册，让 OAM 命令能遍历 active rules。
+ * dp_oam_get_active 返回 RCU 原子读的 active 表快照——调用方遍历完不应 free（所有权属 signaling）。 */
+void         dp_oam_register_ctx(dp_ctx_t *ctx);
+dp_table_t  *dp_oam_get_active(void);
+
 #endif /* NSBC_DIALPLAN_H */
 
 /*

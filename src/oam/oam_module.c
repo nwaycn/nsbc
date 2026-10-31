@@ -11,6 +11,7 @@
 #include "playback_engine.h"
 #include "vad_engine.h"
 #include "log.h"
+#include "cfg_sync.h"     /* P0: 启动时从 nsbc-web DB 拉全量配置 */
 
 static int oam_init(struct nsbc_ctx *ctx)
 {
@@ -50,6 +51,18 @@ static int oam_start(struct nsbc_ctx *ctx)
             llog(LOG_WARN, "oam", "uds_client_start failed rc=%d (non-fatal)", rc);
         } else {
             llog(LOG_NOTICE, "oam", "uds client started → /var/run/nsbc/data.sock");
+
+            /* P0: 启动时从 nsbc-web DB 拉全量 enabled 配置表（trunks/dialplan_rules/sip_profiles）。
+             * 解决两套 reload 通道互不关联：nsbcd 重启后自动知道 DB 里的 trunk，
+             * 不再等 nsbc-web 运行时推 JSON reload。retry 10×500ms 等 data.sock bind。
+             * 失败只打 WARN（web 还没起来正常，后续 Rust web 启动后会自动推 reload）。 */
+            int sync_rc = cfg_sync_on_startup();
+            if (sync_rc != NSBC_OK) {
+                llog(LOG_WARN, "oam",
+                     "cfg_sync_on_startup failed (web not ready yet — DB tables will be synced on next web push or control.sock reload)");
+            } else {
+                llog(LOG_NOTICE, "oam", "cfg_sync_on_startup: DB tables loaded from web");
+            }
         }
     } else {
         llog(LOG_WARN, "oam", "uds_client_init failed rc=%d (non-fatal)", rc);
