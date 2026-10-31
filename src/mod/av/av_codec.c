@@ -175,13 +175,24 @@ static int av_codec_open(struct codec_sess *sess, int is_decoder)
             ctx->channels != target_ch) {
 #endif
 
-/* swresample 版本分三档：
+/* swresample 版本分三档（必须用 MAJOR+MINOR 分开比较，LIBSWRESAMPLE_VERSION
+ * 展开成 AV_VERSION_INT(4,5,0) 有逗号，不能直接和整数比较！）：
  *   < 4.5   — 旧：SwrContext 字段可见 + swr_alloc_set_opts
  *   4.5     — 过渡：SwrContext opaque，但 swr_alloc_set_opts2 还没引入
  *   >= 4.6  — 新：swr_alloc_set_opts2 + opaque SwrContext
- * 服务器上是 4.5（Debian 12 对应 FFmpeg 6.0），最容易踩坑的档
  */
-#if defined(LIBSWRESAMPLE_VERSION) && LIBSWRESAMPLE_VERSION >= 0x040600
+#if (defined(LIBSWRESAMPLE_VERSION_MAJOR) && LIBSWRESAMPLE_VERSION_MAJOR > 4) \
+ || (defined(LIBSWRESAMPLE_VERSION_MAJOR) && LIBSWRESAMPLE_VERSION_MAJOR == 4 \
+     && defined(LIBSWRESAMPLE_VERSION_MINOR) && LIBSWRESAMPLE_VERSION_MINOR >= 6)
+#define NSBC_HAS_SWR_ALLOC_SET_OPTS2 1
+#endif
+#if (defined(LIBSWRESAMPLE_VERSION_MAJOR) && LIBSWRESAMPLE_VERSION_MAJOR > 4) \
+ || (defined(LIBSWRESAMPLE_VERSION_MAJOR) && LIBSWRESAMPLE_VERSION_MAJOR == 4 \
+     && defined(LIBSWRESAMPLE_VERSION_MINOR) && LIBSWRESAMPLE_VERSION_MINOR >= 5)
+#define NSBC_SWR_OPAQUE 1
+#endif
+
+#ifdef NSBC_HAS_SWR_ALLOC_SET_OPTS2
             /* libswresample 4.6+ (FFmpeg 6.1+): swr_alloc_set_opts2 + AVChannelLayout* */
             SwrContext *swr = swr_alloc_set_opts2(
                 NULL,
@@ -215,7 +226,7 @@ static int av_codec_open(struct codec_sess *sess, int is_decoder)
             if (swr) {
                 swr_init(swr);
                 sess->swr = swr;
-#if defined(LIBSWRESAMPLE_VERSION) && LIBSWRESAMPLE_VERSION >= 0x040500
+#ifdef NSBC_SWR_OPAQUE
                 /* libswresample 4.5+: SwrContext opaque, out_sample_rate 不可访问，缓存 */
                 sess->swr_out_rate = target_rate;
 #endif
@@ -342,7 +353,7 @@ static int av_codec_decode(struct codec_sess *sess,
                 int16_t *dst = (int16_t *)(out->pcm + out->samples);
                 memcpy(dst, swr_out, converted * sizeof(int16_t));
                 out->samples += converted;
-#if defined(LIBSWRESAMPLE_VERSION) && LIBSWRESAMPLE_VERSION >= 0x040500
+#ifdef NSBC_SWR_OPAQUE
                 /* libswresample 4.5+: SwrContext opaque, out_sample_rate 不可访问 */
                 out->rate = sess->swr_out_rate;
 #else
