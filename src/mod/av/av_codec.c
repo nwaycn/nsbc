@@ -175,38 +175,15 @@ static int av_codec_open(struct codec_sess *sess, int is_decoder)
             ctx->channels != target_ch) {
 #endif
 
-/* swresample 版本分三档（必须用 MAJOR+MINOR 分开比较，LIBSWRESAMPLE_VERSION
- * 展开成 AV_VERSION_INT(4,5,0) 有逗号，不能直接和整数比较！）：
- *   < 4.5   — 旧：SwrContext 字段可见 + swr_alloc_set_opts
- *   4.5     — 过渡：SwrContext opaque，但 swr_alloc_set_opts2 还没引入
- *   >= 4.6  — 新：swr_alloc_set_opts2 + opaque SwrContext
- */
-#if (defined(LIBSWRESAMPLE_VERSION_MAJOR) && LIBSWRESAMPLE_VERSION_MAJOR > 4) \
- || (defined(LIBSWRESAMPLE_VERSION_MAJOR) && LIBSWRESAMPLE_VERSION_MAJOR == 4 \
-     && defined(LIBSWRESAMPLE_VERSION_MINOR) && LIBSWRESAMPLE_VERSION_MINOR >= 6)
-#define NSBC_HAS_SWR_ALLOC_SET_OPTS2 1
-#endif
-#if (defined(LIBSWRESAMPLE_VERSION_MAJOR) && LIBSWRESAMPLE_VERSION_MAJOR > 4) \
- || (defined(LIBSWRESAMPLE_VERSION_MAJOR) && LIBSWRESAMPLE_VERSION_MAJOR == 4 \
-     && defined(LIBSWRESAMPLE_VERSION_MINOR) && LIBSWRESAMPLE_VERSION_MINOR >= 5)
-#define NSBC_SWR_OPAQUE 1
+/* swresample 版本：只有 SwrContext opaque（4.5+）需要特殊处理
+ * swr_alloc_set_opts 在所有版本都存在 — 永远用它，从 ch_layout.u.mask 提取 channel mask */
+#if LIBSWRESAMPLE_VERSION_MAJOR > 4 \
+ || (LIBSWRESAMPLE_VERSION_MAJOR == 4 && LIBSWRESAMPLE_VERSION_MINOR >= 5)
+#define NSBC_SWR_OPAQUE 1   /* SwrContext 不透明，out_sample_rate 不可访问 */
 #endif
 
-#ifdef NSBC_HAS_SWR_ALLOC_SET_OPTS2
-            /* libswresample 4.6+ (FFmpeg 6.1+): swr_alloc_set_opts2 + AVChannelLayout* */
-            SwrContext *swr = swr_alloc_set_opts2(
-                NULL,
-                /* out */
-                &(AVChannelLayout)AV_CHANNEL_LAYOUT_MONO,
-                target_fmt,
-                target_rate,
-                /* in */
-                &ctx->ch_layout,
-                ctx->sample_fmt,
-                ctx->sample_rate,
-                0, NULL);
-#else
-            /* libswresample <4.6: swr_alloc_set_opts + channel mask */
+            /* swr_alloc_set_opts 在所有 FFmpeg 版本都有 — 统一用这个，避免版本判断
+             * 从新 API ctx->ch_layout.u.mask 或旧 API ctx->channel_layout 取 channel mask */
             uint64_t in_mask =
 #if LIBAVCODEC_VERSION_MAJOR >= 59
                 ctx->ch_layout.u.mask;
@@ -222,12 +199,10 @@ static int av_codec_open(struct codec_sess *sess, int is_decoder)
                 ctx->sample_fmt,
                 ctx->sample_rate,
                 0, NULL);
-#endif
             if (swr) {
                 swr_init(swr);
                 sess->swr = swr;
 #ifdef NSBC_SWR_OPAQUE
-                /* libswresample 4.5+: SwrContext opaque, out_sample_rate 不可访问，缓存 */
                 sess->swr_out_rate = target_rate;
 #endif
                 llog(LOG_DEBUG, "av",
