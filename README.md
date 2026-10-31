@@ -40,6 +40,7 @@
   - [Architecture](#architecture)
     - [Core Components](#core-components)
     - [Module System](#module-system)
+      - [mod.load — The Dynamic Module Manifest](#modload--the-dynamic-module-manifest)
   - [Module List](#module-list)
     - [Statically linked (built into `nsbcd`)](#statically-linked-built-into-nsbcd)
     - [Dynamically loaded (`mod_*.so`)](#dynamically-loaded-mod_so)
@@ -216,7 +217,12 @@ sequenceDiagram
 apt-get update && apt-get install -y \
     build-essential pkg-config git cmake \
     libssl-dev libsrtp2-dev libpcre2-dev libedit-dev \
-    libsqlite3-dev libpq-dev libmysqlclient-dev libopus-dev
+    libsqlite3-dev libpq-dev libmysqlclient-dev libopus-dev \
+    libavcodec-dev libavutil-dev libswresample-dev libswscale-dev pkg-config
+
+
+
+
 
 # Rust toolchain (for nsbc-web sidecar)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh

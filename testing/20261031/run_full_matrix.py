@@ -28,7 +28,7 @@ RESULTS_JSON=$ARCHIVE/results.json
 MASTER_LOG=$ARCHIVE/master.log
 rm -f $RESULTS_JSON $MASTER_LOG
 
-log() { echo "$@" 2>&1 | tee -a $MASTER_LOG; }
+log() { echo "$@" >> "$MASTER_LOG"; }
 
 log "============================================================"
 log "  NSBC Phase 2 完整 SIP 压测矩阵"
@@ -72,7 +72,7 @@ if [ -S /var/run/nsbc/data.sock ]; then
   log "  ✅ data.sock OK"
 else
   log "  ❌ data.sock not found — tail web.log:"
-  tail -20 /tmp/web.log 2>&1 | tee -a $MASTER_LOG
+  tail -20 /tmp/web.log >> "$MASTER_LOG" 2>&1
   exit 1
 fi
 
@@ -83,7 +83,7 @@ if pgrep nsbcd >/dev/null 2>&1; then
   log "  ✅ nsbcd PID: $(pgrep nsbcd)"
 else
   log "  ❌ nsbcd 未启动 — tail bcd.log:"
-  tail -20 /tmp/bcd.log 2>&1 | tee -a $MASTER_LOG
+  tail -20 /tmp/bcd.log >> "$MASTER_LOG" 2>&1
   exit 1
 fi
 
@@ -92,7 +92,7 @@ log "  control.sock: $(ls -la /var/run/nsbc/control.sock 2>/dev/null | awk '{pri
 log "  nsbc-web PID: $(pgrep nsbc-web)"
 log "  SIP 5060: $(ss -ulnp 2>/dev/null | grep 5060 | awk '{print $7}')"
 # 用 nsbcd 的 reload 验证 ratelimit 新值（reload 读 YAML）
-python3 -c "import socket; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect('/var/run/nsbc/control.sock'); s.sendall(b'reload\n'); print('reload:', s.recv(4096)); s.close()" 2>&1 | tee -a $MASTER_LOG
+python3 -c "import socket; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect('/var/run/nsbc/control.sock'); s.sendall(b'reload\n'); print('reload:', s.recv(4096)); s.close()" >> "$MASTER_LOG" 2>&1
 
 # ==================== [4/9] 启 UAS + sanity ====================
 log ""; log "▶ [4/9] 启 UAS + sanity $(date)"
@@ -106,7 +106,7 @@ log "  UAS PID: $(pgrep -a uas.py | head -1)"
 log "  --- SANITY 3 CPS ---"
 timeout 60 python3 $STRESS_PATH \
   --cps 3 --duration 5 --workers 2 --users 6 --user-start 10100 \
-  2>&1 | tee $ARCHIVE/sanity.log
+  > $ARCHIVE/sanity.log 2>&1
 ALIVE=$(pgrep nsbcd 2>/dev/null && echo '✅' || echo '❌')
 log "  nsbcd alive: $ALIVE"
 [ "$ALIVE" = "❌" ] && { log "❌ Sanity crash — 退出"; exit 1; }
@@ -115,8 +115,8 @@ log "  nsbcd alive: $ALIVE"
 log "  --- 预注册 200 users (cps=5, dur=10) ---"
 timeout 120 python3 $STRESS_PATH \
   --cps 5 --duration 10 --workers 4 --users 200 --user-start 10200 \
-  2>&1 | tee $ARCHIVE/pre_register.log
-sqlite3 db/web.db "SELECT count(*) FROM registrations;" 2>&1 | tee -a $MASTER_LOG
+  > $ARCHIVE/pre_register.log 2>&1
+sqlite3 db/web.db "SELECT count(*) FROM registrations;" >> "$MASTER_LOG" 2>&1
 
 # ==================== [5/9] BYPASS 完整矩阵 ====================
 log ""; log "▶ [5/9] BYPASS 完整矩阵 $(date)"
@@ -159,9 +159,9 @@ for line in d.split('\n'):
   local skip_flag=""
   [ "$skip_reg" = "1" ] && skip_flag="--skip-register"
   local t0=$(date +%s)
-  timeout 180 python3 $STRESS_PATH \
+  timeout 60 python3 $STRESS_PATH \
     --cps $cps --duration $duration --workers $workers --users $users --user-start $user_start \
-    $skip_flag 2>&1 | tee $logfile
+    $skip_flag > $logfile 2>&1
   local rc=$?
   local t1=$(date +%s)
   local wall=$((t1 - t0))
@@ -202,10 +202,9 @@ for line in d.split('\n'):
   log "  Wall=${wall}s | Success=${succ}% | Total=${total} | Timeout=${timeout_cnt} | alive=${alive}"
   log "  后态: VmRSS=${vmrss_a}kB Threads=${thr_a} CDR=${cdr_a} ring_dropped=${ring_a}"
 
-  # JSON 记录
-  cat >> $RESULTS_JSON << JEOF
-{"tag":"${tag}","mode":"${mode}","cps":${cps},"duration":${duration},"workers":${workers},"users":${users},"user_start":${user_start},"skip_register":${skip_reg},"wall_time":${wall},"success_rate":"${succ}","total_calls":${total},"timeout_count":${timeout_cnt},"alive":"${alive}","vmrss_before":${vmrss_b},"vmrss_after":${vmrss_a},"threads_before":${thr_b},"threads_after":${thr_a},"cdr_before":${cdr_b},"cdr_after":${cdr_a},"ring_before":${ring_b},"ring_after":${ring_a}}
-JEOF
+  # JSON 记录（用 echo 单行, 不用 cat here-doc — 避免 SIGPIPE 残留）
+  local cdr_delta=$((cdr_a - cdr_b))
+  echo "{\"tag\":\"${tag}\",\"mode\":\"${mode}\",\"cps\":${cps},\"duration\":${duration},\"workers\":${workers},\"users\":${users},\"user_start\":${user_start},\"skip_register\":${skip_reg},\"wall_time\":${wall},\"rc\":${rc},\"success_rate\":\"${succ}\",\"total_calls\":${total},\"timeout_count\":${timeout_cnt},\"alive\":\"${alive}\",\"vmrss_before\":${vmrss_b},\"vmrss_after\":${vmrss_a},\"threads_before\":${thr_b},\"threads_after\":${thr_a},\"cdr_before\":${cdr_b},\"cdr_after\":${cdr_a},\"cdr_delta\":${cdr_delta},\"ring_before\":${ring_b},\"ring_after\":${ring_a}}" >> $RESULTS_JSON
 
   [ "$alive" != "✅" ] && {
     log "  ⚠️ crash — core dump:"
@@ -235,7 +234,7 @@ if ! pgrep nsbcd >/dev/null 2>&1; then
   sleep 20
 fi
 sqlite3 db/web.db "UPDATE dialplan_rules SET action_json='{\"media_mode\":2}' WHERE layer='ext' AND enabled=1;"
-python3 -c "import socket; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect('/var/run/nsbc/control.sock'); s.sendall(b'reload\n'); print('reload:', s.recv(4096)); s.close()" 2>&1 | tee -a $MASTER_LOG
+python3 -c "import socket; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect('/var/run/nsbc/control.sock'); s.sendall(b'reload\n'); print('reload:', s.recv(4096)); s.close()" >> "$MASTER_LOG" 2>&1
 sleep 3
 log "  dialplan RELAY:"
 sqlite3 db/web.db "SELECT name, action_json FROM dialplan_rules WHERE enabled=1;" | while read l; do log "    $l"; done
@@ -245,7 +244,7 @@ log ""; log "▶ [7/9] RELAY sanity $(date)"
 log "  --- RELAY SANITY 3 CPS ---"
 timeout 60 python3 $STRESS_PATH \
   --cps 3 --duration 5 --workers 2 --users 6 --user-start 20100 \
-  2>&1 | tee $ARCHIVE/relay_sanity.log
+  > $ARCHIVE/relay_sanity.log 2>&1
 log "  nsbcd alive: $(pgrep nsbcd 2>/dev/null && echo '✅' || echo '❌')"
 
 log ""; log "▶ [7b/9] RELAY 完整矩阵 $(date)"

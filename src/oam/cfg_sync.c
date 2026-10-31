@@ -32,7 +32,7 @@
 #define _GNU_SOURCE
 #endif
 #include "nsbc_common.h"
-#include "uds_client.h"
+#include "uDS_client.h"
 #include "route_table.h"
 #include "dialplan.h"
 #include "sip_profile.h"

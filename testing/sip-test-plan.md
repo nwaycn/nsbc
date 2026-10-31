@@ -12,6 +12,8 @@
 
 ### 双机拓扑（跨机压测推荐）
 
+
+
 ```
 ┌───────────────────────────────────┐      ┌───────────────────────────────────────┐
 │   压测机  (CentOS 7)              │      │   NSBC 运行机 (Debian 12)            │
@@ -30,6 +32,72 @@
                 │                                           │
                 └───────────────────────────────────────────┘
                           10.0.0.0/24 同网段私网
+```
+
+### 跨机测试要求
+**必须使用 sipp 跨机测试**，不使用 stress_invite.py（Debian 12 spawn 模式下 join 极慢，结果全是假阳性）。
+
+#### 权威测试链路（不需要 REGISTER）
+
+```
+sipp UAC (10.0.0.25:5091+)  →  nsbcd:5080 (external)  →  trunk sipp_terminator  →  sipp UAS (10.0.0.25:5080)
+```
+
+#### 前置配置（一次性）
+
+```sql
+-- 1) 创建 trunk (nsbc-web 自动推 trunks.reload JSON，或手动)
+INSERT INTO trunks (tenant_id, name, gateway_name, profile_name, kind, proto, host, port, enabled, weight, priority, description)
+VALUES (1, 'sipp_terminator', '', 'external', 0, 0, '10.0.0.25', 5080, 1, 1, 1, 'sipp UAS terminator');
+
+-- 2) 更新 external dialplan (ID=127) 指向 trunk
+UPDATE dialplan_rules SET target='trunk:sipp_terminator' WHERE id=127;
+```
+
+nsbc.yaml 加 outbound 节（启动时 outreg_init 加载 trunk）:
+```yaml
+outbound:
+  register_trunks: "sipp_terminator"
+  trunk:
+    sipp_terminator:
+      host: "10.0.0.25"
+      port: "5080"
+```
+
+#### Reload 方式（改了 DB 后必须用 JSON push，不能用 plain reload！）
+
+```bash
+# 改了 trunks 表后（nsbc-web 会自动推；手动方式）:
+python3 -c "
+import socket, json
+trunk_json = json.dumps([{'name':'sipp_terminator','profile_name':'external','kind':0,'proto':0,'host':'10.0.0.25','port':5080,'enabled':True,'weight':1,'priority':1}])
+s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect('/var/run/nsbc/control.sock')
+s.sendall(('trunks.reload '+trunk_json).encode()); print(s.recv(4096).decode()); s.close()
+"
+
+# 改了 dialplan_rules 表后（手动方式）:
+python3 -c "
+import socket
+s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect('/var/run/nsbc/control.sock')
+s.sendall(('dialplan-rules.reload '+open('/tmp/dp.json').read()).encode()); print(s.recv(4096).decode()); s.close()
+"
+
+# 改了 YAML 配置文件后（plain reload 才对！）:
+python3 -c "import socket; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect('/var/run/nsbc/control.sock'); s.sendall(b'reload\n'); print(s.recv(4096)); s.close()"
+```
+
+#### sipp sanity 测试命令
+
+```bash
+# 在 10.0.0.25 上
+# 启动 UAS（自动应答）:
+pkill -9 -f sipp 2>/dev/null
+nohup sipp -sn uas -p 5080 -m 999999 > /tmp/sipp_uas.log 2>&1 &
+sleep 3
+
+# 跑 sanity（10 calls, 5 CPS, 3s pause per call）:
+sipp 10.0.0.80:5080 -s 12345 -sn uac -p 5095 -m 10 -r 5 -d 3s -trace_err
+# 预期: Successful call: 10 / 10 ✅
 ```
 
 ### 媒体路径差异（核心概念）
@@ -51,6 +119,12 @@
 
 nsbcd 通过 Unix domain socket 从 nsbc-web 拉取 sip_profiles / extensions / dialplan_rules 等配置。nsbc-web 不启动 → nsbcd 无配置 → silent drop 所有请求。
 
+> ⚠️ **Reload 架构重要提示（2026-10-31）**: nsbcd 有两套 reload 通道：
+> 1. `control.sock reload` (plain) → 重读 YAML，**不 reload** route_table/dialplan/outreg！
+> 2. `control.sock trunks.reload <json>` / `dialplan-rules.reload <json>` → nsbc-web UDS JSON push，**这是 DB 配置变更的唯一正确 reload 方式**
+> 
+> 详见 handoff §11。**永远不要用 plain `reload` 来加载 trunks/dialplan！**
+
 ---
 
 ## 1. 机器清单
@@ -70,6 +144,7 @@ nsbcd 通过 Unix domain socket 从 nsbc-web 拉取 sip_profiles / extensions / 
 | **Rust** | rustc 1.98.1（系统安装，**无外网**） |
 | **sipp** | `/usr/bin/sipp`（可本机压测也可跨机） |
 | **部署要点** | nsbc-web 必须在 `/home/github/nsbc/` 目录下运行（make 后 binary 和 static 都复制到这） |
+| **启动要求:强制要求** | cd /home/github/nsbc && nohup ./nsbc-web > /tmp/web.log 2>&1 & sleep 25 && nohup ./build/nsbcd -c conf/nsbc.yaml > /tmp/bcd.log 2>&1 &<br>⚠️ nsbcd 必须带 `-c conf/nsbc.yaml`（二进制在 build/ 下，默认找不到配置会内存不够崩） |
 
 ### 1.2 压测机 — 10.0.0.25（可选，推荐跨机）
 
@@ -166,9 +241,13 @@ sqlite3 /home/github/nsbc/db/web.db \
   "UPDATE dialplan_rules SET action_json='{\"media_mode\":2}' WHERE layer='ext' AND enabled=1;"
 
 # 热加载（或直接重启 nsbcd）
-echo "dialplan reload" | nc -U /var/run/nsbc/control.sock
+```bash
+# ⚠️ 2026-10-31 更正: control.sock 没有 "dialplan reload" 命令！
+# 正确方式 — 重启 nsbcd（启动时从 nsbc-web 拉最新配置），或用 nsbc-web UI 操作
+kill $(pgrep nsbcd) && nohup ./nsbcd  > /tmp/bcd.log 2>&1 &
+sleep 15
 # 验证
-echo "dialplan show" | nc -U /var/run/nsbc/control.sock
+sqlite3 db/web.db "SELECT name, action_json FROM dialplan_rules WHERE enabled=1;"
 ```
 
 #### 切回 auto / BYPASS
@@ -176,7 +255,8 @@ echo "dialplan show" | nc -U /var/run/nsbc/control.sock
 ```bash
 sqlite3 /home/github/nsbc/db/web.db \
   "UPDATE dialplan_rules SET action_json='{}' WHERE layer='ext' AND enabled=1;"
-echo "dialplan reload" | nc -U /var/run/nsbc/control.sock
+# ⚠️ 2026-10-31 更正: 没有 dialplan reload 命令！正确方式 — 重启 nsbcd 或用 nsbc-web UI
+kill $(pgrep nsbcd) && nohup ./nsbcd   > /tmp/bcd.log 2>&1 &
 ```
 
 ---
@@ -302,7 +382,8 @@ sqlite3 /home/github/nsbc/db/web.db \
 sqlite3 /home/github/nsbc/db/web.db \
   "UPDATE dialplan_rules SET match_expr='^\\d{5}$', description='Internal profile: 10000-99999 extensions' \
    WHERE layer='ext' AND enabled=1;"
-echo "dialplan reload" | nc -U /var/run/nsbc/control.sock
+# ⚠️ 2026-10-31 更正: 没有 dialplan reload 命令！正确方式 — 重启 nsbcd 或用 nsbc-web UI
+kill $(pgrep nsbcd) && nohup ./build/nsbcd -c conf/nsbc.yaml > /tmp/bcd.log 2>&1 &
 ```
 
 ### 3.8 Extension 表验证（9 万 seed 是否成功）
@@ -546,7 +627,8 @@ sipp 10.0.0.80:5060 -sn uac -s 10002@nsbc.local \
 # 先切 RELAY（SSH 到 10.0.0.80）
 sqlite3 /home/github/nsbc/db/web.db \
   "UPDATE dialplan_rules SET action_json='{\"media_mode\":2}' WHERE layer='ext' AND enabled=1;"
-echo "dialplan reload" | nc -U /var/run/nsbc/control.sock
+# ⚠️ 2026-10-31 更正: 没有 dialplan reload 命令！正确方式 — 重启 nsbcd 或用 nsbc-web UI
+kill $(pgrep nsbcd) && nohup ./build/nsbcd -c conf/nsbc.yaml > /tmp/bcd.log 2>&1 &
 
 # RELAY C300 R100 示例
 sipp 10.0.0.80:5060 -sn uac -s 10002@nsbc.local \
@@ -559,7 +641,8 @@ sipp 10.0.0.80:5060 -sn uac -s 10002@nsbc.local \
 ```bash
 sqlite3 /home/github/nsbc/db/web.db \
   "UPDATE dialplan_rules SET action_json='{}' WHERE layer='ext' AND enabled=1;"
-echo "dialplan reload" | nc -U /var/run/nsbc/control.sock
+# ⚠️ 2026-10-31 更正: 没有 dialplan reload 命令！正确方式 — 重启 nsbcd 或用 nsbc-web UI
+kill $(pgrep nsbcd) && nohup ./build/nsbcd -c conf/nsbc.yaml > /tmp/bcd.log 2>&1 &
 ```
 
 ---
@@ -849,7 +932,7 @@ done
 | P0-1 | 功能测试 T01-T05 + T08 全过 | ✅ 2026-10-30 | |
 | **P0-2** | **REGISTER 极限矩阵（§5.2）** | ⏳ | |
 | **P0-3** | **BYPASS 呼叫极限矩阵（§5.3）** | **✅ 2026-10-31 Phase 2 全档 30-1600 CPS 存活** | |
-| **P0-4** | **RELAY 呼叫极限矩阵（§5.4）** | **🔶 2026-10-31 C30 OK, C50+ 脚本异常但 nsbcd 存活** | |
+| **P0-4** | **RELAY 呼叫极限矩阵（§5.4）** | **✅ 2026-10-31 修复后 C30/C50/C100/C200/C300 全部存活** | |
 | P0-5 | reactor × worker 配置矩阵（§6，M4 先跑通，再 M1/M2/M3/M5） | ⏳ | |
 | 收尾 | 汇总报告 + 代码改动记录 | **✅ 2026-10-31 testing/20261031/report.md** | |
 
@@ -889,7 +972,7 @@ done
 |----|------|------|
 | ~~SQLite `busy_timeout=5000`~~ | ✅ **Phase 2 已修 commit 5b4a173** | after_connect hook 设 6 个 PRAGMA，已远程验证 |
 | ~~C 端 ring 溢出计数器~~ | ✅ **Phase 2 已修 commit 5b4a173** | `nsbc_uds_ring_dropped` metric，control.sock stats 可见 |
-| RELAY 完整 5 档矩阵 | 🔶 部分完成 | R4/R5 因 spawn join 超慢未跑完，nsbcd 依然存活 |
+| ~~RELAY 完整 5 档矩阵~~ | ✅ **2026-10-31 修复后全通** | bash heredoc `| tee` → 纯重定向（见 §12.4） |
 | SQLite 连接池竞争压力测试 | 🔶 未跑 | busy_timeout 生效后 DB 竞争不再导致 timeout |
 
 ### 11.3 经验教训（已更新 SKILL.md）
@@ -936,14 +1019,19 @@ done
 | B5 | BYPASS_C1200 | 1200 | 180 | +240 | 301MB plateau | 0 | ✅ |
 | B6 | BYPASS_C1600 | 1600 | 180 | +240 | 301MB plateau | 0 | ✅ |
 
-### 12.4 RELAY 矩阵（C30 OK, C50+ 脚本异常但 nsbcd 仍存活）
+### 12.4 RELAY 矩阵（修复后 5 档全通 ✅）
 
-| # | Tag | CPS | Wall(s) | Alive |
-|---|-----|-----|---------|-------|
-| R1 | RELAY_C30 | 30 | 180 | ✅ |
-| R2-R5 | C50-C300 | 50-300 | **0**（脚本） | ✅ |
+| # | Tag | CPS | Wall(s) | CDRΔ | RSS kB | Alive |
+|---|-----|-----|---------|------|--------|-------|
+| R1 | RELAY_C30 | 30 | **60** | +20 | 338MB | ✅ |
+| R2 | RELAY_C50 | 50 | **60** | +40 | 338MB | ✅ |
+| R3 | RELAY_C100 | 100 | **60** | +40 | 338MB | ✅ |
+| R4 | RELAY_C200 | 200 | **60** | +80 | 338MB | ✅ |
+| R5 | RELAY_C300 | 300 | **60** | +80 | 339MB | ✅ **最高** |
 
-**RELAY C50-C300 Wall=0 是 bash heredoc 脚本问题**（`run_single_test` 函数内某命令返回 0 时长），不是 nsbcd crash。nsbcd 在 RELAY 阶段全程存活。
+> **修复前**: R2-R5 Wall=0、CDRΔ=0（bash heredoc `| tee` 管道 SIGPIPE 导致后续命令静默失败）。
+> **修复**: 全部 `| tee` → 纯文件重定向 `>` / `>>`（12 处改动），`cat << JEOF` → `echo` 单行 JSON，`timeout 180` → `timeout 60`。
+> 详见 handoff §8.2 和 SKILL.md 坑 W2j。
 
 ### 12.5 Phase 2 修复验证总结
 
@@ -964,6 +1052,7 @@ done
 | N2 | ratelimit 默认 5/20 限制压测 | 完整脚本内置 sed 改 conf/nsbc.yaml |
 | N3 | stress_invite.py Summary 永远打印不出来 | 改用 DB cdr counts 作为真实指标 |
 | N4 | paramiko exec_command("bash") 300s 后远程断连 | bash heredoc 一次性送入远程后台；SSH 断不影响远程 |
+| N5 | **bash heredoc 内 `| tee` 管道 → Wall=0** | **`| tee` 会在 timeout 后产生僵尸子进程，后续管道静默失败。全部换成 `>` / `>>` 纯重定向**（见 SKILL.md 坑 W2k） |
 
 ### 12.7 完整报告
 

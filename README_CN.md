@@ -35,6 +35,7 @@
   - [内部架构](#内部架构)
     - [核心组件](#核心组件)
     - [模块系统](#模块系统)
+      - [mod.load —— 动态模块清单](#modload--动态模块清单)
   - [模块清单](#模块清单)
     - [静态链接（内置 nsbcd）](#静态链接内置-nsbcd)
     - [动态加载（`mod_*.so`）](#动态加载mod_so)
@@ -214,7 +215,8 @@ sequenceDiagram
 apt-get update && apt-get install -y \
     build-essential pkg-config git cmake \
     libssl-dev libsrtp2-dev libpcre2-dev libedit-dev \
-    libsqlite3-dev libpq-dev libmysqlclient-dev libopus-dev
+    libsqlite3-dev libpq-dev libmysqlclient-dev libopus-dev \
+    libavcodec-dev libavutil-dev libswresample-dev libswscale-dev pkg-config
 
 # Rust 工具链（用于 nsbc-web 边车）
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -236,8 +238,7 @@ chmod +x configure
 
 ./configure                 # 扫描 src/，读取 conf/modules.conf
 
-# 可选：./configure --without-modules=hello,ai_dialog
-# 可选：./configure --prefix=/opt/nsbc
+
 
 make -j$(nproc)
 ```
