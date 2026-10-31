@@ -131,9 +131,12 @@ SRC_DIRS := $(shell find src -type d)
 #   src/media/codec/g*  — codec impl files (g711/g729): g711 hard-linked for recorder (added separately in SRCS_BASE),
 #                         g729 goes to mod_codecs.so dynamic module; media_codec.c (registry + transcode engine)
 #                         must be kept (core/moat_bridge/obs_control hard-depend on codec_registry_*/transcode_*)
+#   src/media/play*     — playback engine (playback 是 DYNAMIC 模块，进 mod_playback.so)
+#                         远程服务器可能残留 src/media/playback_engine.c 幽灵文件（老版本位置），必须排除
 SRCS_CORE ?= $(shell find src -name '*.c' ! -name 'nsbc_cli.c' \
               ! -path 'src/mod/*' ! -path 'src/media/rec/*' \
-              ! -path 'src/db/*' ! -path 'src/media/codec/g*.c')
+              ! -path 'src/db/*' ! -path 'src/media/codec/g*.c' \
+              ! -path 'src/media/play*')
 # default hand-picked STATIC modules (fallback when no configure)
 # note: intentionally excludes src/mod/codecs/*——codecs go DYNAMIC, g711.c hard-linked separately into main binary
 SRCS_MOD_STATIC ?= $(shell (find src/mod/endpoints src/mod/outbound_reg -name '*.c'; \
@@ -156,8 +159,8 @@ STATIC_MOD_SRCS ?= $(SRCS_MOD_STATIC)
 # functions (cdr_wal_create/append/destroy/replay), billing is a STATIC module link dep.
 # sqlite3 code in cdr_wal.c is all inside #ifdef NSBC_WITH_SQLITE, as long as override sets NSBC_WITH_SQLITE=0
 # the preprocessor strips the sqlite3 branch, leaving pure-text WAL backend, does not touch DB at all.
-STATIC_MOD_SRCS := $(filter-out src/db/%.c src/mod/codecs/%.c src/media/codec/g%.c,$(STATIC_MOD_SRCS))
-SRCS_CORE := $(filter-out src/db/%.c src/media/codec/g%.c,$(SRCS_CORE))
+STATIC_MOD_SRCS := $(filter-out src/db/%.c src/mod/codecs/%.c src/media/codec/g%.c src/mod/playback/%.c src/media/play%,$(STATIC_MOD_SRCS))
+SRCS_CORE := $(filter-out src/db/%.c src/media/codec/g%.c src/media/play%,$(SRCS_CORE))
 
 # recorder.c (main binary) hard-depends on g711_ulaw_decode / g711_alaw_decode,
 # but configure puts codecs in DYNAMIC, g711.c only goes into mod_codecs.so —— main binary link loses symbols.
@@ -173,7 +176,8 @@ SRCS_BASE := $(sort $(SRCS_CORE) \
 # ---- final fallback: filter out from SRCS_BASE again ----
 # even if filter-out above missed them (config.mk directly sets SRCS_BASE), also exclude db/ here
 # cdr_wal.c INTENTIONALLY kept —— billing STATIC module depends on it
-SRCS_BASE := $(filter-out src/db/%.c,$(SRCS_BASE))
+# src/media/play* covers legacy src/media/playback_engine.c (ghost file on remote servers)
+SRCS_BASE := $(filter-out src/db/%.c src/media/play%,$(SRCS_BASE))
 
 # vendored bcg729 —— compile into mod_codecs.so, no longer into nsbcd
 BCG729_SRCS := $(wildcard 3rd/bcg729/src/*.c)
