@@ -131,9 +131,9 @@ sequenceDiagram
 | Relay | `rtp_relay_start` | src/media/bridge/media_bridge.c:2144 | Allocate RTP/RTCP fd pairs per side |
 | Relay loop | `relay_recv_one` | src/media/bridge/media_bridge.c:376 | Per-packet forward (SRTP decrypt if needed) |
 | Outbound | `send_invite_b` | src/sip/b2bua.c:3820 (path) | Build + send B-leg INVITE |
-| **Worker offload** | `wpool_submit_any` | src/core/worker.c:590 | Worker Pool 任意 worker 投递（RR + slot_ready skip）|
-| **Worker offload** | `wpool_submit` | src/core/worker.c:551 | Worker Pool 固定 shard 投递（hash_key % n_active）|
-| **BYE → CDR** | `billing_cdr` (in-call) → wpool_submit_any → WAL flush | src/mod/billing/cdr.c | 呼叫拆除时 reactor 线程投递，Worker 异步持久化 |
+| **Worker offload** | `wpool_submit_any` | src/core/worker.c:590 | Worker pool submit-any (RR + slot_ready skip dead slots) |
+| **Worker offload** | `wpool_submit` | src/core/worker.c:551 | Worker pool fixed-shard submit (hash_key % n_active) |
+| **BYE → CDR** | `billing_cdr` (in-call) → wpool_submit_any → WAL flush | src/mod/billing/cdr.c | Reactor thread submits on call teardown; Worker persists async |
 
 ---
 

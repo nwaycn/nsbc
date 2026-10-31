@@ -1,9 +1,9 @@
 # NSBC Cookbook — v0.5.0-beta
 
-> **版本**: `v0.5.0-beta` (commit `28f0136`)
-> **范围**: 从 `nsbc-web`（Rust sidecar）到 `nsbcd`（C daemon）的完整操作手册
-> **读者**: 运维、SIP 开发、二次开发者
-> **前置阅读**: [architecture.md](architecture.md) · [user-guide.md](user-guide.md) · [README.md](../README.md)
+> **Version**: `v0.5.0-beta` (commit `28f0136`)
+> **Scope**: End-to-end operation manual from `nsbc-web` (Rust sidecar) to `nsbcd` (C daemon)
+> **Audience**: SREs, SIP developers, secondary developers
+> **Prerequisites**: [architecture.md](architecture.md) · [user-guide.md](user-guide.md) · [README.md](../README.md)
 
 ---
 
@@ -73,8 +73,8 @@
 │  Built on FreeSWITCH-inspired module manager · reactor thread pool │
 │                                                                     │
 │  ┌─ cfg.c (YAML) ───────────────────────────────────────────────┐  │
-│  │  cfg.pull_all ← 启动/reload 时从 web 同步 DB 所有配置表       │  │
-│  │  cfg_sync_after_reload() → 调各模块 _reload_json()             │  │
+│  │  cfg.pull_all ← pulls all DB config tables from web at startup/reload │
+│  │  cfg_sync_after_reload() → calls per-module _reload_json()              │  │
 │  └──────────────────────────────────────────────────────────────┘  │
 │                                                                     │
 │  ┌─ SIP Signaling ──┐  ┌─ Registrar ──┐  ┌─ Media Bridge ──┐      │
@@ -148,27 +148,27 @@ nsbc/
 ├── conf/nsbc.yaml             # active YAML config
 ├── configs/nsbc.yaml          # built-in default (template)
 ├── tls/                       # nsbc-web TLS certs (auto-generated)
-├── mod/                       # POST_BUILD_COPY 从 build/mod/ 复制过来
-│   ├── mod.load               # ← 动态模块清单（每行一个裸 .so 文件名）
+├── mod/                       # sync-mod copies build/mod/ → ./mod/ (phony target, every make)
+│   ├── mod.load               # ← dynamic module manifest (one bare .so filename per line)
 │   ├── mod_codecs.so          # G.711 + G.729 (built-in + bcg729)
 │   ├── mod_av.so              # FFmpeg codec bridge (G722/Opus/H264/VP8/VP9)
 │   ├── mod_cachedb.so
 │   └── ...
 ├── build/
 │   ├── mod/
-│   │   ├── mod.load           # configure 原始产出（L665-677）
-│   │   └── mod_*.so           # Makefile 构建产物
+│   │   ├── mod.load           # configure raw output (L665-677)
+│   │   └── mod_*.so           # Makefile build output
 │   └── nsbcd
-├── .config/config.mk          # configure 生成的 Makefile include
-├── src/core/builtin_modules.gen.inc  # configure 生成的静态模块数组
+├── .config/config.mk          # configure-generated Makefile include
+├── src/core/builtin_modules.gen.inc  # configure-generated static module array
 └── logs/nsbcd.log             # default log file
 ```
 
-**mod.load 关键点：**
-- 它和 `.so` 文件**同级**（在 `mod/` 或 `build/mod/` 里），不与 `nsbcd` 二进制同级
-- 清单里只写裸文件名（`mod_codecs.so`），**不含路径** — 模块管理器从 `dirname(mod.load)` 推导 dlopen base dir
-- nsbcd 按 5 个候选路径依次查找：`exe_dir/mod/mod.load` → YAML override → `build/mod/mod.load` → `build/mod.load` → `/etc/nsbc/mod/mod.load`
-- **HARD_STATIC** 模块（signaling, security, dialplan, oam, ...）永远静态链接，不进入 mod.load
+**mod.load key points:**
+- It lives **alongside** the `.so` files (in `mod/` or `build/mod/`), never with the `nsbcd` binary
+- Entries are bare filenames only (`mod_codecs.so`), **no paths** — module manager derives dlopen base dir from `dirname(mod.load)`
+- nsbcd searches 5 candidate paths in order: `exe_dir/mod/mod.load` → YAML override → `build/mod/mod.load` → `build/mod.load` → `/etc/nsbc/mod/mod.load`
+- **HARD_STATIC** modules (signaling, security, dialplan, oam, ...) are always statically linked — never in mod.load
 
 ---
 
@@ -567,7 +567,7 @@ Commands split into two families: **built-in** (hardcoded if-chain in obs_contro
 | `show registrations` | L0 | Current binding count |
 | `show apps` | L0 | Registered dialplan applications (answer/ai/bridge/...) |
 | `show codecs` | L0 | Audio + video codec table (name/PT/rate/ch/ptime/dec/enc/source) |
-| `show modules` | L0 | **按 category 分组**列出全部模块 + 状态 + flags |
+| `show modules` | L0 | List all modules **grouped by category** with state + flags |
 | `show event_bus` | L0 | Per-core ring buffer write/read/drop counters |
 | `show rates` | L0 | Billing rate table |
 | `show balances` | L0 | Account balances |

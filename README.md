@@ -140,8 +140,8 @@ graph TD
     B2B --> PSTN
     B2B --> Trunk
 
-    %% === Reactor ↔ Worker 交互 ===
-    RE_MGR -->|"wpool_submit_any<br/>CDR flush offload<br/>reactor 不阻塞 I/O"| WK
+    %% === Reactor ↔ Worker interaction ===
+    RE_MGR -->|"wpool_submit_any<br/>CDR flush offload<br/>reactor never blocks on I/O"| WK
 
     Admin -.->|HTTPS 8443| AX
     AX --> SPA
@@ -255,7 +255,7 @@ make -j$(nproc)
 ```bash
 cd web
 
-rm Cargo.lock # 按自己的依赖版本管理
+rm Cargo.lock # let each toolchain pick its own dependency versions
 
 make vendor
 
@@ -517,23 +517,23 @@ The `nsbc_cli` utility communicates with `nsbcd` over the Unix domain socket (`/
 # Core diagnostics
 nsbc_cli help                  # built-in + registry grouped by [b2b] [mod] [security] ...
 nsbc_cli version               # build version, commit, build date
-nsbc_cli show modules          # 按 category 分组列出全部模块 + 状态 + flags
-nsbc_cli show codecs           # 音频/视频 codec 表（FFmpeg 后端 = mod_av）
-nsbc_cli show calls             # active/total/failed 计数
+nsbc_cli show modules          # all modules grouped by category + state + flags
+nsbc_cli show codecs           # audio/video codec table (FFmpeg backend = mod_av)
+nsbc_cli show calls             # active/total/failed counters
 
 # Module hot-reload (no nsbcd restart needed)
-nsbc_cli mod.reload av         # make 后热重启 mod_av.so
-nsbc_cli mod.unload av         # 动态卸载（CALL_PATH/REQUIRED 拒绝）
-nsbc_cli mod.load av           # 动态加载
+nsbc_cli mod.reload av         # hot-restart mod_av.so after make
+nsbc_cli mod.unload av         # dynamic unload (CALL_PATH/REQUIRED rejected)
+nsbc_cli mod.load av           # dynamic load
 
 # Call control (b2b group)
-nsbc_cli uuid_kill <call-id>   # 强制挂断
-nsbc_cli uuid_bridge <a> <b>   # 桥接两通话
-nsbc_cli originate <url>       # 外呼
+nsbc_cli uuid_kill <call-id>   # force hangup
+nsbc_cli uuid_bridge <a> <b>   # bridge two calls
+nsbc_cli originate <url>       # outbound call origination
 
 # Security
-nsbc_cli security.ban.list         # 封禁表
-nsbc_cli security.blacklist.reload # 热更新黑名单
+nsbc_cli security.ban.list         # ban table
+nsbc_cli security.blacklist.reload # hot-push blacklist JSON
 
 # SIP trace
 nsbc_cli sofia siptrace on
