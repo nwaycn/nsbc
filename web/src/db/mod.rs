@@ -6290,6 +6290,14 @@ pub struct RatePlanCreate {
     pub enabled:     bool,
 }
 
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RatePlanUpdate {
+    pub name:        Option<String>,
+    pub description: Option<String>,
+    pub enabled:     Option<bool>,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct RatePlanEntry {
     pub id:              i64,
@@ -7666,6 +7674,15 @@ pub async fn delete_rate_plan(&self, id: i64) -> Result<bool, sqlx::Error> {
     Ok(res.rows_affected() > 0)
 }
 
+pub async fn count_rate_plan_entries_for_plan(&self, plan_id: i64) -> Result<i64, sqlx::Error> {
+    let Some(pool) = self.pool() else { return Ok(0); };
+    let backend = self.backend();
+    sqlx::query_scalar::<_, i64>(&fix_ph("SELECT COUNT(*) FROM rate_plan_entries WHERE plan_id = $1", backend))
+        .bind(plan_id)
+        .fetch_one(pool)
+        .await
+}
+
 // ================ rate_plan_entries CRUD ================
 
 pub async fn list_rate_plan_entries(
@@ -7825,7 +7842,7 @@ pub async fn delete_trunk_rate_override(&self, id: i64) -> Result<bool, sqlx::Er
 // ================ billing_transactions CRUD ================
 
 pub async fn list_billing_transactions(
-    &self, account_id: Option<i64>, call_id: Option<&str>,
+    &self, account_id: Option<i64>, call_id: Option<&str>, tx_type: Option<&str>,
     limit: i64, offset: i64,
 ) -> Result<(Vec<BillingTransaction>, i64), sqlx::Error> {
     let Some(pool) = self.pool() else { return Ok((Vec::new(), 0)); };
@@ -7843,6 +7860,11 @@ pub async fn list_billing_transactions(
         let ph = format!("${}", binds.len() + 1);
         where_parts.push(format!("call_id LIKE {ph}"));
         binds.push(format!("%{}%", c));
+    }
+    if let Some(t) = tx_type {
+        let ph = format!("${}", binds.len() + 1);
+        where_parts.push(format!("tx_type = {ph}"));
+        binds.push(t.to_string());
     }
     let where_sql = if where_parts.is_empty() { String::new() } else { format!("WHERE {}", where_parts.join(" AND ")) };
     let count_sql = fix_ph(&format!("SELECT COUNT(*) FROM billing_transactions {where_sql}"), backend);

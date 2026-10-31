@@ -37,7 +37,7 @@ use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 
 use crate::coreclient::{AccountList, CoreApi, RateList};
-use crate::db::{AccountCreate, RateTableCreate, RateTableUpdate};
+use crate::db::{AccountCreate, RatePlanCreate, RatePlanEntryCreate, RatePlanUpdate, RateTableCreate, RateTableUpdate};
 use crate::error::ApiError;
 use crate::sync;
 use crate::AppState;
@@ -63,6 +63,25 @@ where
         .route("/balances/core", get(core_balances::<C>))
         .route("/balances/:id", get(get_account::<C>).put(update_account::<C>).delete(close_account::<C>))
         .route("/balances/:id/topup", post(topup_account::<C>))
+        // ===== Rate Plans =====
+        .route("/rate-plans", get(list_rate_plans::<C>).post(create_rate_plan::<C>))
+        .route("/rate-plans/reload", post(reload_rate_plans::<C>))
+        .route(
+            "/rate-plans/:id",
+            get(get_rate_plan::<C>)
+                .put(update_rate_plan::<C>)
+                .delete(delete_rate_plan::<C>),
+        )
+        // ===== Rate Plan Entries =====
+        .route("/rate-plan-entries", get(list_rate_plan_entries::<C>).post(create_rate_plan_entry::<C>))
+        .route("/rate-plan-entries/reload", post(reload_rate_plan_entries::<C>))
+        .route(
+            "/rate-plan-entries/:id",
+            get(get_rate_plan_entry::<C>)
+                .delete(delete_rate_plan_entry::<C>),
+        )
+        // ===== Billing Transactions =====
+        .route("/transactions", get(list_transactions::<C>))
         .layer(ServiceBuilder::new().layer(TraceLayer::new_for_http()))
 }
 
@@ -396,4 +415,264 @@ async fn core_balances<C: CoreApi + Clone + 'static>(
     State(st): State<Arc<AppState<C>>>,
 ) -> Result<Json<AccountList>, ApiError> {
     Ok(Json(st.core.show_balances().await?))
+}
+
+// ================================================================
+// Rate Plan CRUD (Phase 1)
+// ================================================================
+
+#[derive(Debug, Deserialize, Default)]
+pub struct RatePlanListQuery {
+    pub tenant_id: Option<i64>,
+    pub enabled:   Option<String>,
+    pub limit:     Option<i64>,
+    pub offset:    Option<i64>,
+}
+
+async fn list_rate_plans<C: CoreApi + Clone + Send + Sync>(
+    State(st): State<Arc<AppState<C>>>,
+    Query(q): Query<RatePlanListQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    st.db.pool().ok_or(ApiError::DbUnavailable)?;
+
+    let enabled = match q.enabled.as_deref() {
+        Some("true")  => Some(true),
+        Some("false") => Some(false),
+        _ => None,
+    };
+    let limit  = q.limit.unwrap_or(50).clamp(1, 500);
+    let offset = q.offset.unwrap_or(0).max(0);
+
+    let (items, total) = st.db
+        .list_rate_plans(q.tenant_id, enabled, limit, offset)
+        .await.map_err(|e| ApiError::Db(e.to_string()))?;
+
+    Ok(Json(json!({ "items": items, "total": total })))
+}
+
+async fn get_rate_plan<C: CoreApi + Clone + Send + Sync>(
+    State(st): State<Arc<AppState<C>>>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse, ApiError> {
+    st.db.pool().ok_or(ApiError::DbUnavailable)?;
+    let row = st.db.get_rate_plan(id).await
+        .map_err(|e| ApiError::Db(e.to_string()))?
+        .ok_or_else(|| ApiError::NotFound("rate plan not found".into()))?;
+    Ok(Json(row))
+}
+
+async fn create_rate_plan<C: CoreApi + Clone + Send + Sync + 'static>(
+    State(st): State<Arc<AppState<C>>>,
+    Json(body): Json<RatePlanCreate>,
+) -> Result<impl IntoResponse, ApiError> {
+    st.db.pool().ok_or(ApiError::DbUnavailable)?;
+
+    let row = st.db.create_rate_plan(body).await.map_err(|e| {
+        if let sqlx::Error::Database(ref db_err) = e {
+            let msg = db_err.message().to_ascii_lowercase();
+            if msg.contains("unique") || msg.contains("duplicate") {
+                return ApiError::Conflict("rate plan name already exists".into());
+            }
+        }
+        ApiError::Db(e.to_string())
+    })?;
+
+    sync::spawn_push(st.clone(), sync::Kind::RatePlans);
+    Ok((StatusCode::CREATED, Json(row)))
+}
+
+async fn update_rate_plan<C: CoreApi + Clone + Send + Sync + 'static>(
+    State(st): State<Arc<AppState<C>>>,
+    Path(id): Path<i64>,
+    Json(body): Json<RatePlanUpdate>,
+) -> Result<impl IntoResponse, ApiError> {
+    st.db.pool().ok_or(ApiError::DbUnavailable)?;
+
+    let row = st.db.update_rate_plan(
+        id,
+        body.name.as_deref(),
+        body.description.as_deref(),
+        body.enabled,
+    ).await.map_err(|e| {
+        match e {
+            sqlx::Error::RowNotFound => ApiError::NotFound("rate plan not found".into()),
+            sqlx::Error::Database(ref db_err) => {
+                let msg = db_err.message().to_ascii_lowercase();
+                if msg.contains("unique") || msg.contains("duplicate") {
+                    return ApiError::Conflict("rate plan name already exists".into());
+                }
+                ApiError::Db(e.to_string())
+            }
+            other => ApiError::Db(other.to_string()),
+        }
+    })?.ok_or_else(|| ApiError::NotFound("rate plan not found".into()))?;
+
+    sync::spawn_push(st.clone(), sync::Kind::RatePlans);
+    Ok(Json(row))
+}
+
+async fn delete_rate_plan<C: CoreApi + Clone + Send + Sync + 'static>(
+    State(st): State<Arc<AppState<C>>>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse, ApiError> {
+    st.db.pool().ok_or(ApiError::DbUnavailable)?;
+
+    // Pre-check: plan must not have entries
+    let entry_count = st.db.count_rate_plan_entries_for_plan(id).await
+        .map_err(|e| ApiError::Db(e.to_string()))?;
+    if entry_count > 0 {
+        return Err(ApiError::Conflict("plan has entries".into()));
+    }
+
+    let deleted = st.db.delete_rate_plan(id).await
+        .map_err(|e| ApiError::Db(e.to_string()))?;
+    if !deleted {
+        return Err(ApiError::NotFound("rate plan not found".into()));
+    }
+
+    sync::spawn_push(st.clone(), sync::Kind::RatePlans);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST /rate-plans/reload — DB enabled rate plans → core UDS rate_plans.reload
+async fn reload_rate_plans<C: CoreApi + Clone + Send + Sync>(
+    State(st): State<Arc<AppState<C>>>,
+) -> Result<impl IntoResponse, ApiError> {
+    st.db.pool().ok_or(ApiError::DbUnavailable)?;
+    let rows = st.db.list_enabled_rate_plans().await
+        .map_err(|e| ApiError::Db(e.to_string()))?;
+    let json = serde_json::to_string(&rows).map_err(|e| ApiError::Db(e.to_string()))?;
+    st.core.reload_rate_plans(&json).await
+        .map_err(|_| ApiError::CoreUnavailable)?;
+    tracing::info!(count = rows.len(), "rate_plans.reload pushed to core");
+    Ok(Json(json!({ "loaded": rows.len() })))
+}
+
+// ================================================================
+// Rate Plan Entry CRUD (Phase 1)
+// ================================================================
+
+#[derive(Debug, Deserialize, Default)]
+pub struct RatePlanEntryListQuery {
+    pub plan_id: Option<i64>,
+    pub enabled:  Option<String>,
+    pub limit:    Option<i64>,
+    pub offset:   Option<i64>,
+}
+
+async fn list_rate_plan_entries<C: CoreApi + Clone + Send + Sync>(
+    State(st): State<Arc<AppState<C>>>,
+    Query(q): Query<RatePlanEntryListQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    st.db.pool().ok_or(ApiError::DbUnavailable)?;
+
+    let enabled = match q.enabled.as_deref() {
+        Some("true")  => Some(true),
+        Some("false") => Some(false),
+        _ => None,
+    };
+    let limit  = q.limit.unwrap_or(50).clamp(1, 500);
+    let offset = q.offset.unwrap_or(0).max(0);
+
+    let (items, total) = st.db
+        .list_rate_plan_entries(q.plan_id, None, enabled, limit, offset)
+        .await.map_err(|e| ApiError::Db(e.to_string()))?;
+
+    Ok(Json(json!({ "items": items, "total": total })))
+}
+
+async fn get_rate_plan_entry<C: CoreApi + Clone + Send + Sync>(
+    State(st): State<Arc<AppState<C>>>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse, ApiError> {
+    st.db.pool().ok_or(ApiError::DbUnavailable)?;
+    let row = st.db.get_rate_plan_entry(id).await
+        .map_err(|e| ApiError::Db(e.to_string()))?
+        .ok_or_else(|| ApiError::NotFound("rate plan entry not found".into()))?;
+    Ok(Json(row))
+}
+
+async fn create_rate_plan_entry<C: CoreApi + Clone + Send + Sync + 'static>(
+    State(st): State<Arc<AppState<C>>>,
+    Json(body): Json<RatePlanEntryCreate>,
+) -> Result<impl IntoResponse, ApiError> {
+    st.db.pool().ok_or(ApiError::DbUnavailable)?;
+
+    let row = st.db.create_rate_plan_entry(body).await.map_err(|e| {
+        if let sqlx::Error::Database(ref db_err) = e {
+            let msg = db_err.message().to_ascii_lowercase();
+            if msg.contains("unique") || msg.contains("duplicate") {
+                return ApiError::Conflict("rate plan entry already exists".into());
+            }
+        }
+        ApiError::Db(e.to_string())
+    })?;
+
+    sync::spawn_push(st.clone(), sync::Kind::RatePlanEntries);
+    Ok((StatusCode::CREATED, Json(row)))
+}
+
+async fn delete_rate_plan_entry<C: CoreApi + Clone + Send + Sync + 'static>(
+    State(st): State<Arc<AppState<C>>>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse, ApiError> {
+    st.db.pool().ok_or(ApiError::DbUnavailable)?;
+
+    let deleted = st.db.delete_rate_plan_entry(id).await
+        .map_err(|e| ApiError::Db(e.to_string()))?;
+    if !deleted {
+        return Err(ApiError::NotFound("rate plan entry not found".into()));
+    }
+
+    sync::spawn_push(st.clone(), sync::Kind::RatePlanEntries);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST /rate-plan-entries/reload — DB enabled rate plan entries → core UDS
+async fn reload_rate_plan_entries<C: CoreApi + Clone + Send + Sync>(
+    State(st): State<Arc<AppState<C>>>,
+) -> Result<impl IntoResponse, ApiError> {
+    st.db.pool().ok_or(ApiError::DbUnavailable)?;
+    let rows = st.db.list_enabled_rate_plan_entries().await
+        .map_err(|e| ApiError::Db(e.to_string()))?;
+    let json = serde_json::to_string(&rows).map_err(|e| ApiError::Db(e.to_string()))?;
+    st.core.reload_rate_plan_entries(&json).await
+        .map_err(|_| ApiError::CoreUnavailable)?;
+    tracing::info!(count = rows.len(), "rate_plan_entries.reload pushed to core");
+    Ok(Json(json!({ "loaded": rows.len() })))
+}
+
+// ================================================================
+// Billing Transactions (Phase 1)
+// ================================================================
+
+#[derive(Debug, Deserialize, Default)]
+pub struct TransactionListQuery {
+    pub account_id: Option<i64>,
+    pub call_id:    Option<String>,
+    pub tx_type:    Option<String>,
+    pub limit:      Option<i64>,
+    pub offset:     Option<i64>,
+}
+
+async fn list_transactions<C: CoreApi + Clone + Send + Sync>(
+    State(st): State<Arc<AppState<C>>>,
+    Query(q): Query<TransactionListQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    st.db.pool().ok_or(ApiError::DbUnavailable)?;
+
+    let limit  = q.limit.unwrap_or(50).clamp(1, 500);
+    let offset = q.offset.unwrap_or(0).max(0);
+
+    let (items, total) = st.db
+        .list_billing_transactions(
+            q.account_id,
+            q.call_id.as_deref(),
+            q.tx_type.as_deref(),
+            limit,
+            offset,
+        )
+        .await.map_err(|e| ApiError::Db(e.to_string()))?;
+
+    Ok(Json(json!({ "items": items, "total": total })))
 }
