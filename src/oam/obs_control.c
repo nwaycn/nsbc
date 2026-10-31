@@ -171,6 +171,7 @@ static void ctl_help(ctl_conn_t *c)
         "  uuid_dump <call-id>  per-leg diagnostic dump (L0)\n"
         "  cdr.recent [N]       last N finished CDRs from in-memory ring (default 500, L0)\n"
         "  cdr.flush            flush pending CDR ring to persist/spool (L1, audited)\n"
+        "  show codecs          registered audio/video codec table (L0)\n"
         "  show cdr             cdr sink aggregate counters (L0)\n"
         "  log dump [N]         last N log lines from ring buffer (default 200)\n"
         "  log stats            dropped/written counter (debug)\n"
@@ -183,6 +184,9 @@ static void ctl_help(ctl_conn_t *c)
         "  config.reload        transactional hot-reload (L1, audited)\n"
         "  hangup <call-id>     force-terminate a call by Call-ID (L1, audited)\n"
         "  reload               alias of config.reload\n"
+        "  mod.load <name>      动态加载 mod_<name>.so (L1, audited)\n"
+        "  mod.unload <name>    stop + fini + dlclose 模块 (L1, audited)\n"
+        "  mod.reload <name>    unload + load + init + start 一键热更 (L1, audited)\n"
         "  sub <topics>         订阅实时推送（events/cdr/log/metrics，逗号分隔；如 sub events,cdr）\n"
         "  unsub <topics>       取消订阅（无参取消全部）\n"
         "  sub.stat             查看本连接订阅状态\n"
@@ -1583,12 +1587,12 @@ static void dispatch(ctl_conn_t *c, char *line)
         cmd_show_cdr(c);
     } else if (strcmp(line, "hangup") == 0) {
         cmd_hangup(c, arg);
-    } else if (strcmp(line, "load") == 0) {
-        /* ---- load <modname> — 动态加载一个 .so 模块 ----
-         * 从 exe_dir/mod、./mod、build/mod、/etc/nsbc/mod 自动找 mod_<name>.so
-         * 已存在同名模块先 unload。加载成功后自动 init + start。*/
+    } else if (strcmp(line, "mod.load") == 0) {
+        /* ---- mod.load <name> — 动态加载 .so 模块 ----
+         * 4 候选路径：exe_dir/mod, ./mod, build/mod, /etc/nsbc/mod
+         * 已存在同名模块先 unload。加载成功自动 init + start。*/
         if (!arg || !*arg) {
-            ctl_printf(c, "ERR usage: load <modname> (e.g. load av)\n");
+            ctl_printf(c, "ERR usage: mod.load <modname> (e.g. mod.load av)\n");
         } else {
             nsbc_modmgr_t *mm = modmgr_get_global();
             if (!mm) {
@@ -1596,16 +1600,16 @@ static void dispatch(ctl_conn_t *c, char *line)
             } else {
                 int rc = modmgr_load_by_name(mm, arg, g_ctx);
                 if (rc == NSBC_OK)
-                    ctl_printf(c, "OK load '%s' success\n", arg);
+                    ctl_printf(c, "OK mod.load '%s' success\n", arg);
                 else
-                    ctl_printf(c, "ERR load '%s' rc=%d\n", arg, rc);
+                    ctl_printf(c, "ERR mod.load '%s' rc=%d\n", arg, rc);
             }
         }
-    } else if (strcmp(line, "unload") == 0) {
-        /* ---- unload <modname> — 安全卸载一个动态模块 ----
-         * stop → fini → dlclose。CALL_PATH / REQUIRED 模块拒绝卸载。*/
+    } else if (strcmp(line, "mod.unload") == 0) {
+        /* ---- mod.unload <name> — stop + fini + dlclose ----
+         * CALL_PATH / REQUIRED 模块拒绝卸载 */
         if (!arg || !*arg) {
-            ctl_printf(c, "ERR usage: unload <modname> (e.g. unload av)\n");
+            ctl_printf(c, "ERR usage: mod.unload <modname> (e.g. mod.unload av)\n");
         } else {
             nsbc_modmgr_t *mm = modmgr_get_global();
             if (!mm) {
@@ -1613,16 +1617,17 @@ static void dispatch(ctl_conn_t *c, char *line)
             } else {
                 int rc = modmgr_unload(mm, arg, g_ctx);
                 if (rc == NSBC_OK)
-                    ctl_printf(c, "OK unload '%s' success\n", arg);
+                    ctl_printf(c, "OK mod.unload '%s' success\n", arg);
                 else
-                    ctl_printf(c, "ERR unload '%s' rc=%d\n", arg, rc);
+                    ctl_printf(c, "ERR mod.unload '%s' rc=%d\n", arg, rc);
             }
         }
-    } else if (strcmp(line, "reload") == 0) {
-        /* ---- reload <modname> — unload + load + init + start ----
-         * 改了 mod_av.so 转码逻辑后不用重启 nsbcd，reload av 即可生效 */
+    } else if (strcmp(line, "mod.reload") == 0) {
+        /* ---- mod.reload <name> — 一键 unload + load + init + start ----
+         * mod_av.so 改了转码逻辑后不用重启 nsbcd：
+         *   make && echo "mod.reload av" | nc -U /var/run/nsbc/control.sock */
         if (!arg || !*arg) {
-            ctl_printf(c, "ERR usage: reload <modname> (e.g. reload av)\n");
+            ctl_printf(c, "ERR usage: mod.reload <modname> (e.g. mod.reload av)\n");
         } else {
             nsbc_modmgr_t *mm = modmgr_get_global();
             if (!mm) {
@@ -1630,9 +1635,9 @@ static void dispatch(ctl_conn_t *c, char *line)
             } else {
                 int rc = modmgr_reload(mm, arg, g_ctx);
                 if (rc == NSBC_OK)
-                    ctl_printf(c, "OK reload '%s' success\n", arg);
+                    ctl_printf(c, "OK mod.reload '%s' success\n", arg);
                 else
-                    ctl_printf(c, "ERR reload '%s' rc=%d\n", arg, rc);
+                    ctl_printf(c, "ERR mod.reload '%s' rc=%d\n", arg, rc);
             }
         }
     } else if (strcmp(line, "sub") == 0) {
