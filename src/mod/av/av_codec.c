@@ -35,6 +35,18 @@
 #include <libavutil/opt.h>
 #include <libavutil/samplefmt.h>
 #include <libswresample/swresample.h>
+
+/* FFmpeg 6.1+ / libswresample 4.6+ 将 swr_alloc_set_opts2 声明进公共 API，
+ * 但某些发行版（包括 Debian 12）虽然 libswresample 版本够新，头文件却把声明条件编译掉了。
+ * 手动加 extern 原型兜底 — 只要 .so 里有符号就能 dlsym/链接通过。
+ * 返回 SwrContext*，参数顺序与官方 swresample.h 声明一致。*/
+extern SwrContext *swr_alloc_set_opts2(
+    SwrContext *s,
+    const AVChannelLayout *out_ch_layout,
+    enum AVSampleFormat out_fmt, int out_rate,
+    const AVChannelLayout *in_ch_layout,
+    enum AVSampleFormat in_fmt, int in_rate,
+    int log_offset, void *log_ctx);
 #endif
 
 /* ============================================================================
@@ -300,12 +312,9 @@ static int av_codec_decode(struct codec_sess *sess,
                 int16_t *dst = (int16_t *)(out->pcm + out->samples);
                 memcpy(dst, swr_out, converted * sizeof(int16_t));
                 out->samples += converted;
-#ifdef NSBC_SWR_OPAQUE
-                /* libswresample 4.5+: SwrContext opaque, out_sample_rate 不可访问 */
+                /* SwrContext 在 FFmpeg 6.x/7.x 不透明，out_sample_rate 直接读不到
+                 * — sess->swr_out_rate 在 av_codec_open 里已缓存 */
                 out->rate = sess->swr_out_rate;
-#else
-                out->rate = sess->swr->out_sample_rate;
-#endif
             }
         } else if (frame->format == AV_SAMPLE_FMT_S16) {
             /* 非重采样路径：codec 输出已是 interleaved S16 + 匹配 sample_rate/channels */
