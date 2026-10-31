@@ -10,6 +10,7 @@
 #define _GNU_SOURCE
 #endif
 #include "app_ctx.h"
+#include "cfg_sync.h"   /* P0: SIGHUP reload 后同步 DB 配置，与 control.sock reload 行为对齐 */
 #include "cfg.h"
 #include "cfg_schema.h"
 #include "log.h"
@@ -251,6 +252,17 @@ static void on_signal(int fd, uint32_t ev, void *arg)
             /* TLS 证书热重载：nsbc-web 每小时更新 cert.pem 后 kill SIGHUP，
              * 这里检测到 reload 后同步刷新 SIP TLS + WebRTC WSS 的 ctx */
             sig_reload_tls_certs(g_ctx);
+            /* P0: 与 control.sock reload 统一入口对齐——YAML reload 成功后
+             * 同步 DB trunks/dialplan_rules/sip_profiles。SIGHUP 是运维常用
+             * reload 方式，之前只 reload YAML 不拉 DB，导致两套 reload 通道
+             * 行为不一致。 */
+            int sync_rc = cfg_sync_after_reload();
+            if (sync_rc != NSBC_OK) {
+                llog(LOG_WARN, "core",
+                     "SIGHUP YAML reloaded but DB sync failed (web not ready?)");
+            } else {
+                llog(LOG_INFO, "core", "SIGHUP DB config synced from web");
+            }
         } else {
             llog(LOG_WARN, "core", "reload rejected rc=%d bad=%s", rc,
                  bad ? bad : "-");
