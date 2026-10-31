@@ -35,18 +35,6 @@
 #include <libavutil/opt.h>
 #include <libavutil/samplefmt.h>
 #include <libswresample/swresample.h>
-
-/* FFmpeg 6.1+ / libswresample 4.6+ 将 swr_alloc_set_opts2 声明进公共 API，
- * 但某些发行版（包括 Debian 12）虽然 libswresample 版本够新，头文件却把声明条件编译掉了。
- * 手动加 extern 原型兜底 — 只要 .so 里有符号就能 dlsym/链接通过。
- * 返回 SwrContext*，参数顺序与官方 swresample.h 声明一致。*/
-extern SwrContext *swr_alloc_set_opts2(
-    SwrContext *s,
-    const AVChannelLayout *out_ch_layout,
-    enum AVSampleFormat out_fmt, int out_rate,
-    const AVChannelLayout *in_ch_layout,
-    enum AVSampleFormat in_fmt, int in_rate,
-    int log_offset, void *log_ctx);
 #endif
 
 /* ============================================================================
@@ -182,17 +170,19 @@ static int av_codec_open(struct codec_sess *sess, int is_decoder)
             ctx->sample_rate != target_rate ||
             ctx->ch_layout.nb_channels != target_ch) {
 
-            SwrContext *swr = swr_alloc_set_opts2(
-                NULL,
+            /* FFmpeg 6.x swr_alloc_set_opts2: 返回 int，第一参数是 out 指针 &swr */
+            SwrContext *swr = NULL;
+            int rc = swr_alloc_set_opts2(
+                &swr,
                 &(AVChannelLayout)AV_CHANNEL_LAYOUT_MONO,
                 target_fmt, target_rate,
                 &ctx->ch_layout,
                 ctx->sample_fmt, ctx->sample_rate,
                 0, NULL);
-            if (swr) {
+            if (rc >= 0 && swr) {
                 swr_init(swr);
                 sess->swr = swr;
-                sess->swr_out_rate = target_rate; /* SwrContext opaque, 自己缓存 */
+                sess->swr_out_rate = target_rate;
                 llog(LOG_DEBUG, "av",
                      "swr init: codec sfmt=%d->%d rate=%d->%d ch=%d->%d",
                      ctx->sample_fmt, target_fmt,
