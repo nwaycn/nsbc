@@ -1,0 +1,77 @@
+============================================================
+  NSBC Phase 2 完整 SIP 压测矩阵
+  Sat Oct 31 10:53:01 AM CST 2026
+============================================================
+
+▶ [1/9] 全杀 + 清理 Sat Oct 31 10:53:01 AM CST 2026
+
+▶ [2/9] 配置修正 Sat Oct 31 10:53:04 AM CST 2026
+  ratelimit (sed 后):
+    ratelimit_regs: 99999                    # window 内最多 REGISTER 次数（默认 10）
+    ratelimit_invites: 99999                 # 全局滑窗内最多 new INVITE（默认 20）
+    ratelimit_invites_active: 99999           # 同时活跃 INVITE 数上限（默认 5）
+  dialplan (BYPASS 默认):
+    Internal extension-to-extension|{}
+
+▶ [3/9] 完整重启 nsbc-web → nsbcd Sat Oct 31 10:53:04 AM CST 2026
+  ✅ data.sock OK
+  ✅ nsbcd PID: 2534911
+  control.sock: 0
+  nsbc-web PID: 2534569
+  SIP 5060: 
+reload: b"NSBC 2.6.0 control interface (try 'help')\nnsbc> "
+
+▶ [4/9] 启 UAS + sanity Sat Oct 31 10:53:52 AM CST 2026
+  UAS PID: 
+  --- SANITY 3 CPS ---
+  nsbcd alive: 2534911
+✅
+  --- 预注册 200 users (cps=5, dur=10) ---
+60
+
+▶ [5/9] BYPASS 完整矩阵 Sat Oct 31 10:54:26 AM CST 2026
+
+  --- BYPASS_C30 dur=15s w=1 u=450 --- Sat Oct 31 10:54:26 AM CST 2026
+  前态: VmRSS=171036kB Threads=25 CDR=3389 ring_dropped=0
+  Wall=180s | Success=N/A% | Total=0 | Timeout=0 | alive=✅
+  后态: VmRSS=211680kB Threads=25 CDR=3449 ring_dropped=0
+
+  --- BYPASS_C100 dur=15s w=2 u=1500 --- Sat Oct 31 10:57:29 AM CST 2026
+  前态: VmRSS=211680kB Threads=25 CDR=3449 ring_dropped=0
+  Wall=180s | Success=N/A% | Total=0 | Timeout=0 | alive=✅
+  后态: VmRSS=233892kB Threads=25 CDR=3569 ring_dropped=0
+
+  --- BYPASS_C300 dur=15s w=2 u=4500 --- Sat Oct 31 11:00:32 AM CST 2026
+  前态: VmRSS=233892kB Threads=25 CDR=3569 ring_dropped=0
+  Wall=180s | Success=N/A% | Total=0 | Timeout=0 | alive=✅
+  后态: VmRSS=301420kB Threads=25 CDR=3689 ring_dropped=0
+
+  --- BYPASS_C800 dur=15s w=4 u=12000 --- Sat Oct 31 11:03:35 AM CST 2026
+  前态: VmRSS=301420kB Threads=25 CDR=3689 ring_dropped=0
+  Wall=180s | Success=N/A% | Total=0 | Timeout=0 | alive=✅
+  后态: VmRSS=301420kB Threads=25 CDR=3929 ring_dropped=0
+
+  --- BYPASS_C1200 dur=15s w=4 u=18000 --- Sat Oct 31 11:06:38 AM CST 2026
+  前态: VmRSS=301948kB Threads=25 CDR=3929 ring_dropped=0
+  Wall=180s | Success=N/A% | Total=0 | Timeout=0 | alive=✅
+  后态: VmRSS=301948kB Threads=25 CDR=4169 ring_dropped=0
+
+  --- BYPASS_C1600 dur=15s w=4 u=24000 --- Sat Oct 31 11:09:41 AM CST 2026
+  前态: VmRSS=301948kB Threads=25 CDR=4169 ring_dropped=0
+  Wall=180s | Success=N/A% | Total=0 | Timeout=0 | alive=✅
+  后态: VmRSS=301948kB Threads=25 CDR=4409 ring_dropped=0
+
+▶ [6/9] 切 RELAY Sat Oct 31 11:12:44 AM CST 2026
+reload: b"NSBC 2.6.0 control interface (try 'help')\nnsbc> OK reload success conf/nsbc.yaml\nnsbc> "
+  dialplan RELAY:
+    Internal extension-to-extension|{"media_mode":2}
+
+▶ [7/9] RELAY sanity Sat Oct 31 11:12:47 AM CST 2026
+  --- RELAY SANITY 3 CPS ---
+  nsbcd alive: 2534911
+✅
+
+▶ [7b/9] RELAY 完整矩阵 Sat Oct 31 11:13:09 AM CST 2026
+
+  --- RELAY_C30 dur=15s w=1 u=450 --- Sat Oct 31 11:13:09 AM CST 2026
+  前态: VmRSS=301948kB Threads=25 CDR=4424 ring_dropped=0

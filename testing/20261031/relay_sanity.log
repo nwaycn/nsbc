@@ -1,0 +1,36 @@
+/home/github/nsbc/testing/reports/20261030-sip-stress-matrix/stress_invite.py:2: SyntaxWarning: invalid escape sequence '\d'
+  """
+============================================================
+NSBC INVITE (BYPASS) Stress Test
+============================================================
+  Target:        127.0.0.1:5060 (UDP, realm=nsbc.local)
+  UAS:           127.0.0.1:5058
+  CPS target:    3
+  Duration:      5s
+  Workers:       2
+  Extensions:    6 (20100-20105)
+  Total calls:   15
+============================================================
+
+[RUN] Starting 2 workers...
+  Progress: 0/2 workers, 0.0s elapsed  Progress: 0/2 workers, 0.5s elapsed  Progress: 0/2 workers, 1.0s elapsed  Progress: 0/2 workers, 1.5s elapsed  Progress: 0/2 workers, 2.0s elapsed  Progress: 0/2 workers, 2.5s elapsed  Progress: 0/2 workers, 3.0s elapsed  Progress: 0/2 workers, 3.5s elapsed  Progress: 0/2 workers, 4.0s elapsed  Progress: 0/2 workers, 4.5s elapsed  Progress: 0/2 workers, 5.0s elapsed  Progress: 0/2 workers, 5.5s elapsed  Progress: 0/2 workers, 6.0s elapsed  Progress: 0/2 workers, 6.5s elapsed  Progress: 0/2 workers, 7.0s elapsed  Progress: 0/2 workers, 7.5s elapsed  Progress: 0/2 workers, 8.0s elapsed  Progress: 0/2 workers, 8.5s elapsed  Progress: 0/2 workers, 9.0s elapsed  Progress: 0/2 workers, 9.5s elapsed  Progress: 0/2 workers, 10.0s elapsed  Progress: 0/2 workers, 10.5s elapsed  Progress: 0/2 workers, 11.0s elapsed  Progress: 0/2 workers, 11.5s elapsed  Progress: 0/2 workers, 12.0s elapsed  Progress: 0/2 workers, 12.5s elapsed  Progress: 0/2 workers, 13.0s elapsed  Progress: 0/2 workers, 13.5s elapsed  Progress: 0/2 workers, 14.0s elapsed  Progress: 0/2 workers, 14.5s elapsed  Progress: 0/2 workers, 15.0s elapsed  Progress: 0/2 workers, 15.5s elapsed  Progress: 0/2 workers, 16.0s elapsed  Progress: 0/2 workers, 16.5s elapsed  Progress: 0/2 workers, 17.0s elapsed  Progress: 0/2 workers, 17.5s elapsed  Progress: 0/2 workers, 18.0s elapsed  Progress: 0/2 workers, 18.5s elapsed  Progress: 0/2 workers, 19.0s elapsed  Progress: 0/2 workers, 19.5s elapsed  Progress: 0/2 workers, 20.0s elapsed  Progress: 0/2 workers, 20.5s elapsed  Progress: 0/2 workers, 21.0s elapsed
+
+============================================================
+RESULTS
+============================================================
+  Wall time:     21.51s
+  Target CPS:    3
+  Actual CPS:    0.7
+  Success rate:  93.3%
+
+  Status breakdown:
+    200 OK:                14
+    Error:                  1
+    Timeout:                0
+    BYE OK:                14
+
+  Latency (ms):
+    p50: 3005.6
+    p95: 3008.7
+    p99: 3008.7
+============================================================

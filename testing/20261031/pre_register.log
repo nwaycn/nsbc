@@ -1,0 +1,36 @@
+/home/github/nsbc/testing/reports/20261030-sip-stress-matrix/stress_invite.py:2: SyntaxWarning: invalid escape sequence '\d'
+  """
+============================================================
+NSBC INVITE (BYPASS) Stress Test
+============================================================
+  Target:        127.0.0.1:5060 (UDP, realm=nsbc.local)
+  UAS:           127.0.0.1:5058
+  CPS target:    5
+  Duration:      10s
+  Workers:       4
+  Extensions:    200 (10200-10399)
+  Total calls:   50
+============================================================
+
+[RUN] Starting 4 workers...
+  Progress: 0/4 workers, 0.0s elapsed  Progress: 0/4 workers, 0.5s elapsed  Progress: 0/4 workers, 1.0s elapsed  Progress: 0/4 workers, 1.5s elapsed  Progress: 0/4 workers, 2.0s elapsed  Progress: 0/4 workers, 2.5s elapsed  Progress: 0/4 workers, 3.0s elapsed  Progress: 0/4 workers, 3.5s elapsed  Progress: 0/4 workers, 4.0s elapsed  Progress: 0/4 workers, 4.5s elapsed  Progress: 0/4 workers, 5.0s elapsed  Progress: 0/4 workers, 5.5s elapsed  Progress: 0/4 workers, 6.0s elapsed  Progress: 1/4 workers, 6.5s elapsed  Progress: 1/4 workers, 7.0s elapsed  Progress: 1/4 workers, 7.5s elapsed  Progress: 1/4 workers, 8.0s elapsed  Progress: 1/4 workers, 8.5s elapsed  Progress: 1/4 workers, 9.0s elapsed
+
+============================================================
+RESULTS
+============================================================
+  Wall time:     9.51s
+  Target CPS:    5
+  Actual CPS:    1.2
+  Success rate:  22.0%
+
+  Status breakdown:
+    200 OK:                11
+    Error:                 39
+    Timeout:                0
+    BYE OK:                11
+
+  Latency (ms):
+    p50: 1.4
+    p95: 3006.8
+    p99: 3006.8
+============================================================

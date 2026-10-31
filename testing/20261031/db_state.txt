@@ -1,0 +1,42 @@
+calls=4486
+cdr=4484
+registrations=66
+
+nsbcd stats (ring/calls/cdr):
+nsbc> # HELP nsbc_worker_threads Worker pool queue and execution metrics
+nsbc_worker_threads_active 1
+nsbc_worker_threads_configured 64
+nsbc_worker_active 0
+nsbc_worker_queued 0
+nsbc_worker_submitted_total 1148
+nsbc_worker_completed_total 1148
+nsbc_worker_rejected_total 0
+nsbc_worker_queue_wait_nanoseconds_total 44134431
+nsbc_worker_queue_wait_seconds_bucket{le="0.00001"} 46
+nsbc_worker_queue_wait_seconds_bucket{le="0.0001"} 1068
+nsbc_worker_queue_wait_seconds_bucket{le="0.001"} 1148
+nsbc_worker_queue_wait_seconds_bucket{le="0.01"} 1148
+nsbc_worker_queue_wait_seconds_bucket{le="0.1"} 1148
+nsbc_worker_queue_wait_seconds_bucket{le="1"} 1148
+nsbc_worker_queue_wait_seconds_bucket{le="+Inf"} 1148
+nsbc_worker_queue_wait_seconds_count 1148
+nsbc_worker_queue_wait_seconds_sum 0.044134431
+nsbc_calls_active 6
+nsbc_calls_total 1160
+nsbc_calls_failed 41
+nsbc_uds_ring_dropped 0
+
+memory:
+VmPeak:	 4446132 kB
+VmSize:	 4446132 kB
+VmLck:	       0 kB
+VmPin:	       0 kB
+VmHWM:	  322852 kB
+VmRSS:	  322852 kB
+VmData:	 2931300 kB
+VmStk:	     416 kB
+VmExe:	     620 kB
+VmLib:	    5456 kB
+VmPTE:	    1188 kB
+VmSwap:	       0 kB
+Threads:	25
