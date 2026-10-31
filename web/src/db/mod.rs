@@ -3996,6 +3996,80 @@ sqlx::query(acct_ddl).execute(pool).await?;
         }
     }
 
+    // --- security_blacklist built-in UA deny seeds (idempotent) ---
+    // SIP scanners / fake PBX / brute-force tools — block on sight.
+    // Matches C core g_nip_default_ua_deny[] in src/mod/security/security.c.
+    {
+        let builtin_ua: &[&str] = &[
+            // Core SIP scanners
+            "friendly-scanner", "sipvicious", "sipsak", "sip-scan",
+            "siparmyknife", "sipcli", "sipv", "sip-user-agent",
+            "simpleSIP", "CSipSimple", "SIPUserAgent",
+            // Forged PBX devices
+            "Cisco-SIPGateway", "Cisco-CUCM", "fpbx",
+            "PolycomSoundPointIP", "PolycomVVX", "tandberg",
+            "mitel", "communitgatepro", "zxmvc8900", "zte",
+            "avaya", "agfeo", "telovoxpbx", "abto",
+            "linksys", "kamailio", "sippy", "mera",
+            "webitel", "technicolor", "sphairon",
+            "smartswitch", "astpp", "devolo",
+            // Brute-force tools
+            "voxalot", "pplsip", "3cxphonesystem", "mizuphone",
+            "ozeki", "iwar", "sundayddr", "independant", "skipper",
+            "rv", "hello", "voip", "test agent",
+            "vaxsipuseragent", "vaxisipuseragent", "tramb2017",
+            // Known malicious signatures
+            "&", "zxcvfdf11", "fgfd", "97",
+            "ipbx-2.11.0", "VOS2009 V2.1.1.5", "NWS_SIP_v1.00",
+            "cisco", "pjsip", "gulp", "sivus",
+            "nxnxbxa", "mic", "tmd", "badua",
+        ];
+        let comment = "nip-default";
+        let enabled: i32 = 1;
+        let kind = "deny";
+        let rule_type = "ua";
+        let mut tx = pool.begin().await?;
+        for ua in builtin_ua {
+            let ua_owned = ua.to_string();
+            let affected = match backend {
+                "sqlite" => {
+                    sqlx::query(
+                        "INSERT OR IGNORE INTO security_blacklist \
+                         (kind, rule_type, value, comment, enabled) \
+                         VALUES ($1, $2, $3, $4, $5)"
+                    )
+                    .bind(kind).bind(rule_type).bind(&ua_owned).bind(comment).bind(enabled)
+                    .execute(&mut *tx).await?
+                    .rows_affected()
+                }
+                "postgres" => {
+                    sqlx::query(
+                        "INSERT INTO security_blacklist \
+                         (kind, rule_type, value, comment, enabled) \
+                         VALUES ($1, $2, $3, $4, $5) \
+                         ON CONFLICT (kind, rule_type, value) DO NOTHING"
+                    )
+                    .bind(kind).bind(rule_type).bind(&ua_owned).bind(comment).bind(enabled)
+                    .execute(&mut *tx).await?
+                    .rows_affected()
+                }
+                _ => { // MySQL
+                    sqlx::query(
+                        "INSERT IGNORE INTO security_blacklist \
+                         (kind, rule_type, value, comment, enabled) \
+                         VALUES (?, ?, ?, ?, ?)"
+                    )
+                    .bind(kind).bind(rule_type).bind(&ua_owned).bind(comment).bind(enabled)
+                    .execute(&mut *tx).await?
+                    .rows_affected()
+                }
+            };
+            let _ = affected;
+        }
+        tx.commit().await?;
+        tracing::info!("db: security_blacklist built-in UA deny seeds ensured ({})", builtin_ua.len());
+    }
+
     // security_config (single row: fence mode + fail2ban 5-dimension configuration)
     // fence_mode: 1=security (full fence, default) / 0=performance (all off)
     // method_blocked: bitmap (1<<(method-1)), uint32

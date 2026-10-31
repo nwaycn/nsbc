@@ -1052,17 +1052,80 @@ int security_blacklist_reload_json(const char *json, char *out_err,
  * YAML 未配置 ua_blacklist 时自动加载，零配置可用。
  * 命中这些 UA 的设备一律静默丢弃（deny）。 */
 static const char *const g_nip_default_ua_deny[] = {
-    "friendly-scanner", "sipvicious", "sipsak", "sip-scan", "csipsimple",
-    "siparmyknife", "sipcli", "sipv", "sip-user-agent", "simpleSIP",
-    "vaxsipuseragent", "vaxisipuseragent", "pplsip", "3cxphonesystem",
-    "miz-phone", "ozeki", "hello", "voip", "test agent", "agfeo",
-    "telovoxpbx", "zte", "communigatepro", "mitel", "polycom",
-    "tandberg", "abto", "pjsip", "avaya", "cisco", "cisco-sipgateway",
-    "cisco-cucm", "fpbx", "webitel", "technicolor", "sphairon",
-    "smartswitch", "linksys", "astpp", "kamailio", "sippy", "mera",
-    "independant", "skipper", "rv", "iwar", "sundayddr", "gulp",
-    "sivus", "devolo", "&", "voxalot", "zxcvfdf11", "fgfd", "97",
-    "ipbx-2.11.0", "nxnxbxa", "tramb2017", "mic", "tmd", "badua",
+    /* === NIP 核心扫描器 === */
+    "friendly-scanner",   /* SIPVicious friendly scanner */
+    "sipvicious",         /* SIPVicious svmap/svwar/svcrack/svbrute */
+    "sipsak",             /* SIP Swiss Army Knife */
+    "sip-scan",           /* sip-scan SIP port scanner */
+    "siparmyknife",       /* Metasploit siparmyknife */
+    "sipcli",             /* ser sipcli testing tool */
+    "sipv",               /* SIPVicious v4 scanning */
+    "sip-user-agent",     /* generic scan signature */
+    "simpleSIP",          /* SimpleSIP scanner variant */
+    "CSipSimple",         /* CSipSimple brute-force tool */
+    "SIPUserAgent",       /* generic SIP scan UA */
+
+    /* === 恶意/伪造 PBX 设备 UA === */
+    "Cisco-SIPGateway",   /* forged Cisco gateway scanning */
+    "Cisco-CUCM",         /* forged CUCM */
+    "fpbx",               /* FreePBX scanning */
+    "PolycomSoundPointIP",/* forged Polycom */
+    "PolycomVVX",         /* forged Polycom */
+    "tandberg",           /* forged Tandberg */
+    "mitel",              /* forged Mitel */
+    "communitgatepro",    /* forged CommuniGate */
+    "zxmvc8900",          /* forged ZTE video conf */
+    "zte",                /* forged ZTE */
+    "avaya",              /* forged Avaya */
+    "agfeo",              /* forged AGFEO */
+    "telovoxpbx",         /* forged Telovox */
+    "abto",               /* forged ABTO */
+    "linksys",            /* forged Linksys */
+    "kamailio",           /* forged Kamailio scanning */
+    "sippy",              /* forged Sippy scanning */
+    "mera",               /* forged MERA */
+    "webitel",            /* forged Webitel */
+    "technicolor",        /* forged Technicolor */
+    "sphairon",           /* forged Sphairon */
+    "smartswitch",        /* forged Smartswitch */
+    "astpp",              /* forged ASTPP */
+    "devolo",             /* forged Devolo */
+
+    /* === 注册/密码爆破工具 === */
+    "voxalot",            /* Voxalot SIP registration brute */
+    "pplsip",             /* pplsip brute force */
+    "3cxphonesystem",     /* 3CX brute variant */
+    "mizuphone",          /* MizuPhone brute tool */
+    "ozeki",              /* Ozeki brute variant */
+    "iwar",               /* iWar brute-force scanner */
+    "sundayddr",          /* Sundayddos SIP DoS tool */
+    "independant",        /* Independent SIP scanner */
+    "skipper",            /* Skipper SIP probe */
+    "rv",                 /* generic SIP scan signature */
+    "hello",              /* generic SIP probe hello */
+    "voip",               /* generic SIP scan */
+    "test agent",         /* generic scan */
+    "vaxsipuseragent",    /* VaxSIPUserAgent brute */
+    "vaxisipuseragent",   /* VaxIPUserAgent brute */
+    "tramb2017",          /* Tramb2017 SIP flood */
+
+    /* === 已知恶意伪装 === */
+    "&",                  /* corrupted UA = SIP DRDoS */
+    "zxcvfdf11",          /* known scanner signature */
+    "fgfd",               /* known scanner signature */
+    "97",                 /* known minimal UA scan */
+    "ipbx-2.11.0",        /* forged IPBX flood */
+    "VOS2009 V2.1.1.5",   /* forged VOS2009 */
+    "NWS_SIP_v1.00",      /* NWS SIP scanner */
+    "cisco",              /* catch-all: any forged Cisco */
+    "pjsip",              /* catch-all: any pjsip-based scanner */
+    "gulp",               /* Gulp SIP DoS */
+    "sivus",              /* SIVuS scanner */
+    "nxnxbxa",            /* known scanner */
+    "mic",                /* generic scan */
+    "tmd",                /* generic scan */
+    "badua",              /* generic bad UA */
+
     NULL  /* sentinel */
 };
 
