@@ -53,6 +53,7 @@ struct codec_sess {
     AVPacket       *pkt;
     AVFrame        *frame;
     SwrContext     *swr;      /* 重采样（如 G.722 16k → SBC 中间 8k），Phase 4 启用 */
+    int             swr_out_rate; /* swr->out_sample_rate 在 FFmpeg 6.x 是不透明，自己缓存 */
 
     /* 编码器路径 */
     AVCodecContext *enc_ctx;
@@ -140,7 +141,8 @@ static int av_codec_open(struct codec_sess *sess, int is_decoder)
         ctx->sample_fmt  = AV_SAMPLE_FMT_S16;
         ctx->sample_rate = (sess->id == CODEC_OPUS) ? 48000 :
                            (sess->id == CODEC_G722) ? 16000 : 8000;
-        ctx->channels    = 1;
+        /* FFmpeg 6.x: ctx->channels removed, use ch_layout */
+        av_channel_layout_default(&ctx->ch_layout, 1);
     }
 
     /* 打开 codec */
@@ -165,18 +167,21 @@ static int av_codec_open(struct codec_sess *sess, int is_decoder)
             ctx->sample_rate != target_rate ||
             ctx->ch_layout.nb_channels != target_ch) {
 
-            SwrContext *swr = swr_alloc_set_opts(
+            SwrContext *swr = swr_alloc_set_opts2(
                 NULL,
-                AV_CH_LAYOUT_MONO,
+                /* out */
+                &(AVChannelLayout)AV_CHANNEL_LAYOUT_MONO,
                 target_fmt,
                 target_rate,
-                ctx->ch_layout,
+                /* in */
+                &ctx->ch_layout,
                 ctx->sample_fmt,
                 ctx->sample_rate,
                 0, NULL);
             if (swr) {
                 swr_init(swr);
                 sess->swr = swr;
+                sess->swr_out_rate = target_rate; /* FFmpeg 6.x swr opaque, cache locally */
                 llog(LOG_DEBUG, "av",
                      "swr init: codec sample_fmt=%d→%d rate=%d→%d ch=%d→%d",
                      ctx->sample_fmt, target_fmt,
@@ -247,7 +252,7 @@ static int av_codec_decode(struct codec_sess *sess,
     if (!sess->dec_ctx) return NSBC_INVAL;
 
     AVPacket *pkt = sess->pkt;
-    av_init_packet(pkt);
+    /* FFmpeg 6.x: av_init_packet deprecated, pkt is already zeroed by av_packet_alloc */
     pkt->data   = (uint8_t *)in;
     pkt->size   = (int)in_len;
 
@@ -283,14 +288,17 @@ static int av_codec_decode(struct codec_sess *sess,
         if (sess->swr) {
             /* swr 路径：重采样到 interleaved S16 mono，每样本占 sizeof(int16_t) * 2 = 4B 预留 */
             uint8_t swr_out[4096];  /* stack buffer，无需 malloc */
+            /* FFmpeg 6.x: swr_convert out 类型是 uint8_t * const *，不能直接传数组地址 */
+            uint8_t *swr_out_ptr = swr_out;
             int converted = swr_convert(sess->swr,
-                &swr_out, sizeof(swr_out) / sizeof(int16_t),
+                &swr_out_ptr, sizeof(swr_out) / sizeof(int16_t),
                 (const uint8_t **)frame->data, frame->nb_samples);
             if (converted > 0) {
                 int16_t *dst = (int16_t *)(out->pcm + out->samples);
                 memcpy(dst, swr_out, converted * sizeof(int16_t));
                 out->samples += converted;
-                out->rate = sess->swr->out_sample_rate;
+                /* FFmpeg 6.x: swr->out_sample_rate opaque, use cached value */
+                out->rate = sess->swr_out_rate;
             }
         } else if (frame->format == AV_SAMPLE_FMT_S16) {
             /* 非重采样路径：codec 输出已是 interleaved S16 + 匹配 sample_rate/channels */
@@ -341,7 +349,7 @@ static int av_codec_encode(struct codec_sess *sess,
     size_t samples_size = in->samples * in->channels * sizeof(int16_t);
     int rc = avcodec_fill_audio_frame(frame, in->channels,
                                       AV_SAMPLE_FMT_S16,
-                                      in->pcm, samples_size, 0);
+                                      (const uint8_t *)in->pcm, samples_size, 0);
     if (rc < 0) return NSBC_ERR;
 
     rc = avcodec_send_frame(sess->enc_ctx, frame);
