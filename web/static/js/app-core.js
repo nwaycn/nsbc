@@ -990,9 +990,13 @@ const app = createApp({
           pwdForm.old_password = ''; pwdForm.new_password = ''; pwdForm.confirm_password = '';
           setTimeout(logout, 800);  // 安全：密码改了后强制重新登录
         } else {
-          ElementPlus.ElMessage.error(data.detail || t('Password change failed'));
+          // 后端错误结构: { "error": { "code": "BAD_REQUEST", "message": "..." } }
+          const msg = (data.error && data.error.message) || data.detail || t('Password change failed');
+          console.warn('[change-password] failed:', res.status, msg);
+          ElementPlus.ElMessage.error(msg);
         }
       } catch (e) {
+        console.error('[change-password] network error:', e);
         ElementPlus.ElMessage.error(t('Network error') + ': ' + e.message);
       } finally {
         pwdLoading.value = false;
