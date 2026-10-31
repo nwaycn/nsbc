@@ -131,12 +131,11 @@ SRC_DIRS := $(shell find src -type d)
 #   src/media/codec/g*  — codec impl files (g711/g729): g711 hard-linked for recorder (added separately in SRCS_BASE),
 #                         g729 goes to mod_codecs.so dynamic module; media_codec.c (registry + transcode engine)
 #                         must be kept (core/moat_bridge/obs_control hard-depend on codec_registry_*/transcode_*)
-#   src/media/play*     — playback engine (playback 是 DYNAMIC 模块，进 mod_playback.so)
-#                         远程服务器可能残留 src/media/playback_engine.c 幽灵文件（老版本位置），必须排除
+#   src/media/playback_engine.c — ghost file (old location)，远程服务器残留；src/media/play/player.c 保留（STATIC core）
 SRCS_CORE ?= $(shell find src -name '*.c' ! -name 'nsbc_cli.c' \
               ! -path 'src/mod/*' ! -path 'src/media/rec/*' \
               ! -path 'src/db/*' ! -path 'src/media/codec/g*.c' \
-              ! -path 'src/media/play*')
+              ! -path 'src/media/playback_engine.c')
 # default hand-picked STATIC modules (fallback when no configure)
 # note: intentionally excludes src/mod/codecs/*——codecs go DYNAMIC, g711.c hard-linked separately into main binary
 SRCS_MOD_STATIC ?= $(shell (find src/mod/endpoints src/mod/outbound_reg -name '*.c'; \
@@ -155,12 +154,12 @@ STATIC_MOD_SRCS ?= $(SRCS_MOD_STATIC)
 #   2) src/db/dbal_module.c     —— same as above (config.mk may include dbal as a module)
 #   3) src/mod/codecs/*.c      —— codec impl files go DYNAMIC module chain, hard-link causes multiple definition
 #   4) src/media/codec/g*.c    —— same as above (g711 hard-linked separately, g729 goes DYNAMIC)
-# ⚠️ note: src/mod/billing/cdr_wal.c must be KEPT —— billing.c unconditionally calls cdr_wal_*
-# functions (cdr_wal_create/append/destroy/replay), billing is a STATIC module link dep.
-# sqlite3 code in cdr_wal.c is all inside #ifdef NSBC_WITH_SQLITE, as long as override sets NSBC_WITH_SQLITE=0
-# the preprocessor strips the sqlite3 branch, leaving pure-text WAL backend, does not touch DB at all.
-STATIC_MOD_SRCS := $(filter-out src/db/%.c src/mod/codecs/%.c src/media/codec/g%.c src/mod/playback/%.c src/media/play%,$(STATIC_MOD_SRCS))
-SRCS_CORE := $(filter-out src/db/%.c src/media/codec/g%.c src/media/play%,$(SRCS_CORE))
+#   5) src/media/playback*     —— ghost 文件（老版本残留），排掉防重复定义
+# ⚠️ note: src/mod/playback/playback_engine.c MUST NOT be excluded —— 硬链进 nsbcd
+# （main.c pb_bind_ctx_slots / oam_module.c pb_engine_start / app_registry.c pb_start 等都是 STATIC 调用）
+# src/mod/playback/playback.c 是 DYNAMIC 入口（pb_engine_start 注册 Dialplan apps），排掉防重复
+STATIC_MOD_SRCS := $(filter-out src/db/%.c src/mod/codecs/%.c src/media/codec/g%.c src/media/playback%,$(STATIC_MOD_SRCS))
+SRCS_CORE := $(filter-out src/db/%.c src/media/codec/g%.c src/media/playback%,$(SRCS_CORE))
 
 # recorder.c (main binary) hard-depends on g711_ulaw_decode / g711_alaw_decode,
 # but configure puts codecs in DYNAMIC, g711.c only goes into mod_codecs.so —— main binary link loses symbols.
@@ -168,16 +167,31 @@ SRCS_CORE := $(filter-out src/db/%.c src/media/codec/g%.c src/media/play%,$(SRCS
 # Pick whichever actually exists (may be src/media/codec/g711.c or src/mod/codecs/g711.c,
 # maybe both —— $(firstword $(wildcard ...)) picks the first).
 G711_SRC := $(firstword $(wildcard src/media/codec/g711.c) $(wildcard src/mod/codecs/g711.c))
+
+# playback_engine.c (pb_start / pb_stop_if_playing / pb_bind_ctx_slots / pb_engine_start)
+# is hard-depended by STATIC modules: main.c (ctx slots), oam_module.c (engine start/stop),
+# app_registry.c (pb_start/start_chain/stop_if_playing for dialplan apps).
+# Must be compiled into nsbcd — same dual-use pattern as g711.c (also goes into mod_playback.so).
+# Pick whichever actually exists: src/mod/playback/playback_engine.c (new canonical)
+# or src/media/playback_engine.c (old ghost, excluded above by find -prune — but fallback anyway).
+PLAYBACK_ENGINE_SRC := $(firstword $(wildcard src/mod/playback/playback_engine.c) $(wildcard src/media/playback_engine.c))
+
+# src/mod/playback/playback.c is DYNAMIC module entry (pb_engine_start registers dialplan apps),
+# must NOT be linked into STATIC nsbcd — exclude it explicitly below.
+PLAYBACK_DYN_ENTRY := src/mod/playback/playback.c
+
 SRCS_BASE := $(sort $(SRCS_CORE) \
                     $(STATIC_MOD_SRCS) \
                     $(if $(G711_SRC),$(G711_SRC)) \
+                    $(if $(PLAYBACK_ENGINE_SRC),$(PLAYBACK_ENGINE_SRC)) \
                     3rd/cjson/cJSON.c)
 
 # ---- final fallback: filter out from SRCS_BASE again ----
 # even if filter-out above missed them (config.mk directly sets SRCS_BASE), also exclude db/ here
 # cdr_wal.c INTENTIONALLY kept —— billing STATIC module depends on it
-# src/media/play* covers legacy src/media/playback_engine.c (ghost file on remote servers)
-SRCS_BASE := $(filter-out src/db/%.c src/media/play%,$(SRCS_BASE))
+# src/media/playback* — ghost file exclusion (remote servers may have old version residue)
+# $(PLAYBACK_DYN_ENTRY) — DYNAMIC module entry, prevent accidental STATIC link
+SRCS_BASE := $(filter-out src/db/%.c src/media/playback% $(PLAYBACK_DYN_ENTRY),$(SRCS_BASE))
 
 # vendored bcg729 —— compile into mod_codecs.so, no longer into nsbcd
 BCG729_SRCS := $(wildcard 3rd/bcg729/src/*.c)
