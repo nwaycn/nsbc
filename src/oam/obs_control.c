@@ -184,9 +184,6 @@ static void ctl_help(ctl_conn_t *c)
         "  config.reload        transactional hot-reload (L1, audited)\n"
         "  hangup <call-id>     force-terminate a call by Call-ID (L1, audited)\n"
         "  reload               alias of config.reload\n"
-        "  mod.load <name>      动态加载 mod_<name>.so (L1, audited)\n"
-        "  mod.unload <name>    stop + fini + dlclose 模块 (L1, audited)\n"
-        "  mod.reload <name>    unload + load + init + start 一键热更 (L1, audited)\n"
         "  sub <topics>         订阅实时推送（events/cdr/log/metrics，逗号分隔；如 sub events,cdr）\n"
         "  unsub <topics>       取消订阅（无参取消全部）\n"
         "  sub.stat             查看本连接订阅状态\n"
@@ -1587,59 +1584,6 @@ static void dispatch(ctl_conn_t *c, char *line)
         cmd_show_cdr(c);
     } else if (strcmp(line, "hangup") == 0) {
         cmd_hangup(c, arg);
-    } else if (strcmp(line, "mod.load") == 0) {
-        /* ---- mod.load <name> — 动态加载 .so 模块 ----
-         * 4 候选路径：exe_dir/mod, ./mod, build/mod, /etc/nsbc/mod
-         * 已存在同名模块先 unload。加载成功自动 init + start。*/
-        if (!arg || !*arg) {
-            ctl_printf(c, "ERR usage: mod.load <modname> (e.g. mod.load av)\n");
-        } else {
-            nsbc_modmgr_t *mm = modmgr_get_global();
-            if (!mm) {
-                ctl_printf(c, "ERR modmgr not initialized\n");
-            } else {
-                int rc = modmgr_load_by_name(mm, arg, g_ctx);
-                if (rc == NSBC_OK)
-                    ctl_printf(c, "OK mod.load '%s' success\n", arg);
-                else
-                    ctl_printf(c, "ERR mod.load '%s' rc=%d\n", arg, rc);
-            }
-        }
-    } else if (strcmp(line, "mod.unload") == 0) {
-        /* ---- mod.unload <name> — stop + fini + dlclose ----
-         * CALL_PATH / REQUIRED 模块拒绝卸载 */
-        if (!arg || !*arg) {
-            ctl_printf(c, "ERR usage: mod.unload <modname> (e.g. mod.unload av)\n");
-        } else {
-            nsbc_modmgr_t *mm = modmgr_get_global();
-            if (!mm) {
-                ctl_printf(c, "ERR modmgr not initialized\n");
-            } else {
-                int rc = modmgr_unload(mm, arg, g_ctx);
-                if (rc == NSBC_OK)
-                    ctl_printf(c, "OK mod.unload '%s' success\n", arg);
-                else
-                    ctl_printf(c, "ERR mod.unload '%s' rc=%d\n", arg, rc);
-            }
-        }
-    } else if (strcmp(line, "mod.reload") == 0) {
-        /* ---- mod.reload <name> — 一键 unload + load + init + start ----
-         * mod_av.so 改了转码逻辑后不用重启 nsbcd：
-         *   make && echo "mod.reload av" | nc -U /var/run/nsbc/control.sock */
-        if (!arg || !*arg) {
-            ctl_printf(c, "ERR usage: mod.reload <modname> (e.g. mod.reload av)\n");
-        } else {
-            nsbc_modmgr_t *mm = modmgr_get_global();
-            if (!mm) {
-                ctl_printf(c, "ERR modmgr not initialized\n");
-            } else {
-                int rc = modmgr_reload(mm, arg, g_ctx);
-                if (rc == NSBC_OK)
-                    ctl_printf(c, "OK mod.reload '%s' success\n", arg);
-                else
-                    ctl_printf(c, "ERR mod.reload '%s' rc=%d\n", arg, rc);
-            }
-        }
     } else if (strcmp(line, "sub") == 0) {
         /* sub <topics> — 订阅实时推送
          * topics 逗号分隔：events / cdr / log / metrics */
@@ -1797,6 +1741,122 @@ static void on_conn_event(int fd, uint32_t ev, void *arg)
     }
 }
 
+/* ============================================================================
+ * cmd_registry 命令：模块管理（Phase 6 从 dispatch 硬编码 if 链迁到注册表）
+ *
+ * 迁移收益：
+ *   1. help 自动列出 — cmd_help() 遍历注册表，不再手动同步 ctl_help 字符串
+ *   2. 权限分级自动生效 — CMD_L2_ADMIN 需要 L2 二次授权
+ *   3. 审计自动触发 — cmd_registry 有统一审计钩子
+ *   4. 模块卸载可联动 — cmd_unregister 支持动态移除
+ * ==========================================================================*/
+
+static int cmd_mod_load(cmd_ctx_t *c, int argc, char **argv, void *ud)
+{
+    if (!c || !c->io_printf) return NSBC_INVAL;
+    (void)argc;  /* cmd_registry 已按空格切词，但 mod.load 只需 argv[1] */
+    (void)ud;    /* modmgr 全局可达 */
+    if (argc < 2 || !argv[1] || !argv[1][0]) {
+        c->io_printf(c->io_ud,
+                     "ERR usage: mod.load <modname> (e.g. mod.load av)\n");
+        return NSBC_INVAL;
+    }
+    nsbc_modmgr_t *mm = modmgr_get_global();
+    if (!mm) {
+        c->io_printf(c->io_ud, "ERR modmgr not initialized\n");
+        return NSBC_ERR;
+    }
+    int rc = modmgr_load_by_name(mm, argv[1], g_ctx);
+    if (rc == NSBC_OK) {
+        c->io_printf(c->io_ud, "OK mod.load '%s' success\n", argv[1]);
+        log_audit("oam", "control-mod-load",
+                  "name=%s result=ok", argv[1]);
+    } else {
+        c->io_printf(c->io_ud, "ERR mod.load '%s' rc=%d\n", argv[1], rc);
+        log_audit("oam", "control-mod-load",
+                  "name=%s result=err rc=%d", argv[1], rc);
+    }
+    return rc == NSBC_OK ? NSBC_OK : NSBC_ERR;
+}
+
+static int cmd_mod_unload(cmd_ctx_t *c, int argc, char **argv, void *ud)
+{
+    if (!c || !c->io_printf) return NSBC_INVAL;
+    (void)argc;
+    (void)ud;
+    if (argc < 2 || !argv[1] || !argv[1][0]) {
+        c->io_printf(c->io_ud,
+                     "ERR usage: mod.unload <modname> (e.g. mod.unload av)\n");
+        return NSBC_INVAL;
+    }
+    nsbc_modmgr_t *mm = modmgr_get_global();
+    if (!mm) {
+        c->io_printf(c->io_ud, "ERR modmgr not initialized\n");
+        return NSBC_ERR;
+    }
+    int rc = modmgr_unload(mm, argv[1], g_ctx);
+    if (rc == NSBC_OK) {
+        c->io_printf(c->io_ud, "OK mod.unload '%s' success\n", argv[1]);
+        log_audit("oam", "control-mod-unload",
+                  "name=%s result=ok", argv[1]);
+    } else {
+        c->io_printf(c->io_ud, "ERR mod.unload '%s' rc=%d\n", argv[1], rc);
+        log_audit("oam", "control-mod-unload",
+                  "name=%s result=err rc=%d", argv[1], rc);
+    }
+    return rc == NSBC_OK ? NSBC_OK : NSBC_ERR;
+}
+
+static int cmd_mod_reload(cmd_ctx_t *c, int argc, char **argv, void *ud)
+{
+    if (!c || !c->io_printf) return NSBC_INVAL;
+    (void)argc;
+    (void)ud;
+    if (argc < 2 || !argv[1] || !argv[1][0]) {
+        c->io_printf(c->io_ud,
+                     "ERR usage: mod.reload <modname> (e.g. mod.reload av)\n");
+        return NSBC_INVAL;
+    }
+    nsbc_modmgr_t *mm = modmgr_get_global();
+    if (!mm) {
+        c->io_printf(c->io_ud, "ERR modmgr not initialized\n");
+        return NSBC_ERR;
+    }
+    int rc = modmgr_reload(mm, argv[1], g_ctx);
+    if (rc == NSBC_OK) {
+        c->io_printf(c->io_ud, "OK mod.reload '%s' success\n", argv[1]);
+        log_audit("oam", "control-mod-reload",
+                  "name=%s result=ok", argv[1]);
+    } else {
+        c->io_printf(c->io_ud, "ERR mod.reload '%s' rc=%d\n", argv[1], rc);
+        log_audit("oam", "control-mod-reload",
+                  "name=%s result=err rc=%d", argv[1], rc);
+    }
+    return rc == NSBC_OK ? NSBC_OK : NSBC_ERR;
+}
+
+/* obs_control 核心命令注册到 cmd_registry（init + start 各调用一次，
+ * 均有幂等保护——obs_cmd_registry_init 先跑，obs_control_start 发现
+ * g_cmd_reg != NULL 就跳过 create 但仍调本函数补注册） */
+void obs_core_commands_register(cmd_reg_t *reg, nsbc_ctx_t *ctx)
+{
+    if (!reg) return;
+    cmd_desc_t descs[] = {
+        { "mod.load",   "动态加载 mod_<name>.so（L2，审计）",
+          CMD_L2_ADMIN, cmd_mod_load, ctx },
+        { "mod.unload", "stop + fini + dlclose 模块（L2，审计）",
+          CMD_L2_ADMIN, cmd_mod_unload, ctx },
+        { "mod.reload", "unload + load + init + start 一键热更（L2，审计）",
+          CMD_L2_ADMIN, cmd_mod_reload, ctx },
+    };
+    for (size_t i = 0; i < sizeof(descs) / sizeof(descs[0]); ++i) {
+        int rc = cmd_register(reg, &descs[i]);
+        if (rc != NSBC_OK)
+            llog(LOG_WARN, "oam", "cmd '%s' register rc=%d",
+                 descs[i].name, rc);
+    }
+}
+
 static void on_accept_event(int fd, uint32_t ev, void *arg)
 {
     (void)ev;
@@ -1871,8 +1931,8 @@ int obs_control_start(nsbc_ctx_t *ctx)
         cmd_reg_create(&g_cmd_reg);
         reload_commands_register(g_cmd_reg);
         call_commands_register(g_cmd_reg, ctx);
+        obs_core_commands_register(g_cmd_reg, ctx);
     }
-
     /* ---- 订阅推送 hub（REQ-OBS-005/006）----
      * send 函数让 obs_sub_publish_events 在调用线程（可能是 worker）
      * 能直接往订阅者帧环推帧，flush 在锁内非阻塞 send。 */
@@ -1919,6 +1979,7 @@ int obs_cmd_registry_init(struct nsbc_ctx *ctx)
     cmd_reg_create(&g_cmd_reg);
     reload_commands_register(g_cmd_reg);
     call_commands_register(g_cmd_reg, ctx);
+    obs_core_commands_register(g_cmd_reg, ctx);
     llog(LOG_INFO, "oam", "cmd_registry init ready (registered %d commands)",
          cmd_count(g_cmd_reg));
     return NSBC_OK;
