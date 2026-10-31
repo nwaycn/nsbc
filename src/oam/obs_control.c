@@ -1233,14 +1233,21 @@ static void dispatch(ctl_conn_t *c, char *line)
                     src = "FFmpeg (mod_av)"; break;
                 }
 
-                ctl_printf(c, "%-16s %4d %7d %4d %5dms %5s %5s %s\n",
+                /* PT=-1 (dynamic) → "dyn"; channels=0 (video) → "-" */
+                char pt_str[8], ch_str[8];
+                if (ops->default_pt < 0)      snprintf(pt_str, sizeof(pt_str), "%-4s", "dyn");
+                else                          snprintf(pt_str, sizeof(pt_str), "%-4d", ops->default_pt);
+                if (ops->channels == 0)       snprintf(ch_str, sizeof(ch_str), "%-4s", "-");
+                else                          snprintf(ch_str, sizeof(ch_str), "%-4d", ops->channels);
+
+                ctl_printf(c, "%-16s %s %7d %s %5dms %5s %5s %s\n",
                     ops->name,
-                    ops->default_pt,
+                    pt_str,
                     ops->clock_rate,
-                    ops->channels,
+                    ch_str,
                     ops->ptime_ms,
-                    ops->decode  ? "\xe2\x9c\x93" : "-",
-                    ops->encode  ? "\xe2\x9c\x93" : "-",
+                    ops->decode     ? "\xe2\x9c\x93" : "-",
+                    ops->encode     ? "\xe2\x9c\x93" : "-",
                     src);
             }
         }
@@ -1256,14 +1263,19 @@ static void dispatch(ctl_conn_t *c, char *line)
                 if (ops->id != CODEC_H264 && ops->id != CODEC_VP8 && ops->id != CODEC_VP9)
                     continue;
 
-                ctl_printf(c, "%-16s %4d %7d %4d %5dms %5s %5s %s\n",
+                char pt_str[8], ch_str[8];
+                if (ops->default_pt < 0)      snprintf(pt_str, sizeof(pt_str), "%-4s", "dyn");
+                else                          snprintf(pt_str, sizeof(pt_str), "%-4d", ops->default_pt);
+                snprintf(ch_str, sizeof(ch_str), "%-4s", "-"); /* 视频 codec 无声道 */
+
+                ctl_printf(c, "%-16s %s %7d %s %5dms %5s %5s %s\n",
                     ops->name,
-                    ops->default_pt,
+                    pt_str,
                     ops->clock_rate,
-                    ops->channels,
+                    ch_str,
                     ops->ptime_ms,
-                    ops->decode  ? "\xe2\x9c\x93" : "-",
-                    ops->encode  ? "\xe2\x9c\x93" : "-",
+                    ops->decode     ? "\xe2\x9c\x93" : "-",
+                    ops->encode     ? "\xe2\x9c\x93" : "-",
                     "FFmpeg (mod_av)");
             }
         }

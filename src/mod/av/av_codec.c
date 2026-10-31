@@ -474,21 +474,32 @@ AVCODEC_DECLARE_OPS(CODEC_VP9,      avcodec_vp9,      90000, 0, -1,   0)
  * ==========================================================================*/
 int av_register_all_codecs(void)
 {
-    codec_ops_t ops;
+    /* 静态槽位数组 —— registry 只存指针不做 copy，
+     * 每个 codec 必须有独立的、跨函数有效的存储。
+     * 之前用单个栈变量 `codec_ops_t ops`，循环内被 fill_ops 覆盖后
+     * codec_registry_register(&ops) 存的栈地址在函数返回后悬空，
+     * 导致 show codecs 显示 NAME/RATE/PTIME 等全是垃圾值。 */
+    static codec_ops_t g_ops_slots[16];   /* 16 > 10 个 AV codec，留点余量 */
+    int slot = 0;
     int total = 0, ok = 0;
 
 #define REG_CODEC(fn)                                                         \
     do {                                                                      \
-        fn(&ops);                                                             \
-        int rc = codec_registry_register(&ops);                               \
+        if (slot >= (int)(sizeof(g_ops_slots)/sizeof(g_ops_slots[0]))) {       \
+            llog(LOG_WARN, "av", "ops slot exhausted, skip %s", #fn);         \
+            break;                                                            \
+        }                                                                     \
+        codec_ops_t *ops = &g_ops_slots[slot++];                              \
+        fn(ops);                                                              \
+        int rc = codec_registry_register(ops);                                \
         total++;                                                              \
         if (rc == NSBC_OK) {                                                  \
             ok++;                                                             \
             llog(LOG_INFO, "av", "registered ops id=%d name=%s PT=%d",        \
-                 ops.id, ops.name, ops.default_pt);                          \
+                 ops->id, ops->name, ops->default_pt);                        \
         } else {                                                              \
             llog(LOG_WARN, "av", "register failed id=%d name=%s rc=%d",       \
-                 ops.id, ops.name, rc);                                      \
+                 ops->id, ops->name, rc);                                     \
         }                                                                     \
     } while (0)
 
