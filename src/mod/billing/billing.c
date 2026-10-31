@@ -18,6 +18,7 @@
 #include "cdr_wal.h"       /* Phase 6: cdr_wal 兜底 */
 #include "cdr_event.h"
 #include "log.h"
+#include <time.h>
 #include "metric_reg.h"
 #include "module.h"
 #include "nsbc_atomic.h"
@@ -74,12 +75,142 @@ static int billing_persist_batch(void *ud, const cdr_event_t *ev, int n)
 /* Phase 0: b2b_cdr_hook_add 回调 —— b2bua call_end 三阶段（START/ANSWER/END）
  * 多槽链里 billing 自己注册的入口。内部直接调 cdr_sink_emit(ud, ev)，
  * ud 就是 billing_init 时传的 g_sink。比旧 ctx->cdr_emit 路径更强：
- * 收到完整三阶段 CDR（START 记开始时间、ANSWER 记应答时间、END 记挂断原因）。*/
+ * 收到完整三阶段 CDR（START 记开始时间、ANSWER 记应答时间、END 记挂断原因）。
+ *
+ * Phase 1 新增：在 CDR 事件里接 reserve/settle 两阶段计费：
+ *   ANSWER → rate_lookup_stair 拿到费率 → 算保守 reserve 金额 → bill_reserve
+ *   END    → calc_stair_charge 算实际费用 → bill_settle（多退少补）
+ *   账户 key 推导：出向=分机付费，入向=中继付费，域内=主叫付费。*/
+
+/* ---- account key 推导 ----
+ * 格式: "tenant:<tid>:extension:<num>" 或 "tenant:<tid>:trunk:<name>" */
+static void billing_make_key(const cdr_event_t *ev, char *out, size_t out_sz)
+{
+    const char *tid = (ev->tenant[0] == '\0') ? "1" : ev->tenant;
+    const char *what, *who;
+    switch (ev->dir) {
+    case CDR_DIR_OUTBOUND:
+        what = "extension"; who = ev->from; break;
+    case CDR_DIR_INBOUND:
+        what = "trunk";
+        who = (ev->trunk[0] != '\0') ? ev->trunk : ev->to;
+        break;
+    case CDR_DIR_INTERNAL:
+    default:
+        what = "extension"; who = ev->from; break;
+    }
+    snprintf(out, out_sz, "tenant:%s:%s:%s", tid, what, who);
+}
+
+/* ---- 当前时间 HH:MM ---- */
+static void billing_now_hhmm(char *buf, size_t sz)
+{
+    time_t t = time(NULL);
+    struct tm tm;
+    localtime_r(&t, &tm);
+    snprintf(buf, sz, "%02d:%02d", tm.tm_hour, tm.tm_min);
+}
+
 static void billing_cdr_cb(void *ud, const cdr_event_t *ev)
 {
     cdr_sink_t *sink = (cdr_sink_t *)ud;
     if (!sink || !ev) return;
-    cdr_sink_emit(sink, ev);
+    cdr_sink_emit(sink, ev);  /* 原有 CDR 落库 —— 始终先做 */
+
+    /* Phase 1: reserve / settle 计费（只有 billing 初始化后才做）*/
+    if (!g_billing) return;
+
+    char acct_key[128];
+    billing_make_key(ev, acct_key, sizeof(acct_key));
+
+    switch (ev->phase) {
+
+    /* ---- ANSWER: 接通 → reserve ----
+     * 查费率（阶梯），按保守金额预占。失败不阻断通话（pre-paid 可以在 INVITE 入口拦截，
+     * 这里是 post-hoc，只记日志）。*/
+    case CDR_PHASE_ANSWER: {
+        if (!ev->to[0]) break;
+        rate_entry_t tiers[8];
+        int n_tiers = 0;
+        char hhmm[8];
+        billing_now_hhmm(hhmm, sizeof(hhmm));
+
+        int rc = rate_lookup_stair(g_billing, ev->to, 0, hhmm, NULL,
+                                   tiers, &n_tiers, 8);
+        if (rc != NSBC_OK || n_tiers == 0) {
+            log_warn("billing", "ANSWER %s rate_lookup_stair rc=%d — no reserve",
+                     ev->call_id, rc);
+            break;
+        }
+
+        /* 保守 reserve = 第一阶梯 max(min_bill_s, 120秒) 的费率 + 接通费 × 2 */
+        uint32_t reserve_sec = (uint32_t)tiers[0].min_bill_s;
+        if (reserve_sec < 120) reserve_sec = 120;
+        int64_t reserve = calc_stair_charge(tiers, n_tiers, reserve_sec);
+        if (reserve < 0) reserve = 0;
+        /* 再保守一点：× 2 + 接通费 */
+        reserve = reserve * 2 + tiers[0].connect_fee_uc;
+
+        uint64_t resv_id = 0;
+        rc = bill_reserve(g_billing, acct_key, reserve, &resv_id);
+        if (rc == NSBC_OK) {
+            log_info("billing", "ANSWER %s reserved=%lld uc acct=%s resv_id=%llu",
+                     ev->call_id, (long long)reserve, acct_key, (unsigned long long)resv_id);
+        } else {
+            log_warn("billing", "ANSWER %s bill_reserve rc=%d reserve=%lld uc acct=%s",
+                     ev->call_id, rc, (long long)reserve, acct_key);
+        }
+        break;
+    }
+
+    /* ---- END: 挂断 → settle ----
+     * 用实际 billsec 算阶梯费用，多退少补。
+     * 未应答（billsec=0）只收接通费（如果费率有 connect_fee）。*/
+    case CDR_PHASE_END: {
+        if (!ev->to[0]) break;
+        rate_entry_t tiers[8];
+        int n_tiers = 0;
+        char hhmm[8];
+        billing_now_hhmm(hhmm, sizeof(hhmm));
+
+        int rc = rate_lookup_stair(g_billing, ev->to, 0, hhmm, NULL,
+                                   tiers, &n_tiers, 8);
+        if (rc != NSBC_OK || n_tiers == 0) {
+            log_warn("billing", "END %s no rate match — no settle", ev->call_id);
+            /* 尝试释放所有 reservation（用 call_id 匹配 resv 的 ai 字段？）*/
+            break;
+        }
+
+        /* 实际费用 */
+        int64_t charge = calc_stair_charge(tiers, n_tiers, ev->billsec);
+
+        /* settle 入参：account key + 实际费用 —— bill_settle 内部会找
+         * 该账户的所有 reservation 并多退少补。*/
+        rc = bill_settle(g_billing, acct_key, charge);
+        if (rc == NSBC_OK) {
+            log_info("billing", "END %s billsec=%u charge=%lld uc acct=%s settle=OK",
+                     ev->call_id, ev->billsec, (long long)charge, acct_key);
+        } else {
+            log_warn("billing", "END %s bill_settle rc=%d charge=%lld uc acct=%s",
+                     ev->call_id, rc, (long long)charge, acct_key);
+        }
+
+        /* 如果账户还有低额阈值，发告警 */
+        int64_t bal = 0, resv = 0;
+        if (account_balance(g_billing, acct_key, &bal, &resv) == NSBC_OK) {
+            if (bal < 0) {
+                log_warn("billing", "END %s account OVERDRAWN bal=%lld uc acct=%s",
+                         ev->call_id, (long long)bal, acct_key);
+                /* Phase 2: 超过 credit_limit 时 kill 同账户其他通话 */
+            }
+        }
+        break;
+    }
+
+    case CDR_PHASE_START:
+        /* 暂不做 pre-auth — Phase 2 在 INVITE 入口接 b2b_guard_hook_add */
+        break;
+    }
 }
 
 static int billing_init(struct nsbc_ctx *ctx)

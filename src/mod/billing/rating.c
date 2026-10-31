@@ -7,12 +7,20 @@
 #include "rating.h"
 #include "ivr.h"   /* jstr / jint / jarray_at — Round 1 公开的手写 JSON 工具 */
 #include "log.h"
+/* 账户：同时承载 accounts 表 + billing_transactions 关联。
+ * 新增字段向后兼容（旧 accounts.reload JSON 不含这些字段，jint 默认 0 / jstr 默认 ""）。*/
 typedef struct {
     int      used;
     char     key[BILL_ACCT_KEY];
     int64_t  balance;
     int64_t  reserved;
     int64_t  credit_limit;
+
+    /* === Phase 1 新增 === */
+    int64_t  tenant_id;          /* 多租户隔离 */
+    char     account_type[16];   /* "extension" / "trunk" / "tenant" / "reseller" */
+    int64_t  rate_plan_id;       /* 关联 rate_plans.id（0 = 走 rate_tables 旧费率）*/
+    int64_t  low_threshold_uc;   /* 低于此值触发告警回调（0 = 不告警）*/
 } acct_t;
 
 typedef struct {
@@ -157,14 +165,25 @@ int rate_quote(const rate_entry_t *r, uint32_t billsec, rate_quote_t *q)
     return NSBC_OK;
 }
 
-static acct_t *acct_find(billing_t *b, const char *key)
+static acct_t *acct_find_locked(billing_t *b, const char *key)
 {
     int i;
+    if (b == NULL || key == NULL) return NULL;
+    /* 调用方已持读/写锁，直接遍历 */
     for (i = 0; i < BILL_ACCT_MAX; ++i) {
         if (b->accts[i].used && strcmp(b->accts[i].key, key) == 0)
             return &b->accts[i];
     }
     return NULL;
+}
+
+static acct_t *acct_find(billing_t *b, const char *key)
+{
+    acct_t *a;
+    pthread_rwlock_rdlock(&b->lock);
+    a = acct_find_locked(b, key);
+    pthread_rwlock_unlock(&b->lock);
+    return a;
 }
 
 int account_open(billing_t *b, const char *key, int64_t balance_uc,
@@ -178,6 +197,9 @@ int account_open(billing_t *b, const char *key, int64_t balance_uc,
     if (a != NULL) {
         a->balance = balance_uc;
         a->credit_limit = credit_limit_uc;
+        /* Phase 1: 旧 account.open 命令默认租户 1 / extension / 无费率方案 / 不告警 */
+        if (a->tenant_id == 0) a->tenant_id = 1;
+        if (!a->account_type[0]) snprintf(a->account_type, sizeof(a->account_type), "extension");
         pthread_rwlock_unlock(&b->lock);
         return NSBC_OK;
     }
@@ -195,11 +217,13 @@ int account_open(billing_t *b, const char *key, int64_t balance_uc,
         pthread_rwlock_unlock(&b->lock);
         return NSBC_NOSPC;
     }
+    memset(a, 0, sizeof(*a));
     a->used = 1;
     snprintf(a->key, sizeof(a->key), "%s", key);
     a->balance = balance_uc;
-    a->reserved = 0;
     a->credit_limit = credit_limit_uc;
+    a->tenant_id = 1;
+    snprintf(a->account_type, sizeof(a->account_type), "extension");
     pthread_rwlock_unlock(&b->lock);
     return NSBC_OK;
 }
@@ -424,6 +448,8 @@ int account_reload_json(billing_t *b, const char *json)
     int i, n_ok = 0, n_fail = 0;
     if (!b || !json) return NSBC_INVAL;
 
+    pthread_rwlock_wrlock(&b->lock);
+
     for (i = 0; ; ++i) {
         size_t len = 0;
         const char *elem = jarray_at(json, i, &len);
@@ -441,19 +467,42 @@ int account_reload_json(billing_t *b, const char *json)
         }
         if (key[0] == '\0') { ++n_fail; continue; }
 
-        /* balance_uc / credit_limit_uc 可能是字符串或整数 — jint 处理整数，
-         * 字符串数字值（如 "1000000"）jint 也能正确解析（strtol 走字符串）*/
         balance = (int64_t)jint(buf, "balance_uc", -1);
         if (balance < 0) balance = (int64_t)jint(buf, "balance", 0);
         credit  = (int64_t)jint(buf, "credit_limit_uc", 0);
         if (credit == 0) credit = (int64_t)jint(buf, "credit_limit", 0);
 
-        if (account_open(b, key, balance, credit) != NSBC_OK) {
-            ++n_fail;
-        } else {
-            ++n_ok;
+        /* Phase 1 新增字段 */
+        int64_t tenant_id       = (int64_t)jint(buf, "tenant_id", 1);
+        int64_t rate_plan_id    = (int64_t)jint(buf, "rate_plan_id", 0);
+        int64_t low_threshold   = (int64_t)jint(buf, "low_threshold_uc", 0);
+        char    account_type[16] = {0};
+        jstr(buf, "account_type", account_type, sizeof(account_type));
+        if (!account_type[0]) snprintf(account_type, sizeof(account_type), "extension");
+
+        /* upsert: 找现有账户或新开 */
+        acct_t *a = acct_find_locked(b, key);
+        if (a == NULL) {
+            int slot = -1;
+            for (int k = 0; k < BILL_ACCT_MAX; ++k) {
+                if (!b->accts[k].used) { slot = k; break; }
+            }
+            if (slot < 0) { ++n_fail; continue; }
+            a = &b->accts[slot];
+            memset(a, 0, sizeof(*a));
+            a->used = 1;
+            snprintf(a->key, sizeof(a->key), "%s", key);
         }
+        a->balance       = balance;
+        a->credit_limit   = credit;
+        a->tenant_id      = tenant_id;
+        a->rate_plan_id   = rate_plan_id;
+        a->low_threshold_uc = low_threshold;
+        snprintf(a->account_type, sizeof(a->account_type), "%s", account_type);
+        ++n_ok;
     }
+
+    pthread_rwlock_unlock(&b->lock);
     llog(LOG_INFO, "billing", "accounts.reload: upserted=%d fail=%d total_seen=%d",
          n_ok, n_fail, i);
     return NSBC_OK;
