@@ -262,7 +262,16 @@ endif
 
 .PHONY: all check clean asan tsan ubsan install cli modules web web-acme web-check web-clean build-acme
 
-all: $(TARGET) $(CLI_TARGET) $(DYNAMIC_SOS)
+# mod.load must be generated before .so build — configure always writes it,
+# but as a safety net we also add an explicit Make fallback here.
+# configure path: build/mod/mod.load (generated at L665-677 of configure)
+# nsbcd reads:   exe_dir/mod/mod.load  (exe_dir = dirname(/proc/self/exe))
+# install copy:   $(PREFIX)/etc/nsbc/mod/mod.load
+ifeq ($(NSBC_WITH_DLOPEN),1)
+all: $(TARGET) $(CLI_TARGET) $(DYNAMIC_SOS) $(BUILD)/mod/mod.load
+else
+all: $(TARGET) $(CLI_TARGET)
+endif
 
 # ================================================================
 # dynamic module build rule: each mod_xxx.so independently built with -shared -fPIC
@@ -320,6 +329,17 @@ $(TARGET): $(OBJS) $(MAIN_OBJ) | $(DYNAMIC_SOS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 	cp -f build/nsbcd .
 	$(POST_BUILD_COPY)
+
+# Fallback: generate build/mod/mod.load if configure didn't run
+# (configure always writes it at $(BUILD)/mod/mod.load; this is just a safety net)
+ifeq ($(NSBC_WITH_DLOPEN),1)
+$(BUILD)/mod/mod.load:
+	@mkdir -p $(dir $@)
+	@if [ ! -f $@ ] && [ -n "$(DYNAMIC_MODS)" ]; then \
+	  for m in $(DYNAMIC_MODS); do echo "mod_$$m.so" >> $@; done; \
+	  echo "  GEN $@ (Make fallback, $(words $(DYNAMIC_MODS)) modules)"; \
+	fi
+endif
 
 $(CLI_OBJ): $(CLI_SRC)
 	@mkdir -p $(dir $@)
@@ -404,7 +424,7 @@ ifeq ($(NSBC_WITH_DLOPEN),1)
 	  for so in $(BUILD)/mod/*.so; do install -m 0644 $$so $(DESTDIR)$(PREFIX)/lib/nsbc/; done; \
 	fi
 	install -d $(DESTDIR)$(PREFIX)/etc/nsbc/mod
-	@if [ -f build/mod.load ]; then install -m 0644 build/mod.load $(DESTDIR)$(PREFIX)/etc/nsbc/mod/mod.load; fi
+	@if [ -f $(BUILD)/mod/mod.load ]; then install -m 0644 $(BUILD)/mod/mod.load $(DESTDIR)$(PREFIX)/etc/nsbc/mod/mod.load; fi
 endif
 ifeq ($(WITH_WEB),1)
 	@echo ""
