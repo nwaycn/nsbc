@@ -340,26 +340,89 @@ async fn dispatch_cmd_req<C: crate::coreclient::CoreApi + Clone + Send + Sync + 
         }
         /* ---- cfg.pull_all：C core 启动/reload 时拉全量 enabled 配置表 ----
          * C 侧发 {"cmd":"cfg.pull_all"}，返回所有需要 reload 的 enabled 行 JSON。
-         * Rust 侧直接复用 list_enabled_* 函数（已有 REST reload 在同样用）。
-         * C 侧收到后分别调 trunk_table_reload_json / dp_rules_reload_json / sip_profiles_reload_json。 */
+         * Rust 侧复用 sync.rs 的 DTO 转换（ExtSyncDto 脱敏 HA1-only；
+         * QueueSyncDto 展开 members_json；security_blacklist 返回含 fence_mode 等的 object）。
+         * C 侧 cfg_sync.c 按 key 分别调各模块的 _reload_json()。 */
         "cfg.pull_all" => {
             if state.db.pool().is_none() {
                 return Ok(serde_json::json!({"ok": false, "reason": "db_not_ready"}).to_string());
             }
+            // --- extensions: 脱敏（HA1-only，复用 sync.rs 的 ExtSyncDto）---
+            let ext_rows = state.db.list_enabled_extensions().await.unwrap_or_default();
+            let extensions: Vec<_> = ext_rows.iter()
+                .map(crate::sync::ExtSyncDto::from)
+                .collect();
+
+            // --- gateways ---
+            let gateways = state.db.list_enabled_gateways().await.unwrap_or_default();
+
+            // --- trunks ---
             let trunks = state.db.list_enabled_trunks().await.unwrap_or_default();
+
+            // --- dialplan_rules ---
             let dprules = state.db.list_enabled_dialplan_rules(None).await.unwrap_or_default();
+
+            // --- sip_profiles ---
             let profiles = state.db.list_enabled_sip_profiles().await.unwrap_or_default();
+
+            // --- queues: list_enabled_queues 返回 (Queue, tenant_name) tuple，展开 members_json ---
+            let q_rows = state.db.list_enabled_queues().await.unwrap_or_default();
+            let queues: Vec<crate::sync::QueueSyncDto> = q_rows.into_iter().map(|(q, tenant_name)| {
+                let members: Vec<String> = serde_json::from_str(&q.members_json).unwrap_or_default();
+                crate::sync::QueueSyncDto {
+                    tenant: tenant_name,
+                    name: q.name.clone(),
+                    enabled: q.enabled != 0,
+                    strategy: q.ring_strategy.clone(),
+                    max_wait_s: q.max_wait_sec,
+                    wrap_time_s: 30,
+                    require_skill: String::new(),
+                    members,
+                }
+            }).collect();
+
+            // --- ivr_menus ---
+            let ivr_menus = state.db.list_enabled_ivr_menus().await.unwrap_or_default();
+
+            // --- security_blacklist: 含 fence_mode + method_blocked + auto_ban 等 ---
+            let bl_rows = state.db.list_enabled_security_blacklist().await.unwrap_or_default();
+            let bl_dtos: Vec<_> = bl_rows.iter().map(crate::sync::BlacklistSyncDto::from).collect();
+            let sec_cfg = state.db.get_security_config().await.unwrap_or_default();
+            let security_blacklist = serde_json::json!({
+                "fence_mode":               sec_cfg.fence_mode,
+                "method_blocked":           sec_cfg.method_blocked,
+                "auto_ban":                 sec_cfg.auto_ban,
+                "authfail_threshold":       sec_cfg.authfail_threshold,
+                "authfail_window_s":        sec_cfg.authfail_window_s,
+                "ban_duration_s":           sec_cfg.ban_duration_s,
+                "ratelimit_regs":           sec_cfg.ratelimit_regs,
+                "ratelimit_window_s":       sec_cfg.ratelimit_window_s,
+                "ratelimit_invites":        sec_cfg.ratelimit_invites,
+                "ratelimit_invites_active": sec_cfg.ratelimit_invites_active,
+                "rules":                    bl_dtos,
+            });
+
             tracing::info!(
+                extensions = extensions.len(),
+                gateways = gateways.len(),
                 trunks = trunks.len(),
                 dprules = dprules.len(),
                 profiles = profiles.len(),
+                queues = queues.len(),
+                ivr_menus = ivr_menus.len(),
+                security_rules = bl_dtos.len(),
                 "cfg.pull_all requested by C core"
             );
             Ok(serde_json::json!({
                 "ok": true,
+                "extensions": extensions,
+                "gateways": gateways,
                 "trunks": trunks,
                 "dialplan_rules": dprules,
                 "sip_profiles": profiles,
+                "queues": queues,
+                "ivr_menus": ivr_menus,
+                "security_blacklist": security_blacklist,
             }).to_string())
         }
         "" => Ok(serde_json::json!({"ok": false, "reason": "bad_request"}).to_string()),
