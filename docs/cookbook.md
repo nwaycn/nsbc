@@ -549,54 +549,170 @@ nsbcli help
 socat - UNIX-CONNECT:/var/run/nsbc/control.sock
 ```
 
-### 7.2 All Commands
+### 7.2 All Commands (by group)
+
+Commands split into two families: **built-in** (hardcoded if-chain in obs_control.c) and **registry** (module self-registering via `cmd_registry.h` — every module adds its own group). Run `help` in nsbc_cli or `echo "help" | nc -U /var/run/nsbc/control.sock` for the live auto-generated list.
+
+#### Built-in (always present)
 
 | Command | Level | Description |
 |---------|-------|-------------|
-| `help` / `?` | L0 | Show all commands |
+| `help` / `?` | L0 | Show all commands (built-in + registry auto-grouped) |
 | `version` | L0 | Build version, commit, build date |
 | `status` | L0 | Uptime, active calls, reactor count, memory |
 | `stats` | L0 | Detailed counters (txn in-flight, CPS, registrations) |
 | `events [N]` | L0 | Last N events from ring buffer (default=20) |
+| `show calls` | L0 | Active/total/failed call counters |
+| `show channels` | L0 | Per-call A/B leg Call-ID + state |
+| `show registrations` | L0 | Current binding count |
+| `show apps` | L0 | Registered dialplan applications (answer/ai/bridge/...) |
+| `show codecs` | L0 | Audio + video codec table (name/PT/rate/ch/ptime/dec/enc/source) |
+| `show modules` | L0 | **按 category 分组**列出全部模块 + 状态 + flags |
+| `show event_bus` | L0 | Per-core ring buffer write/read/drop counters |
+| `show rates` | L0 | Billing rate table |
+| `show balances` | L0 | Account balances |
+| `show transcode` | L0 | Transcoding session table |
+| `show cdr` | L0 | Recent CDR records |
+| `log dump [N]` | L0 | Last N log lines (default=100) |
+| `hangup <call-id>` | L1 | Force-terminate a call |
 | `reload` | L1 | **v0.5.0**: reload YAML + pull all DB tables via cfg.pull_all |
 | `config.reload` | L1 | Alias for `reload` |
 | `config.get <key>` | L0 | Read YAML key (e.g. `sip.profiles.external.port`) |
 | `config.set <key> <val>` | L1 | Runtime set YAML key (hot-only keys) |
-| `calls list` | L0 | Active B2BUA calls |
-| `calls hangup <id>` | L1 | Terminate a call |
-| `calls answer <id>` | L1 | Answer a held call |
-| `calls hold <id>` | L1 | Put a call on hold |
-| `calls transfer <id> <dest>` | L1 | Blind transfer |
-| `profiles.list` | L0 | Loaded SIP profiles (port, transport, auth_calls) |
-| `profiles.reload <json>` | L1 | Atomic RCU swap of sip_profiles |
-| `trunks.reload <json>` | L1 | **Direct** RTU swap (bypasses DB — use `reload` instead) |
-| `dialplan-rules.reload <json>` | L1 | **Direct** RCU swap (bypasses DB) |
-| `extensions.reload <json>` | L1 | RCU swap of endpoints table |
-| `outreg.reload <json>` | L1 | RCU swap of outbound registrations |
-| `ivr.reload <json>` | L1 | RCU swap of IVR menus |
-| `queues.reload <json>` | L1 | RCU swap of ACD queues |
-| `ha.reload <json>` | L1 | HA heartbeat config (no-op — Web DB authoritative) |
-| `route_groups.reload <json>` | L1 | Route group config (no-op) |
 | `metrics` | L0 | Dump internal metric registry |
+| `sub <topics>` | L1 | Subscribe real-time push (events/cdr/log/metrics, comma-sep) |
+| `unsub [topics]` | L1 | Unsubscribe (no args = all) |
+| `sub.stat` | L0 | This connection's subscription state |
 
-### 7.3 New in v0.5.0: Diagnostic Commands
+#### Registry: [b2b] Call-level control
 
 | Command | Level | Description |
 |---------|-------|-------------|
-| `trunks.list` | L0 | List route_table trunks with name/host/port/enabled/open/in_use |
-| `dialplan.show` | L0 | List dp_ctx.active rules sorted by priority |
+| `uuid_kill <call-id> [cause]` | L2 | Force hangup (audit logged) |
+| `uuid_cancel <call-id> [leg]` | L2 | CANCEL early INVITE, leg=-1/0/1 (audit) |
+| `uuid_hold <call-id> on\|off` | L2 | Hold/resume (audit) |
+| `uuid_mute <call-id> on\|off [leg]` | L2 | Mute/resume (audit) |
+| `uuid_transfer <call-id> <dest>` | L2 | Blind REFER transfer (audit) |
+| `uuid_displace <call-id>` | L2 | B-leg answer + A-leg unhold takeover (audit) |
+| `uuid_park <call-id>` | L2 | Hold both legs, pause media (audit) |
+| `uuid_unpark <call-id>` | L2 | Unhold both legs, resume media (audit) |
+| `uuid_bridge <a-call-id> <b-call-id>` | L2 | Bridge two calls (audit) |
+| `uuid_broadcast <call-id> <audio>` | L2 | Inject audio into call |
+| `uuid_record <call-id> start\|stop` | L2 | Media recording |
+| `uuid_send_dtmf <call-id> <seq>` | L2 | Send DTMF digits |
+| `uuid_setvar <call-id> <k> <v>` | L2 | Set channel variable (audit) |
+| `uuid_getvar <call-id> <k>` | L1 | Read channel variable (read-only) |
+| `uuid_wait_for_answer <call-id> [timeout_ms]` | L2 | Block until B-leg 200 OK |
+| `originate <call-url> [&app]` | L2 | Outbound call origination (audit) |
+| `send_msg <call-id> <body>` | L2 | In-dialog MESSAGE (audit) |
 
-**Examples:**
+#### Registry: [infra] Infrastructure
+
+| Command | Level | Description |
+|---------|-------|-------------|
+| `sofia siptrace on\|off` | L2 | Global SIP trace on/off (audit) |
+| `sofia profile <name> rescan` | L2 | Rescan a SIP profile (audit) |
+| `console loglevel <0-7\|name>` | L2 | Runtime log level (audit) |
+| `console siptrace on\|off` | L2 | Shorthand for `sofia siptrace` (audit) |
+
+#### Registry: [media_bug] Passive audio tap
+
+| Command | Level | Description |
+|---------|-------|-------------|
+| `uuid_media_bug <call-id> start\|stop\|list` | L2 | Per-call audio tap lifecycle (audit) |
+| `media_bug purge_all` | L2 | Force-cleanup all media_bugs |
+| `bug.add <call-id>` | L2 | Attach RTP payload listener |
+| `bug.del <call-id>` | L2 | Detach listener |
+| `bug.list` | L1 | Active bugs with counters |
+
+#### Registry: [hep] HEPv3 mirroring
+
+| Command | Level | Description |
+|---------|-------|-------------|
+| `hep status` | L1 | Collector table + last send time |
+| `hep flush` | L2 | Flush buffered mirror packets (audit) |
+| `hep reload` | L2 | Reload HEP config from YAML (audit) |
+
+#### Registry: [mod] Dynamic module management
+
+| Command | Level | Description |
+|---------|-------|-------------|
+| `mod.load <name>` | L2 | dlopen `mod_<name>.so` → register → init → start (audit) |
+| `mod.unload <name>` | L2 | stop → fini → dlclose; CALL_PATH/REQUIRED rejected (audit) |
+| `mod.reload <name>` | L2 | unload + load + init + start — **hot-restart a .so without restarting nsbcd** (audit) |
+
+#### Registry: [reload] Web → Core config sync
+
+| Command | Level | Description |
+|---------|-------|-------------|
+| `profiles.reload <json>` | L2 | Atomic RCU swap of sip_profiles |
+| `gateways.reload <json>` | L2 | RCU swap of gateway table |
+| `trunks.reload <json>` | L2 | Direct RTU swap (bypasses DB — prefer `reload` for normal use) |
+| `dialplan-rules.reload <json>` | L2 | Direct RCU swap of dp_rules |
+| `extensions.reload <json>` | L2 | RCU swap of endpoints table |
+| `ivr.reload <json>` | L2 | RCU swap of IVR menus |
+| `queues.reload <json>` | L2 | RCU swap of ACD queues |
+| `ha.reload <json>` | L2 | HA groups (no-op — Web DB authoritative) |
+| `route_groups.reload <json>` | L2 | Route groups (no-op) |
+
+#### Registry: [show] Read-only queries
+
+| Command | Level | Description |
+|---------|-------|-------------|
+| `profiles.list` | L1 | Loaded SIP profiles (port, transport, auth_calls) |
+| `trunks.list` | L1 | route_table trunks with name/host/port/enabled/open/in_use |
+| `dialplan.show` | L1 | dp_ctx.active rules sorted by priority |
+
+#### Registry: [security] Topology hiding & ban
+
+| Command | Level | Description |
+|---------|-------|-------------|
+| `security.ban.list [ip-substr]` | L1 | Current ban/watch entries |
+| `security.ban.unban <ip>` | L2 | Clear a ban entry (audit) |
+| `security.ban.clear` | L2 | Clear entire ban table (audit) |
+| `security.blacklist.list` | L1 | Static CIDR + UA blacklist |
+| `security.blacklist.reload <json>` | L2 | Push blacklist from JSON (audit) |
+| `security.cfg.reload` | L2 | Reload fail2ban YAML config (audit) |
+
+#### Registry: [misc] Test
+
+| Command | Level | Description |
+|---------|-------|-------------|
+| `test_push_cdr` | L2 | Simulated CDR → data.sock (verify write-through) |
+
+### 7.3 Diagnostic Recipes
 
 ```bash
-# Verify trunk loaded after reload
-echo "trunks.list" | nc -U /var/run/nsbc/control.sock
+# --- Verify all core subsystems up after restart ---
+echo "=== MODULES ==="; echo "show modules"
+echo "=== CALLS ===";    echo "show calls"
+echo "=== CODECS ===";   echo "show codecs"
+echo "=== REGIST ===";   echo "show registrations"
+echo "=== TRUNKS ===";   echo "trunks.list"
+echo "=== DIALPLAN ==="; echo "dialplan.show"
+echo "=== PROFILES ==="; echo "profiles.list"
+| nc -U /var/run/nsbc/control.sock
 
-# Verify dialplan rules loaded
-echo "dialplan.show" | nc -U /var/run/nsbc/control.sock
+# --- Remote nsbcd build-out: verify what's actually loaded ---
+echo "show modules" | nc -U /var/run/nsbc/control.sock
+# Expect: 20+ modules grouped by category, all STARTED or INITED
+# Flags: [CALL_PATH] = never dlclose, [REQUIRED] = fatal if fails
 
-# Combined diagnostic one-liner:
-(echo "=== TRUNKS ==="; echo "trunks.list"; echo "=== RULES ==="; echo "dialplan.show") | nc -U /var/run/nsbc/control.sock
+# --- codec sanity (FFmpeg backend = mod_av) ---
+echo "show codecs" | nc -U /var/run/nsbc/control.sock
+# Expect: 13 codecs — 10 audio (PCMU/PCMA/G722/G726×4/G723.1/Opus/G729) + 3 video (H.264/VP8/VP9)
+# "dyn" PT = dynamic payload (RFC 3551), FFmpeg source labeled "FFmpeg (mod_av)"
+
+# --- Hot-reload mod_av after changing av_codec.c ---
+# (no nsbcd restart required)
+make -j$(nproc)
+echo "mod.reload av" | nc -U /var/run/nsbc/control.sock
+# Expect: OK mod.reload 'av' success
+
+# --- Discover all commands on a running server ---
+echo "help" | nc -U /var/run/nsbc/control.sock
+# Output auto-groups: [b2b] [infra] [media_bug] [hep] [mod] [reload] [show] [security] [misc]
+# "registry commands:" section is built from cmd_registry at runtime
 ```
 
 ---
@@ -649,6 +765,93 @@ modules:
   disable:
     - media_bug
     - presence
+```
+
+### Dynamic Module Hot-Reload (mod.load / mod.reload)
+
+All `mod_*.so` modules can be loaded, unloaded, or **hot-restarted at runtime** — no nsbcd restart required. This is the primary dev/debug loop when iterating on a .so module.
+
+```bash
+# After editing av_codec.c:
+make -j$(nproc)                          # rebuild mod_av.so
+echo "mod.reload av" | nc -U /var/run/nsbc/control.sock
+# Expect: OK mod.reload 'av' success
+
+# Verify new build took effect:
+echo "show codecs" | nc -U /var/run/nsbc/control.sock
+# If you added/removed a codec, it reflects immediately
+```
+
+**Lifecycle of `mod.reload av`**:
+
+```
+modmgr_reload("av")
+  │
+  ├─ modmgr_unload("av")
+  │    ├─ stop()        ← optional
+  │    ├─ fini()       ← module unregisters its cmd_registry commands
+  │    └─ dlclose()     ← unmaps mod_av.so
+  │
+  └─ modmgr_load_by_name("av")
+       ├─ find_so_for_name() → builds exe_dir/mod/mod_av.so, ./mod/mod_av.so, ...
+       ├─ dlopen() + dlsym("nsbcm_av")   ← NSBC_MOD_CAT macro exported symbol
+       ├─ init(ctx)                      ← module re-registers cmd_registry commands
+       └─ start(ctx)
+```
+
+**Safety**: `mod.unload` rejects CALL_PATH modules (`MOD_F_CALL_PATH` — signaling, hep) and REQUIRED modules (`MOD_F_REQUIRED` — security, endpoints, agent_pool, queue). Load failures (ABI mismatch, dlsym miss, missing deps) roll back automatically — module stays at previous RUNNING state.
+
+### cmd_registry — Self-Registering Commands
+
+Every module that has OAM CLI commands registers them itself via `cmd_registry.h`. This is why `help` auto-groups commands by module category — no central if-chain to edit.
+
+**Pattern for adding new commands to a .so module**:
+
+```c
+// src/mod/foo/foo.c — in foo_init()
+#include "cmd_registry.h"
+#include "obs.h"  // obs_control_get_cmd_reg()
+
+int foo_init(nsbc_ctx_t *ctx) {
+    cmd_reg_t *reg = obs_control_get_cmd_reg();
+    if (reg) {
+        cmd_desc_t descs[] = {
+            { "foo.status",     "Show foo runtime state",      "foo",
+              CMD_L1_MONITOR, cmd_foo_status, NULL },
+            { "foo.reload",     "Hot-reload foo config JSON",  "foo",
+              CMD_L2_ADMIN,   cmd_foo_reload, ctx },
+        };
+        for (int i = 0; i < 2; ++i)
+            cmd_register(reg, &descs[i]);
+    }
+    return NSBC_OK;
+}
+```
+
+That's it. `help` will immediately show `[foo] foo.status foo.reload`, auto-classified by level (L1=read-only / L2=write+audit). The `group` field (`"foo"`) matches the module's `NSBC_MOD_CAT` category — convention, not enforced.
+
+### Category → show modules grouping
+
+Every module declares a `mod_category_t` at link time via `NSBC_MOD_CAT` / `NSBC_MOD0_CAT` macro. `show modules` groups by this:
+
+| Category | Examples |
+|----------|----------|
+| `core` | signaling, oam, dbal, ha |
+| `codec` | av, codecs |
+| `media_bug` | media_bug, hep, recording |
+| `endpoint` | endpoints |
+| `application` | applications, dialplan, playback |
+| `billing` | billing |
+| `security` | security |
+| `observability` | event_handlers |
+| `call_center` | agent_pool, queue |
+| `ai` | ai_dialog, asr_tts |
+| `outbound` | outreg |
+| `utility` | cachedb, formats, presence, hello |
+
+```bash
+# Always verify what category your new module landed in:
+echo "show modules" | nc -U /var/run/nsbc/control.sock
 ```
 
 ---
@@ -817,7 +1020,7 @@ sqlite3 data/nsbc.db ".tables"   # should show trunks, dialplan_rules, ...
 |----------|-------|-------------|
 | P2 | `cfg.pull_all` only pulls 3 tables | `extensions`, `gateways`, `queues`, `ivr_menus`, `ha_groups` have `list_enabled_*` + `_reload_json` ready — +10 lines each |
 | P2 | `resolve <user> <ip> <profile>` command | Simulate a number resolution, output matched rule + final target |
-| P2 | `help` command should categorize | Currently flat list; should group by OAM / reload / modules |
+| ~~P2~~ | ~~`help` command should categorize~~ | ✅ **Done**: cmd_registry `group` field + `cmd_help()` grouped output in this commit |
 | P2 | max_calls default too high (100000) | `./build/nsbcd` without `-c` → slab OOM → unclear error message |
 | P2 | 5 other silent-drop sites | CIDR blacklist, PERM_DENIED, `no_rule_matched` — could return more specific codes |
 | P2 | `config_change_hook` bus | Long-term architecture — replace scatter calls with hook registrations |

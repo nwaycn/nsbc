@@ -52,7 +52,8 @@
   - [许可证](#许可证)
   - [致谢](#致谢)
 
-> 深入文档：[架构参考](docs/architecture.md) ·
+> 深入文档：[操作手册（Cookbook）](docs/cookbook.md) ·
+> [架构参考](docs/architecture.md) ·
 > [调用链参考（SIP 与 WebRTC）](docs/call-flows_cn.md) ·
 > [使用指南](docs/user-guide_cn.md)
 
