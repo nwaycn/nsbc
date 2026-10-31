@@ -1147,7 +1147,7 @@ async fn flush_sessions(
     }
 
     match q.execute(pool.as_ref()).await {
-        Ok(_) => debug!(count = n, elapsed_ms = elapsed.elapsed().as_millis(), "batch sessions flush OK"),
+        Ok(_) => info!(count = n, elapsed_ms = elapsed.elapsed().as_millis(), "batch sessions flush OK"),
         Err(e) => warn!(count = n, error = %e, "batch sessions flush FAILED — falling back to per-row"),
     }
     bucket.clear();
@@ -1247,7 +1247,7 @@ async fn flush_registers(
     }
 
     match q.execute(pool.as_ref()).await {
-        Ok(_) => debug!(count = n, elapsed_ms = elapsed.elapsed().as_millis(), "batch registers flush OK"),
+        Ok(_) => info!(count = n, elapsed_ms = elapsed.elapsed().as_millis(), "batch registers flush OK"),
         Err(e) => warn!(count = n, error = %e, "batch registers flush FAILED"),
     }
     bucket.clear();
@@ -1332,7 +1332,7 @@ async fn flush_cdrs(
     }
 
     match q.execute(pool.as_ref()).await {
-        Ok(_) => debug!(count = n, elapsed_ms = elapsed.elapsed().as_millis(), "batch cdrs flush OK"),
+        Ok(_) => info!(count = n, elapsed_ms = elapsed.elapsed().as_millis(), "batch cdrs flush OK"),
         Err(e) => warn!(count = n, error = %e, "batch cdrs flush FAILED"),
     }
     bucket.clear();
@@ -1367,7 +1367,7 @@ async fn flush_runtimes(
     }
 
     match q.execute(pool.as_ref()).await {
-        Ok(_) => debug!(count = n, elapsed_ms = elapsed.elapsed().as_millis(), "batch runtimes flush OK"),
+        Ok(_) => info!(count = n, elapsed_ms = elapsed.elapsed().as_millis(), "batch runtimes flush OK"),
         Err(e) => warn!(count = n, error = %e, "batch runtimes flush FAILED"),
     }
     bucket.clear();
