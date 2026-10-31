@@ -247,10 +247,11 @@ static void pb_fini(struct nsbc_ctx *ctx)
  * 依赖：无（media_bridge 是所有媒体层模块的基础，不需要显式声明）
  * level = MOD_L_CALL_PATH — 拨号计划层播放属于呼叫生命周期核心能力
  * =================================================================*/
-NSBC_MOD(playback,         /* name */
+NSBC_MOD_CAT(playback,         /* name */
          1,                /* version */
          MOD_L_FINAL,      /* level：所有基础框架 ready 后才 init */
          0,                /* flags */
+         MOD_CAT_APPLICATION,  /* category */
          (const char *[]){ NULL },  /* deps：无依赖，NULL 哨兵数组 */
          pb_init,          /* init */
          NULL,             /* start：engine_start 在 init 内完成 */
