@@ -157,10 +157,9 @@ static int av_codec_open(struct codec_sess *sess, int is_decoder)
         return NSBC_ERR;
     }
 
-    /* Phase 4: 音频 decoder 输出 → S16 interleaved 的 swr 准备
-     * 如果 decoder 输出本来就是 AV_SAMPLE_FMT_S16 + 目标 sample_rate/channels 匹配，
-     * 跳过 swr（零开销）。否则创建 swr_context 做：sample_fmt + sample_rate + channels 三件套重采样。
-     * encoder 方向不需要 swr（输入假设 transcode pipeline 已处理好）。*/
+    /* Phase 4: 音频重采样 swr（转码管线必需）
+     * 全部用新 API：swr_alloc_set_opts2 + AVChannelLayout + SwrContext opaque
+     * configure 里 pkg-config --atleast-version 4.6 libswresample 保证版本 */
     if (is_decoder && !p->is_video) {
         enum AVSampleFormat target_fmt   = AV_SAMPLE_FMT_S16;
         int                target_rate   = (sess->id == CODEC_OPUS) ? 48000 :
@@ -169,31 +168,8 @@ static int av_codec_open(struct codec_sess *sess, int is_decoder)
 
         if (ctx->sample_fmt != target_fmt ||
             ctx->sample_rate != target_rate ||
-#if LIBAVCODEC_VERSION_MAJOR >= 59
             ctx->ch_layout.nb_channels != target_ch) {
-#else
-            ctx->channels != target_ch) {
-#endif
 
-/* swresample 两个 API 点分开判断（只用 MAJOR/MINOR，LIBSWRESAMPLE_VERSION 有逗号不能比较）：
- *   swr_alloc_set_opts2  — 新 API (libswresample >= 4.6)
- *   SwrContext opaque     — 旧 API 也变成 opaque (>= 4.5)
- */
-#if defined(LIBSWRESAMPLE_VERSION_MAJOR) \
- && (LIBSWRESAMPLE_VERSION_MAJOR > 4 \
-     || (LIBSWRESAMPLE_VERSION_MAJOR == 4 && defined(LIBSWRESAMPLE_VERSION_MINOR) \
-         && LIBSWRESAMPLE_VERSION_MINOR >= 6))
-#define NSBC_HAS_SWR2 1
-#endif
-#if defined(LIBSWRESAMPLE_VERSION_MAJOR) \
- && (LIBSWRESAMPLE_VERSION_MAJOR > 4 \
-     || (LIBSWRESAMPLE_VERSION_MAJOR == 4 && defined(LIBSWRESAMPLE_VERSION_MINOR) \
-         && LIBSWRESAMPLE_VERSION_MINOR >= 5))
-#define NSBC_SWR_OPAQUE 1
-#endif
-
-#ifdef NSBC_HAS_SWR2
-            /* libswresample >= 4.6: swr_alloc_set_opts2 + AVChannelLayout* */
             SwrContext *swr = swr_alloc_set_opts2(
                 NULL,
                 &(AVChannelLayout)AV_CHANNEL_LAYOUT_MONO,
@@ -201,37 +177,15 @@ static int av_codec_open(struct codec_sess *sess, int is_decoder)
                 &ctx->ch_layout,
                 ctx->sample_fmt, ctx->sample_rate,
                 0, NULL);
-#else
-            /* libswresample <4.6: swr_alloc_set_opts + channel mask */
-            uint64_t in_mask =
-#if LIBAVCODEC_VERSION_MAJOR >= 59
-                ctx->ch_layout.u.mask;
-#else
-                ctx->channel_layout;
-#endif
-            SwrContext *swr = swr_alloc_set_opts(
-                NULL,
-                AV_CH_LAYOUT_MONO,
-                target_fmt, target_rate,
-                in_mask,
-                ctx->sample_fmt, ctx->sample_rate,
-                0, NULL);
-#endif
             if (swr) {
                 swr_init(swr);
                 sess->swr = swr;
-#ifdef NSBC_SWR_OPAQUE
-                sess->swr_out_rate = target_rate;
-#endif
+                sess->swr_out_rate = target_rate; /* SwrContext opaque, 自己缓存 */
                 llog(LOG_DEBUG, "av",
-                     "swr init: codec sample_fmt=%d→%d rate=%d→%d ch=%d→%d",
+                     "swr init: codec sfmt=%d->%d rate=%d->%d ch=%d->%d",
                      ctx->sample_fmt, target_fmt,
                      ctx->sample_rate, target_rate,
-#if LIBAVCODEC_VERSION_MAJOR >= 59
                      ctx->ch_layout.nb_channels, target_ch);
-#else
-                     ctx->channels, target_ch);
-#endif
             }
         }
     }
