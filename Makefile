@@ -285,6 +285,7 @@ AI_DIALOG_CPPFLAGS :=
 endif
 
 # only ai_dialog module gets curl flag
+# only av module gets FFmpeg LDLIBS (configure sets AV_LDLIBS when FFmpeg detected)
 # only codecs module gets bcg729 compatibility flag (third-party code has warnings)
 $(BUILD)/mod/%.so:
 	@mkdir -p $(dir $@)
@@ -294,6 +295,11 @@ ifeq ($(MOD_STEM),ai_dialog)
 	      $(CFLAGS) $(CPPFLAGS) $(AI_DIALOG_CPPFLAGS) -o $@ \
 	      $(MOD_SRC_$(MOD_STEM)) \
 	      $(LDLIBS) $(AI_DIALOG_LDLIBS)
+else ifeq ($(MOD_STEM),av)
+	$(CC) -shared -fPIC -fvisibility=hidden \
+	      $(CFLAGS) $(CPPFLAGS) -o $@ \
+	      $(MOD_SRC_$(MOD_STEM)) \
+	      $(LDLIBS) $(AV_LDLIBS)
 else ifeq ($(MOD_STEM),codecs)
 	$(CC) -shared -fPIC -fvisibility=hidden \
 	      $(CFLAGS) -Wno-error -Wno-unused-parameter -Wno-maybe-uninitialized \

@@ -701,7 +701,7 @@ int main(int argc, char **argv)
      * 路径候选：exe_dir/mod/mod.load → cfg core.mods_load_path → /etc/nsbc/mod/mod.load
      * mod.load 不存在是正常的（0 个动态模块），不报错。 */
     {
-        const char *candidates[4];
+        const char *candidates[8];
         int ncand = 0;
         /* 候选1：可执行文件所在目录的 mod/mod.load（install 后 nsbcd 和 mod/ 放一起） */
         char exe_mod_load[1024];
