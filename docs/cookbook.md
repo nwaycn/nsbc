@@ -1018,13 +1018,13 @@ sqlite3 data/nsbc.db ".tables"   # should show trunks, dialplan_rules, ...
 
 | Priority | Issue | Description |
 |----------|-------|-------------|
-| P2 | `cfg.pull_all` only pulls 3 tables | `extensions`, `gateways`, `queues`, `ivr_menus`, `ha_groups` have `list_enabled_*` + `_reload_json` ready — +10 lines each |
+| ~~P2~~ | ~~`cfg.pull_all` only pulls 3 tables~~ | ✅ **Done**: extended to 8 — extensions, gateways, trunks, dialplan_rules, sip_profiles, queues, ivr_menus, security_blacklist (incl. fence_mode / ratelimit / auto_ban config blob) |
 | P2 | `resolve <user> <ip> <profile>` command | Simulate a number resolution, output matched rule + final target |
-| ~~P2~~ | ~~`help` command should categorize~~ | ✅ **Done**: cmd_registry `group` field + `cmd_help()` grouped output in this commit |
-| P2 | max_calls default too high (100000) | `./build/nsbcd` without `-c` → slab OOM → unclear error message |
-| P2 | 5 other silent-drop sites | CIDR blacklist, PERM_DENIED, `no_rule_matched` — could return more specific codes |
-| P2 | `config_change_hook` bus | Long-term architecture — replace scatter calls with hook registrations |
-| P2 | Test infrastructure | Official sipp XML scenarios + parameterized stress scripts |
+| ~~P2~~ | ~~`help` command should categorize~~ | ✅ **Done**: cmd_registry `group` field + `cmd_help()` grouped output |
+| ~~P2~~ | ~~max_calls default too high (100000)~~ | ✅ **Done**: `DEFAULT_MAX_CALLS` reduced to 4096 in `src/sip/call_session.c` |
+| P2 | Silent-drop sites return 403/404 | CIDR blacklist, PERM_DENIED, `no_rule_matched` currently drop silently (anti-fingerprinting). Consider returning specific codes in DEBUG build |
+| P3 | `config_change_hook` bus | Long-term architecture — replace scatter calls after reload with a hook registry |
+| P2 | Test infrastructure | Official sipp XML scenarios + parameterized stress scripts (currently only ad-hoc Python scripts in `testing/`) |
 
 ---
 
