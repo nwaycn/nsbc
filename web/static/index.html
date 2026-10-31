@@ -213,30 +213,31 @@
         <i class="fa-solid fa-hand-point-right text-4xl mb-4"></i>
         <p>{{ t('Select a module from the sidebar to start') }}</p>
       </div>
+
+      <!-- Change Password Dialog -->
+      <el-dialog v-model="showPwdDialog" :title="t('Change Password')" width="420px" :close-on-click-modal="false">
+        <el-form :model="pwdForm" :rules="pwdRules" ref="pwdFormRef" label-width="110px">
+          <el-form-item :label="t('Current Password')" prop="old_password">
+            <el-input v-model="pwdForm.old_password" type="password" show-password autocomplete="current-password"></el-input>
+          </el-form-item>
+          <el-form-item :label="t('New Password')" prop="new_password">
+            <el-input v-model="pwdForm.new_password" type="password" show-password autocomplete="new-password"></el-input>
+          </el-form-item>
+          <el-form-item :label="t('Confirm New Password')" prop="confirm_password">
+            <el-input v-model="pwdForm.confirm_password" type="password" show-password autocomplete="new-password"></el-input>
+          </el-form-item>
+        </el-form>
+        <template #footer>
+          <el-button @click="showPwdDialog = false">{{ t('Cancel') }}</el-button>
+          <el-button type="primary" :loading="pwdLoading" @click="submitChangePassword">
+            {{ t('Confirm') }}
+          </el-button>
+        </template>
+      </el-dialog>
+
     </main>
   </div>
 </div>
-
-<!-- Change Password Dialog -->
-<el-dialog v-model="showPwdDialog" :title="t('Change Password')" width="420px" :close-on-click-modal="false">
-  <el-form :model="pwdForm" :rules="pwdRules" ref="pwdFormRef" label-width="110px">
-    <el-form-item :label="t('Current Password')" prop="old_password">
-      <el-input v-model="pwdForm.old_password" type="password" show-password autocomplete="current-password"></el-input>
-    </el-form-item>
-    <el-form-item :label="t('New Password')" prop="new_password">
-      <el-input v-model="pwdForm.new_password" type="password" show-password autocomplete="new-password"></el-input>
-    </el-form-item>
-    <el-form-item :label="t('Confirm New Password')" prop="confirm_password">
-      <el-input v-model="pwdForm.confirm_password" type="password" show-password autocomplete="new-password"></el-input>
-    </el-form-item>
-  </el-form>
-  <template #footer>
-    <el-button @click="showPwdDialog = false">{{ t('Cancel') }}</el-button>
-    <el-button type="primary" :loading="pwdLoading" @click="submitChangePassword">
-      {{ t('Confirm') }}
-    </el-button>
-  </template>
-</el-dialog>
 
 <!-- 应用核心（API、编辑器、工厂、App 创建） -->
 <script src="js/app-core.js?v=20261031a"></script>
