@@ -169,13 +169,19 @@ static int av_codec_open(struct codec_sess *sess, int is_decoder)
 
         if (ctx->sample_fmt != target_fmt ||
             ctx->sample_rate != target_rate ||
-#ifdef LIBSWRESAMPLE_VERSION_MAJOR
+#if LIBAVCODEC_VERSION_MAJOR >= 59
             ctx->ch_layout.nb_channels != target_ch) {
 #else
             ctx->channels != target_ch) {
 #endif
 
-#if defined(LIBSWRESAMPLE_VERSION_MAJOR) && LIBSWRESAMPLE_VERSION_MINOR >= 6
+/* swresample 版本分三档：
+ *   < 4.5   — 旧：SwrContext 字段可见 + swr_alloc_set_opts
+ *   4.5     — 过渡：SwrContext opaque，但 swr_alloc_set_opts2 还没引入
+ *   >= 4.6  — 新：swr_alloc_set_opts2 + opaque SwrContext
+ * 服务器上是 4.5（Debian 12 对应 FFmpeg 6.0），最容易踩坑的档
+ */
+#if defined(LIBSWRESAMPLE_VERSION) && LIBSWRESAMPLE_VERSION >= 0x040600
             /* libswresample 4.6+ (FFmpeg 6.1+): swr_alloc_set_opts2 + AVChannelLayout* */
             SwrContext *swr = swr_alloc_set_opts2(
                 NULL,
@@ -189,7 +195,7 @@ static int av_codec_open(struct codec_sess *sess, int is_decoder)
                 ctx->sample_rate,
                 0, NULL);
 #else
-            /* 旧版 libswresample (<4.6): swr_alloc_set_opts + channel mask */
+            /* libswresample <4.6: swr_alloc_set_opts + channel mask */
             uint64_t in_mask =
 #if LIBAVCODEC_VERSION_MAJOR >= 59
                 ctx->ch_layout.u.mask;
@@ -209,14 +215,15 @@ static int av_codec_open(struct codec_sess *sess, int is_decoder)
             if (swr) {
                 swr_init(swr);
                 sess->swr = swr;
-#if defined(LIBSWRESAMPLE_VERSION_MAJOR) && LIBSWRESAMPLE_VERSION_MINOR >= 6
-                sess->swr_out_rate = target_rate; /* swr opaque in new libswresample, cache locally */
+#if defined(LIBSWRESAMPLE_VERSION) && LIBSWRESAMPLE_VERSION >= 0x040500
+                /* libswresample 4.5+: SwrContext opaque, out_sample_rate 不可访问，缓存 */
+                sess->swr_out_rate = target_rate;
 #endif
                 llog(LOG_DEBUG, "av",
                      "swr init: codec sample_fmt=%d→%d rate=%d→%d ch=%d→%d",
                      ctx->sample_fmt, target_fmt,
                      ctx->sample_rate, target_rate,
-#ifdef LIBSWRESAMPLE_VERSION_MAJOR
+#if LIBAVCODEC_VERSION_MAJOR >= 59
                      ctx->ch_layout.nb_channels, target_ch);
 #else
                      ctx->channels, target_ch);
@@ -335,8 +342,8 @@ static int av_codec_decode(struct codec_sess *sess,
                 int16_t *dst = (int16_t *)(out->pcm + out->samples);
                 memcpy(dst, swr_out, converted * sizeof(int16_t));
                 out->samples += converted;
-#if defined(LIBSWRESAMPLE_VERSION_MAJOR) && LIBSWRESAMPLE_VERSION_MINOR >= 6
-                /* 新版 libswresample opaque swr, use cached value */
+#if defined(LIBSWRESAMPLE_VERSION) && LIBSWRESAMPLE_VERSION >= 0x040500
+                /* libswresample 4.5+: SwrContext opaque, out_sample_rate 不可访问 */
                 out->rate = sess->swr_out_rate;
 #else
                 out->rate = sess->swr->out_sample_rate;
