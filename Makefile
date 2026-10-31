@@ -348,7 +348,7 @@ modules: $(DYNAMIC_SOS)
 
 $(TARGET): $(OBJS) $(MAIN_OBJ) | $(DYNAMIC_SOS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
-	cp -f build/nsbcd .
+	cp -f $@ .
 	$(POST_BUILD_COPY)
 
 # Fallback: generate build/mod/mod.load if configure didn't run
@@ -368,7 +368,7 @@ $(CLI_OBJ): $(CLI_SRC)
 
 $(CLI_TARGET): $(CLI_OBJ)
 	$(CC) $(LDFLAGS) -o $@ $^ $(CLI_LDLIBS)
-	cp -f build/nsbc_cli .
+	cp -f $@ .
 
 $(BUILD)/3rd/cjson/cJSON.o: CPPFLAGS += -I3rd/include/cjson
 $(BUILD)/3rd/cjson/cJSON.o: CFLAGS += -Wno-error
