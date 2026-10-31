@@ -239,8 +239,8 @@ sleep 3
 pgrep -a nsbc-web
 tail -20 /tmp/nsbc_web.log
 
-# ② 启动 nsbcd（core dump 已开）
-bash -c 'ulimit -c unlimited && nohup ./nsbcd > /tmp/nsbcd.log 2>&1 < /dev/null &'
+# ② 启动 nsbcd（⚠️ 必须带 -c conf/nsbc.yaml，否则找不到配置文件）
+bash -c 'ulimit -c unlimited && nohup ./build/nsbcd -c conf/nsbc.yaml > /tmp/nsbcd.log 2>&1 < /dev/null &'
 sleep 4
 # 确认起来了
 pgrep -a nsbcd
@@ -317,8 +317,9 @@ sqlite3 /home/github/nsbc/db/web.db \
 ### 3.9 完整启动验证 checklist
 
 - [ ] nsbc-web 进程存在 `pgrep -a nsbc-web`
-- [ ] nsbcd 进程存在 `pgrep -a nsbcd`
+- [ ] nsbcd 进程存在 `pgrep -a nsbcd`（⚠️ 启动命令必须含 `-c conf/nsbc.yaml`）
 - [ ] UDS 存在 `ls /var/run/nsbc/data.sock /var/run/nsbc/control.sock`
+- [ ] SQLite PRAGMA 验证（C 原生 sqlite3 CLI，不是 Python！）: `sqlite3 db/web.db "PRAGMA busy_timeout; PRAGMA journal_mode;"` → `5000 / wal`
 - [ ] OPTIONS 本机 200 OK
 - [ ] 跨机 UDP 5060 可达
 - [ ] 5 个分机 REGISTER 全部 200 OK
@@ -751,18 +752,19 @@ pkill -9 nsbc-web 2>/dev/null; pkill -9 nsbcd 2>/dev/null
 cd /home/github/nsbc
 nohup ./nsbc-web > /tmp/nsbc_web.log 2>&1 < /dev/null &
 sleep 2
-bash -c 'ulimit -c unlimited && nohup ./nsbcd > /tmp/nsbcd.log 2>&1 < /dev/null &'
+# ⚠️ nsbcd 必须带 -c conf/nsbc.yaml（否则找不到配置，txn slab 内存不够启动失败）
+bash -c 'ulimit -c unlimited && nohup ./build/nsbcd -c conf/nsbc.yaml > /tmp/nsbcd.log 2>&1 < /dev/null &'
 sleep 4
 ```
 
-### 热加载
+### 热加载（⚠️ Debian nc 不支持 `-U`，用 Python AF_UNIX）
 
 ```bash
-echo "profile reload"    | nc -U /var/run/nsbc/control.sock
-echo "dialplan reload"   | nc -U /var/run/nsbc/control.sock
-echo "registrar reload"  | nc -U /var/run/nsbc/control.sock
-echo "core show threads" | nc -U /var/run/nsbc/control.sock
-echo "bridge show"       | nc -U /var/run/nsbc/control.sock
+# 通用 reload（热加载所有配置：dialplan/sip_profiles/registrar/trunks 全 reload）
+python3 -c "import socket; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect('/var/run/nsbc/control.sock'); s.sendall(b'reload\n'); print(s.recv(4096)); s.close()"
+
+# 查看系统状态（metrics 文本格式，含 nsbc_uds_ring_dropped 等）
+python3 -c "import socket; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect('/var/run/nsbc/control.sock'); s.sendall(b'stats\n'); import time; time.sleep(0.5); print(s.recv(65535).decode()); s.close()"
 ```
 
 ### DB 查询
@@ -864,12 +866,13 @@ done
 - R1-R3 跑完，DB calls 有增长，nsbcd 存活
 - RELAY workers join 超慢（Debian spawn 模式），完整矩阵待后续 session
 
-#### 未解决项
+### 未解决项
 | 项 | 状态 | 备注 |
 |----|------|------|
-| SQLite `busy_timeout=5000` | ❌ PRAGMA 未生效 | sqlx connection-level PRAGMA 需要 `after_connect` hook，Phase 2 修 |
+| ~~SQLite `busy_timeout=5000`~~ | ✅ **Phase 2 已修 commit 5b4a173** | after_connect hook 设 6 个 PRAGMA，已远程验证 |
+| ~~C 端 ring 溢出计数器~~ | ✅ **Phase 2 已修 commit 5b4a173** | `nsbc_uds_ring_dropped` metric，control.sock stats 可见 |
 | RELAY 完整 5 档矩阵 | 🔶 部分完成 | R4/R5 因 spawn join 超慢未跑完，nsbcd 依然存活 |
-| C 端 ring 溢出计数器 | ❌ 未实现 | 架构事实：ring_put 异步不回压，ring 满丢 oldest — 需加丢弃计数 |
+| SQLite 连接池竞争压力测试 | 🔶 未跑 | busy_timeout 生效后 DB 竞争不再导致 timeout |
 
 ### 11.3 经验教训（已更新 SKILL.md）
 
@@ -877,4 +880,6 @@ done
 |---|----|------|
 | W2f | OPTIONS sanity 假故障（nc -u loopback 无响应） | 跳过 OPTIONS，直接跑 stress_invite |
 | W2g | stress_invite 0% success 假阴性（join 慢导致） | 用 DB calls/cdr 行数判断真实成功率 |
-| W2h | SQLite busy_timeout PRAGMA 在 sqlx 里可能不生效 | 用 after_connect hook（代码待补） |
+| W2h | SQLite busy_timeout PRAGMA 在 sqlx AnyPool 里不生效 | ✅ **Phase 2 已修** after_connect hook（reborrow `&mut *conn`） |
+| W2i | nsbcd 在 build/ 下启动找不到 conf/nsbc.yaml | ✅ **启动必须 `-c conf/nsbc.yaml`** |
+| W2j | sqlx after_connect 里 double-borrow + move 陷阱 | ✅ `let c = &mut *conn; execute(&mut *c)` 每次显式 reborrow |
