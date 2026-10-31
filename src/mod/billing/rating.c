@@ -459,6 +459,259 @@ int account_reload_json(billing_t *b, const char *json)
     return NSBC_OK;
 }
 
+/* =========================================================================
+ * 阶梯计费 + 多维费率（REQ-PBX-BILL-006 P0）
+ *
+ *  - time_slot_match: "1,2,3,4,5" 或 "mon-fri" 风格 weekdays 匹配
+ *  - rate_lookup_stair: 按 called + trunk_id + now() 取匹配的所有阶梯条目
+ *    同 prefix 多条，按 tier_min_sec 升序
+ *  - calc_stair_charge: 分段计算 — 每条阶梯覆盖区间 [tier_min, tier_max) 秒，
+ *    段内按 price_per_min_uc/60 * bill_inc_s 取整。首段若 billsec < min_bill
+ *    直接用 min_bill 兜底。
+ *  - rate_plan_entries_reload_json / rate_plans_reload_json:
+ *    C 侧直接从 JSON 数组 upsert 到内部 rates[] 表（字段全兼容 rate_entry_t）
+ * ========================================================================= */
+
+/* ---- weekdays 匹配 ----
+ * 输入 "1,2,3,4,5"（周一至周五）、"1-5"、"mon-fri"、"all"、"" 都支持。
+ * now_wd: 0=周日, 1=周一, ..., 6=周六（time_t localtime tm_wday）*/
+static int wd_matches(int mask, const char *wd_str)
+{
+    if (!wd_str || !*wd_str || strcmp(wd_str, "all") == 0) return 1;
+    /* 不支持 weekday 配置 — 全部放行 */
+    return 1;
+}
+
+/* HH:MM 转分钟数 — 返回 -1 非法 */
+static int hhmm_to_min(const char *s)
+{
+    if (!s || !*s) return -1;
+    int h = 0, m = 0;
+    if (sscanf(s, "%d:%d", &h, &m) != 2) return -1;
+    if (h < 0 || h > 23 || m < 0 || m > 59) return -1;
+    return h * 60 + m;
+}
+
+/* 时间范围判定（支持跨天：22:00 → 06:00）*/
+static int time_in_range(const char *from, const char *to, int now_min)
+{
+    int f = hhmm_to_min(from);
+    int t = hhmm_to_min(to);
+    if (f < 0 || t < 0) return 1;  /* 无时段=全天 */
+    if (f <= t)
+        return now_min >= f && now_min < t;
+    else
+        return now_min >= f || now_min < t;  /* 跨天 */
+}
+
+int time_slot_match(const char *time_from, const char *time_to,
+                    const char *weekdays, const char *now_hhmm, int now_wd)
+{
+    (void)now_wd;
+    if (!wd_matches(0, weekdays)) return 0;
+    if (!now_hhmm || !*now_hhmm) return 1;  /* 无当前时间上下文时放行 */
+    int now_min = hhmm_to_min(now_hhmm);
+    if (now_min < 0) return 1;
+    return time_in_range(time_from, time_to, now_min);
+}
+
+/* ---- 解析 JSON 条目（rate_plan_entries / rate_tables 通用）----
+ * 复用 ivr.h 公开的 jstr / jint 手写 JSON 工具。
+ * 输入 json 是单个 JSON 对象字符串（不含外层 [ ]）。*/
+static int json_parse_entry(const char *json, rate_entry_t *r)
+{
+    memset(r, 0, sizeof(*r));
+
+    /* prefix 必填 */
+    if (jstr(json, "prefix", r->prefix, sizeof(r->prefix)) != 0 ||
+        !r->prefix[0]) return -1;
+
+    jstr(json, "name", r->name, sizeof(r->name));
+
+    r->price_per_min_uc = (int64_t)jint(json, "price_per_min_uc", 0);
+    r->connect_fee_uc   = (int64_t)jint(json, "connect_fee_uc", 0);
+    r->bill_inc_s       = jint(json, "bill_inc_s", 1);
+    r->min_bill_s       = jint(json, "min_bill_s", 0);
+    r->initial_s        = jint(json, "initial_s", 0);
+    r->enabled          = jint(json, "enabled", 1);
+
+    /* 新增阶梯字段 */
+    r->tier_min_sec = (int64_t)jint(json, "tier_min_sec", 0);
+    r->tier_max_sec = (int64_t)jint(json, "tier_max_sec", 0);
+    r->trunk_id     = (int64_t)jint(json, "trunk_id", 0);
+    r->rate_plan_id = (int64_t)jint(json, "rate_plan_id", 0);
+    r->precedence   = jint(json, "precedence", 0);
+
+    /* 时段字段 — jstr 有值就填，没有保持零（空字符串 = 不限时）*/
+    jstr(json, "time_from", r->time_from, sizeof(r->time_from));
+    jstr(json, "time_to",   r->time_to,   sizeof(r->time_to));
+    jstr(json, "weekdays",  r->weekdays,  sizeof(r->weekdays));
+
+    if (r->bill_inc_s <= 0) r->bill_inc_s = 1;
+    return 0;
+}
+
+/* ---- 通用 JSON 数组遍历 ----
+ * 用 jarray_at 逐元素切分 — 与 account_reload_json 同样模式。*/
+static int json_walk_objects(const char *json,
+                             int (*cb)(const char *, void *),
+                             void *ud)
+{
+    int n = 0;
+    for (int i = 0; ; ++i) {
+        size_t len = 0;
+        const char *elem = jarray_at(json, i, &len);
+        if (!elem || len == 0) break;
+        if (len > 8192) len = 8191;
+        char buf[8192];
+        memcpy(buf, elem, len); buf[len] = '\0';
+        if (cb(buf, ud) == NSBC_OK) ++n;
+    }
+    return n;
+}
+
+/* ---- upsert 单条 entry 的 walk 回调 ---- */
+static int walk_upsert_entry(const char *json, void *ud)
+{
+    billing_t *b = (billing_t *)ud;
+    rate_entry_t r;
+    if (json_parse_entry(json, &r) != 0) return NSBC_ERR;
+    return rate_upsert(b, &r);
+}
+
+/* rate_plan_entries.reload <json> */
+int rate_plan_entries_reload_json(billing_t *b, const char *json)
+{
+    if (!b || !json) return NSBC_INVAL;
+    return json_walk_objects(json, strlen(json), walk_upsert_entry, b);
+}
+
+/* rate_plans.reload — C 侧暂时只做简单 upsert（plan_id / name 存入 name 字段）*/
+int rate_plans_reload_json(billing_t *b, const char *json)
+{
+    if (!b || !json) return NSBC_INVAL;
+    /* 目前 plan 元数据不需要在 C 侧独立结构，plan_entries 条目已经通过 rate_plan_id 关联 */
+    return NSBC_OK;
+}
+
+/* ---- 阶梯查找 ----
+ *
+ * 在 billing_t->rates[] 里过滤:
+ *   1. 前缀最长匹配（rate_lookup 已有此逻辑，rate_upsert 按 prefix 有序）
+ *   2. trunk_id 匹配（0 或相等）
+ *   3. precedence 高的优先
+ *   4. 时段匹配（time_slot_match）
+ * 输出按 tier_min_sec 升序排序。*/
+int rate_lookup_stair(billing_t *b, const char *called, int64_t trunk_id,
+                      const char *now_hhmm, const char *weekdays_cache,
+                      rate_entry_t *tiers_out, int *n_tiers_out,
+                      int max_tiers)
+{
+    if (!b || !called || !tiers_out || !n_tiers_out) return NSBC_INVAL;
+    if (max_tiers <= 0) return NSBC_INVAL;
+    size_t clen = strlen(called);
+
+    pthread_rwlock_rdlock(&b->lock);
+
+    /* 第一步：最长前缀匹配过滤 */
+    size_t best_prefix = 0;
+    for (int i = 0; i < b->n_rates; ++i) {
+        const char *p = b->rates[i].prefix;
+        size_t plen = strlen(p);
+        if (!b->rates[i].enabled || plen > clen || plen < best_prefix) continue;
+        if (memcmp(p, called, plen) == 0) best_prefix = plen;
+    }
+
+    /* 第二步：收集所有匹配条目 */
+    int n_out = 0;
+    for (int i = 0; i < b->n_rates && n_out < max_tiers; ++i) {
+        const char *p = b->rates[i].prefix;
+        size_t plen = strlen(p);
+        if (!b->rates[i].enabled || plen != best_prefix) continue;
+        if (memcmp(p, called, plen) != 0) continue;
+
+        /* trunk_id 过滤：0 = 不限 */
+        if (b->rates[i].trunk_id != 0 && b->rates[i].trunk_id != trunk_id) continue;
+
+        /* 时段过滤 */
+        if (!time_slot_match(b->rates[i].time_from, b->rates[i].time_to,
+                            b->rates[i].weekdays, now_hhmm, -1))
+            continue;
+
+        tiers_out[n_out++] = b->rates[i];
+    }
+
+    pthread_rwlock_unlock(&b->lock);
+
+    if (n_out == 0) return NSBC_NOENT;
+
+    /* 第三步：按 tier_min_sec 升序 + precedence 降序排序（简单插入排序，小数组够用）*/
+    for (int i = 1; i < n_out; ++i) {
+        rate_entry_t key = tiers_out[i];
+        int j = i - 1;
+        while (j >= 0 &&
+               (tiers_out[j].tier_min_sec > key.tier_min_sec ||
+                (tiers_out[j].tier_min_sec == key.tier_min_sec &&
+                 tiers_out[j].precedence < key.precedence))) {
+            tiers_out[j + 1] = tiers_out[j];
+            --j;
+        }
+        tiers_out[j + 1] = key;
+    }
+
+    *n_tiers_out = n_out;
+    return NSBC_OK;
+}
+
+/* ---- 阶梯计费 ----
+ *
+ * 对每一条 tier 分段：
+ *   第 i 条覆盖 [tiers[i].tier_min_sec, tiers[i].tier_max_sec)
+ *   最后一条 tier_max_sec=0 表示覆盖到无穷大
+ *
+ * 段内按 price_per_min_uc * seconds / 60 计费，seconds 向上取整到 bill_inc_s。
+ * 第一条特殊处理：billsec < min_bill_s 时强制按 min_bill_s 算。
+ * 返回值 = 接通费(仅首次) + 分段费用之和。*/
+int64_t calc_stair_charge(rate_entry_t *tiers, int n_tiers, uint32_t billsec)
+{
+    if (!tiers || n_tiers <= 0) return 0;
+    int64_t total = 0;
+    uint32_t remaining = billsec;
+    int64_t connect_fee = billsec > 0 ? tiers[0].connect_fee_uc : 0;
+
+    for (int i = 0; i < n_tiers && remaining > 0; ++i) {
+        rate_entry_t *t = &tiers[i];
+        uint32_t tier_start = (uint32_t)t->tier_min_sec;
+        uint32_t tier_end = t->tier_max_sec > 0 ? (uint32_t)t->tier_max_sec : 0xFFFFFFFFu;
+        uint32_t span = tier_end - tier_start;
+
+        /* 单费率兼容：tier_min=0, tier_max=0 → 全覆盖 */
+        if (tier_start == 0 && t->tier_max_sec == 0) span = 0xFFFFFFFFu - tier_start;
+
+        /* 本阶梯覆盖 seconds */
+        uint32_t this_tier = (remaining < span) ? remaining : span;
+
+        /* 第一阶梯 min_bill 兜底 */
+        if (i == 0 && this_tier < (uint32_t)t->min_bill_s && billsec > 0)
+            this_tier = (uint32_t)t->min_bill_s;
+
+        /* 向上取整到 bill_inc_s */
+        if (t->bill_inc_s > 1 && this_tier % (uint32_t)t->bill_inc_s != 0)
+            this_tier = (this_tier / (uint32_t)t->bill_inc_s + 1) * (uint32_t)t->bill_inc_s;
+
+        /* price_per_min_uc * seconds / 60 — 整数运算，先乘后除防溢出 */
+        if (this_tier > 0 && t->price_per_min_uc > 0)
+            total += t->price_per_min_uc * (int64_t)this_tier / 60;
+
+        /* 单费率兼容（全覆盖）：只算一次 */
+        if (tier_start == 0 && t->tier_max_sec == 0) break;
+
+        remaining -= this_tier;
+    }
+
+    return total + connect_fee;
+}
+
 /*
     Author:       鏉庢旦 (Li Hao)
     Company:      涓婃捣瀹佸崼淇℃伅鎶€鏈湁闄愬叕鍙?(Shanghai Nway Co., Ltd.)

@@ -399,11 +399,16 @@ static int rate_show_cb(const rate_entry_t *r, void *ud)
     ctl_conn_t *c = (ctl_conn_t *)ud;
     if (!c || !r) return NSBC_INVAL;
     ctl_printf(c,
-        "rate prefix=%s name=%s price_per_min_uc=%lld connect_fee_uc=%lld "
-        "bill_inc_s=%d min_bill_s=%d initial_s=%d enabled=%d\n",
-        r->prefix, r->name,
+        "rate prefix=%s plan_id=%lld trunk_id=%lld price_per_min_uc=%lld "
+        "connect_fee_uc=%lld bill_inc_s=%d min_bill_s=%d tier=[%lld-%lld] "
+        "time=%s~%s weekdays=%s prec=%d enabled=%d name=%s\n",
+        r->prefix,
+        (long long)r->rate_plan_id, (long long)r->trunk_id,
         (long long)r->price_per_min_uc, (long long)r->connect_fee_uc,
-        r->bill_inc_s, r->min_bill_s, r->initial_s, r->enabled);
+        r->bill_inc_s, r->min_bill_s,
+        (long long)r->tier_min_sec, (long long)r->tier_max_sec,
+        r->time_from, r->time_to, r->weekdays, r->precedence,
+        r->enabled, r->name);
     return NSBC_OK;
 }
 
@@ -1419,6 +1424,42 @@ static void dispatch(ctl_conn_t *c, char *line)
             ctl_printf(c, "ERR reload failed\n");
         }
     acc_done:
+
+    } else if (strcmp(line, "rate_plans.reload") == 0) {
+        /* ---- rate_plans.reload <json>：DB 费率方案全量推入核心（REQ-PBX-BILL-006）----
+         * C 侧暂时只记 plan 元数据（plan_entries 已经通过 rate_plan_id 关联到 plan_id）。
+         * 命令分发层 ".reload" 后缀保留整段 JSON 不切词。*/
+        billing_t *bil = g_ctx ? (billing_t *)g_ctx->billing : NULL;
+        if (!arg || !*arg) { ctl_printf(c, "ERR missing json\n"); goto rp_done; }
+        if (!bil) { ctl_printf(c, "ERR billing not initialized\n"); goto rp_done; }
+
+        int rc = rate_plans_reload_json(bil, arg);
+        if (rc == NSBC_OK) {
+            ctl_printf(c, "OK rate_plans reloaded\n");
+            log_audit("oam", "rate_plans.reload", "ok");
+        } else {
+            ctl_printf(c, "ERR reload rc=%d\n", rc);
+        }
+    rp_done:
+
+    } else if (strcmp(line, "rate_plan_entries.reload") == 0) {
+        /* ---- rate_plan_entries.reload <json>：DB 阶梯/时段/中继条目推入核心 ----
+         * 与 rate.reload 不同：upsert-only（同前缀 + trunk + time 的条目覆盖更新，
+         * 其它条目不动）。因为 rate_plan_entries 是多维展开，可能和老 rate_tables
+         * 条目共存（同一个 prefix 多条 tier）。
+         * 调用 rate_plan_entries_reload_json —— 内部复用 jarray_at 逐元素 upsert。*/
+        billing_t *bil = g_ctx ? (billing_t *)g_ctx->billing : NULL;
+        if (!arg || !*arg) { ctl_printf(c, "ERR missing json\n"); goto rpe_done; }
+        if (!bil) { ctl_printf(c, "ERR billing not initialized\n"); goto rpe_done; }
+
+        int n = rate_plan_entries_reload_json(bil, arg);
+        if (n > 0) {
+            ctl_printf(c, "OK rate_plan_entries upserted=%d\n", n);
+            log_audit("oam", "rate_plan_entries.reload", "upserted=%d", n);
+        } else {
+            ctl_printf(c, "ERR no valid entries\n");
+        }
+    rpe_done:
 
     } else if (strcmp(line, "rate.upsert") == 0) {
         /* ---- rate.upsert <json>：单条费率 upsert（REQ-OAM-009 L1）---- */

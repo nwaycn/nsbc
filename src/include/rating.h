@@ -29,15 +29,34 @@ extern "C" {
 #define BILL_ACCT_KEY    64
 #define BILL_NAME_MAX    48
 
+/* 费率条目：同时承载单费率（rate_tables）和阶梯费率（rate_plan_entries）两种模型。
+ *
+ * 单费率兼容：tier_min_sec=0, tier_max_sec=0 → 视为全区间单一价格
+ * 阶梯费率   ：同一 prefix 多条，按 tier_min_sec 升序排序。calc_stair_charge 按阶梯分段算。
+ *
+ * trunk_id / time_from / time_to / weekdays：NULL 或 0 表示无此维度限制
+ * precedence：同 prefix + trunk + time 条件下优先级（数值大优先） */
 typedef struct {
     char     prefix[RATE_PREFIX_MAX];
     char     name[BILL_NAME_MAX];
     int64_t  price_per_min_uc;  /* 微元/分钟 */
     int64_t  connect_fee_uc;    /* 接通费（微元） */
-    int      bill_inc_s;        /* 计费进位（1/6 秒） */
+    int      bill_inc_s;        /* 计费进位（1=秒, 6=6秒, 60=分钟） */
     int      min_bill_s;        /* 最小收费秒数 */
     int      initial_s;         /* 首计费块秒数（0=按 bill_inc） */
     int      enabled;
+
+    /* === 阶梯字段（新增，向后兼容） === */
+    int64_t  tier_min_sec;      /* 本阶梯起点秒数（0=第一阶梯） */
+    int64_t  tier_max_sec;      /* 本阶梯终点秒数（0=无上限） */
+
+    /* === 中继/时段维度（新增，向后兼容 0=不限制） === */
+    int64_t  trunk_id;          /* 中继 ID（0=所有中继通用） */
+    int64_t  rate_plan_id;      /* 所属费率方案（0=rate_tables 表旧条目） */
+    char     time_from[8];      /* "HH:MM" 起始时段（"" = 全时段） */
+    char     time_to[8];        /* "HH:MM" 结束时段 */
+    char     weekdays[16];      /* "1,2,3,4,5" 或 "" = 每天 */
+    int      precedence;        /* 同条件优先级（数值大优先） */
 } rate_entry_t;
 
 typedef struct {
@@ -58,6 +77,28 @@ int  rate_delete(billing_t *b, const char *prefix);  /* 按前缀删除，不存
 int  rate_lookup(billing_t *b, const char *called, rate_entry_t *out);
 /* 报价：按 billsec 计算费用（未达最小收费用 min_bill；首块 initial） */
 int  rate_quote(const rate_entry_t *r, uint32_t billsec, rate_quote_t *q);
+
+/* === 阶梯/多维费率 ===
+ *
+ * rate_lookup_stair 按 called + trunk_id + now() 查匹配的所有阶梯条目
+ * (同一 prefix 可能多条 tier)，输出排序后的数组。n_tiers_out 为输出条目数。
+ * 返回 NSBC_OK = 找到（至少一条），NSBC_NOENT = 无匹配（默认费率 plan_id=0 兜底）。
+ *
+ * calc_stair_charge 按匹配到的 tiers 数组计算费用：逐阶梯分段、按各自 bill_inc_s
+ * 取整、首阶梯用 min_bill_s 兜底。返回微元（int64）。 */
+int  rate_lookup_stair(billing_t *b, const char *called, int64_t trunk_id,
+                       const char *time_from_cache, const char *weekdays_cache,
+                       rate_entry_t *tiers_out, int *n_tiers_out,
+                       int max_tiers);
+int64_t calc_stair_charge(rate_entry_t *tiers, int n_tiers, uint32_t billsec);
+
+/* rate_plan_entries.reload / rate_plans.reload — C 侧直接接收 JSON 数组 */
+int  rate_plan_entries_reload_json(billing_t *b, const char *json);
+int  rate_plans_reload_json(billing_t *b, const char *json);
+
+/* 时段匹配辅助（给定 HH:MM 和 weekdays，返回 true = 命中） */
+int  time_slot_match(const char *time_from, const char *time_to,
+                     const char *weekdays, const char *now_hhmm, int now_wd);
 
 /* 账户（balance 余额 / reserved 预占 / credit_limit 透支额度） */
 int  account_open(billing_t *b, const char *key, int64_t balance_uc,
