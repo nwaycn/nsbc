@@ -113,10 +113,12 @@ pub enum Kind {
     RouteGroups,
     Rates,
     Accounts,
+    RatePlans,
+    RatePlanEntries,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 12] = [
+    pub const ALL: [Kind; 14] = [
         Kind::Extensions,
         Kind::Trunks,
         Kind::DialplanRules,
@@ -129,6 +131,8 @@ impl Kind {
         Kind::RouteGroups,
         Kind::Rates,
         Kind::Accounts,
+        Kind::RatePlans,
+        Kind::RatePlanEntries,
     ];
     fn name(self) -> &'static str {
         match self {
@@ -144,6 +148,8 @@ impl Kind {
             Kind::RouteGroups       => "route-groups",
             Kind::Rates             => "rates",
             Kind::Accounts          => "accounts",
+            Kind::RatePlans         => "rate-plans",
+            Kind::RatePlanEntries   => "rate-plan-entries",
         }
     }
 }
@@ -275,6 +281,18 @@ async fn snapshot<C: CoreApi + Clone + Send + Sync>(
             let n = rows.len();
             serde_json::to_string(&rows).map(|j| (j, n)).map_err(|e| e.to_string())
         }
+        Kind::RatePlans => {
+            let rows = st.db.list_enabled_rate_plans().await
+                .map_err(|e| format!("db: {e}"))?;
+            let n = rows.len();
+            serde_json::to_string(&rows).map(|j| (j, n)).map_err(|e| e.to_string())
+        }
+        Kind::RatePlanEntries => {
+            let rows = st.db.list_enabled_rate_plan_entries().await
+                .map_err(|e| format!("db: {e}"))?;
+            let n = rows.len();
+            serde_json::to_string(&rows).map(|j| (j, n)).map_err(|e| e.to_string())
+        }
     }
 }
 
@@ -311,6 +329,8 @@ async fn push_kind<C: CoreApi + Clone + Send + Sync>(
             Kind::RouteGroups       => st.core.reload_route_groups(&json).await,
             Kind::Rates             => st.core.reload_rates(&json).await,
             Kind::Accounts          => st.core.reload_accounts(&json).await,
+            Kind::RatePlans         => st.core.reload_rate_plans(&json).await,
+            Kind::RatePlanEntries   => st.core.reload_rate_plan_entries(&json).await,
         };
         match r {
             Ok(()) => {

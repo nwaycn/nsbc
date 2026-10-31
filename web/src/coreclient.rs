@@ -757,6 +757,18 @@ pub trait CoreApi: Send + Sync {
         json: &str,
     ) -> impl Future<Output = Result<(), CoreError>> + Send;
 
+    /// `rate_plans.reload <json>` — full rate plans table replace.
+    fn reload_rate_plans(
+        &self,
+        json: &str,
+    ) -> impl Future<Output = Result<(), CoreError>> + Send;
+
+    /// `rate_plan_entries.reload <json>` — full rate plan entries table replace.
+    fn reload_rate_plan_entries(
+        &self,
+        json: &str,
+    ) -> impl Future<Output = Result<(), CoreError>> + Send;
+
     /// `rate.upsert <json>` — single rate entry upsert (JSON object).
     fn rate_upsert_json(
         &self,
@@ -1054,6 +1066,14 @@ impl CoreApi for RealCore {
     }
     async fn reload_accounts(&self, json: &str) -> Result<(), CoreError> {
         send_cmd(&self.sock_path, self.timeout, &format!("accounts.reload {json}"))
+            .await.and_then(|b| check_rejected(&b))
+    }
+    async fn reload_rate_plans(&self, json: &str) -> Result<(), CoreError> {
+        send_cmd(&self.sock_path, self.timeout, &format!("rate_plans.reload {json}"))
+            .await.and_then(|b| check_rejected(&b))
+    }
+    async fn reload_rate_plan_entries(&self, json: &str) -> Result<(), CoreError> {
+        send_cmd(&self.sock_path, self.timeout, &format!("rate_plan_entries.reload {json}"))
             .await.and_then(|b| check_rejected(&b))
     }
     async fn rate_upsert_json(&self, json: &str) -> Result<(), CoreError> {
@@ -2626,6 +2646,22 @@ leg 0 sdp_offer 50\nabc\n";
             self.calls.lock().unwrap().push(format!("accounts.reload {json}"));
             self.canned
                 .get("accounts.reload")
+                .cloned()
+                .unwrap_or(Ok("OK\n".into()))
+                .and_then(|b| check_rejected(&b))
+        }
+        async fn reload_rate_plans(&self, json: &str) -> Result<(), CoreError> {
+            self.calls.lock().unwrap().push(format!("rate_plans.reload {json}"));
+            self.canned
+                .get("rate_plans.reload")
+                .cloned()
+                .unwrap_or(Ok("OK\n".into()))
+                .and_then(|b| check_rejected(&b))
+        }
+        async fn reload_rate_plan_entries(&self, json: &str) -> Result<(), CoreError> {
+            self.calls.lock().unwrap().push(format!("rate_plan_entries.reload {json}"));
+            self.canned
+                .get("rate_plan_entries.reload")
                 .cloned()
                 .unwrap_or(Ok("OK\n".into()))
                 .and_then(|b| check_rejected(&b))

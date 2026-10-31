@@ -3021,6 +3021,279 @@ let acct_ddl = match backend {
     "#,
 };
 sqlx::query(acct_ddl).execute(pool).await?;
+
+    // ================ rate_plans (reusable plan template, REQ-BILL-001) ================
+    let rp_ddl = match backend {
+        "sqlite" => r#"
+            CREATE TABLE IF NOT EXISTS rate_plans (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id     INTEGER NOT NULL DEFAULT 1,
+                name          TEXT    NOT NULL,
+                description   TEXT    NOT NULL DEFAULT '',
+                enabled       INTEGER NOT NULL DEFAULT 1,
+                created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+                updated_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(tenant_id, name)
+            )
+        "#,
+        "postgres" => r#"
+            CREATE TABLE IF NOT EXISTS rate_plans (
+                id            BIGSERIAL PRIMARY KEY,
+                tenant_id     BIGINT  NOT NULL DEFAULT 1,
+                name          VARCHAR(64) NOT NULL,
+                description   TEXT    NOT NULL DEFAULT '',
+                enabled       INTEGER NOT NULL DEFAULT 1,
+                created_at    TEXT NOT NULL DEFAULT (to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD') || 'T' || to_char(NOW() AT TIME ZONE 'UTC', 'HH24:MI:SS.MS') || 'Z'),
+                updated_at    TEXT NOT NULL DEFAULT (to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD') || 'T' || to_char(NOW() AT TIME ZONE 'UTC', 'HH24:MI:SS.MS') || 'Z'),
+                UNIQUE(tenant_id, name)
+            )
+        "#,
+        _ => r#"
+            CREATE TABLE IF NOT EXISTS rate_plans (
+                id            BIGINT AUTO_INCREMENT PRIMARY KEY,
+                tenant_id     BIGINT       NOT NULL DEFAULT 1,
+                name          VARCHAR(64)  NOT NULL,
+                description   VARCHAR(512) NOT NULL DEFAULT '',
+                enabled       TINYINT(1)   NOT NULL DEFAULT 1,
+                created_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+                updated_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+                UNIQUE KEY uq_rp_tenant_name (tenant_id, name)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        "#,
+    };
+    sqlx::query(rp_ddl).execute(pool).await?;
+
+    // ================ rate_plan_entries (tiered entries, REQ-BILL-001) ================
+    let rpe_ddl = match backend {
+        "sqlite" => r#"
+            CREATE TABLE IF NOT EXISTS rate_plan_entries (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                plan_id          INTEGER NOT NULL,
+                prefix           TEXT    NOT NULL,
+                trunk_id         INTEGER,
+                enabled          INTEGER NOT NULL DEFAULT 1,
+                time_from        TEXT,
+                time_to          TEXT,
+                weekdays         TEXT,
+                tier_min_sec     INTEGER NOT NULL DEFAULT 0,
+                tier_max_sec     INTEGER,
+                price_per_min_uc INTEGER NOT NULL,
+                bill_inc_s       INTEGER NOT NULL DEFAULT 60,
+                min_bill_s       INTEGER NOT NULL DEFAULT 60,
+                connect_fee_uc   INTEGER NOT NULL DEFAULT 0,
+                precedence       INTEGER NOT NULL DEFAULT 0
+            )
+        "#,
+        "postgres" => r#"
+            CREATE TABLE IF NOT EXISTS rate_plan_entries (
+                id               BIGSERIAL PRIMARY KEY,
+                plan_id          BIGINT  NOT NULL,
+                prefix           VARCHAR(24) NOT NULL,
+                trunk_id         BIGINT,
+                enabled          INTEGER NOT NULL DEFAULT 1,
+                time_from        VARCHAR(16),
+                time_to          VARCHAR(16),
+                weekdays         VARCHAR(16),
+                tier_min_sec     BIGINT  NOT NULL DEFAULT 0,
+                tier_max_sec     BIGINT,
+                price_per_min_uc BIGINT  NOT NULL,
+                bill_inc_s       INTEGER NOT NULL DEFAULT 60,
+                min_bill_s       INTEGER NOT NULL DEFAULT 60,
+                connect_fee_uc   BIGINT  NOT NULL DEFAULT 0,
+                precedence       INTEGER NOT NULL DEFAULT 0
+            )
+        "#,
+        _ => r#"
+            CREATE TABLE IF NOT EXISTS rate_plan_entries (
+                id               BIGINT AUTO_INCREMENT PRIMARY KEY,
+                plan_id          BIGINT      NOT NULL,
+                prefix           VARCHAR(24) NOT NULL,
+                trunk_id         BIGINT      NULL,
+                enabled          TINYINT(1)  NOT NULL DEFAULT 1,
+                time_from        VARCHAR(16) NULL,
+                time_to          VARCHAR(16) NULL,
+                weekdays         VARCHAR(16) NULL,
+                tier_min_sec     BIGINT      NOT NULL DEFAULT 0,
+                tier_max_sec     BIGINT      NULL,
+                price_per_min_uc BIGINT      NOT NULL,
+                bill_inc_s       INT         NOT NULL DEFAULT 60,
+                min_bill_s       INT         NOT NULL DEFAULT 60,
+                connect_fee_uc   BIGINT      NOT NULL DEFAULT 0,
+                precedence       INT         NOT NULL DEFAULT 0,
+                INDEX idx_rpe_plan_prefix (plan_id, prefix)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        "#,
+    };
+    sqlx::query(rpe_ddl).execute(pool).await?;
+    // index for sqlite & postgres
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_rpe_plan_prefix ON rate_plan_entries(plan_id, prefix)").execute(pool).await?;
+
+    // ================ trunk_rate_overrides (trunk-dimension special rates, REQ-BILL-001) ================
+    let tro_ddl = match backend {
+        "sqlite" => r#"
+            CREATE TABLE IF NOT EXISTS trunk_rate_overrides (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                trunk_id         INTEGER NOT NULL,
+                prefix           TEXT    NOT NULL,
+                price_per_min_uc INTEGER NOT NULL,
+                bill_inc_s       INTEGER NOT NULL DEFAULT 60,
+                UNIQUE(trunk_id, prefix)
+            )
+        "#,
+        "postgres" => r#"
+            CREATE TABLE IF NOT EXISTS trunk_rate_overrides (
+                id               BIGSERIAL PRIMARY KEY,
+                trunk_id         BIGINT      NOT NULL,
+                prefix           VARCHAR(24) NOT NULL,
+                price_per_min_uc BIGINT      NOT NULL,
+                bill_inc_s       INTEGER     NOT NULL DEFAULT 60,
+                UNIQUE(trunk_id, prefix)
+            )
+        "#,
+        _ => r#"
+            CREATE TABLE IF NOT EXISTS trunk_rate_overrides (
+                id               BIGINT AUTO_INCREMENT PRIMARY KEY,
+                trunk_id         BIGINT      NOT NULL,
+                prefix           VARCHAR(24) NOT NULL,
+                price_per_min_uc BIGINT      NOT NULL,
+                bill_inc_s       INT         NOT NULL DEFAULT 60,
+                UNIQUE KEY uq_tro_trunk_prefix (trunk_id, prefix)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        "#,
+    };
+    sqlx::query(tro_ddl).execute(pool).await?;
+
+    // ================ billing_transactions (ledger, REQ-BILL-001) ================
+    let bt_ddl = match backend {
+        "sqlite" => r#"
+            CREATE TABLE IF NOT EXISTS billing_transactions (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id      INTEGER NOT NULL,
+                call_id         TEXT,
+                tx_type         TEXT    NOT NULL,
+                amount_uc       INTEGER NOT NULL,
+                balance_after_uc INTEGER NOT NULL,
+                operator        TEXT,
+                remark          TEXT,
+                created_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+            )
+        "#,
+        "postgres" => r#"
+            CREATE TABLE IF NOT EXISTS billing_transactions (
+                id              BIGSERIAL PRIMARY KEY,
+                account_id      BIGINT      NOT NULL,
+                call_id         VARCHAR(127),
+                tx_type         VARCHAR(16) NOT NULL,
+                amount_uc       BIGINT      NOT NULL,
+                balance_after_uc BIGINT     NOT NULL,
+                operator        VARCHAR(64),
+                remark          TEXT,
+                created_at      TEXT NOT NULL DEFAULT (to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD') || 'T' || to_char(NOW() AT TIME ZONE 'UTC', 'HH24:MI:SS.MS') || 'Z')
+            )
+        "#,
+        _ => r#"
+            CREATE TABLE IF NOT EXISTS billing_transactions (
+                id              BIGINT AUTO_INCREMENT PRIMARY KEY,
+                account_id      BIGINT       NOT NULL,
+                call_id         VARCHAR(127) NULL,
+                tx_type         VARCHAR(16)  NOT NULL,
+                amount_uc       BIGINT       NOT NULL,
+                balance_after_uc BIGINT      NOT NULL,
+                operator        VARCHAR(64)  NULL,
+                remark          TEXT         NULL,
+                created_at      DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+                INDEX idx_bt_account (account_id),
+                INDEX idx_bt_call (call_id),
+                INDEX idx_bt_created (created_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        "#,
+    };
+    sqlx::query(bt_ddl).execute(pool).await?;
+    // indexes for sqlite & postgres
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_bt_account ON billing_transactions(account_id)").execute(pool).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_bt_call ON billing_transactions(call_id)").execute(pool).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_bt_created ON billing_transactions(created_at)").execute(pool).await?;
+
+    // --- accounts upgrade: add billing columns (idempotent, cross-backend) ---
+    {
+        const ACCT_REQUIRED_COLS: &[(&str, &str, &str, &str)] = &[
+            ("tenant_id",    "INTEGER NOT NULL DEFAULT 1",  "BIGINT NOT NULL DEFAULT 1",    "BIGINT NOT NULL DEFAULT 1"),
+            ("account_type", "TEXT NOT NULL DEFAULT 'extension'", "VARCHAR(16) NOT NULL DEFAULT 'extension'", "VARCHAR(16) NOT NULL DEFAULT 'extension'"),
+            ("rate_plan_id", "INTEGER",                     "BIGINT",                        "BIGINT"),
+            ("low_threshold_uc", "INTEGER NOT NULL DEFAULT 0", "BIGINT NOT NULL DEFAULT 0", "BIGINT NOT NULL DEFAULT 0"),
+        ];
+        if backend == "sqlite" {
+            let cols: Vec<(i64, String)> = sqlx::query_as("PRAGMA table_info(accounts)")
+                .fetch_all(pool).await.unwrap_or_default();
+            let col_names: Vec<&str> = cols.iter().map(|(_, c)| c.as_str()).collect();
+            for (name, sql_type, _pg_type, _my_type) in ACCT_REQUIRED_COLS {
+                if !col_names.contains(name) {
+                    let _ = sqlx::query(&format!(
+                        "ALTER TABLE accounts ADD COLUMN {} {}", name, sql_type
+                    )).execute(pool).await;
+                }
+            }
+        } else if backend == "postgres" {
+            for (name, _sqlite, pg_type, _my) in ACCT_REQUIRED_COLS {
+                let _ = sqlx::query(&format!(
+                    "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS {} {}", name, pg_type
+                )).execute(pool).await;
+            }
+        } else if backend == "mysql" {
+            let mut missing: Vec<String> = Vec::new();
+            for (name, _sq, _pg, my_type) in ACCT_REQUIRED_COLS {
+                let cnt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.columns WHERE table_name='accounts' AND column_name=?")
+                    .bind(name).fetch_one(pool).await.unwrap_or(0);
+                if cnt == 0 {
+                    missing.push(format!("ADD COLUMN {} {}", name, my_type));
+                }
+            }
+            if !missing.is_empty() {
+                let sql = format!("ALTER TABLE accounts {}", missing.join(", "));
+                let _ = sqlx::query(&sql).execute(pool).await;
+            }
+        }
+    }
+
+    // --- rate_tables upgrade: add tenant_id / rate_plan_id (idempotent, cross-backend) ---
+    {
+        const RT_REQUIRED_COLS: &[(&str, &str, &str, &str)] = &[
+            ("tenant_id",    "INTEGER NOT NULL DEFAULT 1",  "BIGINT NOT NULL DEFAULT 1",    "BIGINT NOT NULL DEFAULT 1"),
+            ("rate_plan_id", "INTEGER",                     "BIGINT",                        "BIGINT"),
+        ];
+        if backend == "sqlite" {
+            let cols: Vec<(i64, String)> = sqlx::query_as("PRAGMA table_info(rate_tables)")
+                .fetch_all(pool).await.unwrap_or_default();
+            let col_names: Vec<&str> = cols.iter().map(|(_, c)| c.as_str()).collect();
+            for (name, sql_type, _pg_type, _my_type) in RT_REQUIRED_COLS {
+                if !col_names.contains(name) {
+                    let _ = sqlx::query(&format!(
+                        "ALTER TABLE rate_tables ADD COLUMN {} {}", name, sql_type
+                    )).execute(pool).await;
+                }
+            }
+        } else if backend == "postgres" {
+            for (name, _sqlite, pg_type, _my) in RT_REQUIRED_COLS {
+                let _ = sqlx::query(&format!(
+                    "ALTER TABLE rate_tables ADD COLUMN IF NOT EXISTS {} {}", name, pg_type
+                )).execute(pool).await;
+            }
+        } else if backend == "mysql" {
+            let mut missing: Vec<String> = Vec::new();
+            for (name, _sq, _pg, my_type) in RT_REQUIRED_COLS {
+                let cnt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.columns WHERE table_name='rate_tables' AND column_name=?")
+                    .bind(name).fetch_one(pool).await.unwrap_or(0);
+                if cnt == 0 {
+                    missing.push(format!("ADD COLUMN {} {}", name, my_type));
+                }
+            }
+            if !missing.is_empty() {
+                let sql = format!("ALTER TABLE rate_tables {}", missing.join(", "));
+                let _ = sqlx::query(&sql).execute(pool).await;
+            }
+        }
+    }
+
     // ================ time_groups (time policy groups) ================
     let tg_ddl = match backend {
         "sqlite" => r#"
@@ -5957,17 +6230,23 @@ pub struct SecurityConfig {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct Account {
     pub id:              i64,
+    pub tenant_id:       i64,
     pub account_key:     String,
     pub balance_uc:      i64,
     pub credit_limit_uc: i64,
     pub description:     String,
     pub created_at:       String,
     pub updated_at:       String,
+    pub account_type:    String,
+    pub rate_plan_id:    Option<i64>,
+    pub low_threshold_uc: i64,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AccountCreate {
+    #[serde(default = "default_one_i64")]
+    pub tenant_id:       i64,
     pub account_key:     String,
     #[serde(default)]
     pub balance_uc:      i64,
@@ -5975,9 +6254,135 @@ pub struct AccountCreate {
     pub credit_limit_uc: i64,
     #[serde(default)]
     pub description:     String,
+    #[serde(default = "default_account_type")]
+    pub account_type:    String,
+    #[serde(default)]
+    pub rate_plan_id:    Option<i64>,
+    #[serde(default)]
+    pub low_threshold_uc: i64,
 }
+fn default_one_i64() -> i64 { 1 }
+fn default_account_type() -> String { "extension".to_string() }
 fn default_10() -> i64 { 10 }
 fn default_3() -> i64 { 3 }
+
+// ================ rate_plans / rate_plan_entries / trunk_rate_overrides / billing_transactions structs ================
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
+pub struct RatePlan {
+    pub id:          i64,
+    pub tenant_id:   i64,
+    pub name:        String,
+    pub description: String,
+    pub enabled:     i64,
+    pub created_at:   String,
+    pub updated_at:   String,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct RatePlanCreate {
+    #[serde(default = "default_one_i64")]
+    pub tenant_id:   i64,
+    pub name:        String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default = "default_true")]
+    pub enabled:     bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
+pub struct RatePlanEntry {
+    pub id:              i64,
+    pub plan_id:         i64,
+    pub prefix:          String,
+    pub trunk_id:        Option<i64>,
+    pub enabled:         i64,
+    pub time_from:       Option<String>,
+    pub time_to:         Option<String>,
+    pub weekdays:        Option<String>,
+    pub tier_min_sec:    i64,
+    pub tier_max_sec:    Option<i64>,
+    pub price_per_min_uc: i64,
+    pub bill_inc_s:      i64,
+    pub min_bill_s:      i64,
+    pub connect_fee_uc:  i64,
+    pub precedence:      i64,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct RatePlanEntryCreate {
+    pub plan_id:          i64,
+    pub prefix:           String,
+    #[serde(default)]
+    pub trunk_id:         Option<i64>,
+    #[serde(default = "default_true")]
+    pub enabled:          bool,
+    #[serde(default)]
+    pub time_from:        Option<String>,
+    #[serde(default)]
+    pub time_to:          Option<String>,
+    #[serde(default)]
+    pub weekdays:         Option<String>,
+    #[serde(default)]
+    pub tier_min_sec:     i64,
+    #[serde(default)]
+    pub tier_max_sec:     Option<i64>,
+    pub price_per_min_uc: i64,
+    #[serde(default = "default_60i64")]
+    pub bill_inc_s:       i64,
+    #[serde(default = "default_60i64")]
+    pub min_bill_s:       i64,
+    #[serde(default)]
+    pub connect_fee_uc:   i64,
+    #[serde(default)]
+    pub precedence:       i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
+pub struct TrunkRateOverride {
+    pub id:              i64,
+    pub trunk_id:        i64,
+    pub prefix:          String,
+    pub price_per_min_uc: i64,
+    pub bill_inc_s:      i64,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct TrunkRateOverrideCreate {
+    pub trunk_id:         i64,
+    pub prefix:           String,
+    pub price_per_min_uc: i64,
+    #[serde(default = "default_60i64")]
+    pub bill_inc_s:       i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
+pub struct BillingTransaction {
+    pub id:             i64,
+    pub account_id:     i64,
+    pub call_id:        Option<String>,
+    pub tx_type:        String,
+    pub amount_uc:      i64,
+    pub balance_after_uc: i64,
+    pub operator:       Option<String>,
+    pub remark:         Option<String>,
+    pub created_at:     String,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct BillingTransactionCreate {
+    pub account_id:  i64,
+    #[serde(default)]
+    pub call_id:     Option<String>,
+    pub tx_type:     String,
+    pub amount_uc:   i64,
+    #[serde(default)]
+    pub operator:    Option<String>,
+    #[serde(default)]
+    pub remark:      Option<String>,
+}
+
+fn default_60i64() -> i64 { 60 }
 
 impl Db {
     // ===== routes =====
@@ -7154,6 +7559,376 @@ pub async fn list_enabled_rates(&self) -> Result<Vec<RateTable>, sqlx::Error> {
         .fetch_all(pool).await
 }
 
+// ================ rate_plans CRUD ================
+
+pub async fn list_rate_plans(
+    &self, tenant_id: Option<i64>, enabled: Option<bool>,
+    limit: i64, offset: i64,
+) -> Result<(Vec<RatePlan>, i64), sqlx::Error> {
+    let Some(pool) = self.pool() else { return Ok((Vec::new(), 0)); };
+    let backend = self.backend();
+    let limit = limit.clamp(1, 500);
+    let offset = offset.max(0);
+    let mut where_parts: Vec<String> = Vec::new();
+    let mut binds: Vec<String> = Vec::new();
+    if let Some(v) = tenant_id {
+        let ph = format!("${}", binds.len() + 1);
+        where_parts.push(format!("tenant_id = {ph}"));
+        binds.push(v.to_string());
+    }
+    if let Some(v) = enabled {
+        let ph = format!("${}", binds.len() + 1);
+        where_parts.push(format!("enabled = {ph}"));
+        binds.push((if v { "1" } else { "0" }).to_string());
+    }
+    let where_sql = if where_parts.is_empty() { String::new() } else { format!("WHERE {}", where_parts.join(" AND ")) };
+    let count_sql = fix_ph(&format!("SELECT COUNT(*) FROM rate_plans {where_sql}"), backend);
+    let rows_sql = fix_ph(&format!("SELECT * FROM rate_plans {where_sql} ORDER BY name LIMIT ${} OFFSET ${}",
+        binds.len() + 1, binds.len() + 2), backend);
+    let mut cq = sqlx::query_scalar::<_, i64>(&count_sql);
+    for b in &binds { cq = cq.bind(b.as_str()); }
+    let total = cq.fetch_one(pool).await.unwrap_or(0);
+    let mut q = sqlx::query_as::<_, RatePlan>(&rows_sql);
+    for b in &binds { q = q.bind(b.as_str()); }
+    q = q.bind(limit).bind(offset);
+    let rows = q.fetch_all(pool).await?;
+    Ok((rows, total))
+}
+
+pub async fn list_enabled_rate_plans(&self) -> Result<Vec<RatePlan>, sqlx::Error> {
+    let Some(pool) = self.pool() else { return Ok(Vec::new()); };
+    let backend = self.backend();
+    sqlx::query_as::<_, RatePlan>(&fix_ph("SELECT * FROM rate_plans WHERE enabled = 1 ORDER BY name", backend))
+        .fetch_all(pool).await
+}
+
+pub async fn get_rate_plan(&self, id: i64) -> Result<Option<RatePlan>, sqlx::Error> {
+    let Some(pool) = self.pool() else { return Ok(None); };
+    let backend = self.backend();
+    sqlx::query_as::<_, RatePlan>(&fix_ph("SELECT * FROM rate_plans WHERE id = $1", backend))
+        .bind(id).fetch_optional(pool).await
+}
+
+pub async fn create_rate_plan(&self, c: RatePlanCreate) -> Result<RatePlan, sqlx::Error> {
+    let pool = self.pool().ok_or(sqlx::Error::Configuration("NSBC_DB_DSN not set".into()))?;
+    let backend = self.backend();
+    let is_mysql = backend == "mysql";
+    let raw_sql = "INSERT INTO rate_plans (tenant_id, name, description, enabled) VALUES ($1, $2, $3, $4) RETURNING *";
+    if is_mysql {
+        let plain_sql = strip_returning(raw_sql);
+        let sql = fix_ph(&plain_sql, backend);
+        sqlx::query(&sql)
+            .bind(c.tenant_id).bind(&c.name).bind(&c.description).bind(c.enabled as i64)
+            .execute(pool).await?;
+        let pick_sql = fix_ph("SELECT * FROM rate_plans WHERE id = LAST_INSERT_ID()", backend);
+        return sqlx::query_as::<_, RatePlan>(&pick_sql).fetch_one(pool).await;
+    }
+    let sql = fix_ph(raw_sql, backend);
+    sqlx::query_as::<_, RatePlan>(&sql)
+        .bind(c.tenant_id).bind(&c.name).bind(&c.description).bind(c.enabled as i64)
+        .fetch_one(pool).await
+}
+
+pub async fn update_rate_plan(&self, id: i64, name: Option<&str>, description: Option<&str>, enabled: Option<bool>) -> Result<Option<RatePlan>, sqlx::Error> {
+    let Some(pool) = self.pool() else { return Ok(None); };
+    let backend = self.backend();
+    let mut sets: Vec<String> = Vec::new();
+    let mut binds: Vec<String> = Vec::new();
+    let mut idx: u32 = 0;
+    if let Some(v) = name { idx += 1; sets.push(format!("name = ${idx}")); binds.push(v.to_string()); }
+    if let Some(v) = description { idx += 1; sets.push(format!("description = ${idx}")); binds.push(v.to_string()); }
+    if let Some(v) = enabled { idx += 1; sets.push(format!("enabled = CAST(${idx} AS INTEGER)")); binds.push((if v { "1" } else { "0" }).to_string()); }
+    if sets.is_empty() { return self.get_rate_plan(id).await; }
+    let ts = match backend { "postgres" => "CAST(NOW() AS TEXT)", "mysql" => "CAST(CURRENT_TIMESTAMP(3) AS CHAR)", _ => "datetime('now')" };
+    let raw_sql = format!("UPDATE rate_plans SET {}, updated_at = {ts} WHERE id = ${} RETURNING *",
+        sets.join(", "), binds.len() + 1);
+    let is_mysql = backend == "mysql";
+    if is_mysql {
+        let plain_sql = fix_ph(&strip_returning(&raw_sql), backend);
+        let mut q = sqlx::query(&plain_sql);
+        for b in &binds { q = q.bind(b.as_str()); }
+        q = q.bind(id);
+        q.execute(pool).await?;
+        let pick_sql = fix_ph("SELECT * FROM rate_plans WHERE id = $1", backend);
+        return sqlx::query_as::<_, RatePlan>(&pick_sql).bind(id).fetch_optional(pool).await;
+    }
+    let sql = fix_ph(&raw_sql, backend);
+    let mut q = sqlx::query_as::<_, RatePlan>(&sql);
+    for b in &binds { q = q.bind(b.as_str()); }
+    q = q.bind(id);
+    q.fetch_optional(pool).await
+}
+
+pub async fn delete_rate_plan(&self, id: i64) -> Result<bool, sqlx::Error> {
+    let Some(pool) = self.pool() else { return Ok(false); };
+    let backend = self.backend();
+    let res = sqlx::query(&fix_ph("DELETE FROM rate_plans WHERE id = $1", backend)).bind(id).execute(pool).await?;
+    Ok(res.rows_affected() > 0)
+}
+
+// ================ rate_plan_entries CRUD ================
+
+pub async fn list_rate_plan_entries(
+    &self, plan_id: Option<i64>, prefix: Option<&str>, enabled: Option<bool>,
+    limit: i64, offset: i64,
+) -> Result<(Vec<RatePlanEntry>, i64), sqlx::Error> {
+    let Some(pool) = self.pool() else { return Ok((Vec::new(), 0)); };
+    let backend = self.backend();
+    let limit = limit.clamp(1, 500);
+    let offset = offset.max(0);
+    let mut where_parts: Vec<String> = Vec::new();
+    let mut binds: Vec<String> = Vec::new();
+    if let Some(v) = plan_id {
+        let ph = format!("${}", binds.len() + 1);
+        where_parts.push(format!("plan_id = {ph}"));
+        binds.push(v.to_string());
+    }
+    if let Some(p) = prefix {
+        let ph = format!("${}", binds.len() + 1);
+        where_parts.push(format!("prefix LIKE {ph}"));
+        binds.push(format!("%{}%", p));
+    }
+    if let Some(v) = enabled {
+        let ph = format!("${}", binds.len() + 1);
+        where_parts.push(format!("enabled = {ph}"));
+        binds.push((if v { "1" } else { "0" }).to_string());
+    }
+    let where_sql = if where_parts.is_empty() { String::new() } else { format!("WHERE {}", where_parts.join(" AND ")) };
+    let count_sql = fix_ph(&format!("SELECT COUNT(*) FROM rate_plan_entries {where_sql}"), backend);
+    let rows_sql = fix_ph(&format!("SELECT * FROM rate_plan_entries {where_sql} ORDER BY plan_id, precedence DESC, prefix LIMIT ${} OFFSET ${}",
+        binds.len() + 1, binds.len() + 2), backend);
+    let mut cq = sqlx::query_scalar::<_, i64>(&count_sql);
+    for b in &binds { cq = cq.bind(b.as_str()); }
+    let total = cq.fetch_one(pool).await.unwrap_or(0);
+    let mut q = sqlx::query_as::<_, RatePlanEntry>(&rows_sql);
+    for b in &binds { q = q.bind(b.as_str()); }
+    q = q.bind(limit).bind(offset);
+    let rows = q.fetch_all(pool).await?;
+    Ok((rows, total))
+}
+
+pub async fn list_enabled_rate_plan_entries(&self) -> Result<Vec<RatePlanEntry>, sqlx::Error> {
+    let Some(pool) = self.pool() else { return Ok(Vec::new()); };
+    let backend = self.backend();
+    sqlx::query_as::<_, RatePlanEntry>(&fix_ph("SELECT * FROM rate_plan_entries WHERE enabled = 1 ORDER BY plan_id, precedence DESC, prefix", backend))
+        .fetch_all(pool).await
+}
+
+pub async fn get_rate_plan_entry(&self, id: i64) -> Result<Option<RatePlanEntry>, sqlx::Error> {
+    let Some(pool) = self.pool() else { return Ok(None); };
+    let backend = self.backend();
+    sqlx::query_as::<_, RatePlanEntry>(&fix_ph("SELECT * FROM rate_plan_entries WHERE id = $1", backend))
+        .bind(id).fetch_optional(pool).await
+}
+
+pub async fn create_rate_plan_entry(&self, c: RatePlanEntryCreate) -> Result<RatePlanEntry, sqlx::Error> {
+    let pool = self.pool().ok_or(sqlx::Error::Configuration("NSBC_DB_DSN not set".into()))?;
+    let backend = self.backend();
+    let is_mysql = backend == "mysql";
+    let raw_sql = "INSERT INTO rate_plan_entries
+        (plan_id, prefix, trunk_id, enabled, time_from, time_to, weekdays,
+         tier_min_sec, tier_max_sec, price_per_min_uc, bill_inc_s, min_bill_s,
+         connect_fee_uc, precedence)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        RETURNING *";
+    if is_mysql {
+        let plain_sql = strip_returning(raw_sql);
+        let sql = fix_ph(&plain_sql, backend);
+        sqlx::query(&sql)
+            .bind(c.plan_id).bind(&c.prefix).bind(c.trunk_id)
+            .bind(c.enabled as i64).bind(&c.time_from).bind(&c.time_to).bind(&c.weekdays)
+            .bind(c.tier_min_sec).bind(c.tier_max_sec).bind(c.price_per_min_uc)
+            .bind(c.bill_inc_s).bind(c.min_bill_s).bind(c.connect_fee_uc).bind(c.precedence)
+            .execute(pool).await?;
+        let pick_sql = fix_ph("SELECT * FROM rate_plan_entries WHERE id = LAST_INSERT_ID()", backend);
+        return sqlx::query_as::<_, RatePlanEntry>(&pick_sql).fetch_one(pool).await;
+    }
+    let sql = fix_ph(raw_sql, backend);
+    sqlx::query_as::<_, RatePlanEntry>(&sql)
+        .bind(c.plan_id).bind(&c.prefix).bind(c.trunk_id)
+        .bind(c.enabled as i64).bind(&c.time_from).bind(&c.time_to).bind(&c.weekdays)
+        .bind(c.tier_min_sec).bind(c.tier_max_sec).bind(c.price_per_min_uc)
+        .bind(c.bill_inc_s).bind(c.min_bill_s).bind(c.connect_fee_uc).bind(c.precedence)
+        .fetch_one(pool).await
+}
+
+pub async fn delete_rate_plan_entry(&self, id: i64) -> Result<bool, sqlx::Error> {
+    let Some(pool) = self.pool() else { return Ok(false); };
+    let backend = self.backend();
+    let res = sqlx::query(&fix_ph("DELETE FROM rate_plan_entries WHERE id = $1", backend)).bind(id).execute(pool).await?;
+    Ok(res.rows_affected() > 0)
+}
+
+// ================ trunk_rate_overrides CRUD ================
+
+pub async fn list_trunk_rate_overrides(
+    &self, trunk_id: Option<i64>, prefix: Option<&str>,
+    limit: i64, offset: i64,
+) -> Result<(Vec<TrunkRateOverride>, i64), sqlx::Error> {
+    let Some(pool) = self.pool() else { return Ok((Vec::new(), 0)); };
+    let backend = self.backend();
+    let limit = limit.clamp(1, 500);
+    let offset = offset.max(0);
+    let mut where_parts: Vec<String> = Vec::new();
+    let mut binds: Vec<String> = Vec::new();
+    if let Some(v) = trunk_id {
+        let ph = format!("${}", binds.len() + 1);
+        where_parts.push(format!("trunk_id = {ph}"));
+        binds.push(v.to_string());
+    }
+    if let Some(p) = prefix {
+        let ph = format!("${}", binds.len() + 1);
+        where_parts.push(format!("prefix LIKE {ph}"));
+        binds.push(format!("%{}%", p));
+    }
+    let where_sql = if where_parts.is_empty() { String::new() } else { format!("WHERE {}", where_parts.join(" AND ")) };
+    let count_sql = fix_ph(&format!("SELECT COUNT(*) FROM trunk_rate_overrides {where_sql}"), backend);
+    let rows_sql = fix_ph(&format!("SELECT * FROM trunk_rate_overrides {where_sql} ORDER BY trunk_id, prefix LIMIT ${} OFFSET ${}",
+        binds.len() + 1, binds.len() + 2), backend);
+    let mut cq = sqlx::query_scalar::<_, i64>(&count_sql);
+    for b in &binds { cq = cq.bind(b.as_str()); }
+    let total = cq.fetch_one(pool).await.unwrap_or(0);
+    let mut q = sqlx::query_as::<_, TrunkRateOverride>(&rows_sql);
+    for b in &binds { q = q.bind(b.as_str()); }
+    q = q.bind(limit).bind(offset);
+    let rows = q.fetch_all(pool).await?;
+    Ok((rows, total))
+}
+
+pub async fn create_trunk_rate_override(&self, c: TrunkRateOverrideCreate) -> Result<TrunkRateOverride, sqlx::Error> {
+    let pool = self.pool().ok_or(sqlx::Error::Configuration("NSBC_DB_DSN not set".into()))?;
+    let backend = self.backend();
+    let is_mysql = backend == "mysql";
+    let raw_sql = "INSERT INTO trunk_rate_overrides (trunk_id, prefix, price_per_min_uc, bill_inc_s) VALUES ($1, $2, $3, $4) RETURNING *";
+    if is_mysql {
+        let plain_sql = strip_returning(raw_sql);
+        let sql = fix_ph(&plain_sql, backend);
+        sqlx::query(&sql)
+            .bind(c.trunk_id).bind(&c.prefix).bind(c.price_per_min_uc).bind(c.bill_inc_s)
+            .execute(pool).await?;
+        let pick_sql = fix_ph("SELECT * FROM trunk_rate_overrides WHERE id = LAST_INSERT_ID()", backend);
+        return sqlx::query_as::<_, TrunkRateOverride>(&pick_sql).fetch_one(pool).await;
+    }
+    let sql = fix_ph(raw_sql, backend);
+    sqlx::query_as::<_, TrunkRateOverride>(&sql)
+        .bind(c.trunk_id).bind(&c.prefix).bind(c.price_per_min_uc).bind(c.bill_inc_s)
+        .fetch_one(pool).await
+}
+
+pub async fn delete_trunk_rate_override(&self, id: i64) -> Result<bool, sqlx::Error> {
+    let Some(pool) = self.pool() else { return Ok(false); };
+    let backend = self.backend();
+    let res = sqlx::query(&fix_ph("DELETE FROM trunk_rate_overrides WHERE id = $1", backend)).bind(id).execute(pool).await?;
+    Ok(res.rows_affected() > 0)
+}
+
+// ================ billing_transactions CRUD ================
+
+pub async fn list_billing_transactions(
+    &self, account_id: Option<i64>, call_id: Option<&str>,
+    limit: i64, offset: i64,
+) -> Result<(Vec<BillingTransaction>, i64), sqlx::Error> {
+    let Some(pool) = self.pool() else { return Ok((Vec::new(), 0)); };
+    let backend = self.backend();
+    let limit = limit.clamp(1, 500);
+    let offset = offset.max(0);
+    let mut where_parts: Vec<String> = Vec::new();
+    let mut binds: Vec<String> = Vec::new();
+    if let Some(v) = account_id {
+        let ph = format!("${}", binds.len() + 1);
+        where_parts.push(format!("account_id = {ph}"));
+        binds.push(v.to_string());
+    }
+    if let Some(c) = call_id {
+        let ph = format!("${}", binds.len() + 1);
+        where_parts.push(format!("call_id LIKE {ph}"));
+        binds.push(format!("%{}%", c));
+    }
+    let where_sql = if where_parts.is_empty() { String::new() } else { format!("WHERE {}", where_parts.join(" AND ")) };
+    let count_sql = fix_ph(&format!("SELECT COUNT(*) FROM billing_transactions {where_sql}"), backend);
+    let rows_sql = fix_ph(&format!("SELECT * FROM billing_transactions {where_sql} ORDER BY id DESC LIMIT ${} OFFSET ${}",
+        binds.len() + 1, binds.len() + 2), backend);
+    let mut cq = sqlx::query_scalar::<_, i64>(&count_sql);
+    for b in &binds { cq = cq.bind(b.as_str()); }
+    let total = cq.fetch_one(pool).await.unwrap_or(0);
+    let mut q = sqlx::query_as::<_, BillingTransaction>(&rows_sql);
+    for b in &binds { q = q.bind(b.as_str()); }
+    q = q.bind(limit).bind(offset);
+    let rows = q.fetch_all(pool).await?;
+    Ok((rows, total))
+}
+
+// ================ billing ledger ops ================
+
+/// Account topup: increment balance, write ledger entry.
+pub async fn account_topup(&self, account_id: i64, delta_uc: i64, operator: Option<&str>, remark: Option<&str>) -> Result<Account, sqlx::Error> {
+    let pool = self.pool().ok_or(sqlx::Error::Configuration("NSBC_DB_DSN not set".into()))?;
+    let backend = self.backend();
+    let ts = match backend { "postgres" => "CAST(NOW() AS TEXT)", "mysql" => "CAST(CURRENT_TIMESTAMP(3) AS CHAR)", _ => "datetime('now')" };
+
+    // Fetch current balance for ledger
+    let acct = self.get_account(account_id).await?.ok_or(sqlx::Error::RowNotFound)?;
+    let new_balance = acct.balance_uc + delta_uc;
+
+    // Update account
+    let is_mysql = backend == "mysql";
+    let update_sql_raw = format!(
+        "UPDATE accounts SET balance_uc = balance_uc + $1, updated_at = {ts} WHERE id = $2 RETURNING *"
+    );
+    let account: Account = if is_mysql {
+        let plain = fix_ph(&strip_returning(&update_sql_raw), backend);
+        sqlx::query(&plain).bind(delta_uc).bind(account_id).execute(pool).await?;
+        let pick = fix_ph("SELECT * FROM accounts WHERE id = $1", backend);
+        sqlx::query_as::<_, Account>(&pick).bind(account_id).fetch_one(pool).await?
+    } else {
+        let sql = fix_ph(&update_sql_raw, backend);
+        sqlx::query_as::<_, Account>(&sql).bind(delta_uc).bind(account_id).fetch_one(pool).await?
+    };
+
+    // Insert ledger entry
+    let tx_type = if delta_uc >= 0 { "topup" } else { "credit_adjust" };
+    let tx_sql = fix_ph(
+        "INSERT INTO billing_transactions (account_id, call_id, tx_type, amount_uc, balance_after_uc, operator, remark) VALUES ($1, NULL, $2, $3, $4, $5, $6)",
+        backend
+    );
+    sqlx::query(&tx_sql)
+        .bind(account_id).bind(tx_type).bind(delta_uc).bind(new_balance)
+        .bind(operator).bind(remark)
+        .execute(pool).await?;
+
+    Ok(account)
+}
+
+/// Settle call billing: deduct from balance, write ledger entry.
+pub async fn settle_billing(&self, account_id: i64, call_id: &str, charge_uc: i64, remark: Option<&str>) -> Result<(), sqlx::Error> {
+    let pool = self.pool().ok_or(sqlx::Error::Configuration("NSBC_DB_DSN not set".into()))?;
+    let backend = self.backend();
+    let ts = match backend { "postgres" => "CAST(NOW() AS TEXT)", "mysql" => "CAST(CURRENT_TIMESTAMP(3) AS CHAR)", _ => "datetime('now')" };
+
+    // Fetch current balance
+    let acct = self.get_account(account_id).await?.ok_or(sqlx::Error::RowNotFound)?;
+    let new_balance = acct.balance_uc - charge_uc;
+
+    // Update account (deduct charge)
+    let is_mysql = backend == "mysql";
+    let update_sql_raw = format!(
+        "UPDATE accounts SET balance_uc = balance_uc - $1, updated_at = {ts} WHERE id = $2"
+    );
+    let update_sql = fix_ph(&update_sql_raw, backend);
+    sqlx::query(&update_sql).bind(charge_uc).bind(account_id).execute(pool).await?;
+
+    // Insert ledger entry (negative amount = charge)
+    let tx_sql = fix_ph(
+        "INSERT INTO billing_transactions (account_id, call_id, tx_type, amount_uc, balance_after_uc, operator, remark) VALUES ($1, $2, 'call_charge', $3, $4, NULL, $5)",
+        backend
+    );
+    sqlx::query(&tx_sql)
+        .bind(account_id).bind(call_id).bind(-charge_uc).bind(new_balance).bind(remark)
+        .execute(pool).await?;
+
+    Ok(())
+}
+
 // ===== Security fence CRUD (NIP 3-layer + deny/allow dual mode) =====
 
 pub async fn list_security_blacklist(
@@ -7371,24 +8146,32 @@ pub async fn open_account(&self, c: AccountCreate) -> Result<Account, sqlx::Erro
         return Err(sqlx::Error::Configuration("NSBC_DB_DSN not set".into()));
     };
     let backend = self.backend();
-    let sql_with_ret = "INSERT INTO accounts (account_key, balance_uc, credit_limit_uc, description) VALUES ($1, $2, $3, $4) RETURNING *";
+    let sql_with_ret = "INSERT INTO accounts (tenant_id, account_key, balance_uc, credit_limit_uc, description, account_type, rate_plan_id, low_threshold_uc) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *";
     let is_mysql = backend == "mysql";
     if is_mysql {
         let sql = fix_ph(&strip_returning(sql_with_ret), backend);
         sqlx::query(&sql)
+            .bind(c.tenant_id)
             .bind(&c.account_key)
             .bind(c.balance_uc)
             .bind(c.credit_limit_uc)
             .bind(&c.description)
+            .bind(&c.account_type)
+            .bind(c.rate_plan_id)
+            .bind(c.low_threshold_uc)
             .execute(pool).await?;
         let pick_sql = fix_ph("SELECT * FROM accounts WHERE id = LAST_INSERT_ID()", backend);
         return sqlx::query_as::<_, Account>(&pick_sql).fetch_one(pool).await;
     }
     sqlx::query_as::<_, Account>(&fix_ph(sql_with_ret, backend))
+    .bind(c.tenant_id)
     .bind(&c.account_key)
     .bind(c.balance_uc)
     .bind(c.credit_limit_uc)
     .bind(&c.description)
+    .bind(&c.account_type)
+    .bind(c.rate_plan_id)
+    .bind(c.low_threshold_uc)
     .fetch_one(pool).await
 }
 
