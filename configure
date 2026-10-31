@@ -614,11 +614,11 @@ mkdir -p build build/mod src/core
     [ -n "$mod_flags" ] && echo "CPPFLAGS +=$mod_flags"
 
     echo ""
-    echo "# ---- Post-build: copy build/mod to project root (nsbcd same directory) ----"
+    echo "# ---- Post-build: copy \$(BUILD)/mod to project root (nsbcd same directory) ----"
     echo "# nsbcd startup: exe_dir/mod/mod.load -> dlopen exe_dir/mod/mod_xxx.so"
     echo "# install-time PREFIX/sbin/nsbcd -> PREFIX/lib/nsbc/ handled separately (does not depend on this)"
     if [ -n "$DYNAMIC_MODS" ]; then
-        echo "POST_BUILD_COPY = rm -rf ./mod && cp -a build/mod ./mod"
+        echo "POST_BUILD_COPY = rm -rf ./mod && if [ -d \$(BUILD)/mod ]; then cp -a \$(BUILD)/mod ./mod; fi"
     else
         echo "POST_BUILD_COPY ="
     fi

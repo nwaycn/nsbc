@@ -17,3 +17,15 @@ SIP方法实现完整性审计.md
 /config/
 /examples/event_client/python/__pycache__/
 /发行版/
+
+# Build artifacts (configure + make outputs)
+/config.mk
+/.config/
+/nsbcd
+/nsbc_cli
+/nsbc-web
+/build/
+/mod/
+/tls/
+/logs/
+/scripts/
