@@ -117,6 +117,12 @@ void modmgr_fini_all(nsbc_modmgr_t *m, struct nsbc_ctx *ctx);
  * fail-safe：refcnt>0 时等待超时 → 仍继续 dlclose（宁泄漏不 crash）*/
 int modmgr_unload(nsbc_modmgr_t *m, const char *name, struct nsbc_ctx *ctx);
 
+/* CLI load/reload：按模块名自动查找 .so 路径（exe_dir/mod, ./mod, build/mod, /etc/nsbc/mod），
+ * dlopen + register + init + start。reload = unload + load（已在 load_by_name 内部自动 unload）。
+ * REQUIRED / CALL_PATH 模块 load 也会被拒绝（modmgr_load 内校验）。*/
+int modmgr_load_by_name(nsbc_modmgr_t *m, const char *name, struct nsbc_ctx *app);
+int modmgr_reload(nsbc_modmgr_t *m, const char *name, struct nsbc_ctx *app);
+
 const nsbc_module_t *modmgr_find(nsbc_modmgr_t *m, const char *name);
 unsigned modmgr_count(nsbc_modmgr_t *m);
 

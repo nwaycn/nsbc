@@ -1583,6 +1583,58 @@ static void dispatch(ctl_conn_t *c, char *line)
         cmd_show_cdr(c);
     } else if (strcmp(line, "hangup") == 0) {
         cmd_hangup(c, arg);
+    } else if (strcmp(line, "load") == 0) {
+        /* ---- load <modname> — 动态加载一个 .so 模块 ----
+         * 从 exe_dir/mod、./mod、build/mod、/etc/nsbc/mod 自动找 mod_<name>.so
+         * 已存在同名模块先 unload。加载成功后自动 init + start。*/
+        if (!arg || !*arg) {
+            ctl_printf(c, "ERR usage: load <modname> (e.g. load av)\n");
+        } else {
+            nsbc_modmgr_t *mm = modmgr_get_global();
+            if (!mm) {
+                ctl_printf(c, "ERR modmgr not initialized\n");
+            } else {
+                int rc = modmgr_load_by_name(mm, arg, g_ctx);
+                if (rc == NSBC_OK)
+                    ctl_printf(c, "OK load '%s' success\n", arg);
+                else
+                    ctl_printf(c, "ERR load '%s' rc=%d\n", arg, rc);
+            }
+        }
+    } else if (strcmp(line, "unload") == 0) {
+        /* ---- unload <modname> — 安全卸载一个动态模块 ----
+         * stop → fini → dlclose。CALL_PATH / REQUIRED 模块拒绝卸载。*/
+        if (!arg || !*arg) {
+            ctl_printf(c, "ERR usage: unload <modname> (e.g. unload av)\n");
+        } else {
+            nsbc_modmgr_t *mm = modmgr_get_global();
+            if (!mm) {
+                ctl_printf(c, "ERR modmgr not initialized\n");
+            } else {
+                int rc = modmgr_unload(mm, arg, g_ctx);
+                if (rc == NSBC_OK)
+                    ctl_printf(c, "OK unload '%s' success\n", arg);
+                else
+                    ctl_printf(c, "ERR unload '%s' rc=%d\n", arg, rc);
+            }
+        }
+    } else if (strcmp(line, "reload") == 0) {
+        /* ---- reload <modname> — unload + load + init + start ----
+         * 改了 mod_av.so 转码逻辑后不用重启 nsbcd，reload av 即可生效 */
+        if (!arg || !*arg) {
+            ctl_printf(c, "ERR usage: reload <modname> (e.g. reload av)\n");
+        } else {
+            nsbc_modmgr_t *mm = modmgr_get_global();
+            if (!mm) {
+                ctl_printf(c, "ERR modmgr not initialized\n");
+            } else {
+                int rc = modmgr_reload(mm, arg, g_ctx);
+                if (rc == NSBC_OK)
+                    ctl_printf(c, "OK reload '%s' success\n", arg);
+                else
+                    ctl_printf(c, "ERR reload '%s' rc=%d\n", arg, rc);
+            }
+        }
     } else if (strcmp(line, "sub") == 0) {
         /* sub <topics> — 订阅实时推送
          * topics 逗号分隔：events / cdr / log / metrics */

@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <dlfcn.h>  /* REQ-ARCH-010：动态模块加载是一等公民（-ldl） */
+#include <unistd.h> /* access / readlink */
 
 /* category → 显示名 */
 const char *mod_category_name(mod_category_t cat) {
@@ -528,6 +529,121 @@ int modmgr_unload(nsbc_modmgr_t *m, const char *name, struct nsbc_ctx *app)
 
     llog(LOG_INFO, "mod", "unload '%s' done (safe)", name);
     return NSBC_OK;
+}
+
+/* CLI load/reload 查找 .so 的候选路径（与 main.c modmgr_load_all 候选一致）：
+ *   1. exe_dir/mod/mod_<name>.so    — dlopen 同级目录的 mod/（最常见）
+ *   2. ./mod/mod_<name>.so          — cwd = repo root 开发环境
+ *   3. build/mod/mod_<name>.so      — configure 产出
+ *   4. /etc/nsbc/mod/mod_<name>.so  — install 后 */
+static int find_so_for_name(const char *name, char *out, size_t out_sz)
+{
+    /* 先拿 exe_dir — /proc/self/exe readlink → dirname */
+    char exe[1024];
+    int exe_len = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    exe[exe_len >= 0 ? exe_len : 0] = '\0';
+
+    const char *candidates[8];
+    int ncand = 0;
+    char exe_dir[512] = {0};
+
+    if (exe_len > 0) {
+        const char *slash = strrchr(exe, '/');
+        if (slash) {
+            size_t dlen = (size_t)(slash - exe);
+            memcpy(exe_dir, exe, dlen);
+            exe_dir[dlen] = '\0';
+            /* 1. exe_dir/mod/mod_<name>.so */
+            candidates[ncand++] = exe_dir;
+        }
+    }
+    /* 2. cwd/mod */
+    candidates[ncand++] = "./mod";
+    /* 3. build/mod */
+    candidates[ncand++] = "build/mod";
+    /* 4. /etc/nsbc/mod */
+    candidates[ncand++] = "/etc/nsbc/mod";
+
+    for (int i = 0; i < ncand; ++i) {
+        snprintf(out, out_sz, "%s/mod_%s.so", candidates[i], name);
+        if (access(out, F_OK) == 0)
+            return NSBC_OK;
+    }
+    return NSBC_NOENT;
+}
+
+/* 按模块名 load — 自动查 .so 路径、dlopen、register、init、start
+ * 已存在同名模块先 unload（安全卸载） */
+int modmgr_load_by_name(nsbc_modmgr_t *m, const char *name, struct nsbc_ctx *app)
+{
+    if (!m || !name || !name[0]) return NSBC_INVAL;
+
+    /* 1. 如果同名模块已存在（上次没卸载干净），先 unload */
+    if (modmgr_find(m, name)) {
+        llog(LOG_INFO, "mod", "load '%s': already loaded → unload first", name);
+        int urc = modmgr_unload(m, name, app);
+        if (urc != NSBC_OK) {
+            llog(LOG_ERR, "mod", "load '%s': unload failed rc=%d", name, urc);
+            return urc;
+        }
+    }
+
+    /* 2. 找 .so 路径 */
+    char so_path[1024];
+    int frc = find_so_for_name(name, so_path, sizeof(so_path));
+    if (frc != NSBC_OK) {
+        llog(LOG_ERR, "mod", "load '%s': .so not found (tried exe_dir/mod, ./mod, build/mod, /etc/nsbc/mod)", name);
+        return NSBC_NOENT;
+    }
+
+    /* 3. dlopen + register */
+    int lrc = modmgr_load(m, so_path);
+    if (lrc != NSBC_OK) {
+        llog(LOG_ERR, "mod", "load '%s': modmgr_load rc=%d", name, lrc);
+        return lrc;
+    }
+
+    /* 4. init — 按模块自己的 level 拓扑初始化 */
+    const nsbc_module_t *d = modmgr_find(m, name);
+    if (!d) {
+        llog(LOG_ERR, "mod", "load '%s': register OK but find returned NULL (bug)", name);
+        return NSBC_ERR;
+    }
+    if (d->init) {
+        llog(LOG_INFO, "mod", "load '%s': init (level %d)", name, d->level);
+        int irc = d->init(app);
+        if (irc != NSBC_OK) {
+            llog(LOG_ERR, "mod", "load '%s': init rc=%d → rollback", name, irc);
+            modmgr_unload(m, name, app);
+            return irc;
+        }
+        /* 更新状态为 INITED（modmgr_load 默认是 REG）*/
+        int idx = find_idx(m, name);
+        if (idx >= 0) m->v[idx].st = MOD_ST_INITED;
+    }
+
+    /* 5. start */
+    if (d->start) {
+        llog(LOG_INFO, "mod", "load '%s': start", name);
+        int src = d->start(app);
+        if (src != NSBC_OK) {
+            llog(LOG_WARN, "mod", "load '%s': start rc=%d (module marked INITED, not STARTED)", name, src);
+        } else {
+            int idx = find_idx(m, name);
+            if (idx >= 0) m->v[idx].st = MOD_ST_STARTED;
+        }
+    }
+
+    llog(LOG_INFO, "mod", "load '%s': OK (dlopen %s)", name, so_path);
+    return NSBC_OK;
+}
+
+/* CLI reload — 强制 unload + load + init + start */
+int modmgr_reload(nsbc_modmgr_t *m, const char *name, struct nsbc_ctx *app)
+{
+    if (!m || !name || !name[0]) return NSBC_INVAL;
+    llog(LOG_INFO, "mod", "===== reload '%s' =====", name);
+    return modmgr_load_by_name(m, name, app); /* load_by_name 内部会先 unload */
 }
 
 /*
