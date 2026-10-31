@@ -431,12 +431,12 @@ install stage (make install PREFIX=/usr/local):
 
 **HARD_STATIC forced promotion** — modules the main binary hard-depends on (e.g., `signaling`, `security`, `dialplan`, `oam`) are **always** static regardless of configure results. They are never in mod.load.
 
-At **configure time** the script scans every `.c` file for `NSBC_MOD()` / `NSBC_MOD0()` registrations, validates dependencies, assigns each module to STATIC or DYNAMIC, and generates both:
+At **configure time** the script scans every `.c` file for `NSBC_MOD_CAT()` / `NSBC_MOD0_CAT()` registrations, validates dependencies, assigns each module to STATIC or DYNAMIC, and generates both:
 - `.config/config.mk` — Makefile include with source lists
 - `src/core/builtin_modules.gen.inc` — C file listing static modules
 - `build/mod/mod.load` — dynamic module manifest (one `.so` filename per line)
 
-At **build time**, the Makefile honors `HARD_STATIC` overrides and ensures the C core is built with `-DNSBC_NO_DB_MODULE` (see [Performance Constraints](#architecture)). After linking, `POST_BUILD_COPY` copies `build/mod/` → `./mod/` so nsbcd can dlopen without an install step.
+At **build time**, the Makefile honors `HARD_STATIC` overrides and ensures the C core is built with `-DNSBC_NO_DB_MODULE` (see [Performance Constraints](#architecture)). After linking, the **`sync-mod` phony target** (executed unconditionally on every `make all`) rsyncs `build/mod/` → `./mod/` so nsbcd can dlopen without an install step. `mod.load` is always alongside the `.so` files — **never** in the same directory as the `nsbcd` binary.
 
 ---
 
@@ -511,15 +511,36 @@ If the `hep` module is loaded, SIP + RTP + DTLS handshake traffic can be mirrore
 
 ### `nsbc_cli` (local Esl/JSON-RPC)
 
-The `nsbc_cli` utility communicates with `nsbcd` over the Unix domain socket (`/var/run/nsbc/nsbc.sock` by default). Example commands:
+The `nsbc_cli` utility communicates with `nsbcd` over the Unix domain socket (`/var/run/nsbc/control.sock`). Every registered command is auto-discoverable via `help` — grouped by module category (cmd_registry).
 
 ```bash
-nsbc_cli status              # show version, uptime, active calls
-nsbc_cli calls list          # list active B2BUA calls
-nsbc_cli calls hangup <id>   # terminate a call
-nsbc_cli reload              # reload dialplan / security config
-nsbc_cli metrics             # dump internal metric registry
+# Core diagnostics
+nsbc_cli help                  # built-in + registry grouped by [b2b] [mod] [security] ...
+nsbc_cli version               # build version, commit, build date
+nsbc_cli show modules          # 按 category 分组列出全部模块 + 状态 + flags
+nsbc_cli show codecs           # 音频/视频 codec 表（FFmpeg 后端 = mod_av）
+nsbc_cli show calls             # active/total/failed 计数
+
+# Module hot-reload (no nsbcd restart needed)
+nsbc_cli mod.reload av         # make 后热重启 mod_av.so
+nsbc_cli mod.unload av         # 动态卸载（CALL_PATH/REQUIRED 拒绝）
+nsbc_cli mod.load av           # 动态加载
+
+# Call control (b2b group)
+nsbc_cli uuid_kill <call-id>   # 强制挂断
+nsbc_cli uuid_bridge <a> <b>   # 桥接两通话
+nsbc_cli originate <url>       # 外呼
+
+# Security
+nsbc_cli security.ban.list         # 封禁表
+nsbc_cli security.blacklist.reload # 热更新黑名单
+
+# SIP trace
+nsbc_cli sofia siptrace on
+nsbc_cli console loglevel debug
 ```
+
+> For the complete command table see **[Cookbook §7 Control Socket Command Reference](docs/cookbook.md#7-control-socket-command-reference)**.
 
 ### Web management API
 
