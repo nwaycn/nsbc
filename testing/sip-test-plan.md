@@ -810,15 +810,33 @@ for c in 100 500 1000 3000 5000; do
   done
 done
 
-# === BYPASS 呼叫矩阵 ===
+# === BYPASS 呼叫矩阵（信令 only，媒体绕开 NSBC）===
 for c in 100 500 1000 3000; do
-  for r in 30 100 300; do
+  for r in 30 100 300 800 1200; do
     echo "▶ BYPASS C${c} R${r}"
     TOTAL=$((c * 30))
     sipp $TARGET -sn uac -s 10002@nsbc.local -ab $AUTHFILE \
       -m $TOTAL -r $r -d 30s -trace_err 2>&1 | tee reports/bypass_C${c}_R${r}.log
   done
 done
+
+# === RELAY 呼叫矩阵（媒体经 NSBC RTP relay 转发）===
+# 前提：先切 RELAY（SSH 到 10.0.0.80）：
+#   sqlite3 /home/github/nsbc/db/web.db \
+#     "UPDATE dialplan_rules SET action_json='{\"media_mode\":2}' WHERE layer='ext' AND enabled=1;"
+#   python3 -c "import socket; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect('/var/run/nsbc/control.sock'); s.sendall(b'reload\n'); print(s.recv(4096)); s.close()"
+# RELAY 负载显著更高（SIP + RTP relay 双层），并发/CPS 档减半
+for c in 50 100 300 500 1000; do
+  for r in 30 50 100 200 300; do
+    echo "▶ RELAY C${c} R${r}"
+    TOTAL=$((c * 30))
+    sipp $TARGET -sn uac -s 10002@nsbc.local -ab $AUTHFILE \
+      -m $TOTAL -r $r -d 30s -trace_err 2>&1 | tee reports/relay_C${c}_R${r}.log
+  done
+done
+# 测完切回 auto：
+#   sqlite3 /home/github/nsbc/db/web.db "UPDATE dialplan_rules SET action_json='{}' WHERE layer='ext' AND enabled=1;"
+#   python3 -c "import socket; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect('/var/run/nsbc/control.sock'); s.sendall(b'reload\n'); print(s.recv(4096)); s.close()"
 ```
 
 ---
