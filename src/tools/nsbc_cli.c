@@ -860,6 +860,12 @@ static const struct cmd_entry g_cmds_all[] = {
     { "console siptrace on|off",            CMD_GLOBAL, "简写等价 sofia siptrace" },
     { "media_bug purge_all",                CMD_GLOBAL, "强制清理所有 media_bug" },
     { "hep status|flush|reload",            CMD_GLOBAL, "HEP3 推流控制" },
+    { "mod.load <name>",                    CMD_GLOBAL, "动态加载 mod_<name>.so（L2）" },
+    { "mod.unload <name>",                  CMD_GLOBAL, "stop+fini+dlclose 模块（L2）" },
+    { "mod.reload <name>",                  CMD_GLOBAL, "一键 unload+load+init+start（L2）" },
+    { "security.ban.list [sub]",            CMD_GLOBAL, "封禁表查询（L1）" },
+    { "security.ban.unban <ip>",            CMD_GLOBAL, "解封 IP（L2）" },
+    { "security.blacklist.reload <json>",   CMD_GLOBAL, "静态黑名单同步（L2）" },
     { "test_push_cdr",                      CMD_GLOBAL, "模拟 CDR 验证 write-through" },
     { NULL, (cmd_group_t)0, NULL }
 };
@@ -1078,6 +1084,11 @@ static const char *g_cmds[] = {
     "media_bug", "uuid_media_bug", "test_push_cdr",
     "console", "events", "cdr", "sip-trace", "sip-filter",
     "sub", "unsub", "focus", "color",
+    "mod.load", "mod.unload", "mod.reload",
+    "security.ban.list", "security.ban.unban", "security.ban.clear",
+    "security.blacklist.list", "security.blacklist.reload", "security.cfg.reload",
+    "profiles.list", "trunks.list", "dialplan.show",
+    "bugs", "bug.add", "bug.del", "bug.list",
     NULL
 };
 
