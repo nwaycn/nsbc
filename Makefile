@@ -281,7 +281,7 @@ CLI_CPPFLAGS =
 CLI_LDLIBS   = -lpthread -ledit
 endif
 
-.PHONY: all check clean asan tsan ubsan install cli modules web web-acme web-check web-clean build-acme
+.PHONY: all check clean asan tsan ubsan install cli modules sync-mod web web-acme web-check web-clean build-acme
 
 # mod.load must be generated before .so build — configure always writes it,
 # but as a safety net we also add an explicit Make fallback here.
@@ -289,7 +289,7 @@ endif
 # nsbcd reads:   exe_dir/mod/mod.load  (exe_dir = dirname(/proc/self/exe))
 # install copy:   $(PREFIX)/etc/nsbc/mod/mod.load
 ifeq ($(NSBC_WITH_DLOPEN),1)
-all: $(TARGET) $(CLI_TARGET) $(DYNAMIC_SOS) $(BUILD)/mod/mod.load
+all: $(TARGET) $(CLI_TARGET) sync-mod
 else
 all: $(TARGET) $(CLI_TARGET)
 endif
@@ -333,16 +333,28 @@ $(BUILD)/mod/%.so:
 	      $(LDLIBS) $(MOD_EXTRA_LDLIBS)
 endif
 
-modules: $(DYNAMIC_SOS)
+modules: $(DYNAMIC_SOS) sync-mod
 
 ifeq ($(NSBC_WITH_DLOPEN),1)
-$(TARGET): $(OBJS) $(MAIN_OBJ) | $(DYNAMIC_SOS) $(BUILD)/mod/mod.load
+$(TARGET): $(OBJS) $(MAIN_OBJ) | $(DYNAMIC_SOS)
 else
 $(TARGET): $(OBJS) $(MAIN_OBJ)
 endif
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 	cp -f $@ .
-	$(POST_BUILD_COPY)
+
+# ---- sync-mod: phony，每次 make 都跑，把 build/mod/ 同步到 ./mod/ ----
+# mod.load 和 .so 是独立产物，生成顺序不保证；sync-mod 作为独立目标
+# 不挂在 $(TARGET) recipe 上，即使 nsbcd 已是最新也能确保 ./mod/ 完整。
+.PHONY: sync-mod
+ifeq ($(NSBC_WITH_DLOPEN),1)
+sync-mod: $(DYNAMIC_SOS) $(BUILD)/mod/mod.load
+	@rm -rf ./mod
+	@cp -a $(BUILD)/mod ./mod
+	@echo "  SYNC ./mod ($(words $(DYNAMIC_MODS)) .so + mod.load)"
+else
+sync-mod:
+endif
 
 # Fallback: generate build/mod/mod.load if configure didn't run
 # (configure always writes it at $(BUILD)/mod/mod.load; this is just a safety net)
