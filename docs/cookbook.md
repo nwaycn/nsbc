@@ -148,9 +148,27 @@ nsbc/
 ├── conf/nsbc.yaml             # active YAML config
 ├── configs/nsbc.yaml          # built-in default (template)
 ├── tls/                       # nsbc-web TLS certs (auto-generated)
-├── build/mod/*.so             # dynamically loaded modules
+├── mod/                       # POST_BUILD_COPY 从 build/mod/ 复制过来
+│   ├── mod.load               # ← 动态模块清单（每行一个裸 .so 文件名）
+│   ├── mod_codecs.so          # G.711 + G.729 (built-in + bcg729)
+│   ├── mod_av.so              # FFmpeg codec bridge (G722/Opus/H264/VP8/VP9)
+│   ├── mod_cachedb.so
+│   └── ...
+├── build/
+│   ├── mod/
+│   │   ├── mod.load           # configure 原始产出（L665-677）
+│   │   └── mod_*.so           # Makefile 构建产物
+│   └── nsbcd
+├── .config/config.mk          # configure 生成的 Makefile include
+├── src/core/builtin_modules.gen.inc  # configure 生成的静态模块数组
 └── logs/nsbcd.log             # default log file
 ```
+
+**mod.load 关键点：**
+- 它和 `.so` 文件**同级**（在 `mod/` 或 `build/mod/` 里），不与 `nsbcd` 二进制同级
+- 清单里只写裸文件名（`mod_codecs.so`），**不含路径** — 模块管理器从 `dirname(mod.load)` 推导 dlopen base dir
+- nsbcd 按 5 个候选路径依次查找：`exe_dir/mod/mod.load` → YAML override → `build/mod/mod.load` → `build/mod.load` → `/etc/nsbc/mod/mod.load`
+- **HARD_STATIC** 模块（signaling, security, dialplan, oam, ...）永远静态链接，不进入 mod.load
 
 ---
 

@@ -387,13 +387,50 @@ Open `https://<host>:443` in your browser.
 NSBC has a two-tier module model:
 
 1. **Statically linked (built-in)** — REQUIRED, CALL_PATH, or EARLY-level modules are linked directly into `nsbcd`. These are the modules the signaling core makes direct function calls to (e.g., `b2bua.c` unconditionally calls `security_blacklist_check()`).
-2. **Dynamically loaded (`mod_*.so`)** — Everything else is compiled as `-shared -fPIC` and loaded via `dlopen()` at startup. The module manager reads `build/mod/mod.load` (one filename per line) and resolves symbols.
+2. **Dynamically loaded (`mod_*.so`)** — Everything else is compiled as `-shared -fPIC` and loaded via `dlopen()` at startup. The module manager reads `mod.load` (one filename per line, **no paths**) and resolves symbols.
+
+#### mod.load — The Dynamic Module Manifest
+
+`mod.load` is the sole manifest controlling which `.so` files nsbcd loads. **It always lives in the same directory as the `.so` files**, not with the `nsbcd` binary itself. The module manager derives the dlopen base dir from `dirname(mod.load)`, so mod.load entries are bare filenames:
+
+```
+mod_codecs.so
+mod_av.so
+mod_cachedb.so
+```
+
+**Where mod.load lives at each stage:**
+
+```
+configure stage:
+  build/mod/mod.load          ← configure writes here (L665-677 of configure)
+
+make stage:
+  ./mod/mod.load              ← POST_BUILD_COPY copies build/mod → ./mod
+  ./mod/mod_*.so              ← alongside the .so files
+  ./nsbcd                     ← exe_dir = dirname(/proc/self/exe) = ./
+
+install stage (make install PREFIX=/usr/local):
+  /usr/local/lib/nsbc/mod_*.so
+  /usr/local/etc/nsbc/mod/mod.load     ← install copies $(BUILD)/mod/mod.load
+```
+
+**nsbcd reads mod.load from 5 candidate paths** (checked in order, first hit wins):
+
+1. `exe_dir/mod/mod.load` — install/binary deployment (exe_dir = dirname of nsbcd binary)
+2. YAML `core.mods_load_path` — explicit override in `nsbc.yaml`
+3. `build/mod/mod.load` — in-tree build (relative to cwd)
+4. `build/mod.load` — legacy flat location
+5. `/etc/nsbc/mod/mod.load` — system install
+
+**HARD_STATIC forced promotion** — modules the main binary hard-depends on (e.g., `signaling`, `security`, `dialplan`, `oam`) are **always** static regardless of configure results. They are never in mod.load.
 
 At **configure time** the script scans every `.c` file for `NSBC_MOD()` / `NSBC_MOD0()` registrations, validates dependencies, assigns each module to STATIC or DYNAMIC, and generates both:
 - `.config/config.mk` — Makefile include with source lists
 - `src/core/builtin_modules.gen.inc` — C file listing static modules
+- `build/mod/mod.load` — dynamic module manifest (one `.so` filename per line)
 
-At **build time**, the Makefile honors `HARD_STATIC` overrides for modules that the main binary hard-depends on, and ensures the C core is built with `-DNSBC_NO_DB_MODULE` (see [Performance Constraints](#architecture)).
+At **build time**, the Makefile honors `HARD_STATIC` overrides and ensures the C core is built with `-DNSBC_NO_DB_MODULE` (see [Performance Constraints](#architecture)). After linking, `POST_BUILD_COPY` copies `build/mod/` → `./mod/` so nsbcd can dlopen without an install step.
 
 ---
 

@@ -397,13 +397,50 @@ cd .. && ./nsbc-web  # HTTPS :443
 NSBC 采用两层模块模型：
 
 1. **静态链接（内置）** —— REQUIRED、CALL_PATH、EARLY 级别的模块直接链入 `nsbcd`。这些是信令核心直接函数调用的模块（例如 `b2bua.c` 无条件调用 `security_blacklist_check()`）。
-2. **动态加载（`mod_*.so`）** —— 其余模块编译为 `-shared -fPIC`，启动时通过 `dlopen()` 加载。模块管理器读取 `build/mod/mod.load`（每行一个 .so 文件名）并解析符号。
+2. **动态加载（`mod_*.so`）** —— 其余模块编译为 `-shared -fPIC`，启动时通过 `dlopen()` 加载。模块管理器读取 `mod.load`（每行一个 **纯文件名**，不含路径），从 `dirname(mod.load)` 推导 dlopen 基目录。
+
+#### mod.load —— 动态模块清单
+
+`mod.load` 是 nsbcd 动态加载哪些 `.so` 的唯一清单。**它始终和 `.so` 文件放在同一目录**，不与 `nsbcd` 二进制同级。清单里只写裸文件名：
+
+```
+mod_codecs.so
+mod_av.so
+mod_cachedb.so
+```
+
+**各阶段 mod.load 所在位置：**
+
+```
+configure 阶段：
+  build/mod/mod.load          ← configure L665-677 写这里
+
+make 阶段：
+  ./mod/mod.load              ← POST_BUILD_COPY 把 build/mod/ 整体复制到 ./mod/
+  ./mod/mod_*.so              ← 与 .so 文件同级
+  ./nsbcd                     ← exe_dir = dirname(/proc/self/exe) = ./
+
+install 阶段（make install PREFIX=/usr/local）：
+  /usr/local/lib/nsbc/mod_*.so
+  /usr/local/etc/nsbc/mod/mod.load     ← install 复制 $(BUILD)/mod/mod.load
+```
+
+**nsbcd 按以下 5 个候选路径依次查找 mod.load（先命中先采用）：**
+
+1. `exe_dir/mod/mod.load` —— 二进制部署（exe_dir = nsbcd 所在目录）
+2. YAML `core.mods_load_path` —— `nsbc.yaml` 中显式覆盖路径
+3. `build/mod/mod.load` —— 源码目录内构建（相对路径，cwd 相关）
+4. `build/mod.load` —— 旧版平级位置（兼容遗留）
+5. `/etc/nsbc/mod/mod.load` —— 系统级 install 位置
+
+**HARD_STATIC 强制提升** —— 主二进制硬依赖的模块（如 `signaling`、`security`、`dialplan`、`oam`）**永远**是静态链接，不进入 mod.load，不受 configure 结果影响。
 
 **configure 阶段**脚本扫描所有 `.c` 文件中的 `NSBC_MOD()` / `NSBC_MOD0()` 注册，校验依赖关系，将每个模块分到 STATIC 或 DYNAMIC，生成：
 - `.config/config.mk` —— Makefile include 的源文件列表
 - `src/core/builtin_modules.gen.inc` —— 列出所有静态模块的 C 头文件
+- `build/mod/mod.load` —— 动态模块清单（每行一个 .so 裸文件名）
 
-**构建阶段**Makefile 会对主二进制硬依赖的模块做 `HARD_STATIC` 强制提升，并确保 C 核心编译时带 `-DNSBC_NO_DB_MODULE`（见下文架构硬约束）。
+**构建阶段**Makefile 会对主二进制硬依赖的模块做 `HARD_STATIC` 强制提升，并确保 C 核心编译时带 `-DNSBC_NO_DB_MODULE`（见下文架构硬约束）。链接完成后 `POST_BUILD_COPY` 把 `build/mod/` → `./mod/`，这样无需 install 也能 dlopen 运行。
 
 ---
 
