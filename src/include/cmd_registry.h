@@ -20,6 +20,7 @@ extern "C" {
 
 #define CMD_NAME_MAX  32
 #define CMD_HELP_MAX  128
+#define CMD_GROUP_MAX 16
 #define CMD_MAX       256
 #define CMD_LINE_MAX  1024
 
@@ -43,6 +44,7 @@ typedef int (*cmd_fn_t)(cmd_ctx_t *c, int argc, char **argv, void *ud);
 typedef struct {
     char        name[CMD_NAME_MAX];
     char        help[CMD_HELP_MAX];
+    char        group[CMD_GROUP_MAX];  /* 所属模块组：mod/call/reload/security/... 空=misc */
     cmd_level_t level;
     cmd_fn_t    fn;
     void       *ud;

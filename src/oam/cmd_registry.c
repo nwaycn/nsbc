@@ -7,6 +7,7 @@
  * 确认令牌在 P1 认证模块补（cmd_ctx_l2_grant 是其回填口）。
  */
 #include "cmd_registry.h"
+#include <string.h>
 
 struct cmd_reg {
     cmd_desc_t cmds[CMD_MAX];
@@ -90,19 +91,59 @@ int cmd_execute(cmd_reg_t *r, cmd_ctx_t *c, int argc, char **argv)
 
 int cmd_help(cmd_reg_t *r, cmd_ctx_t *c, const char *prefix)
 {
-    int i, n = 0;
     if (r == NULL || c == NULL || c->io_printf == NULL)
         return NSBC_INVAL;
-    for (i = 0; i < r->n; ++i) {
-        const cmd_desc_t *d = &r->cmds[i];
+
+    /* ---- pass 1: 收集需要输出的命令（prefix 过滤）---- */
+    int shown[CMD_MAX];
+    int n_shown = 0;
+    for (int i = 0; i < r->n; ++i) {
         if (prefix != NULL && prefix[0] != '\0' &&
-            strncmp(d->name, prefix, strlen(prefix)) != 0)
+            strncmp(r->cmds[i].name, prefix, strlen(prefix)) != 0)
             continue;
-        c->io_printf(c->io_ud, "%-24s [%c] %s\r\n", d->name,
-                     d->level == CMD_L2_ADMIN ? '2' : '1', d->help);
-        ++n;
+        shown[n_shown++] = i;
     }
-    return n;
+    if (n_shown == 0) return 0;
+
+    /* ---- pass 2: 按 group 分组打印 ----
+     * 策略：逐个 group 扫一遍（先打有 group 的，最后打空 group=misc），
+     * 同一个 group 标题只打一次。不排序（保持注册顺序，模块 init 自行分组）。 */
+    int total = 0;
+    int used[CMD_MAX];
+    memset(used, 0, sizeof(used));
+
+    /* 先输出所有有 group 的命令 */
+    for (int pass = 0; pass < 2; ++pass) {  /* pass 0=有 group, pass 1=空 group */
+        int any_in_group = 0;
+        char cur_group[CMD_GROUP_MAX] = "";
+        for (int i = 0; i < n_shown; ++i) {
+            int idx = shown[i];
+            if (used[i]) continue;
+            const char *g = r->cmds[idx].group;
+            int has_group = (g && g[0] != '\0');
+            if ((pass == 0 && !has_group) || (pass == 1 && has_group))
+                continue;
+            /* 打组标题 */
+            if (g && g[0] != '\0') {
+                if (strcmp(cur_group, g) != 0) {
+                    snprintf(cur_group, sizeof(cur_group), "%s", g);
+                    c->io_printf(c->io_ud, "\n  [%s]\r\n", g);
+                    any_in_group = 1;
+                }
+            } else {
+                if (!any_in_group) {
+                    c->io_printf(c->io_ud, "\n  [misc]\r\n");
+                    any_in_group = 1;
+                }
+            }
+            const cmd_desc_t *d = &r->cmds[idx];
+            c->io_printf(c->io_ud, "    %-22s [%c] %s\r\n", d->name,
+                         d->level == CMD_L2_ADMIN ? '2' : '1', d->help);
+            used[i] = 1;
+            ++total;
+        }
+    }
+    return total;
 }
 
 int cmd_count(cmd_reg_t *r)

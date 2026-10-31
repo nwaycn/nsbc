@@ -315,9 +315,9 @@ static int bug_init(struct nsbc_ctx *ctx)
         return 0; /* hook 仍然有效，只是 CLI 不可控 */
     }
     static const cmd_desc_t descs[] = {
-        { "bug.add",  "attach RTP payload listener",     CMD_L2_ADMIN, cmd_bug_add,  NULL },
-        { "bug.del",  "detach listener",                 CMD_L2_ADMIN, cmd_bug_del,  NULL },
-        { "bug.list", "list active bugs with counters",  CMD_L1_MONITOR, cmd_bug_list, NULL },
+        { "bug.add",  "attach RTP payload listener",     "media_bug", CMD_L2_ADMIN, cmd_bug_add,  NULL },
+        { "bug.del",  "detach listener",                 "media_bug", CMD_L2_ADMIN, cmd_bug_del,  NULL },
+        { "bug.list", "list active bugs with counters",  "media_bug", CMD_L1_MONITOR, cmd_bug_list, NULL },
     };
     for (size_t i = 0; i < sizeof(descs)/sizeof(descs[0]); ++i) {
         int rc = cmd_register(reg, &descs[i]);

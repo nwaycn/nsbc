@@ -1671,76 +1671,73 @@ void call_commands_register(cmd_reg_t *reg, nsbc_ctx_t *ctx)
     if (!reg) return;
     /* ud 统一传 ctx，命令函数内部按需解引用拿 b2b/bridge 等 */
     cmd_desc_t descs[] = {
-        /* 呼叫级（L1 只读）——uuid_dump 由 obs_control.c 硬编码 if 链实装，
-         * 此处不注册；status / uuid_getvar 是新增 */
+        /* ---- b2b 呼叫级 ---- */
         { "uuid_getvar",   "获取通道变量（L1，只读）",
-          CMD_L1_MONITOR, cmd_uuid_getvar, ctx },
+          "b2b", CMD_L1_MONITOR, cmd_uuid_getvar, ctx },
         { "status",        "系统综合状态（L1，只读）",
-          CMD_L1_MONITOR, cmd_status, ctx },
-
-        /* 呼叫级（L2 写操作） */
+          "b2b", CMD_L1_MONITOR, cmd_status, ctx },
         { "uuid_kill",     "强制挂断通话 [cause]（L2，审计）",
-          CMD_L2_ADMIN, cmd_uuid_kill, ctx },
+          "b2b", CMD_L2_ADMIN, cmd_uuid_kill, ctx },
         { "uuid_cancel",   "CANCEL 早期 INVITE [leg=-1|0|1]（L2，审计）",
-          CMD_L2_ADMIN, cmd_uuid_cancel, ctx },
+          "b2b", CMD_L2_ADMIN, cmd_uuid_cancel, ctx },
         { "uuid_hold",     "hold/resume on|off（L2，审计）",
-          CMD_L2_ADMIN, cmd_uuid_hold, ctx },
+          "b2b", CMD_L2_ADMIN, cmd_uuid_hold, ctx },
         { "uuid_mute",     "mute/resume on|off [leg=-1|0|1]（L2，审计）",
-          CMD_L2_ADMIN, cmd_uuid_mute, ctx },
+          "b2b", CMD_L2_ADMIN, cmd_uuid_mute, ctx },
         { "uuid_vad_start","启动 VAD 监控 <call-id> [threshold]（L2，AI barge-in P0）",
-          CMD_L2_ADMIN, cmd_uuid_vad_start, ctx },
+          "b2b", CMD_L2_ADMIN, cmd_uuid_vad_start, ctx },
         { "uuid_vad_stop", "停止 VAD 监控 <call-id>（L2，AI barge-in P0）",
-          CMD_L2_ADMIN, cmd_uuid_vad_stop, ctx },
+          "b2b", CMD_L2_ADMIN, cmd_uuid_vad_stop, ctx },
         { "uuid_transfer", "盲转 REFER 到 dest（L2，审计）",
-          CMD_L2_ADMIN, cmd_uuid_transfer, ctx },
+          "b2b", CMD_L2_ADMIN, cmd_uuid_transfer, ctx },
         { "uuid_displace", "B-leg answer + A-leg unhold 接管通话（L2，审计）",
-          CMD_L2_ADMIN, cmd_uuid_displace, ctx },
+          "b2b", CMD_L2_ADMIN, cmd_uuid_displace, ctx },
         { "uuid_park",     "hold 双腿暂停媒体（L2，审计）",
-          CMD_L2_ADMIN, cmd_uuid_park, ctx },
+          "b2b", CMD_L2_ADMIN, cmd_uuid_park, ctx },
         { "uuid_unpark",   "unhold 双腿恢复媒体（L2，审计）",
-          CMD_L2_ADMIN, cmd_uuid_unpark, ctx },
+          "b2b", CMD_L2_ADMIN, cmd_uuid_unpark, ctx },
         { "uuid_deflect",  "盲转 REFER 到 dest（FreeSWITCH deflect 别名，L2，审计）",
-          CMD_L2_ADMIN, cmd_uuid_deflect, ctx },
+          "b2b", CMD_L2_ADMIN, cmd_uuid_deflect, ctx },
         { "uuid_wait_for_answer", "阻塞等待 B-leg 200 OK [timeout_ms]（L1 读+微阻塞）",
-          CMD_L2_ADMIN, cmd_uuid_wait_for_answer, ctx },
+          "b2b", CMD_L2_ADMIN, cmd_uuid_wait_for_answer, ctx },
         { "uuid_bridge",   "桥接两呼叫（L2，审计）",
-          CMD_L2_ADMIN, cmd_uuid_bridge, ctx },
+          "b2b", CMD_L2_ADMIN, cmd_uuid_bridge, ctx },
         { "uuid_broadcast","向通话注入音频（L2）",
-          CMD_L2_ADMIN, cmd_uuid_broadcast, ctx },
+          "b2b", CMD_L2_ADMIN, cmd_uuid_broadcast, ctx },
         { "uuid_break",    "打断当前媒体流（L2）",
-          CMD_L2_ADMIN, cmd_uuid_break, ctx },
+          "b2b", CMD_L2_ADMIN, cmd_uuid_break, ctx },
         { "uuid_record",   "start|stop 录制（L2）",
-          CMD_L2_ADMIN, cmd_uuid_record, ctx },
+          "b2b", CMD_L2_ADMIN, cmd_uuid_record, ctx },
         { "uuid_answer",   "200 OK 应答（L2）",
-          CMD_L2_ADMIN, cmd_uuid_answer, ctx },
+          "b2b", CMD_L2_ADMIN, cmd_uuid_answer, ctx },
         { "uuid_send_dtmf","发送 DTMF 序列（L2）",
-          CMD_L2_ADMIN, cmd_uuid_send_dtmf, ctx },
+          "b2b", CMD_L2_ADMIN, cmd_uuid_send_dtmf, ctx },
         { "send_msg",      "对话内发送 MESSAGE 消息体（L2，审计）",
-          CMD_L2_ADMIN, cmd_send_msg, ctx },
+          "b2b", CMD_L2_ADMIN, cmd_send_msg, ctx },
         { "uuid_setvar",   "设置通道变量（L2，审计）",
-          CMD_L2_ADMIN, cmd_uuid_setvar, ctx },
-
-        /* 全局级（L2） */
+          "b2b", CMD_L2_ADMIN, cmd_uuid_setvar, ctx },
         { "originate",     "发起外呼 call-url [&app]（L2，审计）",
-          CMD_L2_ADMIN, cmd_originate, ctx },
+          "b2b", CMD_L2_ADMIN, cmd_originate, ctx },
+
+        /* ---- infra 基础设施 ---- */
         { "sofia",         "sofia [global] siptrace on|off / profile <name> rescan（L2，审计）",
-          CMD_L2_ADMIN, cmd_sofia, ctx },
+          "infra", CMD_L2_ADMIN, cmd_sofia, ctx },
         { "console",       "console loglevel <0-7|name> / console siptrace on|off（L2，审计）",
-          CMD_L2_ADMIN, cmd_console, ctx },
+          "infra", CMD_L2_ADMIN, cmd_console, ctx },
 
-        /* REQ-MEDIA-BUG-001：媒体 bug 命令族 */
+        /* ---- media_bug 媒体 bug ---- */
         { "uuid_media_bug","附加/媒体 bug start|stop|list（L2，审计）",
-          CMD_L2_ADMIN, cmd_uuid_media_bug, ctx },
+          "media_bug", CMD_L2_ADMIN, cmd_uuid_media_bug, ctx },
         { "media_bug",     "media_bug purge_all（L2，强制清理）",
-          CMD_L2_ADMIN, cmd_media_bug_purge, ctx },
+          "media_bug", CMD_L2_ADMIN, cmd_media_bug_purge, ctx },
 
-        /* REQ-MEDIA-HEP-001：HEP3 推流 OAM */
+        /* ---- hep HEP3 推流 ---- */
         { "hep",           "hep status|flush|reload（L1/L2 混合，审计）",
-          CMD_L2_ADMIN, cmd_hep, ctx },
+          "hep", CMD_L2_ADMIN, cmd_hep, ctx },
 
-        /* data.sock write-through 测试 */
+        /* ---- misc 测试 ---- */
         { "test_push_cdr", "往 data.sock 推一条模拟 CDR 验证 write-through",
-          CMD_L2_ADMIN, cmd_test_push_cdr, ctx },
+          "misc", CMD_L2_ADMIN, cmd_test_push_cdr, ctx },
     };
     for (size_t i = 0; i < sizeof(descs)/sizeof(descs[0]); ++i) {
         int rc = cmd_register(reg, &descs[i]);

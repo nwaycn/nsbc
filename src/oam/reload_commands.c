@@ -271,19 +271,21 @@ void reload_commands_register(cmd_reg_t *reg)
 {
     if (!reg) return;
     cmd_desc_t descs[] = {
-        { "extensions.reload",     "Reload extensions from JSON (Web→core push)",     CMD_L2_ADMIN, cmd_extensions_reload, NULL },
-        { "gateways.reload",       "Reload gateways from JSON",                       CMD_L2_ADMIN, cmd_gateways_reload,   NULL },
-        { "trunks.reload",         "Reload trunks from JSON (trunk_t)",               CMD_L2_ADMIN, cmd_trunks_reload,     NULL },
-        { "dialplan-rules.reload", "Reload dialplan rules from JSON (dp_rule)",       CMD_L2_ADMIN, cmd_dialplan_rules_reload, NULL },
-        { "queues.reload",         "Reload ACD queues from JSON (cc_mgr)",            CMD_L2_ADMIN, cmd_queues_reload,     NULL },
-        { "profiles.reload",       "Reload SIP profiles RCU atomic replace",          CMD_L2_ADMIN, cmd_profiles_reload,   NULL },
-        { "profiles.list",         "List loaded SIP profiles",                        CMD_L1_MONITOR, cmd_profiles_list,    NULL },
-        { "ha.reload",             "Reload HA groups from JSON (Web DB authoritative)", CMD_L2_ADMIN, cmd_reload_noop, (void*)"ha" },
-        { "ivr.reload",            "Reload IVR menus from JSON (nodes JSON tree)",       CMD_L2_ADMIN, cmd_ivr_reload,     NULL },
-        { "route_groups.reload",   "Reload route groups from JSON (Web DB authoritative)", CMD_L2_ADMIN, cmd_reload_noop, (void*)"route_groups" },
-        /* ---- P0 新增诊断命令 ---- */
-        { "trunks.list",           "List loaded trunks and groups from route_table",  CMD_L1_MONITOR, cmd_trunks_list,      NULL },
-        { "dialplan.show",         "List active dialplan rules",                      CMD_L1_MONITOR, cmd_dialplan_show,    NULL },
+        /* ---- reload 热加载 ---- */
+        { "extensions.reload",     "Reload extensions from JSON (Web→core push)",     "reload", CMD_L2_ADMIN, cmd_extensions_reload, NULL },
+        { "gateways.reload",       "Reload gateways from JSON",                       "reload", CMD_L2_ADMIN, cmd_gateways_reload,   NULL },
+        { "trunks.reload",         "Reload trunks from JSON (trunk_t)",               "reload", CMD_L2_ADMIN, cmd_trunks_reload,     NULL },
+        { "dialplan-rules.reload", "Reload dialplan rules from JSON (dp_rule)",       "reload", CMD_L2_ADMIN, cmd_dialplan_rules_reload, NULL },
+        { "queues.reload",         "Reload ACD queues from JSON (cc_mgr)",            "reload", CMD_L2_ADMIN, cmd_queues_reload,     NULL },
+        { "profiles.reload",       "Reload SIP profiles RCU atomic replace",          "reload", CMD_L2_ADMIN, cmd_profiles_reload,   NULL },
+        { "ha.reload",             "Reload HA groups from JSON (Web DB authoritative)", "reload", CMD_L2_ADMIN, cmd_reload_noop, (void*)"ha" },
+        { "ivr.reload",            "Reload IVR menus from JSON (nodes JSON tree)",       "reload", CMD_L2_ADMIN, cmd_ivr_reload,     NULL },
+        { "route_groups.reload",   "Reload route groups from JSON (Web DB authoritative)", "reload", CMD_L2_ADMIN, cmd_reload_noop, (void*)"route_groups" },
+
+        /* ---- show 只读查询 ---- */
+        { "profiles.list",         "List loaded SIP profiles",                        "show", CMD_L1_MONITOR, cmd_profiles_list,    NULL },
+        { "trunks.list",           "List loaded trunks and groups from route_table",  "show", CMD_L1_MONITOR, cmd_trunks_list,      NULL },
+        { "dialplan.show",         "List active dialplan rules",                      "show", CMD_L1_MONITOR, cmd_dialplan_show,    NULL },
     };
     for (size_t i = 0; i < sizeof(descs)/sizeof(descs[0]); ++i)
         cmd_register(reg, &descs[i]);

@@ -1998,17 +1998,17 @@ static int security_init(struct nsbc_ctx *ctx)
     if (creg) {
         const cmd_desc_t descs[] = {
             { "security.ban.list",  "list ban/watch entries [ip-substring]",
-              CMD_L1_MONITOR, cmd_ban_list,  NULL },
+              "security", CMD_L1_MONITOR, cmd_ban_list,  NULL },
             { "security.ban.unban", "unban ip (clear entry)",
-              CMD_L2_ADMIN,   cmd_ban_unban, NULL },
+              "security", CMD_L2_ADMIN,   cmd_ban_unban, NULL },
             { "security.ban.clear", "clear whole ban table",
-              CMD_L2_ADMIN,   cmd_ban_clear, NULL },
+              "security", CMD_L2_ADMIN,   cmd_ban_clear, NULL },
             { "security.blacklist.list",   "list static blacklist (cidr+ua)",
-              CMD_L1_MONITOR, cmd_bl_list,   NULL },
+              "security", CMD_L1_MONITOR, cmd_bl_list,   NULL },
             { "security.blacklist.reload", "reload static blacklist from JSON (Web push)",
-              CMD_L2_ADMIN,   cmd_bl_reload, NULL },
+              "security", CMD_L2_ADMIN,   cmd_bl_reload, NULL },
             { "security.cfg.reload",       "reload fail2ban config from YAML",
-              CMD_L2_ADMIN,   cmd_cfg_reload, ctx },
+              "security", CMD_L2_ADMIN,   cmd_cfg_reload, ctx },
         };
         for (size_t i = 0; i < sizeof(descs) / sizeof(descs[0]); ++i)
             log_info("security", "cmd_register('%s') rc=%d", descs[i].name,

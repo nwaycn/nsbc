@@ -1843,11 +1843,11 @@ void obs_core_commands_register(cmd_reg_t *reg, nsbc_ctx_t *ctx)
     if (!reg) return;
     cmd_desc_t descs[] = {
         { "mod.load",   "动态加载 mod_<name>.so（L2，审计）",
-          CMD_L2_ADMIN, cmd_mod_load, ctx },
+          "mod", CMD_L2_ADMIN, cmd_mod_load, ctx },
         { "mod.unload", "stop + fini + dlclose 模块（L2，审计）",
-          CMD_L2_ADMIN, cmd_mod_unload, ctx },
+          "mod", CMD_L2_ADMIN, cmd_mod_unload, ctx },
         { "mod.reload", "unload + load + init + start 一键热更（L2，审计）",
-          CMD_L2_ADMIN, cmd_mod_reload, ctx },
+          "mod", CMD_L2_ADMIN, cmd_mod_reload, ctx },
     };
     for (size_t i = 0; i < sizeof(descs) / sizeof(descs[0]); ++i) {
         int rc = cmd_register(reg, &descs[i]);
