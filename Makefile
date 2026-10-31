@@ -296,15 +296,11 @@ endif
 
 # ================================================================
 # dynamic module build rule: each mod_xxx.so independently built with -shared -fPIC
-# MOD_SRC_xxx variables from configure specify source paths (falls back to find by default)
-# $* stem is mod_billing -> strip prefix mod_ -> billing to build MOD_SRC_ variable name
 #
-# only ai_dialog module needs cURL —— match by MOD_STEM:
-#   is ai_dialog and NSBC_WITH_CURL=1 -> pkg-config libcurl + -DHAVE_REAL_ASR_TTS
-#   other modules don't get curl headers / -lcurl (avoid all .so depending on libcurl.so)
+# 关键：pattern rule 里不能用 ifeq ($(MOD_STEM),xxx) —— $* 在解析阶段还没绑定，
+# ifeq 永远求值为 false。用 target-specific variable 给每个模块注入额外 flags。
 # ================================================================
 ifeq ($(NSBC_WITH_DLOPEN),1)
-MOD_STEM = $(subst mod_,,$*)
 
 ifeq ($(NSBC_WITH_CURL),1)
 AI_DIALOG_LDLIBS   := $(shell pkg-config --libs libcurl 2>/dev/null)
@@ -314,34 +310,27 @@ AI_DIALOG_LDLIBS   :=
 AI_DIALOG_CPPFLAGS :=
 endif
 
-# only ai_dialog module gets curl flag
-# only av module gets FFmpeg LDLIBS (configure sets AV_LDLIBS when FFmpeg detected)
-# only codecs module gets bcg729 compatibility flag (third-party code has warnings)
+# ---- per-module extra flags（target-specific variable）----
+$(BUILD)/mod/mod_av.so: MOD_EXTRA_LDLIBS = $(AV_LDLIBS) \
+    -Wl,-rpath,$(shell pkg-config --variable=libdir libavcodec 2>/dev/null || echo /usr/lib/x86_64-linux-gnu)
+$(BUILD)/mod/mod_ai_dialog.so: MOD_EXTRA_LDLIBS   = $(AI_DIALOG_LDLIBS)
+$(BUILD)/mod/mod_ai_dialog.so: MOD_EXTRA_CPPFLAGS = $(AI_DIALOG_CPPFLAGS)
+$(BUILD)/mod/mod_codecs.so: MOD_EXTRA_CFLAGS     = -Wno-error -Wno-unused-parameter -Wno-maybe-uninitialized
+
+# ---- defaults ----
+$(BUILD)/mod/%.so: MOD_EXTRA_LDLIBS   ?=
+$(BUILD)/mod/%.so: MOD_EXTRA_CPPFLAGS ?=
+$(BUILD)/mod/%.so: MOD_EXTRA_CFLAGS   ?=
+
+# ---- pattern rule ----
 $(BUILD)/mod/%.so:
 	@mkdir -p $(dir $@)
 	@echo "  MOD $@"
-ifeq ($(MOD_STEM),ai_dialog)
 	$(CC) -shared -fPIC -fvisibility=hidden \
-	      $(CFLAGS) $(CPPFLAGS) $(AI_DIALOG_CPPFLAGS) -o $@ \
-	      $(MOD_SRC_$(MOD_STEM)) \
-	      $(LDLIBS) $(AI_DIALOG_LDLIBS)
-else ifeq ($(MOD_STEM),av)
-	$(CC) -shared -fPIC -fvisibility=hidden \
-	      $(CFLAGS) $(CPPFLAGS) -o $@ \
-	      $(MOD_SRC_$(MOD_STEM)) \
-	      $(LDLIBS) $(AV_LDLIBS)
-else ifeq ($(MOD_STEM),codecs)
-	$(CC) -shared -fPIC -fvisibility=hidden \
-	      $(CFLAGS) -Wno-error -Wno-unused-parameter -Wno-maybe-uninitialized \
-	      $(CPPFLAGS) -o $@ \
-	      $(MOD_SRC_$(MOD_STEM)) \
-	      $(LDLIBS)
-else
-	$(CC) -shared -fPIC -fvisibility=hidden \
-	      $(CFLAGS) $(CPPFLAGS) -o $@ \
-	      $(MOD_SRC_$(MOD_STEM)) \
-	      $(LDLIBS)
-endif
+	      $(CFLAGS) $(MOD_EXTRA_CFLAGS) $(CPPFLAGS) $(MOD_EXTRA_CPPFLAGS) \
+	      -o $@ \
+	      $(MOD_SRC_$(subst mod_,,$*)) \
+	      $(LDLIBS) $(MOD_EXTRA_LDLIBS)
 endif
 
 modules: $(DYNAMIC_SOS)
