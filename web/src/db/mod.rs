@@ -1597,7 +1597,30 @@ async fn connect_and_migrate(dsn: &str) -> Result<Pool<Any>, sqlx::Error> {
     // also journal_mode=MEMORY + synchronous=OFF to bypass sandbox file restrictions.
     // File databases also benefit (journal does not hit disk).
     if backend == "sqlite" {
-        builder = builder.max_connections(1);
+        builder = builder.max_connections(1)
+            // after_connect: 每个新连接建立时强制设 connection-level PRAGMA。
+            // sqlx 的 execute(pool) 每次 acquire 的 Acquire Guard 释放后被回收，
+            // 下一次 acquire 可能返回"不同"的 Acquire Guard（虽然底层只有一个连接）。
+            // busy_timeout / foreign_keys 都是 connection-level，
+            // 必须在 after_connect 里设才能对所有 Acquire Guard 生效。
+            // journal_mode=WAL 是 database-level（持久化到 sqlite_master），这里重复设无副作用。
+            .after_connect(move |mut conn, _meta| Box::pin(async move {
+                // after_connect: 每个 SQLite 新连接建立时强制执行 PRAGMA。
+                // busy_timeout / foreign_keys 是 connection-level，
+                // WAL 等是 database-level（持久化但重复设无害）。
+                // 注意 after_connect 回调里 conn 已经是 &mut AnyConnection，
+                // 直接 execute(&mut conn) 会 double &mut → 报 E0277。
+                // 用 as_mut() 不需要 — 直接 conn.execute() 就够了。
+                // &mut AnyConnection → reborrow 每次 execute() 不 move
+                let c: &mut sqlx::AnyConnection = &mut *conn;
+                let _ = sqlx::query("PRAGMA journal_mode=WAL").execute(&mut *c).await;
+                let _ = sqlx::query("PRAGMA synchronous=NORMAL").execute(&mut *c).await;
+                let _ = sqlx::query("PRAGMA busy_timeout=5000").execute(&mut *c).await;
+                let _ = sqlx::query("PRAGMA wal_autocheckpoint=1000").execute(&mut *c).await;
+                let _ = sqlx::query("PRAGMA auto_vacuum=INCREMENTAL").execute(&mut *c).await;
+                let _ = sqlx::query("PRAGMA foreign_keys=ON").execute(&mut *c).await;
+                Ok::<(), sqlx::Error>(())
+            }));
     } else {
         // PostgreSQL/MySQL: allow tuning via NSBC_DB_POOL_MAX env var; default sqlx = 10
         if let Ok(v) = std::env::var("NSBC_DB_POOL_MAX") {
@@ -1614,10 +1637,8 @@ async fn connect_and_migrate(dsn: &str) -> Result<Pool<Any>, sqlx::Error> {
 
     let pool = builder.connect(dsn).await?;
 
-    if backend == "sqlite" {
-        sqlx::query("PRAGMA journal_mode=MEMORY").execute(&pool).await?;
-        sqlx::query("PRAGMA synchronous=OFF").execute(&pool).await?;
-    }
+    // SQLite PRAGMA 统一在 after_connect hook 里设（L1600-1622），
+    // 这里不再重复 — after_connect 是 connection-level PRAGMA 的唯一靠谱入口。
 
     run_migrations(&pool, backend).await?;
     Ok(pool)

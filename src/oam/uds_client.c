@@ -26,6 +26,7 @@
 #include "uDS_client.h"
 #include "log.h"
 #include "nsbc_common.h"
+#include "metric_reg.h"
 #include <cjson/cJSON.h>
 
 #include <errno.h>
@@ -92,6 +93,9 @@ typedef struct {
     /* 同步请求 */
     uds_reqslot_t   slots[UDS_REQ_SLOTS];
     volatile uint32_t ticket_seq;
+
+    /* 溢出丢弃计数（ring_put full 时 +1，暴露到 control.sock stats） */
+    volatile uint32_t ring_dropped;
 } uds_state_t;
 
 static uds_state_t g = {0};
@@ -456,6 +460,7 @@ static int ring_put(const char *kind, const char *json)
         llog(LOG_WARN, "uds", "ring full, dropping oldest");
         g.tail = (g.tail + 1) % UDS_RING_SIZE;
         g.count--;
+        __atomic_add_fetch(&g.ring_dropped, 1, __ATOMIC_RELAXED);
     }
     uds_slot_t *slot = &g.ring[g.head];
     snprintf(slot->kind, sizeof(slot->kind), "%s", kind);
@@ -572,6 +577,14 @@ int uds_request(const char *cmd_json, int timeout_ms,
  * 生命周期
  * ======================================================================*/
 
+/* OBS 自埋点：UDS ring overflow render —— ring_put full 时丢弃的条数 */
+static int r_uds_ring(char *b, size_t cap, void *ud)
+{
+    (void)ud;
+    uint32_t dropped = __atomic_load_n(&g.ring_dropped, __ATOMIC_RELAXED);
+    return snprintf(b, cap, "nsbc_uds_ring_dropped %u\n", dropped);
+}
+
 int uds_client_init(const char *sock_path)
 {
     const char *p = sock_path ? sock_path : uds_default_sock_path();
@@ -595,6 +608,11 @@ int uds_client_init(const char *sock_path)
     }
     g.fd = -1;
     g.ticket_seq = 0;
+
+    /* 注册 UDS ring overflow metric（暴露到 control.sock stats + /metrics） */
+    metric_source_register("nsbc_uds_ring_dropped",
+                           "UDS ring buffer overflow drops (oldest evicted)",
+                           r_uds_ring, NULL);
     return NSBC_OK;
 }
 
