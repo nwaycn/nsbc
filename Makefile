@@ -335,7 +335,11 @@ endif
 
 modules: $(DYNAMIC_SOS)
 
-$(TARGET): $(OBJS) $(MAIN_OBJ) | $(DYNAMIC_SOS)
+ifeq ($(NSBC_WITH_DLOPEN),1)
+$(TARGET): $(OBJS) $(MAIN_OBJ) | $(DYNAMIC_SOS) $(BUILD)/mod/mod.load
+else
+$(TARGET): $(OBJS) $(MAIN_OBJ)
+endif
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 	cp -f $@ .
 	$(POST_BUILD_COPY)
@@ -358,6 +362,7 @@ $(CLI_OBJ): $(CLI_SRC)
 $(CLI_TARGET): $(CLI_OBJ)
 	$(CC) $(LDFLAGS) -o $@ $^ $(CLI_LDLIBS)
 	cp -f $@ .
+
 
 $(BUILD)/3rd/cjson/cJSON.o: CPPFLAGS += -I3rd/include/cjson
 $(BUILD)/3rd/cjson/cJSON.o: CFLAGS += -Wno-error
