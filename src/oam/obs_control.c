@@ -1172,28 +1172,99 @@ static void dispatch(ctl_conn_t *c, char *line)
             }
         }
     } else if (strcmp(line, "show") == 0 && strcmp(arg, "codecs") == 0) {
-        /* ---- show codecs：codec_registry 已注册条目数（Phase 5）----
+        /* ---- show codecs：codec_registry 已注册条目（v0.5.0 升级）----
          *
-         * 输出格式：
-         *   codecs=N
-         *     g711a PT=8 rate=8000 ch=1 ptime=20ms
-         *     g711u PT=0 rate=8000 ch=1 ptime=20ms
-         *     g729  PT=18 rate=8000 ch=1 ptime=20ms
-         *     ...
+         * 输出格式（分音频 / 视频，表格对齐）：
+         *   codecs=N (audio=M, video=K)
+         *   --- Audio Codecs ---
+         *   NAME          PT   RATE   CH   PTIME   DEC   ENC   SOURCE
+         *   g711a          8    8000    1    20ms    ✓     ✓     built-in
+         *   g711u          0    8000    1    20ms    ✓     ✓     built-in
+         *   g729          18    8000    1    20ms    ✓     ✓     bcg729
+         *   g722           9   16000    1    20ms    ✓     ✓     FFmpeg
+         *   opus          96   48000    1    20ms    ✓     ✓     FFmpeg
+         *   --- Video Codecs ---
+         *   NAME          PT   RATE   CH   PTIME   DEC   ENC   SOURCE
+         *   h264          96   90000    0     0ms    ✓     ✓     FFmpeg
          */
         unsigned total = codec_registry_count();
-        ctl_printf(c, "codecs=%u\n", total);
+        unsigned aud_n = 0, vid_n = 0;
 
-        if (total > 0) {
-            /* 直接遍历 codec_registry（g_ops 数组按 codec_id 索引）*/
+        /* Pass 1: count audio vs video */
+        for (int i = 1; i < CODEC__MAX; i++) {
+            const codec_ops_t *ops = codec_registry_find((codec_id_t)i);
+            if (!ops) continue;
+            if (ops->id == CODEC_H264 || ops->id == CODEC_VP8 || ops->id == CODEC_VP9)
+                vid_n++;
+            else
+                aud_n++;
+        }
+
+        ctl_printf(c, "codecs=%u (audio=%u, video=%u)\n", total, aud_n, vid_n);
+
+        if (total == 0) {
+            ctl_printf(c, "  (no codecs registered — mod_codecs/mod_av may not be loaded)\n");
+        }
+
+        /* Audio pass */
+        if (aud_n > 0) {
+            const char *src;
+            ctl_printf(c, "\n--- Audio Codecs ---\n");
+            ctl_printf(c, "%-16s %4s %7s %4s %7s %5s %5s %s\n",
+                       "NAME", "PT", "RATE", "CH", "PTIME", "DEC", "ENC", "SOURCE");
             for (int i = 1; i < CODEC__MAX; i++) {
                 const codec_ops_t *ops = codec_registry_find((codec_id_t)i);
-                if (ops) {
-                    ctl_printf(c,
-                        "  %s PT=%d rate=%d ch=%d ptime=%dms\n",
-                        ops->name, ops->default_pt, ops->clock_rate,
-                        ops->channels, ops->ptime_ms);
+                if (!ops) continue;
+                if (ops->id == CODEC_H264 || ops->id == CODEC_VP8 || ops->id == CODEC_VP9)
+                    continue;
+
+                /* classify source by codec_id range */
+                switch (ops->id) {
+                case CODEC_PCMA:
+                case CODEC_PCMU:
+                case CODEC_TELEPHONE_EVENT:
+                case CODEC_CN:
+                    src = "built-in"; break;
+                case CODEC_G729:
+                case CODEC_AMR_NB:
+                case CODEC_AMR_WB:
+                    src = "bcg729/vendor"; break;
+                default:
+                    src = "FFmpeg (mod_av)"; break;
                 }
+
+                ctl_printf(c, "%-16s %4d %7d %4d %5dms %5s %5s %s\n",
+                    ops->name,
+                    ops->default_pt,
+                    ops->clock_rate,
+                    ops->channels,
+                    ops->ptime_ms,
+                    ops->decode  ? "\xe2\x9c\x93" : "-",
+                    ops->encode  ? "\xe2\x9c\x93" : "-",
+                    src);
+            }
+        }
+
+        /* Video pass */
+        if (vid_n > 0) {
+            ctl_printf(c, "\n--- Video Codecs ---\n");
+            ctl_printf(c, "%-16s %4s %7s %4s %7s %5s %5s %s\n",
+                       "NAME", "PT", "RATE", "CH", "PTIME", "DEC", "ENC", "SOURCE");
+            for (int i = 1; i < CODEC__MAX; i++) {
+                const codec_ops_t *ops = codec_registry_find((codec_id_t)i);
+                if (!ops) continue;
+                if (ops->id != CODEC_H264 && ops->id != CODEC_VP8 && ops->id != CODEC_VP9)
+                    continue;
+
+                ctl_printf(c, "%-16s %4d %7d %4d %5dms %5s %5s %s\n",
+                    ops->name,
+                    ops->default_pt,
+                    ops->clock_rate,
+                    ops->channels,
+                    ops->ptime_ms,
+                    ops->decode  ? "\xe2\x9c\x93" : "-",
+                    ops->encode  ? "\xe2\x9c\x93" : "-",
+                    "FFmpeg (mod_av)");
             }
         }
     } else if (strcmp(line, "show") == 0 && strcmp(arg, "cdr_wal") == 0) {

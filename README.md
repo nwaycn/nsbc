@@ -56,9 +56,7 @@
   - [License](#license)
   - [Acknowledgements](#acknowledgements)
 
-> In-depth docs: [Architecture Reference](docs/architecture.md) ·
-> [Call-Flow Reference (SIP & WebRTC)](docs/call-flows.md) ·
-> [User Guide](docs/user-guide.md)
+> In-depth docs: **[Cookbook](docs/cookbook.md)** (operation recipes, dialplan patterns, control socket command reference) · [Architecture Reference](docs/architecture.md) · [Call-Flow Reference (SIP & WebRTC)](docs/call-flows.md) · [User Guide](docs/user-guide.md)
 
 ---
 
