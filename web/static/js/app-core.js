@@ -980,7 +980,7 @@ const app = createApp({
       try {
         const res = await fetch('/api/v1/auth/change-password', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + (localStorage.getItem('nsbc_token') || '') },
+          headers: { ...API.headers(true), 'Authorization': 'Bearer ' + (localStorage.getItem('nsbc_token') || '') },
           body: JSON.stringify({ old_password: pwdForm.old_password, new_password: pwdForm.new_password }),
         });
         const data = await res.json().catch(() => ({}));
