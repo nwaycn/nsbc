@@ -942,6 +942,54 @@ const app = createApp({
     }
     function logout() { localStorage.clear(); auth.token = null; location.hash = '#/login'; }
 
+    // ===== Change Password =====
+    const showPwdDialog = ref(false);
+    const pwdLoading = ref(false);
+    const pwdFormRef = ref(null);
+    const pwdForm = reactive({
+      old_password: '',
+      new_password: '',
+      confirm_password: '',
+    });
+    const pwdRules = {
+      old_password: [{ required: true, message: () => t('Please enter current password'), trigger: 'blur' }],
+      new_password: [
+        { required: true, message: () => t('Please enter new password'), trigger: 'blur' },
+        { min: 6, message: () => t('Password must be at least 6 characters'), trigger: 'blur' },
+      ],
+      confirm_password: [
+        { required: true, message: () => t('Please confirm new password'), trigger: 'blur' },
+        { validator: (_, v, cb) => v === pwdForm.new_password ? cb() : cb(new Error(t('Passwords do not match'))), trigger: 'blur' },
+      ],
+    };
+    async function submitChangePassword() {
+      if (!pwdFormRef.value) return;
+      try {
+        await pwdFormRef.value.validate();
+      } catch { return; }
+      pwdLoading.value = true;
+      try {
+        const res = await fetch('/api/v1/auth/change-password', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + (localStorage.getItem('nsbc_token') || '') },
+          body: JSON.stringify({ old_password: pwdForm.old_password, new_password: pwdForm.new_password }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) {
+          ElementPlus.ElMessage.success(t('Password changed. Please log in again.'));
+          showPwdDialog.value = false;
+          pwdForm.old_password = ''; pwdForm.new_password = ''; pwdForm.confirm_password = '';
+          setTimeout(logout, 800);  // 安全：密码改了后强制重新登录
+        } else {
+          ElementPlus.ElMessage.error(data.detail || t('Password change failed'));
+        }
+      } catch (e) {
+        ElementPlus.ElMessage.error(t('Network error') + ': ' + e.message);
+      } finally {
+        pwdLoading.value = false;
+      }
+    }
+
     refreshCaptcha();
     window.__auth = auth;  // 暴露给 API 401 handler 使用
 
@@ -951,7 +999,8 @@ const app = createApp({
     if (auth.token) fetchTenants();
 
     return { auth, loginForm, captchaSvg, clientIp, route, menuItems, login, logout, refreshCaptcha,
-             tenantId, tenantOptions, tenantLoading, changeTenant, fetchTenants };
+             tenantId, tenantOptions, tenantLoading, changeTenant, fetchTenants,
+             showPwdDialog, pwdLoading, pwdFormRef, pwdForm, pwdRules, submitChangePassword };
   },
 });
 

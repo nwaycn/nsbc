@@ -158,9 +158,15 @@
           </span>
         </div>
         <div class="flex items-center justify-between">
-          <a href="#/login" @click.prevent="logout" class="hover:text-red-400 transition-colors">
-            <i class="fa-solid fa-right-from-bracket mr-1"></i>{{ t('Logout') }}
-          </a>
+          <div class="flex items-center gap-3">
+            <a href="#" @click.prevent="showPwdDialog = true" class="hover:text-blue-400 transition-colors">
+              <i class="fa-solid fa-key mr-1"></i>{{ t('Change Password') }}
+            </a>
+            <span class="text-slate-600">|</span>
+            <a href="#/login" @click.prevent="logout" class="hover:text-red-400 transition-colors">
+              <i class="fa-solid fa-right-from-bracket mr-1"></i>{{ t('Logout') }}
+            </a>
+          </div>
           <span class="flex items-center gap-1">
             <button @click="setLang('en')" :class="getLang() === 'en' ? 'text-blue-400 font-semibold' : 'text-slate-500 hover:text-slate-300'" class="transition-colors">EN</button>
             <span class="text-slate-600">|</span>
@@ -210,6 +216,27 @@
     </main>
   </div>
 </div>
+
+<!-- Change Password Dialog -->
+<el-dialog v-model="showPwdDialog" :title="t('Change Password')" width="420px" :close-on-click-modal="false">
+  <el-form :model="pwdForm" :rules="pwdRules" ref="pwdFormRef" label-width="110px">
+    <el-form-item :label="t('Current Password')" prop="old_password">
+      <el-input v-model="pwdForm.old_password" type="password" show-password autocomplete="current-password"></el-input>
+    </el-form-item>
+    <el-form-item :label="t('New Password')" prop="new_password">
+      <el-input v-model="pwdForm.new_password" type="password" show-password autocomplete="new-password"></el-input>
+    </el-form-item>
+    <el-form-item :label="t('Confirm New Password')" prop="confirm_password">
+      <el-input v-model="pwdForm.confirm_password" type="password" show-password autocomplete="new-password"></el-input>
+    </el-form-item>
+  </el-form>
+  <template #footer>
+    <el-button @click="showPwdDialog = false">{{ t('Cancel') }}</el-button>
+    <el-button type="primary" :loading="pwdLoading" @click="submitChangePassword">
+      {{ t('Confirm') }}
+    </el-button>
+  </template>
+</el-dialog>
 
 <!-- 应用核心（API、编辑器、工厂、App 创建） -->
 <script src="js/app-core.js?v=20261023d"></script>
