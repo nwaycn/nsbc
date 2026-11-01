@@ -18,9 +18,11 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::AtomicU64;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::AppState;
-use crate::coreclient::CoreApi;
+use crate::coreclient::{CoreApi, CoreError};
 
 /// Extension sync DTO: DB Extension → C ext_table_reload_json.
 /// Password never leaves Web side (C side only needs HA1 for Digest verification).
@@ -296,11 +298,44 @@ async fn snapshot<C: CoreApi + Clone + Send + Sync>(
     }
 }
 
+/// Global cooldown state — when core is completely unreachable (Connect refused),
+/// all kinds skip retries and bail fast. Next periodic cycle in 60s naturally retries.
+static CORE_DOWN_COOLDOWN: AtomicU64 = AtomicU64::new(0);
+
+/// Is the core currently in "known dead" cooldown? Returns true if last Connect failure
+/// was within the last 30 seconds.
+fn core_in_cooldown() -> bool {
+    let cooldown_until = CORE_DOWN_COOLDOWN.load(std::sync::atomic::Ordering::Relaxed);
+    if cooldown_until == 0 { return false; }
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    now_ms < cooldown_until
+}
+
+/// Mark core as unreachable: set a 30s cooldown so subsequent kinds bail fast.
+fn mark_core_down() {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    CORE_DOWN_COOLDOWN.store(now_ms + 15_000, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Single-kind push: snapshot → CoreApi.reload_*; retry on failure with [500ms,1s,2s,4s,8s].
+/// Special case: if core is completely unreachable (Connection refused / Connect error),
+/// bail out after the FIRST attempt and mark a global 30s cooldown — no point retrying
+/// 84 times across 14 kinds when nothing is listening on that UDS socket.
 async fn push_kind<C: CoreApi + Clone + Send + Sync>(
     st: &Arc<AppState<C>>,
     kind: Kind,
 ) -> Result<(), String> {
+    // If core is in cooldown, bail immediately — save CPU and disk I/O
+    if core_in_cooldown() {
+        return Err("core unreachable (cooldown)".into());
+    }
+
     const DELAYS_MS: [u64; 5] = [500, 1_000, 2_000, 4_000, 8_000];
 
     for attempt in 0..=DELAYS_MS.len() {
@@ -335,9 +370,31 @@ async fn push_kind<C: CoreApi + Clone + Send + Sync>(
         match r {
             Ok(()) => {
                 tracing::info!(kind = kind.name(), count = n, attempt, "pushed to core");
+                // Success clears any cooldown from earlier failures
+                CORE_DOWN_COOLDOWN.store(0, std::sync::atomic::Ordering::Relaxed);
                 return Ok(());
             }
             Err(e) => {
+                // ★ Global cooldown on ANY CoreError at attempt==0.
+                // Why? Because CoreError means the core channel itself is broken
+                // (Connect refused, command unknown, timeout, I/O error, core rejected).
+                // Retrying 6 times per kind × 14 kinds = 84 wasted round trips → CPU spike.
+                // Cooldown 15s; periodic push (60s) naturally resumes after it expires.
+                if attempt == 0 {
+                    let reason = match &e {
+                        CoreError::Connect(_)     => "connect refused",
+                        CoreError::CoreRejected(_)=> "command rejected",
+                        CoreError::Timeout        => "timeout",
+                        CoreError::Io(_)          => "io error",
+                        CoreError::NotFound(_)    => "notfound (unexpected for reload)",
+                        CoreError::Protocol(_)   => "protocol error",
+                        CoreError::Unsupported(_)=> "unsupported",
+                    };
+                    tracing::warn!(kind = kind.name(), error = ?e,
+                        "core channel broken ({reason}) — entering 15s cooldown, skipping remaining kinds");
+                    mark_core_down();
+                    return Err(format!("core channel broken ({reason}): {e:?}"));
+                }
                 tracing::warn!(kind = kind.name(), attempt, error = ?e, "reload cmd failed");
                 if attempt == DELAYS_MS.len() {
                     return Err(format!("reload failed after retries: {e:?}"));
@@ -439,7 +496,14 @@ pub fn spawn_periodic_push<C: CoreApi + Clone + Send + Sync + 'static>(
             tick.tick().await;
             for kind in Kind::ALL {
                 if let Err(e) = push_kind(&st, kind).await {
-                    tracing::warn!(kind = kind.name(), error = %e, "periodic push failed");
+                    // Cooldown bail is noisy when core is down — debug only.
+                    // Real push failures (attempted and failed) stay WARN.
+                    let is_cooldown = e.contains("cooldown") || e.contains("channel broken");
+                    if is_cooldown {
+                        tracing::debug!(kind = kind.name(), error = %e, "periodic push skipped (cooldown)");
+                    } else {
+                        tracing::warn!(kind = kind.name(), error = %e, "periodic push failed");
+                    }
                 }
             }
         }

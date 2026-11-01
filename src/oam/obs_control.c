@@ -161,6 +161,7 @@ static void ctl_help(ctl_conn_t *c)
         "  show apps            registered dialplan applications (answer/ai/bridge/...)\n"
         "  show rates           billing rate table (L0)\n"
         "  show balances        account balances (L0)\n"
+        "  show resv            active reservations (L4v2 tick debug, L0)\n"
         "  show transcode       active media bridge sessions (L0)\n"
         "  rate.reload <json>   full rate table swap from DB (L1, audited)\n"
         "  rate.upsert <json>   single rate entry upsert (L1, audited)\n"
@@ -420,6 +421,28 @@ static int acct_show_cb(const char *key, int64_t balance,
     ctl_printf(c,
         "account key=%s balance_uc=%lld reserved_uc=%lld credit_limit_uc=%lld\n",
         key, (long long)balance, (long long)reserved, (long long)credit_limit);
+    return NSBC_OK;
+}
+
+/* show resv 回调 — 活跃 reservation 实时观察 */
+static int resv_show_cb(int used, uint64_t resv_id,
+                        const char *call_id, const char *account_key,
+                        int64_t billsec, int64_t reserved_uc,
+                        const char *called, int64_t trunk_id,
+                        void *ud)
+{
+    ctl_conn_t *c = (ctl_conn_t *)ud;
+    if (!c) return NSBC_INVAL;
+    ctl_printf(c,
+        "resv id=%llu call=%s acct=%s billsec=%lld reserved_uc=%lld (~%.2f yuan) called=%s trunk_id=%lld\n",
+        (unsigned long long)resv_id,
+        call_id ? call_id : "-",
+        account_key ? account_key : "-",
+        (long long)billsec, (long long)reserved_uc,
+        (double)reserved_uc / 1000000.0,
+        called ? called : "-",
+        (long long)trunk_id);
+    (void)used;
     return NSBC_OK;
 }
 
@@ -913,6 +936,22 @@ static void dispatch(ctl_conn_t *c, char *line)
         *--e = '\0';
     if (*line == '\0')
         return;
+
+    /* ---- 临时诊断：打印收到的原始命令行 ----
+     * 仅在非 show 命令时打，避免日志洪水。arg 长度截断到 200 字节。*/
+    {
+        const char *arg_preview = strchr(line, ' ');
+        int arg_len = arg_preview ? (int)(strlen(line) - (arg_preview - line) - 1) : 0;
+        char preview[21] = {0};
+        if (arg_len > 0) {
+            int preview_len = arg_len < 20 ? arg_len : 20;
+            memcpy(preview, arg_preview + 1, preview_len);
+            preview[preview_len] = '\0';
+        }
+        llog(LOG_INFO, "oam", "dispatch raw: cmd='%s' arg_len=%d arg_head='%s...' g_cmd_reg=%p",
+             line, arg_len, preview, (void*)g_cmd_reg);
+    }
+
     char *arg = line;
     while (*arg && *arg != ' ')
         ++arg;
@@ -1069,6 +1108,22 @@ static void dispatch(ctl_conn_t *c, char *line)
             if (total > 0) {
                 struct { ctl_conn_t *c; } ud = { c };
                 bill_foreach_account(bil, (acct_iter_cb)acct_show_cb, &ud);
+            }
+        }
+    } else if (strcmp(line, "show") == 0 &&
+               strcmp(arg, "resv") == 0) {
+        /* ---- show resv：活跃 reservation 实时观察（OAM L0 只读）----
+         * 运维看 L4v2/L4v3 tick 行为：billsec 实时秒数、reserved_uc 当前预占、
+         * called/trunk_id 精确费率查找输入、acct 账户归属。*/
+        billing_t *bil = g_ctx ? (billing_t *)g_ctx->billing : NULL;
+        if (!bil) {
+            ctl_printf(c, "ERR billing not initialized\n");
+        } else {
+            int total = bill_reservation_count(bil);
+            ctl_printf(c, "reservations=%d (active=%d)\n", total, total);
+            if (total > 0) {
+                struct { ctl_conn_t *c; } ud = { c };
+                bill_foreach_reservation(bil, (resv_iter_cb)resv_show_cb, &ud);
             }
         }
     } else if (strcmp(line, "show") == 0 &&
@@ -1460,6 +1515,21 @@ static void dispatch(ctl_conn_t *c, char *line)
             ctl_printf(c, "ERR no valid entries\n");
         }
     rpe_done:
+
+    } else if (strcmp(line, "trunk_map.reload") == 0) {
+        /* ---- trunk_map.reload <json>：trunk name → trunk_id 映射推入核心（Phase 1.5 L1）----
+         * 格式: [{"name":"china_unicom","id":1},{"name":"telecom","id":2}]
+         * CDR ev->trunk 是字符串，rate_lookup_stair 要 int64 trunk_id —— 这里推映射表 */
+        billing_t *bil = g_ctx ? (billing_t *)g_ctx->billing : NULL;
+        if (!arg || !*arg) { ctl_printf(c, "ERR missing json array\n"); goto tm_done; }
+        if (!bil) { ctl_printf(c, "ERR billing not initialized\n"); goto tm_done; }
+        if (trunk_map_reload_json(bil, arg) == NSBC_OK) {
+            ctl_printf(c, "OK trunk_map.reload loaded\n");
+            log_audit("oam", "trunk_map.reload", "ok");
+        } else {
+            ctl_printf(c, "ERR trunk_map.reload failed\n");
+        }
+    tm_done:
 
     } else if (strcmp(line, "rate.upsert") == 0) {
         /* ---- rate.upsert <json>：单条费率 upsert（REQ-OAM-009 L1）---- */

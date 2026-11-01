@@ -22,7 +22,9 @@
 #include "metric_reg.h"
 #include "module.h"
 #include "nsbc_atomic.h"
-/* rate_limit.h / str_util.h — 不存在，billing.c 未用到这些符号 */
+#include "uDS_client.h"    /* G1: uds_push — END settle 后推 billing_settle 给 Rust 侧 */
+#include <cjson/cJSON.h>   /* G1: cJSON 构建 billing_settle payload */
+#include "cfg.h"           /* Phase 2: cfg_get_bool / cfg_event_fn 热重载回调 */
 
 #ifdef __cplusplus
 extern "C" {
@@ -35,8 +37,13 @@ extern "C" {
 
 /* ---- 模块全局（billing.c 私有） ---- */
 static cdr_sink_t   *g_sink   = NULL;  /* CDR sink（emit + flush 入口）*/
-static billing_t    *g_billing = NULL; /* 费率/余额引擎 */
+static billing_t    *g_billing = NULL; /* 费率/余额引擎（init 时创建；reload 后是悬挂指针，勿直接读！）*/
+static nsbc_ctx_t   *g_ctx    = NULL;  /* 对 nsbc_ctx 的弱引用（RCU reload 后 ctx->billing 才是真相）*/
 static cdr_wal_t    *g_wal    = NULL;  /* Phase 6: WAL 兜底（比 spool 强：有 CRC + 文件头 + replay truncate）*/
+
+/* ★ 统一入口：所有读 g_billing 的地方必须调 B() —— RCU reload 后
+ * ctx->billing 是唯一真相；g_billing 在 rate.reload 后指向已 destroy 的旧对象 */
+static inline billing_t *B(void) { return g_ctx ? g_ctx->billing : g_billing; }
 
 /* persist_batch 回调：先试 DBAL dbal_cdr_batch；失败降级 cdr_wal；再失败才 spool。
  *
@@ -117,8 +124,9 @@ static void billing_cdr_cb(void *ud, const cdr_event_t *ev)
     if (!sink || !ev) return;
     cdr_sink_emit(sink, ev);  /* 原有 CDR 落库 —— 始终先做 */
 
-    /* Phase 1: reserve / settle 计费（只有 billing 初始化后才做）*/
-    if (!g_billing) return;
+    /* Phase 2: billing.enabled 开关 —— 关闭时跳过所有 reserve/settle/pre-auth */
+    billing_t *bl = B();
+    if (!bl || !bill_is_enabled(bl)) return;
 
     char acct_key[128];
     billing_make_key(ev, acct_key, sizeof(acct_key));
@@ -135,7 +143,12 @@ static void billing_cdr_cb(void *ud, const cdr_event_t *ev)
         char hhmm[8];
         billing_now_hhmm(hhmm, sizeof(hhmm));
 
-        int rc = rate_lookup_stair(g_billing, ev->to, 0, hhmm, NULL,
+        /* Phase 1.5 L1: trunk_name → trunk_id（没映射时传 0 表示"不限"兜底）*/
+        int64_t tr_id = 0;
+        if (ev->trunk[0] && bl)
+            tr_id = billing_lookup_trunk_id(bl, ev->trunk);
+
+        int rc = rate_lookup_stair(bl, ev->to, tr_id, hhmm, NULL,
                                    tiers, &n_tiers, 8);
         if (rc != NSBC_OK || n_tiers == 0) {
             log_warn("billing", "ANSWER %s rate_lookup_stair rc=%d — no reserve",
@@ -152,8 +165,11 @@ static void billing_cdr_cb(void *ud, const cdr_event_t *ev)
         reserve = reserve * 2 + tiers[0].connect_fee_uc;
 
         uint64_t resv_id = 0;
-        rc = bill_reserve(g_billing, acct_key, reserve, &resv_id);
+        rc = bill_reserve(bl, acct_key, reserve, ev->call_id, &resv_id);
         if (rc == NSBC_OK) {
+            /* Phase 2 L4: 成功后补填 called/trunk_id —— tick reserve bump 精确费率查找需要 */
+            bill_resv_fill(bl, resv_id, ev->to, tr_id);
+
             log_info("billing", "ANSWER %s reserved=%lld uc acct=%s resv_id=%llu",
                      ev->call_id, (long long)reserve, acct_key, (unsigned long long)resv_id);
         } else {
@@ -173,7 +189,12 @@ static void billing_cdr_cb(void *ud, const cdr_event_t *ev)
         char hhmm[8];
         billing_now_hhmm(hhmm, sizeof(hhmm));
 
-        int rc = rate_lookup_stair(g_billing, ev->to, 0, hhmm, NULL,
+        /* Phase 1.5 L1: 同 ANSWER — 用 trunk_id 做精确费率匹配 */
+        int64_t tr_id = 0;
+        if (ev->trunk[0] && bl)
+            tr_id = billing_lookup_trunk_id(bl, ev->trunk);
+
+        int rc = rate_lookup_stair(bl, ev->to, tr_id, hhmm, NULL,
                                    tiers, &n_tiers, 8);
         if (rc != NSBC_OK || n_tiers == 0) {
             log_warn("billing", "END %s no rate match — no settle", ev->call_id);
@@ -184,12 +205,29 @@ static void billing_cdr_cb(void *ud, const cdr_event_t *ev)
         /* 实际费用 */
         int64_t charge = calc_stair_charge(tiers, n_tiers, ev->billsec);
 
-        /* settle 入参：account key + 实际费用 —— bill_settle 内部会找
-         * 该账户的所有 reservation 并多退少补。*/
-        rc = bill_settle(g_billing, acct_key, charge);
+        /* settle：按 call_id + acct_key 精确匹配 reservation —— 同账户多通话并发不会错乱 */
+        rc = bill_settle(bl, acct_key, ev->call_id, charge);
         if (rc == NSBC_OK) {
             log_info("billing", "END %s billsec=%u charge=%lld uc acct=%s settle=OK",
                      ev->call_id, ev->billsec, (long long)charge, acct_key);
+
+            /* G1: 推 billing_settle → Rust 侧 uds_server 收到后调 settle_billing() 写 DB 流水
+             * payload 契约与 web/src/uds_server.rs dispatch_push("billing_settle") 对齐 */
+            {
+                cJSON *p = cJSON_CreateObject();
+                cJSON_AddStringToObject(p, "account_key", acct_key);
+                cJSON_AddStringToObject(p, "call_id",     ev->call_id);
+                cJSON_AddNumberToObject(p, "charge_uc",   (double)(-charge));  /* 负数 = 扣费 */
+                cJSON_AddNumberToObject(p, "billsec",     (double)ev->billsec);
+                if (ev->tenant[0])  cJSON_AddStringToObject(p, "tenant",  ev->tenant);
+                if (ev->trunk[0])   cJSON_AddStringToObject(p, "trunk",   ev->trunk);
+                char *json = cJSON_PrintUnformatted(p);
+                cJSON_Delete(p);
+                if (json) {
+                    (void)uds_push("billing_settle", json);  /* 非阻塞，内部 ring 满了丢最旧 */
+                    free(json);
+                }
+            }
         } else {
             log_warn("billing", "END %s bill_settle rc=%d charge=%lld uc acct=%s",
                      ev->call_id, rc, (long long)charge, acct_key);
@@ -197,7 +235,7 @@ static void billing_cdr_cb(void *ud, const cdr_event_t *ev)
 
         /* 如果账户还有低额阈值，发告警 */
         int64_t bal = 0, resv = 0;
-        if (account_balance(g_billing, acct_key, &bal, &resv) == NSBC_OK) {
+        if (account_balance(bl, acct_key, &bal, &resv) == NSBC_OK) {
             if (bal < 0) {
                 log_warn("billing", "END %s account OVERDRAWN bal=%lld uc acct=%s",
                          ev->call_id, (long long)bal, acct_key);
@@ -221,6 +259,7 @@ static int billing_init(struct nsbc_ctx *ctx)
     int rc;
 
     if (ctx == NULL) return NSBC_INVAL;
+    g_ctx = ctx;  /* ★ 记住 ctx — RCU reload 后 ctx->billing 才是唯一真相 */
 
     /* Phase 6: 先构 WAL 路径（比 spool 新，replay 优先）*/
     if (ctx->data_dir && ctx->data_dir[0]) {
@@ -275,10 +314,19 @@ static int billing_init(struct nsbc_ctx *ctx)
         log_warn("billing", "bill_create failed rc=%d (OAM show rates/balances unavailable)", rc);
     } else {
         ctx->billing = g_billing;
+
+        /* Phase 2: 读 billing.enabled 全局开关（默认 false）*/
+        int enabled = 0;
+        if (ctx->cfg) {
+            cfg_get_bool(ctx->cfg, "billing.enabled", &enabled, NULL);
+        }
+        bill_set_enabled(g_billing, enabled);
     }
 
-    log_info("billing", "init OK (cdr_sink=%p billing=%p spool=%s)",
-             g_sink, g_billing, spool_path);
+    /* CDR hook 始终注册 —— billing_cdr_cb 内部已有 enabled guard
+     * （CDR 落库始终要做，只是 reserve/settle/pre-auth 在开关关闭时跳过）。*/
+    log_info("billing", "init OK (cdr_sink=%p billing=%p enabled=%d cdr_arc=%d)",
+             g_sink, g_billing, g_billing ? bill_is_enabled(g_billing) : 0, arc);
     return NSBC_OK;
 }
 
@@ -297,15 +345,15 @@ static void billing_fini(struct nsbc_ctx *ctx)
         cdr_wal_destroy(g_wal);
         g_wal = NULL;
     }
-    /* ctx->billing 是最终真相来源 —— rate.reload 会把它 RCU 替换成新对象，
-     * 同时 bill_destroy 旧对象（即最初的 g_billing），但 g_billing 不会同步置空。
-     * 因此 fini 必须以 ctx->billing 为准 destroy，然后置 g_billing = NULL 清悬挂指针。
-     * 如果从未 reload，ctx->billing == g_billing 是同一对象，只 destroy 一次。 */
+    /* ctx->billing 是唯一真相 —— rate.reload 在 obs_control.c 里直接写 ctx->billing = newb
+     * 然后 bill_destroy(旧对象)；B() 辅助函数优先返回 ctx->billing，g_billing 在 reload 后
+     * 成为悬挂指针但再也不会被任何热路径读到（所有读都走 B() / ctx->billing）。*/
     if (ctx != NULL && ctx->billing != NULL) {
         bill_destroy(ctx->billing);
         ctx->billing = NULL;
     }
     g_billing = NULL;  /* 清悬挂指针；不 destroy（已由 ctx->billing 覆盖） */
+    g_ctx = NULL;      /* ★ 清 ctx 弱引用 — 模块卸载后不再读 */
     if (ctx != NULL) {
         ctx->cdr_emit = NULL;
         ctx->cdr_ud = NULL;
@@ -313,6 +361,74 @@ static void billing_fini(struct nsbc_ctx *ctx)
 }
 
 NSBC_MOD0_CAT(billing, 1, MOD_L_FINAL, 0, MOD_CAT_BILLING, billing_init, billing_fini);
+
+/* =========================================================================
+ * Phase 2 L4+L5: billing_tick — 供 main.c ticker_main 周期性调用
+ *
+ * 职责：
+ *   1. 从 YAML 读 billing.enabled（每 ~3s，够快）→ 热重载生效
+ *   2. 调 billing_tick_internal → 遍历 resv[] + accts[] → OVERDRAWN 门闩
+ *   3. 释放 billing 锁后，对 kill_list 里的每个 call_id 调 b2b_terminate_callid
+ *
+ * 锁序安全：billing_tick_internal 返回时 billing 锁已释放；
+ *           b2b_terminate_callid 内部自己管理 shard_lock + call_lock，不碰 billing 锁。
+ * ========================================================================= */
+
+/* tick 节流：上次 tick 时刻 —— 每 3s 真正跑一次 */
+static uint64_t g_last_tick_ms = 0;
+#define BILL_TICK_INTERVAL_MS 3000
+
+int billing_tick(nsbc_ctx_t *ctx)
+{
+    if (!ctx) return NSBC_INVAL;
+
+    /* 节流 */
+    uint64_t now = nsbc_now_ms();
+    if (g_last_tick_ms && (now - g_last_tick_ms) < BILL_TICK_INTERVAL_MS)
+        return NSBC_OK;
+    g_last_tick_ms = now;
+
+    /* ★ 唯一真相：ctx->billing —— rate.reload RCU 换的就是这个
+     * g_billing 在 reload 后指向已 destroy 的旧对象，严禁在此处读！*/
+    billing_t *bl = ctx->billing;
+
+    /* 从 cfg 同步 enabled —— 热重载（control reload / config.set billing.enabled=true）后自动生效
+     * cfg_get_bool 只从内存 cfg 树读，极快，每 3s 一次零压力。 */
+    if (ctx->cfg && bl) {
+        int enabled = 0;
+        if (cfg_get_bool(ctx->cfg, "billing.enabled", &enabled, NULL) == NSBC_OK)
+            bill_set_enabled(bl, enabled);
+    }
+
+    if (!bl || !bill_is_enabled(bl))
+        return NSBC_OK;
+
+    /* 1. 遍历 resv + acct → OVERDRAWN kill_list */
+    char kill_list[256][40];
+    int kill_sz = 0;
+    int rc = billing_tick_internal(bl, kill_list, &kill_sz);
+    if (rc != NSBC_OK) return rc;
+    if (kill_sz == 0) return NSBC_OK;
+
+    /* 2. 释放 billing 锁后调 b2b_terminate_callid —— 锁序安全
+     *    cause_code=41 (NORMAL_CLEARING)；CDR END 后正常走 settle → billing_settle push → DB 落库。*/
+    b2b_core_t *co = (b2b_core_t *)ctx->b2b;
+    if (!co) {
+        log_warn("billing", "tick: no b2b core, can't kill %d OVERDRAWN calls", kill_sz);
+        return NSBC_OK;
+    }
+
+    for (int i = 0; i < kill_sz; ++i) {
+        int krc = b2b_terminate_callid(co, kill_list[i], strlen(kill_list[i]), 41);
+        if (krc == NSBC_OK) {
+            llog(LOG_INFO, "billing", "OVERDRAWN killed callid=%s", kill_list[i]);
+        } else {
+            llog(LOG_WARN, "billing", "OVERDRAWN kill failed callid=%s rc=%d",
+                 kill_list[i], krc);
+        }
+    }
+    return NSBC_OK;
+}
 
 /*
     Author:       李浩 (Li Hao)
