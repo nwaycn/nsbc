@@ -472,12 +472,21 @@ static int ring_put(const char *kind, const char *json)
     return NSBC_OK;
 }
 
-int uds_send_cdr(const char *json)       { return ring_put("cdr",      json); }
-int uds_send_register(const char *json)  { return ring_put("register", json); }
-int uds_send_runtime(const char *json)   { return ring_put("runtime",  json); }
-int uds_send_audit(const char *json)     { return ring_put("audit",    json); }
-int uds_send_session(const char *json)   { return ring_put("session",  json); }
-int uds_send_vad(const char *json)       { return ring_put("vad_event",json); }
+/* G1: 通用推送 API — 任意 kind（"cdr"/"billing_settle"/...），内部 ring 聚合异步发送。
+ * 现有 uds_send_xxx 全部调这里，保持向后兼容。 */
+int uds_push(const char *kind, const char *json)
+{
+    if (!kind || !json || !kind[0] || !g.started)
+        return NSBC_ERR;
+    return ring_put(kind, json);
+}
+
+int uds_send_cdr(const char *json)       { return uds_push("cdr",      json); }
+int uds_send_register(const char *json)  { return uds_push("register", json); }
+int uds_send_runtime(const char *json)   { return uds_push("runtime",  json); }
+int uds_send_audit(const char *json)     { return uds_push("audit",    json); }
+int uds_send_session(const char *json)   { return uds_push("session",  json); }
+int uds_send_vad(const char *json)       { return uds_push("vad_event",json); }
 
 int uds_flush_now(void)
 {

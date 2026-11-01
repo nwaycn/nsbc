@@ -8237,60 +8237,122 @@ pub async fn get_account(&self, id: i64) -> Result<Option<Account>, sqlx::Error>
         .bind(id).fetch_optional(pool).await
 }
 
+/// G1: 通过 account_key（如 "tenant:1:extension:1000"）查 account —— C 侧 END settle 推 billing_settle 时用
+pub async fn get_account_by_key(&self, account_key: &str) -> Result<Option<Account>, sqlx::Error> {
+    let Some(pool) = self.pool() else { return Ok(None); };
+    let backend = self.backend();
+    sqlx::query_as::<_, Account>(&fix_ph("SELECT * FROM accounts WHERE account_key = $1", backend))
+        .bind(account_key).fetch_optional(pool).await
+}
+
 pub async fn open_account(&self, c: AccountCreate) -> Result<Account, sqlx::Error> {
     let Some(pool) = self.pool() else {
         return Err(sqlx::Error::Configuration("NSBC_DB_DSN not set".into()));
     };
     let backend = self.backend();
-    let sql_with_ret = "INSERT INTO accounts (tenant_id, account_key, balance_uc, credit_limit_uc, description, account_type, rate_plan_id, low_threshold_uc) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *";
-    let is_mysql = backend == "mysql";
-    if is_mysql {
-        let sql = fix_ph(&strip_returning(sql_with_ret), backend);
-        sqlx::query(&sql)
-            .bind(c.tenant_id)
-            .bind(&c.account_key)
-            .bind(c.balance_uc)
-            .bind(c.credit_limit_uc)
-            .bind(&c.description)
-            .bind(&c.account_type)
-            .bind(c.rate_plan_id)
-            .bind(c.low_threshold_uc)
-            .execute(pool).await?;
-        let pick_sql = fix_ph("SELECT * FROM accounts WHERE id = LAST_INSERT_ID()", backend);
-        return sqlx::query_as::<_, Account>(&pick_sql).fetch_one(pool).await;
+    let mut tx = pool.begin().await?;
+
+    let account = {
+        let sql_with_ret = "INSERT INTO accounts (tenant_id, account_key, balance_uc, credit_limit_uc, description, account_type, rate_plan_id, low_threshold_uc) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *";
+        let is_mysql = backend == "mysql";
+        if is_mysql {
+            // MySQL 不支持 RETURNING：先 execute INSERT，再 SELECT LAST_INSERT_ID，都在同一个 Transaction 里
+            let plain_sql = fix_ph(&strip_returning(sql_with_ret), backend);
+            sqlx::query(&plain_sql)
+                .bind(c.tenant_id)
+                .bind(&c.account_key)
+                .bind(c.balance_uc)
+                .bind(c.credit_limit_uc)
+                .bind(&c.description)
+                .bind(&c.account_type)
+                .bind(c.rate_plan_id)
+                .bind(c.low_threshold_uc)
+                .execute(&mut *tx).await?;
+            let pick_sql = fix_ph("SELECT * FROM accounts WHERE id = LAST_INSERT_ID()", backend);
+            sqlx::query_as::<_, Account>(&pick_sql).fetch_one(&mut *tx).await?
+        } else {
+            // PostgreSQL / SQLite：RETURNING * 一步到位
+            let sql = fix_ph(sql_with_ret, backend);
+            sqlx::query_as::<_, Account>(&sql)
+                .bind(c.tenant_id)
+                .bind(&c.account_key)
+                .bind(c.balance_uc)
+                .bind(c.credit_limit_uc)
+                .bind(&c.description)
+                .bind(&c.account_type)
+                .bind(c.rate_plan_id)
+                .bind(c.low_threshold_uc)
+                .fetch_one(&mut *tx).await?
+        }
+    };
+
+    // G4: 开户 balance_uc > 0 → 写 tx_type="initial" 流水
+    if account.balance_uc > 0 {
+        let ts = match backend { "postgres" => "CAST(NOW() AS TEXT)", "mysql" => "CAST(CURRENT_TIMESTAMP(3) AS CHAR)", _ => "datetime('now')" };
+        let tx_sql = fix_ph(
+            &format!(
+                "INSERT INTO billing_transactions (account_id, call_id, tx_type, amount_uc, balance_after_uc, operator, remark, created_at) VALUES ($1, NULL, 'initial', $2, $3, NULL, $4, {ts})"
+            ),
+            backend
+        );
+        sqlx::query(&tx_sql)
+            .bind(account.id)
+            .bind(account.balance_uc)
+            .bind(account.balance_uc)
+            .bind("open account initial balance")
+            .execute(&mut *tx).await?;
     }
-    sqlx::query_as::<_, Account>(&fix_ph(sql_with_ret, backend))
-    .bind(c.tenant_id)
-    .bind(&c.account_key)
-    .bind(c.balance_uc)
-    .bind(c.credit_limit_uc)
-    .bind(&c.description)
-    .bind(&c.account_type)
-    .bind(c.rate_plan_id)
-    .bind(c.low_threshold_uc)
-    .fetch_one(pool).await
+
+    tx.commit().await?;
+    Ok(account)
 }
 
 pub async fn topup_account(&self, id: i64, delta_uc: i64) -> Result<Account, sqlx::Error> {
     let Some(pool) = self.pool() else { return Err(sqlx::Error::RowNotFound); };
     let backend = self.backend();
     let ts = match backend { "postgres" => "CAST(NOW() AS TEXT)", "mysql" => "CAST(CURRENT_TIMESTAMP(3) AS CHAR)", _ => "datetime('now')" };
-    let raw_sql = format!("UPDATE accounts SET balance_uc = balance_uc + $1, updated_at = {ts} WHERE id = $2 RETURNING *");
-    let is_mysql = backend == "mysql";
-    if is_mysql {
-        let plain_sql = fix_ph(&strip_returning(&raw_sql), backend);
-        sqlx::query(&plain_sql)
-            .bind(delta_uc)
-            .bind(id)
-            .execute(pool).await?;
-        let pick_sql = fix_ph("SELECT * FROM accounts WHERE id = $1", backend);
-        return sqlx::query_as::<_, Account>(&pick_sql).bind(id).fetch_one(pool).await;
-    }
-    let sql = fix_ph(&raw_sql, backend);
-    sqlx::query_as::<_, Account>(&sql)
-    .bind(delta_uc)
-    .bind(id)
-    .fetch_one(pool).await
+    let mut tx = pool.begin().await?;
+
+    // 1. UPDATE balance + RETURNING Account（MySQL 分支先 execute 再 SELECT）
+    let account = {
+        let raw_sql = format!("UPDATE accounts SET balance_uc = balance_uc + $1, updated_at = {ts} WHERE id = $2 RETURNING *");
+        let is_mysql = backend == "mysql";
+        if is_mysql {
+            let plain_sql = fix_ph(&strip_returning(&raw_sql), backend);
+            let res = sqlx::query(&plain_sql)
+                .bind(delta_uc)
+                .bind(id)
+                .execute(&mut *tx).await?;
+            if res.rows_affected() == 0 {
+                return Err(sqlx::Error::RowNotFound);
+            }
+            let pick_sql = fix_ph("SELECT * FROM accounts WHERE id = $1", backend);
+            sqlx::query_as::<_, Account>(&pick_sql).bind(id).fetch_one(&mut *tx).await?
+        } else {
+            let sql = fix_ph(&raw_sql, backend);
+            sqlx::query_as::<_, Account>(&sql)
+                .bind(delta_uc)
+                .bind(id)
+                .fetch_one(&mut *tx).await?
+        }
+    };
+
+    // 2. G2: 写 billing_transactions(tx_type="topup") — 正 delta_uc 是充值，负是退款前也可以走这里
+    let tx_sql = fix_ph(
+        &format!(
+            "INSERT INTO billing_transactions (account_id, call_id, tx_type, amount_uc, balance_after_uc, operator, remark, created_at) VALUES ($1, NULL, 'topup', $2, $3, NULL, $4, {ts})"
+        ),
+        backend
+    );
+    sqlx::query(&tx_sql)
+        .bind(account.id)
+        .bind(delta_uc)
+        .bind(account.balance_uc)
+        .bind(format!("topup {}", if delta_uc > 0 { "credit" } else { "debit" }))
+        .execute(&mut *tx).await?;
+
+    tx.commit().await?;
+    Ok(account)
 }
 
 pub async fn delete_account(&self, id: i64) -> Result<bool, sqlx::Error> {
@@ -8312,6 +8374,49 @@ pub async fn update_account(&self, id: i64, description: &str, credit_limit_uc: 
         .bind(credit_limit_uc)
         .bind(id)
         .fetch_optional(pool).await
+}
+
+/// G3: 退款接口 — 本质是 topup_account 的反向包装（delta_uc 正数 = 增加余额 = 退款），
+/// 但独立 tx_type="refund" + operator + remark，便于审计区分。
+pub async fn refund_account(&self, id: i64, delta_uc: i64, operator: Option<&str>, remark: Option<&str>) -> Result<Account, sqlx::Error> {
+    let Some(pool) = self.pool() else { return Err(sqlx::Error::RowNotFound); };
+    let backend = self.backend();
+    let ts = match backend { "postgres" => "CAST(NOW() AS TEXT)", "mysql" => "CAST(CURRENT_TIMESTAMP(3) AS CHAR)", _ => "datetime('now')" };
+    let mut tx = pool.begin().await?;
+
+    // 1. UPDATE balance + RETURNING Account
+    let account = {
+        let raw_sql = format!("UPDATE accounts SET balance_uc = balance_uc + $1, updated_at = {ts} WHERE id = $2 RETURNING *");
+        let is_mysql = backend == "mysql";
+        if is_mysql {
+            let plain_sql = fix_ph(&strip_returning(&raw_sql), backend);
+            let res = sqlx::query(&plain_sql).bind(delta_uc).bind(id).execute(&mut *tx).await?;
+            if res.rows_affected() == 0 { return Err(sqlx::Error::RowNotFound); }
+            let pick_sql = fix_ph("SELECT * FROM accounts WHERE id = $1", backend);
+            sqlx::query_as::<_, Account>(&pick_sql).bind(id).fetch_one(&mut *tx).await?
+        } else {
+            let sql = fix_ph(&raw_sql, backend);
+            sqlx::query_as::<_, Account>(&sql).bind(delta_uc).bind(id).fetch_one(&mut *tx).await?
+        }
+    };
+
+    // 2. 写 tx_type="refund" 流水 — operator/remark 可选
+    let tx_sql = fix_ph(
+        &format!(
+            "INSERT INTO billing_transactions (account_id, call_id, tx_type, amount_uc, balance_after_uc, operator, remark, created_at) VALUES ($1, NULL, 'refund', $2, $3, $4, $5, {ts})"
+        ),
+        backend
+    );
+    sqlx::query(&tx_sql)
+        .bind(account.id)
+        .bind(delta_uc)
+        .bind(account.balance_uc)
+        .bind(operator)
+        .bind(remark)
+        .execute(&mut *tx).await?;
+
+    tx.commit().await?;
+    Ok(account)
 }
 
 } // <- close impl Db ④ (routes + accounts module)

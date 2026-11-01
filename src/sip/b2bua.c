@@ -26,6 +26,7 @@
 #include "recording.h"   /* REQ-REC-006: teardown 走统一 registry+stop 路径 */
 #include "realtime.h"
 #include "security.h"    /* 静态黑名单（IP CIDR / UA）三接入点统一检查 */
+#include "rating.h"      /* Phase 1.5 L2: billing_pre_auth — INVITE 入口余额检查 */
 #include "sip_build.h"
 #include "sip_digest.h"    /* P1-12 INVITE 401/407 challenge 解析 + HA1 现算 */
 #include "sip_profile.h"
@@ -3538,6 +3539,35 @@ void handle_new_invite(b2b_core_t *co, sip_txn_t *t,
                 security_fence_log_drop(fctx.hit, gip, f_ua, "INVITE",
                                         f_caller, f_callee);
                 return;
+            }
+        }
+
+        /* ---- Phase 1.5 L2: INVITE pre-auth — 余额不够 reserve → 静默丢 ----
+         *
+         * 在 security_check_fence 之后、HA 门控之前。只对非 emergency INVITE 检查。
+         * billing_pre_auth 内部：
+         *   - 只对 caller 是短 extension 号码的 INVITE 检查（分机付费场景）
+         *   - 中继付费等 ANSWER reserve 阶段再拦
+         *   - 找不到费率/账户时 NOENT（放行，让 ANSWER 兜底）
+         *
+         * 与 ANSWER reserve 形成双保险：pre-auth 快速拒接减少后续资源消耗，
+         * ANSWER reserve 兜底并发消耗余额耗尽的边界场景。*/
+        if (!is_emergency) {
+            nsbc_ctx_t *cctx = nsbc_get_ctx();
+            /* Phase 2: billing.enabled 开关 —— 关闭时跳过 pre-auth（不拦截任何 INVITE）*/
+            if (cctx && cctx->billing && bill_is_enabled(cctx->billing)) {
+                char ba_caller[128] = {0}, ba_callee[128] = {0};
+                msg_caller_copy(m, ba_caller, sizeof(ba_caller));
+                msg_callee_copy(m, ba_callee, sizeof(ba_callee));
+                char ba_srcip[INET6_ADDRSTRLEN] = {0};
+                sa_ip_copy(src, ba_srcip, sizeof(ba_srcip));
+                int arc = billing_pre_auth(cctx->billing, ba_caller, ba_callee,
+                                           NULL, ba_srcip);
+                if (arc == NSBC_PERM_DENIED) {
+                    llog(LOG_INFO, "billing", "INVITE pre-auth DENY caller=%s callee=%s src=%s — silently drop",
+                         ba_caller, ba_callee, ba_srcip);
+                    return;  /* 与 security fence 同一惯例：静默丢弃，防 SBC 指纹暴露 */
+                }
             }
         }
     }

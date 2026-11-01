@@ -163,6 +163,13 @@ static const cfg_desc_t k_core[] = {
     {"ha.heartbeat_ms", CGT_INT, CGF_HOT, "500", NULL, 50, 10000},
     {"ha.failover_ms", CGT_INT, CGF_HOT, "3000", NULL, 100, 60000},
 
+    /* ---- 计费（REQ-PBX-BILL-001，默认关闭；Phase 1.6 资金闭环完成后生产环境开启） ----
+     * billing.enabled=false → C 侧跳过 CDR hook 注册 + INVITE pre-auth 检查 +
+     *                         L4 实时扣费 tick + L5 OVERDRAWN kill。
+     *                         计费逻辑全旁路，不影响任何其他模块。
+     * true  开计费：需要 accounts.reload 至少推一个账户 + 配好 rate_plans/rate_plan_entries。 */
+    {"billing.enabled", CGT_BOOL, CGF_HOT, "false", NULL, 0, 0},
+
     /* ---- Web 边车（第 14 章，默认关闭） ---- */
     {"web.enabled", CGT_BOOL, CGF_RESTART, "false", NULL, 0, 0},
     {"web.bind", CGT_STR, CGF_RESTART, "127.0.0.1:8443", NULL, 0, 0},

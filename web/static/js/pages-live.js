@@ -828,6 +828,201 @@ app.component('transcode-live', {
   },
 });
 
+// ===== Billing 管理（Phase 2） =====
+app.component('billing-page', {
+  template: `
+    <div>
+      <!-- ==== 顶部：计费启停 + 状态卡片 ==== -->
+      <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+        <!-- 启停开关卡片 -->
+        <div class="bg-white rounded-lg border border-gray-200 p-4 md:col-span-2">
+          <div class="flex items-center justify-between">
+            <div>
+              <h2 class="text-lg font-semibold"><i class="fa-solid fa-chart-line text-blue-600"></i> Billing</h2>
+              <p class="text-xs text-gray-500 mt-1">Phase 2 · L4v2+L4v3 tick · L5 OVERDRAWN kill</p>
+            </div>
+            <label class="flex items-center gap-3 cursor-pointer select-none">
+              <span class="text-sm font-medium" :class="billingEnabled ? 'text-green-600' : 'text-gray-400'">
+                {{ billingEnabled ? '● 已启用' : '○ 已关闭' }}
+              </span>
+              <input type="checkbox" class="sr-only peer" v-model="switchLoading" :disabled="switchBusy"
+                     @change="toggleBilling">
+              <div class="relative w-14 h-7 bg-gray-300 peer-checked:bg-green-500 rounded-full transition-colors
+                          after:content-[''] after:absolute after:top-0.5 after:left-0.5 after:bg-white
+                          after:rounded-full after:h-6 after:w-6 after:shadow after:transition-all
+                          peer-checked:after:translate-x-7
+                          disabled:opacity-50 disabled:cursor-not-allowed"></div>
+            </label>
+          </div>
+          <div v-if="switchMsg" class="mt-3 text-xs" :class="switchMsgOk ? 'text-green-600' : 'text-orange-600'">
+            {{ switchMsg }}
+          </div>
+          <div class="mt-3 flex gap-4 text-xs text-gray-500">
+            <a href="#/rates" class="hover:text-blue-600"><i class="fa-solid fa-coins"></i> 费率管理 →</a>
+            <a href="#/balances" class="hover:text-blue-600"><i class="fa-solid fa-wallet"></i> 账户余额 →</a>
+            <a href="#/transcode" class="hover:text-blue-600"><i class="fa-solid fa-microphone"></i> 媒体会话 →</a>
+          </div>
+        </div>
+
+        <!-- 活跃 reservation -->
+        <div class="bg-white rounded-lg border border-gray-200 p-4">
+          <div class="text-xs text-gray-500 mb-1">活跃 Reservation</div>
+          <div class="text-2xl font-bold" :class="resvTotal > 0 ? 'text-blue-600' : 'text-gray-400'">
+            {{ resvTotal }}
+          </div>
+          <div class="text-xs text-gray-400 mt-1">每 5s 刷新</div>
+        </div>
+
+        <!-- 总预占金额 -->
+        <div class="bg-white rounded-lg border border-gray-200 p-4">
+          <div class="text-xs text-gray-500 mb-1">总预占 Reserved</div>
+          <div class="text-2xl font-bold" :class="totalReserved > 0 ? 'text-orange-600' : 'text-gray-400'">
+            {{ (totalReserved / 1000000).toFixed(2) }}
+            <span class="text-sm font-normal">元</span>
+          </div>
+          <div class="text-xs text-gray-400 mt-1">累计 reserved_uc / 1e6</div>
+        </div>
+      </div>
+
+      <!-- ==== 活跃 Reservation 表格 ==== -->
+      <div class="bg-white rounded-lg border border-gray-200">
+        <div class="flex items-center justify-between px-4 py-3 border-b">
+          <h3 class="font-semibold text-gray-700"><i class="fa-solid fa-list-check text-blue-500"></i> 活跃通话 Reservation</h3>
+          <div class="flex items-center gap-3">
+            <span class="text-xs text-gray-400" v-if="!enabledLoadError">
+              <span v-if="billingEnabled">计费已启用 · tick 正常</span>
+              <span v-else>计费已关闭 · tick 旁路跳过</span>
+            </span>
+            <button @click="loadReservations()" class="text-xs px-2 py-1 rounded border hover:bg-gray-50"
+                    :disabled="resvLoading">
+              <i class="fa-solid fa-rotate-right" :class="{ 'animate-spin': resvLoading }"></i> 刷新
+            </button>
+          </div>
+        </div>
+        <div v-if="resvLoading && !resvRows.length" class="p-8 text-center text-gray-400">加载中...</div>
+        <div v-else-if="resvError" class="p-6 text-center text-red-500">⚠ {{ resvError }}</div>
+        <div v-else-if="!resvRows.length" class="p-12 text-center text-gray-400">
+          <i class="fa-solid fa-phone-slash text-4xl mb-3 opacity-30"></i>
+          <div>暂无活跃通话 Reservation</div>
+          <div class="text-xs mt-1">发起通话后，L4 tick 会显示每个通话的实时预占</div>
+        </div>
+        <table v-else class="w-full text-sm border-collapse">
+          <thead><tr class="bg-gray-50 border-b">
+            <th class="px-3 py-2 text-left font-medium text-gray-600">ID</th>
+            <th class="px-3 py-2 text-left font-medium text-gray-600">Call-ID</th>
+            <th class="px-3 py-2 text-left font-medium text-gray-600">账户</th>
+            <th class="px-3 py-2 text-right font-medium text-gray-600">Billsec</th>
+            <th class="px-3 py-2 text-right font-medium text-gray-600">Reserved (元)</th>
+            <th class="px-3 py-2 text-left font-medium text-gray-600">Called</th>
+            <th class="px-3 py-2 text-right font-medium text-gray-600">Trunk</th>
+          </tr></thead>
+          <tbody>
+            <tr v-for="(row, idx) in resvRows" :key="idx" class="border-b hover:bg-blue-50/50">
+              <td class="px-3 py-2 text-gray-400 font-mono text-xs">{{ row.id }}</td>
+              <td class="px-3 py-2 font-mono text-xs text-blue-700">{{ truncate(row.call, 20) }}</td>
+              <td class="px-3 py-2 text-xs">
+                <span class="px-1.5 py-0.5 rounded bg-gray-100 text-gray-700 font-mono">{{ truncate(row.acct, 28) }}</span>
+              </td>
+              <td class="px-3 py-2 text-right font-mono">{{ row.billsec }}s</td>
+              <td class="px-3 py-2 text-right font-mono font-semibold"
+                  :class="row.reserved_uc > 500000 ? 'text-orange-600' : 'text-gray-700'">
+                {{ (row.reserved_uc / 1000000).toFixed(2) }}
+              </td>
+              <td class="px-3 py-2 font-mono text-xs">{{ row.called || '-' }}</td>
+              <td class="px-3 py-2 text-right text-gray-500">{{ row.trunk_id || '-' }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `,
+  setup() {
+    const billingEnabled = ref(false);
+    const switchLoading = ref(false);    // 双向绑定的"视觉 loading"
+    const switchBusy = ref(false);        // API 调用锁
+    const switchMsg = ref('');
+    const switchMsgOk = ref(true);
+    const enabledLoadError = ref(null);
+
+    const resvRows = ref([]);
+    const resvTotal = ref(0);
+    const resvLoading = ref(false);
+    const resvError = ref(null);
+    let resvTimer;
+    let resvInflight = false;
+
+    // 计算汇总
+    const totalReserved = computed(() =>
+      resvRows.value.reduce((s, r) => s + (r.reserved_uc || 0), 0)
+    );
+
+    // === billing.enabled 读写 ===
+    async function loadEnabled() {
+      try {
+        const data = await API.get('/billing/enabled');
+        billingEnabled.value = !!data.enabled;
+        enabledLoadError.value = null;
+      } catch (e) {
+        enabledLoadError.value = e.message;
+        console.warn('[billing] enabled load failed:', e.message);
+      }
+    }
+
+    async function toggleBilling() {
+      if (switchBusy.value) { switchLoading.value = !switchLoading.value; return; }
+      const want = switchLoading.value;  // 已经是新 state（v-model 先更新了）
+      switchBusy.value = true;
+      switchMsg.value = '';
+      try {
+        const data = await API.put('/billing/enabled', { enabled: want });
+        billingEnabled.value = want;
+        switchMsg.value = want
+          ? `✓ 计费已启用（热切换生效中，tick 3s 内开始跑）`
+          : `✓ 计费已关闭（reserve/settle/tick 全旁路）`;
+        switchMsgOk.value = true;
+      } catch (e) {
+        switchLoading.value = !want;  // 回滚视觉 state
+        switchMsg.value = `✗ 切换失败：${e.message}`;
+        switchMsgOk.value = false;
+      } finally {
+        switchBusy.value = false;
+      }
+    }
+
+    // === reservations 刷新 ===
+    async function loadReservations(silent) {
+      if (resvInflight) return;
+      resvInflight = true;
+      if (silent !== true) { resvLoading.value = true; resvError.value = null; }
+      try {
+        const data = await API.get('/billing/reservations/core');
+        resvRows.value = data.reservations || [];
+        resvTotal.value = data.total || resvRows.value.length;
+      } catch (e) {
+        if (!isCoreOfflineError(e.message)) resvError.value = e.message;
+      } finally {
+        resvInflight = false;
+        if (silent !== true) resvLoading.value = false;
+      }
+    }
+
+    function truncate(s, n) { return s && s.length > n ? s.slice(0, n) + '…' : s || '-'; }
+
+    onMounted(() => {
+      loadEnabled();
+      loadReservations();
+      resvTimer = setInterval(() => loadReservations(true), 5000);
+    });
+    onBeforeUnmount(() => clearInterval(resvTimer));
+
+    return {
+      billingEnabled, switchLoading, switchBusy, switchMsg, switchMsgOk, enabledLoadError,
+      resvRows, resvTotal, resvLoading, resvError, totalReserved,
+      loadReservations, toggleBilling, truncate,
+    };
+  },
+});
+
 // ===== Codec Registry (read-only, core self-registered) =====
 app.component('codecs-live', livePanel(t('Codec Registry'), 'fa-solid fa-code', [
   { key: 'name',         label: t('Codec Name') },

@@ -59,6 +59,7 @@ void uds_client_stop(void);
 void uds_client_shutdown(void);
 
 /* ---- 推送 API ---- */
+int uds_push(const char *kind, const char *json);   /* 通用：任意 kind（"cdr"/"billing_settle"/...）*/
 int uds_send_cdr(const char *json);
 int uds_send_register(const char *json);
 int uds_send_runtime(const char *json);

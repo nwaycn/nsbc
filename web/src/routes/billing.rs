@@ -36,7 +36,7 @@ use serde_json::json;
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 
-use crate::coreclient::{AccountList, CoreApi, RateList};
+use crate::coreclient::{AccountList, CoreApi, RateList, ResvList};
 use crate::db::{AccountCreate, RatePlanCreate, RatePlanEntryCreate, RatePlanUpdate, RateTableCreate, RateTableUpdate};
 use crate::error::ApiError;
 use crate::sync;
@@ -63,6 +63,12 @@ where
         .route("/balances/core", get(core_balances::<C>))
         .route("/balances/:id", get(get_account::<C>).put(update_account::<C>).delete(close_account::<C>))
         .route("/balances/:id/topup", post(topup_account::<C>))
+        // ===== G3: 退款接口 — delta_uc 正数表示退多少给客户 =====
+        .route("/balances/:id/refund", post(refund_account::<C>))
+        // ===== Phase 2: L4v2/L4v3 tick 运维 =====
+        .route("/reservations/core", get(core_reservations::<C>))
+        // ===== Phase 2: billing.enabled 启停（热更新 config.set）=====
+        .route("/enabled", get(get_billing_enabled::<C>).put(set_billing_enabled::<C>))
         // ===== Rate Plans =====
         .route("/rate-plans", get(list_rate_plans::<C>).post(create_rate_plan::<C>))
         .route("/rate-plans/reload", post(reload_rate_plans::<C>))
@@ -257,6 +263,17 @@ pub struct TopupBody {
     pub delta_uc: i64,
 }
 
+/// G3: POST /balances/:id/refund request body
+#[derive(Debug, Deserialize)]
+pub struct RefundBody {
+    /// 退款金额（正数，单位微元）
+    pub delta_uc: i64,
+    /// 操作员（可选，审计用）
+    pub operator: Option<String>,
+    /// 退款备注/原因（可选，审计用）
+    pub remark: Option<String>,
+}
+
 async fn list_accounts<C: CoreApi + Clone + Send + Sync>(
     State(st): State<Arc<AppState<C>>>,
     Query(q): Query<AccountListQuery>,
@@ -360,6 +377,56 @@ async fn topup_account<C: CoreApi + Clone + Send + Sync + 'static>(
     Ok(Json(row))
 }
 
+/// G3: POST /balances/:id/refund — 退款给客户（本质是加 delta 到 balance + 写 tx_type="refund" 流水）
+///     DB Transaction 保证 balance 更新和 billing_transactions 写入原子性；
+///     core 侧通过 account_topup 同步，失败走 accounts.reload 安全网。
+async fn refund_account<C: CoreApi + Clone + Send + Sync + 'static>(
+    State(st): State<Arc<AppState<C>>>,
+    Path(id): Path<i64>,
+    Json(body): Json<RefundBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    st.db.pool().ok_or(ApiError::DbUnavailable)?;
+
+    // 退款金额必须正数
+    if body.delta_uc <= 0 {
+        return Err(ApiError::BadRequest("delta_uc must be positive (refund amount)".into()));
+    }
+
+    // Look up account first
+    let acct = st.db.get_account(id).await
+        .map_err(|e| ApiError::Db(e.to_string()))?
+        .ok_or_else(|| ApiError::NotFound("account not found".into()))?;
+
+    let row = st.db.refund_account(
+        id,
+        body.delta_uc,
+        body.operator.as_deref(),
+        body.remark.as_deref(),
+    ).await.map_err(|e| {
+        match e {
+            sqlx::Error::RowNotFound => ApiError::NotFound("account not found".into()),
+            other => ApiError::Db(other.to_string()),
+        }
+    })?;
+
+    // 推 core：refund = 正方向 topup（增加 balance）
+    let core_res = st.core.account_topup(&acct.account_key, body.delta_uc).await;
+    if let Err(e) = &core_res {
+        tracing::warn!(error = %e, key = %acct.account_key, delta = body.delta_uc,
+            "account.refund core failed → spawning accounts.reload safety net");
+        sync::spawn_push(st.clone(), sync::Kind::Accounts);
+    }
+
+    let _ = st.db.insert_config_history(
+        body.operator.as_deref().unwrap_or("api"), "refund",
+        &format!("balances/{}", row.id),
+        Some(&format!("balance_uc={}", acct.balance_uc)),
+        &format!("balance_uc={} refund_delta={} remark={}", row.balance_uc, body.delta_uc, body.remark.as_deref().unwrap_or("")),
+    ).await;
+
+    Ok(Json(row))
+}
+
 /// PUT /balances/:id — update account (description + credit_limit only; balance managed by billing system)
 async fn update_account<C: CoreApi + Clone + Send + Sync>(
     State(st): State<Arc<AppState<C>>>,
@@ -415,6 +482,45 @@ async fn core_balances<C: CoreApi + Clone + 'static>(
     State(st): State<Arc<AppState<C>>>,
 ) -> Result<Json<AccountList>, ApiError> {
     Ok(Json(st.core.show_balances().await?))
+}
+
+/// GET /reservations/core — core-side active reservations (show resv, L4v2 tick debug)
+async fn core_reservations<C: CoreApi + Clone + 'static>(
+    State(st): State<Arc<AppState<C>>>,
+) -> Result<Json<ResvList>, ApiError> {
+    Ok(Json(st.core.show_resv().await?))
+}
+
+/// GET /enabled — billing.enabled 全局开关当前值（config.get billing.enabled）
+async fn get_billing_enabled<C: CoreApi + Clone + 'static>(
+    State(st): State<Arc<AppState<C>>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let cv = st.core.config_get("billing.enabled").await?;
+    let enabled = cv.value.as_deref() == Some("true");
+    Ok(Json(json!({ "enabled": enabled, "secret": false })))
+}
+
+#[derive(Debug, Deserialize)]
+struct BillingEnabledBody {
+    enabled: bool,
+}
+
+/// PUT /enabled — 热切换 billing.enabled（config.set billing.enabled true/false）
+/// C 侧 CGF_HOT 白名单，billing_tick 每 3s 从 cfg 同步 enabled 自动生效。
+/// 生产环境安全网：开启前必须已 reload 费率表并推足够余额。
+async fn set_billing_enabled<C: CoreApi + Clone + Send + Sync + 'static>(
+    State(st): State<Arc<AppState<C>>>,
+    Json(body): Json<BillingEnabledBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    let val = if body.enabled { "true" } else { "false" };
+    let res = st.core.config_set("billing.enabled", val).await?;
+
+    let _ = st.db.insert_config_history(
+        "api", "set", "billing.enabled", None,
+        &format!("enabled={} changed={}", val, res.changed),
+    ).await;
+
+    Ok(Json(json!({ "enabled": body.enabled, "changed": res.changed })))
 }
 
 // ================================================================

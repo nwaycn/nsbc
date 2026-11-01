@@ -890,6 +890,7 @@ const app = createApp({
       { path: '/queues',       label: t('Extension Queues'), icon: 'fa-solid fa-people-group' },
       { path: '/ivr-menus',    label: t('IVR Menus'), icon: 'fa-solid fa-circle-question' },
       // 计费与Media
+      { path: '/billing',      label: t('Billing'), icon: 'fa-solid fa-chart-line' },
       { path: '/rates',        label: t('Rates'), icon: 'fa-solid fa-coins' },
       { path: '/balances',     label: t('Balances'), icon: 'fa-solid fa-wallet' },
       { path: '/transcode',    label: t('MediaSession'), icon: 'fa-solid fa-microphone' },

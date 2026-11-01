@@ -512,6 +512,24 @@ pub struct AccountList {
     pub total: i64,
 }
 
+/// Single active reservation from `show resv` (L4v2 tick debug, L0 read-only).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ResvEntry {
+    pub id: u64,
+    pub call: String,
+    pub acct: String,
+    pub billsec: i64,
+    pub reserved_uc: i64,
+    pub called: String,
+    pub trunk_id: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ResvList {
+    pub reservations: Vec<ResvEntry>,
+    pub total: i64,
+}
+
 /// Single active bridge session from `show transcode` (REQ-OAM-010).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct BridgeSession {
@@ -733,6 +751,11 @@ pub trait CoreApi: Send + Sync {
     fn show_balances(
         &self,
     ) -> impl Future<Output = Result<AccountList, CoreError>> + Send;
+
+    /// `show resv` — active reservations (L4v2 tick debug, L0 read-only).
+    fn show_resv(
+        &self,
+    ) -> impl Future<Output = Result<ResvList, CoreError>> + Send;
 
     // ===== REQ-OAM-010: media bridge active sessions =====
 
@@ -1053,6 +1076,11 @@ impl CoreApi for RealCore {
     async fn show_balances(&self) -> Result<AccountList, CoreError> {
         let body = request(&self.sock_path, self.timeout, "show balances").await?;
         parse_show_balances(&body)
+    }
+
+    async fn show_resv(&self) -> Result<ResvList, CoreError> {
+        let body = request(&self.sock_path, self.timeout, "show resv").await?;
+        parse_show_resv(&body)
     }
 
     async fn show_transcode(&self) -> Result<BridgeList, CoreError> {
@@ -1590,6 +1618,47 @@ pub fn parse_show_balances(body: &str) -> Result<AccountList, CoreError> {
         return Err(CoreError::Protocol(format!("missing accounts header: {body:?}")));
     }
     Ok(AccountList { accounts, total })
+}
+
+/// Parse `show resv` frame (L4v2 tick debug):
+/// Header `reservations=N (active=N)` + per-line
+/// `resv id=I call=C acct=A billsec=B reserved_uc=R called=P trunk_id=T`.
+pub fn parse_show_resv(body: &str) -> Result<ResvList, CoreError> {
+    let mut reservations = Vec::new();
+    let mut total = 0i64;
+    let mut saw_head = false;
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        if let Some(msg) = line.strip_prefix("ERR") {
+            return Err(CoreError::CoreRejected(msg.trim().to_string()));
+        }
+        if let Some(rest) = line.strip_prefix("reservations=") {
+            // "reservations=2 (active=2)" — take first token
+            let head_tok = rest.split_whitespace().next().unwrap_or("0");
+            total = head_tok.parse::<i64>().unwrap_or(0);
+            saw_head = true;
+        } else if let Some(rest) = line.strip_prefix("resv ") {
+            let toks: Vec<&str> = rest.split_whitespace().collect();
+            reservations.push(ResvEntry {
+                id: kv_opt(toks.iter().copied(), "id")
+                    .and_then(|v| v.parse().ok()).unwrap_or(0),
+                call: kv_opt(toks.iter().copied(), "call").unwrap_or_default(),
+                acct: kv_opt(toks.iter().copied(), "acct").unwrap_or_default(),
+                billsec: kv_opt(toks.iter().copied(), "billsec")
+                    .and_then(|v| v.parse().ok()).unwrap_or(0),
+                reserved_uc: kv_opt(toks.iter().copied(), "reserved_uc")
+                    .and_then(|v| v.parse().ok()).unwrap_or(0),
+                called: kv_opt(toks.iter().copied(), "called").unwrap_or_default(),
+                trunk_id: kv_opt(toks.iter().copied(), "trunk_id")
+                    .and_then(|v| v.parse().ok()).unwrap_or(0),
+            });
+        }
+    }
+    if !saw_head {
+        return Err(CoreError::Protocol(format!("missing reservations header: {body:?}")));
+    }
+    Ok(ResvList { reservations, total })
 }
 
 /// Parse `show transcode` frame: header `sessions=N` + per-line `bridge idx=I
@@ -2628,6 +2697,10 @@ leg 0 sdp_offer 50\nabc\n";
 
         async fn show_balances(&self) -> Result<AccountList, CoreError> {
             parse_show_balances(&self.record("show balances")?)
+        }
+
+        async fn show_resv(&self) -> Result<ResvList, CoreError> {
+            parse_show_resv(&self.record("show resv")?)
         }
 
         async fn show_transcode(&self) -> Result<BridgeList, CoreError> {

@@ -282,6 +282,28 @@ async fn dispatch_push<C: crate::coreclient::CoreApi + Clone + Send + Sync + 'st
             let _ = state.vad_tx.send(evt);
             Ok(())
         },
+        // G1: C 侧 billing.c END settle 成功后推 billing_settle
+        // payload: {"account_key":"tenant:1:extension:1000","call_id":"xxx","charge_uc":-150000,"billsec":185}
+        "billing_settle" => {
+            let ak = body.get("account_key").and_then(|x| x.as_str()).unwrap_or("");
+            let call_id = body.get("call_id").and_then(|x| x.as_str()).unwrap_or("");
+            let charge_uc = body.get("charge_uc").and_then(|x| x.as_i64()).unwrap_or(0);
+            if ak.is_empty() || call_id.is_empty() {
+                return Err("billing_settle missing account_key or call_id".into());
+            }
+            // account_key 查 account_id — 账户不存在可能是中继付费场景，跳过不写流水
+            let acct = state.db.get_account_by_key(ak).await
+                .map_err(|e| format!("billing_settle db err: {e}"))?;
+            if let Some(acct) = acct {
+                state.db.settle_billing(acct.id, call_id, -charge_uc, None).await
+                    .map_err(|e| format!("billing_settle settle_billing err: {e}"))?;
+                tracing::info!(account_key = ak, call_id, charge_uc, acct.id,
+                    "billing_settle: call_charge written to billing_transactions");
+            } else {
+                tracing::debug!(account_key = ak, call_id, "billing_settle: account not found in DB — skipping");
+            }
+            Ok(())
+        },
         "" => return Err("missing kind".into()),
         _ => return Err(format!("unknown kind={kind}")),
     };

@@ -121,6 +121,12 @@ security:
 system:
   config_snapshot_dir: "../data/snapshots"
 
+# ---- Billing（计费；默认关闭，生产环境开启）----
+billing:
+  enabled: false      # true 开启 reserve/settle/pre-auth/L4 tick/L5 OVERDRAWN kill
+                      # false = 全旁路，reserve/settle/pre-auth/tick 全跳过，不影响普通通话
+                      # CGF_HOT 热更新：control reload / config.set billing.enabled=true 后自动生效
+
 # ---- nsbc-web-only ----
 web:
   enabled: true

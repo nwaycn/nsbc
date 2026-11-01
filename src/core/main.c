@@ -20,6 +20,7 @@
 #include "reactor.h"
 #include "reactor_manager.h"
 #include "event_bus.h"        /* Phase 2 event_bus: drain 线程启停 */
+#include "rating.h"           /* Phase 2: billing_tick — L4 实时扣费 tick + L5 OVERDRAWN kill */
 #include "security.h"       /* REQ-EXT-API-005: security_set_yaml_path */
 #include "srtp_session.h"
 #include "route_table.h"     /* route_table 统一销毁 */
@@ -156,6 +157,12 @@ static void *ticker_main(void *p)
                         last_workers = cur_workers;
                 }
             }
+
+            /* Phase 2 L4+L5: 实时扣费 tick + OVERDRAWN kill
+             * 内部自带 3s 节流；billing.enabled=false 时空跑。
+             * shutdown 期间 billing_tick 内部已有 ctx_stopping 防护。*/
+            if (!ctx_stopping(t->ctx))
+                (void)billing_tick(t->ctx);
         }
     }
     pthread_mutex_unlock(&t->lock);
