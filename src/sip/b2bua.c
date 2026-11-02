@@ -3629,10 +3629,13 @@ void handle_new_invite(b2b_core_t *co, sip_txn_t *t,
             if (c->prof)
                 llog(LOG_DEBUG, "b2b", "call profile by ip → %s", c->prof->name);
         }
-        /* ★ fallback：WS 呼入（local_port=0、src=:0）两个匹配全挂时，
-         *  取 enabled 的 profile 中 name 字典序最大的（internal > external，
+        /* ★ fallback：port/IP 两个匹配全挂时（WS 呼入、无 ACL 配置、
+         *  C 侧 sip_profiles 表未 reload 全 disabled 等场景），
+         *  优先取 enabled profile 中字典序最大的（internal > external，
          *  确保命中 internal——拨号规则默认归属它）。
-         *  必须确定归属，否则 dp lookup 因 profile 对不上全部 skip → 404。 */
+         *  完全无 enabled profile 时 → 硬编码 fallback 到 "external"
+         *  （信任外部源、跳过 DIGEST + loc_query 活跃注册门槛），
+         *  让 SIP trunk / sipp UAC 等无注册 INVITE 也能正常路由。 */
         if (!c->prof) {
             unsigned n = sip_profile_count();
             sip_profile_t *best = NULL;
@@ -3644,10 +3647,20 @@ void handle_new_invite(b2b_core_t *co, sip_txn_t *t,
                 }
             }
             c->prof = best;
-            if (c->prof)
+            if (c->prof) {
                 llog(LOG_INFO, "b2b", "call profile fallback → %s", c->prof->name);
-            else
-                llog(LOG_WARN, "b2b", "call profile: NO enabled profile found!");
+            } else {
+                /* Phase 1.5: 无 enabled profile → 静态 "external" 占位
+                 * 只填 name+enabled 两个字段，其余全 0。signaling.c 只
+                 * 检查 prof->name 字段，足够让 external 路径走通。 */
+                static sip_profile_t g_fallback_external = {
+                    .name = "external", .enabled = 1, .auth_calls = 0
+                };
+                c->prof = &g_fallback_external;
+                llog(LOG_WARN, "b2b",
+                     "call profile: NO enabled profile — hard fallback to 'external' "
+                     "(信任外部源，跳过 DIGEST/loc_query)");
+            }
         }
         if (c->prof)
             __sync_fetch_and_add(&c->prof->active_calls, 1u);
