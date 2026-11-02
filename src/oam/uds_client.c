@@ -86,8 +86,10 @@ typedef struct {
     /* 重连退避 */
     int             backoff_ms;
 
-    /* 收帧重组（仅后台线程访问） */
-    uint8_t         rbuf[NSBC_FRAME_HDR_LEN + 65536];
+    /* 收帧重组（仅后台线程访问）。
+     * 必须 ≥ Rust 端 MAX_FRAME (FRAME_HDR_LEN + MAX_PAYLOAD = 12 + 1MB = 1_000_012)。
+     * 旧值 65536 不够 cfg.pull_all 全量配置 JSON → frame len invalid → link reset。 */
+    uint8_t         rbuf[NSBC_MAX_FRAME];
     size_t          rhave;
 
     /* 同步请求 */
@@ -269,11 +271,51 @@ static int recv_and_dispatch(void)
     for (;;) {
         /* 消费 rbuf 中所有完整帧 */
         while (g.rhave >= NSBC_FRAME_HDR_LEN) {
+            /* 先校验 magic，再解长度 —— 防御性避免错位解析 */
+            if (g.rbuf[0] != NSBC_FRAME_MAGIC) {
+                /* 扫描寻找下一个 magic 字节 */
+                size_t drop = 0;
+                char hex[97];
+                int hpos = 0;
+                size_t dump_n = g.rhave > 32 ? 32 : g.rhave;
+                for (size_t i = 0; i < dump_n && hpos < (int)sizeof(hex) - 4; i++) {
+                    hpos += snprintf(hex + hpos, sizeof(hex) - hpos, "%02x ", g.rbuf[i]);
+                }
+                hex[hpos] = '\0';
+
+                size_t i;
+                for (i = 1; i < g.rhave; i++) {
+                    if (g.rbuf[i] == NSBC_FRAME_MAGIC) break;
+                }
+                drop = i;
+                if (drop >= g.rhave) {
+                    llog(LOG_WARN, "uds",
+                        "no magic in rbuf (%zu bytes), reset link (first 32: %s)",
+                        g.rhave, hex);
+                    return -1;
+                }
+                llog(LOG_WARN, "uds",
+                    "magic mismatch @0x%02x, dropping %zu bytes (rhave=%zu, first 32: %s)",
+                    g.rbuf[0], drop, g.rhave, hex);
+                memmove(g.rbuf, g.rbuf + drop, g.rhave - drop);
+                g.rhave -= drop;
+                continue;
+            }
+
             uint32_t total =
                 ((uint32_t)g.rbuf[2] << 24) | ((uint32_t)g.rbuf[3] << 16) |
                 ((uint32_t)g.rbuf[4] << 8) | (uint32_t)g.rbuf[5];
             if (total < NSBC_FRAME_HDR_LEN || total > sizeof(g.rbuf)) {
-                llog(LOG_WARN, "uds", "frame len %u invalid, reset link", total);
+                char hex[97];
+                int hpos = 0;
+                size_t dump_n = g.rhave > 32 ? 32 : g.rhave;
+                for (size_t i = 0; i < dump_n && hpos < (int)sizeof(hex) - 4; i++) {
+                    hpos += snprintf(hex + hpos, sizeof(hex) - hpos, "%02x ", g.rbuf[i]);
+                }
+                hex[hpos] = '\0';
+                llog(LOG_WARN, "uds",
+                    "frame len %u invalid (magic=0x%02x, type=0x%02x, hdr hex: %s), reset link",
+                    total, g.rbuf[0], g.rbuf[1], hex);
                 return -1;
             }
             if (g.rhave < total)

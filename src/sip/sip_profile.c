@@ -736,17 +736,21 @@ sip_profile_t *sip_profile_match_port(uint16_t udp_port, uint16_t tcp_port)
 {
     pthread_rwlock_rdlock(&g.rwlock);
     sip_profile_t *found = NULL;
+    sip_profile_t *ext_pref = NULL;  /* auth_calls=0 优先 */
     for (unsigned i = 0; i < g.count; ++i) {
         sip_profile_t *p = &g.prof[i];
         if (p->state != SIP_PROFILE_OK || !p->enabled) continue;
         if ((udp_port > 0 && p->enable_udp && p->sip_udp_port == udp_port) ||
             (tcp_port > 0 && p->enable_tcp && p->sip_tcp_port == tcp_port)) {
-            found = p;
-            break;
+            if (p->auth_calls == 0) {
+                ext_pref = p;
+                break;  /* auth_calls=0 即 external-like → 直接赢 */
+            }
+            if (!found) found = p;  /* 兜底：auth_calls=1 的 internal */
         }
     }
     pthread_rwlock_unlock(&g.rwlock);
-    return found;
+    return ext_pref ? ext_pref : found;
 }
 
 /*

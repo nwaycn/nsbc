@@ -3784,11 +3784,19 @@ sqlx::query(acct_ddl).execute(pool).await?;
         }
     }
 
-    // Default extensions seed: 10000-99999, uniform password 876876, realm=nsbc.local
-    // HA1 = md5(extension:realm:password), used for SIP Digest auth
+    // Default extensions seed: only seed when extensions table is EMPTY
+    // (prevents re-seeding 90k rows after DELETE). Seed just 10 test extensions.
+    let ext_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM extensions")
+        .fetch_one(pool).await.unwrap_or(0);
+    if ext_count > 0 {
+        info!("extensions table already has {ext_count} rows — skipping default seed");
+    } else {
+        info!("extensions table is empty — seeding 10 test extensions (10000-10009)");
+    }
     let default_realm = "nsbc.local";
     let default_pass  = "876876";
-    for n in 10000..100000u32 {
+    let seed_range: Vec<u32> = if ext_count == 0 { (10000..10010).collect() } else { Vec::new() };
+    for n in seed_range {
         let ext = format!("{n}");
         let clip = format!("{n}");
         let password = default_pass;

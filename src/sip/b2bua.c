@@ -3639,27 +3639,37 @@ void handle_new_invite(b2b_core_t *co, sip_txn_t *t,
         if (!c->prof) {
             unsigned n = sip_profile_count();
             sip_profile_t *best = NULL;
+            sip_profile_t *fallback_ext = NULL;  /* auth_calls=0 = external-like */
+            /* 两遍扫描：先找 auth_calls=0（external）优先，
+             * 再找字典序最大（internal 兜底）。
+             * ★ 为什么：未知 IP/端口 白名单没命中 → 不应该归 internal
+             * （internal 强制 DIGEST + loc_query 活跃注册，会 SILENT DROP）。
+             * 未知源 = SIP trunk / sipp UAC = external 语义 —— 信任 + 跳过注册门。 */
             for (unsigned i = 0; i < n; ++i) {
                 sip_profile_t *p = sip_profile_at(i);
                 if (p && p->enabled) {
+                    if (p->auth_calls == 0) {
+                        if (!fallback_ext || strcmp(p->name, fallback_ext->name) > 0)
+                            fallback_ext = p;
+                    }
                     if (!best || strcmp(p->name, best->name) > 0)
                         best = p;
                 }
             }
-            c->prof = best;
+            c->prof = fallback_ext ? fallback_ext : best;
             if (c->prof) {
-                llog(LOG_INFO, "b2b", "call profile fallback → %s", c->prof->name);
+                const char *why = fallback_ext ? "auth_calls=0 (external)" : "dict-order max (internal)";
+                llog(LOG_INFO, "b2b", "call profile fallback → %s (%s)", c->prof->name, why);
             } else {
                 /* Phase 1.5: 无 enabled profile → 静态 "external" 占位
-                 * 只填 name+enabled 两个字段，其余全 0。signaling.c 只
-                 * 检查 prof->name 字段，足够让 external 路径走通。 */
+                 * 只填 name+enabled+auth_calls，其余全 0。signaling.c 只
+                 * 检查 prof->name，足够让 external 路径走通。 */
                 static sip_profile_t g_fallback_external = {
                     .name = "external", .enabled = 1, .auth_calls = 0
                 };
                 c->prof = &g_fallback_external;
                 llog(LOG_WARN, "b2b",
-                     "call profile: NO enabled profile — hard fallback to 'external' "
-                     "(信任外部源，跳过 DIGEST/loc_query)");
+                     "call profile: NO enabled profile — hard fallback to 'external'");
             }
         }
         if (c->prof)
