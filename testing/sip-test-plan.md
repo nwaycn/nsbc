@@ -1,7 +1,8 @@
 # NSBC SIP 测试方案
 
-> **版本**: 3.0
-> **日期**: 2026-10-29
+> **版本**: 3.1
+> **日期**: 2026-11-02
+> **当前拓扑**: 三机（10.0.0.25 UAC / 10.0.0.80 NSBC / 10.0.0.120 UAS）— 详见 §13
 > **测试工具**: sipp 3.5+（`/usr/bin/sipp`）
 > **目标进程**: nsbcd（SIP 信令 + 可选 RTP 媒体转发）
 > **账号池**: 10000 – 99999（9 万），密码统一 876876，realm=`nsbc.local`
@@ -122,7 +123,7 @@ nsbcd 通过 Unix domain socket 从 nsbc-web 拉取 sip_profiles / extensions / 
 > ⚠️ **Reload 架构重要提示（2026-10-31）**: nsbcd 有两套 reload 通道：
 > 1. `control.sock reload` (plain) → 重读 YAML，**不 reload** route_table/dialplan/outreg！
 > 2. `control.sock trunks.reload <json>` / `dialplan-rules.reload <json>` → nsbc-web UDS JSON push，**这是 DB 配置变更的唯一正确 reload 方式**
-> 
+>
 > 详见 handoff §11。**永远不要用 plain `reload` 来加载 trunks/dialplan！**
 
 ---
@@ -152,6 +153,17 @@ nsbcd 通过 Unix domain socket 从 nsbc-web 拉取 sip_profiles / extensions / 
 |----|----|
 | **OS** | CentOS 7 |
 | **SSH** | `ssh root@10.0.0.25`，密码 `Nway@2025` |
+| **sipp** | `/usr/bin/sipp` 3.5.0 |
+| **Python** | 2.7.5 |
+| **Rust** | rustc 1.98.1 |
+| **脚本目录** | `/home/NSBC/` |
+
+### 1.3 压测机 2 - 10.0.0.120（可选，推荐跨机）
+
+| 项 | 值 |
+|----|----|
+| **OS** | CentOS 7 |
+| **SSH** | `ssh root@10.0.0.120`，密码 `Nway@20266` |
 | **sipp** | `/usr/bin/sipp` 3.5.0 |
 | **Python** | 2.7.5 |
 | **Rust** | rustc 1.98.1 |
@@ -1074,3 +1086,279 @@ testing/20261031/
 ├── RELAY_C{30,50,100,200,300}.log
 └── nsbc_matrix_20261031.tar.gz # 远程完整归档
 ```
+
+---
+
+## 13. 三机拓扑部署（2026-11-02）⭐ 当前生产测试用
+
+> **动机**: 原来的双机拓扑（UAC + UAS 都在 10.0.0.25）BYPASS 模式 RTP 走本机 loopback，
+> 压测结果偏乐观。三机拓扑让 UAS 独立到 10.0.0.120，RTP 跨机器，更接近真实生产。
+
+### 13.1 三机拓扑图
+
+```
+┌────────────────────┐          ┌────────────────────┐          ┌────────────────────┐
+│  10.0.0.25         │          │  10.0.0.80         │          │  10.0.0.120        │
+│  CentOS 7           │          │  Debian 12 (nsbc)  │          │  CentOS 7           │
+│  sipp 3.5.0        │          │  nsbcd 2.6.0       │          │  sipp 3.5.0        │
+│                    │          │  nsbc-web          │          │                    │
+│  角色: 纯 UAC       │──SIP──→ │                    │──trunk──→│  角色: 纯 UAS       │
+│  主叫发起 INVITE    │ 5091+→5080 │ 信令处理 + 媒体桥    │ 5080    │ 自动应答 + RTP      │
+│                    │          │                    │          │                    │
+└────────────────────┘          └────────────────────┘          └────────────────────┘
+        │                                                               │
+        └──────── RTP BYPASS: 10.0.0.25 ↔ 10.0.0.120 直连 ────────────┘
+                          （RELAY: 中间绕经 10.0.0.80:10000-59999）
+```
+
+### 13.2 机器角色对照表
+
+| IP | OS | 角色 | sipp 版本 | 目录 | 密钥 |
+|----|----|------|-----------|------|------|
+| **10.0.0.80** | Debian 12 | NSBC 核心 | 3.8.0 | `/home/github/nsbc` | `-p 22322 root / Nway@2025` |
+| **10.0.0.25** | CentOS 7 | UAC 主叫 | 3.5.0 | `/home/NSBC/sip_triple` | `root / Nway@2025` |
+| **10.0.0.120** | CentOS 7 | UAS 被叫 | 3.5.0 | `/home/NSBC/sip_triple` | `root / Nway@20266` |
+
+> ✅ **三台均已同步** `testing/sip/20261031/` 到 `/home/NSBC/sip_triple/`，包含所有 `.sh` / `.xml` / `pcap/g711a.pcap`。
+
+### 13.3 一次性配置变更（只做一次）
+
+#### ① DB — trunk 目标改为 UAS 机器
+
+```sql
+-- SSH 到 10.0.0.80
+cd /home/github/nsbc
+
+-- 查看当前
+sqlite3 db/web.db "SELECT id, name, host, port FROM trunks WHERE name='sipp_terminator';"
+
+-- 改到新 UAS
+sqlite3 db/web.db "UPDATE trunks SET host='10.0.0.120', port=5080 WHERE name='sipp_terminator';"
+
+-- 验证 dialplan 指向 trunk（应已是 trunk:sipp_terminator，不动）
+sqlite3 db/web.db "SELECT id, name, target, action_json FROM dialplan_rules WHERE target LIKE '%sipp%' OR layer='ext';"
+```
+
+#### ② nsbc.yaml — outbound trunk host 同步
+
+```yaml
+# conf/nsbc.yaml，确认/修改:
+outbound:
+  register_trunks: "sipp_terminator"
+  trunk:
+    sipp_terminator:
+      host: "10.0.0.120"    # ← 原来 10.0.0.25
+      port: "5080"
+```
+
+#### ③ nsbc-web 推 trunk JSON reload（⚠️ 不能用 plain reload）
+
+```bash
+python3 -c "
+import socket, json
+trunk_json = json.dumps([{
+    'name':'sipp_terminator','profile_name':'external','kind':0,'proto':0,
+    'host':'10.0.0.120','port':5080,'enabled':True,'weight':1,'priority':1
+}])
+s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+s.connect('/var/run/nsbc/control.sock')
+s.sendall(('trunks.reload '+trunk_json).encode())
+print(s.recv(4096).decode())
+s.close()
+"
+```
+
+#### ④ 重启 nsbcd
+
+```bash
+pkill -9 nsbcd; sleep 2
+nohup bash -c 'ulimit -c unlimited && cd /home/github/nsbc && exec ./build/nsbcd -c conf/nsbc.yaml' \
+  > /tmp/bcd.log 2>&1 &
+sleep 15
+pgrep -a nsbcd && echo "✅ nsbcd alive" || echo "❌ CRASHED"
+```
+
+### 13.4 启动顺序（强制）
+
+```
+① 10.0.0.80: nsbc-web → ② 10.0.0.80: nsbcd → ③ 10.0.0.120: sipp UAS → ④ 10.0.0.25: sipp UAC
+```
+
+#### ①② nsbcd（复用 §3.3，不动）
+
+```bash
+# 10.0.0.80
+cd /home/github/nsbc
+nohup ./nsbc-web > /tmp/web.log 2>&1 &
+sleep 25
+nohup bash -c 'ulimit -c unlimited && exec ./build/nsbcd -c conf/nsbc.yaml' > /tmp/bcd.log 2>&1 &
+sleep 15
+pgrep -a nsbc-web && pgrep -a nsbcd
+ls /var/run/nsbc/data.sock /var/run/nsbc/control.sock
+```
+
+#### ③ 10.0.0.120 启 UAS
+
+```bash
+# 10.0.0.120
+ssh root@10.0.0.120
+
+# 清旧进程
+pkill -9 -f sipp 2>/dev/null
+ss -ulnp | grep :5080 && echo "⚠️ 5080 busy" || echo "✅ 5080 free"
+
+# 启动（在脚本目录下，因为 XML 里 pcap/ 是相对路径）
+cd /home/NSBC/sip_triple
+nohup sipp -sf nsbc_uas.xml -p 5080 -m 999999 -trace_err > /tmp/uas.log 2>&1 &
+sleep 3
+pgrep -a sipp && ss -ulnp | grep :5080
+# tail -f /tmp/uas.log   # 看日志
+```
+
+#### ④ 10.0.0.25 启 UAC + 跑压测
+
+```bash
+# 10.0.0.25
+ssh root@10.0.0.25
+
+# 清旧进程
+pkill -9 -f sipp 2>/dev/null
+
+# sanity 10 calls
+cd /home/NSBC/sip_triple
+sipp 10.0.0.80:5080 -s 12345 -sn uac -p 5095 -m 10 -r 5 -d 3s -trace_err
+# 预期: Successful call: 10 / 10 ✅
+```
+
+### 13.5 三机 Sanity Gate（矩阵前必须全部勾过）
+
+| # | 检查 | 在哪个机器 | 命令 | 期望 |
+|---|------|-----------|------|------|
+| **S1** | UAS 5080 UDP 监听 | 10.0.0.120 | `ss -ulnp \| grep :5080` | 有 sipp pid |
+| **S2** | UAC → nsbcd SIP UDP 可达 | 10.0.0.25 | `timeout 2 nc -uz 10.0.0.80 5080` | exit 0 |
+| **S3** | nsbcd → UAS SIP UDP 可达 | 10.0.0.80 | `timeout 2 nc -uz 10.0.0.120 5080` | exit 0 |
+| **S4** | nsbcd trunk 正确指向 | 10.0.0.80 | sqlite3 trunks 表 `host=10.0.0.120` | 确认 |
+| **S5** | BYPASS sanity 10 calls | 10.0.0.25 | 13.4 步骤 ④ | **10/10 ✅** |
+| **S6** | BYPASS RTP 跨机连通 | 10.0.0.120 | 跑 S5 同时 `timeout 5 tcpdump -n udp port range 10000-59999 -c 5` | 看到来自 10.0.0.25 的 RTP 包 |
+| **S7** | RELAY sanity 10 calls | 10.0.0.25 | 切 RELAY 后重跑 S5 | **10/10 ✅** |
+| **S8** | RELAY RTP 经 NSBC | 10.0.0.80 | 跑 S7 同时 `timeout 5 tcpdump -n udp port range 10000-59999 -c 5` | 看到 RTP 包 |
+
+> ⚠️ **S6 是三机拓扑独有的关键检查** — BYPASS 模式 RTP 从 10.0.0.25 本机 loopback 变成 10.0.0.25 ↔ 10.0.0.120 跨机直连。如果两台 CentOS 间有防火墙挡 RTP，会出现"呼叫接通但听不到声音"但 SIP 信令依然正常的情况。
+
+### 13.6 压测矩阵执行
+
+#### BYPASS 矩阵（默认 action_json={}，RTP 双方直连）
+
+```bash
+# 在 10.0.0.25 执行
+ssh root@10.0.0.25
+cd /home/NSBC/sip_triple
+
+# 用 run_matrix.sh
+bash run_matrix.sh bypass "30 100 300 800 1200 1600"
+
+# 或者直接 sipp 命令模板:
+for cps in 30 100 300 800 1200 1600; do
+  port=$((5100 + ${#cps}))
+  echo "▶ BYPASS C${cps}"
+  sipp 10.0.0.80:5080 -s 12345 -sn uac -p ${port} -r ${cps} -d 30s -trace_err \
+    2>&1 | tee /tmp/nsbc_sip/bypass_C${cps}.log
+  ssh -p 22322 root@10.0.0.80 \
+    "echo -n 'nsbcd alive: '; pgrep nsbcd || echo CRASHED; sqlite3 db/web.db 'SELECT count(*) FROM cdr;'" \
+    2>&1 | tee -a /tmp/nsbc_sip/bypass_C${cps}_metrics.txt
+  sleep 3
+done
+```
+
+#### 切 RELAY + 跑 RELAY 矩阵
+
+```bash
+# ① 10.0.0.80 切模式（SSH 过去）
+ssh -p 22322 root@10.0.0.80
+cd /home/github/nsbc
+sqlite3 db/web.db "UPDATE dialplan_rules SET action_json='{\"media_mode\":2}' WHERE layer='ext' AND enabled=1;"
+# 重启 nsbcd（最可靠的 reload）
+pkill -9 nsbcd; sleep 2
+nohup bash -c 'ulimit -c unlimited && cd /home/github/nsbc && exec ./build/nsbcd -c conf/nsbc.yaml' > /tmp/bcd.log 2>&1 &
+sleep 15 && pgrep nsbcd && echo "✅ RELAY mode"
+
+# ② 10.0.0.25 跑矩阵
+ssh root@10.0.0.25
+cd /home/NSBC/sip_triple
+bash run_matrix.sh relay "30 100 300"
+
+# ③ 跑完切回 BYPASS
+ssh -p 22322 root@10.0.0.80
+cd /home/github/nsbc
+sqlite3 db/web.db "UPDATE dialplan_rules SET action_json='{}' WHERE layer='ext' AND enabled=1;"
+pkill -9 nsbcd; sleep 2
+nohup bash -c 'ulimit -c unlimited && cd /home/github/nsbc && exec ./build/nsbcd -c conf/nsbc.yaml' > /tmp/bcd.log 2>&1 &
+```
+
+### 13.7 三机 vs 原双机行为差异
+
+| 维度 | 原双机 (UAC+UAS 10.0.0.25) | 新三机 (UAC 25 / UAS 120) |
+|------|---------------------------|--------------------------|
+| **BYPASS RTP** | 10.0.0.25 本机 loopback → 零延迟 | 10.0.0.25 ↔ 10.0.0.120 跨机 → 有真实 RTT |
+| **RELAY RTP** | 25→80→25 同机绕出 | 25→80→120 真实三角路径 |
+| **trunk host** | `10.0.0.25:5080` | `10.0.0.120:5080` |
+| **压测机 CPU** | UAC + UAS 抢同一台 | 分散 → 更接近 nsbcd 真实极限 |
+| **防火墙风险** | 无（loopback） | BYPASS RTP 需确认 25↔120 UDP 不挡 |
+| **CDR/RTP 观测点** | 只在 25 上 | 80 (nsbcd) / 120 (UAS) 都能看 |
+
+### 13.8 已知坑（三机新增）
+
+| # | 坑 | 根治 |
+|---|----|------|
+| **T1** | 10.0.0.25 上残留旧 sipp UAS（pid=23252 占了 5080） | `pkill -9 -f sipp`；新角色是纯 UAC，不需要 UAS 在这台跑 |
+| **T2** | trunk 只改 DB 不改 YAML → 重启后 route_table 空 | 必须同时改 `nsbc.yaml outbound.trunk.sipp_terminator.host` |
+| **T3** | 只用 plain `reload` 推 trunk → route_table 不更新 | 用 Python AF_UNIX 发 `trunks.reload <json>`（见 §13.3 ③） |
+| **T4** | UAS 启动不在脚本目录 → `pcap/g711a.pcap` 找不到 | sipp `<mng file="pcap/g711a.pcap">` 按自己 CWD 解析，必须 `cd sip_triple` 后启 |
+| **T5** | BYPASS RTP 跨机不通但 SIP 信令正常 | 必须过 Sanity Gate S6（tcpdump 看 25→120 的 RTP） |
+| **T6** | **sipp 3.5.0 不支持 `<mng>` 标签！** 自定义 `nsbc_uas.xml` 秒退 `Unknown element 'mng'` | UAS **改用内置场景** `-sn uas -p 5060 -m 999999`，不带 `<mng>`，sipp 3.5.0 原生兼容 |
+| **T7** | trunk SQL `UPDATE` 时 `REPLACE()` / `regexp` 在 sqlite3 不可用 | 用 Python 单行字符串替换修 YAML；trunk name 用简单 `UPDATE trunks SET name='sipp_terminator' WHERE id=1` |
+| **T8** | nsbcd 监听 **UDP 5060**（不是 5080！） | `ss -tulnp | grep nsbcd` 确认端口；sipp 命令统一用 `10.0.0.80:5060` |
+
+### 13.10 部署验证结果（2026-11-02 下午）
+
+| 项 | 结果 |
+|----|------|
+| **BYPASS sanity 10 calls** | **10 / 10 ✅** |
+| **UAC → nsbcd** | ✅ UDP 5060 可达 |
+| **nsbcd trunk → UAS** | ✅ 10.0.0.120:5060 |
+| **UAS 场景** | `-sn uas`（内置，sipp 3.5.0 兼容） |
+| **sipp 最终面板** | INVITE 10→100 10→200 10→BYE 10→200 10，0 Timeout，0 Retrans |
+| **nsbcd CDR** | 有增长（calls + cdr 正常写入） |
+| **nsbcd 存活** | PID 3700002，无 crash |
+
+**实际启动命令**:
+```bash
+# 10.0.0.120 UAS
+nohup sipp -sn uas -p 5060 -m 999999 > /tmp/uas.log 2>&1 &
+
+# 10.0.0.25 UAC sanity
+sipp 10.0.0.80:5060 -s 12345 -sn uac -p 5095 -m 10 -r 5 -d 1s -trace_err
+```
+
+### 13.9 文件清单
+
+三机同步的脚本目录 `/home/NSBC/sip_triple/`:
+
+```
+/home/NSBC/sip_triple/
+├── nsbc_uac_bypass.xml     # UAC BYPASS 场景（带 RTP 收发）
+├── nsbc_uac_relay.xml      # UAC RELAY 场景
+├── nsbc_uac_simple.xml     # 纯信令场景
+├── nsbc_uas.xml            # UAS 被叫应答场景（带 RTP）
+├── nsbc_register.xml       # REGISTER XML 场景
+├── pcap/
+│   └── g711a.pcap          # G.711A PCMA 语音流 ≈ 7.3s
+├── run_uac.sh              # UAC 启动脚本（env NSBCD_IP/NSBCD_PORT 覆盖）
+├── run_uas.sh              # UAS 启动脚本（env UAS_PORT 覆盖）
+├── run_sanity.sh           # 一键 sanity gate
+├── run_matrix.sh           # 一键压测矩阵
+└── switch_mode.sh          # DB BYPASS ↔ RELAY 切换
+```
+
+> **⚠️ 2026-11-02 实测**: 两台 CentOS 7 均为 **sipp v3.5.0-PCAP-RTPSTREAM**（支持 RTP 媒体流）。
+> 10.0.0.80 上 sipp 是 3.8.0（Debian 自带），但本机不跑压测，只用跨机 sipp。
