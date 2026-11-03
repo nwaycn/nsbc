@@ -44,6 +44,7 @@
 #include <errno.h>
 
 /* ---- 前向声明：封禁表核心（sec_reg_cb 先于定义使用） ---- */
+static int  ban_is_private_ip(const char *ip_str); /* 私网/loopback — 跳过 auto-ban */
 static int  ban_is_banned(const char *ip);
 static int  ban_note_fail(const char *ip);
 static int  ban_note_reg_req(const char *ip);
@@ -1388,6 +1389,7 @@ static uint32_t ban_duration_for_strikes(uint32_t base_s, int strikes)
  * 返回 1=本次上报触发了封禁。 */
 static int ban_note_fail(const char *ip)
 {
+    if (ban_is_private_ip(ip)) return 0;
     uint64_t now = nsbc_now_ms();
     int banned_now = 0;
     pthread_mutex_lock(&g_ban_lock);
@@ -1425,6 +1427,7 @@ static int ban_note_fail(const char *ip)
  * 阈值/窗口从 g_cfg 读（init / Web reload 均可调整）。 */
 static int ban_note_reg_req(const char *ip)
 {
+    if (ban_is_private_ip(ip)) return 0;
     uint64_t now = nsbc_now_ms();
     int banned_now = 0;
     int window_s = g_cfg.ratelimit_window_s > 0 ? g_cfg.ratelimit_window_s : 60;
@@ -1459,6 +1462,37 @@ static int ban_note_reg_req(const char *ip)
     return banned_now;
 }
 
+/* 检测 IPv4 私网段 / loopback —— 这些 IP 属于内部分机/网关/自连通，
+ * auto-ban 不应该对内网 IP 生效（用户误触发 flood 直接封 3600s）。
+ *
+ * 覆盖：
+ *   10.0.0.0/8       — Class A 私网
+ *   172.16.0.0/12    — Class B 私网
+ *   192.168.0.0/16   — Class C 私网
+ *   127.0.0.0/8      — loopback
+ *   169.254.0.0/16   — link-local（ZTA / 云实例常见）
+ *
+ * IPv6 auto-ban 暂未实现，所以只做 v4。返回 1=私网, 0=公网。 */
+static int ban_is_private_ip(const char *ip_str)
+{
+    if (!ip_str || !ip_str[0]) return 0;
+    uint32_t ip;
+    if (ipv4_to_uint32(ip_str, &ip) != 0) return 0;
+
+    /* 所有比较用网络字节序（ipv4_to_uint32 已保证） */
+    /* 127.0.0.0/8  — loopback */
+    if ((ip & 0xff000000u) == 0x7f000000u) return 1;
+    /* 10.0.0.0/8   — Class A private */
+    if ((ip & 0xff000000u) == 0x0a000000u) return 1;
+    /* 172.16.0.0/12 — Class B private (172.16.0.0 ~ 172.31.255.255) */
+    if ((ip & 0xfff00000u) == 0xac100000u) return 1;
+    /* 192.168.0.0/16 — Class C private */
+    if ((ip & 0xffff0000u) == 0xc0a80000u) return 1;
+    /* 169.254.0.0/16 — link-local */
+    if ((ip & 0xffff0000u) == 0xa9fe0000u) return 1;
+    return 0;
+}
+
 /* INVITE/REGISTER 事务层分配失败 ratelimit：与 REGISTER ratelimit 共用窗口秒，
  * 阈值由 ratelimit_invites 控制（默认 30，设 0 关闭）。
  * b2bua 在 txn_server_input 返回负码（slab 满/NOMEM/NOSPC）时调此函数。
@@ -1467,6 +1501,7 @@ static int ban_note_reg_req(const char *ip)
 static int ban_note_inv_fail(const char *ip)
 {
     if (!g_cfg.auto_ban) return 0;
+    if (ban_is_private_ip(ip)) return 0;
     int window_s = g_cfg.ratelimit_window_s > 0 ? g_cfg.ratelimit_window_s : 60;
     int thr = g_cfg.ratelimit_invites > 0 ? g_cfg.ratelimit_invites : 30;
     if (thr <= 0) return 0;
@@ -1510,6 +1545,7 @@ static int ban_note_inv_fail(const char *ip)
 static int ban_note_inv_count(const char *ip)
 {
     if (!g_cfg.auto_ban) return 0;
+    if (ban_is_private_ip(ip)) return 0;
     int window_s = g_cfg.ratelimit_window_s > 0 ? g_cfg.ratelimit_window_s : 60;
     int thr = g_cfg.ratelimit_invites_active > 0 ? g_cfg.ratelimit_invites_active : 20;
     if (thr <= 0) return 0;
@@ -1563,9 +1599,12 @@ static void ban_clear_counts(const char *ip)
     pthread_mutex_unlock(&g_ban_lock);
 }
 
-/* 封禁查询：1=封禁中（顺手刷新 last_act 供驱逐参考） */
+/* 封禁查询：1=封禁中（顺手刷新 last_act 供驱逐参考）
+ * 私网 IP 跳过 —— auto-ban 不应封内网（用户误触发 flood 直接封 3600s 很坑）。
+ * 管理员手动配 blacklist 里的内网 IP 仍能通过 bl_ip_match 生效。 */
 static int ban_is_banned(const char *ip)
 {
+    if (ban_is_private_ip(ip)) return 0;
     uint64_t now = nsbc_now_ms();
     int hit = 0;
     pthread_mutex_lock(&g_ban_lock);

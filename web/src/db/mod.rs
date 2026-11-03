@@ -5119,6 +5119,17 @@ impl Db {
         Ok(res.rows_affected() > 0)
     }
 
+    /// Count enabled extensions (O(1) vs list_enabled_extensions's O(n)).
+    /// Used by cfg.pull_all to decide whether to include extensions in the
+    /// batch payload — >5000 extensions × ~140B = 12MB exceeds NSBC_MAX_FRAME.
+    pub async fn count_enabled_extensions(&self) -> Result<i64, sqlx::Error> {
+        let Some(pool) = self.pool() else { return Ok(0); };
+        let n = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM extensions WHERE enabled = 1"
+        ).fetch_one(pool).await?;
+        Ok(n)
+    }
+
     /// Export all enabled extensions (bulk-push into core via extensions.reload UDS command).
     pub async fn list_enabled_extensions(&self) -> Result<Vec<Extension>, sqlx::Error> {
         let Some(pool) = self.pool() else { return Ok(Vec::new()); };

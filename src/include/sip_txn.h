@@ -134,6 +134,9 @@ const char *txn_first_request(const sip_txn_t *t, size_t *len);
 txn_state_t txn_state(const sip_txn_t *t);
 txn_kind_t txn_kind(const sip_txn_t *t);
 const nsbc_sa_t *txn_peer(const sip_txn_t *t);
+/* 事务创建时捕获的本地入向监听端口（UDP 5060/5080 等）；
+ * WS/WSS 入向场景为 0。供 registrar.c 等模块按端口匹配 profile 用。 */
+uint16_t txn_local_port(const sip_txn_t *t);
 void *txn_ud(const sip_txn_t *t);
 void txn_set_ud(sip_txn_t *t, void *ud);
 void txn_set_tu(sip_txn_t *t, txn_tu_fn tu);

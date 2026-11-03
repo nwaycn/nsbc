@@ -5704,18 +5704,58 @@ void b2b_on_rx(void *ud, sip_tr_proto_t proto, const nsbc_sa_t *src,
                 llog(LOG_DEBUG, "b2b", "profile match by ip → %s", prof->name);
         }
 
-        /* ---- Phase 2: ACL 判定 ---- */
+        /* ---- Phase 2: ACL 判定 ----
+         * 黑名单全域防御（任何 profile 配置的黑名单都挡，防扫描器），
+         * 白名单仅检查 Phase 1 已归属的 profile ——
+         *
+         * 之前白名单也是全域扫描 sip_profile_match_src(ip, &verdict)，
+         * 导致典型故障：external whitelist 清空后 internal whitelist 变成
+         * 全域网关，10.0.0.163 等非本机 IP（虽然从 5060 进来正确归属
+         * internal，但不在 internal whitelist）被 silently drop，连 401
+         * challenge 都收不到。Python stress 绑 127.0.0.1 刚好在 whitelist
+         * 里所以没暴露。
+         *
+         * 修正：
+         *   黑名单 → 全域（防御性，任何 profile 命中都 DROP）
+         *   白名单 → 只看 Phase 1 归属的 profile
+         *            归属 profile whitelist 为空 → ACCEPT
+         *            Phase 1 没归属 → fallback 全域检查（WS/WSS 等场景） */
         int verdict = SIP_IP_ACCEPT;
-        (void)sip_profile_match_src(ip, &verdict); /* 黑名单/白名单全域检查 */
+
+        /* 2a. 黑名单：全域扫描 — 复用 sip_profile_match_src 的 DROP 判定 */
+        int full_v = SIP_IP_ACCEPT;
+        (void)sip_profile_match_src(ip, &full_v);
+        if (full_v == SIP_IP_DROP) {
+            verdict = SIP_IP_DROP;
+        } else if (!prof) {
+            /* Phase 1 无归属 profile（WS/WSS 桥、共享端口等）→ 兜底全域 */
+            verdict = full_v;
+        }
+        /* Phase 1 已归属 profile → 忽略全域 REJECT（那是其他 profile
+         * 配了 whitelist 但 IP 没命中其他 profile — 不该挡）*/
+
+        /* 2b. 白名单：只检查 Phase 1 归属的 profile */
+        if (verdict == SIP_IP_ACCEPT && prof
+            && prof->ip_whitelist[0] != '\0') {
+            if (!sip_ip_in_cidr_list(prof->ip_whitelist, ip)) {
+                verdict = SIP_IP_REJECT;
+                llog(LOG_NOTICE, "b2b",
+                     "profile ACL reject %.*s from %s — IP not in whitelist of '%s' (silent, no response)",
+                     (int)m.method_str.len, m.method_str.p, ip, prof->name);
+                return;
+            }
+        }
+
         if (verdict == SIP_IP_DROP) {
             llog(LOG_INFO, "b2b",
-                 "profile ACL drop %.*s from %s (silent)",
+                 "profile ACL drop %.*s from %s (blacklist hit, silent)",
                  (int)m.method_str.len, m.method_str.p, ip);
             return;
         }
         if (verdict == SIP_IP_REJECT) {
+            /* 兜底：Phase 1 无归属 profile 时全域 REJECT */
             llog(LOG_NOTICE, "b2b",
-                 "profile ACL reject %.*s from %s (silent, no response)",
+                 "profile ACL reject %.*s from %s (no profile whitelist hit, silent)",
                  (int)m.method_str.len, m.method_str.p, ip);
             return;
         }

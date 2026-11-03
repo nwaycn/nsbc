@@ -492,18 +492,25 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
         }
     }
 
-    /* P2-XX External profile REGISTER guard：
-     * external profile (auth_calls=0) 设计用途是接 SIP 中继/DID 的 INVITE，
-     * 不接受 USER-Agent 的 REGISTER（类似 FreeSWITCH public.xml）。
-     * 返回 403 Forbidden（不是 silent drop），让 UA 立即放弃，
-     * 避免客户端等 32s 超时；同时 403 明确告知"此 profile 不接受注册"，
-     * 与"真的没这个用户"的场景（401/403 auth fail）区分开。 */
+    /* P2-XX Profile 归属 + external REGISTER guard：
+     * 与 INVITE 入口 (b2bua.c:5692) 保持一致 — 先按入端口匹配 profile，
+     * 再 fallback 到源 IP 白名单匹配。之前只用 sip_profile_match_src 按 IP
+     * 匹配，当 internal/external 两个 profile 的 whitelist 都包含 127.0.0.1
+     * 时，数组遍历第一个命中 external (auth_calls=0) → 所有 REGISTER 被 403，
+     * 导致 Python stress / sipp 都无法触发 401 challenge。
+     *
+     * 端口语义：5060=internal (auth_calls=1, 接受 REGISTER)
+     *          5080=external (auth_calls=0, 接受中继 INVITE 但不接受 UA REGISTER)
+     *          WS/WSS 入向 txn->local_port 为 0，此时 fallback 到 IP 匹配。 */
     {
-        const sip_profile_t *prof = sip_profile_match_src(src_ip, NULL);
+        uint16_t in_port = txn_local_port(txn);
+        const sip_profile_t *prof = sip_profile_match_port(in_port, 0);
+        if (!prof)
+            prof = sip_profile_match_src(src_ip, NULL);
         if (prof && prof->auth_calls == 0) {
             llog(LOG_WARN, "reg",
-                 "REGISTER 403: external profile '%s' does not accept registrations, src=%s",
-                 prof->name, src_ip);
+                 "REGISTER 403: external profile '%s' does not accept registrations, src=%s in_port=%u",
+                 prof->name, src_ip, in_port);
             respond(r, proto, src, m, 403,
                     "External profile does not accept registrations",
                     NULL, 0, txn);

@@ -977,6 +977,7 @@ const char *txn_first_request(const sip_txn_t *t, size_t *len)
 txn_state_t txn_state(const sip_txn_t *t) { return t->state; }
 txn_kind_t txn_kind(const sip_txn_t *t) { return t->kind; }
 const nsbc_sa_t *txn_peer(const sip_txn_t *t) { return &t->peer; }
+uint16_t txn_local_port(const sip_txn_t *t) { return t ? t->local_port : 0; }
 void *txn_ud(const sip_txn_t *t) { return t->ud; }
 void txn_set_ud(sip_txn_t *t, void *ud) { t->ud = ud; }
 void txn_set_tu(sip_txn_t *t, txn_tu_fn tu) { t->tu = tu; }

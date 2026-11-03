@@ -361,19 +361,22 @@ async fn dispatch_cmd_req<C: crate::coreclient::CoreApi + Clone + Send + Sync + 
             }).to_string())
         }
         /* ---- cfg.pull_all：C core 启动/reload 时拉全量 enabled 配置表 ----
-         * C 侧发 {"cmd":"cfg.pull_all"}，返回所有需要 reload 的 enabled 行 JSON。
-         * Rust 侧复用 sync.rs 的 DTO 转换（ExtSyncDto 脱敏 HA1-only；
-         * QueueSyncDto 展开 members_json；security_blacklist 返回含 fence_mode 等的 object）。
-         * C 侧 cfg_sync.c 按 key 分别调各模块的 _reload_json()。 */
+         * C 侧发 {"cmd":"cfg.pull_all"}，返回小表的 enabled 行 JSON。
+         *
+         * 大表（extensions）不分发在此通道：
+         *   90000 extensions × ~140B = 12.6MB → 超过 NSBC_MAX_FRAME → 无限
+         *   frame-len-invalid loop。extensions 走独立的 extensions.reload 推送。
+         *
+         * C 侧 cfg_sync.c accept_missing=1 已容忍 extensions key 缺失。
+         * 其他 7 张小表（gateways/trunks/dprules/profiles/queues/ivr_menus/
+         * security_blacklist）加起来 < 100KB，UDS 单帧完全装得下。 */
         "cfg.pull_all" => {
             if state.db.pool().is_none() {
                 return Ok(serde_json::json!({"ok": false, "reason": "db_not_ready"}).to_string());
             }
-            // --- extensions: 脱敏（HA1-only，复用 sync.rs 的 ExtSyncDto）---
-            let ext_rows = state.db.list_enabled_extensions().await.unwrap_or_default();
-            let extensions: Vec<_> = ext_rows.iter()
-                .map(crate::sync::ExtSyncDto::from)
-                .collect();
+            // 大表 extensions 不分发（走独立 extensions.reload）
+            let ext_count = state.db.count_enabled_extensions().await.unwrap_or(0);
+            let large_ext = ext_count > 5000;
 
             // --- gateways ---
             let gateways = state.db.list_enabled_gateways().await.unwrap_or_default();
@@ -425,7 +428,8 @@ async fn dispatch_cmd_req<C: crate::coreclient::CoreApi + Clone + Send + Sync + 
             });
 
             tracing::info!(
-                extensions = extensions.len(),
+                ext_total = ext_count,
+                ext_in_response = if large_ext { "skipped(large)" } else { "included" },
                 gateways = gateways.len(),
                 trunks = trunks.len(),
                 dprules = dprules.len(),
@@ -435,9 +439,17 @@ async fn dispatch_cmd_req<C: crate::coreclient::CoreApi + Clone + Send + Sync + 
                 security_rules = bl_dtos.len(),
                 "cfg.pull_all requested by C core"
             );
-            Ok(serde_json::json!({
+
+            // 大表 extensions 从拉取通道剥离，走独立 extensions.reload
+            let extensions_payload: Option<Vec<_>> = if large_ext {
+                None
+            } else {
+                let ext_rows = state.db.list_enabled_extensions().await.unwrap_or_default();
+                Some(ext_rows.iter().map(crate::sync::ExtSyncDto::from).collect())
+            };
+
+            let mut resp = serde_json::json!({
                 "ok": true,
-                "extensions": extensions,
                 "gateways": gateways,
                 "trunks": trunks,
                 "dialplan_rules": dprules,
@@ -445,7 +457,13 @@ async fn dispatch_cmd_req<C: crate::coreclient::CoreApi + Clone + Send + Sync + 
                 "queues": queues,
                 "ivr_menus": ivr_menus,
                 "security_blacklist": security_blacklist,
-            }).to_string())
+            });
+            if let Some(ext) = extensions_payload {
+                resp["extensions"] = serde_json::json!(ext);
+            } else {
+                resp["extensions_large_skipped"] = serde_json::json!(true);
+            }
+            Ok(resp.to_string())
         }
         "" => Ok(serde_json::json!({"ok": false, "reason": "bad_request"}).to_string()),
         _ => {
