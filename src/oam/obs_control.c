@@ -113,14 +113,42 @@ static int obs_control_sub_send(void *conn, const void *data, size_t len)
     return 0;  /* 全部发送成功 */
 }
 
+/* 命令回复写入（RESPONSE，非订阅推送）：
+ * - MSG_DONTWAIT：fd 本身是 SOCK_NONBLOCK 的，但显式加位防任何 block 路径
+ * - ECONNRESET/EPIPE：客户端已 close（正常断连/超时取消），标记 fd=-1 让
+ *   dispatch 末尾的 nsbc> prompt 也静默跳过，由 on_conn_event EPOLLIN 分支
+ *   下次 recv EOF 时统一释放——不在这里 free，避免 dispatch 返回后 UAF
+ * - EAGAIN：UDS kernel buffer 满（极罕见，UDS 默认 >=128KB），直接 return
+ *   丢帧（命令回复场景不持久保留帧，不像订阅推送有 ring）
+ * - 其他错误：打 WARN 日志方便排查 */
 static void ctl_write(ctl_conn_t *c, const char *p, size_t n)
 {
+    if (!c || c->fd < 0) return;
     while (n) {
-        ssize_t w = send(c->fd, p, n, MSG_NOSIGNAL);
-        if (w <= 0)
-            return;
-        p += w;
-        n -= (size_t)w;
+        ssize_t w = send(c->fd, p, n, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (w > 0) {
+            p += w;
+            n -= (size_t)w;
+            continue;
+        }
+        if (errno == ECONNRESET || errno == EPIPE) {
+            /* 客户端已关闭（常见于 Rust 端 HTTP handler 超时主动 cancel）
+             * 回复在 kernel buffer 还剩的部分也送不出去了，静默标记 fd=-1 */
+            llog(LOG_INFO, "oam",
+                 "ctl_write fd=%d peer closed (errno=%d) — reply dropped (client cancelled/timeout)",
+                 c->fd, errno);
+            c->fd = -1;
+        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            /* 理论上 SOCK_NONBLOCK fd 不会走到这里；UDS EAGAIN 极罕见
+             * 命令回复场景不像订阅推送有持久 ring，直接丢 */
+            llog(LOG_DEBUG, "oam",
+                 "ctl_write fd=%d EAGAIN — %zu bytes dropped", c->fd, n);
+        } else {
+            llog(LOG_WARN, "oam",
+                 "ctl_write fd=%d send failed errno=%d (%s) — %zu bytes dropped",
+                 c->fd, errno, strerror(errno), n);
+        }
+        return;
     }
 }
 

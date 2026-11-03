@@ -93,6 +93,12 @@ typedef struct cnode {
      * 转发 continue（避免对端也收到 RFC4733 包重复解析）。 */
     uint8_t   dtmf_pt[2];     /* 每侧 telephone-event PT；0=未协商 */
     void     *dtmf_rx[2];    /* dtmf_rx_t* 每侧去重器；0=未创建 */
+    /* ★ re-INVITE media_update 方向门控 — bridge_confirm 每次被调用时
+     * 从新 SDP 解析填入，relay_recv_one 转发前读取：
+     *   dir[X]=SENDONLY(3)/SENDRECV(2) → X 能发 RTP → 允许
+     *   dir[X]=RECVONLY(4)/INACTIVE(5) → X 不能发/hold → 丢包
+     * legacy hold (c=0.0.0.0) 在 bridge_confirm 里强制 INACTIVE */
+    sdp_dir_t dir[2];
 } cnode_t;
 
 typedef struct {
@@ -733,6 +739,20 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
         if (r->node && r->node->precond_active && !r->node->precond_met) {
             ++r->drops;
             continue;
+        }
+
+        /* ★ re-INVITE media_update 方向门控：
+         * side X 发来的 RTP，只有 dir[X] 表明 X 可以发送时才放行。
+         * SENDONLY(3)=只能发不能收 → 能发 RTP → 允许
+         * SENDRECV(2)=收发均可 → 能发 → 允许
+         * RECVONLY(4)=只能收不能发 → 不能发 RTP → 丢
+         * INACTIVE(5)=hold → 丢 */
+        if (r->node) {
+            sdp_dir_t d = r->node->dir[side];
+            if (d == SDP_DIR_INACTIVE || d == SDP_DIR_RECVONLY) {
+                ++r->drops;
+                continue;
+            }
         }
 
         /* REQ-MEDIA-BUG-001：BUG_RAW_RTP + BUG_RTCP_MIRROR 原始帧投递
@@ -3672,6 +3692,38 @@ int bridge_confirm(bridge_mgr_t *m, void *call, const char *offer,
                 dtmf_rx_t *rx = NULL;
                 if (dtmf_rx_create((int)e->dtmf_pt[1], &rx) == NSBC_OK)
                     e->dtmf_rx[1] = rx;
+            }
+        }
+
+        /* ★ re-INVITE media_update：方向门控刷新
+         * bridge_confirm 每次被调用（初始 + re-INVITE re-entry）都会跑这段，
+         * 保证新 SDP 的 hold/unhold/codec renegotiation 立即生效。
+         * side 0 = offer 侧（朝 A leg），side 1 = answer 侧（朝 B leg）。 */
+        {
+            sdp_dir_t nd[2] = { SDP_DIR_SENDRECV, SDP_DIR_SENDRECV };
+            sdp_t sd;
+            if (offer_len > 0) {
+                memset(&sd, 0, sizeof(sd));
+                if (sdp_parse(&sd, offer, offer_len) == NSBC_OK && sd.nmedia > 0) {
+                    nd[0] = sdp_media_effective_dir(&sd, &sd.media[0]);
+                    if (sdp_media_is_legacy_hold(&sd, &sd.media[0]))
+                        nd[0] = SDP_DIR_INACTIVE;
+                }
+            }
+            if (answer_len > 0) {
+                memset(&sd, 0, sizeof(sd));
+                if (sdp_parse(&sd, answer, answer_len) == NSBC_OK && sd.nmedia > 0) {
+                    nd[1] = sdp_media_effective_dir(&sd, &sd.media[0]);
+                    if (sdp_media_is_legacy_hold(&sd, &sd.media[0]))
+                        nd[1] = SDP_DIR_INACTIVE;
+                }
+            }
+            if (nd[0] != e->dir[0] || nd[1] != e->dir[1]) {
+                llog(LOG_INFO, "media",
+                     "★BRIDGE_DIR call=%p dir[0]: %d→%d dir[1]: %d→%d",
+                     call, e->dir[0], nd[0], e->dir[1], nd[1]);
+                e->dir[0] = nd[0];
+                e->dir[1] = nd[1];
             }
         }
 

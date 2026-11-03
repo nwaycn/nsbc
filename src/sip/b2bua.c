@@ -916,6 +916,49 @@ static void tok_from_user(const sip_msg_t *m, char *dst, size_t cap)
     dst[0] = '\0';
 }
 
+/* ---- 通用 dialog leg 匹配 ----
+ * B2BUA 两条腿共享同一个 Call-ID，tbl_find(..., &leg) 只靠 Call-ID
+ * 永远返回先注册的 leg。对话内请求必须额外用 dialog To tag 判定：
+ *
+ *   msg.To tag = 我们这边 dialog local tag = leg[i].loc_tag
+ *
+ * 两条腿 loc_tag 由 nsbc_rand_token 各生成，保证唯一，所以 ttag
+ * 只匹配一条腿。rem_tag 不可靠（WebRTC SIP.js From tag 可能丢失或错），
+ * 不参与匹配。
+ *
+ * ★ CANCEL 例外：RFC 3261 §9.1 规定 CANCEL To 不带 tag — CANCEL
+ * 匹配的是那个 leg 的正在处理的 INVITE，CANCEL handler 单独处理。
+ *
+ * 返回：leg index (0/1) 或 -1（ttag 不匹配任何 loc_tag → 不是这通 call）。 */
+static int find_leg_by_dialog(const b2b_call_t *c, const sip_msg_t *m)
+{
+    char ttag[DLG_TAG_MAX];
+    tok_to_tag(m, ttag, sizeof(ttag));
+    if (!ttag[0])
+        return -1;  /* 无 To tag（CANCEL 等）— 交给调用方特殊处理 */
+    for (int i = 0; i < 2; i++) {
+        if (!c->leg[i].loc_tag[0]) continue;
+        if (!strcmp(ttag, c->leg[i].loc_tag))
+            return i;
+    }
+    return -1;
+}
+
+/* CANCEL 专用 leg 匹配：无 To tag，按哪条腿在 CALLING/EARLY 来判断。
+ * 如果两条腿都在 CALLING/EARLY（极少发生：同时发 INVITE），
+ * 按 tbl_find 先注册的那条（保守 fallback）。 */
+static int find_leg_for_cancel(const b2b_call_t *c, int tbl_leg)
+{
+    int calling0 = (c->leg[0].state == LEG_CALLING ||
+                    c->leg[0].state == LEG_EARLY);
+    int calling1 = (c->leg[1].state == LEG_CALLING ||
+                    c->leg[1].state == LEG_EARLY);
+    if (calling0 && !calling1) return 0;
+    if (calling1 && !calling0) return 1;
+    if (calling0 && calling1)  return tbl_leg;  /* 两条都 EARLY → tbl_find 先注册的 */
+    return tbl_leg;  /* 两条都 CONFIRMED/TERMINATING → fallback */
+}
+
 static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                    void *ud);
 
@@ -1733,12 +1776,7 @@ static void maybe_start_media(b2b_call_t *c)
         return;
     }
 
-    /* ---- originate 单腿模式（leg[1] offer=我们发出，leg[1] answer=收到 2xx）----
-     *
-     * 之前 bridge_confirm 依赖 leg[0].offer_len → originate 模式 leg[0] 没创建
-     * → bridge_confirm 永不调用 → codec transcode/dtmf/precondition 全没初始化。
-     * echo 只需要 relay+echo_mode，不直接依赖 bridge_confirm，但后续转码、
-     * DTMF、precondition 都需要它来 finalize。 */
+    /* ---- originate 单腿模式（leg[1] offer=我们发出，leg[1] answer=收到 2xx）---- */
     if (c->leg[1].offer_len && c->leg[1].answer_len) {
         c->media_done = 1;
         co->cfg.media(c, c->leg[1].offer, c->leg[1].offer_len,
@@ -1747,6 +1785,77 @@ static void maybe_start_media(b2b_call_t *c)
         llog(LOG_INFO, "media", "maybe_start_media: originate mode confirmed");
     }
 }
+
+/* ---- re-INVITE / UPDATE SDP 重协商后的媒体重桥接 ----
+ * 与 maybe_start_media 对称，但：
+ *   1. 强制绕过 media_done（已由调用方清 0）
+ *   2. 两侧 SDP 显式传入（调用方决定当前哪组是最新的）
+ *      语义：sdp0=朝 leg[0] 的最新 SDP，sdp1=朝 leg[1] 的最新 SDP
+ *   3. bridge_confirm 内部识别 relay 已存在 → 只更新 PT/DTMF/direction
+ *      （不重建 relay fd），RTP 会话无缝延续 */
+static void maybe_restart_media(b2b_call_t *c,
+                                const char *sdp0, size_t len0,
+                                const char *sdp1, size_t len1)
+{
+    b2b_core_t *co = c->core;
+    if (!co->cfg.media)
+        return;
+    if (!sdp0 || !len0 || !sdp1 || !len1)
+        return;
+
+    /* ★ 两侧 SDP 齐备 → 重调 bridge_confirm。
+     * bridge_confirm 内部分支：
+     *   e->relay == NULL → 首次建 relay（应该不会走到这里，media_done 之前是 1）
+     *   e->relay != NULL → 更新 pt_allowed / dtmf_pt / direction / transcode
+     *     （不 teardown relay fd，媒体包继续流） */
+    co->cfg.media(c, sdp0, len0, sdp1, len1, co->cfg.media_ud);
+    c->media_done = 1;
+    llog(LOG_INFO, "media",
+         "media_restart: re-INVITE 新 SDP → bridge_confirm 重入 "
+         "sdp0_len=%zu sdp1_len=%zu callid=%s",
+         len0, len1, c->leg[0].callid);
+}
+
+/* 选出 re-INVITE 后传给 bridge_confirm 的两侧 SDP。
+ * 语义：sdp0=朝 leg[0] 的最新 SDP（offer 或 answer），sdp1=朝 leg[1] 的最新。
+ *
+ * 规则（每次 re-INVITE 成功后调用）：
+ *   B 发 re-INVITE → leg[1].offer=新B侧offer, leg[0].answer=新A侧answer
+ *     → sdp0=leg[0].answer, sdp1=leg[1].offer
+ *   A 发 re-INVITE → leg[0].offer=新A侧offer, leg[1].answer=新B侧answer
+ *     → sdp0=leg[0].offer, sdp1=leg[1].answer
+ *
+ * 简化：offer_len > answer_len 的那组是最新的（每次 re-INVITE 重写整个 buffer，
+ * 所以 offer_len/answer_len 都有值，无法直接比较"新"。改用简单的启发：
+ *   如果 leg[1].offer_len > leg[0].offer_len → B 最近发过 re-INVITE
+ *   如果 leg[0].offer_len > leg[1].offer_len → A 最近发过 re-INVITE
+ * 不行 — 两边 offer_len 可能相同。换用 reinv 标志时间戳？也没有。
+ *
+ * ★ 最简单正确方案：re-INVITE 成功后，两侧 offer/answer 都是最新的。
+ *   朝 leg[x] 方向 = leg[x] 上最后一次被写的 SDP。
+ *   re-INVITE handler 写发起腿.offer，cli_tu 写应答腿.answer。
+ *   → 朝 leg[x] 的最新 SDP:
+ *       如果 leg[x].offer_len > 0 且 (leg[x].answer_len == 0 或 最后操作是 offer)
+ *       否则 leg[x].answer
+ *
+ *   我们没有"最后操作"标记。那就：朝 leg[x] 选 leg[x].offer（如果 offer_len > 0
+ *   且 比 leg[x].answer 新 — 无法判断）。
+ *
+ *   ★ 终极简化：offer 和 answer 每次 re-INVITE 都会被覆盖成最新值，
+ *   所以朝 leg[0] 用 leg[0].offer（re-INVITE A 发起时更新了，B 发起时没更新但
+ *   初始 offer 也没问题因为 bridge 只从 offer 提取 codec/port/direction），
+ *   朝 leg[1] 用 leg[1].answer（同理）。
+ *
+ *   等等 — re-INVITE B 发起后 leg[0].offer 是旧的初始 offer，leg[0].answer 是
+ *   新的 A 侧 answer。bridge_confirm 读 leg[0].offer → 拿到旧 offer 里的 codec/port！
+ *   这就错了！
+ *
+ *   ★ 真正的解：不猜。re-INVITE 成功后，发起腿.offer 和应答腿.answer 都是新的。
+ *   我们需要知道哪个腿是"发起腿"。cli_tu 里已经知道了（leg[0].reinv 或
+ *   leg[1].reinv）。在那里直接拼参数：
+ *     B 发起 → sdp0=leg[0].answer, sdp1=leg[1].offer
+ *     A 发起 → sdp0=leg[0].offer, sdp1=leg[1].answer
+ *   这就是为什么我让 maybe_restart_media 显式接收两侧 SDP 参数。 */
 
 /* B 2xx 后向 B 逐跳发 ACK（含 2xx 重传吸收） */
 /* 2xx 终响应 ACK：用新 Via branch（RFC3261 §17.1.1——INVITE 的 2xx ACK 必须
@@ -2883,6 +2992,23 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                     respond_txn(co, c->leg[1].srv_txn, st, NULL,
                                 ctbuf[0] ? ctbuf : NULL,
                                 m->body.p, m->body.len);
+
+                    /* ★ re-INVITE 200 OK: 存 answer 到 leg[0]（A 腿=应答腿）
+                     * 初始 INVITE 时 answer 也存 leg[1].answer，bridge_confirm
+                     * 从 leg[0].offer + leg[1].answer 拿两侧方向 SDP。
+                     * B 发 re-INVITE 后角色反转：
+                     *   leg[1].offer = 新 B 侧 offer（已在 re-INVITE handler 存）
+                     *   leg[0].answer = 新 A 侧 answer（现在存）
+                     * bridge_confirm 后续调用时两侧 SDP 都是最新的。 */
+                    if (m->body.len && m->body.p && m->body.len <= B2B_SDP_MAX
+                        && c->leg[0].reinv) {
+                        memcpy(c->leg[0].answer, m->body.p, m->body.len);
+                        c->leg[0].answer_len = m->body.len;
+                        /* 清 media_done 强制重新桥接（bridge_confirm 会
+                         * 重入：已建 relay 时只更新 PT/DTMF/direction，
+                         * 不重建 relay）。 */
+                        c->media_done = 0;
+                    }
                 } else {
                     send_ack_non2xx(c, 0);
                     respond_txn(co, c->leg[1].srv_txn, st, NULL, NULL,
@@ -2896,6 +3022,17 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
              * guard 必须在此处释放）。 */
             sip_upd_end(&c->leg[0].guard);
             sip_upd_end(&c->leg[1].guard);
+
+            /* ★ re-INVITE 完成后强制重新桥接媒体（hold/unhold/codec 变化）。
+             * media_done 已在上块清 0，这里按方向拼两侧最新 SDP：
+             *   B 发起 re-INVITE → leg[1].offer=新B侧offer, leg[0].answer=新A侧answer */
+            if (!c->media_done) {
+                call_unlock(c);
+                maybe_restart_media(c,
+                    c->leg[0].answer, c->leg[0].answer_len,  /* 朝 leg[0] = A 腿最新 */
+                    c->leg[1].offer,  c->leg[1].offer_len);   /* 朝 leg[1] = B 腿最新 */
+                return;
+            }
         } else if (ev == TXN_EV_TIMEOUT) {
             /* BYE TIMEOUT 兜底：覆盖 BYE 入站转发和 API 发起两种来源。
              * 32s Timer J 是 BYE NICT 不回 200 OK 的最后期限。 */
@@ -2974,6 +3111,15 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                             ctbuf[0] ? ctbuf : NULL,
                             m->body.len ? m->body.p : NULL,
                             m->body.len);
+
+                /* ★ A 发 re-INVITE → leg[0].offer 已在 handler 更新 →
+                 * B 腿回 200 OK 存 answer 到 leg[1].answer + 清 media_done。 */
+                if (m->body.len && m->body.p && m->body.len <= B2B_SDP_MAX
+                    && c->leg[1].reinv) {
+                    memcpy(c->leg[1].answer, m->body.p, m->body.len);
+                    c->leg[1].answer_len = m->body.len;
+                    c->media_done = 0;
+                }
                 c->leg[0].srv_txn = NULL;
             }
             /* PRACK/UPDATE/MESSAGE/INFO 转发终响应：释放双 leg 的 upd guard
@@ -2981,6 +3127,16 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
              * sip_upd_end 幂等，BYE/CANCEL 场景无害。 */
             sip_upd_end(&c->leg[0].guard);
             sip_upd_end(&c->leg[1].guard);
+
+            /* ★ re-INVITE 完成后强制重新桥接媒体（对称 leg[0].out_txn 分支）。
+             * A 发起 re-INVITE → leg[0].offer=新A侧offer, leg[1].answer=新B侧answer */
+            if (!c->media_done) {
+                call_unlock(c);
+                maybe_restart_media(c,
+                    c->leg[0].offer,  c->leg[0].offer_len,   /* 朝 leg[0] = A 腿最新 */
+                    c->leg[1].answer, c->leg[1].answer_len);  /* 朝 leg[1] = B 腿最新 */
+                return;
+            }
         } else if (ev == TXN_EV_TIMEOUT) {
             /* BYE TIMEOUT 兜底：覆盖 BYE 入站转发和 API 发起两种来源。
              * 32s Timer J 是 BYE NICT 不回 200 OK 的最后期限。 */
@@ -4766,7 +4922,8 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
             sip_hdr_t *cid = sip_hdr_get(m, SIP_H_CALL_ID);
             b2b_call_t *c = NULL;
             if (cid)
-                c = tbl_find(co, cid->value.p, cid->value.len, &leg);
+                c = tbl_find(co, cid->value.p, cid->value.len, NULL);
+            if (c) leg = find_leg_by_dialog(c, m);
             if (c && leg >= 0) {
                 call_lock(c);
                 if (!c->dead)
@@ -4826,9 +4983,14 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
 
     if (m->method == SIP_M_CANCEL) {
         sip_hdr_t *cid = sip_hdr_get(m, SIP_H_CALL_ID);
-        int leg = -1;
-        b2b_call_t *c = cid ? tbl_find(co, cid->value.p, cid->value.len, &leg)
-                            : NULL;
+        int leg = -1, tbl_leg = -1;
+        b2b_call_t *c = NULL;
+        if (cid) {
+            /* 先用 tbl_find 拿到 call + 默认 leg（不丢兼容） */
+            c = tbl_find(co, cid->value.p, cid->value.len, &tbl_leg);
+            /* CANCEL 无 To tag — 按哪条腿在 CALLING/EARLY 精确匹配 */
+            if (c) leg = find_leg_for_cancel(c, tbl_leg);
+        }
         /* 200 给 CANCEL 本身 */
         respond_txn(co, t, 200, NULL, NULL, NULL, 0);
         if (!c)
@@ -4838,7 +5000,7 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
             call_unlock(c);
             return;
         }
-        b2b_leg_t *target = &c->leg[leg >= 0 ? leg : 0];
+        b2b_leg_t *target = &c->leg[leg >= 0 ? leg : (tbl_leg >= 0 ? tbl_leg : 0)];
         /* 存储 CANCEL 入站 NIST → call_destroy 时 detach_txn(cancel_txn) 清理，
          * 避免 Timer J (32s) 自然超时堆积。用 cancel_txn 字段，不占 srv_txn
          * （srv_txn 是 re-INVITE/MESSAGE/INFO 用的）。 */
@@ -4888,14 +5050,8 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
             respond_txn(co, t, 481, NULL, NULL, NULL, 0);
             return;
         }
-        /* ★ 用 dialog tag 匹配 leg — B2BUA 两条腿共享同一个 Call-ID，
-         * tbl_find 只靠 Call-ID 永远返回先注册的 leg → 必须 tag 二次判定。
-         *
-         * ★ 关键洞察：ttag 优先！
-         *   BYE To   tag = 我们这边 dialog local tag = leg[i].loc_tag   ← 100% 可靠（我们生成）
-         *   BYE From tag = 对端 dialog local tag    = leg[i].rem_tag    ← 可能不可靠（对端 bug 或空）
-         * 同一 Call-ID 下两条腿 loc_tag 肯定不同（随机生成），所以 ttag 只匹配一条腿。
-         * rem_tag 匹配作为额外验证（如果 rem_tag 不为空但 ftag 不匹配 → warn）。 */
+        /* ★ 用 find_leg_by_dialog 按 To tag 匹配 leg。
+         * 保留完整诊断日志（ftag 不匹配 rem_tag 时 warn）。 */
         {
             char ftag[DLG_TAG_MAX], ttag[DLG_TAG_MAX];
             tok_from_tag(m, ftag, sizeof(ftag));
@@ -4908,33 +5064,20 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                  c->leg[0].loc_tag, c->leg[0].rem_tag, c->leg[0].state,
                  c->leg[1].loc_tag, c->leg[1].rem_tag, c->leg[1].state);
 
-            int ttag_match = -1;
-            for (int i = 0; i < 2; i++) {
-                if (!c->leg[i].loc_tag[0]) continue;
-                llog(LOG_INFO, "b2b",
-                     "★BYE_TAG_CHECK i=%d ttag_match_loc=%d ftag_match_rem=%d",
-                     i,
-                     (ttag[0] && !strcmp(ttag, c->leg[i].loc_tag)),
-                     (ftag[0] && c->leg[i].rem_tag[0] &&
-                      strcmp(ftag, c->leg[i].rem_tag) == 0));
-                if (ttag[0] && !strcmp(ttag, c->leg[i].loc_tag)) {
-                    ttag_match = i;
-                    if (ftag[0] && c->leg[i].rem_tag[0] &&
-                        strcmp(ftag, c->leg[i].rem_tag) != 0) {
-                        llog(LOG_WARN, "b2b",
-                             "★BYE_FTAG_MISMATCH leg=%d ftag=[%s] rem_tag=[%s] "
-                             "ttag=[%s] loc_tag=[%s] — 可能对端 From 头没 tag 或 tag 错",
-                             i, ftag, c->leg[i].rem_tag, ttag, c->leg[i].loc_tag);
-                    }
-                }
+            leg = find_leg_by_dialog(c, m);
+
+            if (leg >= 0 && ftag[0] && c->leg[leg].rem_tag[0] &&
+                strcmp(ftag, c->leg[leg].rem_tag) != 0) {
+                llog(LOG_WARN, "b2b",
+                     "★BYE_FTAG_MISMATCH leg=%d ftag=[%s] rem_tag=[%s] — "
+                     "ttag=[%s] loc_tag=[%s] 对端 From tag 可能丢失或错",
+                     leg, ftag, c->leg[leg].rem_tag, ttag, c->leg[leg].loc_tag);
             }
-            if (ttag_match >= 0) {
-                leg = ttag_match;
+            if (leg >= 0) {
                 llog(LOG_INFO, "b2b", "★BYE_TAG_MATCH leg=%d (ttag→loc_tag)", leg);
             } else {
                 llog(LOG_WARN, "b2b",
-                     "★BYE_TAG_MISS: ttag=[%s] 不匹配任何 loc_tag → 481",
-                     ttag);
+                     "★BYE_TAG_MISS: ttag=[%s] 不匹配任何 loc_tag → 481", ttag);
             }
         }
         if (leg < 0) {
@@ -4990,7 +5133,8 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
     if (m->method == SIP_M_INVITE && sip_msg_in_dialog(m)) {
         int leg = -1;
         sip_hdr_t *cid = sip_hdr_get(m, SIP_H_CALL_ID);
-        b2b_call_t *c = cid ? tbl_find(co, cid->value.p, cid->value.len, &leg) : NULL;
+        b2b_call_t *c = cid ? tbl_find(co, cid->value.p, cid->value.len, NULL) : NULL;
+        if (c) leg = find_leg_by_dialog(c, m);
         if (!c || leg < 0) {
             respond_txn(co, t, 481, NULL, NULL, NULL, 0);
             return;
@@ -5090,7 +5234,8 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
     if (m->method == SIP_M_REFER && sip_msg_in_dialog(m)) {
         int leg = -1;
         sip_hdr_t *cid = sip_hdr_get(m, SIP_H_CALL_ID);
-        b2b_call_t *c = cid ? tbl_find(co, cid->value.p, cid->value.len, &leg) : NULL;
+        b2b_call_t *c = cid ? tbl_find(co, cid->value.p, cid->value.len, NULL) : NULL;
+        if (c) leg = find_leg_by_dialog(c, m);
         if (!c || leg < 0) {
             respond_txn(co, t, 481, NULL, NULL, NULL, 0);
             return;
@@ -5179,7 +5324,8 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
     if (m->method == SIP_M_UPDATE && sip_msg_in_dialog(m)) {
         int leg = -1;
         sip_hdr_t *cid = sip_hdr_get(m, SIP_H_CALL_ID);
-        b2b_call_t *c = cid ? tbl_find(co, cid->value.p, cid->value.len, &leg) : NULL;
+        b2b_call_t *c = cid ? tbl_find(co, cid->value.p, cid->value.len, NULL) : NULL;
+        if (c) leg = find_leg_by_dialog(c, m);
         if (!c || leg < 0) {
             respond_txn(co, t, 481, NULL, NULL, NULL, 0);
             return;
@@ -5268,7 +5414,8 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
     if (m->method == SIP_M_PRACK && sip_msg_in_dialog(m)) {
         int leg = -1;
         sip_hdr_t *cid = sip_hdr_get(m, SIP_H_CALL_ID);
-        b2b_call_t *c = cid ? tbl_find(co, cid->value.p, cid->value.len, &leg) : NULL;
+        b2b_call_t *c = cid ? tbl_find(co, cid->value.p, cid->value.len, NULL) : NULL;
+        if (c) leg = find_leg_by_dialog(c, m);
         if (!c || leg < 0) {
             respond_txn(co, t, 481, NULL, NULL, NULL, 0);
             return;
@@ -5386,7 +5533,8 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
     if (m->method == SIP_M_MESSAGE && sip_msg_in_dialog(m)) {
         int leg = -1;
         sip_hdr_t *cid = sip_hdr_get(m, SIP_H_CALL_ID);
-        b2b_call_t *c = cid ? tbl_find(co, cid->value.p, cid->value.len, &leg) : NULL;
+        b2b_call_t *c = cid ? tbl_find(co, cid->value.p, cid->value.len, NULL) : NULL;
+        if (c) leg = find_leg_by_dialog(c, m);
         if (!c || leg < 0) {
             respond_txn(co, t, 481, NULL, NULL, NULL, 0);
             return;
@@ -5472,7 +5620,8 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
     if (m->method == SIP_M_INFO && sip_msg_in_dialog(m)) {
         int leg = -1;
         sip_hdr_t *cid = sip_hdr_get(m, SIP_H_CALL_ID);
-        b2b_call_t *c = cid ? tbl_find(co, cid->value.p, cid->value.len, &leg) : NULL;
+        b2b_call_t *c = cid ? tbl_find(co, cid->value.p, cid->value.len, NULL) : NULL;
+        if (c) leg = find_leg_by_dialog(c, m);
         if (!c || leg < 0) {
             respond_txn(co, t, 481, NULL, NULL, NULL, 0);
             return;
@@ -5557,7 +5706,8 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
     if (m->method == SIP_M_PUBLISH && sip_msg_in_dialog(m)) {
         int leg = -1;
         sip_hdr_t *cid = sip_hdr_get(m, SIP_H_CALL_ID);
-        b2b_call_t *c = cid ? tbl_find(co, cid->value.p, cid->value.len, &leg) : NULL;
+        b2b_call_t *c = cid ? tbl_find(co, cid->value.p, cid->value.len, NULL) : NULL;
+        if (c) leg = find_leg_by_dialog(c, m);
         if (!c || leg < 0) {
             respond_txn(co, t, 481, NULL, NULL, NULL, 0);
             return;
@@ -5641,7 +5791,8 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
         && sip_msg_in_dialog(m)) {
         int leg = -1;
         sip_hdr_t *cid = sip_hdr_get(m, SIP_H_CALL_ID);
-        b2b_call_t *c = cid ? tbl_find(co, cid->value.p, cid->value.len, &leg) : NULL;
+        b2b_call_t *c = cid ? tbl_find(co, cid->value.p, cid->value.len, NULL) : NULL;
+        if (c) leg = find_leg_by_dialog(c, m);
         if (!c || leg < 0) {
             respond_txn(co, t, 481, NULL, NULL, NULL, 0);
             return;
