@@ -63,15 +63,23 @@ struct reg_core {
     digest_cfg_t dig;
     tbucket_t ip[TB_IP_N];
     tbucket_t aor[TB_AOR_N];
-    /* 全局令牌桶 —— lock-free：用两个 atomic 变量，CAS 循环代替 pthread_mutex
-     * 之前 glock 是所有 REGISTER 的串行热点（不管 IP/AoR）。
-     * 改成 atomic 后全局 CPS 限流器本身零锁竞争。
-     * tbucket_t ip/aor 各自仍有 pthread_mutex（shard 锁），因为 per-IP/per-AoR
-     * 令牌桶状态更复杂（key 切换 + tokens 重置），改成 lock-free 收益不大。 */
-    _Atomic double  gtokens;
-    _Atomic uint64_t glast_ms;
+    /* 全局令牌桶 —— lock-free：把 (时间戳, token) 打包成 16 字节 struct，
+     * 用单次 128-bit CAS (cmpxchg16b on x86_64) 同时更新两个字段。
+     * 之前用两个独立 atomic + 双 CAS 有致命竞态：线程 A CAS 1 刷了时间戳
+     * 但还没 CAS 2 设 token，线程 B 进来看到时间戳"已是最新"就跳过 add，
+     * 但 token 还是旧值 → 所有并发 REGISTER 被拒。
+     * 
+     * 单次 CAS 保证两个字段同步更新——要么全新，要么全旧。
+     * _Atomic token_state_t 在 GCC x86_64 上编译成 cmpxchg16b 指令。 */
+    _Atomic(token_state_t) state;
     uint64_t n_total, n_rej, n_thr;
 };
+
+/* 必须 16 字节对齐 —— cmpxchg16b 要求目标地址 16 字节对齐 */
+typedef struct {
+    uint64_t last_ms;
+    double   tokens;
+} token_state_t __attribute__((aligned(16)));
 
 static int tb_take(tbucket_t *b, uint32_t key, int cps, uint64_t now)
 {
@@ -117,52 +125,50 @@ static uint32_t str_key(const char *s)
 
 static int global_take(reg_core_t *r, uint64_t now)
 {
-    /* Lock-free 全局令牌桶 —— CAS 循环
-     * 两个独立 atomic：glast_ms（时间戳）+ gtokens（令牌数）
+    /* Lock-free 全局令牌桶 —— 单次 128-bit CAS
      * 
-     * 难点：时间戳刷新和令牌消费必须"看起来"原子（否则竞态：A 刷了时间戳
-     * 但还没消费 token，B 也刷时间戳然后消费）。
+     * 把 (last_ms, tokens) 打包成 16 字节 token_state_t，
+     * 用 atomic_compare_exchange 对整个 struct 做单次 CAS。
      * 
-     * 解法：用经典的双 CAS 循环。先 CAS 刷新时间戳，再 CAS 消费 token。
-     * 如果 CAS 失败说明有别人同时操作，restart 重试。
+     * 为什么要打包？双 CAS 不是原子的——线程 A 刷了时间戳但还没扣 token，
+     * 线程 B 看到时间戳"已是最新"就跳过 token 补充，但 token 还是旧值 0
+     * → 所有并发 REGISTER 被拒。这就是当前 bug！
      * 
-     * 注意：double 的 atomic CAS 在 GCC 下用 __atomic_* 内建（编译成
-     * cmpxchg8b/cmpxchg16b），不需要 libatomic 库，O(1) 无锁开销。 */
-    const int64_t cap = (int64_t)r->cfg.global_cps;
-    
+     * 单次 CAS 保证：要么两个字段同时看到新值，要么同时看到旧值——
+     * 中间态不存在，竞态完全消除。
+     * 
+     * C11 _Atomic struct 在 GCC x86_64 上编译成 cmpxchg16b。
+     * token_state_t 16 字节 + aligned(16) → 满足 cmpxchg16b 对齐要求。 */
+    const double cap = (double)r->cfg.global_cps;
+
     for (;;) {
-        /* Load current state */
-        uint64_t last = atomic_load_explicit(&r->glast_ms, memory_order_acquire);
-        double toks = atomic_load_explicit(&r->gtokens, memory_order_acquire);
-        
-        /* Compute new tokens since last tick */
-        if ((int64_t)(now - last) > 0) {
-            double add = (double)(now - last) * r->cfg.global_cps / 1000.0;
-            toks += add;
-            if (toks > (double)cap) toks = (double)cap;
+        /* 1. 整体 load（要么全新要么全旧，中间态不可能） */
+        token_state_t cur = atomic_load_explicit(&r->state, memory_order_acquire);
+
+        /* 2. 计算新 token（基于 cur.last_ms） */
+        token_state_t next = cur;
+        next.last_ms = now;
+        if ((int64_t)(now - cur.last_ms) > 0) {
+            double add = (double)(now - cur.last_ms) * r->cfg.global_cps / 1000.0;
+            next.tokens = cur.tokens + add;
+            if (next.tokens > cap) next.tokens = cap;
         }
-        
-        /* Check if we can take one */
-        if (toks < 1.0)
-            return 0;  /* 限流 */
-        
-        double new_toks = toks - 1.0;
-        
-        /* CAS: 先刷新时间戳，再消费 token
-         * 如果别人在我们计算期间改了状态，CAS 失败 → 重试 */
-        uint64_t expected_last = last;
-        if (!atomic_compare_exchange_weak_explicit(
-                &r->glast_ms, &expected_last, now,
+
+        /* 3. 检查够不够 */
+        if (next.tokens < 1.0)
+            return 0;  /* 限流（确实没 token，不是竞态） */
+
+        /* 4. 扣 1 token */
+        next.tokens -= 1.0;
+
+        /* 5. 单次 CAS 原子更新两个字段
+         * expected=cur, desired=next —— 如果别人在我们计算期间改了状态，
+         * CAS 失败 → cur 被更新成新值 → 重试 */
+        if (atomic_compare_exchange_weak_explicit(
+                &r->state, &cur, next,
                 memory_order_acq_rel, memory_order_acquire))
-            continue;  /* 别人先刷时间戳了，重来 */
-        
-        double expected_toks = toks;
-        if (!atomic_compare_exchange_weak_explicit(
-                &r->gtokens, &expected_toks, new_toks,
-                memory_order_acq_rel, memory_order_acquire))
-            continue;  /* 别人先消费了 token，重来 */
-        
-        return 1;  /* 成功 */
+            return 1;  /* 成功 */
+        /* else: cur 被自动更新成最新值，continue 重试 */
     }
 }
 
@@ -424,8 +430,8 @@ int reg_core_create(const reg_cfg_t *cfg, reg_core_t **out)
         free(r);
         return NSBC_NOMEM;
     }
-    /* glock 已移除 —— gtokens/glast_ms 现在是 _Atomic 变量
-     * calloc 已清零（gtokens=0, glast_ms=0），和旧代码行为一致 */
+    /* state 是 _Atomic(token_state_t) —— calloc 已清零
+     * last_ms=0, tokens=0，和旧 mutex 版本行为一致 */
     for (int i = 0; i < TB_IP_N; ++i)
         pthread_mutex_init(&r->ip[i].lock, NULL);
     for (int i = 0; i < TB_AOR_N; ++i)
