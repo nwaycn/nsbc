@@ -735,8 +735,15 @@ app.component('rates-live', crudTable(
     { key: 'name',            label: t('Name'),                type: 'text',   default: '' },
     { key: 'price_per_min_uc',label: t('Rate/min (µ)'),       type: 'number', default: 0, help: 'Micro-units per minute (1e-6 CNY)' },
     { key: 'connect_fee_uc',  label: t('Connect fee (µ)'),     type: 'number', default: 0 },
-    { key: 'bill_inc_s',      label: t('Billing block (s)'),   type: 'number', default: 60, help: 'Per-call billing granularity' },
-    { key: 'min_bill_s',      label: t('Min bill (s)'),       type: 'number', default: 60, help: 'Minimum billing seconds per call' },
+    { key: 'bill_inc_s',      label: t('Billing block (s)'),   type: 'select', default: 60,
+      options: [
+        { value: 30,  label: t('Per 30 seconds') },
+        { value: 60,  label: t('Per minute (60s)') },
+        { value: 180, label: t('Per 3 minutes') },
+        { value: 300, label: t('Per 5 minutes') },
+      ],
+      help: 'Per-call billing granularity' },
+    { key: 'min_bill_s',      label: t('Min bill (s)'),       type: 'number', default: 60, help: 'Minimum billing seconds per call (≥ bill_inc_s)' },
     { key: 'enabled',         label: t('Enable'),              type: 'bool',   default: true },
   ],
 ));
