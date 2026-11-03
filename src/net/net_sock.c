@@ -2,12 +2,14 @@
 #define _GNU_SOURCE
 #endif
 #include "net_sock.h"
+#include "log.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>   /* TCP_NODELAY */
 #include <netdb.h>
 #include <string.h>
 #include <sys/types.h>
