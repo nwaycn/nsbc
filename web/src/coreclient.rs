@@ -887,6 +887,45 @@ impl RealCore {
             .unwrap_or_else(|| Duration::from_millis(DEFAULT_TIMEOUT_MS));
         Self::new(sock_path, timeout)
     }
+
+    /// All reload commands: migrated from obs_control.sock line protocol to
+    /// data_cmd.sock UDS frame protocol with built-in fragmentation for large
+    /// payloads (e.g. extensions.reload 12.6MB JSON).
+    ///
+    /// Builds: derive data_cmd.sock path from uds_server default base path.
+    /// Sends: line-text "<cmd_name>.reload <json>" as CMD_REQ (may fragment).
+    /// Receives: raw bytes → String → check_rejected → Ok(()) or CoreRejected.
+    #[cfg(unix)]
+    async fn reload_via_uds(&self, cmd_name: &str, json: &str) -> Result<(), CoreError> {
+        let base = crate::uds_server::default_sock_base_path();
+        let base_str = base.to_string_lossy();
+        let cmd_path = if let Some(dot) = base_str.rfind('.') {
+            let prefix = &base_str[..dot];
+            std::path::PathBuf::from(format!("{prefix}_cmd.sock"))
+        } else {
+            std::path::PathBuf::from(format!("{base_str}_cmd.sock"))
+        };
+
+        let cmd_text = format!("{cmd_name}.reload {json}");
+        let timeout_ms = self.timeout.as_millis() as u64;
+        match crate::uds_server::send_core_cmd_via_uds(&cmd_path, &cmd_text, timeout_ms).await {
+            Ok(bytes) => {
+                let text = String::from_utf8(bytes)
+                    .map_err(|e| CoreError::Protocol(format!("non-UTF8 RSP: {e}")))?;
+                check_rejected(&text)
+            }
+            Err(e) => Err(CoreError::Io(e)),
+        }
+    }
+
+    /// Windows dev fallback: reload_via_uds is cfg(unix) only, this stub keeps
+    /// the trait impl compiling on non-unix. We delegate back to obs_control
+    /// send_cmd on Windows since there is no UDS transport there anyway.
+    #[cfg(not(unix))]
+    async fn reload_via_uds(&self, cmd_name: &str, json: &str) -> Result<(), CoreError> {
+        send_cmd(&self.sock_path, self.timeout, &format!("{cmd_name}.reload {json}"))
+            .await.and_then(|b| check_rejected(&b))
+    }
 }
 
 impl CoreApi for RealCore {
@@ -988,45 +1027,35 @@ impl CoreApi for RealCore {
     }
 
     async fn reload_extensions(&self, json: &str) -> Result<(), CoreError> {
-        send_cmd(&self.sock_path, self.timeout, &format!("extensions.reload {json}"))
-            .await.and_then(|b| check_rejected(&b))
+        self.reload_via_uds("extensions", json).await
     }
     async fn reload_gateways(&self, json: &str) -> Result<(), CoreError> {
-        send_cmd(&self.sock_path, self.timeout, &format!("gateways.reload {json}"))
-            .await.and_then(|b| check_rejected(&b))
+        self.reload_via_uds("gateways", json).await
     }
     async fn reload_trunks(&self, json: &str) -> Result<(), CoreError> {
-        send_cmd(&self.sock_path, self.timeout, &format!("trunks.reload {json}"))
-            .await.and_then(|b| check_rejected(&b))
+        self.reload_via_uds("trunks", json).await
     }
     async fn reload_dialplan_rules(&self, json: &str) -> Result<(), CoreError> {
-        send_cmd(&self.sock_path, self.timeout, &format!("dialplan-rules.reload {json}"))
-            .await.and_then(|b| check_rejected(&b))
+        self.reload_via_uds("dialplan-rules", json).await
     }
     async fn reload_queues(&self, json: &str) -> Result<(), CoreError> {
-        send_cmd(&self.sock_path, self.timeout, &format!("queues.reload {json}"))
-            .await.and_then(|b| check_rejected(&b))
+        self.reload_via_uds("queues", json).await
     }
     async fn reload_sip_profiles(&self, json: &str) -> Result<(), CoreError> {
-        send_cmd(&self.sock_path, self.timeout, &format!("profiles.reload {json}"))
-            .await.and_then(|b| check_rejected(&b))
+        self.reload_via_uds("profiles", json).await
     }
     async fn reload_security_blacklist(&self, json: &str) -> Result<(), CoreError> {
-        send_cmd(&self.sock_path, self.timeout, &format!("security.blacklist.reload {json}"))
-            .await.and_then(|b| check_rejected(&b))
+        self.reload_via_uds("security.blacklist", json).await
     }
 
     async fn reload_ha_groups(&self, json: &str) -> Result<(), CoreError> {
-        send_cmd(&self.sock_path, self.timeout, &format!("ha.reload {json}"))
-            .await.and_then(|b| check_rejected(&b))
+        self.reload_via_uds("ha", json).await
     }
     async fn reload_ivr_menus(&self, json: &str) -> Result<(), CoreError> {
-        send_cmd(&self.sock_path, self.timeout, &format!("ivr.reload {json}"))
-            .await.and_then(|b| check_rejected(&b))
+        self.reload_via_uds("ivr", json).await
     }
     async fn reload_route_groups(&self, json: &str) -> Result<(), CoreError> {
-        send_cmd(&self.sock_path, self.timeout, &format!("route_groups.reload {json}"))
-            .await.and_then(|b| check_rejected(&b))
+        self.reload_via_uds("route_groups", json).await
     }
 
     async fn call_action(
@@ -1089,20 +1118,16 @@ impl CoreApi for RealCore {
     }
 
     async fn reload_rates(&self, json: &str) -> Result<(), CoreError> {
-        send_cmd(&self.sock_path, self.timeout, &format!("rate.reload {json}"))
-            .await.and_then(|b| check_rejected(&b))
+        self.reload_via_uds("rate", json).await
     }
     async fn reload_accounts(&self, json: &str) -> Result<(), CoreError> {
-        send_cmd(&self.sock_path, self.timeout, &format!("accounts.reload {json}"))
-            .await.and_then(|b| check_rejected(&b))
+        self.reload_via_uds("accounts", json).await
     }
     async fn reload_rate_plans(&self, json: &str) -> Result<(), CoreError> {
-        send_cmd(&self.sock_path, self.timeout, &format!("rate_plans.reload {json}"))
-            .await.and_then(|b| check_rejected(&b))
+        self.reload_via_uds("rate_plans", json).await
     }
     async fn reload_rate_plan_entries(&self, json: &str) -> Result<(), CoreError> {
-        send_cmd(&self.sock_path, self.timeout, &format!("rate_plan_entries.reload {json}"))
-            .await.and_then(|b| check_rejected(&b))
+        self.reload_via_uds("rate_plan_entries", json).await
     }
     async fn rate_upsert_json(&self, json: &str) -> Result<(), CoreError> {
         send_cmd(&self.sock_path, self.timeout, &format!("rate.upsert {json}"))

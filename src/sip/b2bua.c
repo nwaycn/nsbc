@@ -2318,6 +2318,17 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
             b2b_leg_t *b = &c->leg[1];  /* 外层作用域——P1-12 challenge 块也用 */
             tok_from_tag(m, c->leg[1].rem_tag, DLG_TAG_MAX);
             tok_to_tag(m, c->leg[1].peer_tag, DLG_TAG_MAX);
+            {
+                char mftag[DLG_TAG_MAX] = "(no-from-tag)";
+                char mttag[DLG_TAG_MAX] = "(no-to-tag)";
+                tok_from_tag(m, mftag, sizeof(mftag));
+                tok_to_tag(m, mttag, sizeof(mttag));
+                llog(LOG_INFO, "b2b",
+                     "★B200OK_TAGS m.status=%d msg.From.tag=[%s] msg.To.tag=[%s] "
+                     "→ set leg1.rem_tag=[%s] leg1.peer_tag=[%s] loc_tag=[%s]",
+                     m->status, mftag, mttag,
+                     c->leg[1].rem_tag, c->leg[1].peer_tag, c->leg[1].loc_tag);
+            }
             dlg_uac_on_response(co->cfg.dlg, m);
             disarm_noanswer_timer(c); /* 任何终态都 disarm ring timer */
             c->leg[1].last_prov_status = 0; /* 终态后重置去重标记 */
@@ -2824,10 +2835,37 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
         return;
     }
 
-    /* 发向 A 腿的在轮事务（B 发起 re-INVITE/MESSAGE/INFO 或 API 触发） */
+    /* ---- 通用 BYE-out 判定：out_txn 是 BYE NICT 且通话在终结流程中 ----
+     * 两种来源：
+     *   1. BYE 入站转发 → hangup_by != 0（BYE handler 设了）
+     *   2. API b2b_terminate → send_bye_leg 设 leg.state=LEG_TERMINATING
+     * 统一判定：hangup_by != 0 或这条腿自己就是 LEG_TERMINATING（send_bye_leg 会设，
+     * re-INVITE/MESSAGE/INFO 的 out_txn 不设）。 */
+    #define IS_BYE_OUT(L) \
+        (c->hangup_by != 0 || c->leg[L].state == LEG_TERMINATING)
+
+    /* 发向 A 腿的在轮事务（BYE / re-INVITE / MESSAGE / INFO） */
     if (t == c->leg[0].out_txn) {
         if (ev == TXN_EV_FINAL && m) {
             int st = m->status;
+            /* ★ BYE 路径优先：防止 BYE handler 存的 leg[1].srv_txn 劫持 re-INVITE 分支。
+             * 同时覆盖 BYE 入站转发 (hangup_by!=0) 和 API 挂断 (send_bye_leg 设 TERMINATING)。
+             * 无论 2xx 还是非 2xx — 既然在发 BYE，通话就该结束。 */
+            if (IS_BYE_OUT(0)) {
+                llog(LOG_INFO, "b2b",
+                     "BYE A-leg final st=%d hangup_by=%d → call_destroy callid=%s",
+                     st, c->hangup_by, c->leg[0].callid);
+                c->leg[0].state = LEG_TERMINATED;
+                c->leg[1].state = LEG_TERMINATED;
+                c->leg[0].out_txn = NULL;
+                /* ★ 不清 BYE 入站 srv_txn —— call_destroy 会 detach_txn
+                 * force_terminate 防止 BYE NIST 残留到 Timer J (32s)。 */
+                call_unlock(c);
+                call_destroy(c);
+                return;
+            }
+            /* re-INVITE/MESSAGE/INFO 路径：只有 hangup_by==0 且 leg.state!=TERMINATING
+             * 时才走这里 —— srv_txn 是入站请求事务（非 BYE） */
             if (c->leg[1].srv_txn) {
                 /* B 发起 re-INVITE/MESSAGE/INFO：把 A 的应答转回 B。
                  * 响应 body 的 Content-Type 原样透传（MESSAGE/INFO
@@ -2852,15 +2890,6 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                 }
                 c->leg[1].srv_txn = NULL;
                 c->leg[0].reinv = 0;
-            } else if (st >= 200 && st < 300 &&
-                       c->leg[1].state == LEG_TERMINATING) {
-                /* 转发 BYE 完成，收尾 */
-                c->leg[0].state = LEG_TERMINATED;
-                c->leg[1].state = LEG_TERMINATED;
-                c->leg[0].out_txn = NULL;
-                call_unlock(c);
-                call_destroy(c);
-                return;
             }
             /* 双腿 guard 释放：srv_txn 有无都要放（reinv 路径上面已放
              * 过，但 sip_upd_end 幂等；API 发起 MESSAGE/INFO 无 srv_txn，
@@ -2868,10 +2897,22 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
             sip_upd_end(&c->leg[0].guard);
             sip_upd_end(&c->leg[1].guard);
         } else if (ev == TXN_EV_TIMEOUT) {
-            /* Timer B/F：A 腿无终响应（B 发起的 re-INVITE/MESSAGE/INFO
-             * 或 API 触发）→ 408 回 B 腿（若有 srv_txn）+ 释放 guard */
+            /* BYE TIMEOUT 兜底：覆盖 BYE 入站转发和 API 发起两种来源。
+             * 32s Timer J 是 BYE NICT 不回 200 OK 的最后期限。 */
+            if (IS_BYE_OUT(0)) {
+                llog(LOG_WARN, "b2b",
+                     "BYE TIMEOUT: A leg no 200 OK, hangup_by=%d → force call_destroy callid=%s",
+                     c->hangup_by, c->leg[0].callid);
+                c->leg[0].state = LEG_TERMINATED;
+                c->leg[1].state = LEG_TERMINATED;
+                c->leg[0].out_txn = NULL;
+                call_unlock(c);
+                call_destroy(c);
+                return;
+            }
+            /* Timer B/F：re-INVITE/MESSAGE/INFO 等 A 腿无终响应 → 408 回 B 腿 + 释放 guard */
             llog(LOG_WARN, "b2b",
-                 "timer B/F: A leg no response, callid=%s → 408",
+                 "timer B/F: A leg no final response, callid=%s → 408",
                  c->leg[0].callid);
             if (c->leg[1].srv_txn) {
                 respond_txn(co, c->leg[1].srv_txn, 408, NULL, NULL, NULL, 0);
@@ -2887,11 +2928,26 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
         return;
     }
 
-    /* 发向 B 腿的 NICT（CANCEL/BYE/PRACK/UPDATE/MESSAGE/INFO 转发） */
+    /* 发向 B 腿的事务：CANCEL / BYE / re-INVITE / MESSAGE / INFO 转发 */
     if (t == c->leg[1].out_txn) {
         if (ev == TXN_EV_FINAL && m) {
+            int st = m->status;
+            /* ★ BYE 路径优先（与 leg[0].out_txn 对称）：
+             * IS_BYE_OUT(1) 覆盖 BYE 入站转发 (hangup_by!=0) 和 API 发起 (TERMINATING)。
+             * 不管 2xx / 4xx / 408 — BYE 就是要结束。 */
+            if (IS_BYE_OUT(1)) {
+                llog(LOG_INFO, "b2b",
+                     "BYE B-leg final st=%d hangup_by=%d → call_destroy callid=%s",
+                     st, c->hangup_by, c->leg[0].callid);
+                c->leg[0].state = LEG_TERMINATED;
+                c->leg[1].state = LEG_TERMINATED;
+                c->leg[1].out_txn = NULL;
+                call_unlock(c);
+                call_destroy(c);
+                return;
+            }
             /* CANCEL 得 487 由 B 腿 INVITE 事务分支收尾；BYE 200 收尾 */
-            if (m->status >= 200 && m->status < 300 &&
+            if (st >= 200 && st < 300 &&
                 c->leg[0].state == LEG_TERMINATING) {
                 llog(LOG_INFO, "b2b", "hangup ok -> call_destroy!");
                 c->leg[0].state = LEG_TERMINATED;
@@ -2926,7 +2982,20 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
             sip_upd_end(&c->leg[0].guard);
             sip_upd_end(&c->leg[1].guard);
         } else if (ev == TXN_EV_TIMEOUT) {
-            /* Timer F：B 腿无终响应 → 408 回 A 腿 + 释放 guard（防死锁） */
+            /* BYE TIMEOUT 兜底：覆盖 BYE 入站转发和 API 发起两种来源。
+             * 32s Timer J 是 BYE NICT 不回 200 OK 的最后期限。 */
+            if (IS_BYE_OUT(1)) {
+                llog(LOG_WARN, "b2b",
+                     "BYE TIMEOUT: B leg no 200 OK, hangup_by=%d → force call_destroy callid=%s",
+                     c->hangup_by, c->leg[0].callid);
+                c->leg[0].state = LEG_TERMINATED;
+                c->leg[1].state = LEG_TERMINATED;
+                c->leg[1].out_txn = NULL;
+                call_unlock(c);
+                call_destroy(c);
+                return;
+            }
+            /* Timer F：B 腿无终响应（re-INVITE MESSAGE INFO 等）→ 408 回 A 腿 + 释放 guard */
             llog(LOG_WARN, "b2b",
                  "timer F: B leg no final response, callid=%s → 408",
                  c->leg[0].callid);
@@ -4806,18 +4875,82 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
     if (m->method == SIP_M_BYE) {
         sip_hdr_t *cid = sip_hdr_get(m, SIP_H_CALL_ID);
         int leg = -1;
-        b2b_call_t *c = cid ? tbl_find(co, cid->value.p, cid->value.len, &leg)
+        b2b_call_t *c = cid ? tbl_find(co, cid->value.p, cid->value.len, NULL)
                             : NULL;
-        if (!c || leg < 0) {
+        llog(LOG_INFO, "b2b",
+             "★BYE_RECV callid=[%.*s] txn=%p cid_present=%d call_found=%d",
+             (int)(cid ? cid->value.len : 0), cid ? cid->value.p : "?",
+             (void *)t, !!cid, !!c);
+        if (!c) {
+            llog(LOG_WARN, "b2b",
+                 "★BYE_RECV: no matching call → 481 callid=[%.*s]",
+                 (int)(cid ? cid->value.len : 0), cid ? cid->value.p : "?");
+            respond_txn(co, t, 481, NULL, NULL, NULL, 0);
+            return;
+        }
+        /* ★ 用 dialog tag 匹配 leg — B2BUA 两条腿共享同一个 Call-ID，
+         * tbl_find 只靠 Call-ID 永远返回先注册的 leg → 必须 tag 二次判定。
+         *
+         * ★ 关键洞察：ttag 优先！
+         *   BYE To   tag = 我们这边 dialog local tag = leg[i].loc_tag   ← 100% 可靠（我们生成）
+         *   BYE From tag = 对端 dialog local tag    = leg[i].rem_tag    ← 可能不可靠（对端 bug 或空）
+         * 同一 Call-ID 下两条腿 loc_tag 肯定不同（随机生成），所以 ttag 只匹配一条腿。
+         * rem_tag 匹配作为额外验证（如果 rem_tag 不为空但 ftag 不匹配 → warn）。 */
+        {
+            char ftag[DLG_TAG_MAX], ttag[DLG_TAG_MAX];
+            tok_from_tag(m, ftag, sizeof(ftag));
+            tok_to_tag(m, ttag, sizeof(ttag));
+            llog(LOG_INFO, "b2b",
+                 "★BYE_TAGS ftag=[%s] ttag=[%s] "
+                 "leg0_loc=[%s] leg0_rem=[%s] leg0_s=%d "
+                 "leg1_loc=[%s] leg1_rem=[%s] leg1_s=%d",
+                 ftag, ttag,
+                 c->leg[0].loc_tag, c->leg[0].rem_tag, c->leg[0].state,
+                 c->leg[1].loc_tag, c->leg[1].rem_tag, c->leg[1].state);
+
+            int ttag_match = -1;
+            for (int i = 0; i < 2; i++) {
+                if (!c->leg[i].loc_tag[0]) continue;
+                llog(LOG_INFO, "b2b",
+                     "★BYE_TAG_CHECK i=%d ttag_match_loc=%d ftag_match_rem=%d",
+                     i,
+                     (ttag[0] && !strcmp(ttag, c->leg[i].loc_tag)),
+                     (ftag[0] && c->leg[i].rem_tag[0] &&
+                      strcmp(ftag, c->leg[i].rem_tag) == 0));
+                if (ttag[0] && !strcmp(ttag, c->leg[i].loc_tag)) {
+                    ttag_match = i;
+                    if (ftag[0] && c->leg[i].rem_tag[0] &&
+                        strcmp(ftag, c->leg[i].rem_tag) != 0) {
+                        llog(LOG_WARN, "b2b",
+                             "★BYE_FTAG_MISMATCH leg=%d ftag=[%s] rem_tag=[%s] "
+                             "ttag=[%s] loc_tag=[%s] — 可能对端 From 头没 tag 或 tag 错",
+                             i, ftag, c->leg[i].rem_tag, ttag, c->leg[i].loc_tag);
+                    }
+                }
+            }
+            if (ttag_match >= 0) {
+                leg = ttag_match;
+                llog(LOG_INFO, "b2b", "★BYE_TAG_MATCH leg=%d (ttag→loc_tag)", leg);
+            } else {
+                llog(LOG_WARN, "b2b",
+                     "★BYE_TAG_MISS: ttag=[%s] 不匹配任何 loc_tag → 481",
+                     ttag);
+            }
+        }
+        if (leg < 0) {
             respond_txn(co, t, 481, NULL, NULL, NULL, 0);
             return;
         }
         respond_txn(co, t, 200, NULL, NULL, NULL, 0);
         call_lock(c);
         if (c->dead) {
+            llog(LOG_WARN, "b2b", "★BYE_POST_200_OK: call already dead → skip");
             call_unlock(c);
             return;
         }
+        llog(LOG_INFO, "b2b",
+             "★BYE_PREP leg=%d leg_state=%d other_state=%d dead=0",
+             leg, c->leg[leg].state, c->leg[leg ^ 1].state);
         /* 存储 BYE 入站 NIST 事务 → call_destroy 时 detach_txn 会 force_terminate。
          * 旧代码不存，BYE NIST 靠 Timer J (64*T1=32s) 自然 cb_dead→t_remove_hash，
          * 压测 60 通 → 60 条残留，10s 后仍有 21 条未到期。 */
@@ -4828,9 +4961,15 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
         /* ★ 记录谁发起的挂断：leg=0→A腿(主叫)发BYE，leg=1→B腿(被叫)发BYE */
         c->hangup_by = leg + 1;
         int other = leg ^ 1;
-        if (c->leg[other].state == LEG_CONFIRMED)
+        if (c->leg[other].state == LEG_CONFIRMED) {
+            llog(LOG_INFO, "b2b",
+                 "★BYE_FWD: leg=%d other=%d (state=%d) → send_bye_leg(other)",
+                 leg, other, c->leg[other].state);
             send_bye_leg(c, other);
-        else {
+        } else {
+            llog(LOG_INFO, "b2b",
+                 "★BYE_IMMEDIATE_DESTROY: leg=%d other=%d state=%d (NOT CONFIRMED) → call_destroy",
+                 leg, other, c->leg[other].state);
             c->leg[other].state = LEG_TERMINATED;
             c->leg[leg].state = LEG_TERMINATED;
             call_unlock(c);
@@ -4839,7 +4978,7 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
         }
         /* 注意：不设 leg[leg].state = LEG_TERMINATED — 保留 TERMINATING
          * 状态让 cli_tu 在对端 BYE 200 OK 回来时能通过条件检查
-         * （cli_tu line 1352: leg[0].state == LEG_TERMINATING 才 call_destroy）。 */
+         * （cli_tu 用 IS_BYE_OUT 统一判定）。 */
         call_unlock(c);
         return;
     }

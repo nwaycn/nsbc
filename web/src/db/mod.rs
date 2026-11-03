@@ -1268,12 +1268,26 @@ async fn flush_cdrs(
         .collect();
     let values_sql = placeholders.join("), (");
 
+    // 11 列 — INSERT 同 batch 里可能含同 call_id 三条（phase=start/answer/end）：
+    //   phase=start  → 初始落库（answer_time=NULL, end_time=NULL, duration=0）
+    //   phase=answer → UPDATE answer_time + billsec
+    //   phase=end    → UPDATE end_time + duration_sec + billsec + cause_code + metadata（最全）
+    // 用 COALESCE(excluded.col, cdr.col) 保护 answer_time/end_time：START 的 NULL 不覆盖 ANSWER/END 已写值。
+    // 其余列（duration_sec/billsec/cause_code/cause_text/metadata）END payload 最全，直接覆盖。
     let sql = match backend {
         "mysql" => format!(
-            "INSERT IGNORE INTO cdr \
+            "INSERT INTO cdr \
              (call_id, caller, callee, start_time, answer_time, end_time, \
               duration_sec, billsec, cause_code, cause_text, metadata) \
-             VALUES ({})",
+             VALUES ({}) \
+             ON DUPLICATE KEY UPDATE \
+             answer_time = COALESCE(VALUES(answer_time), cdr.answer_time), \
+             end_time    = COALESCE(VALUES(end_time),    cdr.end_time), \
+             duration_sec = VALUES(duration_sec), \
+             billsec     = VALUES(billsec), \
+             cause_code  = VALUES(cause_code), \
+             cause_text  = VALUES(cause_text), \
+             metadata    = VALUES(metadata)",
             values_sql
         ),
         _ => format!(
@@ -1281,7 +1295,14 @@ async fn flush_cdrs(
              (call_id, caller, callee, start_time, answer_time, end_time, \
               duration_sec, billsec, cause_code, cause_text, metadata) \
              VALUES ({}) \
-             ON CONFLICT DO NOTHING",
+             ON CONFLICT(call_id) DO UPDATE SET \
+             answer_time = COALESCE(excluded.answer_time, cdr.answer_time), \
+             end_time    = COALESCE(excluded.end_time,    cdr.end_time), \
+             duration_sec = excluded.duration_sec, \
+             billsec     = excluded.billsec, \
+             cause_code  = excluded.cause_code, \
+             cause_text  = excluded.cause_text, \
+             metadata    = excluded.metadata",
             values_sql
         ),
     };

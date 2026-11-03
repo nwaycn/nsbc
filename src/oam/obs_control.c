@@ -61,10 +61,14 @@
  *    真实规模 200+ 条会触发 "超长无换行丢弃" 静默失败。
  *  - 原 1MB 只够 ~90KB extensions.reload 完整表（900 entries）；
  *    90000 entries × 140B ≈ 12.6MB —— 一次 reload 命令撑爆 recv buf！
- *  - 提至 32MB 与 reload_commands.c RELOAD_JSON_MAX 对齐；
- *    32MB 堆上完全可接受（ctl_conn_t 本身 calloc 分配）。
- *    1 个 control 连接 ~32MB，10 并发 = 320MB —— 通常只有 1 个并发 reload 命令，OK。 */
-#define CTL_BUF_MAX (32 * 1024 * 1024)
+ *  - 临时提至 32MB 是懒方案（commit 76db7bb），真正正解：reload 命令
+ *    从 obs_control 行协议迁到 data_cmd.sock 二进制帧 + 分片。
+ *  - 现在 reload 命令已全迁走（extensions/gateways/trunks/dprules/profiles/
+ *    queues/ivr/security_blacklist/ha/route_groups/accounts/rates/rate_plans/
+ *    rate_plan_entries），obs_control 只承载小命令（show/stats/hangup/
+ *    config.* / uuid_dump / exec_cmd / security.ban.* / originate / status 等）。
+ *  - 256KB 对这些命令绰绰有余；32MB 堆太重回退。 */
+#define CTL_BUF_MAX (256 * 1024)
 #define CTL_OUT_MAX (256 * 1024)
 /* uuid_dump：两 Leg × 各 2KB SDP + 头行，16KB 足够 */
 #define CTL_DUMP_MAX (16 * 1024)

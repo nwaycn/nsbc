@@ -38,6 +38,18 @@ extern "C" {
 #define NSBC_MAX_PAYLOAD       (256 * 1024)  /* 256KB payload → 256KB+12B ≈ 256KB 单 datagram */
 #define NSBC_MAX_FRAME         (NSBC_FRAME_HDR_LEN + NSBC_MAX_PAYLOAD)
 
+/* ---- 分片帧 (REQ-DATA-SVC-002 P0 扩展) ----
+ * 大 payload（如 extensions.reload 12.6MB JSON）超过 MAX_PAYLOAD 时，
+ * 拆成 N 片 × MAX_PAYLOAD 大小，每片独立 datagram，ticket 相同。
+ *   flags.bit0 = more_fragment：1=还有后续片，0=最后一片
+ *   flags.bit1 = compressed（预留，P1 MessagePack 压缩用）
+ * 重组端：收到 bit0=1 累积；收到 bit0=0 得到完整 payload 后 dispatch。
+ * 超时保护：超过 UDS_FRAG_TIMEOUT_MS 没收到后续片 → free + 丢弃。 */
+#define UDS_FLG_MORE_FRAG   0x01    /* flags bit0: 还有后续分片 */
+#define UDS_FLG_COMPRESSED  0x02    /* flags bit1: payload 已压缩（预留） */
+#define UDS_FRAG_TIMEOUT_MS 3000    /* 分片重组超时阈值 */
+#define UDS_FRAG_MAX_TOTAL  (64 * 1024 * 1024)  /* 重组 buffer 上限 64MB，防 OOM */
+
 /* frame_type (1 字节) */
 #define FT_HELLO          0x01
 #define FT_HELLO_ACK      0x02
@@ -86,14 +98,22 @@ int uds_request(const char *cmd_json, int timeout_ms,
 #define UDS_REQ_TIMEOUT_MS  2000    /* uds_request 允许的上限超时 */
 
 /* ---- 帧编码 ----
- * frame_type: FT_DATA_PUSH / FT_HELLO / ...
- * ticket:     REQ→RSP 配对 ID；PUSH 用 0
+ * frame_type: FT_DATA_PUSH / FT_HELLO / FT_CMD_REQ / FT_CMD_RSP / ...
+ * ticket:     REQ→RSP 配对 ID；PUSH/HELLO 用 0
+ * flags:      UDS_FLG_MORE_FRAG / UDS_FLG_COMPRESSED / 0
  * payload:    JSON 文本（不含头部）
  * 返回: 实际编码字节数；失败 0
  */
-size_t uds_encode_frame(uint8_t frame_type, uint32_t ticket,
+size_t uds_encode_frame(uint8_t frame_type, uint32_t ticket, uint8_t flags,
                         const char *payload, size_t payload_len,
                         uint8_t *out, size_t out_sz);
+
+/* ---- 分片发送 ----
+ * payload 超过 MAX_PAYLOAD 时拆成多片发送，每片独立 datagram。
+ * ticket 相同，前 N-1 片 flags|=UDS_FLG_MORE_FRAG。
+ * send_lock 必须由调用者持有。 */
+int uds_send_fragmented_locked(int fd, uint8_t frame_type, uint32_t ticket,
+                               const char *payload, size_t payload_len);
 
 static inline const char *uds_default_sock_path(void)
 {

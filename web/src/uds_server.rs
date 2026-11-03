@@ -29,6 +29,10 @@
 //! skipped here — the HELLO frame carries pid/hostname as a soft handshake.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
+use std::collections::HashMap;
+use tokio::sync::oneshot;
 
 use crate::AppState;
 
@@ -47,6 +51,27 @@ pub const FT_ERROR:       u8 = 0x0F;
 /* 256KB datagram-safe payload upper bound (matches C-side NSBC_MAX_PAYLOAD exactly). */
 const MAX_PAYLOAD: usize = 256 * 1024;
 const MAX_FRAME:  usize = FRAME_HDR_LEN + MAX_PAYLOAD;
+
+/* ---- flags 位定义 (与 C 端 uDS_client.h 对齐) ---- */
+const UDS_FLG_MORE_FRAG:   u8 = 0x01;  /* bit0: 还有后续分片 */
+const UDS_FLG_COMPRESSED:  u8 = 0x02;  /* bit1: payload 已压缩（预留） */
+const UDS_FRAG_TIMEOUT_MS: u64 = 3000;  /* 分片重组超时阈值 */
+const UDS_FRAG_MAX_TOTAL:  usize = 64 * 1024 * 1024;  /* 重组 buffer 上限 64MB */
+
+/* ---- Rust→C CMD_REQ 状态 (Web 发命令给 C core, 等 RSP) ----
+ * ticket 生成用高位 0x80000000 区分方向（C→Rust ticket 高位为 0）。 */
+static CORE_CMD_TICKET: AtomicU32 = AtomicU32::new(0x80000000);
+static CORE_CMD_WAITERS: Mutex<Option<HashMap<u32, oneshot::Sender<Vec<u8>>>>> = Mutex::new(None);
+/* 分片重组状态（cmd_recv_loop 内部持有，每次 loop 重置） */
+struct FragState {
+    ticket: u32,
+    buf: Vec<u8>,
+    last_ms: u64,
+}
+impl FragState {
+    fn new() -> Self { Self { ticket: 0, buf: Vec::new(), last_ms: 0 } }
+    fn reset(&mut self) { self.ticket = 0; self.buf.clear(); self.last_ms = 0; }
+}
 
 pub fn default_sock_base_path() -> std::path::PathBuf {
     std::path::PathBuf::from(std::env::var_os("NSBC_DATA_SOCK")
@@ -137,27 +162,49 @@ pub fn start<C: crate::coreclient::CoreApi + Clone + Send + Sync + 'static>(
 
 /// Decode one frame from a raw datagram buffer. Returns parsed fields on success,
 /// or None on malformed magic/len. payload bytes reference `buf`.
-fn decode_frame(buf: &[u8]) -> Option<(u8, u32, u32, &[u8])> {
+fn decode_frame(buf: &[u8]) -> Option<(u8, u32, u32, u8, &[u8])> {
     if buf.len() < FRAME_HDR_LEN { return None; }
     if buf[0] != FRAME_MAGIC { return None; }
     let total_len = u32::from_be_bytes([buf[2], buf[3], buf[4], buf[5]]) as usize;
     if total_len < FRAME_HDR_LEN || total_len > MAX_FRAME { return None; }
     let ticket    = u32::from_be_bytes([buf[6], buf[7], buf[8], buf[9]]);
     let frame_type = buf[1];
+    let flags = buf[10];
     let payload = &buf[FRAME_HDR_LEN..total_len.min(buf.len())];
-    Some((frame_type, total_len as u32, ticket, payload))
+    Some((frame_type, total_len as u32, ticket, flags, payload))
 }
 
-fn build_frame(frame_type: u8, ticket: u32, payload: &str) -> Vec<u8> {
+fn build_frame(frame_type: u8, ticket: u32, flags: u8, payload: &[u8]) -> Vec<u8> {
     let total_len = (FRAME_HDR_LEN + payload.len()) as u32;
     let mut out = Vec::with_capacity(total_len as usize);
     out.push(FRAME_MAGIC);
     out.push(frame_type);
     out.extend_from_slice(&total_len.to_be_bytes());
     out.extend_from_slice(&ticket.to_be_bytes());
-    out.push(0); /* flags */
-    out.push(0); /* rsvd */
-    out.extend_from_slice(payload.as_bytes());
+    out.push(flags);   /* flags: bit0=more_fragment, bit1=compressed */
+    out.push(0);       /* rsvd */
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Build one or more frames: if payload fits in MAX_PAYLOAD → single frame.
+/// Otherwise split into ceil(len/MAX_PAYLOAD) fragments, all sharing the same
+/// ticket; first N-1 frames have flags|=UDS_FLG_MORE_FRAG.
+fn build_fragmented_frames(frame_type: u8, ticket: u32, payload: &[u8]) -> Vec<Vec<u8>> {
+    let chunk = MAX_PAYLOAD;
+    if payload.len() <= chunk {
+        return vec![build_frame(frame_type, ticket, 0, payload)];
+    }
+    let mut out = Vec::new();
+    let mut sent = 0;
+    while sent < payload.len() {
+        let remaining = payload.len() - sent;
+        let this_chunk = remaining.min(chunk);
+        let is_last = sent + this_chunk >= payload.len();
+        let flags = if is_last { 0 } else { UDS_FLG_MORE_FRAG };
+        out.push(build_frame(frame_type, ticket, flags, &payload[sent..sent+this_chunk]));
+        sent += this_chunk;
+    }
     out
 }
 
@@ -193,7 +240,7 @@ async fn push_recv_loop<C: crate::coreclient::CoreApi + Clone + Send + Sync + 's
                 continue;
             }
         };
-        let (frame_type, _total, _ticket, payload) = frame;
+        let (frame_type, _total, _ticket, _flags, payload) = frame;
         let payload_str = String::from_utf8_lossy(payload).to_string();
 
         match frame_type {
@@ -216,7 +263,7 @@ async fn push_recv_loop<C: crate::coreclient::CoreApi + Clone + Send + Sync + 's
 }
 
 /* -------------------------------------------------------------------------- */
-/* Cmd recv loop — bidirectional REQ/RSP + HELLO                              */
+/* Cmd recv loop — bidirectional REQ/RSP + HELLO + fragment reassembly        */
 /* -------------------------------------------------------------------------- */
 
 #[cfg(unix)]
@@ -224,51 +271,196 @@ async fn cmd_recv_loop<C: crate::coreclient::CoreApi + Clone + Send + Sync + 'st
     sock: tokio::net::UnixDatagram,
     state: &Arc<AppState<C>>,
 ) -> std::io::Result<()> {
+    /* 初始化 CORE_CMD_WAITERS（send_core_cmd_via_uds 暴露给 coreclient.rs 用） */
+    {
+        let mut w = CORE_CMD_WAITERS.lock().unwrap();
+        if w.is_none() {
+            *w = Some(HashMap::new());
+        }
+    }
+
     let mut buf = vec![0u8; MAX_FRAME];
+    let mut frag = FragState::new();
+
     loop {
         let (n, peer) = sock.recv_from(&mut buf).await?;
         let frame = match decode_frame(&buf[..n]) {
             Some(f) => f,
             None => {
-                /* malformed magic/len — best-effort ACK so caller knows it dropped */
-                let _ = sock.send_to(&build_bad_frame_ack(0, b"invalid frame"), &peer).await;
+                if let Some(p) = peer.as_pathname() {
+                    let _ = sock.send_to(&build_bad_frame_ack(0, b"invalid frame"), p).await;
+                }
                 continue;
             }
         };
-        let (frame_type, _total, ticket, payload) = frame;
-        let payload_str = String::from_utf8_lossy(payload).to_string();
+        let (frame_type, _total, ticket, flags, payload) = frame;
 
-        let resp: Option<(u8, String)> = match frame_type {
-            FT_CMD_REQ => match dispatch_cmd_req(&payload_str, state).await {
-                Ok(body)  => Some((FT_CMD_RSP, body)),
-                Err(e)    => Some((FT_CMD_RSP, serde_json::json!({"ok": false, "reason": "bad_request", "error": e}).to_string())),
-            },
+        /* ---- 分片重组 ---- */
+        let is_last = (flags & UDS_FLG_MORE_FRAG) == 0;
+        if !is_last {
+            /* 中间分片：累积 */
+            if frag.ticket != ticket { frag.reset(); }
+            let new_len = frag.buf.len() + payload.len();
+            if new_len > UDS_FRAG_MAX_TOTAL {
+                tracing::warn!(ticket, "fragment too large, dropping");
+                frag.reset();
+                continue;
+            }
+            frag.buf.extend_from_slice(payload);
+            frag.ticket = ticket;
+            frag.last_ms = now_ms();
+            continue;
+        }
+
+        /* 最后一片：拼完整 payload */
+        let full_payload: Vec<u8> = if frag.ticket == ticket && !frag.buf.is_empty() {
+            let mut complete = std::mem::take(&mut frag.buf);
+            complete.extend_from_slice(payload);
+            frag.reset();
+            complete
+        } else {
+            payload.to_vec()
+        };
+
+        let is_rust_originated = (ticket & 0x80000000) != 0;
+
+        /* ---- Rust→C CMD_RSP 匹配（Web 发的命令回来了） ---- */
+        if frame_type == FT_CMD_RSP && is_rust_originated {
+            let mut w = CORE_CMD_WAITERS.lock().unwrap();
+            if let Some(map) = w.as_mut() {
+                if let Some(tx) = map.remove(&ticket) {
+                    let _ = tx.send(full_payload);
+                    continue;  /* 成功匹配，跳过下面的 CMD_REQ 分发 */
+                }
+            }
+        }
+
+        /* ---- C→Rust CMD_REQ（cmd_recv_loop 原生处理的请求） ---- */
+        if frame_type == FT_CMD_REQ && !is_rust_originated {
+            let payload_str = String::from_utf8_lossy(&full_payload).to_string();
+            let resp: Option<(u8, Vec<u8>)> = match dispatch_cmd_req(&payload_str, state).await {
+                Ok(body)  => Some((FT_CMD_RSP, body.into_bytes())),
+                Err(e)    => Some((FT_CMD_RSP, serde_json::json!({"ok": false, "reason": "bad_request", "error": e}).to_string().into_bytes())),
+            };
+            if let Some((ft, body)) = resp {
+                let frames = build_fragmented_frames(ft, ticket, &body);
+                if let Some(p) = peer.as_pathname() {
+                    for f in frames {
+                        let _ = sock.send_to(&f, p).await;
+                    }
+                }
+            }
+            continue;
+        }
+
+        /* ---- 其他帧类型 ---- */
+        let payload_str = String::from_utf8_lossy(&full_payload).to_string();
+        let resp: Option<(u8, Vec<u8>)> = match frame_type {
             FT_HELLO => {
                 crate::sync::on_hello(state.clone());
-                Some((FT_HELLO_ACK, serde_json::json!({"ok": true}).to_string()))
+                Some((FT_HELLO_ACK, serde_json::json!({"ok": true}).to_string().into_bytes()))
             }
-            FT_HEARTBEAT => Some((FT_ACK, serde_json::json!({"ok": true}).to_string())),
+            FT_HEARTBEAT => Some((FT_ACK, serde_json::json!({"ok": true}).to_string().into_bytes())),
             FT_DATA_PUSH => {
-                /* PUSH should land on push channel, but tolerate — dispatch + ACK */
                 if let Err(e) = dispatch_push(&payload_str, state).await {
                     tracing::warn!(error = %e, "cmd channel push fallback failed");
                 }
-                None /* no ACK needed, push is fire-and-forget */
+                None
             }
             FT_ERROR => {
                 tracing::warn!(payload = %payload_str, "C side UDS error frame");
                 None
             }
-            FT_HELLO_ACK | FT_CMD_RSP | FT_ACK => None, /* server doesn't wait for these */
+            FT_HELLO_ACK | FT_CMD_RSP | FT_ACK => None, /* 静默 */
             other => {
-                tracing::warn!(frame_type = other, "unknown UDS frame type");
-                Some((FT_ACK, serde_json::json!({"ok": false, "error": format!("unknown frame_type=0x{other:02x}")}).to_string()))
+                tracing::debug!(frame_type = other, "unknown UDS frame type");
+                None
             }
         };
 
         if let Some((ft, body)) = resp {
-            let frame = build_frame(ft, ticket, &body);
-            let _ = sock.send_to(&frame, &peer).await;
+            let frames = build_fragmented_frames(ft, ticket, &body);
+            if let Some(p) = peer.as_pathname() {
+                for f in frames {
+                    let _ = sock.send_to(&f, p).await;
+                }
+            }
+        }
+    }
+}
+
+/// 当前时间戳（ms，供分片超时用）
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/* -------------------------------------------------------------------------- */
+/* send_core_cmd_via_uds —— Web→C 命令发送 + 分片 + 等待 RSP                  */
+/* -------------------------------------------------------------------------- */
+
+/// Send a command to C core via data_cmd.sock UDS frame protocol.
+/// Handles fragmentation automatically if payload exceeds MAX_PAYLOAD.
+/// Returns the raw RSP bytes from C core (may also be fragmented on C→Rust path,
+/// reassembled by cmd_recv_loop before being delivered here).
+///
+/// Uses a temporary client datagram bind path (mirrors C-side uds_open_dgram).
+/// The actual RSP delivery is routed through cmd_recv_loop + CORE_CMD_WAITERS map,
+/// so this function blocks on oneshot::Receiver until timeout.
+#[cfg(unix)]
+pub async fn send_core_cmd_via_uds(
+    sock_path: &std::path::Path,
+    cmd_text: &str,
+    timeout_ms: u64,
+) -> Result<Vec<u8>, String> {
+    use tokio::io::AsyncWriteExt;
+
+    let cmd_payload = cmd_text.as_bytes();
+    let ticket = CORE_CMD_TICKET.fetch_add(1, Ordering::Relaxed);
+
+    /* 注册等待者 */
+    let (tx, rx) = oneshot::channel();
+    {
+        let mut w = CORE_CMD_WAITERS.lock().map_err(|e| e.to_string())?;
+        if let Some(map) = w.as_mut() {
+            map.insert(ticket, tx);
+        } else {
+            return Err("CORE_CMD_WAITERS not initialized".into());
+        }
+    }
+
+    /* 构造分片帧 */
+    let frames = build_fragmented_frames(FT_CMD_REQ, ticket, cmd_payload);
+
+    /* 用临时 client datagram bind → connect → 发送所有分片
+     * （C 端 connect 到 server path，send() 就自动 route 回 server 的 recv_from） */
+    let client_path = format!("/tmp/nsbc_web_cmd_{}.sock", std::process::id());
+    let client = tokio::net::UnixDatagram::bind(&client_path)
+        .map_err(|e| format!("bind client datagram {client_path}: {e}"))?;
+    let _ = tokio::fs::remove_file(&client_path).await; /* 清理残留 */
+
+    let cmd_path = crate::uds_server::default_sock_base_path();
+    let (_, cmd_path) = derive_paths(&cmd_path);
+    client.connect(&cmd_path)
+        .map_err(|e| format!("connect to cmd_path: {e}"))?;
+
+    for frame in &frames {
+        client.send(frame).await
+            .map_err(|e| format!("send CMD_REQ fragment: {e}"))?;
+    }
+
+    /* 等 RSP —— 来自 cmd_recv_loop 通过 oneshot 唤醒 */
+    let timeout = std::time::Duration::from_millis(timeout_ms);
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(data)) => Ok(data),
+        Ok(Err(_)) => Err(format!("CMD_REQ ticket={ticket} dropped (cmd_recv_loop exited)")),
+        Err(_) => {
+            /* 超时 —— 清理等待者 */
+            let mut w = CORE_CMD_WAITERS.lock().map_err(|e| e.to_string())?;
+            if let Some(map) = w.as_mut() { map.remove(&ticket); }
+            Err(format!("CMD_REQ ticket={ticket} timed out after {timeout_ms}ms"))
         }
     }
 }
