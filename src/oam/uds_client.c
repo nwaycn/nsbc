@@ -99,6 +99,12 @@ typedef struct {
     pthread_t        thread;        /* consumer thread */
     int              running;       /* 1=已启动 */
 
+    /* flush batch 临时 buffer（heap 分配，避免栈溢出 — frames[32][262KB] ≈ 8.3MB） */
+    uds_slot_t      *batch;         /* UDS_BATCH_SEND × uds_slot_t ≈ 256KB */
+    uint8_t         *frames;        /* UDS_BATCH_SEND × NSBC_MAX_FRAME ≈ 8MB */
+    struct iovec    *iov;           /* UDS_BATCH_SEND × struct iovec */
+    struct mmsghdr  *mh;            /* UDS_BATCH_SEND × struct mmsghdr */
+
     /* drop 计数（暴露到 metrics） */
     _Atomic uint32_t dropped;
 } uds_shard_t;
@@ -669,6 +675,20 @@ static int shard_init(uds_shard_t *s, uint32_t ring_size, int idx)
     s->wake_rd = wfd[0];
     s->wake_wr = wfd[1];
     pthread_mutex_init(&s->send_lock, NULL);
+
+    /* 分配 flush batch 临时 buffer（heap，避免 8MB 栈溢出） */
+    s->batch = (uds_slot_t *)calloc(UDS_BATCH_SEND, sizeof(uds_slot_t));
+    s->frames = (uint8_t *)calloc(UDS_BATCH_SEND, NSBC_MAX_FRAME);
+    s->iov = (struct iovec *)calloc(UDS_BATCH_SEND, sizeof(struct iovec));
+    s->mh = (struct mmsghdr *)calloc(UDS_BATCH_SEND, sizeof(struct mmsghdr));
+    if (!s->batch || !s->frames || !s->iov || !s->mh) {
+        free(s->batch); free(s->frames); free(s->iov); free(s->mh);
+        s->batch = NULL; s->frames = NULL; s->iov = NULL; s->mh = NULL;
+        pthread_mutex_destroy(&s->send_lock);
+        close(s->wake_rd); close(s->wake_wr);
+        free(s->slots); s->slots = NULL;
+        return -1;
+    }
     return 0;
 }
 
@@ -677,6 +697,11 @@ static void shard_destroy(uds_shard_t *s)
     if (s->wake_rd >= 0) { close(s->wake_rd); s->wake_rd = -1; }
     if (s->wake_wr >= 0) { close(s->wake_wr); s->wake_wr = -1; }
     pthread_mutex_destroy(&s->send_lock);
+    /* 释放 batch 临时 buffer */
+    free(s->batch);  s->batch  = NULL;
+    free(s->frames); s->frames = NULL;
+    free(s->iov);    s->iov    = NULL;
+    free(s->mh);     s->mh     = NULL;
     free(s->slots);
     s->slots = NULL;
 }
@@ -735,14 +760,16 @@ static int shard_try_pop(uds_shard_t *s, uds_slot_t *out, int max)
  * 一次 syscall 发 UDS_BATCH_SEND 帧。每条帧是独立 datagram。 */
 static int shard_flush_batch(uds_shard_t *s, int *out_fatal)
 {
-    uds_slot_t batch[UDS_BATCH_SEND];
+    /* 用 shard 自己预分配的 heap buffer，避免 8MB 栈溢出 */
+    uds_slot_t *batch = s->batch;      /* UDS_BATCH_SEND × 8KB ≈ 256KB */
+    uint8_t    *frames = s->frames;    /* UDS_BATCH_SEND × NSBC_MAX_FRAME ≈ 8MB */
+    struct iovec *iov = s->iov;
+    struct mmsghdr *mh = s->mh;
+
     int n = shard_try_pop(s, batch, UDS_BATCH_SEND);
     if (n == 0) return 0;
 
     int sent = 0;
-    uint8_t frames[UDS_BATCH_SEND][NSBC_FRAME_HDR_LEN + NSBC_MAX_PAYLOAD];
-    struct iovec iov[UDS_BATCH_SEND];
-    struct mmsghdr mh[UDS_BATCH_SEND];
 
     for (int i = 0; i < n; i++) {
         /* cJSON 包装 —— 这个 CPU 是 consumer 自己的，开销不影响 worker */
@@ -765,13 +792,15 @@ static int shard_flush_batch(uds_shard_t *s, int *out_fatal)
             break;
         }
 
+        /* frames[i] — 每次从 s->frames 基址偏移 i×NSBC_MAX_FRAME */
+        uint8_t *frm = frames + (size_t)i * NSBC_MAX_FRAME;
         size_t fsz = uds_encode_frame(FT_DATA_PUSH, 0, 0,
                                         json_str, jlen,
-                                        frames[i], sizeof(frames[i]));
+                                        frm, NSBC_MAX_FRAME);
         cJSON_free(json_str);
         if (fsz == 0) break;
 
-        iov[i].iov_base = frames[i];
+        iov[i].iov_base = frm;
         iov[i].iov_len  = fsz;
         memset(&mh[i], 0, sizeof(mh[i]));
         mh[i].msg_hdr.msg_iov = &iov[i];
@@ -789,13 +818,13 @@ static int shard_flush_batch(uds_shard_t *s, int *out_fatal)
 
     int sent_total = 0;
     /* glibc 在 _GNU_SOURCE 下已声明 sendmmsg —— 直接调
-     * 最后一个参数 flags=0（无 GSO/zerocopy 等扩展）
      * 返回 int：成功 = 发送的消息数 >=0，失败 = -1 */
     sent_total = sendmmsg(g.fd_push, mh, sent, 0);
     if (sent_total == -1) {
         /* sendmmsg 系统调用失败 —— 回退逐帧 send（兼容内核版本 < 3.0） */
         for (int i = 0; i < sent; i++) {
-            if (dgram_send_locked(g.fd_push, frames[i], iov[i].iov_len) != 0) {
+            uint8_t *frm = frames + (size_t)i * NSBC_MAX_FRAME;
+            if (dgram_send_locked(g.fd_push, frm, iov[i].iov_len) != 0) {
                 *out_fatal = 1;
                 pthread_mutex_unlock(&s->send_lock);
                 return n;
@@ -804,7 +833,8 @@ static int shard_flush_batch(uds_shard_t *s, int *out_fatal)
     } else {
         /* sendmmsg 可能部分成功 —— 失败帧按单帧 send 补 */
         for (int i = sent_total; i < sent; i++) {
-            if (dgram_send_locked(g.fd_push, frames[i], iov[i].iov_len) != 0) {
+            uint8_t *frm = frames + (size_t)i * NSBC_MAX_FRAME;
+            if (dgram_send_locked(g.fd_push, frm, iov[i].iov_len) != 0) {
                 *out_fatal = 1;
                 pthread_mutex_unlock(&s->send_lock);
                 return n;
