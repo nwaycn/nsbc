@@ -417,7 +417,9 @@ static void respond(reg_core_t *r, sip_tr_proto_t proto, const nsbc_sa_t *dst,
     if (n <= 0) return;
     /* 优先走 txn 层：自动缓存响应 + 吸收同 branch 重传 */
     if (txn) {
+        txn_ref(txn);  /* ★ 防竞态：protect txn_send_response 期间 txn 不被释放 */
         txn_send_response(txn, out, (size_t)n, nsbc_now_ms());
+        txn_unref(txn);
     } else {
         sip_tr_send(r->cfg.tr, proto, out, (size_t)n, dst);
     }

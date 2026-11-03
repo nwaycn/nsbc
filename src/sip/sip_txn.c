@@ -114,6 +114,18 @@ static long t_unref(sip_txn_t *t)
     return r;
 }
 
+/* 公开 ref 接口：让外部模块（b2bua）能在使用 txn 期间保证其生命周期。
+ * 典型场景：cli_tu Timer F 回调用 srv_txn 发 408 时，call_destroy 可能并发
+ * 释放 srv_txn —— t_ref() 让 refcount 不归零，obj 不释放。 */
+void txn_ref(sip_txn_t *t)
+{
+    if (t) t_ref(t);
+}
+void txn_unref(sip_txn_t *t)
+{
+    if (t) t_unref(t);
+}
+
 static void t_send(sip_txn_t *t, const char *buf, size_t len)
 {
     /* 恢复发送端口：确保重发时仍用 txn 创建时捕获的 local_port
@@ -166,6 +178,11 @@ static void cb_dead(uint64_t now, void *arg);
 static void arm(sip_txn_t *t, tw_node_t *n, uint32_t ms, tw_cb_fn cb,
                 uint64_t now)
 {
+    /* 防御：call_destroy / detach_txn 可能在 Ticker 回调 arm 之前就把
+     * t 置 TERMINATED 并释放了 mgr/tw。此 check 把 SIGSEGV 降级为
+     * "静默丢失 timer arm"——竞态场景下的最小化损害。 */
+    if (!t || !t->mgr || !t->mgr->cfg.tw)
+        return;
     tw_add(t->mgr->cfg.tw, n, now + ms, cb, t);
     t_ref(t); /* 在轮 = +1；cb 结束若未重挂则对应 unref */
 }

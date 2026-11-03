@@ -789,29 +789,45 @@ static void call_destroy(b2b_call_t *c)
     mem_obj_release(c);
 }
 
-/* 由服务端事务缓存的原始请求构造应答并经事务发出 */
+/* 由服务端事务缓存的原始请求构造应答并经事务发出
+ *
+ * ★ 内部自带 txn_ref/txn_unref：保证整个调用链（sip_parse →
+ * sip_build_response → txn_send_response）期间 txn 不被并发释放。
+ * 否则 cli_tu Timer F 回调与 call_destroy 在同一 call 上竞态时，
+ * srv_txn 可能在 txn_first_request 读取后被释放。 */
 static int respond_txn(b2b_core_t *co, sip_txn_t *t, int status,
                        const char *contact, const char *extra,
                        const char *body, size_t bodylen)
 {
     if (!t)
         return NSBC_INVAL;
+    txn_ref(t); /* ★ 保证整个调用链 txn 存活 */
+    int rc;
     size_t rlen = 0;
     const char *raw = txn_first_request(t, &rlen);
-    if (!raw)
-        return NSBC_ERR;
+    if (!raw) {
+        rc = NSBC_ERR;
+        goto out;
+    }
     sip_msg_t req;
-    if (sip_parse(&req, raw, rlen) != NSBC_OK)
-        return NSBC_PROTO;
+    if (sip_parse(&req, raw, rlen) != NSBC_OK) {
+        rc = NSBC_PROTO;
+        goto out;
+    }
     char out[SIP_MAX_MSG];
     /* 取本侧 to-tag：服务端事务对应的腿 */
     const char *tag = NULL;
     (void)co;
     int n = sip_build_response(out, sizeof(out), &req, status, NULL, tag,
                                contact, extra, body, bodylen);
-    if (n < 0)
-        return NSBC_NOSPC;
-    return txn_send_response(t, out, (size_t)n, now_ms());
+    if (n < 0) {
+        rc = NSBC_NOSPC;
+        goto out;
+    }
+    rc = txn_send_response(t, out, (size_t)n, now_ms());
+out:
+    txn_unref(t);
+    return rc;
 }
 
 /* Route 头块（对话路由集，UAC 逆序已在 dlg 层处理） */
@@ -1593,6 +1609,7 @@ static void respond_a(b2b_call_t *c, int status, const char *body,
          status, bodylen, a->srv_txn, a->inv_txn, t, c->leg[1].reinv, c->a_final);
     if (!t)
         return;
+    txn_ref(t); /* ★ 防竞态：respond_a 可能被 Timer 回调触发，call_destroy 可并发释放 txn */
     /* REQ-NAT-001：respond_a 里构造的 Contact 也走 external_sip_ip
      * REQ-NAT-002：优先 per-call profile，fallback cfg */
     const char *prof_ext = (c->prof && c->prof->external_sip_ip[0])
@@ -1671,10 +1688,10 @@ static void respond_a(b2b_call_t *c, int status, const char *body,
     size_t rlen = 0;
     const char *raw = txn_first_request(t, &rlen);
     if (!raw)
-        return;
+        goto out;
     sip_msg_t req;
     if (sip_parse(&req, raw, rlen) != NSBC_OK)
-        return;
+        goto out;
     /* REQ-NAT-003：dialog 内请求也走 per-call profile 的 sip_udp_port */
     char contact[B2B_HDR_MAX];
     uint16_t dlg_port = (c->prof && c->prof->sip_udp_port)
@@ -1688,9 +1705,11 @@ static void respond_a(b2b_call_t *c, int status, const char *body,
                                tag, contact, extra[0] ? extra : NULL,
                                body, bodylen);
     if (n < 0)
-        return;
+        goto out;
     int trc = txn_send_response(t, out, (size_t)n, now_ms());
     llog(LOG_INFO, "b2b", "respond_a: txn_send_response rc=%d n=%zu t=%p status=%d", trc, (size_t)n, t, status);
+out:
+    txn_unref(t);
 }
 
 /* 媒体决策一次 */

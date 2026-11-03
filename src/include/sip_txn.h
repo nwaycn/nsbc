@@ -144,6 +144,12 @@ const char *txn_state_name(txn_state_t s);
  * 幂等：已 dead 的 txn 直接返回。 */
 void txn_force_terminate(sip_txn_t *t);
 
+/* 公开引用计数：外部模块使用 txn 期间调用保证其生命周期。
+ * 典型场景：Timer 回调触发的 respond_txn 调用，call_destroy 可能并发释放 txn。
+ * txn_ref() 让 refcount 不归零 → obj 不释放。 */
+void txn_ref(sip_txn_t *t);
+void txn_unref(sip_txn_t *t);
+
 /* 统计（OBS） */
 uint64_t txn_mgr_active(txn_mgr_t *m);
 uint64_t txn_mgr_retrans_in(txn_mgr_t *m);
