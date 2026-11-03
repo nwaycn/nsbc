@@ -94,7 +94,7 @@ override CPPFLAGS += -DNSBC_WITH_OPENSSL -DNSBC_WITH_SRTP
 override CPPFLAGS += -DNSBC_NO_DB_MODULE   # architectural hard constraint: C core does not touch DB
 
 # linker libs: override layer ensures base libs are complete, don't recompute to preserve existing libs in L160
-override LDLIBS += -lm -lpcre2-8 -lpthread -lrt
+override LDLIBS += -lm -lpcre2-8 -lpthread -lrt -latomic
 # filter out sqlite3-related (architectural hard constraint), but leave other libs untouched
 override LDLIBS := $(strip $(filter-out -lsqlite3 $(SQLITE_LDLIBS),$(LDLIBS)))
 override LDLIBS += -lssl -lcrypto
