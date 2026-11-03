@@ -63,9 +63,13 @@ struct reg_core {
     digest_cfg_t dig;
     tbucket_t ip[TB_IP_N];
     tbucket_t aor[TB_AOR_N];
-    pthread_mutex_t glock;
-    double gtokens;
-    uint64_t glast_ms;
+    /* 全局令牌桶 —— lock-free：用两个 atomic 变量，CAS 循环代替 pthread_mutex
+     * 之前 glock 是所有 REGISTER 的串行热点（不管 IP/AoR）。
+     * 改成 atomic 后全局 CPS 限流器本身零锁竞争。
+     * tbucket_t ip/aor 各自仍有 pthread_mutex（shard 锁），因为 per-IP/per-AoR
+     * 令牌桶状态更复杂（key 切换 + tokens 重置），改成 lock-free 收益不大。 */
+    _Atomic double  gtokens;
+    _Atomic uint64_t glast_ms;
     uint64_t n_total, n_rej, n_thr;
 };
 
@@ -113,17 +117,53 @@ static uint32_t str_key(const char *s)
 
 static int global_take(reg_core_t *r, uint64_t now)
 {
-    pthread_mutex_lock(&r->glock);
-    double add = (double)(now - r->glast_ms) * r->cfg.global_cps / 1000.0;
-    r->gtokens += add;
-    if (r->gtokens > r->cfg.global_cps)
-        r->gtokens = r->cfg.global_cps;
-    r->glast_ms = now;
-    int ok = r->gtokens >= 1.0;
-    if (ok)
-        r->gtokens -= 1.0;
-    pthread_mutex_unlock(&r->glock);
-    return ok;
+    /* Lock-free 全局令牌桶 —— CAS 循环
+     * 两个独立 atomic：glast_ms（时间戳）+ gtokens（令牌数）
+     * 
+     * 难点：时间戳刷新和令牌消费必须"看起来"原子（否则竞态：A 刷了时间戳
+     * 但还没消费 token，B 也刷时间戳然后消费）。
+     * 
+     * 解法：用经典的双 CAS 循环。先 CAS 刷新时间戳，再 CAS 消费 token。
+     * 如果 CAS 失败说明有别人同时操作，restart 重试。
+     * 
+     * 注意：double 的 atomic CAS 在 GCC 下用 __atomic_* 内建（编译成
+     * cmpxchg8b/cmpxchg16b），不需要 libatomic 库，O(1) 无锁开销。 */
+    const int64_t cap = (int64_t)r->cfg.global_cps;
+    
+    for (;;) {
+        /* Load current state */
+        uint64_t last = atomic_load_explicit(&r->glast_ms, memory_order_acquire);
+        double toks = atomic_load_explicit(&r->gtokens, memory_order_acquire);
+        
+        /* Compute new tokens since last tick */
+        if ((int64_t)(now - last) > 0) {
+            double add = (double)(now - last) * r->cfg.global_cps / 1000.0;
+            toks += add;
+            if (toks > (double)cap) toks = (double)cap;
+        }
+        
+        /* Check if we can take one */
+        if (toks < 1.0)
+            return 0;  /* 限流 */
+        
+        double new_toks = toks - 1.0;
+        
+        /* CAS: 先刷新时间戳，再消费 token
+         * 如果别人在我们计算期间改了状态，CAS 失败 → 重试 */
+        uint64_t expected_last = last;
+        if (!atomic_compare_exchange_weak_explicit(
+                &r->glast_ms, &expected_last, now,
+                memory_order_acq_rel, memory_order_acquire))
+            continue;  /* 别人先刷时间戳了，重来 */
+        
+        double expected_toks = toks;
+        if (!atomic_compare_exchange_weak_explicit(
+                &r->gtokens, &expected_toks, new_toks,
+                memory_order_acq_rel, memory_order_acquire))
+            continue;  /* 别人先消费了 token，重来 */
+        
+        return 1;  /* 成功 */
+    }
 }
 
 /* 在 Contact 头原始值里取 ;expires= / +sip.instance= / reg-id= */
@@ -384,7 +424,8 @@ int reg_core_create(const reg_cfg_t *cfg, reg_core_t **out)
         free(r);
         return NSBC_NOMEM;
     }
-    pthread_mutex_init(&r->glock, NULL);
+    /* glock 已移除 —— gtokens/glast_ms 现在是 _Atomic 变量
+     * calloc 已清零（gtokens=0, glast_ms=0），和旧代码行为一致 */
     for (int i = 0; i < TB_IP_N; ++i)
         pthread_mutex_init(&r->ip[i].lock, NULL);
     for (int i = 0; i < TB_AOR_N; ++i)
@@ -403,7 +444,7 @@ void reg_core_destroy(reg_core_t *r)
         pthread_mutex_destroy(&r->ip[i].lock);
     for (int i = 0; i < TB_AOR_N; ++i)
         pthread_mutex_destroy(&r->aor[i].lock);
-    pthread_mutex_destroy(&r->glock);
+    /* glock 已移除 —— atomic 变量不需要 destroy */
     free(r);
 }
 

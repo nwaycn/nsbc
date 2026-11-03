@@ -204,9 +204,22 @@ int net_udp_open(const char *bind_host, uint16_t port, const net_udp_cfg_t *cfg)
     if (cfg && cfg->pktinfo)
         setsockopt(fd, IPPROTO_IP, IP_PKTINFO, &yes, sizeof(yes));
     if (cfg) {
-        set_rcvbuff(fd, cfg->rcvbuf, SO_RCVBUF);
-        set_rcvbuff(fd, cfg->sndbuf, SO_SNDBUF);
+        /* cfg 显式传入时，若值为 0 则用工程默认值：
+         * SO_RCVBUF=8MB, SO_SNDBUF=4MB（Linux 默认 UDP SO_RCVBUF≈208KB 太小，
+         * 压测 >5K CPS 时 receive buffer errors 计数器必涨） */
+        int rcvbuf = cfg->rcvbuf > 0 ? cfg->rcvbuf : (8 * 1024 * 1024);
+        int sndbuf = cfg->sndbuf > 0 ? cfg->sndbuf : (4 * 1024 * 1024);
+        set_rcvbuff(fd, rcvbuf, SO_RCVBUF);
+        set_rcvbuff(fd, sndbuf, SO_SNDBUF);
+    } else {
+        /* cfg 为 NULL（调用方连默认配置都没传）—— 硬编码兜底 */
+        int rcvbuf = 8 * 1024 * 1024;
+        int sndbuf = 4 * 1024 * 1024;
+        set_rcvbuff(fd, rcvbuf, SO_RCVBUF);
+        set_rcvbuff(fd, sndbuf, SO_SNDBUF);
     }
+    llog(LOG_INFO, "net", "udp_open %s:%u rcvbuf=%d sndbuf=%d",
+         bind_host, port, cfg ? cfg->rcvbuf : 0, cfg ? cfg->sndbuf : 0);
     nsbc_sa_t a;
     if (nsbc_sa_from(&a, bind_host, port, family) != NSBC_OK) {
         close(fd);
@@ -250,6 +263,13 @@ int net_tcp_accept(int lfd, nsbc_sa_t *peer)
     nsbc_sa_clear(peer);
     int fd = accept4(lfd, (struct sockaddr *)&peer->ss, &peer->len,
                      SOCK_NONBLOCK | SOCK_CLOEXEC);
+    if (fd >= 0) {
+        /* TCP_NODELAY —— 禁用 Nagle 算法。
+         * SIP/WebSocket/HTTP 都是小包高频交互，Nagle 合并延迟 ~40ms 不可接受。
+         * 设置 TCP_NODELAY 在内核层禁用 Nagle，让小包立即发出。 */
+        int flag = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, (socklen_t)sizeof(flag));
+    }
     return fd; /* <0：errno 由调用方处理（EAGAIN 正常） */
 }
 
