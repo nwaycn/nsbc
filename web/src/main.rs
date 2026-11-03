@@ -181,7 +181,7 @@ fn api_router<C: CoreApi + Clone + 'static>(st: Arc<AppState<C>>) -> Router {
         .merge(routes::security::router())
         .merge(routes::recordings::router())
         .merge(routes::recordings::public_file_router(st.clone()))
-        .merge(routes::billing::router())
+        .nest("/billing", routes::billing::router())
         .merge(routes::transcode::router())
         .merge(routes::tenants::router())
         .merge(routes::auth::protected_router())

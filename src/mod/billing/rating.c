@@ -86,6 +86,18 @@ struct billing {
      * bill_destroy 时 free。生命周期和 billing_t 对齐，tick 零 malloc。
      * Pass 1 累加 → Pass 2 批量应用 → 下次 tick 前 memset 清零。*/
     int64_t *per_acct_delta;
+
+    /* Phase 2.1: billing_pre_auth 结果缓存
+     * 128 桶，每桶 1 条，TTL 30s。reactor 单线程无锁。
+     * 防止同一 caller+callee 组合 INVITE 风暴时
+     * 反复查 account_balance + rate_lookup_stair + acct_find。*/
+#define PREAUTH_CACHE_MAX 128
+    struct {
+        char     key[128];
+        int      result;
+        uint64_t expires_ms;
+    } preauth_cache[PREAUTH_CACHE_MAX];
+    int preauth_cache_count;
 };
 
 int bill_create(billing_t **out)
@@ -1009,6 +1021,30 @@ int billing_pre_auth(billing_t *b, const char *caller, const char *callee,
     /* 跳过 pre-auth —— 找不到明确的内部分机付费方（中继付费等 ANSWER reserve 再拦）*/
     if (!payer) return NSBC_NOENT;
 
+    /* ---- Phase 2.1: pre-auth 结果缓存查（30s TTL）----
+     * 防止同一 caller+callee 组合 INVITE 风暴时
+     * 反复查 account_balance + rate_lookup_stair + acct_find。*/
+    {
+        char cache_key[128];
+        snprintf(cache_key, sizeof(cache_key), "%s|%s", caller,
+                 callee ? callee : "");
+        uint64_t now = nsbc_now_ms();
+        for (int i = 0; i < b->preauth_cache_count; ++i) {
+            if (strcmp(b->preauth_cache[i].key, cache_key) == 0) {
+                if (b->preauth_cache[i].expires_ms > now) {
+                    llog(LOG_DEBUG, "billing", "pre-auth cache HIT caller=%s callee=%s result=%d",
+                         caller, callee ? callee : "-", b->preauth_cache[i].result);
+                    return b->preauth_cache[i].result;
+                }
+                /* 过期 → 标记为待覆盖（移到末尾）*/
+                memmove(&b->preauth_cache[i], &b->preauth_cache[i+1],
+                        (b->preauth_cache_count - i - 1) * sizeof(b->preauth_cache[0]));
+                b->preauth_cache_count--;
+                break;
+            }
+        }
+    }
+
     /* 推 account key */
     char acct_key[BILL_ACCT_KEY];
     snprintf(acct_key, sizeof(acct_key), "tenant:%s:extension:%s", tid, payer);
@@ -1018,11 +1054,11 @@ int billing_pre_auth(billing_t *b, const char *caller, const char *callee,
     int rc = account_balance(b, acct_key, &bal, &resv);
     if (rc != NSBC_OK) {
         /* 账户不存在 —— 放行（可能是新账户，或者这个分机没配 rate_plan）*/
-        return NSBC_NOENT;
+        rc = NSBC_NOENT; goto out;
     }
 
     /* 查费率 —— 用 callee（被叫）做前缀匹配 */
-    if (!callee || !callee[0]) return NSBC_NOENT;
+    if (!callee || !callee[0]) { rc = NSBC_NOENT; goto out; }
 
     /* 取当前时间 HH:MM */
     char hhmm[8];
@@ -1038,7 +1074,7 @@ int billing_pre_auth(billing_t *b, const char *caller, const char *callee,
     rc = rate_lookup_stair(b, callee, 0, hhmm, NULL, tiers, &n_tiers, 8);
     if (rc != NSBC_OK || n_tiers == 0) {
         /* 没匹配费率 —— 放行（可能走 rate_tables 旧费率）*/
-        return NSBC_NOENT;
+        rc = NSBC_NOENT; goto out;
     }
 
     /* 保守 reserve = max(min_bill_s, 120s) × 2 + connect_fee */
@@ -1060,18 +1096,42 @@ int billing_pre_auth(billing_t *b, const char *caller, const char *callee,
                  caller, callee, acct_key,
                  (long long)a->balance, (long long)a->credit_limit, (long long)resv,
                  (long long)reserve);
-            return NSBC_OK;
+            rc = NSBC_OK; goto out;
         } else {
             llog(LOG_WARN, "billing", "pre-auth DENY caller=%s callee=%s acct=%s bal=%lld credit=%lld reserved=%lld need=%lld",
                  caller, callee, acct_key,
                  (long long)a->balance, (long long)a->credit_limit, (long long)resv,
                  (long long)reserve);
-            return NSBC_PERM_DENIED;
+            rc = NSBC_PERM_DENIED; goto out;
         }
     }
 
     /* 竞态：刚查了 account_balance 拿到余额但 acct_find 找不到了 → 放行 */
-    return NSBC_NOENT;
+    rc = NSBC_NOENT;
+
+    /* ---- Phase 2.1: pre-auth 结果缓存写 ---- */
+out: {
+        char cache_key[128];
+        snprintf(cache_key, sizeof(cache_key), "%s|%s", caller,
+                 callee ? callee : "");
+        uint64_t expires = nsbc_now_ms() + 30000;  /* 30s TTL */
+        /* 先去重（如果刚才 cache HIT 分支已经删了过期的，这里直接追加）*/
+        if (b->preauth_cache_count >= PREAUTH_CACHE_MAX) {
+            /* 满了 → 覆盖最旧（索引 0 移到末尾）*/
+            memmove(&b->preauth_cache[0], &b->preauth_cache[1],
+                    (PREAUTH_CACHE_MAX - 1) * sizeof(b->preauth_cache[0]));
+            b->preauth_cache_count = PREAUTH_CACHE_MAX - 1;
+        }
+        strncpy(b->preauth_cache[b->preauth_cache_count].key,
+                cache_key, 127);
+        b->preauth_cache[b->preauth_cache_count].key[127] = '\0';
+        b->preauth_cache[b->preauth_cache_count].result = rc;
+        b->preauth_cache[b->preauth_cache_count].expires_ms = expires;
+        b->preauth_cache_count++;
+        llog(LOG_DEBUG, "billing", "pre-auth cache SET caller=%s callee=%s result=%d",
+             caller, callee ? callee : "-", rc);
+    }
+    return rc;
 }
 
 /* =========================================================================
