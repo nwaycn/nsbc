@@ -111,14 +111,24 @@ pub async fn create<C: CoreApi + Clone + Send + Sync + 'static>(
     // P2-security: app_chain whitelist validation (skip when core dialplan module is
     // not loaded; an empty known_apps array will make a non-empty app_chain all fail —
     // which is correct: you cannot request a non-existent app when the dialplan
-    // module is disabled)
+    // module is disabled).
+    // ★ Fault-tolerant: dialplan_apps() is read-only validation — if core is unreachable
+    // (connect/timeout/I-O), DO NOT block the DB write. Log warn + skip validation;
+    // the async spawn_push below will retry later and the core executor reports NOENT
+    // on unknown apps anyway.
     let app_chain = body.app_chain.as_str();
     if !app_chain.trim().is_empty() {
-        let known: Vec<String> = st.core.dialplan_apps().await
-            .map_err(|_| ApiError::CoreUnavailable)?
-            .into_iter().map(|a| a.name).collect();
-        validate_app_chain(app_chain, &known)
-            .map_err(|msg| ApiError::BadRequest(msg))?;
+        match st.core.dialplan_apps().await {
+            Ok(apps) => {
+                let known: Vec<String> = apps.into_iter().map(|a| a.name).collect();
+                validate_app_chain(app_chain, &known)
+                    .map_err(|msg| ApiError::BadRequest(msg))?;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e,
+                    "dialplan_apps unavailable — skipping app_chain validation on create");
+            }
+        }
     }
 
     let row = st.db.create_dialplan_rule(body).await.map_err(|e| {
@@ -145,14 +155,21 @@ pub async fn update<C: CoreApi + Clone + Send + Sync + 'static>(
 ) -> Result<impl IntoResponse, ApiError> {
     st.db.pool().ok_or(ApiError::DbUnavailable)?;
 
-    // P2-security: only validate when app_chain is being updated
+    // P2-security: only validate when app_chain is being updated.
+    // ★ Fault-tolerant: same as create() — do NOT block DB write on core failure.
     if let Some(ref app_chain) = body.app_chain {
         if !app_chain.trim().is_empty() {
-            let known: Vec<String> = st.core.dialplan_apps().await
-                .map_err(|_| ApiError::CoreUnavailable)?
-                .into_iter().map(|a| a.name).collect();
-            validate_app_chain(app_chain, &known)
-                .map_err(|msg| ApiError::BadRequest(msg))?;
+            match st.core.dialplan_apps().await {
+                Ok(apps) => {
+                    let known: Vec<String> = apps.into_iter().map(|a| a.name).collect();
+                    validate_app_chain(app_chain, &known)
+                        .map_err(|msg| ApiError::BadRequest(msg))?;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e,
+                        "dialplan_apps unavailable — skipping app_chain validation on update");
+                }
+            }
         }
     }
 

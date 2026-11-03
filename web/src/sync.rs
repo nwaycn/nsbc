@@ -18,7 +18,6 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::sync::atomic::AtomicU64;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::AppState;
@@ -298,42 +297,55 @@ async fn snapshot<C: CoreApi + Clone + Send + Sync>(
     }
 }
 
-/// Global cooldown state — when core is completely unreachable (Connect refused),
-/// all kinds skip retries and bail fast. Next periodic cycle in 60s naturally retries.
-static CORE_DOWN_COOLDOWN: AtomicU64 = AtomicU64::new(0);
-
-/// Is the core currently in "known dead" cooldown? Returns true if last Connect failure
-/// was within the last 30 seconds.
-fn core_in_cooldown() -> bool {
-    let cooldown_until = CORE_DOWN_COOLDOWN.load(std::sync::atomic::Ordering::Relaxed);
-    if cooldown_until == 0 { return false; }
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    now_ms < cooldown_until
+// ---------------------------------------------------------------------------
+// Per-kind cooldown — one kind's failure (e.g. extensions large payload framing
+// overflow) must NOT block other kinds (dialplan-rules / sip-profiles / trunks)
+// from retrying immediately. Previously a single global AtomicU64 cooldown
+// caused a single kind's CoreError to skip all 14 kinds for 15s, which is the
+// root cause of "extensions.reload broke, then dialplan-rules.reload never retried".
+// ---------------------------------------------------------------------------
+fn kind_cooldowns() -> &'static Mutex<HashMap<Kind, u64>> {
+    static CDS: OnceLock<Mutex<HashMap<Kind, u64>>> = OnceLock::new();
+    CDS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Mark core as unreachable: set a 30s cooldown so subsequent kinds bail fast.
-fn mark_core_down() {
-    let now_ms = SystemTime::now()
+fn now_ms() -> u64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    CORE_DOWN_COOLDOWN.store(now_ms + 15_000, std::sync::atomic::Ordering::Relaxed);
+        .unwrap_or(0)
+}
+
+fn kind_in_cooldown(kind: Kind) -> bool {
+    let cds = kind_cooldowns().lock().unwrap();
+    match cds.get(&kind) {
+        Some(&until) if until > now_ms() => true,
+        _ => false,
+    }
+}
+
+fn mark_kind_down(kind: Kind) {
+    let until = now_ms() + 15_000;
+    let mut cds = kind_cooldowns().lock().unwrap();
+    cds.insert(kind, until);
+}
+
+fn clear_kind_cooldown(kind: Kind) {
+    let mut cds = kind_cooldowns().lock().unwrap();
+    cds.remove(&kind);
 }
 
 /// Single-kind push: snapshot → CoreApi.reload_*; retry on failure with [500ms,1s,2s,4s,8s].
-/// Special case: if core is completely unreachable (Connection refused / Connect error),
-/// bail out after the FIRST attempt and mark a global 30s cooldown — no point retrying
-/// 84 times across 14 kinds when nothing is listening on that UDS socket.
+/// Per-kind cooldown: a kind that fails at attempt==0 (CoreError) marks ONLY itself
+/// cooldown 15s — other kinds are unaffected. This prevents one kind's large-payload
+/// framing overflow from blacking out the entire config push pipeline.
 async fn push_kind<C: CoreApi + Clone + Send + Sync>(
     st: &Arc<AppState<C>>,
     kind: Kind,
 ) -> Result<(), String> {
-    // If core is in cooldown, bail immediately — save CPU and disk I/O
-    if core_in_cooldown() {
-        return Err("core unreachable (cooldown)".into());
+    // Per-kind cooldown bail — save CPU and disk I/O for THIS kind only.
+    if kind_in_cooldown(kind) {
+        return Err(format!("core unreachable ({kind:?} cooldown)"));
     }
 
     const DELAYS_MS: [u64; 5] = [500, 1_000, 2_000, 4_000, 8_000];
@@ -370,16 +382,14 @@ async fn push_kind<C: CoreApi + Clone + Send + Sync>(
         match r {
             Ok(()) => {
                 tracing::info!(kind = kind.name(), count = n, attempt, "pushed to core");
-                // Success clears any cooldown from earlier failures
-                CORE_DOWN_COOLDOWN.store(0, std::sync::atomic::Ordering::Relaxed);
+                // Success clears this kind's cooldown (if any) so next trigger retries immediately
+                clear_kind_cooldown(kind);
                 return Ok(());
             }
             Err(e) => {
-                // ★ Global cooldown on ANY CoreError at attempt==0.
-                // Why? Because CoreError means the core channel itself is broken
-                // (Connect refused, command unknown, timeout, I/O error, core rejected).
-                // Retrying 6 times per kind × 14 kinds = 84 wasted round trips → CPU spike.
-                // Cooldown 15s; periodic push (60s) naturally resumes after it expires.
+                // ★ Per-kind cooldown on ANY CoreError at attempt==0.
+                // Only mark THIS kind as cooldown — other kinds must keep retrying
+                // (e.g. extensions large-payload overflow must not black out dialplan-rules).
                 if attempt == 0 {
                     let reason = match &e {
                         CoreError::Connect(_)     => "connect refused",
@@ -391,8 +401,8 @@ async fn push_kind<C: CoreApi + Clone + Send + Sync>(
                         CoreError::Unsupported(_)=> "unsupported",
                     };
                     tracing::warn!(kind = kind.name(), error = ?e,
-                        "core channel broken ({reason}) — entering 15s cooldown, skipping remaining kinds");
-                    mark_core_down();
+                        "kind reload failed ({reason}) — entering 15s per-kind cooldown");
+                    mark_kind_down(kind);
                     return Err(format!("core channel broken ({reason}): {e:?}"));
                 }
                 tracing::warn!(kind = kind.name(), attempt, error = ?e, "reload cmd failed");
