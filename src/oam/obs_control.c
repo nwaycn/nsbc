@@ -59,9 +59,12 @@
 /* CTL_BUF_MAX：UDS 命令行接收缓冲（堆上 calloc，非栈）。
  *  - 原 8192 只够 ~40 条费率的 JSON reload payload（每条 ~200B），
  *    真实规模 200+ 条会触发 "超长无换行丢弃" 静默失败。
- *  - 提至 1MB 以覆盖 extensions.reload 完整表（90KB+）及未来批量场景；
- *    1 个 control 连接 ~1MB，10 并发 = 10MB，完全可接受。 */
-#define CTL_BUF_MAX (1024 * 1024)
+ *  - 原 1MB 只够 ~90KB extensions.reload 完整表（900 entries）；
+ *    90000 entries × 140B ≈ 12.6MB —— 一次 reload 命令撑爆 recv buf！
+ *  - 提至 32MB 与 reload_commands.c RELOAD_JSON_MAX 对齐；
+ *    32MB 堆上完全可接受（ctl_conn_t 本身 calloc 分配）。
+ *    1 个 control 连接 ~32MB，10 并发 = 320MB —— 通常只有 1 个并发 reload 命令，OK。 */
+#define CTL_BUF_MAX (32 * 1024 * 1024)
 #define CTL_OUT_MAX (256 * 1024)
 /* uuid_dump：两 Leg × 各 2KB SDP + 头行，16KB 足够 */
 #define CTL_DUMP_MAX (16 * 1024)

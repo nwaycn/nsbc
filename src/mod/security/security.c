@@ -1632,6 +1632,10 @@ int security_is_blocked(const nsbc_sa_t *src)
     char ip[INET6_ADDRSTRLEN] = {0};
     sa_to_ip_str(src, ip, sizeof(ip));
     if (!ip[0]) return 0;
+    /* 0. 私网跳过 —— auto-ban producer 端已经 skip，这里再加一层入口 skip
+     *    双保险：动态 ban 表 + 静态 CIDR 黑名单都不应该封私网段
+     *    （管理员不太可能把整个 10.0.0.0/8 配成黑名单，那会封掉内网所有设备）。 */
+    if (ban_is_private_ip(ip)) return 0;
     /* 1. 动态封禁表（auto-ban） */
     if (ban_is_banned(ip)) return 1;
     /* 2. 静态 CIDR 黑名单（仅 block_on_register/invite 启用时） */
