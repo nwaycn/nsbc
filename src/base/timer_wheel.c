@@ -146,9 +146,10 @@ int tw_mod(tw_t *w, tw_node_t *n, uint64_t expire_ms)
     return NSBC_OK;
 }
 
-/* 摘出某 L0 槽中到期节点到 fired 链；未到期重挂。持锁调用 */
-static void tw_drain_slot(tw_t *w, nsbc_node_t *slot, uint64_t now_tick,
-                          nsbc_node_t *fired)
+/* 摘出某 slot 中到期节点到 fired 链；未到期保持原位（它们已在正确槽位，
+ * 下次 advance 自然会扫到 —— 不做 re-enqueue 避免 catch-up 风暴）。持锁调用 */
+static void tw_collect_fired(tw_t *w, nsbc_node_t *slot, uint64_t now_tick,
+                             nsbc_node_t *fired)
 {
     nsbc_node_t *pos, *tmp;
     nsbc_list_for_each_safe(pos, tmp, slot)
@@ -161,7 +162,10 @@ static void tw_drain_slot(tw_t *w, nsbc_node_t *slot, uint64_t now_tick,
         if (tw_ticks(w, n->expire_ms) <= now_tick) {
             nsbc_list_append(fired, pos); /* 锁外统一回调 */
         } else {
-            tw_enqueue(w, n, now_tick, 0);
+            /* 未到期：原地 re-insert（slot 没变，因为 slot 索引就是
+             * deadline 桶的编码 —— 我们在扫描的就是它应该在的槽） */
+            nsbc_list_insert(slot, pos);
+            n->queued = 1;
         }
     }
 }
@@ -177,47 +181,43 @@ uint32_t tw_advance(tw_t *w, uint64_t now_ms)
         pthread_mutex_unlock(&w->lock);
         return 0;
     }
-    uint64_t offset = w->now_ms % w->tick_ms;
-    uint64_t start = tw_ticks(w, w->now_ms);
-    uint64_t end = tw_ticks(w, now_ms);
-    for (uint64_t t = start + 1; t <= end; ++t) {
-        uint32_t s0 = (uint32_t)t & TW_M0;
-        if (s0 == 0) {
-            uint32_t s1 = (uint32_t)(t >> TW_L0_BITS) & TW_M1;
-            if (s1 == 0) {
-                uint32_t s2 =
-                    (uint32_t)(t >> (TW_L0_BITS + TW_LN_BITS)) & TW_M2;
-                nsbc_node_t *slot2 = &w->lv[2].slots[s2];
-                nsbc_node_t *p, *tmp;
-                nsbc_list_for_each_safe(p, tmp, slot2)
-                {
-                    tw_node_t *n = NSBC_CONTAINER_OF(p, tw_node_t, link);
-                    nsbc_list_del(p);
-                    n->queued = 0;
-                    if (!n->cancelled)
-                        tw_enqueue(w, n, t, 0);
-                }
-            }
-            nsbc_node_t *slot1 = &w->lv[1].slots[s1];
-            nsbc_node_t *p, *tmp;
-            nsbc_list_for_each_safe(p, tmp, slot1)
-            {
-                tw_node_t *n = NSBC_CONTAINER_OF(p, tw_node_t, link);
-                nsbc_list_del(p);
-                n->queued = 0;
-                if (!n->cancelled)
-                    tw_enqueue(w, n, t, 0);
-            }
-        }
-        w->now_ms = (t == end) ? now_ms : (t * w->tick_ms + offset);
-        tw_drain_slot(w, &w->lv[0].slots[s0], t, &fired);
-    }
     w->now_ms = now_ms;
-    /* 统计到期数并在锁外回调 */
+    uint64_t now_tick = tw_ticks(w, now_ms);
+
+    /* 修复 catch-up 风暴（BUG-TW-001）：
+     *
+     * 旧实现：for (t = start+1; t <= end; ++t) 逐 tick 推进，每 tick
+     *   tw_drain_slot → 未到期 tw_enqueue 重挂。ticker 线程一旦被阻塞
+     *   （比如 worker 抢 CPU、pthread_mutex_lock 争用），一次性 catch-up
+     *   可能是几千 tick → 几千次 drain_slot × L1/L2 级联重挂 × L0 重挂
+     *   → tw_enqueue 占 70% CPU，进程看起来没死但一颗核被吃满。
+     *
+     * 新实现：一次性扫描所有 slot，fire 已到期 node，未到期原地保留。
+     *   O(TW_N0 + TW_N1 + TW_N2) = O(1152) 次 slot 检查，与 catch-up
+     *   tick 数完全解耦。tw_enqueue 只在 tw_add/tw_mod 业务线程路径
+     *   被调，advance 里零调用。
+     *
+     * 槽位语义：slot 索引编码 deadline 桶（L0=最近、L1=中层、L2=远期），
+     * 每个 node 的 expire_ms 存精确到期时间 —— tw_ticks(w, expire_ms)
+     * 与 now_tick 比较就能判断是否到期，与它挂在哪个 level 无关。
+     * 旧代码的 L1/L2→L0 级联只是为了让下次 tick 推进时能 drain，
+     * 我们直接 fire 所有已到期的，级联就不需要了。 */
+    for (int lvl = 0; lvl < TW_LEVELS; ++lvl) {
+        nsbc_node_t *slots = w->lv[lvl].slots;
+        uint32_t     nslots = w->lv[lvl].nslots;
+        for (uint32_t i = 0; i < nslots; ++i) {
+            if (nsbc_list_empty(&slots[i]))
+                continue;
+            tw_collect_fired(w, &slots[i], now_tick, &fired);
+        }
+    }
+
+    /* 计数 fired 链长度（仅用于日志/埋点） */
     for (nsbc_node_t *p = fired.next; p != &fired; p = p->next)
         ++fired_n;
     pthread_mutex_unlock(&w->lock);
 
+    /* 锁外回调：业务回调里可能调 tw_add/tw_mod —— 必须持锁 */
     nsbc_node_t *pos, *tmp;
     nsbc_list_for_each_safe(pos, tmp, &fired)
     {
