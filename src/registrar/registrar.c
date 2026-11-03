@@ -58,6 +58,13 @@ typedef struct {
     uint32_t key;
 } tbucket_t;
 
+/* 必须 16 字节对齐 —— cmpxchg16b 要求目标地址 16 字节对齐。
+ * 定义必须在 struct reg_core 之前——_Atomic(token_state_t) 需要已知类型。 */
+typedef struct {
+    uint64_t last_ms;
+    double   tokens;
+} token_state_t __attribute__((aligned(16)));
+
 struct reg_core {
     reg_cfg_t cfg;
     digest_cfg_t dig;
@@ -65,21 +72,11 @@ struct reg_core {
     tbucket_t aor[TB_AOR_N];
     /* 全局令牌桶 —— lock-free：把 (时间戳, token) 打包成 16 字节 struct，
      * 用单次 128-bit CAS (cmpxchg16b on x86_64) 同时更新两个字段。
-     * 之前用两个独立 atomic + 双 CAS 有致命竞态：线程 A CAS 1 刷了时间戳
-     * 但还没 CAS 2 设 token，线程 B 进来看到时间戳"已是最新"就跳过 add，
-     * 但 token 还是旧值 → 所有并发 REGISTER 被拒。
-     * 
-     * 单次 CAS 保证两个字段同步更新——要么全新，要么全旧。
-     * _Atomic token_state_t 在 GCC x86_64 上编译成 cmpxchg16b 指令。 */
+     * 单次 CAS 保证两个字段同步更新——要么全新，要么全旧，
+     * 中间态不存在，双 CAS 竞态完全消除。 */
     _Atomic(token_state_t) state;
     uint64_t n_total, n_rej, n_thr;
 };
-
-/* 必须 16 字节对齐 —— cmpxchg16b 要求目标地址 16 字节对齐 */
-typedef struct {
-    uint64_t last_ms;
-    double   tokens;
-} token_state_t __attribute__((aligned(16)));
 
 static int tb_take(tbucket_t *b, uint32_t key, int cps, uint64_t now)
 {
