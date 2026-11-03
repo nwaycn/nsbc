@@ -59,8 +59,9 @@
 /* CTL_BUF_MAX：UDS 命令行接收缓冲（堆上 calloc，非栈）。
  *  - 原 8192 只够 ~40 条费率的 JSON reload payload（每条 ~200B），
  *    真实规模 200+ 条会触发 "超长无换行丢弃" 静默失败。
- *  - 提至 256KB 与 CTL_OUT_MAX 同口径，支持批量 reload。 */
-#define CTL_BUF_MAX (256 * 1024)
+ *  - 提至 1MB 以覆盖 extensions.reload 完整表（90KB+）及未来批量场景；
+ *    1 个 control 连接 ~1MB，10 并发 = 10MB，完全可接受。 */
+#define CTL_BUF_MAX (1024 * 1024)
 #define CTL_OUT_MAX (256 * 1024)
 /* uuid_dump：两 Leg × 各 2KB SDP + 头行，16KB 足够 */
 #define CTL_DUMP_MAX (16 * 1024)
@@ -1817,8 +1818,18 @@ static void on_conn_event(int fd, uint32_t ev, void *arg)
         for (;;) {
             char *lf = memchr(c->buf, '\n', c->n);
             if (!lf) {
-                if (c->n == sizeof(c->buf))
-                    c->n = 0; /* 超长无换行：丢弃 */
+                if (c->n == sizeof(c->buf)) {
+                    /* ★ buf 满了还没有 \n — 命令超过 CTL_BUF_MAX。
+                     * 之前静默丢弃导致 Rust 端 "unknown command: <garbled>" 乱码。
+                     * 现在明确返回 ERR oversized command frame，让 Rust 端知道
+                     * 是 size 问题（CoreError::Protocol），而不是命令语法错误。 */
+                    ctl_printf(c, "ERR oversized command frame (max %zu bytes)\n",
+                               sizeof(c->buf));
+                    c->n = 0;
+                    llog(LOG_WARN, "oam",
+                         "ctl fd=%d recv buf full (%zu) no \\n — command discarded",
+                         c->fd, sizeof(c->buf));
+                }
                 break;
             }
             size_t llen = (size_t)(lf - c->buf) + 1;

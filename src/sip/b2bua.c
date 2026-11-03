@@ -54,6 +54,7 @@ static inline route_table_t *b2b_rt(b2b_core_t *co)
  * 在 reactor 线程栈内传递（全流程同步在同一 epoll 线程执行）。
  * 定义已移到 sip_transport.c（sip_transport 是公共依赖模块，方便 sip_tr_send 引用）。 */
 extern __thread uint16_t g_rx_local_port;
+extern __thread sip_tr_proto_t g_rx_proto;
 
 #include <arpa/inet.h>
 #include <ctype.h>    /* toupper() — codec 名称大小写规范化 */
@@ -3659,26 +3660,49 @@ void handle_new_invite(b2b_core_t *co, sip_txn_t *t,
             unsigned n = sip_profile_count();
             sip_profile_t *best = NULL;
             sip_profile_t *fallback_ext = NULL;  /* auth_calls=0 = external-like */
-            /* 两遍扫描：先找 auth_calls=0（external）优先，
-             * 再找字典序最大（internal 兜底）。
-             * ★ 为什么：未知 IP/端口 白名单没命中 → 不应该归 internal
-             * （internal 强制 DIGEST + loc_query 活跃注册，会 SILENT DROP）。
-             * 未知源 = SIP trunk / sipp UAC = external 语义 —— 信任 + 跳过注册门。 */
+            sip_profile_t *fallback_int = NULL;  /* auth_calls=1 = internal-like */
+            /* 三遍扫描：
+             *   best           = 字典序最大（最终兜底）
+             *   fallback_ext   = auth_calls=0（external，外部 SIP trunk / sipp UAC）
+             *   fallback_int   = auth_calls=1（internal，WS/WSS 分机 WebRTC）
+             * ★ WS/WSS 强制 internal：浏览器 WebRTC 分机经 signaling gateway
+             *   ws 认证后注入，local_port 全 0（sig_ws_bridge_rx 占位）导致
+             *   sip_profile_match_port 匹配不上任何 UDP/TCP profile — 必须在
+             *   fallback 层用 proto 语义归位到 internal（auth_calls=1 +
+             *   dialplan internal 分区 ^\d{5}$ 本地分机路由）。
+             * ★ 其它未知源（UDP/TCP/TLS）默认 external：未知 IP 白名单未命中 →
+             *   应信任 + 跳过注册门，否则 internal 强制 DIGEST + loc_query
+             *   会 SILENT DROP SIP trunk / sipp UAC 无注册 INVITE。 */
             for (unsigned i = 0; i < n; ++i) {
                 sip_profile_t *p = sip_profile_at(i);
                 if (p && p->enabled) {
                     if (p->auth_calls == 0) {
                         if (!fallback_ext || strcmp(p->name, fallback_ext->name) > 0)
                             fallback_ext = p;
+                    } else {
+                        if (!fallback_int || strcmp(p->name, fallback_int->name) > 0)
+                            fallback_int = p;
                     }
                     if (!best || strcmp(p->name, best->name) > 0)
                         best = p;
                 }
             }
-            c->prof = fallback_ext ? fallback_ext : best;
+            int is_webrtc_ws = (proto == SIP_TR_WS || proto == SIP_TR_WSS);
+            c->prof = is_webrtc_ws
+                ? (fallback_int ? fallback_int : (fallback_ext ? fallback_ext : best))
+                : (fallback_ext ? fallback_ext : best);
             if (c->prof) {
-                const char *why = fallback_ext ? "auth_calls=0 (external)" : "dict-order max (internal)";
-                llog(LOG_INFO, "b2b", "call profile fallback → %s (%s)", c->prof->name, why);
+                const char *why;
+                if (is_webrtc_ws && fallback_int)
+                    why = "WS/WSS → auth_calls=1 (internal, WebRTC分机)";
+                else if (fallback_ext)
+                    why = "auth_calls=0 (external, 未知源/未匹配端口)";
+                else if (fallback_int)
+                    why = "auth_calls=1 (internal)";
+                else
+                    why = "dict-order max";
+                llog(LOG_INFO, "b2b", "call profile fallback → %s (%s) proto=%u",
+                     c->prof->name, why, (unsigned)proto);
             } else {
                 /* Phase 1.5: 无 enabled profile → 静态 "external" 占位
                  * 只填 name+enabled+auth_calls，其余全 0。signaling.c 只
@@ -4702,7 +4726,7 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
             if (ep) {
                 sip_invite_ctx_t ictx = {
                     .co = co, .t = t, .m = m,
-                    .proto = SIP_TR_UDP, .src = txn_peer(t),
+                    .proto = g_rx_proto, .src = txn_peer(t),
                     .local_port = g_rx_local_port
                 };
                 int rc = 0;
@@ -4727,7 +4751,7 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
             }
             /* 没 endpoint 接管 → 走原有路径 */
         }
-        handle_new_invite(co, t, m, SIP_TR_UDP, txn_peer(t), g_rx_local_port);
+        handle_new_invite(co, t, m, g_rx_proto, txn_peer(t), g_rx_local_port);
         return;
     }
 
@@ -5613,15 +5637,16 @@ void b2b_on_rx(void *ud, sip_tr_proto_t proto, const nsbc_sa_t *src,
     char src_gip[INET6_ADDRSTRLEN] = {0};
     sa_ip_str(src, src_gip, sizeof(src_gip));
 
-    /* 存入向本地端口到 __thread 变量（handle_new_invite 深层读） */
+    /* 存入向本地端口 + proto 到 __thread 变量（handle_new_invite 深层读） */
     g_rx_local_port = 0;
+    g_rx_proto = proto;
     if (local && local->ss.ss_family == AF_INET)
         g_rx_local_port = nsbc_sa_port(local);
     llog(LOG_DEBUG, "b2b",
-         "b2b_on_rx: local_fam=%d local_port_direct=%u g_rx_local_port=%u",
+         "b2b_on_rx: local_fam=%d local_port_direct=%u g_rx_local_port=%u g_rx_proto=%d",
          local ? local->ss.ss_family : 0,
          local ? nsbc_sa_port(local) : 0,
-         g_rx_local_port);
+         g_rx_local_port, (int)g_rx_proto);
 
     if (sip_parse_ex(&m, buf, len, SIP_F_COMPAT_ALL) != NSBC_OK) {
         /* 短包 keepalive 检测：

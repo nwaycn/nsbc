@@ -18,6 +18,11 @@
  * 同一 epoll 线程内同步执行）。定义在此文件：sip_transport 是核心公共模块，
  * 保证其他模块（b2bua.c）可以 extern 引用。 */
 __thread uint16_t g_rx_local_port = 0;
+/* 配对线程变量：入向 INVITE 的 proto（UDP/TCP/TLS/WS/WSS）。
+ * sig_ws_bridge_rx → b2b_on_rx 传入 proto=WSS，但 b2b_server_tu /
+ * endpoint_registry 分发路径签名里没有 proto 参数，所以和 g_rx_local_port
+ * 一样用 __thread 传递。sip_tr_proto_t 枚举定义在 sip_transport.h。 */
+__thread sip_tr_proto_t g_rx_proto = SIP_TR_UDP;
 
 /* ------------------------------------------------------------------ */
 /* SIP trace 全局开关（类似 FreeSWITCH sofia global siptrace）
