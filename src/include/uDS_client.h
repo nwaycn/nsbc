@@ -1,5 +1,11 @@
 /* NSBC UDS 统一帧协议 — C 侧声明（REQ-DATA-SVC-002 P0）
  *
+ * 传输层：双 AF_UNIX SOCK_DGRAM（Linux 可靠 datagram，无丢包无乱序）
+ *   data_push.sock — 单向 C→Rust，承载 FT_DATA_PUSH（CDR/register/runtime/audit/session）
+ *                    fire-and-forget，不等待 ACK（ring buffer 自身有 overflow 处理）
+ *   data_cmd.sock  — 双向，承载 FT_HELLO/HELLO_ACK/CMD_REQ/CMD_RSP
+ *                    CMD_REQ 阻塞等待 RSP（16 槽 cond_wait）
+ *
  * 帧格式（与 web/src/uds_server.rs 完全对齐）：
  *   偏移  长度  字段
  *     0     1    magic         固定 0x01
@@ -12,12 +18,7 @@
  *    12     N    payload       NBO JSON
  *
  * 固定头 = 12 字节。payload_len = total_len - 12。
- *   PUSH payload:  {"kind":"cdr","payload":{...}}
- *                  {"kind":"register","payload":{...}}
- *                  {"kind":"runtime","payload":{...}}
- *                  {"kind":"audit","payload":{...}}
- *   HELLO payload: {"version":1,"hostname":"..","pid":1234}
- *   HB:            {}
+ * datagram 天然消息边界，一帧就是一个 datagram — 无需帧重组，无需 half-frame 处理。
  */
 #ifndef NSBC_UDS_CLIENT_H
 #define NSBC_UDS_CLIENT_H
@@ -32,7 +33,9 @@ extern "C" {
 
 #define NSBC_FRAME_MAGIC       0x01
 #define NSBC_FRAME_HDR_LEN     12      /* magic(1)+type(1)+total_len(4)+ticket(4)+flags(1)+rsvd(1) */
-#define NSBC_MAX_PAYLOAD       (1024 * 1024)   /* 1MB */
+
+/* datagram 安全上限：Linux SO_SNDBUF 默认 256KB，设 256KB 留 12B 头空间 */
+#define NSBC_MAX_PAYLOAD       (256 * 1024)  /* 256KB payload → 256KB+12B ≈ 256KB 单 datagram */
 #define NSBC_MAX_FRAME         (NSBC_FRAME_HDR_LEN + NSBC_MAX_PAYLOAD)
 
 /* frame_type (1 字节) */
@@ -94,7 +97,29 @@ size_t uds_encode_frame(uint8_t frame_type, uint32_t ticket,
 
 static inline const char *uds_default_sock_path(void)
 {
+    /* base path — C 端从它派生 data_push.sock + data_cmd.sock */
     return "/var/run/nsbc/data.sock";
+}
+
+/* 从 base path 派生 push / cmd socket 路径。
+ *   base = /var/run/nsbc/data.sock
+ *   push = /var/run/nsbc/data_push.sock
+ *   cmd  = /var/run/nsbc/data_cmd.sock
+ * 实现简单：替换最后一个 '.' 为 '_push' / '_cmd'。
+ * 如果 base path 不含 '.'（罕见），在末尾追加后缀。 */
+static inline void uds_derive_paths(const char *base,
+                                    char *push_out, size_t push_cap,
+                                    char *cmd_out,  size_t cmd_cap)
+{
+    const char *dot = strrchr(base, '.');
+    if (dot) {
+        size_t prefix_len = (size_t)(dot - base);
+        snprintf(push_out, push_cap, "%.*s_push.sock", (int)prefix_len, base);
+        snprintf(cmd_out,  cmd_cap,  "%.*s_cmd.sock",  (int)prefix_len, base);
+    } else {
+        snprintf(push_out, push_cap, "%s_push.sock", base);
+        snprintf(cmd_out,  cmd_cap,  "%s_cmd.sock",  base);
+    }
 }
 
 #ifdef __cplusplus

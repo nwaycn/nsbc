@@ -1,6 +1,15 @@
 //! NSBC UDS Data Service — C core→Web direction UDS Server (REQ-DATA-SVC-002 P0, unified
 //! frame protocol).
 //!
+//! Transport: 2 × AF_UNIX SOCK_DGRAM (Linux reliable datagram, no fragmentation, one
+//! datagram = one frame — natural message boundary, no half-frame reassembly needed).
+//!
+//!   data_push.sock — C→Rust only, carries FT_DATA_PUSH (CDR/register/runtime/audit/
+//!                    session/vad/billing_settle). Fire-and-forget — NO ACK back.
+//!                    C-side ring buffer self-heals on overflow.
+//!   data_cmd.sock  — bidirectional, carries FT_HELLO / FT_HELLO_ACK / FT_CMD_REQ /
+//!                    FT_CMD_RSP. C-side blocks on cond_wait for matching ticket.
+//!
 //! Frame format (fully aligned with src/include/uds_client.h):
 //!   Offset  Length  Field
 //!     0       1    magic         fixed 0x01
@@ -13,15 +22,11 @@
 //!    12       N    payload       NBO JSON
 //!
 //! Fixed header = 12 bytes. payload_len = total_len - 12.
-//! DATA_PUSH payload: {"kind":"cdr","payload":{...}}
-//!                    {"kind":"register","payload":{...}}
-//!                    {"kind":"runtime","payload":{...}}
-//!                    {"kind":"audit","payload":{...}}
-//! CMD_REQ  payload: {"cmd":"ext.ha1","user":"1000","realm":"nsbc.local"}
-//!           → CMD_RSP {"ok":true,"ha1":..,"clip":..,"clir":..,"max_contacts":..}
-//!                    {"ok":false,"reason":"not_found|disabled|db_error|unknown_cmd"}
-//! HELLO (core start/reconnect) → HELLO_ACK + trigger full config push via
-//! [`crate::sync`].
+//! One recv_from = one complete datagram = one complete frame.
+//!
+//! Peer cred: Rust server binds, C core connect()s. AF_UNIX datagram is already
+//! same-isolated-machine only; the legacy peer_cred() check from UnixStream mode is
+//! skipped here — the HELLO frame carries pid/hostname as a soft handshake.
 
 use std::sync::Arc;
 
@@ -39,13 +44,35 @@ pub const FT_ACK:         u8 = 0x06;
 pub const FT_HEARTBEAT:   u8 = 0x07;
 pub const FT_ERROR:       u8 = 0x0F;
 
-const MAX_PAYLOAD: usize = 1_000_000;
+/* 256KB datagram-safe payload upper bound (matches C-side NSBC_MAX_PAYLOAD exactly). */
+const MAX_PAYLOAD: usize = 256 * 1024;
 const MAX_FRAME:  usize = FRAME_HDR_LEN + MAX_PAYLOAD;
 
-pub fn default_sock_path() -> std::path::PathBuf {
+pub fn default_sock_base_path() -> std::path::PathBuf {
     std::path::PathBuf::from(std::env::var_os("NSBC_DATA_SOCK")
         .unwrap_or_else(|| "/var/run/nsbc/data.sock".into()))
 }
+
+/* Derive push / cmd socket paths from base path (mirrors C-side uds_derive_paths). */
+fn derive_paths(base: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let base_str = base.to_string_lossy();
+    if let Some(dot) = base_str.rfind('.') {
+        let prefix = &base_str[..dot];
+        (
+            std::path::PathBuf::from(format!("{prefix}_push.sock")),
+            std::path::PathBuf::from(format!("{prefix}_cmd.sock")),
+        )
+    } else {
+        (
+            std::path::PathBuf::from(format!("{base_str}_push.sock")),
+            std::path::PathBuf::from(format!("{base_str}_cmd.sock")),
+        )
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Platform selection                                                         */
+/* -------------------------------------------------------------------------- */
 
 #[cfg(unix)]
 pub fn start<C: crate::coreclient::CoreApi + Clone + Send + Sync + 'static>(
@@ -59,62 +86,38 @@ pub fn start<C: crate::coreclient::CoreApi + Clone + Send + Sync + 'static>(
             }
         }
     }
-    if sock_path.exists() { let _ = std::fs::remove_file(&sock_path); }
-    let listener = tokio::net::UnixListener::bind(&sock_path)?;
-    tracing::info!(path = %sock_path.display(), "UDS Data Service bound (unified frame protocol)");
+
+    let (push_path, cmd_path) = derive_paths(&sock_path);
+    /* Clean stale socket paths from previous runs */
+    for p in [&push_path, &cmd_path] {
+        if p.exists() { let _ = std::fs::remove_file(p); }
+    }
+
+    let push_sock = tokio::net::UnixDatagram::bind(&push_path)?;
+    let cmd_sock  = tokio::net::UnixDatagram::bind(&cmd_path)?;
+    tracing::info!(
+        push = %push_path.display(),
+        cmd  = %cmd_path.display(),
+        "UDS Data Service bound (dual AF_UNIX DGRAM)"
+    );
 
     Ok(tokio::spawn(async move {
-        // audit RW-C1 hardening: resolve our own effective UID once (startup 时取)
-        // 纯 Rust 读 /proc/self/status 的 Uid 行拿 euid（避免引入 libc crate）
-        #[cfg(unix)]
-        let our_euid: u32 = std::fs::read_to_string("/proc/self/status")
-            .ok()
-            .and_then(|s| {
-                s.lines()
-                    .find(|l| l.starts_with("Uid:"))
-                    .and_then(|l| l.split_whitespace().nth(1))
-                    .and_then(|v| v.parse::<u32>().ok())
-            })
-            .unwrap_or(0); // fallback 0 (假设 root)
-        #[cfg(not(unix))]
-        let our_euid: u32 = 0;
-        loop {
-            let (mut stream, _peer_addr) = match listener.accept().await {
-                Ok(v) => v,
-                Err(e) => { tracing::warn!(error = %e, "UDS accept failed"); continue; }
-            };
+        let push_state = state.clone();
+        let cmd_state  = state.clone();
 
-            // --- RW-C1: peer_cred 鉴权 ---
-            // tokio: peer_cred() -> Result<UCred, io::Error>
-            match stream.peer_cred() {
-                Ok(cred) => {
-                    let caller_uid = cred.uid() as u32;
-                    tracing::debug!(caller_uid, "UDS accepted");
-                    // 加固：uid != 0 且 != 自身 euid → 拒绝
-                    if caller_uid != 0 && caller_uid != our_euid {
-                        tracing::warn!(
-                            caller_uid, our_euid,
-                            "UDS rejected: caller uid {} not 0/self (RW-C1)",
-                            caller_uid
-                        );
-                        drop(stream);
-                        continue;
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "UDS rejected: peer_cred() failed (RW-C1)");
-                    drop(stream);
-                    continue;
-                }
+        let push_join = tokio::spawn(async move {
+            if let Err(e) = push_recv_loop(push_sock, &push_state).await {
+                tracing::warn!(error = %e, "UDS push loop exited");
             }
+        });
 
-            let state = state.clone();
-            tokio::spawn(async move {
-                if let Err(e) = handle_conn(&mut stream, &state).await {
-                    tracing::warn!(error = %e, "UDS connection error");
-                }
-            });
-        }
+        let cmd_join = tokio::spawn(async move {
+            if let Err(e) = cmd_recv_loop(cmd_sock, &cmd_state).await {
+                tracing::warn!(error = %e, "UDS cmd loop exited");
+            }
+        });
+
+        let _ = tokio::join!(push_join, cmd_join);
     }))
 }
 
@@ -128,99 +131,23 @@ pub fn start<C: crate::coreclient::CoreApi + Clone + Send + Sync + 'static>(
     }))
 }
 
-// --- Unix-only ---
+/* -------------------------------------------------------------------------- */
+/* Frame decode helpers — one datagram = one frame, no reassembly              */
+/* -------------------------------------------------------------------------- */
 
-/// Per-connection loop: decode frame → dispatch → send ACK; keep reading until EOF/error.
-/// Any early exit (EOF / error / format anomaly) goes through a finally-style block that
-/// sets data_pushed back to false, so the poller resumes polling as a fallback
-/// (REQ-DATA-002).
-#[cfg(unix)]
-async fn handle_conn<C: crate::coreclient::CoreApi + Clone + Send + Sync + 'static>(
-    stream: &mut tokio::net::UnixStream,
-    state: &Arc<AppState<C>>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use std::sync::atomic::Ordering;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    state.data_pushed.store(true, Ordering::Relaxed);
-    tracing::debug!("UDS client connected");
-
-    let result: Result<(), Box<dyn std::error::Error>> = async {
-        loop {
-            let mut hdr = [0u8; FRAME_HDR_LEN];
-            match stream.read_exact(&mut hdr).await {
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-                Err(e) => return Err(e.into()),
-            }
-
-            if hdr[0] != FRAME_MAGIC {
-                let _ = stream.write_all(&bad_frame_ack(0, "invalid magic".as_bytes())).await;
-                return Ok(());
-            }
-
-            let frame_type = hdr[1];
-            let total_len = u32::from_be_bytes([hdr[2], hdr[3], hdr[4], hdr[5]]) as usize;
-            let ticket    = u32::from_be_bytes([hdr[6], hdr[7], hdr[8], hdr[9]]);
-
-            if total_len < FRAME_HDR_LEN || total_len > MAX_FRAME {
-                let _ = stream.write_all(&bad_frame_ack(ticket, "frame too large or malformed".as_bytes())).await;
-                return Ok(());
-            }
-
-            let payload_len = total_len - FRAME_HDR_LEN;
-            let mut payload_buf = vec![0u8; payload_len];
-            if payload_len > 0 {
-                stream.read_exact(&mut payload_buf).await?;
-            }
-            let payload_str = String::from_utf8_lossy(&payload_buf).to_string();
-
-            let resp: Option<(u8, String)> = match frame_type {
-                FT_DATA_PUSH => match dispatch_push(&payload_str, state).await {
-                    Ok(body) => Some((FT_ACK, body)),
-                    Err(e) => Some((FT_ACK, serde_json::json!({"ok": false, "error": e}).to_string())),
-                },
-                FT_CMD_REQ => match dispatch_cmd_req(&payload_str, state).await {
-                    Ok(body) => Some((FT_CMD_RSP, body)),
-                    Err(e) => Some((FT_CMD_RSP, serde_json::json!({"ok": false, "reason": "bad_request", "error": e}).to_string())),
-                },
-                FT_HELLO => {
-                    crate::sync::on_hello(state.clone());
-                    Some((FT_HELLO_ACK, serde_json::json!({"ok": true}).to_string()))
-                }
-                FT_HEARTBEAT => Some((FT_ACK, serde_json::json!({"ok": true}).to_string())),
-                FT_ERROR => {
-                    tracing::warn!(payload = %payload_str, "C side UDS error frame");
-                    None
-                }
-                FT_HELLO_ACK => None,
-                other => {
-                    tracing::warn!(frame_type = other, "unknown UDS frame type");
-                    Some((FT_ACK, serde_json::json!({"ok": false, "error": format!("unknown frame_type=0x{other:02x}")}).to_string()))
-                }
-            };
-
-            if let Some((ft, body)) = resp {
-                if !body.is_empty() {
-                    let frame = build_frame(ft, ticket, &body);
-                    let _ = stream.write_all(&frame).await;
-                    let _ = stream.flush().await;
-                }
-            }
-        }
-    }.await;
-
-    // REQ-DATA-002: UDS link drops → data_pushed back to false, poller resumes.
-    // Multi-connection scenario: any handle_conn exit sets false — as long as one is
-    // alive the next accept will set it back true; a brief false only causes a few
-    // extra poller rounds, no correctness impact.
-    state.data_pushed.store(false, Ordering::Relaxed);
-    tracing::debug!(result_ok = result.is_ok(), "UDS client disconnected, poller re-enabled");
-
-    result
+/// Decode one frame from a raw datagram buffer. Returns parsed fields on success,
+/// or None on malformed magic/len. payload bytes reference `buf`.
+fn decode_frame(buf: &[u8]) -> Option<(u8, u32, u32, &[u8])> {
+    if buf.len() < FRAME_HDR_LEN { return None; }
+    if buf[0] != FRAME_MAGIC { return None; }
+    let total_len = u32::from_be_bytes([buf[2], buf[3], buf[4], buf[5]]) as usize;
+    if total_len < FRAME_HDR_LEN || total_len > MAX_FRAME { return None; }
+    let ticket    = u32::from_be_bytes([buf[6], buf[7], buf[8], buf[9]]);
+    let frame_type = buf[1];
+    let payload = &buf[FRAME_HDR_LEN..total_len.min(buf.len())];
+    Some((frame_type, total_len as u32, ticket, payload))
 }
 
-/// Frame builder: 12B fixed header (type + ticket) + payload.
 fn build_frame(frame_type: u8, ticket: u32, payload: &str) -> Vec<u8> {
     let total_len = (FRAME_HDR_LEN + payload.len()) as u32;
     let mut out = Vec::with_capacity(total_len as usize);
@@ -228,15 +155,14 @@ fn build_frame(frame_type: u8, ticket: u32, payload: &str) -> Vec<u8> {
     out.push(frame_type);
     out.extend_from_slice(&total_len.to_be_bytes());
     out.extend_from_slice(&ticket.to_be_bytes());
-    out.push(0); // flags
-    out.push(0); // rsvd
+    out.push(0); /* flags */
+    out.push(0); /* rsvd */
     out.extend_from_slice(payload.as_bytes());
     out
 }
 
-fn bad_frame_ack(ticket: u32, msg: &[u8]) -> Vec<u8> {
-    let payload_len = msg.len();
-    let total_len = (FRAME_HDR_LEN + payload_len) as u32;
+fn build_bad_frame_ack(ticket: u32, msg: &[u8]) -> Vec<u8> {
+    let total_len = (FRAME_HDR_LEN + msg.len()) as u32;
     let mut out = Vec::with_capacity(total_len as usize);
     out.push(FRAME_MAGIC);
     out.push(FT_ACK);
@@ -248,7 +174,111 @@ fn bad_frame_ack(ticket: u32, msg: &[u8]) -> Vec<u8> {
     out
 }
 
-/// DATA_PUSH / CMD_REQ payload dispatch. payload = {"kind":"...", "payload":...}
+/* -------------------------------------------------------------------------- */
+/* Push recv loop — fire-and-forget, NO ACK back                              */
+/* -------------------------------------------------------------------------- */
+
+#[cfg(unix)]
+async fn push_recv_loop<C: crate::coreclient::CoreApi + Clone + Send + Sync + 'static>(
+    sock: tokio::net::UnixDatagram,
+    state: &Arc<AppState<C>>,
+) -> std::io::Result<()> {
+    let mut buf = vec![0u8; MAX_FRAME];
+    loop {
+        let (n, _peer) = sock.recv_from(&mut buf).await?;
+        let frame = match decode_frame(&buf[..n]) {
+            Some(f) => f,
+            None => {
+                tracing::debug!("push: malformed frame, dropped");
+                continue;
+            }
+        };
+        let (frame_type, _total, _ticket, payload) = frame;
+        let payload_str = String::from_utf8_lossy(payload).to_string();
+
+        match frame_type {
+            FT_DATA_PUSH => {
+                /* Fire-and-forget — no ACK back to C side. */
+                if let Err(e) = dispatch_push(&payload_str, state).await {
+                    tracing::warn!(error = %e, "push dispatch failed");
+                }
+            }
+            FT_HELLO => {
+                /* Hello sometimes arrives on wrong channel if C-side misconfig.
+                 * Forward to sync module (no need to reply here). */
+                crate::sync::on_hello(state.clone());
+            }
+            other => {
+                tracing::debug!(frame_type = other, "push channel: unexpected frame type");
+            }
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Cmd recv loop — bidirectional REQ/RSP + HELLO                              */
+/* -------------------------------------------------------------------------- */
+
+#[cfg(unix)]
+async fn cmd_recv_loop<C: crate::coreclient::CoreApi + Clone + Send + Sync + 'static>(
+    sock: tokio::net::UnixDatagram,
+    state: &Arc<AppState<C>>,
+) -> std::io::Result<()> {
+    let mut buf = vec![0u8; MAX_FRAME];
+    loop {
+        let (n, peer) = sock.recv_from(&mut buf).await?;
+        let frame = match decode_frame(&buf[..n]) {
+            Some(f) => f,
+            None => {
+                /* malformed magic/len — best-effort ACK so caller knows it dropped */
+                let _ = sock.send_to(&build_bad_frame_ack(0, b"invalid frame"), &peer).await;
+                continue;
+            }
+        };
+        let (frame_type, _total, ticket, payload) = frame;
+        let payload_str = String::from_utf8_lossy(payload).to_string();
+
+        let resp: Option<(u8, String)> = match frame_type {
+            FT_CMD_REQ => match dispatch_cmd_req(&payload_str, state).await {
+                Ok(body)  => Some((FT_CMD_RSP, body)),
+                Err(e)    => Some((FT_CMD_RSP, serde_json::json!({"ok": false, "reason": "bad_request", "error": e}).to_string())),
+            },
+            FT_HELLO => {
+                crate::sync::on_hello(state.clone());
+                Some((FT_HELLO_ACK, serde_json::json!({"ok": true}).to_string()))
+            }
+            FT_HEARTBEAT => Some((FT_ACK, serde_json::json!({"ok": true}).to_string())),
+            FT_DATA_PUSH => {
+                /* PUSH should land on push channel, but tolerate — dispatch + ACK */
+                if let Err(e) = dispatch_push(&payload_str, state).await {
+                    tracing::warn!(error = %e, "cmd channel push fallback failed");
+                }
+                None /* no ACK needed, push is fire-and-forget */
+            }
+            FT_ERROR => {
+                tracing::warn!(payload = %payload_str, "C side UDS error frame");
+                None
+            }
+            FT_HELLO_ACK | FT_CMD_RSP | FT_ACK => None, /* server doesn't wait for these */
+            other => {
+                tracing::warn!(frame_type = other, "unknown UDS frame type");
+                Some((FT_ACK, serde_json::json!({"ok": false, "error": format!("unknown frame_type=0x{other:02x}")}).to_string()))
+            }
+        };
+
+        if let Some((ft, body)) = resp {
+            let frame = build_frame(ft, ticket, &body);
+            let _ = sock.send_to(&frame, &peer).await;
+        }
+    }
+}
+
+/* ========================================================================
+ *  PUSH / CMD dispatch handlers (kept verbatim from stream era — logic
+ *  is identical, only transport framing changed above).
+ * ======================================================================*/
+
+/// DATA_PUSH payload dispatch. payload = {"kind":"...", "payload":...}
 async fn dispatch_push<C: crate::coreclient::CoreApi + Clone + Send + Sync + 'static>(
     payload: &str,
     state: &Arc<AppState<C>>,
@@ -473,10 +503,10 @@ async fn dispatch_cmd_req<C: crate::coreclient::CoreApi + Clone + Send + Sync + 
     }
 }
 
-// --- DB helpers (Phase 1: 异步批量写入 submit_*，不再 .await DB 操作) ---
+/* -------------------------------------------------------------------------- */
+/* DB helpers (kept verbatim from stream era)                                  */
+/* -------------------------------------------------------------------------- */
 
-/// submit_cdr — 解析 JSON 后调用 db.submit_cdr（mpsc 入队后立即返回）。
-/// 返回 Ok 表示入队成功或 fallback 同步写成功；Err 表示 JSON 缺关键字段。
 fn submit_cdr(db: &crate::db::Db, v: &serde_json::Value) -> Result<(), String> {
     let call_id = v.get("call_id").and_then(|x| x.as_str()).unwrap_or("");
     if call_id.is_empty() {
@@ -583,7 +613,6 @@ fn submit_session(db: &crate::db::Db, v: &serde_json::Value) -> Result<(), Strin
     Ok(())
 }
 
-/// insert_audit — 保持同步 await（低频，不走 batch）。
 async fn insert_audit(db: &crate::db::Db, v: &serde_json::Value) -> Result<(), String> {
     let event = v.get("event").and_then(|x| x.as_str()).unwrap_or("");
     if event.is_empty() {

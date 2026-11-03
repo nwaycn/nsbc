@@ -1,22 +1,26 @@
-/* NSBC Data Service — C 侧 UDS Client（REQ-DATA-SVC-002 + S2 命令面）
+/* NSBC Data Service — C 侧 UDS Client（REQ-DATA-SVC-002 P0）
  *
- * 连接 data.sock（Web 端 uds_server.rs 为 SERVER，本端 CLIENT）：
- *   - PUSH：CDR/注册/运行时状态事件（ring 聚合，后台线程发）
- *   - HELLO：连接建立时上报版本/主机/PID → Web 触发全量配置推送
- *   - CMD_REQ/CMD_RSP：uds_request() 同步查询（S6 注册鉴权兜底用）
+ * 传输层：双 AF_UNIX SOCK_DGRAM（Linux 可靠 datagram，无丢包无乱序，
+ * 一帧一个 datagram —— 天然消息边界，无需帧重组 / half-frame 处理）。
+ *   data_push.sock — 单向 C→Rust，FT_DATA_PUSH（CDR/register/runtime/audit/session）
+ *                    fire-and-forget，不等待 ACK（ring buffer 自身有 overflow 处理）
+ *   data_cmd.sock  — 双向，FT_HELLO/HELLO_ACK/CMD_REQ/CMD_RSP
+ *                    CMD_REQ 阻塞等待匹配 ticket 的 CMD_RSP（16 槽 cond_wait）
  *
  * 帧格式（12B 固定头，与 web/src/uds_server.rs 完全对齐）：
  *   magic(1) + type(1) + total_len(4 NBO) + ticket(4 NBO) + flags(1) + rsvd(1)
+ *   datagram 边界 = 帧边界，每次 recv 返回完整一帧。
  *
- * 线程模型：
- *   - 后台线程 uds_client_thread：poll(socket + wake_pipe, 200ms)
- *       socket 可读 → 帧重组 → RSP 按票投递等待槽 / HELLO_ACK 记日志
- *       ring 有数据 → 组装 PUSH 帧 → send
- *   - 业务线程：uds_send_*() 写 ring；uds_request() 占槽+send+cond 等待
+ * 线程模型（简化了 stream 时代的帧重组逻辑）：
+ *   - 后台线程 uds_client_thread：poll(fd_cmd + fd_push + wake_pipe, 200ms)
+ *       fd_cmd 可读 → recv → dispatch_frame（CMD_RSP/HELLO_ACK）
+ *       fd_push 可读 → recv → 直接忽略（PUSH 不需要 Rust 回 ACK；Rust 端单独处理）
+ *       ring 有数据 → 组装 PUSH 帧 → sendto(fd_push)
+ *   - 业务线程：uds_send_*() 写 ring + wake；uds_request() 占槽+send(cmd)+cond 等
  *
  * 同步原语：
  *   g.lock      —— ring 生产/消费互斥
- *   g.send_lock —— 对 g.fd 的 send/close/赋值全串行（跨线程 fd 竞态收口）
+ *   g.send_lock —— 对两个 fd 的 send/close 串行（跨线程 fd 竞态收口）
  *   slot->mtx/cv —— 每个等待槽独立（16 槽并发上限）
  *   wake_pipe   —— ring_put/stop 唤醒后台线程立即处理（替代 cond 轮询）
  */
@@ -65,13 +69,18 @@ typedef struct {
 
 typedef struct {
     pthread_mutex_t lock;      /* ring 互斥 */
-    pthread_mutex_t send_lock; /* fd send/close 串行 */
+    pthread_mutex_t send_lock; /* 对两个 fd 的 send/close 串行 */
     pthread_t       thread;
     int             started;
     int             stop_flag;
 
-    int             fd;       /* 仅在 send_lock 内改；主线程 poll 前读快照 */
-    char            path[128];
+    /* 双 datagram fd —— 都用 connect() 到固定路径，简化为 send/recv */
+    int             fd_push;   /* C→Rust PUSH 通道，data_push.sock */
+    int             fd_cmd;    /* 双向 CMD/HELLO 通道，data_cmd.sock */
+
+    /* 派生的两个路径（init 时从 base path 生成） */
+    char            path_push[128];
+    char            path_cmd[128];
 
     /* wake pipe（业务线程 → 后台线程立即处理） */
     int             wake_rd;
@@ -86,15 +95,12 @@ typedef struct {
     /* 重连退避 */
     int             backoff_ms;
 
-    /* 收帧重组（仅后台线程访问）。
-     * 必须 ≥ Rust 端 MAX_FRAME (FRAME_HDR_LEN + MAX_PAYLOAD = 12 + 1MB = 1_000_012)。
-     * 旧值 65536 不够 cfg.pull_all 全量配置 JSON → frame len invalid → link reset。 */
-    uint8_t         rbuf[NSBC_MAX_FRAME];
-    size_t          rhave;
-
     /* 同步请求 */
     uds_reqslot_t   slots[UDS_REQ_SLOTS];
     volatile uint32_t ticket_seq;
+
+    /* 上次收到帧时间戳（ms） —— heartbeat 超时检测用 */
+    uint64_t        last_recv_ms;
 
     /* 溢出丢弃计数（ring_put full 时 +1，暴露到 control.sock stats） */
     volatile uint32_t ring_dropped;
@@ -134,65 +140,67 @@ size_t uds_encode_frame(uint8_t frame_type, uint32_t ticket,
 }
 
 /* ========================================================================
- * 连接 / 重连 / 发送原语
+ * datagram 连接 / 发送原语
  * ======================================================================*/
 
-static int uds_connect_nonblocking(void)
+/* 打开一个 AF_UNIX SOCK_DGRAM 并 connect 到固定路径。
+ * datagram connect() 是立即的（同机路径不存在连接握手）。
+ * 返回 fd（≥0），失败返回 -1。 */
+static int uds_open_dgram(const char *sock_path)
 {
-    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
+
+    /* datagram 也可以设 SO_RCVBUF/SO_SNDBUF 让 kernel queue 更大 */
+    int rcvbuf = 1 << 20; /* 1 MB */
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &rcvbuf, sizeof(rcvbuf));
+
     struct sockaddr_un un;
     memset(&un, 0, sizeof(un));
     un.sun_family = AF_UNIX;
-    snprintf(un.sun_path, sizeof(un.sun_path), "%s", g.path);
-    int rc = connect(fd, (struct sockaddr *)&un, sizeof(un));
-    if (rc == 0) return fd;      /* 同步连接成功（同机 Unix socket 常见） */
-    if (errno == EINPROGRESS) return fd;
-    close(fd);
-    return -1;
-}
-
-/* EINPROGRESS 收尾：poll POLLOUT + SO_ERROR 确认连接真正建立 */
-static int uds_wait_connected(int fd)
-{
-    struct pollfd p = { fd, POLLOUT, 0 };
-    if (poll(&p, 1, 500) <= 0)
+    snprintf(un.sun_path, sizeof(un.sun_path), "%s", sock_path);
+    if (connect(fd, (struct sockaddr *)&un, sizeof(un)) != 0) {
+        close(fd);
         return -1;
-    if (!(p.revents & POLLOUT))
-        return -1;
-    int err = 0;
-    socklen_t el = sizeof(err);
-    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) != 0 || err != 0)
-        return -1;
-    return 0;
-}
-
-/* send_lock 内：整帧写出。失败返回 -1（连接由调用方标记断开） */
-static int send_all_locked(const uint8_t *buf, size_t len)
-{
-    size_t w = 0;
-    while (w < len) {
-        ssize_t wr = send(g.fd, buf + w, len - w, MSG_NOSIGNAL);
-        if (wr <= 0) {
-            if (wr < 0 && (errno == EINTR)) continue;
-            return -1;
-        }
-        w += (size_t)wr;
     }
+    return fd;
+}
+
+/* send_lock 内：datagram 不需要循环发（内核保证一次性递送）。 */
+static int dgram_send_locked(int fd, const uint8_t *buf, size_t len)
+{
+    ssize_t n = send(fd, buf, len, MSG_NOSIGNAL);
+    if (n < 0 && errno == EINTR) {
+        n = send(fd, buf, len, MSG_NOSIGNAL);
+    }
+    if ((size_t)n != len) return -1;
     return 0;
 }
 
-/* 标记连接断开（send_lock 内调用）：close+置 -1，等待槽靠超时自然回收 */
+/* 标记所有连接断开（send_lock 内调用） */
 static void mark_broken_locked(void)
 {
-    if (g.fd >= 0) {
-        close(g.fd);
-        g.fd = -1;
-    }
-    g.rhave = 0;
+    if (g.fd_push >= 0) { close(g.fd_push); g.fd_push = -1; }
+    if (g.fd_cmd  >= 0) { close(g.fd_cmd);  g.fd_cmd  = -1; }
 }
 
-/* 连接建立点：发 FT_HELLO（Web 端收到后回 HELLO_ACK 并触发全量推送） */
+/* 全量重建两个 datagram 连接。成功返回 0，失败返回 -1。 */
+static int uds_reconnect_both(void)
+{
+    int p = uds_open_dgram(g.path_push);
+    if (p < 0) return -1;
+    int c = uds_open_dgram(g.path_cmd);
+    if (c < 0) { close(p); return -1; }
+    mark_broken_locked();
+    g.fd_push = p;
+    g.fd_cmd  = c;
+    g.backoff_ms = UDS_RECONNECT_BASE_MS;
+    g.last_recv_ms = 0;
+    return 0;
+}
+
+/* CMD 通道发 HELLO */
 static void send_hello(void)
 {
     char host[128] = "unknown";
@@ -206,16 +214,15 @@ static void send_hello(void)
     uint8_t frame[NSBC_FRAME_HDR_LEN + 256];
     size_t fsz = uds_encode_frame(FT_HELLO, 0, payload, (size_t)n,
                                   frame, sizeof(frame));
-    if (fsz == 0)
-        return;
+    if (fsz == 0) return;
     pthread_mutex_lock(&g.send_lock);
-    if (g.fd >= 0 && send_all_locked(frame, fsz) != 0)
+    if (g.fd_cmd >= 0 && dgram_send_locked(g.fd_cmd, frame, fsz) != 0)
         mark_broken_locked();
     pthread_mutex_unlock(&g.send_lock);
 }
 
 /* ========================================================================
- * 收帧分发（仅后台线程）
+ * 收帧分发（仅后台线程，datagram 天然完整帧 —— 无需重组）
  * ======================================================================*/
 
 static void dispatch_rsp(uint32_t ticket, const uint8_t *payload, size_t len)
@@ -239,10 +246,18 @@ static void dispatch_rsp(uint32_t ticket, const uint8_t *payload, size_t len)
     llog(LOG_DEBUG, "uds", "rsp ticket=%u unmatched, dropped", ticket);
 }
 
+/* 校验 magic + total_len，然后按 frame_type 分发。
+ * datagram 天然一个 recv 就是一帧 —— 不需要 half-frame / memmove 错位扫描。 */
 static void dispatch_frame(const uint8_t *frame, size_t len)
 {
-    if (len < NSBC_FRAME_HDR_LEN || frame[0] != NSBC_FRAME_MAGIC)
-        return;
+    if (len < NSBC_FRAME_HDR_LEN) return;
+    if (frame[0] != NSBC_FRAME_MAGIC) return;
+
+    uint32_t total =
+        ((uint32_t)frame[2] << 24) | ((uint32_t)frame[3] << 16) |
+        ((uint32_t)frame[4] << 8) | (uint32_t)frame[5];
+    if (total != len) return; /* datagram 帧完整性自检 —— 丢包/错位不应发生 */
+
     uint8_t ftype = frame[1];
     uint32_t ticket = ((uint32_t)frame[6] << 24) | ((uint32_t)frame[7] << 16) |
                       ((uint32_t)frame[8] << 8) | (uint32_t)frame[9];
@@ -265,88 +280,33 @@ static void dispatch_frame(const uint8_t *frame, size_t len)
     }
 }
 
-/* 非阻塞收帧重组。返回 0=正常（读尽或消费完）；-1=连接断开/协议错乱 */
-static int recv_and_dispatch(void)
+/* datagram 收帧 —— 天然一帧一 recv，无重组负担。
+ * recv 返回 0 或 errno=ECONNREFUSED 表示对端路径不存在（Rust 端还没 bind 好）。
+ * 其他错误返回 -1 → 上层 reconnect。 */
+static int recv_cmd_once(void)
 {
-    for (;;) {
-        /* 消费 rbuf 中所有完整帧 */
-        while (g.rhave >= NSBC_FRAME_HDR_LEN) {
-            /* 先校验 magic，再解长度 —— 防御性避免错位解析 */
-            if (g.rbuf[0] != NSBC_FRAME_MAGIC) {
-                /* 扫描寻找下一个 magic 字节 */
-                size_t drop = 0;
-                char hex[97];
-                int hpos = 0;
-                size_t dump_n = g.rhave > 32 ? 32 : g.rhave;
-                for (size_t i = 0; i < dump_n && hpos < (int)sizeof(hex) - 4; i++) {
-                    hpos += snprintf(hex + hpos, sizeof(hex) - hpos, "%02x ", g.rbuf[i]);
-                }
-                hex[hpos] = '\0';
-
-                size_t i;
-                for (i = 1; i < g.rhave; i++) {
-                    if (g.rbuf[i] == NSBC_FRAME_MAGIC) break;
-                }
-                drop = i;
-                if (drop >= g.rhave) {
-                    llog(LOG_WARN, "uds",
-                        "no magic in rbuf (%zu bytes), reset link (first 32: %s)",
-                        g.rhave, hex);
-                    return -1;
-                }
-                llog(LOG_WARN, "uds",
-                    "magic mismatch @0x%02x, dropping %zu bytes (rhave=%zu, first 32: %s)",
-                    g.rbuf[0], drop, g.rhave, hex);
-                memmove(g.rbuf, g.rbuf + drop, g.rhave - drop);
-                g.rhave -= drop;
-                continue;
-            }
-
-            uint32_t total =
-                ((uint32_t)g.rbuf[2] << 24) | ((uint32_t)g.rbuf[3] << 16) |
-                ((uint32_t)g.rbuf[4] << 8) | (uint32_t)g.rbuf[5];
-            if (total < NSBC_FRAME_HDR_LEN || total > sizeof(g.rbuf)) {
-                char hex[97];
-                int hpos = 0;
-                size_t dump_n = g.rhave > 32 ? 32 : g.rhave;
-                for (size_t i = 0; i < dump_n && hpos < (int)sizeof(hex) - 4; i++) {
-                    hpos += snprintf(hex + hpos, sizeof(hex) - hpos, "%02x ", g.rbuf[i]);
-                }
-                hex[hpos] = '\0';
-                llog(LOG_WARN, "uds",
-                    "frame len %u invalid (magic=0x%02x, type=0x%02x, hdr hex: %s), reset link",
-                    total, g.rbuf[0], g.rbuf[1], hex);
-                return -1;
-            }
-            if (g.rhave < total)
-                break; /* 半帧，继续收 */
-            dispatch_frame(g.rbuf, total);
-            memmove(g.rbuf, g.rbuf + total, g.rhave - total);
-            g.rhave -= total;
-        }
-        if (g.rhave == sizeof(g.rbuf))
-            return -1; /* 头声明不足一帧却塞满缓冲：错乱 */
-
-        ssize_t r = recv(g.fd, g.rbuf + g.rhave, sizeof(g.rbuf) - g.rhave, 0);
-        if (r > 0) {
-            g.rhave += (size_t)r;
-            continue;
-        }
-        if (r == 0)
-            return -1; /* 对端关闭 */
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
-            return 0;  /* 读尽 */
-        if (errno == EINTR)
-            continue;
-        return -1;
+    uint8_t frame[NSBC_MAX_FRAME];
+    ssize_t n = recv(g.fd_cmd, frame, sizeof(frame), 0);
+    if (n > 0) {
+        g.last_recv_ms = nsbc_now_ms();
+        dispatch_frame(frame, (size_t)n);
+        return 0;
     }
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        return 0;
+    if (n < 0 && errno == EINTR)
+        return 0;
+    /* ECONNREFUSED / ENOENT —— Rust 端还没起来，不是永久错误 */
+    if (n < 0 && (errno == ECONNREFUSED || errno == ENOENT))
+        return -1; /* 触发上层重连 */
+    return -1;
 }
 
 /* ========================================================================
- * 后台线程：connect → poll(socket+wake) → 收帧分发 / ring → PUSH
+ * 后台线程：reconnect → poll(fd_cmd + fd_push + wake) → 收帧 / ring → PUSH
  * ======================================================================*/
 
-/* 从 ring 取一条并发送 PUSH 帧（每轮一条，保持响应性） */
+/* ring → PUSH（push 通道，fire-and-forget，不回 ACK） */
 static void flush_ring_one(void)
 {
     uds_slot_t slot;
@@ -362,8 +322,7 @@ static void flush_ring_one(void)
 
     /* cJSON 包装 {"kind":"..","payload":{...}}（Web uds_server.rs 口径） */
     cJSON *root = cJSON_CreateObject();
-    if (!root)
-        return;
+    if (!root) return;
     cJSON_AddStringToObject(root, "kind", slot.kind);
     cJSON *parsed = cJSON_Parse(slot.json);
     if (parsed)
@@ -372,24 +331,26 @@ static void flush_ring_one(void)
         cJSON_AddStringToObject(root, "payload", slot.json);
     char *json_str = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
-    if (!json_str)
-        return;
+    if (!json_str) return;
 
-    uint8_t frame[NSBC_FRAME_HDR_LEN + 16384];
     size_t n = strlen(json_str);
-    size_t fsz = (n <= 16384)
-                     ? uds_encode_frame(FT_DATA_PUSH, 0, json_str, n,
-                                        frame, sizeof(frame))
-                     : 0;
-    cJSON_free(json_str);
-    if (fsz > 0) {
-        pthread_mutex_lock(&g.send_lock);
-        if (g.fd >= 0 && send_all_locked(frame, fsz) != 0)
-            mark_broken_locked();
-        pthread_mutex_unlock(&g.send_lock);
-    } else {
+    if (n > NSBC_MAX_PAYLOAD - NSBC_FRAME_HDR_LEN) {
+        /* 单条事件超过 datagram 安全上限 —— 直接丢弃（大 payload 不应出现在 CDR） */
         llog(LOG_WARN, "uds", "push frame too large (%zuB), dropped", n);
+        cJSON_free(json_str);
+        return;
     }
+
+    uint8_t frame[NSBC_FRAME_HDR_LEN + NSBC_MAX_PAYLOAD];
+    size_t fsz = uds_encode_frame(FT_DATA_PUSH, 0, json_str, n,
+                                   frame, sizeof(frame));
+    cJSON_free(json_str);
+    if (fsz == 0) return;
+
+    pthread_mutex_lock(&g.send_lock);
+    if (g.fd_push >= 0 && dgram_send_locked(g.fd_push, frame, fsz) != 0)
+        mark_broken_locked();
+    pthread_mutex_unlock(&g.send_lock);
 }
 
 static void drain_wake_pipe(void)
@@ -405,80 +366,78 @@ static void *uds_client_thread(void *ud)
     g.backoff_ms = UDS_RECONNECT_BASE_MS;
 
     for (;;) {
-        if (g.stop_flag)
-            break;
+        if (g.stop_flag) break;
 
-        /* ---- 未连接：connect（成功点发 HELLO）---- */
-        if (g.fd < 0) {
-            int fd = uds_connect_nonblocking();
-            if (fd < 0 || uds_wait_connected(fd) != 0) {
-                if (fd >= 0)
-                    close(fd);
+        /* ---- 未连接：重连两个 datagram ---- */
+        if (g.fd_push < 0 || g.fd_cmd < 0) {
+            pthread_mutex_lock(&g.send_lock);
+            int rc = uds_reconnect_both();
+            pthread_mutex_unlock(&g.send_lock);
+            if (rc != 0) {
                 if (g.backoff_ms > UDS_RECONNECT_MAX_MS)
                     g.backoff_ms = UDS_RECONNECT_MAX_MS;
-                llog(LOG_WARN, "uds",
-                     "connect %s failed, retry in %dms errno=%d",
-                     g.path, g.backoff_ms, errno);
+                llog(LOG_INFO, "uds",
+                     "connect %s+%s failed, retry in %dms errno=%d",
+                     g.path_push, g.path_cmd, g.backoff_ms, errno);
                 usleep((useconds_t)g.backoff_ms * 1000);
                 g.backoff_ms *= 2;
                 continue;
             }
-            g.rhave = 0;
-            pthread_mutex_lock(&g.send_lock);
-            g.fd = fd;
-            pthread_mutex_unlock(&g.send_lock);
             g.backoff_ms = UDS_RECONNECT_BASE_MS;
-            llog(LOG_NOTICE, "uds", "connected to %s, sending hello", g.path);
+            llog(LOG_NOTICE, "uds", "connected to %s + %s, sending hello",
+                 g.path_push, g.path_cmd);
             send_hello();
         }
 
-        /* ---- poll 双源：socket 收帧 + wake pipe 立即处理 ---- */
-        int sfd = g.fd;
-        struct pollfd pfd[2];
-        pfd[0].fd = sfd;       /* sfd<0 时 poll 忽略该项 */
-        pfd[0].events = POLLIN;
-        pfd[1].fd = g.wake_rd;
-        pfd[1].events = POLLIN;
-        int pr = poll(pfd, 2, 200);
-        if (g.stop_flag)
-            break;
+        /* ---- poll 三源：fd_cmd/POLLIN + fd_push/POLLIN + wake_pipe/POLLIN ----
+         * fd_push 理论上不会收到数据（我们只发不收），但留着以防 Rust 端
+         * 反向发 PUSH 回来（现在不会，但未来扩展安全）。 */
+        int fdp = g.fd_push, fdc = g.fd_cmd;
+        struct pollfd pfd[3];
+        int nfds = 0;
+        if (fdc >= 0) { pfd[nfds].fd = fdc; pfd[nfds].events = POLLIN; nfds++; }
+        if (fdp >= 0) { pfd[nfds].fd = fdp; pfd[nfds].events = POLLIN; nfds++; }
+        pfd[nfds].fd = g.wake_rd;
+        pfd[nfds].events = POLLIN;
+        nfds++;
+
+        int pr = poll(pfd, nfds, 200);
+        if (g.stop_flag) break;
         if (pr < 0) {
-            if (errno == EINTR)
-                continue;
+            if (errno == EINTR) continue;
             pthread_mutex_lock(&g.send_lock);
             mark_broken_locked();
             pthread_mutex_unlock(&g.send_lock);
             continue;
         }
 
-        if (sfd >= 0 && (pfd[0].revents & (POLLIN | POLLHUP | POLLERR))) {
-            if (recv_and_dispatch() != 0) {
+        /* fd_cmd 可读 —— 收 RSP / HELLO_ACK / HEARTBEAT */
+        if (fdc >= 0 && (pfd[0].revents & (POLLIN | POLLHUP | POLLERR))) {
+            if (recv_cmd_once() != 0) {
                 pthread_mutex_lock(&g.send_lock);
                 mark_broken_locked();
                 pthread_mutex_unlock(&g.send_lock);
-                llog(LOG_WARN, "uds", "link reset by peer, reconnecting");
+                llog(LOG_INFO, "uds", "datagram path reset by peer, reconnecting");
                 continue;
             }
         }
-        if (pfd[1].revents & POLLIN)
+        /* wake pipe —— ring 有新消息 or stop */
+        if (pfd[nfds-1].revents & POLLIN)
             drain_wake_pipe();
 
         /* ---- ring → PUSH ---- */
         flush_ring_one();
     }
 
-    /* stop：尽力 flush 剩余（连接已断则丢弃） */
+    /* stop：尽力 flush 剩余（push 通道断了则丢弃） */
     pthread_mutex_lock(&g.lock);
     int remain = (int)g.count;
     pthread_mutex_unlock(&g.lock);
-    while (remain-- > 0 && g.fd >= 0)
+    while (remain-- > 0 && g.fd_push >= 0)
         flush_ring_one();
 
     pthread_mutex_lock(&g.send_lock);
-    if (g.fd >= 0) {
-        close(g.fd);
-        g.fd = -1;
-    }
+    mark_broken_locked();
     pthread_mutex_unlock(&g.send_lock);
     return NULL;
 }
@@ -537,7 +496,7 @@ int uds_flush_now(void)
 }
 
 /* ========================================================================
- * 同步命令请求（S2）：占槽 → send → cond 等待 RSP
+ * 同步命令请求（S2）：占槽 → send(cmd) → cond 等待 RSP
  * ======================================================================*/
 
 int uds_request(const char *cmd_json, int timeout_ms,
@@ -546,7 +505,7 @@ int uds_request(const char *cmd_json, int timeout_ms,
     if (!cmd_json || !resp || resp_cap == 0)
         return NSBC_INVAL;
     resp[0] = '\0';
-    if (!g.started || g.fd < 0)
+    if (!g.started || g.fd_cmd < 0)
         return NSBC_ERR;
     if (timeout_ms <= 0 || timeout_ms > UDS_REQ_TIMEOUT_MS)
         timeout_ms = UDS_REQ_TIMEOUT_MS;
@@ -571,7 +530,7 @@ int uds_request(const char *cmd_json, int timeout_ms,
     slot->done = 0;
     slot->resp_len = 0;
 
-    uint8_t frame[2048];
+    uint8_t frame[NSBC_FRAME_HDR_LEN + 2048];
     size_t plen = strlen(cmd_json);
     size_t fsz = (plen > 0 && plen <= sizeof(frame) - NSBC_FRAME_HDR_LEN)
                      ? uds_encode_frame(FT_CMD_REQ, ticket, cmd_json, plen,
@@ -586,12 +545,12 @@ int uds_request(const char *cmd_json, int timeout_ms,
 
     /* 2. 发送（send_lock 与 PUSH/HELLO 串行） */
     pthread_mutex_lock(&g.send_lock);
-    int sfailed = (g.fd < 0 || send_all_locked(frame, fsz) != 0);
+    int sfailed = (g.fd_cmd < 0 || dgram_send_locked(g.fd_cmd, frame, fsz) != 0);
     pthread_mutex_unlock(&g.send_lock);
 
     int rc = NSBC_ERR;
     if (!sfailed) {
-        /* 3. 等 RSP（CLOCK_REALTIME 绝对超时，与 cond_timedwait 时钟一致） */
+        /* 3. 等 RSP */
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         ts.tv_sec += timeout_ms / 1000;
@@ -613,7 +572,7 @@ int uds_request(const char *cmd_json, int timeout_ms,
             resp[n] = '\0';
             rc = NSBC_OK;
         }
-        slot->in_use = 0; /* 释放槽（含超时路径；迟到 RSP 自然落空） */
+        slot->in_use = 0;
         pthread_mutex_unlock(&slot->mtx);
         return rc;
     }
@@ -639,8 +598,9 @@ static int r_uds_ring(char *b, size_t cap, void *ud)
 int uds_client_init(const char *sock_path)
 {
     const char *p = sock_path ? sock_path : uds_default_sock_path();
-    if (strlen(p) >= sizeof(g.path)) return NSBC_INVAL;
-    snprintf(g.path, sizeof(g.path), "%s", p);
+    uds_derive_paths(p, g.path_push, sizeof(g.path_push),
+                         g.path_cmd,  sizeof(g.path_cmd));
+
     pthread_mutex_init(&g.lock, NULL);
     pthread_mutex_init(&g.send_lock, NULL);
 
@@ -657,10 +617,10 @@ int uds_client_init(const char *sock_path)
         pthread_mutex_init(&g.slots[i].mtx, NULL);
         pthread_cond_init(&g.slots[i].cv, NULL);
     }
-    g.fd = -1;
+    g.fd_push = -1;
+    g.fd_cmd  = -1;
     g.ticket_seq = 0;
 
-    /* 注册 UDS ring overflow metric（暴露到 control.sock stats + /metrics） */
     metric_source_register("nsbc_uds_ring_dropped",
                            "UDS ring buffer overflow drops (oldest evicted)",
                            r_uds_ring, NULL);
@@ -674,7 +634,9 @@ int uds_client_start(void)
     int rc = pthread_create(&g.thread, NULL, uds_client_thread, NULL);
     if (rc != 0) return NSBC_ERR;
     g.started = 1;
-    llog(LOG_NOTICE, "uds", "client thread started, target %s", g.path);
+    llog(LOG_NOTICE, "uds",
+         "client thread started, push=%s cmd=%s",
+         g.path_push, g.path_cmd);
     return NSBC_OK;
 }
 
@@ -701,7 +663,8 @@ void uds_client_shutdown(void)
     }
     if (g.wake_rd >= 0) { close(g.wake_rd); g.wake_rd = -1; }
     if (g.wake_wr >= 0) { close(g.wake_wr); g.wake_wr = -1; }
-    if (g.fd >= 0) { close(g.fd); g.fd = -1; }
+    if (g.fd_push >= 0) { close(g.fd_push); g.fd_push = -1; }
+    if (g.fd_cmd  >= 0) { close(g.fd_cmd);  g.fd_cmd  = -1; }
 }
 
 /*
