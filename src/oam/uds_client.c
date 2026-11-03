@@ -52,23 +52,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <sys/syscall.h> /* sendmmsg */
 #include <sys/un.h>
 #include <unistd.h>
-
-/* Linux sendmmsg —— 一次系统调用发 N 个 datagram */
-#ifndef SYS_sendmmsg
-  #if defined(__x86_64__)
-    #define SYS_sendmmsg 307
-  #elif defined(__i386__)
-    #define SYS_sendmmsg 349
-  #elif defined(__aarch64__)
-    #define SYS_sendmmsg 469
-  #endif
-#endif
-#ifndef HAVE_SENDMMSG
-int sendmmsg(int, struct mmsghdr *, unsigned int, unsigned int);
-#endif
 
 /* ========================================================================
  * 自适应多核心架构（REQ-DATA-SVC-002 P1）
@@ -665,6 +650,7 @@ static inline uint32_t next_pow2(uint32_t v)
 
 static int shard_init(uds_shard_t *s, uint32_t ring_size, int idx)
 {
+    (void)idx;  /* 未来可用于 shard 编号诊断日志，当前实现不需要 */
     memset(s, 0, sizeof(*s));
     s->size = next_pow2(ring_size);
     if (s->size < 256) s->size = 256;
@@ -801,15 +787,13 @@ static int shard_flush_batch(uds_shard_t *s, int *out_fatal)
         return n;  /* fd 已断，丢剩余 */
     }
 
-    unsigned int sent_total = 0;
-    /* 优先用原生 sendmmsg，若系统未声明则 syscall fallback */
-#ifdef HAVE_SENDMMSG
+    int sent_total = 0;
+    /* glibc 在 _GNU_SOURCE 下已声明 sendmmsg —— 直接调
+     * 最后一个参数 flags=0（无 GSO/zerocopy 等扩展）
+     * 返回 int：成功 = 发送的消息数 >=0，失败 = -1 */
     sent_total = sendmmsg(g.fd_push, mh, sent, 0);
-#else
-    sent_total = (unsigned int)syscall(SYS_sendmmsg, g.fd_push, mh, sent, 0);
-#endif
-    if (sent_total == (unsigned int)-1) {
-        /* syscall 失败 —— 回退逐帧 send（兼容内核版本 < 3.0） */
+    if (sent_total == -1) {
+        /* sendmmsg 系统调用失败 —— 回退逐帧 send（兼容内核版本 < 3.0） */
         for (int i = 0; i < sent; i++) {
             if (dgram_send_locked(g.fd_push, frames[i], iov[i].iov_len) != 0) {
                 *out_fatal = 1;
@@ -819,7 +803,7 @@ static int shard_flush_batch(uds_shard_t *s, int *out_fatal)
         }
     } else {
         /* sendmmsg 可能部分成功 —— 失败帧按单帧 send 补 */
-        for (unsigned int i = sent_total; i < (unsigned int)sent; i++) {
+        for (int i = sent_total; i < sent; i++) {
             if (dgram_send_locked(g.fd_push, frames[i], iov[i].iov_len) != 0) {
                 *out_fatal = 1;
                 pthread_mutex_unlock(&s->send_lock);
