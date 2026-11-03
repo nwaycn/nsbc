@@ -17,7 +17,7 @@ extern void *sig_ws_bridge_conn_from_sa(const nsbc_sa_t *sa);
 
 #include <cjson/cJSON.h>
 #include <arpa/inet.h>
-
+#include <stdatomic.h>   /* C11 _Atomic + atomic_load_explicit + memory_order_* */
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
