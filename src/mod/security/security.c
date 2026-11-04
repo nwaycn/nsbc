@@ -1231,6 +1231,16 @@ static int sec_reg_cb(sip_tr_proto_t proto, const nsbc_sa_t *src,
     char ip[INET6_ADDRSTRLEN] = {0};
     sa_to_ip_str(src, ip, sizeof(ip));
 
+    /* ★ 私网 IP 快速放行 —— RFC 1918 / loopback / link-local / IPv6 内网
+     * 都是内部设备（分机/网关/自连通/WebRTC 桥），不可能是外部扫描者。
+     * 完全跳过 fence + auto-ban（零锁、零遍历、零计数、最安全）。
+     *
+     * 之前的做法是"进 fence 内部跳过 deny CIDR"，但还是要拿 rwlock
+     * + 遍历 deny UA 表 60+ 条 + 可能的 allowlist。对每包都是浪费。 */
+    if (ip[0] && ban_is_private_ip(ip)) {
+        return NSBC_OK;
+    }
+
     /* 1. NIP 完整围栏：method + IP + UA（REGISTER 无主叫/被叫）
      *    命中 → 静默丢弃 NSBC_PERM_DENIED（不进 401/403、不计入 auto-ban）。
      *    优先级：method 禁用 → deny 全表 → allowlist 未命中。 */
@@ -1707,6 +1717,13 @@ static int sec_guard_cb(const char *src_ip, b2b_guard_evt_t evt, void *ud)
 {
     (void)ud;
     if (!src_ip || !src_ip[0]) return NSBC_OK;
+
+    /* ★ 私网 IP 快速放行 —— 和 sec_reg_cb 一致。
+     * 完全跳过 ban mutex + hash 查找 + 计数更新。
+     * ban_note_* / ban_is_banned 内部虽然也有 private IP 跳过，
+     * 但还是要拿锁 + 哈希 + 链表遍历 —— 全是浪费。 */
+    if (ban_is_private_ip(src_ip))
+        return NSBC_OK;
 
     if (evt == B2B_GUARD_AUTH_FAIL) {
         if (!g_cfg.auto_ban) return NSBC_OK;
