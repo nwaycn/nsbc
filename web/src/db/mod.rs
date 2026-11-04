@@ -3806,17 +3806,18 @@ sqlx::query(acct_ddl).execute(pool).await?;
     }
 
     // Default extensions seed: only seed when extensions table is EMPTY
-    // (prevents re-seeding 90k rows after DELETE). Seed just 10 test extensions.
+    // (prevents re-seeding after DELETE). Seed full range 10000-99999 (90000 extensions).
+    // Used for large-scale register stress testing and production defaults.
     let ext_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM extensions")
         .fetch_one(pool).await.unwrap_or(0);
     if ext_count > 0 {
         info!("extensions table already has {ext_count} rows — skipping default seed");
     } else {
-        info!("extensions table is empty — seeding 10 test extensions (10000-10009)");
+        info!("extensions table is empty — seeding full range 10000-99999 (90000 extensions)");
     }
     let default_realm = "nsbc.local";
     let default_pass  = "876876";
-    let seed_range: Vec<u32> = if ext_count == 0 { (10000..10010).collect() } else { Vec::new() };
+    let seed_range: Vec<u32> = if ext_count == 0 { (10000..100000).collect() } else { Vec::new() };
     for n in seed_range {
         let ext = format!("{n}");
         let clip = format!("{n}");
