@@ -446,13 +446,19 @@ void security_check_fence(security_fence_ctx_t *ctx)
     /* === 读锁：deny + allow 全表遍历 === */
     pthread_rwlock_rdlock(&g_bl_rwlock);
 
-    /* deny: IP CIDR */
+    /* deny: IP CIDR —— 私网 IP 跳过（管理员误操作把 10.0.0.0/8 加 deny 表的常见坑） */
     if (ctx->src && ctx->src->sa_family != AF_UNSPEC && g_deny_cidr_n > 0) {
-        for (int i = 0; i < g_deny_cidr_n; ++i) {
-            if (bl_ip_match(ctx->src, &g_deny_cidr[i])) {
-                pthread_rwlock_unlock(&g_bl_rwlock);
-                ctx->hit = BLACKLIST_IP;
-                return;
+        char ip_s[INET6_ADDRSTRLEN] = {0};
+        const struct sockaddr *s = ctx->src;
+        if (s->sa_family == AF_INET)
+            inet_ntop(AF_INET, &((const struct sockaddr_in *)s)->sin_addr, ip_s, sizeof(ip_s));
+        if (!ban_is_private_ip(ip_s)) {   /* ★ 私网跳过 deny CIDR */
+            for (int i = 0; i < g_deny_cidr_n; ++i) {
+                if (bl_ip_match(ctx->src, &g_deny_cidr[i])) {
+                    pthread_rwlock_unlock(&g_bl_rwlock);
+                    ctx->hit = BLACKLIST_IP;
+                    return;
+                }
             }
         }
     }
@@ -1272,7 +1278,11 @@ static int sec_reg_cb(sip_tr_proto_t proto, const nsbc_sa_t *src,
         return NSBC_PERM_DENIED;
     }
 
+    /* L1276 security_check_ip 旧路径 —— 私网 IP 跳过（和 ban_is_banned 一致）。
+     * 管理员不太可能把整个 10.0.0.0/8 配成 CIDR 黑名单；
+     * 如果真配了，大概率是 Web 安全中心误操作。 */
     if (!cfg->block_on_register) return NSBC_OK;  /* 静态黑名单未启用 → 放行 */
+    if (ban_is_private_ip(ip)) return NSBC_OK;   /* ★ 私网跳过 —— 和 auto-ban 一致 */
     if (security_check_ip(ip, cfg)) {
         log_notice("security", "REGISTER PERM_DENIED ip=%s (blacklist)", ip);
         return NSBC_PERM_DENIED;   /* ★ silent drop：黑产连 401 都收不到 */
