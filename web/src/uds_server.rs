@@ -62,6 +62,11 @@ const UDS_FRAG_MAX_TOTAL:  usize = 64 * 1024 * 1024;  /* 重组 buffer 上限 64
  * ticket 生成用高位 0x80000000 区分方向（C→Rust ticket 高位为 0）。 */
 static CORE_CMD_TICKET: AtomicU32 = AtomicU32::new(0x80000000);
 static CORE_CMD_WAITERS: Mutex<Option<HashMap<u32, oneshot::Sender<Vec<u8>>>>> = Mutex::new(None);
+/* cmd channel 持有的 UnixDatagram（Arc 共享所有权，send_core_cmd_via_uds 也用它发） */
+#[cfg(unix)]
+static CORE_CMD_SOCK: Mutex<Option<Arc<tokio::net::UnixDatagram>>> = Mutex::new(None);
+/* C 侧 peer 的 bind 路径（/tmp/nsbc_client_PID_cmd.sock），sendto 目标 */
+static CORE_PEER_CMD_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 /* 分片重组状态（cmd_recv_loop 内部持有，每次 loop 重置） */
 struct FragState {
     ticket: u32,
@@ -126,6 +131,13 @@ pub fn start<C: crate::coreclient::CoreApi + Clone + Send + Sync + 'static>(
         "UDS Data Service bound (dual AF_UNIX DGRAM)"
     );
 
+    /* 把 cmd_sock 存入 CORE_CMD_SOCK，send_core_cmd_via_uds 用它直接 sendto C 侧 */
+    let cmd_sock_arc = Arc::new(cmd_sock);
+    {
+        let mut w = CORE_CMD_SOCK.lock().unwrap();
+        *w = Some(cmd_sock_arc.clone());
+    }
+
     Ok(tokio::spawn(async move {
         let push_state = state.clone();
         let cmd_state  = state.clone();
@@ -137,7 +149,7 @@ pub fn start<C: crate::coreclient::CoreApi + Clone + Send + Sync + 'static>(
         });
 
         let cmd_join = tokio::spawn(async move {
-            if let Err(e) = cmd_recv_loop(cmd_sock, &cmd_state).await {
+            if let Err(e) = cmd_recv_loop(cmd_sock_arc, &cmd_state).await {
                 tracing::warn!(error = %e, "UDS cmd loop exited");
             }
         });
@@ -268,7 +280,7 @@ async fn push_recv_loop<C: crate::coreclient::CoreApi + Clone + Send + Sync + 's
 
 #[cfg(unix)]
 async fn cmd_recv_loop<C: crate::coreclient::CoreApi + Clone + Send + Sync + 'static>(
-    sock: tokio::net::UnixDatagram,
+    sock: Arc<tokio::net::UnixDatagram>,
     state: &Arc<AppState<C>>,
 ) -> std::io::Result<()> {
     /* 初始化 CORE_CMD_WAITERS（send_core_cmd_via_uds 暴露给 coreclient.rs 用） */
@@ -284,6 +296,32 @@ async fn cmd_recv_loop<C: crate::coreclient::CoreApi + Clone + Send + Sync + 'st
 
     loop {
         let (n, peer) = sock.recv_from(&mut buf).await?;
+        /* 每次收到 C 侧消息，记录 peer 路径 —— 这就是 send_core_cmd_via_uds 要 sendto 的目标 */
+        if let Some(p) = peer.as_pathname() {
+            let is_first_connect = {
+                let mut pp = CORE_PEER_CMD_PATH.lock().unwrap();
+                let need_update = match pp.as_ref() {
+                    Some(existing) => existing != p,
+                    None => true,
+                };
+                if need_update {
+                    tracing::info!(peer = %p.display(), "C side connected (cmd peer path recorded)");
+                    *pp = Some(p.to_path_buf());
+                }
+                pp.is_none() || matches!(pp.as_ref(), Some(prev) if prev != p)
+            };
+            /* 第一次连接 / peer 变化 → 立即 push_all 绕过 cooldown */
+            if is_first_connect {
+                /* 先清除所有 kind cooldown —— Web 启动后周期性同步可能先跑失败，
+                 * 已经把所有 kind 标记为 cooldown 了 */
+                crate::sync::clear_all_cooldowns();
+                let state_clone = state.clone();
+                tokio::spawn(async move {
+                    tracing::info!("C 侧刚连上 —— 立即 push_all");
+                    crate::sync::push_all(state_clone).await;
+                });
+            }
+        }
         let frame = match decode_frame(&buf[..n]) {
             Some(f) => f,
             None => {
@@ -406,17 +444,17 @@ fn now_ms() -> u64 {
 /// Returns the raw RSP bytes from C core (may also be fragmented on C→Rust path,
 /// reassembled by cmd_recv_loop before being delivered here).
 ///
-/// Uses a temporary client datagram bind path (mirrors C-side uds_open_dgram).
+/// 方式 D 实现：从 cmd_recv_loop 持有的 Arc<UnixDatagram> 直接 sendto C 侧的 peer
+/// 路径（/tmp/nsbc_client_PID_cmd.sock），绕过临时 client 的 loopback bug。
+///
 /// The actual RSP delivery is routed through cmd_recv_loop + CORE_CMD_WAITERS map,
 /// so this function blocks on oneshot::Receiver until timeout.
 #[cfg(unix)]
 pub async fn send_core_cmd_via_uds(
-    sock_path: &std::path::Path,
+    _sock_path: &std::path::Path,
     cmd_text: &str,
     timeout_ms: u64,
 ) -> Result<Vec<u8>, String> {
-    use tokio::io::AsyncWriteExt;
-
     let cmd_payload = cmd_text.as_bytes();
     let ticket = CORE_CMD_TICKET.fetch_add(1, Ordering::Relaxed);
 
@@ -434,21 +472,28 @@ pub async fn send_core_cmd_via_uds(
     /* 构造分片帧 */
     let frames = build_fragmented_frames(FT_CMD_REQ, ticket, cmd_payload);
 
-    /* 用临时 client datagram bind → connect → 发送所有分片
-     * （C 端 connect 到 server path，send() 就自动 route 回 server 的 recv_from） */
-    let client_path = format!("/tmp/nsbc_web_cmd_{}.sock", std::process::id());
-    let client = tokio::net::UnixDatagram::bind(&client_path)
-        .map_err(|e| format!("bind client datagram {client_path}: {e}"))?;
-    let _ = tokio::fs::remove_file(&client_path).await; /* 清理残留 */
+    /* 从 CORE_CMD_SOCK 拿 cmd_recv_loop 持有的 socket
+     * 从 CORE_PEER_CMD_PATH 拿 C 侧 bind 的 peer 路径 */
+    let (sock_arc, peer_path) = {
+        let s = CORE_CMD_SOCK.lock().unwrap().clone()
+            .ok_or_else(|| "CORE_CMD_SOCK not initialized (UDS service not started?)".to_string())?;
+        let p = CORE_PEER_CMD_PATH.lock().unwrap().clone()
+            .ok_or_else(|| "CORE_PEER_CMD_PATH not known — C side hasn't sent any frame yet".to_string())?;
+        (s, p)
+    };
 
-    let cmd_path = crate::uds_server::default_sock_base_path();
-    let (_, cmd_path) = derive_paths(&cmd_path);
-    client.connect(&cmd_path)
-        .map_err(|e| format!("connect to cmd_path: {e}"))?;
+    tracing::debug!(
+        ticket,
+        frame_count = frames.len(),
+        payload_bytes = cmd_payload.len(),
+        peer = %peer_path.display(),
+        "Web→C CMD_REQ sendto"
+    );
 
+    /* 直接 sendto C 侧 peer，绕过临时 client loopback bug */
     for frame in &frames {
-        client.send(frame).await
-            .map_err(|e| format!("send CMD_REQ fragment: {e}"))?;
+        sock_arc.send_to(frame, &peer_path).await
+            .map_err(|e| format!("sendto CMD_REQ fragment to {}: {e}", peer_path.display()))?;
     }
 
     /* 等 RSP —— 来自 cmd_recv_loop 通过 oneshot 唤醒 */

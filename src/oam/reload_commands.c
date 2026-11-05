@@ -278,9 +278,17 @@ void reload_commands_register(cmd_reg_t *reg)
         { "dialplan-rules.reload", "Reload dialplan rules from JSON (dp_rule)",       "reload", CMD_L2_ADMIN, cmd_dialplan_rules_reload, NULL },
         { "queues.reload",         "Reload ACD queues from JSON (cc_mgr)",            "reload", CMD_L2_ADMIN, cmd_queues_reload,     NULL },
         { "profiles.reload",       "Reload SIP profiles RCU atomic replace",          "reload", CMD_L2_ADMIN, cmd_profiles_reload,   NULL },
-        { "ha.reload",             "Reload HA groups from JSON (Web DB authoritative)", "reload", CMD_L2_ADMIN, cmd_reload_noop, (void*)"ha" },
-        { "ivr.reload",            "Reload IVR menus from JSON (nodes JSON tree)",       "reload", CMD_L2_ADMIN, cmd_ivr_reload,     NULL },
-        { "route_groups.reload",   "Reload route groups from JSON (Web DB authoritative)", "reload", CMD_L2_ADMIN, cmd_reload_noop, (void*)"route_groups" },
+        { "ha.reload",             "Reload HA groups (Web DB authoritative)",         "reload", CMD_L2_ADMIN, cmd_reload_noop, (void*)"ha" },
+        { "ivr.reload",            "Reload IVR menus from JSON (nodes JSON tree)",    "reload", CMD_L2_ADMIN, cmd_ivr_reload,     NULL },
+        { "route_groups.reload",   "Reload route groups (Web DB authoritative)",      "reload", CMD_L2_ADMIN, cmd_reload_noop, (void*)"route_groups" },
+
+        /* 下面这些 Web DB  authoritative，C 侧暂不消费 — no-op 占位让 CMD_REQ 不报 unknown */
+        /* ⚠️ 命令名必须和 Rust CoreApi reload_via_uds(cmd_name) 的 cmd_name 精确匹配！ */
+        { "rate.reload",           "Reload rates (no-op — Web DB authoritative)",      "reload", CMD_L2_ADMIN, cmd_reload_noop, (void*)"rate" },
+        { "accounts.reload",       "Reload accounts (no-op — Web DB authoritative)",  "reload", CMD_L2_ADMIN, cmd_reload_noop, (void*)"accounts" },
+        { "rate_plans.reload",     "Reload rate plans (no-op — Web DB authoritative)","reload", CMD_L2_ADMIN, cmd_reload_noop, (void*)"rate_plans" },
+        { "rate_plan_entries.reload","Reload rate plan entries (no-op — Web DB authoritative)","reload", CMD_L2_ADMIN, cmd_reload_noop, (void*)"rate_plan_entries" },
+        /* security.blacklist.reload 由 security.c 自己注册 — 不在本表重复 */
 
         /* ---- show 只读查询 ---- */
         { "profiles.list",         "List loaded SIP profiles",                        "show", CMD_L1_MONITOR, cmd_profiles_list,    NULL },

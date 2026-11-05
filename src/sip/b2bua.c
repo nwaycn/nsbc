@@ -5039,14 +5039,17 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
         int leg = -1;
         b2b_call_t *c = cid ? tbl_find(co, cid->value.p, cid->value.len, NULL)
                             : NULL;
-        llog(LOG_INFO, "b2b",
-             "★BYE_RECV callid=[%.*s] txn=%p cid_present=%d call_found=%d",
+        llog(LOG_WARN, "b2b",
+             "BYE_RECV callid=[%.*s] txn=%p cid_present=%d call_found=%d",
              (int)(cid ? cid->value.len : 0), cid ? cid->value.p : "?",
              (void *)t, !!cid, !!c);
         if (!c) {
+            /* BYE for unknown call → 481 Call Does Not Exist (SIP RFC 3261) */
+            const nsbc_sa_t *bye_rp = txn_peer(t);
             llog(LOG_WARN, "b2b",
-                 "★BYE_RECV: no matching call → 481 callid=[%.*s]",
-                 (int)(cid ? cid->value.len : 0), cid ? cid->value.p : "?");
+                 "BYE_RECV: no matching call → 481 callid=[%.*s] src_fam=%d",
+                 (int)(cid ? cid->value.len : 0), cid ? cid->value.p : "?",
+                 bye_rp ? bye_rp->ss.ss_family : -1);
             respond_txn(co, t, 481, NULL, NULL, NULL, 0);
             return;
         }

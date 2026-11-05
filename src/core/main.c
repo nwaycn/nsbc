@@ -13,8 +13,10 @@
 #include "cfg_sync.h"   /* P0: SIGHUP reload 后同步 DB 配置，与 control.sock reload 行为对齐 */
 #include "cfg.h"
 #include "cfg_schema.h"
+#include "endpoints.h"   /* dbmode=0: g_ep_loaded 等 reload_extensions 完成 */
 #include "log.h"
 #include "module.h"
+#include "nsbc_atomic.h"
 #include "nsbcd_signal.h"
 #include "playback_engine.h"
 #include "reactor.h"
@@ -417,7 +419,7 @@ int main(int argc, char **argv)
     setenv("MALLOC_MMAP_THRESHOLD_", "131072", 0); /* 128KB，默认 */
 #ifdef __GLIBC__
     mallopt(M_ARENA_MAX, 2);                     /* 旧 glibc 兜底 */
-    mallopt(M_TRIM_THRESHOLD_, 1024 * 1024);    /* 空闲 1MB 就还给 OS */
+    mallopt(M_TRIM_THRESHOLD, 1024 * 1024);      /* 空闲 1MB 就还给 OS */
 #endif
 
     /* 离线子命令（不进启动序列；主版本不符时守护进程拒绝启动，迁移必须
@@ -842,6 +844,32 @@ int main(int argc, char **argv)
     if (rc != NSBC_OK)
         goto shutdown_failed;
     log_audit("system", "boot-complete", "modules started, accepting traffic");
+
+    /* ================================================================
+     * dbmode=0：等 Web 侧 push_all → reload_extensions 完成再开 reactor
+     *
+     * 根因：nsbcd 启动时 UDS HELLO → Web tokio::spawn(push_all) 异步执行，
+     * reactor ready 和 L1 热之间有时序竞争。如果此时 sipp 发 REGISTER →
+     * L1 miss → L2 UDS 阻塞 reactor ~5-10ms × 400/s = UDP 丢包！
+     *
+     * 解法：reload_extensions 成功后置 sat_write(g_ep_loaded, 1)，
+     * reactor_mgr_start_threads() 之前 sat_read 等这个标志。
+     * 超时 60s：extensions reload 90K entries 实测 ~43s (单线程 poll)。
+     * ================================================================ */
+    {
+        llog(LOG_INFO, "core", "dbmode=0: 等 reload_extensions（让 L1 热了再开 reactor）...");
+        int waited_ms = 0;
+        for (int i = 0; i < 600; ++i) {
+            if (sat_read(g_ep_loaded))
+                break;
+            usleep(100 * 1000);  /* 100ms */
+            waited_ms += 100;
+        }
+        if (sat_read(g_ep_loaded))
+            llog(LOG_NOTICE, "core", "dbmode=0 ready: reload 完成（等了 %dms），开 reactor", waited_ms);
+        else
+            llog(LOG_WARN, "core", "dbmode=0: 60s 超时没等到 reload（L1 冷，部分 REGISTER 会打 L2）");
+    }
 
     /* P3: 启动 reactor[1..n-1] 的 pthread。
      * 必须在 modmgr_start_all 之后——所有模块 init 的 reactor_add（sip_transport UDP sockets,

@@ -10,9 +10,12 @@
 #define _GNU_SOURCE
 #endif
 #include "app_ctx.h"
+#include "cfg.h"
 #include "endpoints.h"
+#include "location_db.h"
 #include "log.h"
 #include "module.h"
+#include "nsbc_atomic.h"
 #include "uDS_client.h"
 
 #include <pthread.h>
@@ -38,6 +41,9 @@ typedef struct {
 } ep_store_t;
 
 static ep_store_t *g_ep;
+
+/* dbmode=0 标志：reload_extensions 至少成功过一次 → L1 热了 */
+nsbc_atomic_t g_ep_loaded;
 
 static unsigned hash_user(const char *s, size_t n)
 {
@@ -152,15 +158,22 @@ static int json_truthy(const cJSON *j, int def)
  *
  * 三级查找（REQ-DATA-SVC-003 混合式兜底）：
  *   L1 内存表（Web 全量推送 + 本回调回填；含负缓存 TTL 判断）
- *   L2 UDS 实时查询 Web DB（uds_request，EP_UDS_TIMEOUT_MS 超时；
+ *   L2 UDS 实时查询 Web DB（uds_request，g_ep_uds_timeout_ms 超时；
  *      uds 线程未起/断链立即失败，不阻塞注册路径）
  *   L3 结果回填内存表（正=完整条目；负=neg+TTL 抑制重复查询） */
 static __thread char tls_ha1[EP_HA1_LEN + 1];
 
-#define EP_UDS_TIMEOUT_MS    50   /* L2 查询超时（阻塞 reactor 的容忍上限） */
-#define EP_NEG_TTL_MS     30000   /* not_found/disabled 负缓存 TTL */
-#define EP_NEG_TTL_ERR_MS  2000   /* db_error/uds 失败负缓存 TTL */
-#define EP_HA1_POS_TTL_MS 300000  /* 正缓存 TTL = 300s；到期触发 L2 重查（密码生效窗口） */
+/* 默认值（cfg 未配置时用这些） */
+#define EP_DEF_UDS_TIMEOUT_MS    50   /* L2 查询超时（阻塞 reactor 的容忍上限） */
+#define EP_DEF_NEG_TTL_MS     10000   /* not_found/disabled 负缓存 TTL */
+#define EP_DEF_NEG_TTL_ERR_MS  2000   /* db_error/uds 失败负缓存 TTL */
+#define EP_DEF_HA1_POS_TTL_MS 300000  /* 正缓存 TTL = 300s */
+
+/* 运行时值 — ep_init 从 cfg 读取后覆盖默认值 */
+static int g_ep_uds_timeout_ms = EP_DEF_UDS_TIMEOUT_MS;
+static int g_ep_neg_ttl_ms     = EP_DEF_NEG_TTL_MS;
+static int g_ep_neg_ttl_err_ms = EP_DEF_NEG_TTL_ERR_MS;
+static int g_ep_ha1_pos_ttl_ms = EP_DEF_HA1_POS_TTL_MS;
 
 static int64_t ep_now_ms(void)
 {
@@ -250,7 +263,7 @@ static const char *ep_ha1_lookup(const char *realm, size_t rlen,
     if (found_ha1) return found_ha1;
     llog(LOG_INFO, "ep", "ha1 lookup L1 MISS user=%s realm=%s → L2 UDS query", u, rlm);
 
-    /* L2：UDS 实时查询 Web DB（锁外阻塞，最长 EP_UDS_TIMEOUT_MS） */
+    /* L2：UDS 实时查询 Web DB（锁外阻塞，最长 g_ep_uds_timeout_ms） */
     char rlm_esc[64];
     ep_json_escape(rlm, strlen(rlm), rlm_esc, sizeof(rlm_esc));
     char req[256];
@@ -258,13 +271,13 @@ static const char *ep_ha1_lookup(const char *realm, size_t rlen,
              "{\"cmd\":\"ext.ha1\",\"user\":\"%s\",\"realm\":\"%s\"}", u, rlm_esc);
 
     char rsp[512];
-    int rc = uds_request(req, EP_UDS_TIMEOUT_MS, rsp, sizeof(rsp));
+    int rc = uds_request(req, g_ep_uds_timeout_ms, rsp, sizeof(rsp));
     if (rc != NSBC_OK) {
         /* 未连接/超时/槽满：短负缓存，避免注册风暴打穿 UDS */
         llog(LOG_WARN, "ep",
              "ha1 lookup L2 UDS FAILED user=%s realm=%s rc=%d (not connected?)",
              u, rlm, rc);
-        ep_neg_cache_put(e, u, rlm, EP_NEG_TTL_ERR_MS);
+        ep_neg_cache_put(e, u, rlm, g_ep_neg_ttl_err_ms);
         return NULL;
     }
     llog(LOG_INFO, "ep", "ha1 lookup L2 rsp user=%s realm=%s: %s", u, rlm, rsp);
@@ -272,7 +285,7 @@ static const char *ep_ha1_lookup(const char *realm, size_t rlen,
     cJSON *r = cJSON_Parse(rsp);
     if (!r) {
         llog(LOG_WARN, "ep", "ha1 lookup L2 parse failed user=%s realm=%s", u, rlm);
-        ep_neg_cache_put(e, u, rlm, EP_NEG_TTL_ERR_MS);
+        ep_neg_cache_put(e, u, rlm, g_ep_neg_ttl_err_ms);
         return NULL;
     }
     cJSON *okj = cJSON_GetObjectItem(r, "ok");
@@ -285,7 +298,7 @@ static const char *ep_ha1_lookup(const char *realm, size_t rlen,
         snprintf(ne.user, sizeof(ne.user), "%s", u);
         snprintf(ne.realm, sizeof(ne.realm), "%s", rlm);
         memcpy(ne.ha1, h1->valuestring, EP_HA1_LEN + 1);
-        ne.ha1_expire_ms = ep_now_ms() + EP_HA1_POS_TTL_MS;  /* 正缓存 TTL */
+        ne.ha1_expire_ms = ep_now_ms() + g_ep_ha1_pos_ttl_ms;  /* 正缓存 TTL */
         cJSON *j;
         j = cJSON_GetObjectItem(r, "clip");
         if (j && cJSON_IsString(j))
@@ -307,7 +320,7 @@ static const char *ep_ha1_lookup(const char *realm, size_t rlen,
                    (strcmp(rsn->valuestring, "not_found") == 0 ||
                     strcmp(rsn->valuestring, "disabled") == 0);
     cJSON_Delete(r);
-    ep_neg_cache_put(e, u, rlm, long_neg ? EP_NEG_TTL_MS : EP_NEG_TTL_ERR_MS);
+    ep_neg_cache_put(e, u, rlm, long_neg ? g_ep_neg_ttl_ms : g_ep_neg_ttl_err_ms);
     return NULL;
 }
 
@@ -321,6 +334,19 @@ static int ep_init(struct nsbc_ctx *ctx)
     g_ep = e;
     ctx->ha1_cb = ep_ha1_lookup;
     ctx->ha1_ud = e;
+
+    /* 从 cfg 读取缓存参数覆盖默认值（P1-2 HA1 缓存 SLA 可调） */
+    if (ctx && ctx->cfg) {
+        long v = 0;
+        if (cfg_get_int(ctx->cfg, "ep.cache_ttl_s", &v, NULL) == NSBC_OK && v > 0) {
+            g_ep_ha1_pos_ttl_ms = (int)v * 1000;
+            llog(LOG_INFO, "ep", "ep_init: ha1_pos_ttl = %lds (cfg override)", v);
+        }
+        if (cfg_get_int(ctx->cfg, "ep.uds_timeout_ms", &v, NULL) == NSBC_OK && v > 0) {
+            g_ep_uds_timeout_ms = (int)v;
+            llog(LOG_INFO, "ep", "ep_init: uds_timeout = %ldms (cfg override)", v);
+        }
+    }
     return NSBC_OK;
 }
 
@@ -532,11 +558,58 @@ int ext_table_reload_json(const char *json, char *out_err, size_t err_sz)
         pthread_mutex_unlock(&tmp->sh[i].lock);
     }
 
+    /* [2.5] 差集扫描：旧表里有、新表里没有 → loc_remove 清 binding
+     * 覆盖场景：Web 禁用分机 / Web 删除分机（reload 时新表不含它们）
+     * 不覆盖改密码：改密码只影响下次 REGISTER 认证，已注册 UA 不受影响 */
+    {
+        nsbc_ctx_t *c = nsbc_get_ctx();
+        loc_db_t *db = c ? (loc_db_t *)c->loc_db : NULL;
+        int invalidated = 0;
+        if (db) {
+            for (int si = 0; si < EP_SHARDS; ++si) {
+                ep_ext_t *old = tmp->sh[si].head;
+                while (old) {
+                    ep_ext_t *next = old->next;  /* 先取 next，destroy 会 free */
+                    /* 去新表（g_ep）查 user+realm 是否仍存在 */
+                    int sh = hash_user(old->user, strlen(old->user)) & (EP_SHARDS - 1);
+                    int found = 0;
+                    pthread_mutex_lock(&g_ep->sh[sh].lock);
+                    for (ep_ext_t *x = g_ep->sh[sh].head; x; x = x->next) {
+                        if (!x->neg && strcmp(x->user, old->user) == 0 &&
+                            strcmp(x->realm, old->realm) == 0) {
+                            found = 1;
+                            break;
+                        }
+                    }
+                    pthread_mutex_unlock(&g_ep->sh[sh].lock);
+                    if (!found) {
+                        char aor[LOC_AOR_MAX];
+                        snprintf(aor, sizeof(aor), "%s@%s",
+                                 old->user, old->realm[0] ? old->realm : "nsbc.local");
+                        int n = loc_remove(db, aor, "*");
+                        if (n > 0) {
+                            invalidated += n;
+                            llog(LOG_INFO, "ep",
+                                 "reload invalidated %d binding(s) for disabled/deleted aor=%s",
+                                 n, aor);
+                        }
+                    }
+                    old = next;
+                }
+            }
+            if (invalidated)
+                llog(LOG_INFO, "ep",
+                     "reload: invalidated %d disabled/deleted extension bindings total",
+                     invalidated);
+        }
+    }
+
     /* [3] tmp 现持有全部旧链：锁外销毁（交接完成后无并发读者） */
     ep_store_destroy(tmp);
 
     llog(LOG_NOTICE, "ep", "reload: %d extensions active (from %d pushed)",
          loaded, n);
+    sat_write(g_ep_loaded, 1);  /* dbmode=0：标记 L1 已热，reactor 可以开始收 SIP 了 */
     return NSBC_OK;
 
 rollback:

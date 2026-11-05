@@ -1330,9 +1330,15 @@ async fn flush_registers(
             // batch 路径这里直接用 Option<String>，to_string 后 None 正确）
             let contact = contact.as_deref().filter(|s| !s.is_empty());
             let agent = agent.as_deref().filter(|s| !s.is_empty());
-            let received_ip = received_ip.as_deref().filter(|s| !s.is_empty());
-            let public_contact = public_contact.as_deref().filter(|s| !s.is_empty());
-            let transport = transport.as_deref().filter(|s| !s.is_empty());
+            let received_ip = received_ip.as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("");
+            let public_contact = public_contact.as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("");
+            let transport = transport.as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("");
 
             q = q.bind(user_name)
                  .bind(contact)

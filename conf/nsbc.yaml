@@ -42,13 +42,26 @@ config_version: "1.0"
 core:
   # read by nsbcd (B2B memory limits, etc.)
   workers: 1            # default one worker; 0 = match CPU core count
-  max_calls: 10000      # conservative value of 10K, increase as needed
+  reactors: 2           # SIP 收包 reactor 数；stress test 建议 2，生产按 CPU 核数
+  max_calls: 20000      # stress test 20K calls；生产按需调
   timer_tick_ms: 100
 
   # UDS socket already hardcoded to /var/run/nsbc/ in C/Web code,
   # this config key is ignored (kept only for tools like nsbc_cli to read/parse)
   control_sock: "unix:/var/run/nsbc/control.sock"
   data_sock:    "/var/run/nsbc/data.sock"
+
+# ---- 内存五域（stress test 调优：REGISTER 不需要 media/transcode/record）----
+# 20K calls 配置参考：
+#   b2b_call_t ≈ 48KB × 20000 = 931MB
+#   + txn slab + dlg slab + loc_db + 其他 signaling 结构体 ≈ 至少 1.5GB signal
+# 16GB 机器：signal 2GB + packet 512MB 完全够用
+mem:
+  signal_mb: 2048       # 20K calls 必需；光 b2b 一个 slab 就 931MB
+  packet_mb: 512        # 默认 1024，REGISTER stress test 砍一半
+  media_mb: 256         # 默认 512，REGISTER stress test 不需要大媒体缓冲
+  transcode_mb: 0       # stress test 不需要转码
+  record_mb: 0          # stress test 不需要录音
 
 # ---- nsbcd-only ----
 log:
@@ -84,8 +97,8 @@ registrar:
   # SIP REGISTER auth secret; empty = use digest_secret default
   # digest_secret: "file:../tls/key.pem"
   min_expires: 60
-  default_expires: 3600
-  max_expires: 3600
+  default_expires: 600   # 2026-11-05 stress test 调优：location_db 占用降 83%，清理加速
+  max_expires: 600       # 生产环境如需更长重注册窗口可改为 1800+
 
 # ---- Call recording (REQ-REC-001~004, P1 implementation) ----
 recording:

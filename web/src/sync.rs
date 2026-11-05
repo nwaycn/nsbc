@@ -335,16 +335,35 @@ fn clear_kind_cooldown(kind: Kind) {
     cds.remove(&kind);
 }
 
+/// C core 重新连上时，清除所有 kind 的 cooldown，让后续的 push_all 立即生效。
+/// （否则 Web 启动后周期性同步先跑失败会让所有 kind 进入 15s cooldown，
+///  C 连上触发的 push_all 会全部被跳过）。
+pub fn clear_all_cooldowns() {
+    let mut cds = kind_cooldowns().lock().unwrap();
+    if !cds.is_empty() {
+        let n = cds.len();
+        cds.clear();
+        tracing::info!(n, "C 侧连接 —— 清除了 {n} 个 kind cooldown");
+    }
+}
+
 /// Single-kind push: snapshot → CoreApi.reload_*; retry on failure with [500ms,1s,2s,4s,8s].
 /// Per-kind cooldown: a kind that fails at attempt==0 (CoreError) marks ONLY itself
 /// cooldown 15s — other kinds are unaffected. This prevents one kind's large-payload
 /// framing overflow from blacking out the entire config push pipeline.
+///
+/// `bypass_cooldown=true` 用于 push_all（C 连接触发的最高优先级路径）—— 它必须
+/// 绕过 cooldown 检查，且 attempt==0 失败也不能标记 cooldown（可能是 extensions
+/// 仍在处理中，60s timeout 还没到）。
 async fn push_kind<C: CoreApi + Clone + Send + Sync>(
     st: &Arc<AppState<C>>,
     kind: Kind,
+    bypass_cooldown: bool,
 ) -> Result<(), String> {
     // Per-kind cooldown bail — save CPU and disk I/O for THIS kind only.
-    if kind_in_cooldown(kind) {
+    // 但 push_all (C 连接) 必须绕过！否则周期同步先跑失败 → 14 kinds cooldown →
+    // C 刚连上触发的 push_all 立即全部被挡。
+    if !bypass_cooldown && kind_in_cooldown(kind) {
         return Err(format!("core unreachable ({kind:?} cooldown)"));
     }
 
@@ -390,7 +409,10 @@ async fn push_kind<C: CoreApi + Clone + Send + Sync>(
                 // ★ Per-kind cooldown on ANY CoreError at attempt==0.
                 // Only mark THIS kind as cooldown — other kinds must keep retrying
                 // (e.g. extensions large-payload overflow must not black out dialplan-rules).
-                if attempt == 0 {
+                //
+                // 但 push_all (bypass_cooldown) 绝不能标记 cooldown —— 可能只是
+                // extensions 还在 41s 处理中，后续 retry 或下一次 periodic push 会成功。
+                if attempt == 0 && !bypass_cooldown {
                     let reason = match &e {
                         CoreError::Connect(_)     => "connect refused",
                         CoreError::CoreRejected(_)=> "command rejected",
@@ -416,15 +438,40 @@ async fn push_kind<C: CoreApi + Clone + Send + Sync>(
     unreachable!()
 }
 
-/// Full push (four kinds in sequence; one kind failure does not block others — log ERROR,
-/// the next trigger will retry).
-pub async fn push_all<C: CoreApi + Clone + Send + Sync>(st: Arc<AppState<C>>) {
-    tracing::info!("full config push begin (hello)");
-    let mut failed = Vec::new();
+/// Full push —— 14 kinds **并发**发送。
+///
+/// 为什么必须并发：C 侧 recv_cmd_once 是单线程 poll 循环，所有 CMD_REQ 串行处理
+/// （extensions.reload 90K entries 实测 ~41s，其他 kinds 毫秒级）。如果 Web 串行发，
+/// 第一个 extensions 会 60s timeout 才返回（成功），但后续 13 种在 Rust 侧各自独立
+/// timeout（旧 2s 不够），先超时放弃。并发 send 让 14 个 datagram 同时进 C 侧
+/// kernel queue，单线程 poll 串行处理后，所有 RSP 在 extensions 完后密集返回。
+///
+/// 每种 kind 内部仍保留独立的 retry backoff (500ms→8s) 和 per-kind cooldown 逻辑。
+pub async fn push_all<C: CoreApi + Clone + Send + Sync + 'static>(st: Arc<AppState<C>>) {
+    tracing::info!("full config push begin (concurrent x{})", Kind::ALL.len());
+
+    // 每种 kind spawn 独立 task —— 14 种同时 sendto C 侧 kernel queue
+    let mut handles: Vec<(Kind, tokio::task::JoinHandle<Result<(), String>>)> = Vec::new();
     for kind in Kind::ALL {
-        if let Err(e) = push_kind(&st, kind).await {
-            tracing::error!(kind = kind.name(), error = %e, "full push kind failed");
-            failed.push(kind.name());
+        let st_clone = st.clone();
+        let handle = tokio::spawn(async move {
+            push_kind(&st_clone, kind, true).await  // bypass cooldown — C 连接最高优先级
+        });
+        handles.push((kind, handle));
+    }
+
+    let mut failed = Vec::new();
+    for (kind, handle) in handles {
+        match handle.await {
+            Ok(Ok(())) => {},
+            Ok(Err(e)) => {
+                tracing::error!(kind = kind.name(), error = %e, "full push kind failed");
+                failed.push(kind.name().to_string());
+            }
+            Err(join_err) => {
+                tracing::error!(kind = kind.name(), error = %join_err, "push task panicked");
+                failed.push(kind.name().to_string());
+            }
         }
     }
     if failed.is_empty() {
@@ -471,7 +518,7 @@ pub fn spawn_push<C: CoreApi + Clone + Send + Sync + 'static>(
     }
     let h = tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        if let Err(e) = push_kind(&st, kind).await {
+        if let Err(e) = push_kind(&st, kind, false).await {
             tracing::error!(kind = kind.name(), error = %e, "spawned push failed");
         }
     });
@@ -505,7 +552,7 @@ pub fn spawn_periodic_push<C: CoreApi + Clone + Send + Sync + 'static>(
         loop {
             tick.tick().await;
             for kind in Kind::ALL {
-                if let Err(e) = push_kind(&st, kind).await {
+                if let Err(e) = push_kind(&st, kind, false).await {
                     // Cooldown bail is noisy when core is down — debug only.
                     // Real push failures (attempted and failed) stay WARN.
                     let is_cooldown = e.contains("cooldown") || e.contains("channel broken");

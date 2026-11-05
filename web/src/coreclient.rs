@@ -909,7 +909,12 @@ impl RealCore {
         };
 
         let cmd_text = format!("{cmd_name}.reload {json}");
-        let timeout_ms = self.timeout.as_millis() as u64;
+        /* 所有 reload 统一 60s timeout：
+         * C 侧 recv_cmd_once 是单线程 poll 循环，14 种 CMD_REQ 在 kernel queue 串行处理。
+         * extensions.reload 90K entries 实测约 41s，其他小 payload 虽毫秒级但必须等
+         * extensions 先处理完。push_all 改为并发 send 后，所有 RSP 会在 extensions 完后
+         * 密集返回 —— 60s 足够覆盖整个串行队列处理周期。 */
+        let timeout_ms = 60_000u64;
         match crate::uds_server::send_core_cmd_via_uds(&cmd_path, &cmd_text, timeout_ms).await {
             Ok(bytes) => {
                 let text = String::from_utf8(bytes)
@@ -2432,7 +2437,7 @@ leg 0 sdp_offer 50\nabc\n";
     #[derive(Clone, Default)]
     pub(crate) struct MockCore {
         pub(crate) calls: Arc<Mutex<Vec<String>>>,
-        pub(crate) canned: Arc<BTreeMap<String, Result<String, CoreError>>>,
+        pub(crate) canned: Arc<Mutex<BTreeMap<String, Result<String, CoreError>>>>,
     }
 
     impl MockCore {
@@ -2504,7 +2509,7 @@ leg 0 sdp_offer 50\nabc\n";
             let canned = self
                 .canned
                 .get(&key)
-                .or_else(|| self.canned.get("hangup"))
+                .or_else(|| self.canned.lock().unwrap().get("hangup"))
                 .cloned()
                 .unwrap_or_else(|| {
                     Err(CoreError::Protocol("uncanned hangup".into()))
@@ -2531,7 +2536,7 @@ leg 0 sdp_offer 50\nabc\n";
             let canned = self
                 .canned
                 .get(&ckey)
-                .or_else(|| self.canned.get("config.set"))
+                .or_else(|| self.canned.lock().unwrap().get("config.set"))
                 .cloned()
                 .unwrap_or_else(|| Err(CoreError::Protocol("uncanned config.set".into())));
             parse_config_set(&canned?, key)
@@ -2542,7 +2547,7 @@ leg 0 sdp_offer 50\nabc\n";
             let canned = self
                 .canned
                 .get(&ckey)
-                .or_else(|| self.canned.get("config.validate"))
+                .or_else(|| self.canned.lock().unwrap().get("config.validate"))
                 .cloned()
                 .unwrap_or_else(|| Err(CoreError::Protocol("uncanned config.validate".into())));
             parse_config_validate(&canned?)
@@ -2684,7 +2689,7 @@ leg 0 sdp_offer 50\nabc\n";
             let canned = self
                 .canned
                 .get(&key_specific)
-                .or_else(|| self.canned.get(&format!("uuid_{action}")))
+                .or_else(|| self.canned.lock().unwrap().get(&format!("uuid_{action}")))
                 .cloned()
                 .unwrap_or_else(|| Err(CoreError::Protocol(format!("uncanned {cmd}"))));
             parse_call_action_ok_err(&canned?, call_id)
@@ -2697,7 +2702,7 @@ leg 0 sdp_offer 50\nabc\n";
             let canned = self
                 .canned
                 .get(&key)
-                .or_else(|| self.canned.get("send_msg"))
+                .or_else(|| self.canned.lock().unwrap().get("send_msg"))
                 .cloned()
                 .unwrap_or_else(|| Err(CoreError::Protocol(format!("uncanned send_msg {call_id}"))));
             parse_call_action_ok_err(&canned?, call_id)
@@ -2779,7 +2784,7 @@ leg 0 sdp_offer 50\nabc\n";
             let key = format!("rate.delete:{prefix}");
             self.canned
                 .get(&key)
-                .or_else(|| self.canned.get("rate.delete"))
+                .or_else(|| self.canned.lock().unwrap().get("rate.delete"))
                 .cloned()
                 .unwrap_or(Ok("OK\n".into()))
                 .and_then(|b| check_rejected(&b))
@@ -2789,7 +2794,7 @@ leg 0 sdp_offer 50\nabc\n";
             let ckey = format!("account.open:{key}");
             self.canned
                 .get(&ckey)
-                .or_else(|| self.canned.get("account.open"))
+                .or_else(|| self.canned.lock().unwrap().get("account.open"))
                 .cloned()
                 .unwrap_or(Ok("OK\n".into()))
                 .and_then(|b| check_rejected(&b))
@@ -2799,7 +2804,7 @@ leg 0 sdp_offer 50\nabc\n";
             let ckey = format!("account.topup:{key}");
             self.canned
                 .get(&ckey)
-                .or_else(|| self.canned.get("account.topup"))
+                .or_else(|| self.canned.lock().unwrap().get("account.topup"))
                 .cloned()
                 .unwrap_or(Ok("OK\n".into()))
                 .and_then(|b| check_rejected(&b))
@@ -2813,8 +2818,8 @@ leg 0 sdp_offer 50\nabc\n";
             let specific = format!("exec_cmd:{cmd}");
             self.canned
                 .get(&specific)
-                .or_else(|| self.canned.get("exec_cmd"))
-                .or_else(|| self.canned.get(cmd))
+                .or_else(|| self.canned.lock().unwrap().get("exec_cmd"))
+                .or_else(|| self.canned.lock().unwrap().get(cmd))
                 .cloned()
                 .unwrap_or_else(|| Ok(format!("(mock exec_cmd: no can for \"{cmd}\")\n")))
         }
@@ -2856,7 +2861,7 @@ leg 0 sdp_offer 50\nabc\n";
         };
 
         // account_open 查 canned["account.open:alice"] → miss → 查 canned["account.open"] → miss → Ok fallback
-        // 等下，MockCore.account_open 的 canned 逻辑是 .or_else(|| self.canned.get("account.open")) → 找不到返回 Ok("OK\n")
+        // 等下，MockCore.account_open 的 canned 逻辑是 .or_else(|| self.canned.lock().unwrap().get("account.open")) → 找不到返回 Ok("OK\n")
         // 所以默认其实是 OK。我需要显式预设 Err 来模拟 UDS 失败
         m.canned.lock().unwrap().insert(
             "account.open".to_string(),

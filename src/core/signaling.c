@@ -1708,7 +1708,10 @@ static int sig_start(struct nsbc_ctx *ctx)
     llog(LOG_INFO, "sig", "registrar cfg: digest_secret_configured=%d",
          s->digest_secret != NULL);
     long minexp = 60, defexp = 3600, maxexp = 3600;
-    long ipcps = 100, aorcps = 10, gcps = 2000;
+    /* REGISTER 消耗极少资源 → 开源默认不限流（0）。
+     * 核心并发限制只在 INVITE 侧 sip.max_concurrent_calls 做。
+     * 生产环境如需防注册风暴，可显式设 registrar.rps_per_ip / rps_per_aor / rps_global。 */
+    long ipcps = 0, aorcps = 0, gcps = 0;
     cfg_get_int(cfg, "registrar.min_expires", &minexp, NULL);
     cfg_get_int(cfg, "registrar.default_expires", &defexp, NULL);
     cfg_get_int(cfg, "registrar.max_expires", &maxexp, NULL);

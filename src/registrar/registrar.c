@@ -80,6 +80,9 @@ struct reg_core {
 
 static int tb_take(tbucket_t *b, uint32_t key, int cps, uint64_t now)
 {
+    /* cps <= 0 = 不限流（开源默认：REGISTER 消耗极少资源，不对其做并发限制） */
+    if (cps <= 0)
+        return 1;
     pthread_mutex_lock(&b->lock);
     if (b->key != key) {
         b->key = key;
@@ -122,18 +125,21 @@ static uint32_t str_key(const char *s)
 
 static int global_take(reg_core_t *r, uint64_t now)
 {
+    /* global_cps <= 0 = 不限流（开源默认） */
+    if (r->cfg.global_cps <= 0)
+        return 1;
     /* Lock-free 全局令牌桶 —— 单次 128-bit CAS
-     * 
+     *
      * 把 (last_ms, tokens) 打包成 16 字节 token_state_t，
      * 用 atomic_compare_exchange 对整个 struct 做单次 CAS。
-     * 
+     *
      * 为什么要打包？双 CAS 不是原子的——线程 A 刷了时间戳但还没扣 token，
      * 线程 B 看到时间戳"已是最新"就跳过 token 补充，但 token 还是旧值 0
      * → 所有并发 REGISTER 被拒。这就是当前 bug！
-     * 
+     *
      * 单次 CAS 保证：要么两个字段同时看到新值，要么同时看到旧值——
      * 中间态不存在，竞态完全消除。
-     * 
+     *
      * C11 _Atomic struct 在 GCC x86_64 上编译成 cmpxchg16b。
      * token_state_t 16 字节 + aligned(16) → 满足 cmpxchg16b 对齐要求。 */
     const double cap = (double)r->cfg.global_cps;
@@ -413,12 +419,12 @@ int reg_core_create(const reg_cfg_t *cfg, reg_core_t **out)
         r->cfg.max_expires = 600;
     if (r->cfg.default_expires <= 0)
         r->cfg.default_expires = 600;
-    if (r->cfg.ip_cps <= 0)
-        r->cfg.ip_cps = 50;
-    if (r->cfg.aor_cps <= 0)
-        r->cfg.aor_cps = 10;
-    if (r->cfg.global_cps <= 0)
-        r->cfg.global_cps = 100000;
+    /* 默认 0 = 不限流（开源默认：REGISTER 消耗极少资源，
+     * 核心并发限制只在 INVITE 侧（sip.max_concurrent_calls）做）。
+     * 生产环境如需防注册风暴，可在 cfg 里显式设 registrar.rps_per_ip / rps_per_aor / rps_global。 */
+    if (r->cfg.ip_cps < 0)  r->cfg.ip_cps = 0;      /* 0 = 不限 */
+    if (r->cfg.aor_cps < 0) r->cfg.aor_cps = 0;     /* 0 = 不限 */
+    if (r->cfg.global_cps < 0) r->cfg.global_cps = 0; /* 0 = 不限 */
     if (r->cfg.retry_after_s <= 0)
         r->cfg.retry_after_s = 30;
     if (digest_init(&r->dig, cfg->realm, cfg->digest_secret,

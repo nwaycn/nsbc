@@ -5,7 +5,9 @@
  *
  * - REGISTER 无 Authorization → 401 + RFC2617 Digest 质询（nonce 签名）；
  * - HA1 由 endpoints 凭证模块回调提供，明文密码不入本模块；
- * - 注册风暴防护：IP / AoR / 全局三级令牌桶，超限 503 + Retry-After；
+ * - 注册风暴防护：IP / AoR / 全局三级令牌桶，超限 503 + Retry-After。
+ *   ★ 开源默认 0 = 不限流（REGISTER 消耗极少资源，核心并发限制在 INVITE 侧）；
+ *     生产环境如需防注册风暴，显式设置 registrar.rps_per_ip / rps_per_aor / rps_global。
  * - 绑定增删改/Contact:* 注销/幂等刷新，过期时间由位置库统一扫描；
  * - 423 Interval Too Brief：expires 小于 min_expires。
  *
@@ -34,10 +36,10 @@ typedef struct {
     int min_expires;     /* 默认 60s */
     int max_expires;     /* 默认 3600s */
     int default_expires; /* 默认 3600s */
-    int ip_cps;          /* 单 IP 每秒 REGISTER 上限，默认 50 */
-    int aor_cps;         /* 单 AoR 每秒上限，默认 10 */
-    int global_cps;      /* 全局每秒上限，默认 100000 */
-    int retry_after_s;
+    int ip_cps;          /* 单 IP 每秒 REGISTER 上限，0 = 不限（开源默认 0） */
+    int aor_cps;         /* 单 AoR 每秒上限，0 = 不限（开源默认 0） */
+    int global_cps;      /* 全局每秒上限，0 = 不限（开源默认 0） */
+    int retry_after_s;   /* 限流时 Retry-After 秒数，默认 30 */
 } reg_cfg_t;
 
 int reg_core_create(const reg_cfg_t *cfg, reg_core_t **out);

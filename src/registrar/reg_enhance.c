@@ -263,10 +263,16 @@ int reg_range_check(reg_enh_t *e, const char *tenant,
 int reg_throttle_validate(int ip_cps, int aor_cps, int global_cps)
 {
     /* 粗口径：单 AoR 不可能超过单 IP 桶；单 IP×64（粗放大系数）不超
-     * 全局桶，避免三级桶语义倒挂（接线批把 64 提为配置并加单测）。 */
-    if (ip_cps <= 0 || aor_cps <= 0 || global_cps <= 0)
+     * 全局桶，避免三级桶语义倒挂（接线批把 64 提为配置并加单测）。
+     * 0 表示该级别不限流（开源默认），负数才非法。
+     * 限流开启（>0）的级别之间必须满足约束。 */
+    if (ip_cps < 0 || aor_cps < 0 || global_cps < 0)
         return NSBC_INVAL;
-    if (aor_cps > ip_cps || (long long)ip_cps * 64 > global_cps)
+    /* 如果全部为 0（全不限流），直接 OK */
+    if (ip_cps == 0 && aor_cps == 0 && global_cps == 0)
+        return NSBC_OK;
+    /* 限流开启的级别之间仍需满足约束 */
+    if (aor_cps > ip_cps || (ip_cps > 0 && global_cps > 0 && (long long)ip_cps * 64 > global_cps))
         return NSBC_INVAL;
     return NSBC_OK;
 }

@@ -1,6 +1,7 @@
 #ifndef NSBC_ENDPOINTS_H
 #define NSBC_ENDPOINTS_H
 
+#include "nsbc_atomic.h"
 #include "nsbc_common.h"
 
 #ifdef __cplusplus
@@ -66,6 +67,10 @@ int ep_extensions_load(const char *cfg_str);
  *   [3] 锁外释放旧链
  * 返回 NSBC_OK / 错误码；失败时 out_err 填原因。 */
 int ext_table_reload_json(const char *json, char *out_err, size_t err_sz);
+
+/* dbmode=0 标志：reload_extensions 至少成功过一次（L1 热了）。
+ * main.c 在 reactor_mgr_start_threads() 之前等这个 → 让 SIP 收包从一开始就走 L1。 */
+extern nsbc_atomic_t g_ep_loaded;
 
 #ifdef __cplusplus
 }

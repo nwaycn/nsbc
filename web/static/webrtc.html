@@ -86,6 +86,35 @@
 
   /* ---- Hold 按钮激活态 ---- */
   .btn-held { background:#f59e0b !important; color:#000 !important; }
+
+  /* ---- 移动端自适应 ---- */
+  @media (max-width: 768px) {
+    .wrap { padding: 10px; }
+    h1 { font-size: 18px; }
+    .grid { grid-template-columns: 1fr; gap: 10px; margin-bottom: 10px; }
+    .row { flex-wrap: wrap; }
+    .row label { width: 80px; font-size: 12px; }
+    .row input { font-size: 16px; }     /* 防止 iOS 自动缩放 */
+    .videos { grid-template-columns: 1fr; gap: 10px; }
+    .video-box { aspect-ratio: 16/10; }  /* 手机上 16:10 更自然 */
+    .video-box video { object-fit: contain; background:#000; }
+    .card { padding: 12px; }
+    .dialpad button { padding: 12px 0; font-size: 16px; }
+    .btn { padding: 8px 14px; font-size: 13px; }
+    /* 拨号盘 Del/Clear 保持 2 列 span */
+    .dialpad button.wide { grid-column: span 2; }
+    .incoming { flex-direction: column; gap: 10px; text-align: center; }
+    .dc-area { flex-direction: column; }
+    .sip-log, .dc-log { font-size: 11px; }
+    /* 视频卡位置：远程在上、本地在下（镜像布局） */
+    .card:nth-of-type(2) .videos > .video-box:first-child { order: 2; }
+    .card:nth-of-type(2) .videos > .video-box:last-child  { order: 1; }
+  }
+  @media (max-width: 480px) {
+    .video-box { aspect-ratio: 16/9; }
+    .wrap { padding: 8px; }
+    .card { padding: 10px; border-radius: 10px; }
+  }
 </style>
 </head>
 <body>

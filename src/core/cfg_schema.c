@@ -101,7 +101,7 @@ static const cfg_desc_t k_core[] = {
     {"dialplan.rules", CGT_STR, CGF_RESTART, "", NULL, 0, 0},
     {"media.allow_bypass", CGT_BOOL, CGF_HOT, "false", NULL, 0, 0},
     {"media.trust_private", CGT_BOOL, CGF_HOT, "true", NULL, 0, 0},
-    {"registrar.rps_per_aor", CGT_INT, CGF_HOT, "10", NULL, 0, 10000},
+    {"registrar.rps_per_aor", CGT_INT, CGF_HOT, "0", NULL, 0, 10000},
 
     /* ---- RTP/媒体 ---- */
     {"rtp.port_start", CGT_INT, CGF_RESTART, "10000", NULL, 1024, 65000},
@@ -127,8 +127,12 @@ static const cfg_desc_t k_core[] = {
     {"registrar.default_expires", CGT_INT, CGF_HOT, "600", NULL, 60, 86400},
     {"registrar.max_expires", CGT_INT, CGF_HOT, "600", NULL, 60, 86400},
     {"registrar.max_contacts", CGT_INT, CGF_HOT, "10", NULL, 1, 20},
-    {"registrar.rps_global", CGT_INT, CGF_HOT, "2000", NULL, 0, 1000000},
-    {"registrar.rps_per_ip", CGT_INT, CGF_HOT, "100", NULL, 0, 100000},
+    {"registrar.rps_global", CGT_INT, CGF_HOT, "0", NULL, 0, 1000000},
+    {"registrar.rps_per_ip", CGT_INT, CGF_HOT, "0", NULL, 0, 100000},
+
+    /* ---- Endpoints HA1 缓存（分机凭证库 L1/L2 缓存调优）---- */
+    {"ep.cache_ttl_s", CGT_INT, CGF_HOT, "300", NULL, 30, 3600},
+    {"ep.uds_timeout_ms", CGT_INT, CGF_HOT, "50", NULL, 10, 500},
 
     /* ---- DB（REQ-DB-001~007） ---- */
     {"db.driver", CGT_ENUM, CGF_RESTART, "sqlite",

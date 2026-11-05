@@ -456,6 +456,19 @@ static int uds_io_printf(void *io_ud, const char *fmt, ...)
     return n;
 }
 
+/* 前向声明 — uds_handle_core_cmd 在下方定义，worker 线程需要先调 */
+static void uds_handle_core_cmd(uint32_t ticket, const char *line, size_t len);
+
+/* CMD_REQ 异步 worker —— 让 poll thread 立即回去 poll 不被 43s 的 extensions.reload 阻塞 */
+typedef struct _cmd_job { uint32_t ticket; char *payload; size_t len; } _cmd_job_t;
+static void *uds_handle_core_cmd_worker(void *arg) {
+    _cmd_job_t *j = arg;
+    uds_handle_core_cmd(j->ticket, j->payload, j->len);
+    free(j->payload);
+    free(j);
+    return NULL;
+}
+
 /* 处理 Rust 发来的 CMD_REQ payload（行协议："extensions.reload <json>"），
  * 调 cmd_registry → 把结果作为 FT_CMD_RSP 发回。
  * send_lock 必须由调用者持有。 */
@@ -506,6 +519,9 @@ static void uds_handle_core_cmd(uint32_t ticket, const char *line, size_t len)
         .io_ud = &io,
     };
 
+    llog(LOG_NOTICE, "uds-cmd", "CMD_REQ argv0='%s' argv1_len=%zu ticket=%u",
+         argv0, argv1_len, ticket);
+
     /* 把 argv1 拷贝到临时 buffer（cmd_execute 可能原地修改 argv[1]） */
     char *argv1_copy = NULL;
     if (argv1_len > 0) {
@@ -521,12 +537,20 @@ static void uds_handle_core_cmd(uint32_t ticket, const char *line, size_t len)
     (void)rc;
 
 cleanup:
-    /* 把命令结果作为 FT_CMD_RSP 发回 Rust 端 */
-    if (io.buf && io.len > 0 && g.fd_cmd >= 0) {
-        /* 构造 RSP payload —— 用 uds_send_fragmented_locked（可能超限） */
-        if (uds_send_fragmented_locked(g.fd_cmd, FT_CMD_RSP, ticket,
-                                        io.buf, io.len) != 0) {
-            llog(LOG_WARN, "uds", "failed to send CMD_RSP ticket=%u", ticket);
+    /* 把命令结果作为 FT_CMD_RSP 发回 Rust 端
+     * conn_lock 保护 fd_cmd 不被 reconnect 并发重建，
+     * cmd_lock 保护 send 分片（uds_send_fragmented_locked 假设调用者持锁）。 */
+    if (io.buf && io.len > 0) {
+        pthread_mutex_lock(&g.conn_lock);
+        int fd = g.fd_cmd;
+        pthread_mutex_unlock(&g.conn_lock);
+        if (fd >= 0) {
+            pthread_mutex_lock(&g.cmd_lock);
+            if (uds_send_fragmented_locked(fd, FT_CMD_RSP, ticket,
+                                            io.buf, io.len) != 0) {
+                llog(LOG_WARN, "uds", "failed to send CMD_RSP ticket=%u", ticket);
+            }
+            pthread_mutex_unlock(&g.cmd_lock);
         }
     }
     free(argv1_copy);
@@ -589,11 +613,23 @@ static void dispatch_frame(const uint8_t *frame, size_t len)
         dispatch_rsp(ticket, (const uint8_t *)full_payload, full_len);
         break;
     case FT_CMD_REQ: {
-        /* Rust→C 命令请求（extensions.reload 等大命令）
-         * conn_lock 保护调用期间 fd_push/fd_cmd 不会被 reconnect 并发重建 */
-        pthread_mutex_lock(&g.conn_lock);
-        uds_handle_core_cmd(ticket, full_payload, full_len);
-        pthread_mutex_unlock(&g.conn_lock);
+        /* Rust→C 命令请求
+         * cmd_execute 可能耗时几十秒（extensions.reload 90K entries ≈ 43s）。
+         * 绝不能在 poll thread 里同步执行 —— 会阻塞整个 poll loop，
+         * 占满一颗核 + 让后续 CMD_REQ 排队。
+         * 方案：pthread_create detached 执行 —— poll thread 立即回去 poll。 */
+        _cmd_job_t *j = calloc(1, sizeof(*j));
+        j->ticket  = ticket;
+        j->payload = full_payload;       /* 所有权转移给 worker */
+        j->len     = full_len;
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, uds_handle_core_cmd_worker, j) == 0)
+            pthread_detach(tid);
+        else {
+            uds_handle_core_cmd(ticket, full_payload, full_len); /* fallback 同步 */
+            free(j);
+        }
+        full_payload = NULL;   /* 防止下面 free — worker 接管 */
         break;
     }
     case FT_HELLO_ACK:
