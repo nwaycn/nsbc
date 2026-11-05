@@ -66,9 +66,11 @@ fn is_safe_ip_fragment(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b':')
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub struct BanQueryParams {
-    pub query: Option<String>,
+    pub query:  Option<String>,
+    pub limit:  Option<i64>,
+    pub offset: Option<i64>,
 }
 
 async fn list_bans<C: CoreApi + Clone>(
@@ -82,7 +84,11 @@ async fn list_bans<C: CoreApi + Clone>(
         ));
     }
     let bans = st.core.security_ban_list(filter).await?;
-    Ok(axum::Json(json!({ "total": bans.len(), "data": bans })))
+    let total = bans.len();
+    let limit  = q.limit.unwrap_or(50).clamp(1, 500) as usize;
+    let offset = q.offset.unwrap_or(0).max(0) as usize;
+    let data: Vec<_> = bans.into_iter().skip(offset).take(limit).collect();
+    Ok(axum::Json(json!({ "total": total, "data": data })))
 }
 
 async fn unban<C: CoreApi + Clone>(
@@ -179,6 +185,7 @@ pub struct BlacklistQueryParams {
     #[serde(rename = "type", alias = "rule_type")]
     pub rule_type:  Option<String>,
     pub enabled:    Option<String>,
+    pub keyword:    Option<String>,
     pub limit:      Option<i64>,
     pub offset:     Option<i64>,
 }
@@ -219,6 +226,7 @@ async fn list_blacklist<C: CoreApi + Clone>(
             kind,
             rule_type,
             enabled,
+            q.keyword.as_deref(),
             q.limit.unwrap_or(200).clamp(1, 500),
             q.offset.unwrap_or(0).max(0),
         )

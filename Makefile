@@ -254,6 +254,12 @@ LDFLAGS += -fsanitize=thread -pie
 else ifeq ($(SANITIZE),ubsan)
 CFLAGS  += -fsanitize=undefined -fno-sanitize-recover=all -Wno-error
 LDFLAGS += -fsanitize=undefined
+else ifeq ($(SANITIZE),debug)
+# debug: ASan + UBSan + 完整栈帧，用于精确定位 heap 越界/use-after-free
+# 只追加 sanitizer flag，不覆盖基础 CFLAGS（-D_GNU_SOURCE -std=gnu99 -pthread 等）。
+# -O2 保留：ASan 在 O2 下也能准确定位越界写，无需特意降到 O1。
+CFLAGS  += -fsanitize=address,undefined -fno-omit-frame-pointer -fno-optimize-sibling-calls -Wno-error -DNSBC_DEBUG_REACTOR_SLOTS
+LDFLAGS += -fsanitize=address,undefined
 endif
 
 OBJS     := $(patsubst %.c,$(BUILD)/%.o,$(LIB_SRCS))
@@ -281,7 +287,7 @@ CLI_CPPFLAGS =
 CLI_LDLIBS   = -lpthread -ledit
 endif
 
-.PHONY: all check clean asan tsan ubsan install cli modules sync-mod web web-acme web-check web-clean build-acme
+.PHONY: all check clean asan tsan ubsan debug install cli modules sync-mod web web-acme web-check web-clean build-acme
 
 # mod.load must be generated before .so build — configure always writes it,
 # but as a safety net we also add an explicit Make fallback here.
@@ -399,6 +405,20 @@ tsan:
 	$(MAKE) --no-print-directory SANITIZE=tsan BUILD=$(BUILD)-tsan -j$(NPROC) check
 ubsan:
 	$(MAKE) --no-print-directory SANITIZE=ubsan BUILD=$(BUILD)-ubsan -j$(NPROC) check
+
+# debug: ASan + UBSan + 低优化度 + 完整帧指针，只编译不跑测试
+#   产物: build-debug/nsbcd, build-debug/nsbc_cli, ./nsbcd
+#   运行时建议: ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:strict_string_checks=1:check_initialization_order=1 ./nsbcd
+#   作用: 精确定位 heap 越界写 / use-after-free / double-free / 未定义行为
+debug:
+	@echo "=== [debug] SANITIZE=debug → ASan+UBSan+O1 (BUILD=$(BUILD)-debug) ==="
+	$(MAKE) --no-print-directory SANITIZE=debug BUILD=$(BUILD)-debug -j$(NPROC) all
+	@echo ""
+	@echo "✅ debug build done → ./nsbcd (ASan+UBSan, no tests)"
+	@echo "   run:  ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 ./nsbcd"
+	@echo "   sipp: 另开终端 CPS=50 跑 60s 压测触发 bug"
+	@echo "   clean: rm -rf build-debug"
+
 
 PREFIX ?= /usr/local
 DESTDIR ?=

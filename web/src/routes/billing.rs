@@ -99,6 +99,7 @@ where
 pub struct RateListQuery {
     pub prefix:  Option<String>,
     pub enabled: Option<String>,
+    pub keyword: Option<String>,
     pub limit:   Option<i64>,
     pub offset:  Option<i64>,
 }
@@ -118,7 +119,7 @@ async fn list_rates<C: CoreApi + Clone + Send + Sync>(
     let offset = q.offset.unwrap_or(0).max(0);
 
     let (items, total) = st.db
-        .list_rates(q.prefix.as_deref(), enabled, limit, offset)
+        .list_rates(q.prefix.as_deref(), enabled, q.keyword.as_deref(), limit, offset)
         .await.map_err(|e| ApiError::Db(e.to_string()))?;
 
     Ok(Json(json!({ "items": items, "total": total })))

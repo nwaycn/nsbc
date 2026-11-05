@@ -59,6 +59,7 @@ static int ep_ext_insert(ep_store_t *e, const ep_ext_t *ne)
         if (strcmp(x->user, ne->user) == 0 &&
             strcmp(x->realm, ne->realm) == 0) {
             memcpy(x->ha1, ne->ha1, EP_HA1_LEN + 1);
+            x->ha1_expire_ms = ne->ha1_expire_ms;
             x->neg = ne->neg;
             x->neg_until_ms = ne->neg_until_ms;
             memcpy(x->clip, ne->clip, sizeof(x->clip));
@@ -156,9 +157,10 @@ static int json_truthy(const cJSON *j, int def)
  *   L3 结果回填内存表（正=完整条目；负=neg+TTL 抑制重复查询） */
 static __thread char tls_ha1[EP_HA1_LEN + 1];
 
-#define EP_UDS_TIMEOUT_MS   200   /* L2 查询超时（注册路径容忍上限） */
+#define EP_UDS_TIMEOUT_MS    50   /* L2 查询超时（阻塞 reactor 的容忍上限） */
 #define EP_NEG_TTL_MS     30000   /* not_found/disabled 负缓存 TTL */
-#define EP_NEG_TTL_ERR_MS  3000   /* db_error/uds 失败负缓存 TTL */
+#define EP_NEG_TTL_ERR_MS  2000   /* db_error/uds 失败负缓存 TTL */
+#define EP_HA1_POS_TTL_MS 300000  /* 正缓存 TTL = 300s；到期触发 L2 重查（密码生效窗口） */
 
 static int64_t ep_now_ms(void)
 {
@@ -234,6 +236,11 @@ static const char *ep_ha1_lookup(const char *realm, size_t rlen,
             continue; /* 负缓存过期 → 让 L2 去查 */
         /* 精确匹配优先；miss 再用空 realm 兜底（旧数据兼容） */
         if (strcmp(x->realm, rlm) == 0 || strcmp(x->realm, "") == 0) {
+            /* 正缓存 TTL 检查：CSV 预加载 ha1_expire_ms=0 永不过期；
+             * L2 回填的条目不超过 TTL 才有效，过期视为 miss 触发重查
+             * （密码改了最多 TTL 内生效） */
+            if (x->ha1_expire_ms > 0 && now > x->ha1_expire_ms)
+                continue;
             memcpy(tls_ha1, x->ha1, EP_HA1_LEN + 1);
             found_ha1 = tls_ha1;
             break;
@@ -278,6 +285,7 @@ static const char *ep_ha1_lookup(const char *realm, size_t rlen,
         snprintf(ne.user, sizeof(ne.user), "%s", u);
         snprintf(ne.realm, sizeof(ne.realm), "%s", rlm);
         memcpy(ne.ha1, h1->valuestring, EP_HA1_LEN + 1);
+        ne.ha1_expire_ms = ep_now_ms() + EP_HA1_POS_TTL_MS;  /* 正缓存 TTL */
         cJSON *j;
         j = cJSON_GetObjectItem(r, "clip");
         if (j && cJSON_IsString(j))

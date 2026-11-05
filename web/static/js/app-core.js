@@ -1050,6 +1050,31 @@ function crudTable(entity, path, columns, formSchema, asyncLoaders = null) {
           </div>
         </div>
 
+        <!-- 搜索栏 -->
+        <div class="flex items-center gap-2">
+          <el-input
+            v-model="searchKeyword"
+            size="small"
+            style="width:260px"
+            :placeholder="t('Search name/description...')"
+            clearable
+            @keyup.enter="doSearch"
+            @clear="doSearch"
+          >
+            <template #prefix><i class="fa-solid fa-magnifying-glass text-gray-400"></i></template>
+          </el-input>
+          <el-button size="small" type="primary" @click="doSearch">
+            <i class="fa-solid fa-magnifying-glass mr-1"></i>{{ t('Search') }}
+          </el-button>
+          <el-button size="small" @click="resetSearch">
+            <i class="fa-solid fa-rotate-left mr-1"></i>{{ t('Reset') }}
+          </el-button>
+          <span v-if="keyword" class="text-xs text-gray-400 ml-2">
+            {{ t('Filtering') }}: "{{ keyword }}"
+            <i class="fa-solid fa-xmark ml-1 cursor-pointer text-gray-300 hover:text-gray-500" @click="resetSearch"></i>
+          </span>
+        </div>
+
         <el-table :data="items" border stripe size="default" style="width:100%">
           <el-table-column type="index" label="#" width="55" align="center"></el-table-column>
           <el-table-column v-for="c in columns" :key="c.key" :prop="c.key" :label="c.label" min-width="120">
@@ -1142,6 +1167,8 @@ function crudTable(entity, path, columns, formSchema, asyncLoaders = null) {
     setup() {
       const items = ref([]), total = ref(0), page = ref(1), limit = ref(50);
       const filterEnabled = ref('');
+      const keyword = ref('');        // 当前生效的搜索条件（API 请求用）
+      const searchKeyword = ref('');  // 用户输入框的值
       const showModal = ref(false), editingId = ref(null);
       const form = reactive({}), saving = ref(false);
       const rawMode = reactive({});
@@ -1153,9 +1180,22 @@ function crudTable(entity, path, columns, formSchema, asyncLoaders = null) {
       const hasBoolColumn = columns.some(c => c.type === 'bool');
       const hasAsync = !!asyncLoaders;
 
+      function doSearch() {
+        keyword.value = (searchKeyword.value || '').trim();
+        page.value = 1;
+        load();
+      }
+      function resetSearch() {
+        searchKeyword.value = '';
+        keyword.value = '';
+        page.value = 1;
+        load();
+      }
+
       async function load() {
         const q = new URLSearchParams({ limit: limit.value, offset: (page.value - 1) * limit.value });
         if (filterEnabled.value) q.set('enabled', filterEnabled.value);
+        if (keyword.value) q.set('keyword', keyword.value);
         errorMsg.value = '';
         try {
           const r = await API.get(path + '?' + q.toString());
@@ -1237,8 +1277,9 @@ function crudTable(entity, path, columns, formSchema, asyncLoaders = null) {
       });
       watch([page, limit, filterEnabled], load);
 
-      return { items, total, page, limit, filterEnabled, showModal, editingId, form, saving, rawMode,
+      return { items, total, page, limit, filterEnabled, keyword, searchKeyword, showModal, editingId, form, saving, rawMode,
                errorMsg, hasBoolColumn, hasAsync, columns, formSchema, asyncOptions, asyncLoading,
+               doSearch, resetSearch,
                openCreate, openEdit, toggleRaw, save, del };
     },
   };
@@ -1259,8 +1300,24 @@ function livePanel(title, icon, columns, apiPath, opts = {}) {
             <button @click="load" class="px-2 py-1 border rounded hover:bg-gray-50">{{ t('Refresh') }}</button>
           </div>
         </div>
-        <div v-if="!allRows.length && !loading" class="text-center text-gray-400 py-12">
-          No data
+        <!-- 搜索栏（前端过滤） -->
+        <div class="flex items-center gap-2 mb-3">
+          <el-input
+            v-model="searchKeyword"
+            size="small"
+            style="width:260px"
+            :placeholder="t('Search all fields...')"
+            clearable
+          >
+            <template #prefix><i class="fa-solid fa-magnifying-glass text-gray-400"></i></template>
+          </el-input>
+          <span v-if="searchKeyword" class="text-xs text-gray-400">
+            {{ t('Filtering') }}: "{{ searchKeyword }}"
+            <i class="fa-solid fa-xmark ml-1 cursor-pointer text-gray-300 hover:text-gray-500" @click="searchKeyword = ''"></i>
+          </span>
+        </div>
+        <div v-if="!filteredRows.length && !loading" class="text-center text-gray-400 py-12">
+          {{ searchKeyword ? t('No matching records') : 'No data' }}
         </div>
         <div v-else class="overflow-x-auto border rounded">
         <table class="w-full text-sm border-collapse min-w-[1400px]">
@@ -1289,8 +1346,8 @@ function livePanel(title, icon, columns, apiPath, opts = {}) {
         </table>
         </div>
         <!-- 分控件 -->
-        <div v-if="allRows.length > pageSize" class="flex items-center justify-between mt-3 text-xs text-gray-500">
-          <div>Total {{ allRows.length }}  · {{ pageSize }} per page </div>
+        <div v-if="filteredRows.length > pageSize" class="flex items-center justify-between mt-3 text-xs text-gray-500">
+          <div>Total {{ filteredRows.length }} {{ searchKeyword ? ('(' + allRows.length + ' ' + t('raw') + ')') : '' }} · {{ pageSize }} per page </div>
           <div class="flex items-center gap-1">
             <button @click="currentPage = 1" :disabled="currentPage===1" class="px-2 py-1 border rounded disabled:opacity-30">«</button>
             <button @click="currentPage--" :disabled="currentPage===1" class="px-2 py-1 border rounded disabled:opacity-30">‹</button>
@@ -1307,14 +1364,36 @@ function livePanel(title, icon, columns, apiPath, opts = {}) {
       const error = ref(null);
       const lastUpdated = ref('');
       const currentPage = ref(1);
+      const searchKeyword = ref('');   // 前端搜索关键字
       let timer = null;
       let inflight = false;          // in-flight 互斥：上一个 load 没回来不再发新请求
       let refreshTimer = null;       // SSE 去抖 timer
 
-      const totalPages = computed(() => Math.max(1, Math.ceil(allRows.value.length / pageSize)));
+      // 前端过滤后的行
+      const filteredRows = computed(() => {
+        const kw = (searchKeyword.value || '').trim().toLowerCase();
+        if (!kw) return allRows.value;
+        return allRows.value.filter(row => {
+          for (const col of columns) {
+            const v = row[col.key];
+            if (v != null && String(v).toLowerCase().includes(kw)) return true;
+          }
+          return false;
+        });
+      });
+      const totalPages = computed(() => Math.max(1, Math.ceil(filteredRows.value.length / pageSize)));
       const pagedRows = computed(() => {
-        const start = (currentPage.value - 1) * pageSize;
-        return allRows.value.slice(start, start + pageSize);
+        // 如果当前页超出了过滤后的总页数，跳到最后一页
+        let cp = currentPage.value;
+        if (cp > totalPages.value) cp = totalPages.value;
+        const start = (cp - 1) * pageSize;
+        return filteredRows.value.slice(start, start + pageSize);
+      });
+
+      // 搜索变化时回到第一页
+      let lastSearchKw = '';
+      watch(searchKeyword, (val) => {
+        if (val !== lastSearchKw) { lastSearchKw = val; currentPage.value = 1; }
       });
 
       async function load(silent) {
@@ -1370,7 +1449,7 @@ function livePanel(title, icon, columns, apiPath, opts = {}) {
         clearTimeout(refreshTimer);
         document.removeEventListener('nsbc-refresh', scheduleRefresh);
       });
-      return { allRows, loading, error, lastUpdated, load, columns, icon, currentPage, totalPages, pagedRows, actionCol };
+      return { allRows, filteredRows, loading, error, lastUpdated, load, columns, icon, currentPage, totalPages, pagedRows, actionCol, searchKeyword };
     },
   };
 }

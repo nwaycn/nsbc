@@ -54,6 +54,12 @@ uint64_t reg_total(reg_core_t *r);
 uint64_t reg_rejected(reg_core_t *r);
 uint64_t reg_throttled(reg_core_t *r);
 
+/* 注册快照推送到 Rust 侧 obs_sub/DB（UDS FT_DATA_PUSH "register"）。
+ * expires_sec=0 表示 terminal deregister → Rust 侧 DELETE；
+ * expires_sec>0 表示 active register → 刷新 expires_at。
+ * 由 reg_on_register 成功路径 + loc_sweep 过期扫描回调路径调用。 */
+void reg_push(const loc_binding_t *b, long expires_sec);
+
 #ifdef __cplusplus
 }
 #endif

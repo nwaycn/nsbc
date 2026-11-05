@@ -37,6 +37,7 @@ pub struct ListQuery {
     pub tenant_id: Option<i64>,
     pub layer:  Option<String>,
     pub enabled: Option<String>,
+    pub keyword: Option<String>,
     pub limit:  Option<i64>,
     pub offset: Option<i64>,
 }
@@ -84,6 +85,7 @@ pub async fn list<C: CoreApi + Clone + Send + Sync>(
             q.tenant_id,
             q.layer.as_deref(),
             enabled,
+            q.keyword.as_deref(),
             q.limit.unwrap_or(50).clamp(1, 500),
             q.offset.unwrap_or(0).max(0),
         )

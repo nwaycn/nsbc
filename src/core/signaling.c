@@ -1359,6 +1359,14 @@ static void sig_on_end_cb(void *call_key, void *ud)
 /* ------------------------------------------------------------------ */
 static void sweep_cb(uint64_t now_ms, void *arg);
 
+/* loc_sweep expunge 回调：每清一条过期 binding → 推 Rust 侧 DELETE
+ * Rust 侧 upsert_registration 收到 expires_sec=0 → DELETE registrations */
+static void sweep_expunge_notify(const loc_binding_t *b, void *ud)
+{
+    (void)ud;
+    reg_push(b, 0);
+}
+
 static void sweep_arm(sig_runtime_t *s)
 {
     tw_node_init(&s->sweep_node);
@@ -1371,9 +1379,10 @@ static void sweep_arm(sig_runtime_t *s)
 static void sweep_cb(uint64_t now_ms, void *arg)
 {
     sig_runtime_t *s = (sig_runtime_t *)arg;
-    int removed = loc_sweep(s->loc, now_ms);
+    /* ★ 清过期绑定 + 同步 Rust 侧 DB DELETE（sweep_expunge_notify 每清一条调一次 reg_push(0)） */
+    int removed = loc_sweep(s->loc, now_ms, sweep_expunge_notify, NULL);
     if (removed > 0)
-        llog(LOG_DEBUG, "sig", "loc sweep removed %d expired bindings",
+        llog(LOG_DEBUG, "sig", "loc sweep removed %d expired bindings (Rust DELETE pushed)",
              removed);
     sweep_arm(s);
 }
@@ -1460,59 +1469,67 @@ static int sig_init(struct nsbc_ctx *ctx)
     cfg_get_int(ctx->cfg, "rtp.port_end", &port_hi, NULL);
 
     /* 端口表 + 媒体桥 */
+    llog(LOG_INFO, "sig", "[step1] ptable_create port_lo=%ld port_hi=%ld", port_lo, port_hi);
     ptable_cfg_t pc = {(uint16_t)port_lo, (uint16_t)port_hi, 64};
-    if (ptable_create(&pc, &s->ptable) != NSBC_OK)
+    if (ptable_create(&pc, &s->ptable) != NSBC_OK) {
+        llog(LOG_CRIT, "sig", "[step1] ptable_create FAILED");
         goto fail;
+    }
     int allow_bypass = 0, trust_priv = 1;
     cfg_get_bool(ctx->cfg, "media.allow_bypass", &allow_bypass, NULL);
     cfg_get_bool(ctx->cfg, "media.trust_private", &trust_priv, NULL);
     mb_cfg_t mc = {
         .ptable = s->ptable,
         .re = ctx->re,
-        .mgr = ctx->mgr,  /* P3: 多 reactor 路由 */
+        .mgr = ctx->mgr,
         .local_ip = s->local_host,
         .allow_bypass = allow_bypass,
         .trust_private = trust_priv,
-        /* Phase 0: rec_feed_fn 硬编码桥接已移除 —— recording 模块 init 时通过
-         * bridge_add_rec_feed_hook 自注册 recording_rec_feed 回调，零跨模块依赖 */
-        /* REQ-SIP-PROFILE-001：per-call RTP 端口段（组合根才可解引用
-         * call_key；media 层经回调取值，ARCH-011） */
         .call_port_range = sig_call_port_range,
-        /* REQ-DTLS-001：B 腿 WebRTC（WS/WSS）判定回调 */
         .call_b_is_ws = sig_call_b_is_ws,
-        /* REQ-MEDIA-DP-001：拨号规则级媒体模式 override 回调 */
         .call_media_mode = sig_call_media_mode,
-        /* REQ-NAT-002：per-call NAT 公网 RTP IP —— profile 热更新自动生效 */
         .call_external_rtp_ip = sig_call_external_rtp_ip,
     };
-    if (bridge_mgr_create(&mc, &s->bridge) != NSBC_OK)
+    llog(LOG_INFO, "sig", "[step2] bridge_mgr_create");
+    if (bridge_mgr_create(&mc, &s->bridge) != NSBC_OK) {
+        llog(LOG_CRIT, "sig", "[step2] bridge_mgr_create FAILED");
         goto fail;
+    }
 
     /* Location DB / 对话 / 事务 */
+    llog(LOG_INFO, "sig", "[step3] loc_db_create capacity=%ld arena_size=512MB", max_calls);
     loc_db_cfg_t lc = {ctx->arena[MEM_DOMAIN_SIGNAL], (int)max_calls, 10};
     long max_contacts = 10;
     cfg_get_int(ctx->cfg, "registrar.max_contacts", &max_contacts, NULL);
     lc.max_contacts = (int)max_contacts;
-    if (loc_db_create(&lc, &s->loc) != NSBC_OK)
+    if (loc_db_create(&lc, &s->loc) != NSBC_OK) {
+        llog(LOG_CRIT, "sig", "[step3] loc_db_create FAILED");
         goto fail;
+    }
 
+    llog(LOG_INFO, "sig", "[step4] dlg_mgr_create capacity=%ld", max_calls);
     dlg_mgr_cfg_t dc = {ctx->arena[MEM_DOMAIN_SIGNAL], NULL,
                         (int)max_calls};
-    if (dlg_mgr_create(&dc, &s->dlg) != NSBC_OK)
+    if (dlg_mgr_create(&dc, &s->dlg) != NSBC_OK) {
+        llog(LOG_CRIT, "sig", "[step4] dlg_mgr_create FAILED");
         goto fail;
+    }
 
     long t1 = 500, t2 = 4000, t4 = 5000, td = 32000;
     cfg_get_int(ctx->cfg, "sip.t1_ms", &t1, NULL);
     cfg_get_int(ctx->cfg, "sip.t2_ms", &t2, NULL);
     cfg_get_int(ctx->cfg, "sip.t4_ms", &t4, NULL);
     cfg_get_int(ctx->cfg, "sip.timer_d_ms", &td, NULL);
+    llog(LOG_INFO, "sig", "[step5] txn_mgr_create capacity=%ld t1=%ld", max_calls, t1);
     txn_mgr_cfg_t tc = {ctx->arena[MEM_DOMAIN_SIGNAL],
                         ctx->arena[MEM_DOMAIN_PACKET], NULL,
                         (int)max_calls, ctx->tw,
                         (uint32_t)t1, (uint32_t)t2, (uint32_t)t4,
                         (uint32_t)td, tr_send_cb, s, NULL, NULL};
-    if (txn_mgr_create(&tc, &s->txn) != NSBC_OK)
+    if (txn_mgr_create(&tc, &s->txn) != NSBC_OK) {
+        llog(LOG_CRIT, "sig", "[step5] txn_mgr_create FAILED");
         goto fail;
+    }
 
     /* B2BUA 在 start 阶段创建（依赖 transport + registrar） */
     ctx->loc_db = s->loc;

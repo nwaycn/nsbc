@@ -124,8 +124,8 @@ static const cfg_desc_t k_core[] = {
 
     /* ---- 注册 ---- */
     {"registrar.min_expires", CGT_INT, CGF_HOT, "60", NULL, 10, 3600},
-    {"registrar.default_expires", CGT_INT, CGF_HOT, "3600", NULL, 60, 86400},
-    {"registrar.max_expires", CGT_INT, CGF_HOT, "3600", NULL, 60, 86400},
+    {"registrar.default_expires", CGT_INT, CGF_HOT, "600", NULL, 60, 86400},
+    {"registrar.max_expires", CGT_INT, CGF_HOT, "600", NULL, 60, 86400},
     {"registrar.max_contacts", CGT_INT, CGF_HOT, "10", NULL, 1, 20},
     {"registrar.rps_global", CGT_INT, CGF_HOT, "2000", NULL, 0, 1000000},
     {"registrar.rps_per_ip", CGT_INT, CGF_HOT, "100", NULL, 0, 100000},

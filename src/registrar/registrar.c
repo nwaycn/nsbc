@@ -410,9 +410,9 @@ int reg_core_create(const reg_cfg_t *cfg, reg_core_t **out)
     if (r->cfg.min_expires <= 0)
         r->cfg.min_expires = 60;
     if (r->cfg.max_expires <= 0)
-        r->cfg.max_expires = 3600;
+        r->cfg.max_expires = 600;
     if (r->cfg.default_expires <= 0)
-        r->cfg.default_expires = 3600;
+        r->cfg.default_expires = 600;
     if (r->cfg.ip_cps <= 0)
         r->cfg.ip_cps = 50;
     if (r->cfg.aor_cps <= 0)
@@ -476,7 +476,7 @@ static void respond(reg_core_t *r, sip_tr_proto_t proto, const nsbc_sa_t *dst,
  * 非阻塞：UDS 不可用时静默丢，uds_client 内部 ring 满自动丢最旧。
  * NAT 字段（REQ-NAT-001）：received_ip/received_port/nat_detected/public_contact/transport
  *   由调用方从 loc_binding_t 传入，用于 Web registrations 表落库与前端展示。 */
-static void reg_push(const loc_binding_t *b, long expires_sec)
+void reg_push(const loc_binding_t *b, long expires_sec)
 {
     if (!b) return;
     /* 从 AOR 提取 user 部分（去掉 sip: 和 @domain） */

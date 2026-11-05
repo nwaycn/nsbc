@@ -90,6 +90,25 @@ pub struct Db {
     batch: Option<Arc<DbBatch>>,
 }
 
+/// Row from the `registrations` table — one active SIP binding (user + instance).
+/// Map via sqlx::FromRow in list_registrations(); column names match DDL exactly.
+#[derive(Clone, Debug, Default, sqlx::FromRow)]
+pub struct RegistrationRow {
+    pub id:             i64,
+    pub user_name:      String,
+    pub contact:        Option<String>,
+    pub instance_id:    String,
+    pub agent:          Option<String>,
+    pub expires_at:     Option<String>,
+    pub registered_at:  String,
+    pub updated_at:     Option<String>,
+    pub received_ip:    String,
+    pub received_port:  i64,
+    pub nat_detected:   i64,
+    pub public_contact: String,
+    pub transport:      String,
+}
+
 impl Db {
     pub fn new() -> Self { Db { pool: None, backend: None, batch: None } }
 
@@ -538,6 +557,19 @@ impl Db {
     ) -> Result<(), sqlx::Error> {
         let Some(pool) = self.pool.as_ref() else { return Ok(()); };
 
+        // expires_sec == 0 → terminal deregistration: DELETE instead of UPSERT.
+        // C-side registrar.c pushes expires_sec=0 on un-REGISTER / contact expiry.
+        if expires_sec == 0 {
+            sqlx::query(
+                "DELETE FROM registrations WHERE user_name = $1 AND instance_id = $2",
+            )
+            .bind(user_name)
+            .bind(instance_id)
+            .execute(pool.as_ref())
+            .await?;
+            return Ok(());
+        }
+
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -589,6 +621,76 @@ impl Db {
             .execute(pool.as_ref())
             .await?;
         Ok(())
+    }
+
+    /// registrations.read: list active bindings with keyword + pagination.
+    /// Active = expires_at > NOW() (defensive: expires_sec=0 DELETEs on dereg,
+    /// but this catches stale rows from missed pushes / C restart).
+    /// keyword matches user_name / contact / received_ip / public_contact.
+    pub async fn list_registrations(
+        &self, keyword: Option<&str>, limit: i64, offset: i64,
+    ) -> Result<(Vec<RegistrationRow>, i64), sqlx::Error> {
+        let Some(pool) = self.pool() else { return Ok((Vec::new(), 0)); };
+        let backend = self.backend();
+        let limit = limit.clamp(1, 500);
+        let offset = offset.max(0);
+
+        // expires_at is TEXT (ISO 8601) on all 3 backends; current-time literal
+        // must match backend's NOW()-as-text function.
+        let now_sql = match backend {
+            "sqlite"   => "datetime('now')",
+            "postgres" => "NOW()::text",
+            _          => "CAST(CURRENT_TIMESTAMP AS CHAR)", // mysql
+        };
+
+        let mut clauses: Vec<String> = vec![format!("expires_at > {now_sql}")];
+        let mut binds: Vec<String> = Vec::new();
+        let mut idx: u32 = 0;
+
+        if let Some(kw) = keyword {
+            idx += 1;
+            clauses.push(format!(
+                "(user_name LIKE ${idx} OR contact LIKE ${idx} OR \
+                 received_ip LIKE ${idx} OR public_contact LIKE ${idx})"
+            ));
+            binds.push(format!("%{}%", kw));
+        }
+
+        let where_sql = "WHERE ".to_string() + &clauses.join(" AND ");
+
+        let count_sql = fix_ph(&format!("SELECT COUNT(*) FROM registrations {where_sql}"), backend);
+        let mut cq = sqlx::query_scalar::<_, i64>(&count_sql);
+        for b in &binds { cq = cq.bind(b.as_str()); }
+        let total = cq.fetch_one(pool).await.unwrap_or(0);
+
+        let l = idx + 1;
+        let o = idx + 2;
+        let rows_sql = fix_ph(
+            &format!("SELECT * FROM registrations {where_sql} ORDER BY updated_at DESC LIMIT ${l} OFFSET ${o}"),
+            backend,
+        );
+        let mut q = sqlx::query_as::<_, RegistrationRow>(&rows_sql);
+        for b in &binds { q = q.bind(b.as_str()); }
+        q = q.bind(limit).bind(offset);
+        let rows = q.fetch_all(pool).await?;
+        Ok((rows, total))
+    }
+
+    /// registrations.count: fast total-active count (no keyword filter).
+    pub async fn count_registrations(&self) -> Result<i64, sqlx::Error> {
+        let Some(pool) = self.pool() else { return Ok(0); };
+        let backend = self.backend();
+        let now_sql = match backend {
+            "sqlite"   => "datetime('now')",
+            "postgres" => "NOW()::text",
+            _          => "CAST(CURRENT_TIMESTAMP AS CHAR)",
+        };
+        let sql = fix_ph(
+            &format!("SELECT COUNT(*) FROM registrations WHERE expires_at > {now_sql}"),
+            backend,
+        );
+        sqlx::query_scalar::<_, i64>(&sql).fetch_one(pool).await
+            .map_err(|e| e.into())
     }
 
     /// runtime.write: append a call state change trajectory row (runtime_state table, INSERT only).
@@ -4861,6 +4963,7 @@ impl Db {
         extension: Option<&str>,
         realm: Option<&str>,
         enabled: Option<bool>,
+        keyword: Option<&str>,
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<Extension>, i64), sqlx::Error> {
@@ -4891,6 +4994,14 @@ impl Db {
             idx += 1;
             clauses.push(format!("enabled = ${idx}"));
             binds.push(if en { "1".into() } else { "0".into() });
+        }
+        if let Some(kw) = keyword {
+            let kw = kw.trim();
+            if !kw.is_empty() {
+                idx += 1;
+                clauses.push(format!("(extension LIKE ${idx} OR description LIKE ${idx} OR display_number LIKE ${idx})"));
+                binds.push(format!("%{}%", kw));
+            }
         }
 
         let where_sql = if clauses.is_empty() {
@@ -5404,17 +5515,36 @@ impl Db {
     // ===== gateways =====
 
     pub async fn list_gateways(
-        &self, limit: i64, offset: i64,
+        &self, keyword: Option<&str>, limit: i64, offset: i64,
     ) -> Result<(Vec<Gateway>, i64), sqlx::Error> {
         let Some(pool) = self.pool() else { return Ok((Vec::new(), 0)); };
         let backend = self.backend();
         let limit = limit.clamp(1, 500);
         let offset = offset.max(0);
-        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM gateways")
-            .fetch_one(pool).await.unwrap_or(0);
-        let rows_sql = fix_ph("SELECT * FROM gateways ORDER BY name LIMIT $1 OFFSET $2", backend);
-        let rows = sqlx::query_as::<_, Gateway>(&rows_sql)
-            .bind(limit).bind(offset).fetch_all(pool).await?;
+
+        let mut clauses: Vec<String> = Vec::new();
+        let mut binds: Vec<String> = Vec::new();
+        let mut idx: u32 = 0;
+
+        if let Some(kw) = keyword {
+            let kw = kw.trim();
+            if !kw.is_empty() {
+                idx += 1; clauses.push(format!("name LIKE ${idx}"));
+                binds.push(format!("%{}%", kw));
+            }
+        }
+        let where_sql = if clauses.is_empty() { String::new() } else { "WHERE ".to_string() + &clauses.join(" AND ") };
+
+        let count_sql = fix_ph(&format!("SELECT COUNT(*) FROM gateways {where_sql}"), backend);
+        let mut cq = sqlx::query_scalar::<_, i64>(&count_sql);
+        for b in &binds { cq = cq.bind(b.as_str()); }
+        let total = cq.fetch_one(pool).await.unwrap_or(0);
+        let rows_sql = fix_ph(&format!("SELECT * FROM gateways {where_sql} ORDER BY name LIMIT ${} OFFSET ${}",
+            binds.len() + 1, binds.len() + 2), backend);
+        let mut q = sqlx::query_as::<_, Gateway>(&rows_sql);
+        for b in &binds { q = q.bind(b.as_str()); }
+        q = q.bind(limit).bind(offset);
+        let rows = q.fetch_all(pool).await?;
         Ok((rows, total))
     }
 
@@ -5519,6 +5649,7 @@ impl Db {
         tenant_id: Option<i64>,
         gateway_name: Option<&str>,
         enabled: Option<bool>,
+        keyword: Option<&str>,
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<Trunk>, i64), sqlx::Error> {
@@ -5540,6 +5671,13 @@ impl Db {
         if let Some(en) = enabled {
             idx += 1; clauses.push(format!("enabled = ${idx}"));
             binds.push(if en { "1".into() } else { "0".into() });
+        }
+        if let Some(kw) = keyword {
+            let kw = kw.trim();
+            if !kw.is_empty() {
+                idx += 1; clauses.push(format!("name LIKE ${idx}"));
+                binds.push(format!("%{}%", kw));
+            }
         }
 
         let where_sql = if clauses.is_empty() { String::new() } else { "WHERE ".to_string() + &clauses.join(" AND ") };
@@ -6511,17 +6649,30 @@ impl Db {
     // ===== routes =====
 
     pub async fn list_routes(
-        &self, enabled: Option<bool>, limit: i64, offset: i64,
+        &self, enabled: Option<bool>, keyword: Option<&str>, limit: i64, offset: i64,
     ) -> Result<(Vec<Route>, i64), sqlx::Error> {
         let Some(pool) = self.pool() else { return Ok((Vec::new(), 0)); };
         let backend = self.backend();
         let limit = limit.clamp(1, 500);
         let offset = offset.max(0);
-        let (where_sql, binds) = match enabled {
-            Some(v) => ("WHERE enabled = $1".to_string(),
-                        vec![if v { "1".to_string() } else { "0".to_string() }]),
-            None => (String::new(), Vec::new()),
-        };
+
+        let mut clauses: Vec<String> = Vec::new();
+        let mut binds: Vec<String> = Vec::new();
+        let mut idx: u32 = 0;
+
+        if let Some(v) = enabled {
+            idx += 1; clauses.push(format!("enabled = ${idx}"));
+            binds.push(if v { "1".into() } else { "0".into() });
+        }
+        if let Some(kw) = keyword {
+            let kw = kw.trim();
+            if !kw.is_empty() {
+                idx += 1; clauses.push(format!("name LIKE ${idx}"));
+                binds.push(format!("%{}%", kw));
+            }
+        }
+        let where_sql = if clauses.is_empty() { String::new() } else { "WHERE ".to_string() + &clauses.join(" AND ") };
+
         let count_sql = fix_ph(&format!("SELECT COUNT(*) FROM routes {where_sql}"), backend);
         let mut cq = sqlx::query_scalar::<_, i64>(&count_sql);
         for b in &binds { cq = cq.bind(b.as_str()); }
@@ -6614,6 +6765,7 @@ impl Db {
         tenant_id: Option<i64>,
         layer: Option<&str>,
         enabled: Option<bool>,
+        keyword: Option<&str>,
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<DialplanRule>, i64), sqlx::Error> {
@@ -6633,6 +6785,13 @@ impl Db {
         if let Some(en) = enabled {
             idx += 1; clauses.push(format!("enabled = ${idx}"));
             binds.push(if en { "1".into() } else { "0".into() });
+        }
+        if let Some(kw) = keyword {
+            let kw = kw.trim();
+            if !kw.is_empty() {
+                idx += 1; clauses.push(format!("(profile_name LIKE ${idx} OR rule_name LIKE ${idx} OR pattern LIKE ${idx})"));
+                binds.push(format!("%{}%", kw));
+            }
         }
         let where_sql = if clauses.is_empty() { String::new() } else { "WHERE ".to_string() + &clauses.join(" AND ") };
 
@@ -6785,17 +6944,29 @@ impl Db {
     // ===== ha_groups =====
 
     pub async fn list_ha_groups(
-        &self, enabled: Option<bool>, limit: i64, offset: i64,
+        &self, enabled: Option<bool>, keyword: Option<&str>, limit: i64, offset: i64,
     ) -> Result<(Vec<HaGroup>, i64), sqlx::Error> {
         let Some(pool) = self.pool() else { return Ok((Vec::new(), 0)); };
         let backend = self.backend();
         let limit = limit.clamp(1, 500);
         let offset = offset.max(0);
-        let (where_sql, binds) = match enabled {
-            Some(v) => ("WHERE enabled = $1".to_string(),
-                        vec![if v { "1".to_string() } else { "0".to_string() }]),
-            None => (String::new(), Vec::new()),
-        };
+
+        let mut clauses: Vec<String> = Vec::new();
+        let mut binds: Vec<String> = Vec::new();
+        let mut idx: u32 = 0;
+
+        if let Some(v) = enabled {
+            idx += 1; clauses.push(format!("enabled = ${idx}"));
+            binds.push(if v { "1".into() } else { "0".into() });
+        }
+        if let Some(kw) = keyword {
+            let kw = kw.trim();
+            if !kw.is_empty() {
+                idx += 1; clauses.push(format!("name LIKE ${idx}"));
+                binds.push(format!("%{}%", kw));
+            }
+        }
+        let where_sql = if clauses.is_empty() { String::new() } else { "WHERE ".to_string() + &clauses.join(" AND ") };
         let count_sql = fix_ph(&format!("SELECT COUNT(*) FROM ha_groups {where_sql}"), backend);
         let mut cq = sqlx::query_scalar::<_, i64>(&count_sql);
         for b in &binds { cq = cq.bind(b.as_str()); }
@@ -6916,17 +7087,30 @@ impl Db {
     // ===== time_groups =====
 
     pub async fn list_time_groups(
-        &self, enabled: Option<bool>, limit: i64, offset: i64,
+        &self, enabled: Option<bool>, keyword: Option<&str>, limit: i64, offset: i64,
     ) -> Result<(Vec<TimeGroup>, i64), sqlx::Error> {
         let Some(pool) = self.pool() else { return Ok((Vec::new(), 0)); };
         let backend = self.backend();
         let limit = limit.clamp(1, 500);
         let offset = offset.max(0);
-        let (where_sql, binds) = match enabled {
-            Some(v) => ("WHERE enabled = $1".to_string(),
-                        vec![if v { "1".to_string() } else { "0".to_string() }]),
-            None => (String::new(), Vec::new()),
-        };
+
+        let mut clauses: Vec<String> = Vec::new();
+        let mut binds: Vec<String> = Vec::new();
+        let mut idx: u32 = 0;
+
+        if let Some(v) = enabled {
+            idx += 1; clauses.push(format!("enabled = ${idx}"));
+            binds.push(if v { "1".into() } else { "0".into() });
+        }
+        if let Some(kw) = keyword {
+            let kw = kw.trim();
+            if !kw.is_empty() {
+                idx += 1; clauses.push(format!("name LIKE ${idx}"));
+                binds.push(format!("%{}%", kw));
+            }
+        }
+        let where_sql = if clauses.is_empty() { String::new() } else { "WHERE ".to_string() + &clauses.join(" AND ") };
+
         let count_sql = fix_ph(&format!("SELECT COUNT(*) FROM time_groups {where_sql}"), backend);
         let mut cq = sqlx::query_scalar::<_, i64>(&count_sql);
         for b in &binds { cq = cq.bind(b.as_str()); }
@@ -7034,7 +7218,8 @@ impl Db {
     // ===== queues =====
 
     pub async fn list_queues(
-        &self, tenant_id: Option<i64>, enabled: Option<bool>, limit: i64, offset: i64,
+        &self, tenant_id: Option<i64>, enabled: Option<bool>, keyword: Option<&str>,
+        limit: i64, offset: i64,
     ) -> Result<(Vec<Queue>, i64), sqlx::Error> {
         let Some(pool) = self.pool() else { return Ok((Vec::new(), 0)); };
         let backend = self.backend();
@@ -7051,6 +7236,13 @@ impl Db {
         if let Some(en) = enabled {
             idx += 1; clauses.push(format!("enabled = ${idx}"));
             binds.push(if en { "1".to_string() } else { "0".to_string() });
+        }
+        if let Some(kw) = keyword {
+            let kw = kw.trim();
+            if !kw.is_empty() {
+                idx += 1; clauses.push(format!("name LIKE ${idx}"));
+                binds.push(format!("%{}%", kw));
+            }
         }
         let where_sql = if clauses.is_empty() { String::new() } else { "WHERE ".to_string() + &clauses.join(" AND ") };
 
@@ -7194,7 +7386,8 @@ impl Db {
     // ===== ivr_menus =====
 
     pub async fn list_ivr_menus(
-        &self, enabled: Option<bool>, tenant_id: Option<i64>, limit: i64, offset: i64,
+        &self, enabled: Option<bool>, tenant_id: Option<i64>,
+        keyword: Option<&str>, limit: i64, offset: i64,
     ) -> Result<(Vec<IvrMenu>, i64), sqlx::Error> {
         let Some(pool) = self.pool() else { return Ok((Vec::new(), 0)); };
         let backend = self.backend();
@@ -7208,8 +7401,15 @@ impl Db {
         }
         if let Some(tid) = tenant_id {
             let ph = format!("${}", binds.len() + 1);
-            where_parts.push(format!("tenant_id = {ph}"));  /* F-08 修复：之前是普通字符串，SQL 里出现字面 {ph} */
+            where_parts.push(format!("tenant_id = {ph}"));
             binds.push(tid.to_string());
+        }
+        if let Some(kw) = keyword {
+            let kw = kw.trim();
+            if !kw.is_empty() {
+                where_parts.push(format!("name LIKE ${}", binds.len() + 1));
+                binds.push(format!("%{}%", kw));
+            }
         }
         let where_sql = if where_parts.is_empty() { String::new() } else { format!("WHERE {}", where_parts.join(" AND ")) };
         let count_sql = fix_ph(&format!("SELECT COUNT(*) FROM ivr_menus {where_sql}"), backend);
@@ -7345,26 +7545,40 @@ impl Db {
     // ===== sip_profiles =====
 
     pub async fn list_sip_profiles(
-        &self, enabled: Option<bool>, limit: i64, offset: i64,
+        &self, enabled: Option<bool>, keyword: Option<&str>, limit: i64, offset: i64,
     ) -> Result<(Vec<SipProfile>, i64), sqlx::Error> {
         let Some(pool) = self.pool() else { return Ok((Vec::new(), 0)); };
         let backend = self.backend();
-        let (rows, total) = if let Some(on) = enabled {
-            let on_i = if on { 1i64 } else { 0 };
-            let rows = sqlx::query_as::<_, SipProfile>(&fix_ph(
-                "SELECT * FROM sip_profiles WHERE enabled = ? ORDER BY name LIMIT ? OFFSET ?", backend
-            )).bind(on_i).bind(limit).bind(offset).fetch_all(pool).await?;
-            let total: (i64,) = sqlx::query_as(&fix_ph(
-                "SELECT COUNT(*) FROM sip_profiles WHERE enabled = ?", backend
-            )).bind(on_i).fetch_one(pool).await?;
-            (rows, total.0)
-        } else {
-            let rows = sqlx::query_as::<_, SipProfile>(&fix_ph(
-                "SELECT * FROM sip_profiles ORDER BY name LIMIT ? OFFSET ?", backend
-            )).bind(limit).bind(offset).fetch_all(pool).await?;
-            let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sip_profiles").fetch_one(pool).await?;
-            (rows, total.0)
-        };
+        let limit = limit.clamp(1, 500);
+        let offset = offset.max(0);
+
+        let mut clauses: Vec<String> = Vec::new();
+        let mut binds: Vec<String> = Vec::new();
+        let mut idx: u32 = 0;
+
+        if let Some(v) = enabled {
+            idx += 1; clauses.push(format!("enabled = ${idx}"));
+            binds.push(if v { "1".into() } else { "0".into() });
+        }
+        if let Some(kw) = keyword {
+            let kw = kw.trim();
+            if !kw.is_empty() {
+                idx += 1; clauses.push(format!("name LIKE ${idx}"));
+                binds.push(format!("%{}%", kw));
+            }
+        }
+        let where_sql = if clauses.is_empty() { String::new() } else { "WHERE ".to_string() + &clauses.join(" AND ") };
+
+        let count_sql = fix_ph(&format!("SELECT COUNT(*) FROM sip_profiles {where_sql}"), backend);
+        let mut cq = sqlx::query_scalar::<_, i64>(&count_sql);
+        for b in &binds { cq = cq.bind(b.as_str()); }
+        let total = cq.fetch_one(pool).await.unwrap_or(0);
+        let rows_sql = fix_ph(&format!("SELECT * FROM sip_profiles {where_sql} ORDER BY name LIMIT ${} OFFSET ${}",
+            binds.len() + 1, binds.len() + 2), backend);
+        let mut q = sqlx::query_as::<_, SipProfile>(&rows_sql);
+        for b in &binds { q = q.bind(b.as_str()); }
+        q = q.bind(limit).bind(offset);
+        let rows = q.fetch_all(pool).await?;
         Ok((rows, total))
     }
 
@@ -7554,7 +7768,7 @@ impl Db {
 
 pub async fn list_rates(
     &self, prefix: Option<&str>, enabled: Option<bool>,
-    limit: i64, offset: i64,
+    keyword: Option<&str>, limit: i64, offset: i64,
 ) -> Result<(Vec<RateTable>, i64), sqlx::Error> {
     let Some(pool) = self.pool() else { return Ok((Vec::new(), 0)); };
     let backend = self.backend();
@@ -7567,6 +7781,14 @@ pub async fn list_rates(
     if let Some(e) = enabled {
         where_parts.push(format!("enabled = ${}", binds.len() + 1));
         binds.push((if e { "1" } else { "0" }).to_string());
+    }
+    if let Some(kw) = keyword {
+        let kw = kw.trim();
+        if !kw.is_empty() {
+            where_parts.push(format!("(name LIKE ${idx} OR prefix LIKE ${idx})",
+                idx = binds.len() + 1));
+            binds.push(format!("%{}%", kw));
+        }
     }
     let where_sql = if where_parts.is_empty() { String::new() } else { format!("WHERE {}", where_parts.join(" AND ")) };
     let count_sql = fix_ph(&format!("SELECT COUNT(*) FROM rate_tables {}", where_sql), backend);
@@ -8070,7 +8292,7 @@ pub async fn settle_billing(&self, account_id: i64, call_id: &str, charge_uc: i6
 
 pub async fn list_security_blacklist(
     &self, kind: Option<&str>, rule_type: Option<&str>, enabled: Option<bool>,
-    limit: i64, offset: i64,
+    keyword: Option<&str>, limit: i64, offset: i64,
 ) -> Result<(Vec<SecurityBlacklist>, i64), sqlx::Error> {
     let Some(pool) = self.pool() else { return Ok((Vec::new(), 0)); };
     let backend = self.backend();
@@ -8087,6 +8309,14 @@ pub async fn list_security_blacklist(
     if let Some(e) = enabled {
         where_parts.push(format!("enabled = ${}", binds.len() + 1));
         binds.push((if e { "1" } else { "0" }).to_string());
+    }
+    if let Some(kw) = keyword {
+        let kw = kw.trim();
+        if !kw.is_empty() {
+            where_parts.push(format!("(value LIKE ${idx} OR comment LIKE ${idx})",
+                idx = binds.len() + 1));
+            binds.push(format!("%{}%", kw));
+        }
     }
     let where_sql = if where_parts.is_empty() { String::new() } else { format!("WHERE {}", where_parts.join(" AND ")) };
     let count_sql = fix_ph(&format!("SELECT COUNT(*) FROM security_blacklist {}", where_sql), backend);
@@ -8501,11 +8731,38 @@ pub struct TenantUpdate {
 }
 
 impl Db {
-    pub async fn list_tenants(&self) -> Result<Vec<Tenant>, sqlx::Error> {
-        let Some(pool) = self.pool() else { return Ok(Vec::new()); };
+    pub async fn list_tenants(
+        &self, keyword: Option<&str>, limit: i64, offset: i64,
+    ) -> Result<(Vec<Tenant>, i64), sqlx::Error> {
+        let Some(pool) = self.pool() else { return Ok((Vec::new(), 0)); };
         let backend = self.backend();
-        sqlx::query_as::<_, Tenant>(&fix_ph("SELECT * FROM tenants ORDER BY id", backend))
-            .fetch_all(pool).await
+        let limit = limit.clamp(1, 500);
+        let offset = offset.max(0);
+
+        let mut clauses: Vec<String> = Vec::new();
+        let mut binds: Vec<String> = Vec::new();
+        let mut idx: u32 = 0;
+
+        if let Some(kw) = keyword {
+            let kw = kw.trim();
+            if !kw.is_empty() {
+                idx += 1; clauses.push(format!("tenant_name LIKE ${idx} OR description LIKE ${idx}"));
+                binds.push(format!("%{}%", kw));
+            }
+        }
+        let where_sql = if clauses.is_empty() { String::new() } else { "WHERE ".to_string() + &clauses.join(" AND ") };
+
+        let count_sql = fix_ph(&format!("SELECT COUNT(*) FROM tenants {where_sql}"), backend);
+        let mut cq = sqlx::query_scalar::<_, i64>(&count_sql);
+        for b in &binds { cq = cq.bind(b.as_str()); }
+        let total = cq.fetch_one(pool).await.unwrap_or(0);
+        let rows_sql = fix_ph(&format!("SELECT * FROM tenants {where_sql} ORDER BY id LIMIT ${} OFFSET ${}",
+            binds.len() + 1, binds.len() + 2), backend);
+        let mut q = sqlx::query_as::<_, Tenant>(&rows_sql);
+        for b in &binds { q = q.bind(b.as_str()); }
+        q = q.bind(limit).bind(offset);
+        let rows = q.fetch_all(pool).await?;
+        Ok((rows, total))
     }
 
     pub async fn get_tenant(&self, id: i64) -> Result<Option<Tenant>, sqlx::Error> {

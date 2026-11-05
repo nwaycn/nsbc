@@ -38,6 +38,7 @@ where
 #[derive(Debug, Deserialize, Default)]
 pub struct ListQuery {
     pub enabled: Option<String>,
+    pub keyword: Option<String>,
     pub limit:  Option<i64>,
     pub offset: Option<i64>,
 }
@@ -53,7 +54,7 @@ pub async fn list<C: CoreApi + Clone + Send + Sync>(
         _ => None,
     };
     let (items, total) = st.db
-        .list_routes(enabled, q.limit.unwrap_or(50).clamp(1, 500), q.offset.unwrap_or(0).max(0))
+        .list_routes(enabled, q.keyword.as_deref(), q.limit.unwrap_or(50).clamp(1, 500), q.offset.unwrap_or(0).max(0))
         .await.map_err(|e| ApiError::Db(e.to_string()))?;
     Ok(Json(json!({ "items": items, "total": total })))
 }

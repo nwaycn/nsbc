@@ -267,7 +267,7 @@ async fn snapshot<C: CoreApi + Clone + Send + Sync>(
             serde_json::to_string(&rows).map(|j| (j, n)).map_err(|e| e.to_string())
         }
         Kind::Rates => {
-            let (rows, _total) = st.db.list_rates(None, Some(true), i64::MAX, 0).await
+            let (rows, _total) = st.db.list_rates(None, Some(true), None, i64::MAX, 0).await
                 .map_err(|e| format!("db: {e}"))?;
             let n = rows.len();
             serde_json::to_string(&rows).map(|j| (j, n)).map_err(|e| e.to_string())

@@ -28,6 +28,7 @@
 #include <errno.h>
 #include <getopt.h>
 #include <libgen.h>
+#include <malloc.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -397,6 +398,28 @@ static void usage(const char *argv0)
 
 int main(int argc, char **argv)
 {
+    /* ================================================================
+     * glibc malloc arena 限制 —— 必须在任何 malloc/calloc 之前设置！
+     *
+     * 问题：glibc ptmalloc2 默认按需 mmap 无限扩展 arena，多线程进程
+     * 会积累几十到上百个 arena（每个 56MB+ 虚拟地址），导致：
+     *   VmSize 飙升到 16-20GB（虽然 RSS 只有 1-2GB）
+     *   mmap 碎片吞噬地址空间，OOM killer 风险升高
+     *
+     * 修复：默认把 arena 数限制到 2（nsbcd 单 reactor 场景足够），
+     *     空闲 1MB 就 madvise 还给 OS。
+     * 外部覆盖：用户传 MALLOC_ARENA_MAX=8 则 setenv 的 override=0 会
+     *     跳过，尊重用户设置。
+     * 双保险：环境变量（glibc 2.34+ 唯一有效方式） + mallopt（旧 glibc
+     *     兜底）。
+     * ================================================================ */
+    setenv("MALLOC_ARENA_MAX", "2", 0);          /* 不覆盖外部已设值 */
+    setenv("MALLOC_MMAP_THRESHOLD_", "131072", 0); /* 128KB，默认 */
+#ifdef __GLIBC__
+    mallopt(M_ARENA_MAX, 2);                     /* 旧 glibc 兜底 */
+    mallopt(M_TRIM_THRESHOLD_, 1024 * 1024);    /* 空闲 1MB 就还给 OS */
+#endif
+
     /* 离线子命令（不进启动序列；主版本不符时守护进程拒绝启动，迁移必须
      * 能独立运行，故不走 control socket）。 */
     if (argc >= 3 && strcmp(argv[1], "config") == 0 &&

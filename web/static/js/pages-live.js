@@ -604,15 +604,36 @@ app.component('registrations-live', {
     <div>
       <div class="flex items-center justify-between mb-4">
         <h2 class="text-lg font-semibold"><i class="fa-solid fa-user-check"></i> Registration status
-          <span v-if="shown" class="text-sm text-gray-500">
+          <span v-if="total" class="text-sm text-gray-500">
             ({{ shown }} <span v-if="total > shown"> · {{ total }} {{ t('registration endpoints') }}</span>)
           </span>
         </h2>
         <div v-if="truncated" class="text-xs text-yellow-600">{{ t('⚠ Output truncated') }}</div>
       </div>
+      <!-- 搜索栏（debounce → 后端 DB 原生过滤） -->
+      <div class="flex items-center gap-2 mb-3">
+        <el-input
+          v-model="searchKeyword"
+          size="small"
+          style="width:280px"
+          :placeholder="t('Search extension/AoR/contact...')"
+          clearable
+        >
+          <template #prefix><i class="fa-solid fa-magnifying-glass text-gray-400"></i></template>
+        </el-input>
+        <span v-if="searchKeyword" class="text-xs text-gray-400">
+          {{ t('Filtering') }}: "{{ searchKeyword }}"
+          <i class="fa-solid fa-xmark ml-1 cursor-pointer text-gray-300 hover:text-gray-500" @click="clearSearch"></i>
+        </span>
+        <span v-if="loadDebouncing" class="text-xs text-blue-400 animate-pulse">
+          <i class="fa-solid fa-spinner fa-spin"></i> {{ t('Searching...') }}
+        </span>
+      </div>
       <div v-if="loading" class="text-gray-400">{{ t('Loading...') }}</div>
       <div v-else-if="error" class="text-red-500">⚠ {{ error }}</div>
-      <div v-else-if="!rows.length" class="text-center text-gray-400 py-12">{{ t('No registrations yet') }}</div>
+      <div v-else-if="!rows.length" class="text-center text-gray-400 py-12">
+        {{ searchKeyword ? t('No matching registrations') : t('No registrations yet') }}
+      </div>
       <table v-else class="w-full text-sm border-collapse">
         <thead><tr class="bg-gray-50 border-b">
           <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Extension') }}</th>
@@ -620,31 +641,31 @@ app.component('registrations-live', {
           <th class="px-3 py-2 text-left font-medium text-gray-600">Contact（原始）</th>
           <th class="px-3 py-2 text-left font-medium text-gray-600">NAT</th>
           <th class="px-3 py-2 text-left font-medium text-gray-600">Received</th>
-          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Public contact') }}</th>
+          <th class="px-3 py-2 text-left font-medium text-gray-600">Public contact</th>
           <th class="px-3 py-2 text-left font-medium text-gray-600">Transport</th>
           <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Registered') }}</th>
           <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Remaining') }}</th>
           <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Status') }}</th>
         </tr></thead>
         <tbody>
-          <tr v-for="(row, idx) in rows" :key="idx" class="border-b hover:bg-blue-50/50">
+          <tr v-for="(row, idx) in rows" :key="row.user + '-' + row.received_ip + '-' + idx" class="border-b hover:bg-blue-50/50">
             <td class="px-3 py-2 font-mono text-sm font-semibold text-blue-700">{{ row.user || '-' }}</td>
             <td class="px-3 py-2 font-mono text-xs text-gray-600">{{ row.aor || '-' }}</td>
             <td class="px-3 py-2 font-mono text-xs text-gray-500 truncate max-w-[240px]" :title="row.contact">{{ row.contact || '-' }}</td>
-            <!-- NAT 标记（REQ-NAT-001） -->
+            <!-- NAT 标记 -->
             <td class="px-3 py-2 text-xs">
               <span v-if="row.nat_detected" class="inline-block px-1.5 py-0.5 rounded text-white bg-amber-500 font-semibold">NAT</span>
               <span v-else-if="row.received_ip && row.received_ip.length" class="text-green-600 font-medium">无</span>
               <span v-else class="text-gray-400">-</span>
             </td>
-            <!-- Received：NAT 后真实到达地址（FreeSWITCH Via received/rport 等效） -->
+            <!-- Received -->
             <td class="px-3 py-2 font-mono text-xs" :class="row.nat_detected ? 'text-amber-600' : 'text-gray-500'">
               <div v-if="row.received_ip || row.received_port">
                 <div>{{ row.received_ip || '-' }}<span class="text-gray-400">:</span>{{ row.received_port || '-' }}</div>
               </div>
               <span v-else class="text-gray-400">-</span>
             </td>
-            <!-- Public contact：NAT 改写后的公网可达地址（FreeSWITCH fs_nat=1 等效） -->
+            <!-- Public contact -->
             <td class="px-3 py-2 font-mono text-xs truncate max-w-[240px]"
                 :class="row.nat_detected ? 'text-amber-700' : 'text-gray-500'"
                 :title="row.public_contact">
@@ -660,31 +681,55 @@ app.component('registrations-live', {
           </tr>
         </tbody>
       </table>
+      <!-- 分页器（后端 DB 原生分页，避免前端全量加载大表） -->
+      <div v-if="total > pageSize" class="flex justify-end pt-2">
+        <el-pagination
+          v-model:current-page="currentPage"
+          :page-size="pageSize"
+          :total="total"
+          layout="total, prev, pager, next"
+          small
+          background
+          @current-change="onPageChange"
+        ></el-pagination>
+      </div>
     </div>
   `,
   setup() {
     const data = ref(null), loading = ref(false), error = ref(null);
-    // 按Extension去重：同一Extension多终端Register时，保留剩余有效时间最长（最新Register）那
-    // loc_db Allow多 binding（多终端/GRUU），UI 只显示每Extension一
-    const rows = computed(() => {
-      const list = (data.value && data.value.bindings) || [];
-      const map = new Map();
-      for (const b of list) {
-        const key = b.user || b.aor || b.contact || '';
-        const exist = map.get(key);
-        // 剩余时间更长 = 最新Register，保留
-        if (!exist || (b.expires_sec ?? 0) > (exist.expires_sec ?? 0)) {
-          map.set(key, b);
-        }
-      }
-      return Array.from(map.values());
-    });
-    // 总数 = 原始 binding 数（真实Register数，不去重）
-    const total = computed(() => data.value?.registrations || ((data.value && data.value.bindings) || []).length);
+    const searchKeyword = ref('');
+    const currentPage = ref(1);
+    const pageSize = ref(50);
+    const loadDebouncing = ref(false);
+    let debounceTimer = null;
+    let inflight = false;
+    let autoRefreshTimer = null;
+
+    // 直接用后端返回的行（DB 已经 keyword 过滤 + 分页）
+    const rows = computed(() => (data.value && data.value.bindings) || []);
+    const total = computed(() => data.value?.registrations || 0);
     const shown = computed(() => rows.value.length);
     const truncated = computed(() => data.value?.truncated || false);
-    let timer;
-    let inflight = false;
+
+    // 每次 keyword 变化（停止输入 300ms 后）→ 后端 DB 原生过滤
+    watch(searchKeyword, () => {
+      if (debounceTimer) clearTimeout(debounceTimer);
+      loadDebouncing.value = true;
+      debounceTimer = setTimeout(() => {
+        currentPage.value = 1;  // 搜索变化回到第一页
+        load(true);
+        loadDebouncing.value = false;
+      }, 300);
+    });
+
+    function clearSearch() {
+      searchKeyword.value = '';
+    }
+
+    function onPageChange(page) {
+      currentPage.value = page;
+      load(true);
+    }
 
     function fmtDur(sec) {
       if (sec == null) return '-';
@@ -700,20 +745,43 @@ app.component('registrations-live', {
       return 'text-gray-600';
     }
 
+    // 后端 DB 原生过滤 + 分页
     async function load(silent) {
       if (inflight) return;
       inflight = true;
       if (silent !== true) loading.value = true; error.value = null;
-      try { data.value = await API.get('/registrations'); }
-      catch (e) { error.value = e.message; }
+      try {
+        const params = new URLSearchParams();
+        if (searchKeyword.value && searchKeyword.value.trim()) {
+          params.set('keyword', searchKeyword.value.trim());
+        }
+        params.set('limit', pageSize.value);
+        params.set('offset', (currentPage.value - 1) * pageSize.value);
+        const url = '/registrations?' + params.toString();
+        data.value = await API.get(url);
+      } catch (e) { error.value = e.message; }
       finally {
         inflight = false;
         if (silent !== true) loading.value = false;
       }
     }
-    onMounted(() => { load(); timer = setInterval(() => load(true), 5000); });
-    onBeforeUnmount(() => clearInterval(timer));
-    return { data, rows, total, shown, truncated, loading, error, fmtDur, renewClass };
+
+    onMounted(() => {
+      load();
+      // 只在无 keyword 且在第一页时自动刷新（keyword 搜索时用户可能在逐页翻，自动刷新会打乱偏移）
+      autoRefreshTimer = setInterval(() => {
+        if (!searchKeyword.value && currentPage.value === 1) {
+          load(true);
+        }
+      }, 5000);
+    });
+    onBeforeUnmount(() => {
+      if (autoRefreshTimer) clearInterval(autoRefreshTimer);
+      if (debounceTimer) clearTimeout(debounceTimer);
+    });
+
+    return { rows, total, shown, truncated, loading, error, fmtDur, renewClass,
+             searchKeyword, currentPage, pageSize, loadDebouncing, clearSearch, onPageChange };
   },
 });
 
@@ -774,9 +842,27 @@ app.component('transcode-live', {
         <h2 class="text-lg font-semibold"><i class="fa-solid fa-microphone"></i>{{ t(' Media Bridge sessions') }}</h2>
         <span class="text-xs text-gray-500">{{ t('Active sessions:') }} {{ total }}</span>
       </div>
+      <!-- 搜索栏 -->
+      <div class="flex items-center gap-2 mb-3">
+        <el-input
+          v-model="searchKeyword"
+          size="small"
+          style="width:260px"
+          :placeholder="t('Search call_key/rtp...')"
+          clearable
+        >
+          <template #prefix><i class="fa-solid fa-magnifying-glass text-gray-400"></i></template>
+        </el-input>
+        <span v-if="searchKeyword" class="text-xs text-gray-400">
+          {{ t('Filtering') }}: "{{ searchKeyword }}"
+          <i class="fa-solid fa-xmark ml-1 cursor-pointer text-gray-300 hover:text-gray-500" @click="searchKeyword = ''"></i>
+        </span>
+      </div>
       <div v-if="loading" class="text-gray-400">{{ t('Loading...') }}</div>
       <div v-else-if="error" class="text-red-500">⚠ {{ error }}</div>
-      <div v-else-if="!rows.length" class="text-center text-gray-400 py-12">{{ t('无活跃Media sessions') }}</div>
+      <div v-else-if="!filteredRows.length" class="text-center text-gray-400 py-12">
+        {{ searchKeyword ? t('No matching sessions') : t('无活跃Media sessions') }}
+      </div>
       <table v-else class="w-full text-sm border-collapse">
         <thead><tr class="bg-gray-50 border-b">
           <th class="px-3 py-2 text-left font-medium text-gray-600">#</th>
@@ -788,7 +874,7 @@ app.component('transcode-live', {
           <th class="px-3 py-2 text-right font-medium text-gray-600">{{ t('Dropped pkts') }}</th>
         </tr></thead>
         <tbody>
-          <tr v-for="(row, idx) in rows" :key="idx" class="border-b hover:bg-blue-50/50">
+          <tr v-for="(row, idx) in pagedRows" :key="idx" class="border-b hover:bg-blue-50/50">
             <td class="px-3 py-2 text-gray-400">{{ row.idx }}</td>
             <td class="px-3 py-2 font-mono text-xs">{{ row.call_key_ptr }}</td>
             <td class="px-3 py-2">
@@ -807,10 +893,40 @@ app.component('transcode-live', {
           </tr>
         </tbody>
       </table>
+      <!-- 分页器 -->
+      <div v-if="filteredRows.length > pageSize" class="flex justify-end pt-2">
+        <el-pagination
+          v-model:current-page="currentPage"
+          :page-size="pageSize"
+          :total="filteredRows.length"
+          layout="total, prev, pager, next"
+          small
+          background
+        ></el-pagination>
+      </div>
     </div>
   `,
   setup() {
     const rows = ref([]), total = ref(0), loading = ref(false), error = ref(null);
+    const searchKeyword = ref('');
+    const currentPage = ref(1);
+    const pageSize = ref(50);
+    // 前端过滤 + 分页
+    const filteredRows = computed(() => {
+      const kw = (searchKeyword.value || '').trim().toLowerCase();
+      if (!kw) return rows.value;
+      return rows.value.filter(row => {
+        const hay = [row.call_key_ptr, row.mode, row.a_rtp, row.b_rtp]
+          .filter(v => v != null).join(' ').toLowerCase();
+        return hay.includes(kw);
+      });
+    });
+    const pagedRows = computed(() => {
+      const start = (currentPage.value - 1) * pageSize.value;
+      return filteredRows.value.slice(start, start + pageSize.value);
+    });
+    watch(searchKeyword, () => { currentPage.value = 1; });
+
     let timer;
     let inflight = false;
     async function load(silent) {
@@ -831,7 +947,7 @@ app.component('transcode-live', {
     }
     onMounted(() => { load(); timer = setInterval(() => load(true), 3000); });
     onBeforeUnmount(() => clearInterval(timer));
-    return { rows, total, loading, error };
+    return { filteredRows, pagedRows, total, loading, error, searchKeyword, currentPage, pageSize };
   },
 });
 
@@ -900,7 +1016,16 @@ app.component('billing-page', {
               <span v-if="billingEnabled">计费已启用 · tick 正常</span>
               <span v-else>计费已关闭 · tick 旁路跳过</span>
             </span>
-            <button @click="loadReservations()" class="text-xs px-2 py-1 rounded border hover:bg-gray-50"
+            <el-input
+              v-model="resvKeyword"
+              size="small"
+              style="width:220px"
+              :placeholder="t('Search call/account...')"
+              clearable
+            >
+              <template #prefix><i class="fa-solid fa-magnifying-glass text-gray-400"></i></template>
+            </el-input>
+            <button @click="resvPage=1; loadReservations()" class="text-xs px-2 py-1 rounded border hover:bg-gray-50"
                     :disabled="resvLoading">
               <i class="fa-solid fa-rotate-right" :class="{ 'animate-spin': resvLoading }"></i> 刷新
             </button>
@@ -908,9 +1033,9 @@ app.component('billing-page', {
         </div>
         <div v-if="resvLoading && !resvRows.length" class="p-8 text-center text-gray-400">加载中...</div>
         <div v-else-if="resvError" class="p-6 text-center text-red-500">⚠ {{ resvError }}</div>
-        <div v-else-if="!resvRows.length" class="p-12 text-center text-gray-400">
+        <div v-else-if="!filteredResvRows.length" class="p-12 text-center text-gray-400">
           <i class="fa-solid fa-phone-slash text-4xl mb-3 opacity-30"></i>
-          <div>暂无活跃通话 Reservation</div>
+          <div>{{ resvKeyword ? t('No matching reservations') : '暂无活跃通话 Reservation' }}</div>
           <div class="text-xs mt-1">发起通话后，L4 tick 会显示每个通话的实时预占</div>
         </div>
         <table v-else class="w-full text-sm border-collapse">
@@ -924,7 +1049,7 @@ app.component('billing-page', {
             <th class="px-3 py-2 text-right font-medium text-gray-600">Trunk</th>
           </tr></thead>
           <tbody>
-            <tr v-for="(row, idx) in resvRows" :key="idx" class="border-b hover:bg-blue-50/50">
+            <tr v-for="(row, idx) in pagedResvRows" :key="idx" class="border-b hover:bg-blue-50/50">
               <td class="px-3 py-2 text-gray-400 font-mono text-xs">{{ row.id }}</td>
               <td class="px-3 py-2 font-mono text-xs text-blue-700">{{ truncate(row.call, 20) }}</td>
               <td class="px-3 py-2 text-xs">
@@ -940,6 +1065,17 @@ app.component('billing-page', {
             </tr>
           </tbody>
         </table>
+        <!-- Reservations 分页器 -->
+        <div v-if="filteredResvRows.length > resvPageSize" class="flex justify-end px-4 pb-3">
+          <el-pagination
+            v-model:current-page="resvPage"
+            :page-size="resvPageSize"
+            :total="filteredResvRows.length"
+            layout="total, prev, pager, next"
+            small
+            background
+          ></el-pagination>
+        </div>
       </div>
     </div>
   `,
@@ -955,8 +1091,27 @@ app.component('billing-page', {
     const resvTotal = ref(0);
     const resvLoading = ref(false);
     const resvError = ref(null);
+    const resvKeyword = ref('');
+    const resvPage = ref(1);
+    const resvPageSize = ref(50);
     let resvTimer;
     let resvInflight = false;
+
+    // 前端过滤 + 分页
+    const filteredResvRows = computed(() => {
+      const kw = (resvKeyword.value || '').trim().toLowerCase();
+      if (!kw) return resvRows.value;
+      return resvRows.value.filter(r => {
+        const hay = [r.call, r.acct, r.called, r.trunk_id]
+          .filter(v => v != null).join(' ').toLowerCase();
+        return hay.includes(kw);
+      });
+    });
+    const pagedResvRows = computed(() => {
+      const start = (resvPage.value - 1) * resvPageSize.value;
+      return filteredResvRows.value.slice(start, start + resvPageSize.value);
+    });
+    watch(resvKeyword, () => { resvPage.value = 1; });
 
     // 计算汇总
     const totalReserved = computed(() =>
@@ -1025,6 +1180,7 @@ app.component('billing-page', {
     return {
       billingEnabled, switchLoading, switchBusy, switchMsg, switchMsgOk, enabledLoadError,
       resvRows, resvTotal, resvLoading, resvError, totalReserved,
+      resvKeyword, resvPage, resvPageSize, filteredResvRows, pagedResvRows,
       loadReservations, toggleBilling, truncate,
     };
   },

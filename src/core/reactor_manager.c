@@ -1,3 +1,13 @@
+/* _GNU_SOURCE 必须在 include sched.h 之前定义，否则 CPU_ZERO/CPU_SET 宏
+ * 无法展开成内联代码（会被当成外部符号 → 链接 undefined reference）。
+ * Makefile 默认 -D_GNU_SOURCE，但某些 sanitizer 变体（如 make debug）可能意外丢失。
+ * 这里 hardcode 兜底，保证不管 CFLAGS 怎么传都能编过。 */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
 
 #include "reactor_manager.h"
 #include "log.h"

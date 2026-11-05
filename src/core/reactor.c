@@ -277,8 +277,16 @@ int reactor_mod(reactor_t *r, int fd, uint32_t events)
 
 int reactor_del(reactor_t *r, int fd)
 {
-    if (!r || fd < 0 || fd == r->wake_fd)
+#ifdef NSBC_DEBUG_REACTOR_SLOTS
+    fprintf(stderr, "[reactor] del ENTER r=%p fd=%d wake_fd=%d slots_cap=%zu\n",
+            (void*)r, fd, r ? r->wake_fd : -1, r ? r->slots_cap : 0);
+#endif
+    if (!r || fd < 0 || fd == r->wake_fd) {
+#ifdef NSBC_DEBUG_REACTOR_SLOTS
+        fprintf(stderr, "[reactor] del REJECTED r=%p fd=%d (INVAL)\n", (void*)r, fd);
+#endif
         return NSBC_INVAL;
+    }
 #ifdef NSBC_REACTOR_OWNER_CHECK
     if (!pthread_equal(pthread_self(), r->owner)) {
         fprintf(stderr,
@@ -286,12 +294,31 @@ int reactor_del(reactor_t *r, int fd)
         return NSBC_PERM_DENIED;
     }
 #endif
-    if (epoll_ctl(r->epfd, EPOLL_CTL_DEL, fd, NULL) < 0)
-        return NSBC_ERR;
+    /* ★ slots 清理必须在 epoll_ctl 之前 —— 即使 EPOLL_CTL_DEL 失败
+     * (fd 未被监控、epfd 关闭等边界情况)，也要先置 cb/arg=NULL，
+     * 防止 reactor_wait dispatch 残留事件到已释放的 arg。 */
     if (fd >= 0 && fd < r->slots_cap) {
         r->slots[fd].cb = NULL;
         r->slots[fd].arg = NULL;
+#ifdef NSBC_DEBUG_REACTOR_SLOTS
+        fprintf(stderr, "[reactor] del fd=%d slots[fd] cleared (cb=NULL)\n", fd);
+#endif
+    } else {
+#ifdef NSBC_DEBUG_REACTOR_SLOTS
+        fprintf(stderr, "[reactor] del fd=%d SKIP slots clear (fd >= slots_cap=%zu)\n",
+                fd, r->slots_cap);
+#endif
     }
+    if (epoll_ctl(r->epfd, EPOLL_CTL_DEL, fd, NULL) < 0) {
+#ifdef NSBC_DEBUG_REACTOR_SLOTS
+        fprintf(stderr, "[reactor] del fd=%d epoll_ctl DEL FAILED errno=%d (slots already cleared)\n",
+                fd, errno);
+#endif
+        return NSBC_ERR;
+    }
+#ifdef NSBC_DEBUG_REACTOR_SLOTS
+    fprintf(stderr, "[reactor] del fd=%d OK (epoll DEL + slots cleared)\n", fd);
+#endif
     return NSBC_OK;
 }
 
@@ -450,9 +477,34 @@ int reactor_wait(reactor_t *r, int timeout_ms)
             (void)reactor_run_tasks(r, (unsigned)r->max_events);
             continue;
         }
-        if (fd >= r->slots_cap || !r->slots[fd].cb)
+        if (fd >= r->slots_cap || !r->slots[fd].cb) {
+#ifdef NSBC_DEBUG_REACTOR_SLOTS
+            if (fd < r->slots_cap)
+                fprintf(stderr, "[reactor] i=%d fd=%d SKIP (slots[fd].cb=%p arg=%p)\n",
+                        i, fd, (void*)r->slots[fd].cb, r->slots[fd].arg);
+            else
+                fprintf(stderr, "[reactor] i=%d fd=%d SKIP (fd >= slots_cap=%zu)\n",
+                        i, fd, r->slots_cap);
+#endif
             continue;
-        r->slots[fd].cb(fd, r->events[i].events, r->slots[fd].arg);
+        }
+#ifdef NSBC_DEBUG_REACTOR_SLOTS
+        fprintf(stderr, "[reactor] i=%d fd=%d ev=0x%x cb=%p arg=%p → dispatch\n",
+                i, fd, (unsigned)r->events[i].events,
+                (void*)r->slots[fd].cb, r->slots[fd].arg);
+#endif
+        /* ★ 同一 epoll batch 内同一 fd 可能出现在多个 events 位置
+         *   （EPOLLIN/EPOLLHUP 分别被 LT 模式捕获）。callback 可能 free(arg) →
+         *   同 batch 后续 dispatch 访问已释放内存 → UAF。
+         *   先保存 cb/arg 到局部变量，再 dispatch —— slots 本身保持不动，
+         *   让 callback 自己通过 reactor_del/mod 管理生命周期。 */
+        reactor_cb_fn cb = r->slots[fd].cb;
+        void *arg = r->slots[fd].arg;
+        cb(fd, r->events[i].events, arg);
+#ifdef NSBC_DEBUG_REACTOR_SLOTS
+        fprintf(stderr, "[reactor] i=%d fd=%d dispatch RETURNED (slots[fd].cb=%p)\n",
+                i, fd, (void*)r->slots[fd].cb);
+#endif
     }
     if (reactor_stopping(r))
         (void)reactor_run_tasks(r, UINT_MAX);

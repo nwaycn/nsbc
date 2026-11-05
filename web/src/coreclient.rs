@@ -52,10 +52,12 @@ use serde::Serialize;
 pub const DEFAULT_SOCK_PATH: &str = "/var/run/nsbc/control.sock";
 
 const PROMPT: &[u8] = b"nsbc> ";
-/// stats exposition capped at 256KB on the core side; frame limit leaves ample headroom.
-/// Only consumed by the cfg(unix) transport read path; Windows dev builds have no consumer.
+/// Core control-socket response frame size cap.
+/// show registrations with 10k+ bindings at ~260 bytes/line ≈ 2.6MB,
+/// plus prompt overhead → set to 8MB to leave headroom. Core side allocates
+/// its own per-command buffer matching this cap (obs_control.c REG_OUT_MAX).
 #[cfg_attr(not(unix), allow(dead_code))]
-const MAX_FRAME: usize = 512 * 1024;
+const MAX_FRAME: usize = 8 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS: u64 = 2000;
 
 /// Error classification for core control-plane interaction (REQ-WEB-014).

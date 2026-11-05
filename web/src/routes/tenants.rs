@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -41,15 +41,21 @@ where
 #[derive(Debug, Deserialize, Default)]
 pub struct ListQuery {
     pub keyword: Option<String>,
+    pub limit:   Option<i64>,
+    pub offset:  Option<i64>,
 }
 
 pub async fn list<C: CoreApi + Clone + Send + Sync>(
     State(st): State<Arc<AppState<C>>>,
+    Query(q): Query<ListQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     st.db.pool().ok_or(ApiError::DbUnavailable)?;
-    let items = st.db.list_tenants().await
-        .map_err(|e| ApiError::Db(e.to_string()))?;
-    Ok(Json(json!({ "items": items, "total": items.len() })))
+    let limit  = q.limit.unwrap_or(50).clamp(1, 500);
+    let offset = q.offset.unwrap_or(0).max(0);
+    let (items, total) = st.db
+        .list_tenants(q.keyword.as_deref(), limit, offset)
+        .await.map_err(|e| ApiError::Db(e.to_string()))?;
+    Ok(Json(json!({ "items": items, "total": total })))
 }
 
 // --- get ---

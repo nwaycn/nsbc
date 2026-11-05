@@ -64,21 +64,26 @@ static char g_yaml_path[PATH_MAX] = {0};
  * Phase 4: 纯 C IPv4 CIDR 前缀匹配（替代 libcidr 重依赖）
  *
  * 算法：
- *   1. parse_cidr("10.0.0.0/24", &net, &prefix) → net=0x0A000000, prefix=24
- *   2. ipv4_to_uint32("10.0.0.5", &ip) → ip=0x0A000005
+ *   1. parse_cidr("10.0.0.0/24", &net, &prefix) → net=0x0000000A(hbo), prefix=24
+ *   2. ipv4_to_uint32("10.0.0.5", &ip) → ip=0x0500000A(hbo)
  *   3. mask = ~0U << (32 - prefix)   (prefix=0 时 mask=0 匹配所有)
  *   4. (ip & mask) == (net & mask) → 命中
  * ==================================================================*/
 
-/* 把 "a.b.c.d" 转成 uint32_t（network byte order — 即大端序）
- * inet_pton(AF_INET) 直接把 4 字节按网络序塞进 struct sockaddr_in.sin_addr，
- * 所以 *(uint32_t*)&sin_addr 就是目标值。*/
+/* 把 "a.b.c.d" 转成 uint32_t（**主机字节序 hbo**）
+ * inet_pton(AF_INET) 把 4 字节按网络序塞进 struct in_addr.s_addr，
+ * 但后续 CIDR 掩码/私网段比较都是在主机序上做 —— 必须 ntohl 转一下。
+ *
+ * little-endian (x86/ARM 云服务器):
+ *   inet_pton("10.0.0.25") → s_addr bytes = [0x0a,0x00,0x00,0x19]
+ *   memcpy 到 uint32_t → 0x1900000a（主机上是反的！这是之前私网判断全错的根因）
+ *   必须 ntohl → 0x0a000019 → 主机序才能做 (ip & 0xff) == 10 这种比较 */
 static int ipv4_to_uint32(const char *ip_str, uint32_t *out)
 {
     if (!ip_str || !out) return -1;
     struct in_addr a;
     if (inet_pton(AF_INET, ip_str, &a) != 1) return -1;
-    memcpy(out, &a.s_addr, 4);  /* 大端序 */
+    *out = (uint32_t)ntohl(a.s_addr);  /* ★ 主机字节序！之前漏了 ntohl，私网判断全错 */
     return 0;
 }
 
@@ -111,7 +116,17 @@ static int parse_cidr(const char *cidr_str, uint32_t *out_net, int *out_prefix)
         if (ip_len >= sizeof(ip_part)) return -1;
         memcpy(ip_part, start, ip_len);
         ip_part[ip_len] = '\0';
-        prefix = atoi(slash + 1);
+        /* prefix 部分必须全是数字（atoi("24abc")=24 被接受，防御性修掉） */
+        const char *p = slash + 1;
+        if (!*p) return -1;
+        int prefix_val = 0;
+        while (*p) {
+            if (*p < '0' || *p > '9') return -1;
+            prefix_val = prefix_val * 10 + (*p - '0');
+            if (prefix_val > 32) return -1;  /* 提前溢出检测 */
+            p++;
+        }
+        prefix = prefix_val;
     } else {
         snprintf(ip_part, sizeof(ip_part), "%s", start);
         prefix = 32;  /* 默认：单 IP 精确匹配 */
@@ -124,7 +139,10 @@ static int parse_cidr(const char *cidr_str, uint32_t *out_net, int *out_prefix)
     return 0;
 }
 
-/* CIDR 前缀匹配：(ip & mask) == (net & mask) */
+/* CIDR 前缀匹配（主机序 uint32_t — ipv4_to_uint32 返回 ntohl 后 big-endian 值）：
+ * ntohl 后 ip 的高位 = IP 的第 1 个 octet，所以 CIDR mask 用标准写法 << (32-prefix)。
+ * 例：10.0.0.0/24 → net=0x0a000000, mask=0xffffff00（高 24 位 1，匹配前 24 位）。
+ * 跨架构（LE/BE）安全，因为 ntohl 统一了语义。 */
 static int cidr_match(uint32_t ip, uint32_t net, int prefix)
 {
     uint32_t mask = (prefix == 0) ? 0U : (~0U << (32 - prefix));
@@ -1496,20 +1514,63 @@ static int ban_note_reg_req(const char *ip)
 static int ban_is_private_ip(const char *ip_str)
 {
     if (!ip_str || !ip_str[0]) return 0;
-    uint32_t ip;
-    if (ipv4_to_uint32(ip_str, &ip) != 0) return 0;
 
-    /* 所有比较用网络字节序（ipv4_to_uint32 已保证） */
-    /* 127.0.0.0/8  — loopback */
-    if ((ip & 0xff000000u) == 0x7f000000u) return 1;
-    /* 10.0.0.0/8   — Class A private */
-    if ((ip & 0xff000000u) == 0x0a000000u) return 1;
-    /* 172.16.0.0/12 — Class B private (172.16.0.0 ~ 172.31.255.255) */
-    if ((ip & 0xfff00000u) == 0xac100000u) return 1;
-    /* 192.168.0.0/16 — Class C private */
-    if ((ip & 0xffff0000u) == 0xc0a80000u) return 1;
-    /* 169.254.0.0/16 — link-local */
-    if ((ip & 0xffff0000u) == 0xa9fe0000u) return 1;
+    /* === 先试 IPv6 纯地址 ===
+     * ::ffff:a.b.c.d 这种 v4-mapped 会先被 strncmp 吃掉走 v4 路径。
+     * 纯 IPv6 地址在这里 inet_pton(AF_INET6) 成功，做私网判断。 */
+    struct in6_addr a6;
+    if (inet_pton(AF_INET6, ip_str, &a6) == 1) {
+        /* ::1 loopback */
+        static const unsigned char v6_loop[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
+        if (memcmp(a6.s6_addr, v6_loop, 16) == 0) return 1;
+        /* :: unspecified */
+        static const unsigned char v6_zero[16] = {0};
+        if (memcmp(a6.s6_addr, v6_zero, 16) == 0) return 1;
+        /* fc00::/7 unique local（RFC 4193：fc00::/8 未分配 + fd00::/8 站点本地） */
+        if ((a6.s6_addr[0] & 0xfe) == 0xfc) return 1;
+        /* fe80::/10 link-local */
+        if (a6.s6_addr[0] == 0xfe && (a6.s6_addr[1] & 0xc0) == 0x80) return 1;
+        return 0;  /* 其他 v6 视为公网 */
+    }
+
+    /* === IPv4 路径 ===
+     * IPv4-mapped IPv6 兼容：Linux dual-stack socket 上 IPv4 包可能被表示为
+     * ::ffff:a.b.c.d —— 截取末尾 IPv4 部分再判断私网。 */
+    const char *ipv4_part = ip_str;
+    if (strncmp(ip_str, "::ffff:", 7) == 0 && ip_str[7])
+        ipv4_part = ip_str + 7;
+
+    uint32_t ip;
+    int rc = ipv4_to_uint32(ipv4_part, &ip);
+    if (rc != 0) {
+        static unsigned dbg_bad = 0;
+        if (dbg_bad++ % 256 == 0)
+            log_warn("security",
+                     "ban_is_private_ip: ipv4_to_uint32 FAIL ip_str='%s' ipv4_part='%s' rc=%d",
+                     ip_str, ipv4_part, rc);
+        return 0;
+    }
+
+    /* ip 是 ntohl 后的**主机序 big-endian 值**（最高位 = 第 1 个 octet）。
+     * 例："10.0.0.25" → inet_pton s_addr=0x1900000a(主机序原始值) → ntohl → 0x0a000019
+     * 高位在前：o1=10(最高), o2=0, o3=0, o4=25(最低) */
+    uint8_t o1 = (uint8_t)(ip >> 24);           /* 第 1 个 octet (最高位) */
+    uint8_t o2 = (uint8_t)((ip >> 16) & 0xff);  /* 第 2 个 octet */
+
+    /* 127.0.0.0/8      — loopback */
+    if (o1 == 127) return 1;
+    /* 10.0.0.0/8       — Class A private */
+    if (o1 == 10) return 1;
+    /* 172.16.0.0/12    — Class B private (172.16.0.0 ~ 172.31.255.255) */
+    if (o1 == 172 && (o2 & 0xf0) == 0x10) return 1;
+    /* 192.168.0.0/16   — Class C private */
+    if (o1 == 192 && o2 == 168) return 1;
+    /* 169.254.0.0/16   — link-local */
+    if (o1 == 169 && o2 == 254) return 1;
+    /* 100.64.0.0/10    — CGNAT (RFC 6598，云运营商内部网) */
+    if (o1 == 100 && (o2 & 0xc0) == 0x40) return 1;
+    /* 0.0.0.0/8        — "this network" (本机/未指定源) */
+    if (o1 == 0) return 1;
     return 0;
 }
 
@@ -1657,11 +1718,24 @@ int security_is_blocked(const nsbc_sa_t *src)
      *    （管理员不太可能把整个 10.0.0.0/8 配成黑名单，那会封掉内网所有设备）。 */
     if (ban_is_private_ip(ip)) return 0;
     /* 1. 动态封禁表（auto-ban） */
-    if (ban_is_banned(ip)) return 1;
+    if (ban_is_banned(ip)) {
+        static unsigned dbg = 0;
+        if (dbg++ % 1024 == 0)
+            log_notice("security",
+                       "security_is_blocked ip=%s via ban_is_banned (ban_until<=now? check)",
+                       ip);
+        return 1;
+    }
     /* 2. 静态 CIDR 黑名单（仅 block_on_register/invite 启用时） */
     if ((g_cfg.block_on_register || g_cfg.block_on_invite) &&
-        security_check_ip(ip, &g_cfg))
+        security_check_ip(ip, &g_cfg)) {
+        static unsigned dbg2 = 0;
+        if (dbg2++ % 1024 == 0)
+            log_notice("security",
+                       "security_is_blocked ip=%s via security_check_ip CIDR (block_on_reg=%d block_on_inv=%d)",
+                       ip, g_cfg.block_on_register, g_cfg.block_on_invite);
         return 1;
+    }
     return 0;
 }
 
@@ -1722,8 +1796,15 @@ static int sec_guard_cb(const char *src_ip, b2b_guard_evt_t evt, void *ud)
      * 完全跳过 ban mutex + hash 查找 + 计数更新。
      * ban_note_* / ban_is_banned 内部虽然也有 private IP 跳过，
      * 但还是要拿锁 + 哈希 + 链表遍历 —— 全是浪费。 */
-    if (ban_is_private_ip(src_ip))
-        return NSBC_OK;
+    int priv = ban_is_private_ip(src_ip);
+    if (priv) return NSBC_OK;
+    {
+        static unsigned dbg_guard_priv = 0;
+        if (dbg_guard_priv++ % 256 == 0)
+            log_notice("security",
+                       "sec_guard_cb src_ip='%s' ban_is_private_ip=%d (should be 1 for 10.x!)",
+                       src_ip, priv);
+    }
 
     if (evt == B2B_GUARD_AUTH_FAIL) {
         if (!g_cfg.auto_ban) return NSBC_OK;

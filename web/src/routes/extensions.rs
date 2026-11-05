@@ -54,6 +54,7 @@ pub struct ListQuery {
     pub extension: Option<String>,
     pub realm:     Option<String>,
     pub enabled:    Option<String>,   // "true"/"false" or empty
+    pub keyword:    Option<String>,
     pub limit:     Option<i64>,
     pub offset:    Option<i64>,
 }
@@ -78,6 +79,7 @@ pub async fn list<C: CoreApi + Clone + Send + Sync>(
             q.extension.as_deref(),
             q.realm.as_deref(),
             enabled,
+            q.keyword.as_deref(),
             limit, offset,
         )
         .await.map_err(|e| ApiError::Db(e.to_string()))?;

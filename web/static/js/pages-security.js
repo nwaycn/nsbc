@@ -82,27 +82,51 @@ app.component('security-center', {
               </template>
             </el-table-column>
           </el-table>
+          <!-- Bans 分页器 -->
+          <div v-if="banTotal > banLimit" class="flex justify-end pt-2">
+            <el-pagination
+              v-model:current-page="banPage"
+              :page-size="banLimit"
+              :total="banTotal"
+              layout="total, prev, pager, next"
+              small
+              background
+              @current-change="load"
+            ></el-pagination>
+          </div>
         </el-tab-pane>
 
         <!-- ================ Tab 2: Fence Rules ================ -->
         <el-tab-pane label="🛡️ Fence Rules" name="fence">
           <div class="flex items-center justify-between mb-3">
             <div class="flex items-center gap-3">
-              <el-radio-group v-model="blKind" size="small" @change="loadBl">
+              <el-radio-group v-model="blKind" size="small" @change="blPage=1; loadBl()">
                 <el-radio-button label="">{{ t('All') }}</el-radio-button>
                 <el-radio-button label="deny">{{ t('Blacklist (deny)') }}</el-radio-button>
                 <el-radio-button label="allow">{{ t('Whitelist (allow)') }}</el-radio-button>
               </el-radio-group>
-              <el-radio-group v-model="blType" size="small" @change="loadBl">
+              <el-radio-group v-model="blType" size="small" @change="blPage=1; loadBl()">
                 <el-radio-button label="">{{ t('All') }}</el-radio-button>
                 <el-radio-button label="ip_cidr">IP CIDR</el-radio-button>
                 <el-radio-button label="ua">UA</el-radio-button>
                 <el-radio-button label="called_prefix">{{ t('Called Prefix') }}</el-radio-button>
                 <el-radio-button label="caller_prefix">{{ t('Caller Prefix') }}</el-radio-button>
               </el-radio-group>
+              <el-input
+                v-model="blKeyword"
+                size="small"
+                style="width:240px"
+                :placeholder="t('Search value/notes...')"
+                clearable
+                @keyup.enter="blPage=1; loadBl()"
+                @clear="blPage=1; loadBl()"
+              >
+                <template #prefix><i class="fa-solid fa-magnifying-glass text-gray-400"></i></template>
+              </el-input>
+              <el-button size="small" type="primary" @click="blPage=1; loadBl()">{{ t('Search') }}</el-button>
             </div>
             <div class="flex items-center gap-2">
-              <el-button size="small" @click="loadBl">
+              <el-button size="small" @click="blPage=1; loadBl()">
                 <i class="fa-solid fa-rotate"></i> Refresh
               </el-button>
               <el-button size="small" type="primary" @click="openAdd">
@@ -164,6 +188,18 @@ app.component('security-center', {
               </template>
             </el-table-column>
           </el-table>
+          <!-- Blacklist 分页器 -->
+          <div v-if="blTotal > blLimit" class="flex justify-end pt-2">
+            <el-pagination
+              v-model:current-page="blPage"
+              :page-size="blLimit"
+              :total="blTotal"
+              layout="total, prev, pager, next"
+              small
+              background
+              @current-change="loadBl"
+            ></el-pagination>
+          </div>
 
           <!-- New Rule dialog -->
           <el-dialog v-model="dlgVisible" title="New Fence Rule" width="480px">
@@ -353,6 +389,7 @@ app.component('security-center', {
     // ============ Tab 1: Dynamic Ban ============
     const rows = ref([]), loading = ref(false), error = ref(null);
     const query = ref('');
+    const banPage = ref(1), banLimit = ref(50), banTotal = ref(0);
     let timer = null;
 
     function fmtDur(s) {
@@ -364,15 +401,18 @@ app.component('security-center', {
     async function load() {
       loading.value = true; error.value = null;
       try {
+        const params = new URLSearchParams({ limit: banLimit.value, offset: (banPage.value - 1) * banLimit.value });
         const q = (query.value || '').trim();
-        const data = await API.get('/security/bans' + (q ? '?query=' + encodeURIComponent(q) : ''));
+        if (q) params.set('query', q);
+        const data = await API.get('/security/bans?' + params.toString());
         rows.value = data.data || [];
+        banTotal.value = data.total || rows.value.length;
       } catch (e) {
         error.value = e.message;
       }
       loading.value = false;
     }
-    function reload() { load(); }
+    function reload() { banPage.value = 1; load(); }
 
     async function unban(ip) {
       try {
@@ -387,6 +427,8 @@ app.component('security-center', {
     // ============ Tab 2: Fence Rules ============
     const blRows = ref([]), blLoading = ref(false), blError = ref(null);
     const blKind = ref(''), blType = ref('');
+    const blKeyword = ref('');
+    const blPage = ref(1), blLimit = ref(50), blTotal = ref(0);
     const dlgVisible = ref(false), saving = ref(false);
     const form = reactive({ kind: 'deny', type: 'ip_cidr', value: '', comment: '', enabled: true });
 
@@ -412,12 +454,15 @@ app.component('security-center', {
     async function loadBl() {
       blLoading.value = true; blError.value = null;
       try {
-        const params = new URLSearchParams();
+        const params = new URLSearchParams({ limit: blLimit.value, offset: (blPage.value - 1) * blLimit.value });
         if (blKind.value) params.set('kind', blKind.value);
         if (blType.value) params.set('type', blType.value);
+        const kw = (blKeyword.value || '').trim();
+        if (kw) params.set('keyword', kw);
         const p = params.toString();
         const data = await API.get('/security/blacklist' + (p ? '?' + p : ''));
         blRows.value = data.items || [];
+        blTotal.value = data.total || blRows.value.length;
       } catch (e) {
         blError.value = e.message;
       }
@@ -537,7 +582,8 @@ app.component('security-center', {
     onBeforeUnmount(() => clearInterval(timer));
     return {
       tab, rows, loading, error, query, fmtDur, reload, load, unban,
-      blRows, blLoading, blError, blKind, blType, loadBl,
+      banPage, banLimit, banTotal,
+      blRows, blLoading, blError, blKind, blType, blKeyword, blPage, blLimit, blTotal, loadBl,
       dlgVisible, saving, form, openAdd, saveBl, toggleBl, removeBl,
       valueLabel, valuePlaceholder,
       cfg, cfgLoading, cfgError, cfgSaving,

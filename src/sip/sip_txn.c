@@ -303,6 +303,8 @@ int txn_mgr_create(const txn_mgr_cfg_t *cfg, txn_mgr_t **out)
         fprintf(stderr, "[txn] creating slab name=%s obj_size=%zu capacity=%d arena=%p\n",
                 sc.name, sc.obj_size, sc.capacity, (void *)sc.arena);
         if (mem_slab_create(&sc, &m->slab_own) != NSBC_OK) {
+            fprintf(stderr, "[txn] mem_slab_create FAILED name=%s capacity=%d obj_size=%zu\n",
+                    sc.name, sc.capacity, sc.obj_size);
             free(m);
             return NSBC_NOMEM;
         }

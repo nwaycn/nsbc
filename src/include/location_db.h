@@ -86,8 +86,10 @@ int loc_remove(loc_db_t *db, const char *aor, const char *contact);
 int loc_query(loc_db_t *db, const char *aor, loc_binding_t *out, int max,
               uint64_t now_ms);
 
-/* 到期扫描（由 oam ticker 周期调用）；返回删除条数 */
-int loc_sweep(loc_db_t *db, uint64_t now_ms);
+/* 到期扫描（由 oam ticker 周期调用）；返回删除条数
+ * 若 expunged_cb != NULL，每清一条回调一次（用于通知 Rust 侧 DB 同步 DELETE）。 */
+typedef void (*loc_expunge_cb)(const loc_binding_t *b, void *ud);
+int loc_sweep(loc_db_t *db, uint64_t now_ms, loc_expunge_cb cb, void *ud);
 
 uint64_t loc_db_count(loc_db_t *db);
 

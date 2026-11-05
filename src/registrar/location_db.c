@@ -290,7 +290,7 @@ int loc_query(loc_db_t *db, const char *aor, loc_binding_t *out, int max,
     return n;
 }
 
-int loc_sweep(loc_db_t *db, uint64_t now_ms)
+int loc_sweep(loc_db_t *db, uint64_t now_ms, loc_expunge_cb cb, void *ud)
 {
     int removed = 0;
     for (int i = 0; i < LOC_SHARDS; ++i) {
@@ -305,6 +305,8 @@ int loc_sweep(loc_db_t *db, uint64_t now_ms)
                     loc_node_t *p = *pp;
                     if (p->b.expire_ms && p->b.expire_ms <= now_ms) {
                         *pp = p->next;
+                        /* ★ 回调通知上层（如 registrar）—— 上层负责推 Rust 侧 DELETE */
+                        if (cb) cb(&p->b, ud);
                         mem_obj_release(p);
                         ++removed;
                         --s->n;

@@ -1093,24 +1093,28 @@ static void dispatch(ctl_conn_t *c, char *line)
         }
     } else if (strcmp(line, "show") == 0 &&
                strcmp(arg, "registrations") == 0) {
-        /* ---- show registrations：列出所有有效 binding（REQ-OAM-011 P1）---- */
+        /* ---- show registrations：列出所有有效 binding（REQ-OAM-011 P1）----
+         * buffer 单独放大到 4MB（比全局 CTL_OUT_MAX 大 16x），
+         * 因为注册数可能很多（测试 CPS=50 就有 ~2000+），每条 ~200 字节。
+         * summary 行用 loc_db_count 真实总数，shown 只是输出的条数。 */
         loc_db_t *db = g_ctx->binding_count_ud
                        ? (loc_db_t *)g_ctx->binding_count_ud : NULL;
-        char *body = malloc(CTL_OUT_MAX);
+        enum { REG_OUT_MAX = 4 * 1024 * 1024 }; /* 4MB */
+        char *body = malloc(REG_OUT_MAX);
         if (!body) {
             ctl_printf(c, "ERR oom\n");
         } else if (db) {
             struct { char *out; size_t cap; size_t pos; } ud;
-            ud.out = body; ud.cap = CTL_OUT_MAX; ud.pos = 0;
+            ud.out = body; ud.cap = REG_OUT_MAX; ud.pos = 0;
             uint64_t now = nsbc_now_ms();
             extern int cmd_reg_line_cb(const loc_binding_t *b, void *ud);
             int shown = loc_db_foreach(db, now, cmd_reg_line_cb, &ud);
-            if (ud.pos + 64 <= CTL_OUT_MAX) {
-                ud.pos += snprintf(ud.out + ud.pos, CTL_OUT_MAX - ud.pos,
-                                   "registrations=%d truncated=%d\n",
-                                   shown, ud.pos >= CTL_OUT_MAX);
-            }
-            ctl_write(c, body, strlen(body));
+            uint64_t total = loc_db_count(db);
+            int truncated = (shown < (int)total) || (ud.pos + 256 >= REG_OUT_MAX);
+            ud.pos += snprintf(ud.out + ud.pos, REG_OUT_MAX - ud.pos,
+                               "registrations=%llu shown=%d truncated=%d\n",
+                               (unsigned long long)total, shown, truncated);
+            ctl_write(c, body, ud.pos);
         } else {
             ctl_printf(c, "registrations=0\n");
         }
@@ -1815,11 +1819,27 @@ static void ctl_detach_sub(ctl_conn_t *c)
 static void on_conn_event(int fd, uint32_t ev, void *arg)
 {
     ctl_conn_t *c = (ctl_conn_t *)arg;
+    /* ★ 参数 fd 是 epoll 给的真值，永远正确。
+     * c->fd 可能被外部代码（dispatch 内的 quit 命令）改成 -1，
+     * 导致 reactor_del(re, -1) → INVAL → slots 没清 → 下一个 reactor_wait
+     * batch 继续 dispatch 到同一 fd，arg 已是已 free 的 c → UAF。
+     * 所以：**所有 fd 操作统一用参数 fd，绝不信 c->fd**。 */
+    fprintf(stderr, "[obs] ENTER fd=%d ev=0x%x c=%p c->fd=%d (epoll fd is truth)\n",
+            fd, (unsigned)ev, (void*)c, c ? c->fd : -999);
+    if (c && c->fd != fd) {
+        fprintf(stderr, "[obs] ⚠ c->fd(%d) != epoll fd(%d) — c->fd 被外部代码改过！\n",
+                c->fd, fd);
+    }
     if (ev & (EPOLLHUP | EPOLLERR)) {
+        fprintf(stderr, "[obs] HUP path fd=%d c=%p\n", fd, (void*)c);
         ctl_detach_sub(c);
-        reactor_del(g_ctx->re, c->fd);
-        close(c->fd);
+        fprintf(stderr, "[obs] HUP calling reactor_del(%p, %d)\n", (void*)g_ctx->re, fd);
+        int rc = reactor_del(g_ctx->re, fd);
+        fprintf(stderr, "[obs] HUP reactor_del returned rc=%d\n", rc);
+        close(fd);
+        fprintf(stderr, "[obs] HUP free(c=%p)\n", (void*)c);
         free(c);
+        fprintf(stderr, "[obs] HUP return\n");
         return;
     }
 
@@ -1829,24 +1849,33 @@ static void on_conn_event(int fd, uint32_t ev, void *arg)
         if (g_sub_hub && c->sub_topics) {
             obs_sub_flush(g_sub_hub, c);
             if (obs_sub_ring_empty(g_sub_hub, c) && g_ctx && g_ctx->re)
-                reactor_mod(g_ctx->re, c->fd, EPOLLIN);
+                reactor_mod(g_ctx->re, fd, EPOLLIN);
         }
     }
 
-    if (!(ev & EPOLLIN))
+    if (!(ev & EPOLLIN)) {
+        fprintf(stderr, "[obs] return (no EPOLLIN)\n");
         return;
+    }
 
     for (;;) {
-        ssize_t n = recv(c->fd, c->buf + c->n, sizeof(c->buf) - c->n, 0);
+        ssize_t n = recv(fd, c->buf + c->n, sizeof(c->buf) - c->n, 0);
         if (n <= 0) {
             if (n == 0) {
-                llog(LOG_NOTICE, "oam", "control client fd=%d closed (EOF)", c->fd);
+                fprintf(stderr, "[obs] EOF path fd=%d c=%p\n", fd, (void*)c);
+                llog(LOG_NOTICE, "oam", "control client fd=%d closed (EOF)", fd);
                 ctl_detach_sub(c);
-                reactor_del(g_ctx->re, c->fd);
-                close(c->fd);
+                fprintf(stderr, "[obs] EOF calling reactor_del(%p, %d)\n", (void*)g_ctx->re, fd);
+                int rc = reactor_del(g_ctx->re, fd);
+                fprintf(stderr, "[obs] EOF reactor_del returned rc=%d\n", rc);
+                close(fd);
+                fprintf(stderr, "[obs] EOF free(c=%p)\n", (void*)c);
                 free(c);
+            } else {
+                fprintf(stderr, "[obs] recv EAGAIN n=%zd fd=%d\n", n, fd);
             }
-            return; /* EAGAIN */
+            fprintf(stderr, "[obs] return (recv done)\n");
+            return;
         }
         c->n += (size_t)n;
         /* 逐行分发 */
@@ -1854,27 +1883,31 @@ static void on_conn_event(int fd, uint32_t ev, void *arg)
             char *lf = memchr(c->buf, '\n', c->n);
             if (!lf) {
                 if (c->n == sizeof(c->buf)) {
-                    /* ★ buf 满了还没有 \n — 命令超过 CTL_BUF_MAX。
-                     * 之前静默丢弃导致 Rust 端 "unknown command: <garbled>" 乱码。
-                     * 现在明确返回 ERR oversized command frame，让 Rust 端知道
-                     * 是 size 问题（CoreError::Protocol），而不是命令语法错误。 */
                     ctl_printf(c, "ERR oversized command frame (max %zu bytes)\n",
                                sizeof(c->buf));
                     c->n = 0;
                     llog(LOG_WARN, "oam",
                          "ctl fd=%d recv buf full (%zu) no \\n — command discarded",
-                         c->fd, sizeof(c->buf));
+                         fd, sizeof(c->buf));
                 }
+                fprintf(stderr, "[obs] break (no \\n)\n");
                 break;
             }
             size_t llen = (size_t)(lf - c->buf) + 1;
             *lf = '\0';
+            fprintf(stderr, "[obs] dispatch cmd=%s fd=%d c=%p\n", c->buf, fd, (void*)c);
             dispatch(c, c->buf);
+            fprintf(stderr, "[obs] dispatch returned c->fd=%d (epoll fd=%d)\n", c->fd, fd);
             if (c->fd < 0) { /* quit：就地释放 */
+                fprintf(stderr, "[obs] QUIT path fd=%d c=%p\n", fd, (void*)c);
                 ctl_detach_sub(c);
-                reactor_del(g_ctx->re, fd);
+                fprintf(stderr, "[obs] QUIT calling reactor_del(%p, %d)\n", (void*)g_ctx->re, fd);
+                int rc = reactor_del(g_ctx->re, fd);
+                fprintf(stderr, "[obs] QUIT reactor_del returned rc=%d\n", rc);
                 close(fd);
+                fprintf(stderr, "[obs] QUIT free(c=%p)\n", (void*)c);
                 free(c);
+                fprintf(stderr, "[obs] QUIT return\n");
                 return;
             }
             memmove(c->buf, c->buf + llen, c->n - llen);

@@ -32,6 +32,9 @@ typedef struct ep_ext {
     int used;
     int neg;
     int64_t neg_until_ms;
+    int64_t ha1_expire_ms;   /* 正缓存 TTL：0=永不过期（CSV 预加载）；
+                              * >0 到期后 L1 miss，触发 L2 重新查
+                              * （密码改了能在 TTL 内生效）。 */
     char clip[EP_CLIP_MAX];
     uint8_t clir;
     int max_contacts;

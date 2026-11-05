@@ -33,6 +33,7 @@ where C: CoreApi + Clone + 'static,
 pub struct ListQuery {
     pub tenant_id: Option<i64>,
     pub enabled: Option<String>,
+    pub keyword: Option<String>,
     pub limit:  Option<i64>,
     pub offset: Option<i64>,
 }
@@ -43,7 +44,7 @@ pub async fn list<C: CoreApi + Clone + Send + Sync>(
     st.db.pool().ok_or(ApiError::DbUnavailable)?;
     let enabled = match q.enabled.as_deref() { Some("true") => Some(true), Some("false") => Some(false), _ => None };
     let (items, total) = st.db
-        .list_queues(q.tenant_id, enabled, q.limit.unwrap_or(50).clamp(1, 500), q.offset.unwrap_or(0).max(0))
+        .list_queues(q.tenant_id, enabled, q.keyword.as_deref(), q.limit.unwrap_or(50).clamp(1, 500), q.offset.unwrap_or(0).max(0))
         .await.map_err(|e| ApiError::Db(e.to_string()))?;
     Ok(Json(json!({ "items": items, "total": total })))
 }
