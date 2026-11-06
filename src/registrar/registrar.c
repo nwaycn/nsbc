@@ -471,7 +471,7 @@ static void respond(reg_core_t *r, sip_tr_proto_t proto, const nsbc_sa_t *dst,
     if (dst) {
         char src_ip[INET6_ADDRSTRLEN] = "";
         uint16_t src_port = 0;
-        nsbc_sa_fmt_port(dst, src_ip, sizeof(src_ip), &src_port);
+        sa_to_str(dst, src_ip, sizeof(src_ip), &src_port);
         size_t len = (size_t)n;
         sip_via_patch_received_rport(out, &len, sizeof(out), src_ip, src_port);
     }

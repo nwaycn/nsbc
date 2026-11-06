@@ -830,8 +830,14 @@ static int respond_txn(b2b_core_t *co, sip_txn_t *t, int status,
     {
         const nsbc_sa_t *peer = txn_peer(t);
         char src_ip[INET6_ADDRSTRLEN] = "";
-        uint16_t src_port = 0;
-        nsbc_sa_fmt_port(peer, src_ip, sizeof(src_ip), &src_port);
+        uint16_t src_port = peer ? nsbc_sa_port(peer) : 0;
+        if (peer && peer->ss.ss_family == AF_INET) {
+            inet_ntop(AF_INET, &((const struct sockaddr_in *)&peer->ss)->sin_addr,
+                      src_ip, sizeof(src_ip));
+        } else if (peer && peer->ss.ss_family == AF_INET6) {
+            inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)&peer->ss)->sin6_addr,
+                      src_ip, sizeof(src_ip));
+        }
         size_t len = (size_t)n;
         sip_via_patch_received_rport(out, &len, sizeof(out), src_ip, src_port);
     }
