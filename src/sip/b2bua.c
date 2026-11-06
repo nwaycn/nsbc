@@ -4866,19 +4866,19 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
             (rp && rp->ss.ss_family == AF_UNSPEC) ? g_ws_bridge_proto
                                                   : SIP_TR_UDP;
         int handled = 0;
-        llog(LOG_INFO, "b2b", "REGISTER hook chain start: n=%d ha_active=%d src_fam=%d",
+        llog(LOG_DEBUG, "b2b", "REGISTER hook chain start: n=%d ha_active=%d src_fam=%d",
              g_reg_hook_n, ha_role() == HA_ROLE_ACTIVE,
              rp ? rp->ss.ss_family : -1);
         pthread_mutex_lock(&g_reg_hook_lock);
         for (int i = 0; i < g_reg_hook_n; ++i) {
             int rc = g_reg_hooks[i].fn(reg_proto, rp, (sip_msg_t*)m, NULL,
                                        0, t, g_reg_hooks[i].ud);
-            llog(LOG_INFO, "b2b", "REGISTER hook[%d] rc=%d", i, rc);
+            llog(LOG_DEBUG, "b2b", "REGISTER hook[%d] rc=%d", i, rc);
             if (rc == NSBC_PERM_DENIED) { handled = 1; break; }
             if (rc == NSBC_OK) handled = 1;
         }
         pthread_mutex_unlock(&g_reg_hook_lock);
-        llog(LOG_INFO, "b2b", "REGISTER hook chain end: handled=%d", handled);
+        llog(LOG_DEBUG, "b2b", "REGISTER hook chain end: handled=%d", handled);
         if (!handled)
             respond_txn(co, t, 501, NULL, NULL, NULL, 0);
         return;

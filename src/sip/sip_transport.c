@@ -1218,7 +1218,7 @@ int sip_tr_send(sip_transport_t *t, sip_tr_proto_t proto,
                                    i, t->udp_fds[i], p);
             strncat(fdlist, tmp, sizeof(fdlist) - strlen(fdlist) - 1);
         }
-        llog(LOG_INFO, "sip-tr",
+        llog(LOG_DEBUG, "sip-tr",
              "UDP send: g_rx_local_port=%u fd_count=%d fds=%s",
              use_port, t->udp_fd_count, fdlist);
         if (use_port > 0 && t->udp_fd_count > 1) {
@@ -1228,7 +1228,7 @@ int sip_tr_send(sip_transport_t *t, sip_tr_proto_t proto,
                     getsockname(t->udp_fds[i], (struct sockaddr *)&sin, &sl) == 0 &&
                     ntohs(sin.sin_port) == use_port) {
                     udp = t->udp_fds[i];
-                    llog(LOG_INFO, "sip-tr", "UDP send match: i=%d fd=%d port=%u", i, udp, use_port);
+                    llog(LOG_DEBUG, "sip-tr", "UDP send match: i=%d fd=%d port=%u", i, udp, use_port);
                     break;
                 }
             }

@@ -134,7 +134,7 @@ static void t_send(sip_txn_t *t, const char *buf, size_t len)
         g_rx_local_port = t->local_port;
     if (t->mgr->cfg.send) {
         char ps[128]; nsbc_sa_fmt(&t->peer, ps, sizeof(ps));
-        llog(LOG_INFO, "txn", "t_send: method=%d kind=%d len=%zu peer=%s reliable=%d",
+        llog(LOG_DEBUG, "txn", "t_send: method=%d kind=%d len=%zu peer=%s reliable=%d",
              t->method, t->kind, len, ps, t->reliable);
         t->mgr->cfg.send(t->mgr->cfg.send_ud, buf, len, &t->peer,
                          t->reliable);
@@ -834,11 +834,29 @@ int txn_server_input(txn_mgr_t *m, sip_msg_t *msg, const nsbc_sa_t *src,
          * 导致 t->resp 永远 NULL，auth challenge retry 只能靠 branch 复用命中。
          * 现在 registrar 走 txn_send_response，401/200 都会让 NIST 进入 COMPLETED，
          * 后续同 branch 包一律视为重传，重放 resp。client 侧 outreg 每次 auth retry
-         * 都新建 txn（新 branch），走正常 NEW 路径。 */
-        t_send(t, t->resp, t->resp_len);
-        __atomic_add_fetch(&m->rin, 1, __ATOMIC_RELAXED);
-        __atomic_add_fetch(&m->rout, 1, __ATOMIC_RELAXED);
-        pthread_mutex_unlock(&s->lock);
+         * 都新建 txn（新 branch），走正常 NEW 路径。
+         *
+         * NIST COMPLETED 后不再 replay：
+         * sipp 收到 200 OK → 匹配 scenario → 进入 Pause。
+         * UDP retrans timer 之前已触发 → retrans 包在路上 → 服务器 replay →
+         * Paused call 收到第二个 200 OK → Unexpected-Msg 爆炸。
+         * 根因是 sipp scenario 固定用 <recv response="200"/>，
+         * 只接受一次 200 OK，replay 来的就是 Unexpected。
+         *
+         * 内网 UDP 压测几乎无丢包（InErrors=0），replay 无意义。
+         * 生产如果真要应对丢包，应靠 UDS 应用层可靠性，不靠 txn 重放。
+         * RFC 3261 §17.1.1 也没强制 NIST 重传响应。 */
+        if (t->kind == TXN_NIST && t->state >= TXN_NIST_COMPLETED) {
+            /* NIST 已 COMPLETED：吸收 retrans，完全不 replay */
+            __atomic_add_fetch(&m->rin, 1, __ATOMIC_RELAXED);
+            pthread_mutex_unlock(&s->lock);
+        } else {
+            /* IST/NICT/ICT 等 INVITE 相关事务照常 replay */
+            t_send(t, t->resp, t->resp_len);
+            __atomic_add_fetch(&m->rin, 1, __ATOMIC_RELAXED);
+            __atomic_add_fetch(&m->rout, 1, __ATOMIC_RELAXED);
+            pthread_mutex_unlock(&s->lock);
+        }
     } else {
         /* 尚无响应可重发：说明 registrar 还在处理中，吸收重传，避免重复 TU */
         __atomic_add_fetch(&m->rin, 1, __ATOMIC_RELAXED);
@@ -949,8 +967,11 @@ int txn_send_response(sip_txn_t *t, const char *buf, size_t len,
             if (tw_del(m->cfg.tw, &t->tm_dead))
                 t_unref(t); /* 抵消 arm 时的 ref */
             if (!t->reliable) {
-                arm(t, &t->tm_dead, 64u * m->cfg.t1_ms, cb_dead,
-                    now_ms); /* J */
+                /* Timer J：RFC3261 定义 64×T1=32s，但 REGISTER/SUBSCRIBE 等 NIST
+                 * 无 retrans 探测（客户端不会发同 branch 的东西回来），
+                 * 用 4×T1=2s 足够吸收 UDP retrans，且 slab 占用 = 900CPS×2×2s=3600。
+                 * 设固定值避免 T1 配置影响（部分场景 T1=50ms 时 64×T1=3.2s 太短）。 */
+                arm(t, &t->tm_dead, 2000u, cb_dead, now_ms); /* J: 2s */
             } else {
                 t->dead = 1;
                 nsbc_hnode_t **pp = bucket_for_hash(s, hash);

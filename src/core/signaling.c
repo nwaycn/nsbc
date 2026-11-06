@@ -85,18 +85,18 @@ static int tr_send_cb(void *ud, const char *buf, size_t len,
     if (!s->tr)
         return NSBC_ERR;
     int fam = dst ? dst->ss.ss_family : -1;
-    llog(LOG_INFO, "txn-send-cb", "len=%zu fam=%d reliable=%d dst_p=%p",
+    llog(LOG_DEBUG, "txn-send-cb", "len=%zu fam=%d reliable=%d dst_p=%p",
          len, fam, reliable, (const void *)dst);
     /* WS/WSS：dst.ss_family == AF_UNSPEC 是 ws bridge 约定（藏 ws_conn*）。
      * 不能走 TCP/UDP 分支 — 那些按 IP:port 匹配连接，AF_UNSPEC 匹配不上。
      * 用全局 g_ws_bridge_proto 判断（WS vs WSS 由配置决定）。 */
     if (fam == AF_UNSPEC) {
         extern sip_tr_proto_t g_ws_bridge_proto;  /* sig_ws_bridge_init 设 */
-        llog(LOG_INFO, "txn-send-cb", "→ WS/WSS branch proto=%d", (int)g_ws_bridge_proto);
+        llog(LOG_DEBUG, "txn-send-cb", "→ WS/WSS branch proto=%d", (int)g_ws_bridge_proto);
         return sip_tr_send(s->tr, g_ws_bridge_proto, buf, len, dst);
     }
     /* P0：TCP/TLS 仅复用入向连接（sip_tr_send 内部匹配），UDP 直发 */
-    llog(LOG_INFO, "txn-send-cb", "→ TCP/UDP branch reliable=%d", reliable);
+    llog(LOG_DEBUG, "txn-send-cb", "→ TCP/UDP branch reliable=%d", reliable);
     return sip_tr_send(s->tr, reliable ? SIP_TR_TCP : SIP_TR_UDP, buf, len,
                        dst);
 }

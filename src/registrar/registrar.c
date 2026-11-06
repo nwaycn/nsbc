@@ -10,6 +10,7 @@
 #include "uDS_client.h"
 #include "log.h"
 #include "net_sock.h"
+#include <time.h>       /* clock_gettime(CLOCK_MONOTONIC) — perf 计时 */
 
 /* signaling.c：从 AF_UNSPEC nsbc_sa_t padding 提取 ws_conn*
  * （WS/WSS REGISTER 的 src 藏有 conn 指针，见 sig_ws_bridge_rx） */
@@ -530,6 +531,11 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
     uint64_t now = nsbc_now_ms();
     __sync_fetch_and_add(&r->n_total, 1);
 
+    /* ---- PERF: entry timestamp (CLOCK_MONOTONIC microseconds) ---- */
+    struct timespec _t0;
+    clock_gettime(CLOCK_MONOTONIC, &_t0);
+    int _rc = NSBC_OK;  /* 所有 return 改成 goto reg_out，这里存返回值 */
+
     /* src IP 字符串（fail2ban 日志用） */
     char src_ip[INET6_ADDRSTRLEN] = "-";
     if (src) {
@@ -564,8 +570,7 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
             respond(r, proto, src, m, 403,
                     "External profile does not accept registrations",
                     NULL, 0, txn);
-            txn_force_terminate(txn); /* final response → 立即释放 NIST */
-            return NSBC_OK;
+            _rc = NSBC_OK; goto reg_out;
         }
     }
 
@@ -574,7 +579,7 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
     if (!toh || sip_hdr_parse_addr(toh) != NSBC_OK ||
         !toh->u.addr.uri.user.p) {
         respond(r, proto, src, m, 400, NULL, NULL, 0, txn);
-        return NSBC_OK;
+        _rc = NSBC_OK; goto reg_out;
     }
     char aor[LOC_AOR_MAX];
     sip_uri_t *u = &toh->u.addr.uri;
@@ -614,8 +619,7 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
         snprintf(extra, sizeof(extra), "Retry-After: %d\r\n",
                  r->cfg.retry_after_s);
         respond(r, proto, src, m, 503, extra, NULL, 0, txn);
-        txn_force_terminate(txn); /* final response → 立即释放 NIST */
-        return NSBC_OK;
+        _rc = NSBC_OK; goto reg_out;
     }
 
     /* Digest 鉴权 —— realm 用 REGISTER 请求 To 头的 URI host（reg_realm），
@@ -649,7 +653,7 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
                  "aor=%s user_len=%zu realm=%s src_ip=%s auth_present=%d",
                  aor, u->user.len, reg_realm,
                  src_ip, auth ? 1 : 0);
-            return NSBC_OK;
+            _rc = NSBC_OK; goto reg_out;
         }
         /* HA1 存在 → 继续正常流程（无论 auth 头有没有） */
     }
@@ -665,7 +669,7 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
              "key=fail2ban src_ip=%s reason=no_auth_header aor=%s",
              src_ip, aor);
         respond(r, proto, src, m, 401, extra, NULL, 0, txn);
-        return NSBC_OK;
+        _rc = NSBC_OK; goto reg_out;
     }
     llog(LOG_DEBUG, "reg", "REGISTER with Authorization header → verifying...");
     dig_auth_rc_t ar = digest_verify(&dig, m, &auth->u.auth, now);
@@ -676,7 +680,7 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
         snprintf(extra, sizeof(extra), "WWW-Authenticate: %s\r\n", ch);
         llog(LOG_DEBUG, "reg", "REGISTER → 401 stale nonce");
         respond(r, proto, src, m, 401, extra, NULL, 0, txn);
-        return NSBC_OK;
+        _rc = NSBC_OK; goto reg_out;
     }
     if (ar != DIG_AUTH_OK) {
         __sync_fetch_and_add(&r->n_rej, 1);
@@ -704,8 +708,7 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
          * 阈值自动封禁该 IP，后续 REGISTER/INVITE 静默丢弃） */
         b2b_guard_notify(src_ip, B2B_GUARD_AUTH_FAIL);
         respond(r, proto, src, m, 403, NULL, NULL, 0, txn);
-        txn_force_terminate(txn); /* final response → 立即释放 NIST */
-        return NSBC_OK;
+        _rc = NSBC_OK; goto reg_out;
     }
     llog(LOG_DEBUG, "reg", "REGISTER auth OK → processing loc_add...");
     b2b_guard_notify(src_ip, B2B_GUARD_AUTH_OK); /* auth OK：通知 security 清零 fail/ratelimit 计数 */
@@ -793,7 +796,7 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
     /* Contact: * 整 AoR 注销 */
     sip_hdr_t *ch0 = sip_hdr_get(m, SIP_H_CONTACT);
     sip_hdr_t contact_tmp; /* 提前声明，避免 GCC 12 dangling-pointer */
-    llog(LOG_INFO, "reg", "loc_add: Contact hdr ptr=%p star=%d val_len=%zd",
+    llog(LOG_DEBUG, "reg", "loc_add: Contact hdr ptr=%p star=%d val_len=%zd",
          (void*)ch0, ch0 ? (int)ch0->u.addr.star : 0,
          ch0 ? ch0->value.len : 0);
     if (ch0) {
@@ -822,18 +825,17 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
             respond(r, proto, src, m, 200, "Contact: *\r\nExpires: 0\r\n",
                     NULL, 0, txn);
         }
-        txn_force_terminate(txn); /* REGISTER 200 OK 后立即释放 NIST，不等 Timer J 32s */
-        return NSBC_OK;
+        _rc = NSBC_OK; goto reg_out;
     }
 
     /* 逐 Contact 处理 */
     int nc = 0;
     for (sip_hdr_t *h = ch0; h; h = sip_hdr_next(m, h)) {
-        llog(LOG_INFO, "reg", "loc_add loop: h=%p type=%d", (void*)h, h->type);
+        llog(LOG_DEBUG, "reg", "loc_add loop: h=%p type=%d", (void*)h, h->type);
         if (h->type != SIP_H_CONTACT)
             continue;
         int prc = sip_hdr_parse_addr(h);
-        llog(LOG_INFO, "reg", "loc_add: parse_addr rc=%d star=%d val_len=%zd val=%.100s", prc,
+        llog(LOG_DEBUG, "reg", "loc_add: parse_addr rc=%d star=%d val_len=%zd val=%.100s", prc,
              prc == NSBC_OK ? (int)h->u.addr.star : -1,
              h->value.len, h->value.p ? h->value.p : "(null)");
         if (prc != NSBC_OK)
@@ -846,8 +848,7 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
             snprintf(extra, sizeof(extra), "Min-Expires: %d\r\n",
                      r->cfg.min_expires);
             respond(r, proto, src, m, 423, extra, NULL, 0, txn);
-            txn_force_terminate(txn); /* final response → 立即释放 NIST */
-            return NSBC_OK;
+            _rc = NSBC_OK; goto reg_out;
         }
         if (exp > r->cfg.max_expires)
             exp = r->cfg.max_expires;
@@ -950,10 +951,10 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
         } else {
             /* 公网直连（含 WS/WSS）：public_contact = 原始 Contact */
             snprintf(b.public_contact, sizeof(b.public_contact), "%s", b.contact);
-            llog(LOG_INFO, "reg", "no NAT contact=%s src=%s:%u", b.contact, src_ip, src_port);
+            llog(LOG_DEBUG, "reg", "no NAT contact=%s src=%s:%u", b.contact, src_ip, src_port);
         }
 
-        llog(LOG_INFO, "reg", "loc_upsert call: aor=%s contact=%s public=%s nat=%d expire_ms=%lu exp=%ld now=%lu",
+        llog(LOG_DEBUG, "reg", "loc_upsert call: aor=%s contact=%s public=%s nat=%d expire_ms=%lu exp=%ld now=%lu",
              b.aor, b.contact, b.public_contact, b.nat_detected,
              (unsigned long)b.expire_ms, exp, (unsigned long)now);
         loc_rc_t rc = loc_upsert(r->cfg.db, &b, now);
@@ -962,8 +963,7 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
             snprintf(extra, sizeof(extra), "Retry-After: %d\r\n",
                      r->cfg.retry_after_s);
             respond(r, proto, src, m, 503, extra, NULL, 0, txn);
-            txn_force_terminate(txn); /* final response → 立即释放 NIST */
-            return NSBC_OK;
+            _rc = NSBC_OK; goto reg_out;
         }
         if (rc != LOC_OK) {
             /* LOC_STALE_CSEQ = 同 Call-ID CSeq 回退，LOC_EXPIRED = upsert 时已过期 */
@@ -979,8 +979,7 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
         /* 无 Contact 且非 *：查询口径（P0 直接 200 空列表） */
         respond(r, proto, src, m, 200,
                 hdr_prefix[0] ? hdr_prefix : NULL, NULL, 0, txn);
-        txn_force_terminate(txn); /* REGISTER 200 OK 后立即释放 NIST，不等 Timer J 32s */
-        return NSBC_OK;
+        _rc = NSBC_OK; goto reg_out;
     }
 
     /* 200 回显当前绑定 */
@@ -1003,8 +1002,26 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
         used += (size_t)w;
     }
     respond(r, proto, src, m, 200, extra[0] ? extra : NULL, NULL, 0, txn);
-    txn_force_terminate(txn); /* REGISTER 200 OK 后立即释放 NIST，不等 Timer J 32s */
-    return NSBC_OK;
+    _rc = NSBC_OK; goto reg_out;
+
+    /* ================================================================
+     * reg_out: 所有 exit 路径统一汇聚点
+     *   - 计算 handler 耗时（CLOCK_MONOTONIC → 微秒）
+     *   - LOG_DEBUG 输出（默认 nsbc.yaml info 级别不会打印，零开销）
+     * ================================================================ */
+reg_out:
+    {
+        struct timespec _t1;
+        clock_gettime(CLOCK_MONOTONIC, &_t1);
+        uint64_t _elapsed_us = (uint64_t)(_t1.tv_sec - _t0.tv_sec) * 1000000ULL
+                             + (uint64_t)(_t1.tv_nsec - _t0.tv_nsec) / 1000ULL;
+        /* aor 在 line 586 之后才计算；早期 exit 点用 "-" 占位 */
+        llog(LOG_DEBUG, "reg-perf",
+             "REGISTER handler exit aor=%s elapsed=%lu us",
+             aor[0] ? aor : "-",
+             (unsigned long)_elapsed_us);
+    }
+    return _rc;
 }
 
 uint64_t reg_total(reg_core_t *r)

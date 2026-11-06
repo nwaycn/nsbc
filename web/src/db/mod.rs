@@ -826,9 +826,14 @@ impl Db {
 
     // ---- Phase 1: 异步批量写入 submit_* 方法 ----
     // 所有方法立即返回 Ok(())，实际写入由后台 DbBatch consumer task 执行。
-    // pool=None 或 channel 满降级：同步 fallback 写（队满只 warn 不丢数据）。
+    // pool=None 或 channel 满降级：spawn 独立 task 同步 fallback 写。
     //
-    // 关键：closure 必须先于 item 构造 — closure FnOnce 捕获参数的 owned 值（move），
+    // ⚠️ 关键修复（原 rt.block_on 在 tokio worker 内调 → panic abort → SIGABRT core dump）：
+    //    fallback 不能 block_on，因为 submit_* 本身就在 tokio runtime worker 里被调（UDS handler）。
+    //    改用 tokio::spawn 独立 task — 不阻塞当前 worker，不 panic，
+    //    和 DbBatch consumer 并行执行（独立写 Pool，不抢 batch channel）。
+    //
+    // closure 必须先于 item 构造 — closure FnOnce 捕获参数的 owned 值（move），
     // 然后 item 用 clone() 的副本；这样 try_send Full 路径下 closure 有自己的 owned copy。
 
     pub fn submit_session(
@@ -847,20 +852,40 @@ impl Db {
         b_peer_ip: String,
     ) {
         let Some(batch) = self.batch.as_ref() else { return; };
-        let fallback = || {
-            let rt = tokio::runtime::Handle::current();
-            let _ = rt.block_on(
-                self.upsert_call(
-                    &call_id, &from_num, &to_num, &dir, &state, &event, cause,
-                    &from_ip, &codec_a, &codec_b, &a_peer_ip, &b_peer_ip,
-                )
-            );
+        // ★ 先 clone 一份给 move 闭包，再用原始参数构造 DbBatchItem
+        let call_id_fb = call_id.clone();
+        let from_num_fb = from_num.clone();
+        let to_num_fb = to_num.clone();
+        let dir_fb = dir.clone();
+        let state_fb = state.clone();
+        let event_fb = event.clone();
+        let from_ip_fb = from_ip.clone();
+        let codec_a_fb = codec_a.clone();
+        let codec_b_fb = codec_b.clone();
+        let a_peer_ip_fb = a_peer_ip.clone();
+        let b_peer_ip_fb = b_peer_ip.clone();
+        let pool_clone = self.pool.clone();
+        let fallback = move || {
+            tokio::spawn(async move {
+                if let Some(pool) = pool_clone.as_ref() {
+                    let _ = sqlx::query(
+                        "INSERT INTO sessions \
+                         (call_id, from_num, to_num, dir, state, event, cause, \
+                          from_ip, codec_a, codec_b, a_peer_ip, b_peer_ip) \
+                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
+                    )
+                    .bind(&call_id_fb).bind(&from_num_fb).bind(&to_num_fb).bind(&dir_fb)
+                    .bind(&state_fb).bind(&event_fb).bind(cause)
+                    .bind(&from_ip_fb).bind(&codec_a_fb).bind(&codec_b_fb)
+                    .bind(&a_peer_ip_fb).bind(&b_peer_ip_fb)
+                    .execute(pool.as_ref())
+                    .await;
+                }
+            });
         };
         let item = DbBatchItem::Session {
-            call_id: call_id.clone(), from_num: from_num.clone(), to_num: to_num.clone(),
-            dir: dir.clone(), state: state.clone(), event: event.clone(), cause,
-            from_ip: from_ip.clone(), codec_a: codec_a.clone(), codec_b: codec_b.clone(),
-            a_peer_ip: a_peer_ip.clone(), b_peer_ip: b_peer_ip.clone(),
+            call_id, from_num, to_num, dir, state, event, cause,
+            from_ip, codec_a, codec_b, a_peer_ip, b_peer_ip,
         };
         batch.try_send(item, fallback);
     }
@@ -880,21 +905,79 @@ impl Db {
         transport: Option<String>,
     ) {
         let Some(batch) = self.batch.as_ref() else { return; };
-        let fallback = || {
-            let rt = tokio::runtime::Handle::current();
-            let _ = rt.block_on(
-                self.upsert_registration(
-                    &user_name, contact.as_deref(), &instance_id, agent.as_deref(), expires_sec,
-                    received_ip.as_deref(), received_port, nat_detected,
-                    public_contact.as_deref(), transport.as_deref(),
-                )
-            );
+        // ★ clone 给 move 闭包一份，原始参数移交给 DbBatchItem
+        let user_name_fb = user_name.clone();
+        let contact_fb = contact.clone();
+        let instance_id_fb = instance_id.clone();
+        let agent_fb = agent.clone();
+        let received_ip_fb = received_ip.clone();
+        let public_contact_fb = public_contact.clone();
+        let transport_fb = transport.clone();
+        let pool_clone = self.pool.clone();
+        let backend_clone = self.backend.clone();
+        let fallback = move || {
+            tokio::spawn(async move {
+                let Some(pool) = pool_clone.as_ref() else { return; };
+                if expires_sec == 0 {
+                    let _ = sqlx::query(
+                        "DELETE FROM registrations WHERE user_name = $1 AND instance_id = $2"
+                    )
+                    .bind(&user_name_fb).bind(&instance_id_fb)
+                    .execute(pool.as_ref()).await;
+                    return;
+                }
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64).unwrap_or(0);
+                let expires_at = ms_to_iso(now_ms + expires_sec as u64 * 1000);
+                let updated_at = ms_to_iso(now_ms);
+                let received_ip  = received_ip_fb.as_deref().and_then(|s| if s.is_empty() { None } else { Some(s) });
+                let public_contact = public_contact_fb.as_deref().and_then(|s| if s.is_empty() { None } else { Some(s) });
+                let transport    = transport_fb.as_deref().and_then(|s| if s.is_empty() { None } else { Some(s) });
+                let sql = match backend_clone.as_deref() {
+                    Some("sqlite") | Some("postgres") => {
+                        "INSERT INTO registrations \
+                         (user_name, contact, instance_id, agent, expires_at, updated_at, \
+                          received_ip, received_port, nat_detected, public_contact, transport) \
+                         VALUES (?,?,?,?,?,?,?,?,?,?,?) \
+                         ON CONFLICT(user_name, instance_id) DO UPDATE SET \
+                         contact=excluded.contact, expires_at=excluded.expires_at, \
+                         updated_at=excluded.updated_at, received_ip=excluded.received_ip, \
+                         received_port=excluded.received_port, nat_detected=excluded.nat_detected, \
+                         public_contact=excluded.public_contact, transport=excluded.transport"
+                    }
+                    Some("mysql") => {
+                        "INSERT INTO registrations \
+                         (user_name, contact, instance_id, agent, expires_at, updated_at, \
+                          received_ip, received_port, nat_detected, public_contact, transport) \
+                         VALUES (?,?,?,?,?,?,?,?,?,?,?) \
+                         ON DUPLICATE KEY UPDATE \
+                         contact=VALUES(contact), expires_at=VALUES(expires_at), \
+                         updated_at=VALUES(updated_at), received_ip=VALUES(received_ip), \
+                         received_port=VALUES(received_port), nat_detected=VALUES(nat_detected), \
+                         public_contact=VALUES(public_contact), transport=VALUES(transport)"
+                    }
+                    _ => {
+                        "INSERT OR REPLACE INTO registrations \
+                         (user_name, contact, instance_id, agent, expires_at, updated_at, \
+                          received_ip, received_port, nat_detected, public_contact, transport) \
+                         VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+                    }
+                };
+                let received_port_i64 = received_port.unwrap_or(0);
+                let nat_detected_i64  = nat_detected.unwrap_or(0);
+                let _ = sqlx::query(sql)
+                    .bind(&user_name_fb).bind(contact_fb.as_deref()).bind(&instance_id_fb)
+                    .bind(agent_fb.as_deref()).bind(&expires_at).bind(&updated_at)
+                    .bind(received_ip).bind(received_port_i64).bind(nat_detected_i64)
+                    .bind(public_contact).bind(transport)
+                    .execute(pool.as_ref()).await;
+            });
         };
         let item = DbBatchItem::Register {
-            user_name: user_name.clone(), contact: contact.clone(),
-            instance_id: instance_id.clone(), agent: agent.clone(), expires_sec,
-            received_ip: received_ip.clone(), received_port, nat_detected,
-            public_contact: public_contact.clone(), transport: transport.clone(),
+            user_name, contact, instance_id, agent, expires_sec,
+            received_ip, received_port, nat_detected,
+            public_contact, transport,
         };
         batch.try_send(item, fallback);
     }
@@ -927,27 +1010,63 @@ impl Db {
         threat_reason: Option<String>,
     ) {
         let Some(batch) = self.batch.as_ref() else { return; };
-        let fallback = || {
-            let rt = tokio::runtime::Handle::current();
-            let _ = rt.block_on(
-                self.insert_cdr(
-                    &call_id, tenant.as_deref(), &from_num, &to_num, trunk.as_deref(),
-                    rec_path.as_deref(), &dir, &phase, &disposition,
-                    start_ms, answer_ms, end_ms, billsec, duration_s, cause, emergency,
-                    from_ip.as_deref(), codec_a.as_deref(), codec_b.as_deref(),
-                    a_peer_ip.as_deref(), b_peer_ip.as_deref(), is_malicious, threat_reason.as_deref(),
-                )
-            );
+        // ★ clone 给 move 闭包一份，原始参数移交给 DbBatchItem
+        let call_id_fb = call_id.clone();
+        let tenant_fb = tenant.clone();
+        let from_num_fb = from_num.clone();
+        let to_num_fb = to_num.clone();
+        let trunk_fb = trunk.clone();
+        let rec_path_fb = rec_path.clone();
+        let dir_fb = dir.clone();
+        let phase_fb = phase.clone();
+        let disposition_fb = disposition.clone();
+        let from_ip_fb = from_ip.clone();
+        let codec_a_fb = codec_a.clone();
+        let codec_b_fb = codec_b.clone();
+        let a_peer_ip_fb = a_peer_ip.clone();
+        let b_peer_ip_fb = b_peer_ip.clone();
+        let threat_reason_fb = threat_reason.clone();
+        let pool_clone = self.pool.clone();
+        let fallback = move || {
+            tokio::spawn(async move {
+                if let Some(pool) = pool_clone.as_ref() {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64).unwrap_or(0);
+                    let phase_time = ms_to_iso(now_ms);
+                    let sql = "INSERT INTO cdrs \
+                        (call_id, tenant, from_num, to_num, trunk, rec_path, dir, phase, disposition, \
+                         start_time, answer_time, end_time, billsec, duration_s, cause, emergency, \
+                         from_ip, codec_a, codec_b, a_peer_ip, b_peer_ip, \
+                         is_malicious, threat_reason) \
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)";
+                    let _ = sqlx::query(sql)
+                        .bind(&call_id_fb).bind(tenant_fb.as_deref()).bind(&from_num_fb).bind(&to_num_fb)
+                        .bind(trunk_fb.as_deref()).bind(rec_path_fb.as_deref()).bind(&dir_fb)
+                        .bind(&phase_fb).bind(&disposition_fb)
+                        .bind(ms_to_iso(start_ms)).bind(ms_to_iso(answer_ms))
+                        .bind(ms_to_iso(end_ms)).bind(billsec as i64).bind(duration_s as i64)
+                        .bind(cause).bind(emergency as i32)
+                        .bind(from_ip_fb.as_deref())
+                        .bind(codec_a_fb.as_deref()).bind(codec_b_fb.as_deref())
+                        .bind(a_peer_ip_fb.as_deref()).bind(b_peer_ip_fb.as_deref())
+                        .bind(is_malicious as i32).bind(threat_reason_fb.as_deref())
+                        .execute(pool.as_ref()).await;
+                    let _ = sqlx::query(
+                        "INSERT INTO runtime_states (call_id, state, detail, phase_time) VALUES ($1,$2,$3,$4) \
+                         ON CONFLICT(call_id, state) DO UPDATE SET detail=excluded.detail, phase_time=excluded.phase_time"
+                    )
+                    .bind(&call_id_fb).bind("CDR").bind(&disposition_fb).bind(&phase_time)
+                    .execute(pool.as_ref()).await;
+                }
+            });
         };
         let item = DbBatchItem::Cdr {
-            call_id: call_id.clone(), tenant: tenant.clone(),
-            from_num: from_num.clone(), to_num: to_num.clone(),
-            trunk: trunk.clone(), rec_path: rec_path.clone(),
-            dir: dir.clone(), phase: phase.clone(), disposition: disposition.clone(),
+            call_id, tenant, from_num, to_num, trunk, rec_path,
+            dir, phase, disposition,
             start_ms, answer_ms, end_ms, billsec, duration_s, cause, emergency,
-            from_ip: from_ip.clone(), codec_a: codec_a.clone(), codec_b: codec_b.clone(),
-            a_peer_ip: a_peer_ip.clone(), b_peer_ip: b_peer_ip.clone(),
-            is_malicious, threat_reason: threat_reason.clone(),
+            from_ip, codec_a, codec_b, a_peer_ip, b_peer_ip,
+            is_malicious, threat_reason,
         };
         batch.try_send(item, fallback);
     }
@@ -959,11 +1078,25 @@ impl Db {
         detail: Option<String>,
     ) {
         let Some(batch) = self.batch.as_ref() else { return; };
-        let fallback = || {
-            let rt = tokio::runtime::Handle::current();
-            let _ = rt.block_on(
-                self.insert_runtime_state(&call_id, &state, detail.as_deref())
-            );
+        let call_id_fb = call_id.clone();
+        let state_fb = state.clone();
+        let detail_fb = detail.clone();
+        let pool_clone = self.pool.clone();
+        let fallback = move || {
+            tokio::spawn(async move {
+                if let Some(pool) = pool_clone.as_ref() {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64).unwrap_or(0);
+                    let phase_time = ms_to_iso(now_ms);
+                    let _ = sqlx::query(
+                        "INSERT INTO runtime_states (call_id, state, detail, phase_time) VALUES ($1,$2,$3,$4) \
+                         ON CONFLICT(call_id, state) DO UPDATE SET detail=excluded.detail, phase_time=excluded.phase_time"
+                    )
+                    .bind(&call_id_fb).bind(&state_fb).bind(detail_fb.as_deref()).bind(&phase_time)
+                    .execute(pool.as_ref()).await;
+                }
+            });
         };
         let item = DbBatchItem::Runtime {
             call_id: call_id.clone(), state: state.clone(), detail: detail.clone(),
