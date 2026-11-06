@@ -564,6 +564,7 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
             respond(r, proto, src, m, 403,
                     "External profile does not accept registrations",
                     NULL, 0, txn);
+            txn_force_terminate(txn); /* final response → 立即释放 NIST */
             return NSBC_OK;
         }
     }
@@ -613,6 +614,7 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
         snprintf(extra, sizeof(extra), "Retry-After: %d\r\n",
                  r->cfg.retry_after_s);
         respond(r, proto, src, m, 503, extra, NULL, 0, txn);
+        txn_force_terminate(txn); /* final response → 立即释放 NIST */
         return NSBC_OK;
     }
 
@@ -702,6 +704,7 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
          * 阈值自动封禁该 IP，后续 REGISTER/INVITE 静默丢弃） */
         b2b_guard_notify(src_ip, B2B_GUARD_AUTH_FAIL);
         respond(r, proto, src, m, 403, NULL, NULL, 0, txn);
+        txn_force_terminate(txn); /* final response → 立即释放 NIST */
         return NSBC_OK;
     }
     llog(LOG_DEBUG, "reg", "REGISTER auth OK → processing loc_add...");
@@ -819,6 +822,7 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
             respond(r, proto, src, m, 200, "Contact: *\r\nExpires: 0\r\n",
                     NULL, 0, txn);
         }
+        txn_force_terminate(txn); /* REGISTER 200 OK 后立即释放 NIST，不等 Timer J 32s */
         return NSBC_OK;
     }
 
@@ -842,6 +846,7 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
             snprintf(extra, sizeof(extra), "Min-Expires: %d\r\n",
                      r->cfg.min_expires);
             respond(r, proto, src, m, 423, extra, NULL, 0, txn);
+            txn_force_terminate(txn); /* final response → 立即释放 NIST */
             return NSBC_OK;
         }
         if (exp > r->cfg.max_expires)
@@ -957,6 +962,7 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
             snprintf(extra, sizeof(extra), "Retry-After: %d\r\n",
                      r->cfg.retry_after_s);
             respond(r, proto, src, m, 503, extra, NULL, 0, txn);
+            txn_force_terminate(txn); /* final response → 立即释放 NIST */
             return NSBC_OK;
         }
         if (rc != LOC_OK) {
@@ -973,6 +979,7 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
         /* 无 Contact 且非 *：查询口径（P0 直接 200 空列表） */
         respond(r, proto, src, m, 200,
                 hdr_prefix[0] ? hdr_prefix : NULL, NULL, 0, txn);
+        txn_force_terminate(txn); /* REGISTER 200 OK 后立即释放 NIST，不等 Timer J 32s */
         return NSBC_OK;
     }
 
@@ -996,6 +1003,7 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
         used += (size_t)w;
     }
     respond(r, proto, src, m, 200, extra[0] ? extra : NULL, NULL, 0, txn);
+    txn_force_terminate(txn); /* REGISTER 200 OK 后立即释放 NIST，不等 Timer J 32s */
     return NSBC_OK;
 }
 

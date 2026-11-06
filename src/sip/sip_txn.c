@@ -1014,10 +1014,19 @@ void txn_force_terminate(sip_txn_t *t)
     if (!t || t->dead)
         return;
     /* 跳过 cb_dead 的 TU 回调（call 已销毁，不需要再通知），
-     * 直接置 TERMINATED + t_remove_hash 做：tw_del Timer G/H/B/F + 摘链 + unref */
-    t->state = (t->kind == TXN_ICT) ? TXN_ICT_TERMINATED
-             : (t->kind == TXN_IST) ? TXN_IST_TERMINATED
-             : TXN_NICT_TERMINATED;
+     * 直接置 TERMINATED + t_remove_hash 做：tw_del Timer G/H/B/F/J/K + 摘链 + unref
+     *
+     * 重要：非 INVITE server transaction（NIST）如 REGISTER/SUBSCRIBE 发完最终响应
+     * 后，客户端不会再发 ACK 回来（那是 INVITE 专属），所以没必要等 Timer J
+     * 默认的 32 秒再销毁——立即释放 slab 槽，避免高并发下 txn slab 被 NIST 撑爆。
+     * 参考 RFC 3261 §17.2.2：NIST 发送最终响应后若无重传探测需要，可直接 teardown。 */
+    switch (t->kind) {
+    case TXN_ICT:  t->state = TXN_ICT_TERMINATED;  break;
+    case TXN_IST:  t->state = TXN_IST_TERMINATED;  break;
+    case TXN_NIST: t->state = TXN_NIST_TERMINATED; break;
+    case TXN_NICT: t->state = TXN_NICT_TERMINATED; break;
+    default: break;
+    }
     t_remove_hash(t);
 }
 
