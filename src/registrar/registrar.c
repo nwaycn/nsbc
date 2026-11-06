@@ -466,6 +466,15 @@ static void respond(reg_core_t *r, sip_tr_proto_t proto, const nsbc_sa_t *dst,
     int n = sip_build_response(out, sizeof(out), req, status, NULL, NULL,
                                NULL, extra, body, bodylen);
     if (n <= 0) return;
+    /* NAT: RFC 3261 §18.2.2 — Via 响应补 received=src_ip;rport=src_port
+     * 让 NAT conntrack 更新，保证响应能回到正确的内网地址 */
+    if (dst) {
+        char src_ip[INET6_ADDRSTRLEN] = "";
+        uint16_t src_port = 0;
+        nsbc_sa_fmt_port(dst, src_ip, sizeof(src_ip), &src_port);
+        size_t len = (size_t)n;
+        sip_via_patch_received_rport(out, &len, sizeof(out), src_ip, src_port);
+    }
     /* 优先走 txn 层：自动缓存响应 + 吸收同 branch 重传 */
     if (txn) {
         txn_ref(txn);  /* ★ 防竞态：protect txn_send_response 期间 txn 不被释放 */
@@ -994,9 +1003,15 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
     }
     for (int i = 0; i < n; ++i) {
         long e = (long)((list[i].expire_ms - now) / 1000);
+        /* NAT: 200 OK Contact 用服务器认可的 public_contact（可达地址）
+         * RFC 3261 §10.2：Server-Selected Contact；
+         * NAT 场景 public_contact != b.contact；公网直连两者相同 */
+        const char *show_contact =
+            (list[i].nat_detected && list[i].public_contact[0])
+            ? list[i].public_contact : list[i].contact;
         int w = snprintf(extra + used, sizeof(extra) - used,
                          "Contact: %s;expires=%ld\r\n",
-                         list[i].contact, e > 0 ? e : 0);
+                         show_contact, e > 0 ? e : 0);
         if (w < 0 || (size_t)w >= sizeof(extra) - used)
             break;
         used += (size_t)w;

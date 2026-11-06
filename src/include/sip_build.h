@@ -48,6 +48,13 @@ int sip_build_response(char *buf, size_t cap, const sip_msg_t *req,
 int sip_build_via(char *out, size_t outsz, const char *host, int port,
                   const char *transport, const char *branch, int rport);
 
+/* post-process Via header: append received=src_ip and rport=src_port
+ * per RFC 3261 §18.2.2 + RFC 3581. Skips if Via already has received=.
+ * Modifies msg in-place, updates *msg_len. Called AFTER sip_build_response
+ * and BEFORE txn_send_response / sip_tr_send. */
+void sip_via_patch_received_rport(char *msg, size_t *msg_len, size_t msg_cap,
+                                  const char *src_ip, uint16_t src_port);
+
 typedef struct {
     const char *method;
     const char *ruri;

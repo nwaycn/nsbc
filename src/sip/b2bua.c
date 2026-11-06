@@ -825,6 +825,16 @@ static int respond_txn(b2b_core_t *co, sip_txn_t *t, int status,
         rc = NSBC_NOSPC;
         goto out;
     }
+    /* NAT: RFC 3261 §18.2.2 — Via 响应补 received=src_ip;rport=src_port
+     * 让 NAT conntrack 更新，保证响应能回到正确的内网地址 */
+    {
+        const nsbc_sa_t *peer = txn_peer(t);
+        char src_ip[INET6_ADDRSTRLEN] = "";
+        uint16_t src_port = 0;
+        nsbc_sa_fmt_port(peer, src_ip, sizeof(src_ip), &src_port);
+        size_t len = (size_t)n;
+        sip_via_patch_received_rport(out, &len, sizeof(out), src_ip, src_port);
+    }
     rc = txn_send_response(t, out, (size_t)n, now_ms());
 out:
     txn_unref(t);

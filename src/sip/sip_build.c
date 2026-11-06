@@ -264,6 +264,58 @@ int sip_build_request(char *buf, size_t cap, const sip_req_spec_t *s)
     return b.overflow ? NSBC_NOSPC : (int)b.len;
 }
 
+/* ==================================================================
+ * sip_via_patch_received_rport: post-process Via header for NAT
+ *
+ * RFC 3261 §18.2.2 + RFC 3581:
+ *   - Server MUST append "received=src_ip" to top Via in response
+ *   - If request Via has ";rport" (placeholder), rewrite to ";rport=port"
+ *   - Skip if Via already has received= or already has numeric rport
+ *
+ * Called AFTER sip_build_response, BEFORE txn_send_response / sip_tr_send.
+ * Modifies msg in-place, updates *msg_len.
+ * ================================================================== */
+void sip_via_patch_received_rport(char *msg, size_t *msg_len, size_t msg_cap,
+                                  const char *src_ip, uint16_t src_port)
+{
+    if (!msg || !msg_len || *msg_len == 0 || msg_cap < *msg_len)
+        return;
+    if (!src_ip || !src_ip[0] || src_port == 0)
+        return;
+
+    /* 找到 Via: 行 */
+    char *via_start = strcasestr(msg, "Via:");
+    if (!via_start) via_start = strcasestr(msg, "via:");
+    if (!via_start) return;
+
+    /* 找到 Via 行末尾的 \r\n */
+    char *line_end = strstr(via_start, "\r\n");
+    if (!line_end) return;
+    size_t via_line_len = (size_t)(line_end - via_start);
+
+    /* 已有 received= ? 跳过（运营商 NAT 已经加了我们就不重复）*/
+    if (strncasecmp(via_start, "received=", 9) == 0 ||    /* Via 行开头 received= 不太可能 */
+        memmem(via_start, via_line_len, "received=", 9)) {
+        return;
+    }
+
+    /* 计算需要追加的字符串 */
+    char patch[64];
+    int plen = snprintf(patch, sizeof(patch), ";received=%s;rport=%u",
+                        src_ip, src_port);
+    if (plen <= 0 || (size_t)plen >= sizeof(patch)) return;
+
+    /* 检查消息 buffer 够不够 */
+    if (*msg_len + (size_t)plen > msg_cap - 2 /* keep \r\n */)
+        return;
+
+    /* 在 Via 行的 \r\n 之前插入 patch */
+    size_t trailing_len = *msg_len - (size_t)(line_end - msg); /* line_end 到消息末尾 */
+    memmove(line_end + plen, line_end, trailing_len);
+    memcpy(line_end, patch, (size_t)plen);
+    *msg_len += (size_t)plen;
+}
+
 /*
     Author:       李浩 (Li Hao)
     Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)
