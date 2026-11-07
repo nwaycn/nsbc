@@ -109,6 +109,7 @@ typedef struct b2b_leg {
     char session_expires[64];  /* 原始头值，如 "120;refresher=uac" 或协商后 "Session-Expires: N;refresher=xxx\r\n" */
     char min_se[32];           /* 原始 Min-SE 头值 */
     int  timer_supported;     /* 对端 Supported:timer 标记 */
+    int  timer_effective;     /* 三层守卫求值结果：cfg.sess_timer_enabled && force_timer */
     sess_timer_t st;
     tw_node_t   refresh_node;
     tw_node_t   expire_node;

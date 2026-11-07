@@ -505,6 +505,14 @@ int sip_profiles_reload_json(const char *json, char *out_err, size_t err_sz)
         if (root) cJSON_Delete(root);
         return NSBC_NOMEM;
     }
+    /* ---- 默认值：Session Timer (RFC 4028) 开启 ----
+     * 现代 SIP 终端（MicroSIP/Linphone/Bria/WebRTC 全栈）普遍携带 Supported:timer，
+     * 默认关会导致"UA 发起 Session Timer → B2BUA 协商/回包但不 arm → UA 超时断话"。
+     * 企业 PBX 或不需要时可在 JSON profile 里显式 "enable_timer": false 关闭。
+     * 其他特性默认保持 calloc 清零（enable_prack=0, enable_precondition=0 等）。 */
+    for (int i = 0; i < (n > 0 ? n : 1); ++i) {
+        new_prof[i].enable_timer = 1;
+    }
 
     /* ---- [2] 逐条填充 + 校验 ---- */
     int loaded = 0;

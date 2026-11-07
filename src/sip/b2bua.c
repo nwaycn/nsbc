@@ -1410,24 +1410,26 @@ static sip_txn_t *send_invite_b(b2b_call_t *c, int leg_idx,
                          do_gruu       ? ", gruu"         : "");
         if (n > 0) { st_extra[n] = '\0'; }
     }
+    /* Session-Expires / Min-SE 头注入 B-leg INVITE：
+     * 三层守卫必须与协商/arm 一致 —— timer_effective=0 时不透传这些头，
+     * 否则 B-leg UA 以为 Session Timer 已建立但 B2BUA 不刷新 → 对端超时断话 */
     if (a->session_expires[0] && !co->cfg.sess_timer_enabled) {
-        /* P0 透传模式：extract_sess_timer_hdrs 存纯值 "120;refresher=uac"，
-         * 需拼 "Session-Expires: xxx\r\n" 头行 */
+        /* P0 透传模式：全局关 timer 时的 fallback（此时不协商不 arm，仅透传头值） */
         char se_line[96];
         int sn = snprintf(se_line, sizeof(se_line), "Session-Expires: %s\r\n", a->session_expires);
         if (sn > 0 && (size_t)sn < sizeof(se_line)) {
             size_t cur = strlen(st_extra);
             if (cur + sn < sizeof(st_extra)) { memcpy(st_extra + cur, se_line, sn); cur += sn; st_extra[cur] = '\0'; }
         }
-    } else if (a->session_expires[0] && co->cfg.sess_timer_enabled) {
-        /* P1 完整模式：sess_timer_uas_negotiate 存的是完整头行
+    } else if (a->session_expires[0] && co->cfg.sess_timer_enabled && a->timer_effective) {
+        /* P1 完整模式 + 三层守卫通过：sess_timer_uas_negotiate 存的是完整头行
          * "Session-Expires: N;refresher=xxx\r\n"，直接拼 */
         size_t cur = strlen(st_extra);
         size_t slen = strlen(a->session_expires);
         if (cur + slen < sizeof(st_extra)) { memcpy(st_extra + cur, a->session_expires, slen); cur += slen; st_extra[cur] = '\0'; }
     }
-    if (a->min_se[0]) {
-        /* extract_sess_timer_hdrs 存 Min-SE 纯值 */
+    if (a->min_se[0] && a->timer_effective) {
+        /* Min-SE：仅三层守卫通过时才注入 */
         char mse_line[64];
         int mn = snprintf(mse_line, sizeof(mse_line), "Min-SE: %s\r\n", a->min_se);
         if (mn > 0 && (size_t)mn < sizeof(mse_line)) {
@@ -1704,35 +1706,45 @@ static void respond_a(b2b_call_t *c, int status, const char *body,
             extra[used] = '\0';
         }
     }
-    /* Session Timer (RFC 4028)：注入 Alice 200 OK */
-    b2b_leg_t *b_leg = &c->leg[1];
+    /* Session Timer (RFC 4028)：注入 Alice 200 OK —— P1 完整模式 + P0 透传模式 都要处理
+     * P1 (timer_effective=1)：三层守卫通过，用协商后的值（a->session_expires 已是完整头行）+ cfg min_se_s
+     * P0 (!sess_timer_enabled)：全局关 timer，不协商不 arm，但 A↔B 双向透传头值
+     *                         send_invite_b 里已经把 Alice 的 Session-Expires 拼给了 Bob，
+     *                         现在把 Bob 回的 Session-Expires (b_leg->session_expires) 拼回给 Alice */
     if (a->timer_supported && used + 256 < sizeof(extra)) {
-        /* Supported:timer 合并 */
+        /* Supported:timer 宣告：P0/P1 都要（只要 Alice 声称 Supported，NSBC 就要回 Supported） */
         const char *sup = "Supported: timer,precondition,gruu,path,outbound,sec-agree\r\n";
         int sn = snprintf(extra + used, sizeof(extra) - used, "%s", sup);
         if (sn > 0) { used += (size_t)sn; }
-        /* Session-Expires */
-        const char *se_val = NULL;
-        if (co->cfg.sess_timer_enabled && a->session_expires[0]) {
-            /* P1 完整模式：用协商后的值（格式已含完整头行） */
-            se_val = a->session_expires;
-            int sen = snprintf(extra + used, sizeof(extra) - used, "%s", se_val);
-            if (sen > 0) used += (size_t)sen;
-        } else if (!co->cfg.sess_timer_enabled && b_leg->session_expires[0]) {
-            /* P0 透传模式：从 Bob 200 OK 存的纯值拼头行 */
-            int sen = snprintf(extra + used, sizeof(extra) - used,
-                               "Session-Expires: %s\r\n", b_leg->session_expires);
-            if (sen > 0) used += (size_t)sen;
-        }
-        /* Min-SE：RFC 4028 §5.3 若 UAS 提高了 Min-SE 必须回显；
-         * P1 模式用 B2BUA cfg 的 min_se_s（UAS 真实下限）；
-         * P0 透传模式用 Alice 原始提议的 Min-SE 原样回显 */
-        {
-            int p1 = co->cfg.sess_timer_enabled;
-            int mse = p1 ? co->cfg.sess_timer_cfg.min_se_s : atoi(a->min_se);
-            if (mse > 0) {
+
+        if (a->timer_effective) {
+            /* ---- P1 完整模式：用协商后的值 ---- */
+            if (a->session_expires[0]) {
+                int sen = snprintf(extra + used, sizeof(extra) - used, "%s", a->session_expires);
+                if (sen > 0) used += (size_t)sen;
+            }
+            /* Min-SE：RFC 4028 §5.3 — UAS 提高了 Min-SE 必须回显（用 cfg 的真实下限） */
+            {
+                int mse = co->cfg.sess_timer_cfg.min_se_s;
+                if (mse > 0) {
+                    int mn = snprintf(extra + used, sizeof(extra) - used,
+                                      "Min-SE: %d\r\n", mse);
+                    if (mn > 0) used += (size_t)mn;
+                }
+            }
+        } else if (!co->cfg.sess_timer_enabled) {
+            /* ---- P0 透传模式：全局关 timer，A↔B 双向透传 ---- */
+            b2b_leg_t *b_leg = &c->leg[1];
+            if (b_leg->session_expires[0]) {
+                /* Bob 200 OK 回了 Session-Expires，原样拼回 Alice */
+                int sen = snprintf(extra + used, sizeof(extra) - used,
+                                   "Session-Expires: %s\r\n", b_leg->session_expires);
+                if (sen > 0) used += (size_t)sen;
+            }
+            /* Min-SE：Alice 原始提议的值原样回显（NSBC 不干预） */
+            if (a->min_se[0]) {
                 int mn = snprintf(extra + used, sizeof(extra) - used,
-                                  "Min-SE: %d\r\n", mse);
+                                  "Min-SE: %s\r\n", a->min_se);
                 if (mn > 0) used += (size_t)mn;
             }
         }
@@ -2531,15 +2543,11 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                 }
 
                 /* Session Timer: extract Bob 200 OK + arm both legs
-                 * ★ 三层守卫：cfg.sess_timer_enabled (全局) → force_timer (dialplan 三态) → profile.enable_timer */
+                 * ★ 三层守卫：直接用协商阶段算好的 al->timer_effective（保持全链路一致） */
                 {
-                    sip_profile_t *pr = c->prof;
-                    /* force_timer 三态：0=AUTO(继承 profile) / 1=强制开 / 2=强制关 */
-                    int prof_en = pr ? pr->enable_timer : 0;  /* profile NULL → 默认关 */
-                    int force_en = (c->force_timer == 1) ? 1 : (c->force_timer == 2 ? 0 : prof_en);
-                    if (co->cfg.sess_timer_enabled && force_en) {
-                    sess_timer_nego_t nb;
                     b2b_leg_t *al = &c->leg[0];
+                    if (al->timer_effective) {
+                    sess_timer_nego_t nb;
                     uint64_t nm = now_ms();
                     /* A-leg arm（协商后值格式 "Session-Expires: N;refresher=xxx\r\n"） */
                     if (al->session_expires[0]) {
@@ -4081,7 +4089,16 @@ void handle_new_invite(b2b_core_t *co, sip_txn_t *t,
     /* extract 必须无条件执行（P0 透传 + P1 完整都需要原始头值） */
     extract_sess_timer_hdrs(m, a->session_expires, sizeof(a->session_expires),
                              a->min_se, sizeof(a->min_se), &a->timer_supported);
-    if (co->cfg.sess_timer_enabled) {
+    /* ★ 三层守卫：cfg.sess_timer_enabled (全局) → force_timer (dialplan 三态) → profile.enable_timer
+     * 协商阶段必须与 arm 阶段使用相同守卫条件，否则会出现"协商成功但不 arm"的不一致状态
+     * → 对端 UA 以为 Session Timer 已建立，实际 B2BUA 不刷新也不监控 → 300s 后对端超时断话 */
+    {
+        sip_profile_t *pr = c->prof;
+        int prof_en = pr ? pr->enable_timer : 1;  /* profile NULL → 默认开（修复：原来默认关会导致协商不生效） */
+        int force_en = (c->force_timer == 1) ? 1 : (c->force_timer == 2 ? 0 : prof_en);
+        a->timer_effective = (co->cfg.sess_timer_enabled && force_en) ? 1 : 0;
+    }
+    if (a->timer_effective) {
         sess_timer_init(&a->st);
         sess_timer_init(&c->leg[1].st);
         tw_node_init(&a->refresh_node);

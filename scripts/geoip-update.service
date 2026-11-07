@@ -1,0 +1,31 @@
+# ============================================================
+# NSBC GeoIP CN 白名单 —— 每日自动更新
+# 安装：
+#   cp scripts/geoip-update.sh /usr/local/bin/
+#   cp scripts/geoip-update.service /etc/systemd/system/
+#   cp scripts/geoip-update.timer   /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now geoip-update.timer
+# 查看：
+#   systemctl status geoip-update.timer
+#   systemctl list-timers geoip-update.timer
+#   journalctl -u geoip-update.service -f
+# ============================================================
+
+[Unit]
+Description=NSBC GeoIP CN whitelist daily update (multi-source fallback + hot-reload)
+After=network-online.target nsbc-web.service nsbcd.service
+Wants=network-online.target
+Requires=nsbcd.service
+
+[Service]
+Type=oneshot
+Environment=NSBC_HOME=/opt/nsbc
+ExecStartPre=/bin/mkdir -p /var/cache/nsbc-geoip /opt/nsbc/geo
+ExecStart=/usr/local/bin/geoip-update.sh
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target

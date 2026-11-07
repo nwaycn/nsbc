@@ -7,6 +7,7 @@
 #include "sip_build.h"
 #include "sip_profile.h"
 #include "sip_txn.h"
+#include "security.h"   /* security_check_fence — REGISTER 也走全局围栏（deny + allow + method 禁用） */
 #include "uDS_client.h"
 #include "log.h"
 #include "net_sock.h"
@@ -580,6 +581,39 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
                     "External profile does not accept registrations",
                     NULL, 0, txn);
             _rc = NSBC_OK; goto reg_out;
+        }
+    }
+
+    /* ---- Security Fence：REGISTER 也走全局围栏（deny + allow + method 禁用）----
+     * INVITE/OPTIONS 路径都已经在 b2bua.c 里走 security_check_fence，
+     * REGISTER 之前漏掉了 → 拨号规则里配的 allow/deny CIDR、method 禁用对注册无效
+     * → 公网扫号器能绕过 allow CIDR 直接撞库 → fail2ban。
+     * 放在 profile ACL 之后（profile ACL 是更底层的端口/IP 归属）、任何实质性处理之前。
+     * 命中则 silent drop（不回 SIP 响应，防 SBC 指纹暴露，与 INVITE 一致）。 */
+    {
+        char f_ua[128] = {0};
+        char f_from[64] = {0};   /* From user part — 注册者分机号 */
+        char f_to[64]   = {0};   /* To user part   — 被注册 AoR */
+        sip_hdr_t *uah = sip_hdr_get(m, SIP_H_USER_AGENT);
+        if (uah && uah->value.len > 0)
+            snprintf(f_ua, sizeof(f_ua), "%.*s", (int)uah->value.len, uah->value.p);
+        sip_hdr_t *frh = sip_hdr_get(m, SIP_H_FROM);
+        if (frh && sip_hdr_parse_addr(frh) == NSBC_OK && frh->u.addr.uri.user.p)
+            snprintf(f_from, sizeof(f_from), "%.*s", (int)frh->u.addr.uri.user.len, frh->u.addr.uri.user.p);
+        sip_hdr_t *toh_pre = sip_hdr_get(m, SIP_H_TO);
+        if (toh_pre && sip_hdr_parse_addr(toh_pre) == NSBC_OK && toh_pre->u.addr.uri.user.p)
+            snprintf(f_to, sizeof(f_to), "%.*s", (int)toh_pre->u.addr.uri.user.len, toh_pre->u.addr.uri.user.p);
+
+        security_fence_ctx_t fctx = {0};
+        fctx.src    = (const struct sockaddr *)src;
+        fctx.method = SIP_M_REGISTER;
+        fctx.ua     = f_ua[0]   ? f_ua   : NULL;
+        fctx.caller = f_from[0] ? f_from : NULL;
+        fctx.callee = f_to[0]   ? f_to   : NULL;
+        security_check_fence(&fctx);
+        if (fctx.hit != BLACKLIST_OK) {
+            security_fence_log_drop(fctx.hit, src_ip, f_ua, "REGISTER", f_from, f_to);
+            _rc = NSBC_OK; goto reg_out;  /* silent drop，不回任何响应 */
         }
     }
 

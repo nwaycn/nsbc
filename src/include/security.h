@@ -54,6 +54,9 @@ typedef struct {
     /* NIP Phase 5 新增 */
     int fence_mode;               /* 1=security（默认）/ 0=performance */
     uint32_t method_blocked;      /* 禁用 method 位图：(1<<(SIP_M_xxx - 1)) */
+    /* GeoIP 批量 CIDR 文件（可选，启动时 bl_seed_from_cfg 之后加载） */
+    char deny_cidr_file[512];     /* deny CIDR 批量文件路径（如 spamhaus DROP 列表） */
+    char allow_cidr_file[512];    /* allow CIDR 批量文件路径（如中国 IP 白名单） */
 } security_cfg_t;
 
 /* 查询源 IP 是否命中黑名单（CIDR 匹配简化骨架）*/
@@ -142,6 +145,18 @@ int security_is_blocked(const nsbc_sa_t *src);
  * 只读、无副作用、线程安全（内部加 ban_lock 读 ban 表；blacklist 表用 wrlock 读）。
  * 设计为 CDR 生成链上同步调用 — 不能阻塞太久，只查 hash 桶。 */
 int security_get_threat(const char *ip, char *reason_out, size_t reason_sz);
+
+/* ==== GeoIP 批量 CIDR 文件加载（deny/allow 大列表，如 spamhaus DROP / 中国 IP 白名单）====
+ * 文件格式：每行一个 CIDR（如 "8.8.8.0/24"），支持 # 注释行和空行。
+ * 加载位置：g_deny_cidr / g_allow_cidr 从已有 n_cidr 之后追加 —— JSON/YAML 交互式规则
+ *          排在前面优先匹配，geoip 规则作为兜底。
+ * kind: BL_KIND_DENY(0) → 进 deny 表；BL_KIND_ALLOW(1) → 进 allow 表
+ * 容量：BL_CIDR_MAX（当前 4096），超过则 WARN 跳过多余条目，已加载的仍然生效。
+ * 原子：内部 wrlock 保护，调用方可在启动时或 reload 时调用。
+ * 返回值：实际加载条数（成功），-1 文件打不开，-2 文件格式错误（解析 0 条有效 CIDR）。
+ * 注：与 security_blacklist_reload_json 互斥 —— reload_json 会整体替换 deny/allow 表，
+ *     geoip 文件加载应在 reload_json 之后执行（见 signaling.c cfg_load_file 流程）。 */
+int security_geoip_load_file(const char *path, int kind, char *out_err, size_t err_sz);
 
 #ifdef __cplusplus
 }

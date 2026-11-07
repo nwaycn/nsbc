@@ -1,0 +1,15 @@
+[Unit]
+Description=Daily NSBC GeoIP CN whitelist update timer
+
+# 每天凌晨 03:17 执行（避开 apnic 整点拉取高峰）
+# RandomizedDelaySec 让多台服务器错开 0-5 分钟，避免打爆上游
+[Timer]
+OnCalendar=*-*-* 03:17:00
+RandomizedDelaySec=300
+# 上次失败或关机期间错过 → 开机补跑一次
+Persistent=true
+# 最多排队 1 个（避免 service 还没跑完 timer 又触发）
+MaxRunningSec=0
+
+[Install]
+WantedBy=timers.target

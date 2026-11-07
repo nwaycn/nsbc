@@ -212,7 +212,9 @@ static void sa_to_ip_str(const nsbc_sa_t *sa, char *out, size_t outsz)
  * 读锁遍历。表空时零成本快路径直接返回；持锁内只做内存匹配，禁止 IO。
  * ==================================================================*/
 
-#define BL_CIDR_MAX     256    /* CIDR 规则容量（文档 §2） */
+#define BL_CIDR_MAX     16384  /* CIDR 规则容量：覆盖 spamhaus DROP(~12K) + CN(~7K) + 国内运营商(~3K) 叠加
+                                * 内存：deny + allow 全局表 = 2 × 16384 × ~224B ≈ 7MB（静态全局，不在栈上）
+                                * 函数内临时数组改为 calloc（见 bl_seed_from_cfg / security_geoip_load_file）*/
 #define BL_UA_MAX       128    /* UA 规则容量（NIP 60+ 默认种子扩容） */
 #define BL_PREFIX_MAX   128    /* 号码前缀规则容量（called/caller 各 64） */
 #define BL_VAL_MAX      128    /* value / UA pattern 长度上限（与 Web 校验对齐） */
@@ -870,25 +872,24 @@ int security_blacklist_reload_json(const char *json, char *out_err,
         return NSBC_ERR;
     }
 
-    /* ★ R1 P0: 去掉 static — 函数内 static 临时数组被并发 reload 同时写 → 数据错乱。
-     * 改成栈上：单 reload 调用独占栈帧，并发 reload 各自独立副本。
-     * 总大小 ≈ 220KB — 默认 8MB 线程栈完全够。 */
-    bl_cidr_t  n_dc[BL_CIDR_MAX];
-    bl_ua_t    n_du[BL_UA_MAX];
-    bl_prefix_t n_dc2[BL_PREFIX_MAX];
-    bl_prefix_t n_dcr[BL_PREFIX_MAX];
-    bl_cidr_t  n_ac[BL_CIDR_MAX];
-    bl_ua_t    n_au[BL_UA_MAX];
-    bl_prefix_t n_ac2[BL_PREFIX_MAX];
-    bl_prefix_t n_acr[BL_PREFIX_MAX];
-    memset(n_dc, 0, sizeof(n_dc));
-    memset(n_du, 0, sizeof(n_du));
-    memset(n_dc2, 0, sizeof(n_dc2));
-    memset(n_dcr, 0, sizeof(n_dcr));
-    memset(n_ac, 0, sizeof(n_ac));
-    memset(n_au, 0, sizeof(n_au));
-    memset(n_ac2, 0, sizeof(n_ac2));
-    memset(n_acr, 0, sizeof(n_acr));
+    /* ★ R1 P0: calloc 堆分配 — BL_CIDR_MAX=16384 时 2 × 16384 × 224B ≈ 7MB，
+     * Linux 默认 8MB 线程栈会爆。改为堆上，用完即 free。
+     * 单 reload 独占调用，堆上临时分配一次不影响热路径。 */
+    bl_cidr_t  *n_dc  = calloc(BL_CIDR_MAX, sizeof(*n_dc));
+    bl_ua_t    *n_du  = calloc(BL_UA_MAX,   sizeof(*n_du));
+    bl_prefix_t *n_dc2 = calloc(BL_PREFIX_MAX, sizeof(*n_dc2));
+    bl_prefix_t *n_dcr = calloc(BL_PREFIX_MAX, sizeof(*n_dcr));
+    bl_cidr_t  *n_ac  = calloc(BL_CIDR_MAX, sizeof(*n_ac));
+    bl_ua_t    *n_au  = calloc(BL_UA_MAX,   sizeof(*n_au));
+    bl_prefix_t *n_ac2 = calloc(BL_PREFIX_MAX, sizeof(*n_ac2));
+    bl_prefix_t *n_acr = calloc(BL_PREFIX_MAX, sizeof(*n_acr));
+    if (!n_dc || !n_ac || !n_du || !n_au || !n_dc2 || !n_dcr || !n_ac2 || !n_acr) {
+        free(n_dc); free(n_du); free(n_dc2); free(n_dcr);
+        free(n_ac); free(n_au); free(n_ac2); free(n_acr);
+        cJSON_Delete(root);
+        if (out_err) snprintf(out_err, err_sz, "oom");
+        return NSBC_ERR;
+    }
     int ndc = 0, ndu = 0, ndc2 = 0, ndcr = 0;
     int nac = 0, nau = 0, nac2 = 0, nacr = 0;
     int skipped = 0;
@@ -946,6 +947,8 @@ int security_blacklist_reload_json(const char *json, char *out_err,
     }
     if (!arr) {
         cJSON_Delete(root);
+        free(n_dc); free(n_du); free(n_dc2); free(n_dcr);
+        free(n_ac); free(n_au); free(n_ac2); free(n_acr);
         if (out_err) snprintf(out_err, err_sz, "json must be array or object with rules");
         return NSBC_ERR;
     }
@@ -1066,6 +1069,8 @@ int security_blacklist_reload_json(const char *json, char *out_err,
      * 非致命：yaml 不可写 → WARN 就行，reload 本身仍然成功。 */
     (void)security_cfg_save_yaml();
 
+    free(n_dc); free(n_du); free(n_dc2); free(n_dcr);
+    free(n_ac); free(n_au); free(n_ac2); free(n_acr);
     return NSBC_OK;
 
     #undef FILL_CIDR
@@ -1770,6 +1775,104 @@ int security_get_threat(const char *ip, char *reason_out, size_t reason_sz)
     return 0;
 }
 
+/* ==== GeoIP 批量 CIDR 文件加载 ====
+ * 每行一个 CIDR，支持 # 注释和空行。追加到现有 deny/allow 表（JSON 交互式规则在前）。
+ * 注意：必须在 security_blacklist_reload_json 之后调用（后者整体替换 deny/allow 表）。 */
+int security_geoip_load_file(const char *path, int kind, char *out_err, size_t err_sz)
+{
+    if (out_err && err_sz) out_err[0] = '\0';
+    if (!path || !path[0]) {
+        if (out_err) snprintf(out_err, err_sz, "path empty");
+        return -1;
+    }
+    if (kind != BL_KIND_DENY && kind != BL_KIND_ALLOW) {
+        if (out_err) snprintf(out_err, err_sz, "invalid kind %d", kind);
+        return -1;
+    }
+
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        if (out_err) snprintf(out_err, err_sz, "fopen(%s): %s", path, strerror(errno));
+        return -1;
+    }
+
+    /* ---- 1. 先全部读到堆上临时数组（避免 wrlock 内 IO；BL_CIDR_MAX=16384 栈上 3.6MB 会爆）---- */
+    bl_cidr_t *tmp = calloc(BL_CIDR_MAX, sizeof(*tmp));
+    if (!tmp) {
+        if (out_err) snprintf(out_err, err_sz, "oom for tmp[%d]", BL_CIDR_MAX);
+        fclose(f);
+        return -1;
+    }
+    int count = 0, skipped = 0;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        /* strip leading/trailing whitespace */
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        size_t plen = strlen(p);
+        while (plen > 0 && (p[plen-1] == '\n' || p[plen-1] == '\r' ||
+                            p[plen-1] == ' ' || p[plen-1] == '\t')) p[--plen] = '\0';
+        if (plen == 0 || p[0] == '#') continue;
+
+        if (count >= BL_CIDR_MAX) {
+            skipped++;
+            continue;
+        }
+        int fam; uint32_t net[4]; int prefix;
+        if (bl_parse_cidr(p, &fam, net, &prefix) != 0) {
+            skipped++;
+            continue;
+        }
+        bl_cidr_t *r = &tmp[count];
+        r->family = fam;
+        memcpy(r->net, net, sizeof(net));
+        r->prefix = prefix;
+        r->enabled = 1;
+        snprintf(r->value, sizeof(r->value), "%s", p);
+        snprintf(r->comment, sizeof(r->comment), "geoip");
+        count++;
+    }
+    fclose(f);
+
+    if (count == 0) {
+        free(tmp);
+        if (out_err) snprintf(out_err, err_sz, "no valid CIDRs in %s (%d skipped)", path, skipped);
+        return -2;
+    }
+
+    /* ---- 2. wrlock 下追加到正式表 ---- */
+    pthread_rwlock_wrlock(&g_bl_rwlock);
+    if (kind == BL_KIND_DENY) {
+        int base = g_deny_cidr_n;
+        int cap  = BL_CIDR_MAX - base;
+        int to_add = count < cap ? count : cap;
+        for (int i = 0; i < to_add; ++i) {
+            g_deny_cidr[base + i] = tmp[i];
+        }
+        g_deny_cidr_n = base + to_add;
+        pthread_rwlock_unlock(&g_bl_rwlock);
+        free(tmp);
+        log_notice("security",
+                   "geoip: loaded %d deny CIDRs from %s (skipped=%d, cap_used=%d/%d)",
+                   to_add, path, skipped + (count - to_add), g_deny_cidr_n, BL_CIDR_MAX);
+        return to_add;
+    } else {
+        int base = g_allow_cidr_n;
+        int cap  = BL_CIDR_MAX - base;
+        int to_add = count < cap ? count : cap;
+        for (int i = 0; i < to_add; ++i) {
+            g_allow_cidr[base + i] = tmp[i];
+        }
+        g_allow_cidr_n = base + to_add;
+        pthread_rwlock_unlock(&g_bl_rwlock);
+        free(tmp);
+        log_notice("security",
+                   "geoip: loaded %d allow CIDRs from %s (skipped=%d, cap_used=%d/%d)",
+                   to_add, path, skipped + (count - to_add), g_allow_cidr_n, BL_CIDR_MAX);
+        return to_add;
+    }
+}
+
 static void ban_clear_all(void)
 {
     pthread_mutex_lock(&g_ban_lock);
@@ -2122,6 +2225,25 @@ static int cmd_cfg_reload(cmd_ctx_t *c, int argc, char **argv, void *ud)
         snprintf(g_cfg.blacklist_cidrs, sizeof(g_cfg.blacklist_cidrs), "%s", s);
     if (cfg_get_str(ctx->cfg, "security.ua_blacklist", &s, NULL) == NSBC_OK && s && s[0])
         snprintf(g_cfg.ua_blacklist, sizeof(g_cfg.ua_blacklist), "%s", s);
+    if (cfg_get_str(ctx->cfg, "security.deny_cidr_file", &s, NULL) == NSBC_OK && s && s[0])
+        cfg_resolve_path(ctx->cfg, s, g_cfg.deny_cidr_file, sizeof(g_cfg.deny_cidr_file));
+    if (cfg_get_str(ctx->cfg, "security.allow_cidr_file", &s, NULL) == NSBC_OK && s && s[0])
+        cfg_resolve_path(ctx->cfg, s, g_cfg.allow_cidr_file, sizeof(g_cfg.allow_cidr_file));
+
+    /* geoip 文件重新加载 —— bl_seed_from_cfg 会整体替换 deny/allow 表，
+     * 所以必须在之后追加 geoip */
+    bl_seed_from_cfg();
+    {
+        char err[256] = {0};
+        if (g_cfg.deny_cidr_file[0]) {
+            int nr = security_geoip_load_file(g_cfg.deny_cidr_file, BL_KIND_DENY, err, sizeof(err));
+            if (nr < 0) log_warn("security", "cfg.reload geoip deny fail: %s", err);
+        }
+        if (g_cfg.allow_cidr_file[0]) {
+            int nr = security_geoip_load_file(g_cfg.allow_cidr_file, BL_KIND_ALLOW, err, sizeof(err));
+            if (nr < 0) log_warn("security", "cfg.reload geoip allow fail: %s", err);
+        }
+    }
 
     c->io_printf(c->io_ud,
                  "OK security.cfg.reload auto_ban=%d thr=%d win=%ds ban=%ds "
@@ -2134,7 +2256,112 @@ static int cmd_cfg_reload(cmd_ctx_t *c, int argc, char **argv, void *ud)
     return NSBC_OK;
 }
 
-/* === init / fini === */
+/* ==== GeoIP OAM 命令 ==== */
+/* security.geoip.load_deny  <path>     追加加载 deny CIDR 批量文件（如 spamhaus DROP） */
+/* security.geoip.load_allow <path>     追加加载 allow CIDR 批量文件（如中国 IP 白名单） */
+/* security.geoip.reload               bl_seed + 所有 geoip 文件（cfg + 默认种子） */
+/* security.geoip.list                 当前 deny/allow CIDR 计数 + allowlist 模式开关 */
+
+static int cmd_geoip_load_deny(cmd_ctx_t *c, int argc, char **argv, void *ud)
+{
+    (void)ud;
+    if (argc < 2 || !argv[1][0]) {
+        c->io_printf(c->io_ud, "ERR usage: security.geoip.load_deny <file>\n");
+        return NSBC_ERR;
+    }
+    char err[256] = {0};
+    int nr = security_geoip_load_file(argv[1], BL_KIND_DENY, err, sizeof(err));
+    if (nr < 0) {
+        c->io_printf(c->io_ud, "ERR geoip deny load: %s\n", err);
+        return NSBC_ERR;
+    }
+    c->io_printf(c->io_ud, "OK geoip deny loaded %d from %s (deny_total=%d)\n",
+                 nr, argv[1], g_deny_cidr_n);
+    return NSBC_OK;
+}
+
+static int cmd_geoip_load_allow(cmd_ctx_t *c, int argc, char **argv, void *ud)
+{
+    (void)ud;
+    if (argc < 2 || !argv[1][0]) {
+        c->io_printf(c->io_ud, "ERR usage: security.geoip.load_allow <file>\n");
+        return NSBC_ERR;
+    }
+    char err[256] = {0};
+    int nr = security_geoip_load_file(argv[1], BL_KIND_ALLOW, err, sizeof(err));
+    if (nr < 0) {
+        c->io_printf(c->io_ud, "ERR geoip allow load: %s\n", err);
+        return NSBC_ERR;
+    }
+    c->io_printf(c->io_ud, "OK geoip allow loaded %d from %s (allow_total=%d, allowlist_mode=%s)\n",
+                 nr, argv[1], g_allow_cidr_n, g_allow_cidr_n > 0 ? "ON" : "OFF");
+    return NSBC_OK;
+}
+
+static int cmd_geoip_reload(cmd_ctx_t *c, int argc, char **argv, void *ud)
+{
+    (void)argc; (void)argv; (void)ud;
+
+    /* bl_seed_from_cfg 会整体替换 deny/allow 表，geoip 文件追加在后 */
+    bl_seed_from_cfg();
+    char err[256] = {0};
+    int total_deny = 0, total_allow = 0;
+
+    if (g_cfg.deny_cidr_file[0]) {
+        int nr = security_geoip_load_file(g_cfg.deny_cidr_file, BL_KIND_DENY, err, sizeof(err));
+        if (nr >= 0) total_deny += nr;
+        else c->io_printf(c->io_ud, "WRN geoip deny(%s): %s\n", g_cfg.deny_cidr_file, err);
+    }
+    if (g_cfg.allow_cidr_file[0]) {
+        int nr = security_geoip_load_file(g_cfg.allow_cidr_file, BL_KIND_ALLOW, err, sizeof(err));
+        if (nr >= 0) total_allow += nr;
+        else c->io_printf(c->io_ud, "WRN geoip allow(%s): %s\n", g_cfg.allow_cidr_file, err);
+    } else {
+        /* 默认种子兜底 */
+        const char *home = getenv("NSBC_HOME");
+        if (!home || !home[0]) home = ".";
+        char seed[512];
+        snprintf(seed, sizeof(seed), "%s/geo/cn_cidrs.txt", home);
+        FILE *f = fopen(seed, "r");
+        if (f) {
+            fclose(f);
+            int nr = security_geoip_load_file(seed, BL_KIND_ALLOW, err, sizeof(err));
+            if (nr >= 0) total_allow += nr;
+        }
+    }
+
+    c->io_printf(c->io_ud,
+                 "OK geoip.reload: seed deny=%d allow=%d | geoip deny_added=%d allow_added=%d | "
+                 "allowlist_mode=%s (total deny=%d allow=%d cap=%d each)\n",
+                 0, 0, total_deny, total_allow,
+                 g_allow_cidr_n > 0 ? "ON" : "OFF",
+                 g_deny_cidr_n, g_allow_cidr_n, BL_CIDR_MAX);
+    return NSBC_OK;
+}
+
+static int cmd_geoip_list(cmd_ctx_t *c, int argc, char **argv, void *ud)
+{
+    (void)argc; (void)argv; (void)ud;
+    pthread_rwlock_rdlock(&g_bl_rwlock);
+    int deny_n = g_deny_cidr_n, allow_n = g_allow_cidr_n;
+    pthread_rwlock_unlock(&g_bl_rwlock);
+
+    c->io_printf(c->io_ud,
+                 "geoip status:\n"
+                 "  deny CIDRs total : %d / %d\n"
+                 "  allow CIDRs total: %d / %d\n"
+                 "  allowlist mode   : %s\n"
+                 "  cfg deny_file    : %s\n"
+                 "  cfg allow_file   : %s\n"
+                 "  fence_mode       : %s\n",
+                 deny_n,  BL_CIDR_MAX,
+                 allow_n, BL_CIDR_MAX,
+                 allow_n > 0 ? "ON (non-whitelist IPs SILENT DROP)" : "OFF (all IPs accepted)",
+                 g_cfg.deny_cidr_file[0]  ? g_cfg.deny_cidr_file  : "-",
+                 g_cfg.allow_cidr_file[0] ? g_cfg.allow_cidr_file : "-",
+                 __atomic_load_n(&g_fence_mode, __ATOMIC_RELAXED) ? "security" : "performance");
+    return NSBC_OK;
+}
 static int security_init(struct nsbc_ctx *ctx)
 {
     /* 默认值全量内置（零配置可用，分发场景不依赖 YAML）：
@@ -2173,6 +2400,14 @@ static int security_init(struct nsbc_ctx *ctx)
                 == NSBC_OK && s && s[0]) {
             snprintf(g_cfg.ua_blacklist, sizeof(g_cfg.ua_blacklist), "%s", s);
         }
+        if (cfg_get_str(ctx->cfg, "security.deny_cidr_file", &s, NULL)
+                == NSBC_OK && s && s[0]) {
+            cfg_resolve_path(ctx->cfg, s, g_cfg.deny_cidr_file, sizeof(g_cfg.deny_cidr_file));
+        }
+        if (cfg_get_str(ctx->cfg, "security.allow_cidr_file", &s, NULL)
+                == NSBC_OK && s && s[0]) {
+            cfg_resolve_path(ctx->cfg, s, g_cfg.allow_cidr_file, sizeof(g_cfg.allow_cidr_file));
+        }
         if (cfg_get_int(ctx->cfg, "security.authfail_threshold", &v,
                         NULL) == NSBC_OK && v >= 1 && v <= 1000)
             g_cfg.authfail_threshold = (int)v;
@@ -2200,14 +2435,55 @@ static int security_init(struct nsbc_ctx *ctx)
      * 推送后以 web.db 为准——文档 §6：数据库为准，YAML 仅启动加载/fallback） */
     bl_seed_from_cfg();
 
+    /* GeoIP 批量 CIDR 文件（spamhaus DROP / 中国 IP 白名单等大列表）
+     * 必须在 bl_seed_from_cfg 之后 —— 后者会整体替换 deny/allow 表。
+     * 加载是追加式的：YAML 种子在前（优先匹配），geoip 文件在后（兜底）。
+     *
+     * allow CIDR 白名单强制模式：g_allow_cidr_n > 0 → 不在白名单里的 IP 一律 silent drop
+     * 默认行为：如果 YAML 没配 allow_cidr_file，但仓库默认种子存在就自动加载 →
+     * 公网部署装完 nsbcd 自动启用中国大陆 IP 白名单，零运维即可防御全球扫描器。 */
+    {
+        char err[256] = {0};
+        int nr;
+        if (g_cfg.deny_cidr_file[0]) {
+            nr = security_geoip_load_file(g_cfg.deny_cidr_file, BL_KIND_DENY, err, sizeof(err));
+            if (nr < 0) log_warn("security", "geoip deny load fail: %s", err);
+        }
+        if (g_cfg.allow_cidr_file[0]) {
+            nr = security_geoip_load_file(g_cfg.allow_cidr_file, BL_KIND_ALLOW, err, sizeof(err));
+            if (nr < 0) log_warn("security", "geoip allow load fail: %s", err);
+        } else {
+            /* ---- 默认种子兜底：NSBC_HOME/geo/cn_cidrs.txt 存在就自动加载 ----
+             * 零配置部署友好 —— 二进制旁边放 geo/cn_cidrs.txt 就自动启用 CN IP 白名单。
+             * 优先级：YAML allow_cidr_file > 默认种子 > 不加载（g_allow_cidr_n=0 → 不过滤） */
+            const char *home = getenv("NSBC_HOME");
+            if (!home || !home[0]) home = ".";
+            char seed[512];
+            snprintf(seed, sizeof(seed), "%s/geo/cn_cidrs.txt", home);
+            FILE *f = fopen(seed, "r");
+            if (f) {
+                fclose(f);
+                nr = security_geoip_load_file(seed, BL_KIND_ALLOW, err, sizeof(err));
+                if (nr < 0)
+                    log_warn("security", "geoip default cn seed load fail: %s", err);
+                else
+                    log_info("security", "geoip: auto-loaded %d CN CIDRs from %s", nr, seed);
+            } else {
+                log_info("security", "geoip: no allow_cidr_file configured, "
+                         "default cn seed not found at %s — allowlist mode OFF "
+                         "(all IPs accepted, only deny CIDRs block)", seed);
+            }
+        }
+    }
+
     int rc = b2b_register_hook_add(sec_reg_cb, &g_cfg);
     log_info("security", "init: b2b_register_hook_add rc=%d (hook=%s)",
              rc, rc == NSBC_OK ? "ok" : "full/dup");
     int grc = b2b_guard_hook_add(sec_guard_cb, NULL);
     log_info("security", "init: b2b_guard_hook_add rc=%d", grc);
 
-    /* OAM 命令（Web 封禁管理 + 静态黑名单同步 + 配置 reload）——CCMD 统一注册表
-     * （media_bug 同模式）。list=L1 监控可读；unban/clear/reload=L2 管理员。 */
+    /* OAM 命令（Web 封禁管理 + 静态黑名单同步 + 配置 reload + GeoIP 批量 CIDR 加载）——CCMD 统一注册表
+     * （media_bug 同模式）。list=L1 监控可读；unban/clear/reload/geoip=L2 管理员。 */
     cmd_reg_t *creg = obs_control_get_cmd_reg();
     if (creg) {
         const cmd_desc_t descs[] = {
@@ -2223,6 +2499,15 @@ static int security_init(struct nsbc_ctx *ctx)
               "security", CMD_L2_ADMIN,   cmd_bl_reload, NULL },
             { "security.cfg.reload",       "reload fail2ban config from YAML",
               "security", CMD_L2_ADMIN,   cmd_cfg_reload, ctx },
+            /* GeoIP 批量 CIDR —— 应用层 ipset 替代：allowlist 模式默认启用中国 IP 白名单 */
+            { "security.geoip.load_deny",  "append deny CIDR bulk file (e.g. spamhaus drop)",
+              "security", CMD_L2_ADMIN,   cmd_geoip_load_deny,  NULL },
+            { "security.geoip.load_allow", "append allow CIDR bulk file (e.g. CN IP whitelist)",
+              "security", CMD_L2_ADMIN,   cmd_geoip_load_allow, NULL },
+            { "security.geoip.reload",     "reload bl_seed + all geoip files (cfg + default seed)",
+              "security", CMD_L2_ADMIN,   cmd_geoip_reload,     NULL },
+            { "security.geoip.list",       "geoip status: deny/allow counts + allowlist mode",
+              "security", CMD_L1_MONITOR, cmd_geoip_list,       NULL },
         };
         for (size_t i = 0; i < sizeof(descs) / sizeof(descs[0]); ++i)
             log_info("security", "cmd_register('%s') rc=%d", descs[i].name,
@@ -2254,6 +2539,10 @@ static void security_fini(struct nsbc_ctx *ctx)
         cmd_unregister(creg, "security.blacklist.list");
         cmd_unregister(creg, "security.blacklist.reload");
         cmd_unregister(creg, "security.cfg.reload");
+        cmd_unregister(creg, "security.geoip.load_deny");
+        cmd_unregister(creg, "security.geoip.load_allow");
+        cmd_unregister(creg, "security.geoip.reload");
+        cmd_unregister(creg, "security.geoip.list");
     }
     ban_clear_all();
     pthread_rwlock_wrlock(&g_bl_rwlock);

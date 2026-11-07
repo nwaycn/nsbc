@@ -2190,27 +2190,19 @@ int bridge_rewrite_sdp(const char *in, size_t in_len, char *out,
                          "★REWRITE_BRANCH[%d]: orig_port=%u media_port=0 → BYPASS keep port=%u",
                          media_idx, orig_port, this_port);
                 } else if (orig_port == 0) {
-                    /* ★ REQ-ORIGINATE-ECHO-002：orig_port=0 通常是 auto_offer
-                     * （originate 构造的最小 SDP）或被上一节点标记为 rejected。
-                     * 但如果我们有 relay（media_port!=0），说明 offer_hook
-                     * 已决定做 SRTP_RELAY 转发 → 必须用 relay 的真实端口，
-                     * 不能保留 0 否则对端收到 m=audio 0 + a=inactive →
-                     * 不回 200 OK 或回 200 但不发音频。
-                     *
-                     * ★ BUNDLE 规则（RFC 8843）：
-                     *   dir == WS（WebRTC/BUNDLE）→ 所有 m= 段共用同一 transport，
-                     *     端口统一 = media_port，不加 idx 偏移。
-                     *   dir == PLAIN/ASIS → 硬 SIP 端无 BUNDLE，audio/video 独立 relay，
-                     *     用 media_port + media_idx*2 分端口。 */
-                    if (dir == MB_SDP_WS)
-                        this_port = (uint16_t)media_port;
-                    else
-                        this_port = (uint16_t)(media_port + (uint16_t)(media_idx * 2));
+                    /* ★ RFC 3264 语义：m=xxx 0 = 拒绝/关闭该媒体流
+                     *   - answer 里 port=0 → 对端明确拒绝（如 MicroSIP 拒 video）
+                     *   - offer 里 port=0 → hold 或关闭该媒体
+                     *   ★ 必须保持原样，绝对不能改写成 relay 真实端口——
+                     *     改写 = 硬启用被拒绝的媒体 → WebRTC setRemoteDescription
+                     *     检测到 answer 声称启用但 offer ICE 不可达 → reject → BYE 立挂。
+                     *   后续 this_port==0 分支（L2239+L2256）已正确处理：
+                     *     - proto 保持原始（不做 WS/SAVPF 注入）
+                     *     - tail 只保留第一个 fmt token */
+                    this_port = 0;
                     llog(LOG_INFO, "media",
-                         "★REWRITE_BRANCH[%d]: orig_port=0 relay active → %s port=%u media_port=%u",
-                         media_idx,
-                         dir == MB_SDP_WS ? "BUNDLE-unified" : "idx-offset",
-                         this_port, (unsigned)media_port);
+                         "★REWRITE_BRANCH[%d]: orig_port=0 (media REJECTED/CLOSED) → keep port=0 (no rewrite)",
+                         media_idx);
                 } else {
                     /* ★ BUNDLE 规则（RFC 8843）：
                      *   WS 方向（WebRTC answer）→ audio/video 共用同一 transport，
@@ -2231,7 +2223,11 @@ int bridge_rewrite_sdp(const char *in, size_t in_len, char *out,
                 while (pe < p + llen && *pe != ' ') ++pe;
 
                 const char *proto_token;
-                if (dir != MB_SDP_ASIS && pe > ps) {
+                if (this_port == 0) {
+                    /* ★ port=0 的 rejected m-line：保持原始 proto（如 RTP/AVP），
+                     * 不做 WS/SAVPF 注入——对方明确说拒绝，不需要给它注入 DTLS 语义。 */
+                    proto_token = (pe > ps) ? ps : "RTP/AVP";
+                } else if (dir != MB_SDP_ASIS && pe > ps) {
                     proto_token = (dir == MB_SDP_WS)
                                      ? "UDP/TLS/RTP/SAVPF" : "RTP/AVP";
                 } else if (pe > ps) {
@@ -2771,13 +2767,20 @@ int bridge_offer_hook(void *call, const char *in, size_t inlen,
     if (m->cfg.call_media_mode)
         rule_mm = m->cfg.call_media_mode(m->cfg.call_media_mode_ud, call);
 
-    /* ① 硬约束 */
+    /* ① 硬约束
+     * mixed_ws (混合 WebRTC + SIP 明文) 强制 MB_RELAY：
+     *   - WebRTC 侧 DTLS-SRTP 由 bridge 终结
+     *   - SIP 侧走 RTP/AVP 明文
+     *   - bridge 做 SRTP↔RTP 加解密转换
+     *   - 绝不能用 MB_SRTP_RELAY —— SRTP_RELAY 要求两端都是 WebRTC/DTLS-SRTP，
+     *     SIP 明文端不支持 DTLS，会导致 media bridge 卡死在等待 ClientHello。
+     * both_ws (两端都是 WebRTC) 才强制 MB_SRTP_RELAY。 */
     if (mixed_ws) {
         if (rule_mm == 1)
-            llog(LOG_WARN, "media", "offer_hook: rule=bypass but mixed-leg WebRTC (ignored, forcing SRTP_RELAY)");
-        if (mode != MB_SRTP_RELAY) {
-            mode = MB_SRTP_RELAY;
-            llog(LOG_INFO, "media", "offer_hook: mixed WebRTC leg → force SRTP_RELAY");
+            llog(LOG_WARN, "media", "offer_hook: rule=bypass but mixed-leg WebRTC (ignored, forcing RELAY)");
+        if (mode != MB_RELAY) {
+            mode = MB_RELAY;
+            llog(LOG_INFO, "media", "offer_hook: mixed WebRTC leg → force RELAY (WebRTC DTLS + SIP RTP/AVP via SRTP↔RTP bridge)");
         }
     }
     if (both_ws && rule_mm == 0) {
@@ -2792,7 +2795,7 @@ int bridge_offer_hook(void *call, const char *in, size_t inlen,
     /* ② rule override（rule=auto(0) 时跳过） */
     if (rule_mm == 1) {  /* rule=bypass */
         if (mixed_ws) {
-            /* 混合腿 rule=bypass 已在上面打 WARN，此处不动 mode（已被强制 SRTP_RELAY） */
+            /* 混合腿 rule=bypass 已在上面打 WARN，此处不动 mode（已被强制 RELAY） */
         } else {
             llog(LOG_INFO, "media", "offer_hook: rule→force BYPASS%s", both_ws ? " (WebRTC↔WebRTC P2P)" : "");
             mode = MB_BYPASS;
@@ -2882,7 +2885,7 @@ int bridge_offer_hook(void *call, const char *in, size_t inlen,
      * 边界情况：如果 b_ws=0 但 B 腿实际发了带 a=fingerprint 的 DTLS-SRTP answer
      * （某些 UDP SIP 端点也支持），answer_hook 里 is_webrtc_sdp(answer) 检测到后
      * 会补建 side=1 的 DTLS server —— 见 answer_hook 修复。 */
-    if (mode == MB_SRTP_RELAY && m->cfg.re) {
+    if ((mode == MB_SRTP_RELAY || mode == MB_RELAY) && m->cfg.re) {
         dtls_cfg_t dc = {
             .srtp_profile_id = 0x0007, /* SRTP_AEAD_AES_128_GCM */
         };

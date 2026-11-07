@@ -130,6 +130,13 @@ security:
   # INVITE flood guard（注册完成后同一 IP 狂发 INVITE）
   ratelimit_invites: 20                 # 全局滑窗内最多 new INVITE（默认 20）
   ratelimit_invites_active: 5           # 同时活跃 INVITE 数上限（默认 5）
+  # ---- GeoIP 应用层 ipset（NSBC 原生实现，零内核依赖）----
+  # allowlist 模式：allow_cidr_file 有值即开启，不在白名单的 IP 一律 silent drop
+  # 相对路径：基于 conf/nsbc.yaml 所在目录 → ../geo/cn_cidrs.txt 指向 deploy-root/geo/
+  # geoip-update.sh 会自动拉取并 cp 到 $NSBC_HOME/geo/cn_cidrs.txt
+  allow_cidr_file: "/var/cache/nsbc-geoip/cn_cidrs.txt"    # CN IP 白名单（geoip-update.sh 生成 + 热重载）
+  deny_cidr_file:  ""                       # 可选：全球黑名单（spamhaus DROP 等）
+  blacklist_cidrs: ""                       # 可选：逗号分隔小列表，优先级最高，如 "1.2.3.0/24,10.20.0.0/16"
 
 system:
   config_snapshot_dir: "../data/snapshots"
