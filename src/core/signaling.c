@@ -1708,6 +1708,10 @@ static int sig_start(struct nsbc_ctx *ctx)
     llog(LOG_INFO, "sig", "registrar cfg: digest_secret_configured=%d",
          s->digest_secret != NULL);
     long minexp = 60, defexp = 3600, maxexp = 3600;
+    /* FS sip-force-expires: 0=不强制；>0=完全覆盖客户端 exp（公网部署推荐 1800） */
+    long force_exp = 0, jitter = 0;
+    /* FS multiple-registrations: 1=允许多 Contact；0=只保留最新 */
+    long multi = 1, max_ext = 0, force_ok = 0;
     /* REGISTER 消耗极少资源 → 开源默认不限流（0）。
      * 核心并发限制只在 INVITE 侧 sip.max_concurrent_calls 做。
      * 生产环境如需防注册风暴，可显式设 registrar.rps_per_ip / rps_per_aor / rps_global。 */
@@ -1715,6 +1719,11 @@ static int sig_start(struct nsbc_ctx *ctx)
     cfg_get_int(cfg, "registrar.min_expires", &minexp, NULL);
     cfg_get_int(cfg, "registrar.default_expires", &defexp, NULL);
     cfg_get_int(cfg, "registrar.max_expires", &maxexp, NULL);
+    cfg_get_int(cfg, "registrar.force_expires", &force_exp, NULL);
+    cfg_get_int(cfg, "registrar.expires_jitter_s", &jitter, NULL);
+    cfg_get_int(cfg, "registrar.multiple_registrations", &multi, NULL);
+    cfg_get_int(cfg, "registrar.max_registrations_per_ext", &max_ext, NULL);
+    cfg_get_int(cfg, "registrar.force_register_ok", &force_ok, NULL);
     cfg_get_int(cfg, "registrar.rps_per_ip", &ipcps, NULL);
     cfg_get_int(cfg, "registrar.rps_per_aor", &aorcps, NULL);
     cfg_get_int(cfg, "registrar.rps_global", &gcps, NULL);
@@ -1730,6 +1739,11 @@ static int sig_start(struct nsbc_ctx *ctx)
     rc.min_expires = (int)minexp;
     rc.max_expires = (int)maxexp;
     rc.default_expires = (int)defexp;
+    rc.force_expires = (int)force_exp;
+    rc.expires_jitter_s = (int)jitter;
+    rc.multiple_registrations = (int)multi;
+    rc.max_registrations_per_ext = (int)max_ext;
+    rc.force_register_ok = (int)force_ok;  /* ★ 调试开关：一行 YAML 跳过 auth */
     rc.ip_cps = (int)ipcps;
     rc.aor_cps = (int)aorcps;
     rc.global_cps = (int)gcps;

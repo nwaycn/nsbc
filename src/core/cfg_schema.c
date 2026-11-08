@@ -126,6 +126,14 @@ static const cfg_desc_t k_core[] = {
     {"registrar.min_expires", CGT_INT, CGF_HOT, "60", NULL, 10, 3600},
     {"registrar.default_expires", CGT_INT, CGF_HOT, "600", NULL, 60, 86400},
     {"registrar.max_expires", CGT_INT, CGF_HOT, "600", NULL, 60, 86400},
+    /* FS sip-force-expires: 0=不强制；>0=完全覆盖客户端 exp（公网部署推荐 1800） */
+    {"registrar.force_expires", CGT_INT, CGF_HOT, "0", NULL, 0, 86400},
+    /* FS sip-expires-max-deviation: force_expires ± jitter 随机化防风暴（默认 0 关闭） */
+    {"registrar.expires_jitter_s", CGT_INT, CGF_HOT, "0", NULL, 0, 3600},
+    /* FS multiple-registrations: 1=允许多 Contact 同 AoR（默认）；0=只保留最新 */
+    {"registrar.multiple_registrations", CGT_INT, CGF_HOT, "1", NULL, 0, 1},
+    /* FS max-registrations-per-extension: 0=不限；>0=每个分机号最多 N 个同时注册 */
+    {"registrar.max_registrations_per_ext", CGT_INT, CGF_HOT, "0", NULL, 0, 1024},
     {"registrar.max_contacts", CGT_INT, CGF_HOT, "10", NULL, 1, 20},
     {"registrar.rps_global", CGT_INT, CGF_HOT, "0", NULL, 0, 1000000},
     {"registrar.rps_per_ip", CGT_INT, CGF_HOT, "0", NULL, 0, 100000},

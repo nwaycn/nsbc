@@ -5207,14 +5207,20 @@ impl Db {
             .bind(c.tenant_id).fetch_optional(pool).await?
             .unwrap_or_else(|| "nsbc.local".to_string());
 
-        // Password handling: if plaintext provided, compute ha1/ha1b; otherwise use supplied ha1 directly
+        // Password handling: if plaintext provided, compute ha1/ha1b; otherwise use supplied ha1 directly.
+        // ★ 防御：password 和 ha1 都空 → 返回错误（不让创建空 ha1 的死账号）
         let (password, ha1, ha1b) = if !c.password.is_empty() {
             let ha1_hex = ha1_of(&c.extension, &realm, &c.password);
             let ha1b_hex = ha1_of(&c.extension, &realm, &c.password);
             (c.password.clone(), ha1_hex, ha1b_hex)
-        } else {
+        } else if !c.ha1.is_empty() {
+            // 前端显式传了预计算 ha1（32 hex），不重新算
             ("".to_string(), c.ha1.clone(), c.ha1b.clone())
-        };
+        } else {
+            return Err(sqlx::Error::Protocol(
+                "extensions: must provide either `password` or `ha1` (both empty → cannot compute SIP Digest auth)".into()
+            ));
+        }
 
         let raw_sql = "INSERT INTO extensions
                 (tenant_id, extension, realm, password, ha1, ha1b, enabled, clip, clir,

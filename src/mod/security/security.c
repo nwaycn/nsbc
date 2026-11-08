@@ -44,13 +44,31 @@
 #include <errno.h>
 
 /* ---- 前向声明：封禁表核心（sec_reg_cb 先于定义使用） ---- */
+
+/* ban_reason 位掩码：区分封禁原因 → reactor 层前置检查可选择性跳过
+ * INVITE flood 封禁（CGNAT 场景下不能把同一出口 IP 的 REGISTER 也封了）。
+ * 必须在 sec_reg_cb（L1315）之前定义，因为 REGISTER 路径直接引用。 */
+#define BAN_REASON_INV_FLOOD  0x01   /* INVITE 频率超阈值（ratelimit_invites_active） */
+#define BAN_REASON_AUTH_FAIL  0x02   /* REGISTER digest auth fail 超阈值 */
+#define BAN_REASON_REG_REQ    0x04   /* REGISTER 请求频率超阈值（ratelimit_registrations） */
+#define BAN_REASON_INV_REQ    0x08   /* 被动：INVITE/REGISTER txn slab 分配失败计数 */
+
 static int  ban_is_private_ip(const char *ip_str); /* 私网/loopback — 跳过 auto-ban */
-static int  ban_is_banned(const char *ip);
+static int  ban_is_banned(const char *ip, int allow_reasons);
 static int  ban_note_fail(const char *ip);
 static int  ban_note_reg_req(const char *ip);
 static int  ban_note_inv_fail(const char *ip);   /* 被动：txn slab 分配失败计数 */
 static int  ban_note_inv_count(const char *ip); /* 主动：per-IP 新 INVITE 频率计数 */
 static uint32_t ban_duration_for_strikes(uint32_t base_s, int strikes);
+
+/* ---- helper：IP 在 allowlist 里？（GeoIP CN 白名单命中 → 可信来源）----
+ * 用于两处：
+ *   1. security_is_blocked：reactor 收包层前置
+ *   2. ban producer（guard_notify / registrar auth fail 累加）
+ * allowlist 命中 → 整个 auto-ban 路径跳过（可信 IP 不会被动态封禁）。
+ * 未配置 allowlist（g_allow_cidr_n==0）→ 返回 0（不跳过）。 */
+static int ip_in_allowlist(const char *ip_str);
+static int ip_in_deny_cidr(const char *ip_str);
 static int  security_cfg_save_yaml(void);          /* REQ-EXT-API-005 前向声明 */
 
 /* === 全局配置（init 时从 YAML 加载；简化骨架：默认全 0）=== */
@@ -1301,8 +1319,9 @@ static int sec_reg_cb(sip_tr_proto_t proto, const nsbc_sa_t *src,
         return NSBC_PERM_DENIED;
     }
 
-    /* 动态封禁：命中即静默丢（限频采样日志，防攻击流量刷屏） */
-    if (cfg->auto_ban && ban_is_banned(ip)) {
+    /* 动态封禁：命中即静默丢（限频采样日志，防攻击流量刷屏）
+     * CGNAT 修复：排除 BAN_REASON_INV_FLOOD（inv flood ban 不应 block REGISTER） */
+    if (cfg->auto_ban && ban_is_banned(ip, BAN_REASON_AUTH_FAIL | BAN_REASON_REG_REQ | BAN_REASON_INV_REQ)) {
         static unsigned ban_drop_n = 0;
         if (ban_drop_n++ % 512 == 0)
             log_notice("security",
@@ -1346,6 +1365,7 @@ typedef struct ban_ent {
     uint64_t ban_until;      /* 封禁到期时刻（mono ms） */
     uint64_t last_act;       /* 最近活动（满表驱逐用） */
     int  strikes;            /* 累计封禁次数（递进封禁） */
+    int  ban_reason;         /* 当前 ban_until 触发原因（位掩码） */
     struct ban_ent *next;
 } ban_ent_t;
 
@@ -1433,6 +1453,7 @@ static uint32_t ban_duration_for_strikes(uint32_t base_s, int strikes)
 static int ban_note_fail(const char *ip)
 {
     if (ban_is_private_ip(ip)) return 0;
+    if (ip_in_allowlist(ip)) return 0;  /* GeoIP 白名单 → 可信来源不计数不封禁 */
     uint64_t now = nsbc_now_ms();
     int banned_now = 0;
     pthread_mutex_lock(&g_ban_lock);
@@ -1459,6 +1480,7 @@ static int ban_note_fail(const char *ip)
     if (++e->fails >= g_cfg.authfail_threshold) {
         e->strikes++;
         e->ban_until = now + (uint64_t)ban_duration_for_strikes(g_cfg.ban_duration_s, e->strikes) * 1000;
+        e->ban_reason |= BAN_REASON_AUTH_FAIL;
         banned_now = 1;
     }
     pthread_mutex_unlock(&g_ban_lock);
@@ -1471,6 +1493,7 @@ static int ban_note_fail(const char *ip)
 static int ban_note_reg_req(const char *ip)
 {
     if (ban_is_private_ip(ip)) return 0;
+    if (ip_in_allowlist(ip)) return 0;  /* GeoIP 白名单 → 可信来源不计数不封禁 */
     uint64_t now = nsbc_now_ms();
     int banned_now = 0;
     int window_s = g_cfg.ratelimit_window_s > 0 ? g_cfg.ratelimit_window_s : 60;
@@ -1499,6 +1522,7 @@ static int ban_note_reg_req(const char *ip)
     if (++e->reqs >= regs_thr) {
         e->strikes++;
         e->ban_until = now + (uint64_t)ban_duration_for_strikes(g_cfg.ban_duration_s, e->strikes) * 1000;
+        e->ban_reason |= BAN_REASON_REG_REQ;
         banned_now = 1;
     }
     pthread_mutex_unlock(&g_ban_lock);
@@ -1579,6 +1603,39 @@ static int ban_is_private_ip(const char *ip_str)
     return 0;
 }
 
+/* === GeoIP CIDR allowlist/deny 快速查询 ===
+ * 从 g_allow_cidr[] / g_deny_cidr[] 表里查，加读锁。
+ * 表为空 → 返回 0（不命中）。
+ * allowlist 命中 → 整个 auto-ban 路径跳过（reactor 收包放行 + fail2ban 不计数）。
+ * deny CIDR 命中 → security_is_blocked 里直接 silent drop。 */
+static int ip_in_allowlist(const char *ip_str)
+{
+    if (!ip_str || !ip_str[0] || g_allow_cidr_n == 0) return 0;
+    struct sockaddr_in6 sa = {0};
+    if (inet_pton(AF_INET6, ip_str, &sa.sin6_addr) != 1) return 0;
+    pthread_rwlock_rdlock(&g_bl_rwlock);
+    int hit = 0;
+    for (int i = 0; i < g_allow_cidr_n; ++i) {
+        if (bl_ip_match((struct sockaddr *)&sa, &g_allow_cidr[i])) { hit = 1; break; }
+    }
+    pthread_rwlock_unlock(&g_bl_rwlock);
+    return hit;
+}
+
+static int ip_in_deny_cidr(const char *ip_str)
+{
+    if (!ip_str || !ip_str[0] || g_deny_cidr_n == 0) return 0;
+    struct sockaddr_in6 sa = {0};
+    if (inet_pton(AF_INET6, ip_str, &sa.sin6_addr) != 1) return 0;
+    pthread_rwlock_rdlock(&g_bl_rwlock);
+    int hit = 0;
+    for (int i = 0; i < g_deny_cidr_n; ++i) {
+        if (bl_ip_match((struct sockaddr *)&sa, &g_deny_cidr[i])) { hit = 1; break; }
+    }
+    pthread_rwlock_unlock(&g_bl_rwlock);
+    return hit;
+}
+
 /* INVITE/REGISTER 事务层分配失败 ratelimit：与 REGISTER ratelimit 共用窗口秒，
  * 阈值由 ratelimit_invites 控制（默认 30，设 0 关闭）。
  * b2bua 在 txn_server_input 返回负码（slab 满/NOMEM/NOSPC）时调此函数。
@@ -1588,6 +1645,7 @@ static int ban_note_inv_fail(const char *ip)
 {
     if (!g_cfg.auto_ban) return 0;
     if (ban_is_private_ip(ip)) return 0;
+    if (ip_in_allowlist(ip)) return 0;  /* GeoIP 白名单 → 可信来源不计数不封禁 */
     int window_s = g_cfg.ratelimit_window_s > 0 ? g_cfg.ratelimit_window_s : 60;
     int thr = g_cfg.ratelimit_invites > 0 ? g_cfg.ratelimit_invites : 30;
     if (thr <= 0) return 0;
@@ -1617,6 +1675,7 @@ static int ban_note_inv_fail(const char *ip)
     if (++e->inv_req >= thr) {
         e->strikes++;
         e->ban_until = now + (uint64_t)ban_duration_for_strikes(g_cfg.ban_duration_s, e->strikes) * 1000;
+        e->ban_reason |= BAN_REASON_INV_REQ;
         banned_now = 1;
     }
     pthread_mutex_unlock(&g_ban_lock);
@@ -1632,6 +1691,7 @@ static int ban_note_inv_count(const char *ip)
 {
     if (!g_cfg.auto_ban) return 0;
     if (ban_is_private_ip(ip)) return 0;
+    if (ip_in_allowlist(ip)) return 0;  /* GeoIP 白名单 → 可信来源不计数不封禁 */
     int window_s = g_cfg.ratelimit_window_s > 0 ? g_cfg.ratelimit_window_s : 60;
     int thr = g_cfg.ratelimit_invites_active > 0 ? g_cfg.ratelimit_invites_active : 20;
     if (thr <= 0) return 0;
@@ -1661,6 +1721,7 @@ static int ban_note_inv_count(const char *ip)
     if (++e->inv_count >= thr) {
         e->strikes++;
         e->ban_until = now + (uint64_t)ban_duration_for_strikes(g_cfg.ban_duration_s, e->strikes) * 1000;
+        e->ban_reason |= BAN_REASON_INV_FLOOD;
         banned_now = 1;
     }
     pthread_mutex_unlock(&g_ban_lock);
@@ -1687,8 +1748,19 @@ static void ban_clear_counts(const char *ip)
 
 /* 封禁查询：1=封禁中（顺手刷新 last_act 供驱逐参考）
  * 私网 IP 跳过 —— auto-ban 不应封内网（用户误触发 flood 直接封 3600s 很坑）。
- * 管理员手动配 blacklist 里的内网 IP 仍能通过 bl_ip_match 生效。 */
-static int ban_is_banned(const char *ip)
+ * 管理员手动配 blacklist 里的内网 IP 仍能通过 bl_ip_match 生效。
+ *
+ * @param allow_reasons  允许匹配的 ban_reason 位掩码：
+ *   传 BAN_REASON_AUTH_FAIL|BAN_REASON_REG_REQ → reactor 层前置检查（REGISTER 也 block）
+ *   传 BAN_REASON_ALL（= 0x0F 所有位）→ INVITE 入口检查（全 block）
+ *   传 0 → 兼容旧语义（所有 ban 原因都 block）
+ *
+ * 设计意图（CGNAT 关键修复）：
+ *   运营商级 NAT 把多个用户汇聚到同一出口 IP，其中一人发 INVITE flood →
+ *   不能把同 IP 的正常 REGISTER 也封死。所以 INVITE flood 的 ban 只在
+ *   b2bua INVITE 入口生效；reactor 层前置检查只 block REGISTER auth fail /
+ *   REGISTER ratelimit 这类真正针对注册的威胁。 */
+static int ban_is_banned(const char *ip, int allow_reasons)
 {
     if (ban_is_private_ip(ip)) return 0;
     uint64_t now = nsbc_now_ms();
@@ -1697,8 +1769,22 @@ static int ban_is_banned(const char *ip)
     ban_ent_t *e = ban_find_locked(ip);
     if (e) {
         e->last_act = now;
-        if (e->ban_until > now)
-            hit = 1;
+        if (e->ban_until > now) {
+            if (allow_reasons == 0) {
+                /* 兼容旧语义：任何 ban_reason 都 block */
+                hit = 1;
+            } else if (e->ban_reason == 0) {
+                /* 旧 ban 条目（ban_reason 未设置）→ 假设是 INVITE flood 触发的
+                 * 新逻辑下 inv flood ban 不应该 block REGISTER，所以 reactor 层放行。
+                 * INVITE 入口传 BAN_REASON_ALL（0x0F）+ ban_reason==0 时也放行 INVITE
+                 * 太激进，这里对旧条目一律放行（让它们等自然过期）。 */
+                hit = 0;
+            } else if (e->ban_reason & allow_reasons) {
+                /* ban_reason 与 allow_reasons 有交集 → block */
+                hit = 1;
+            }
+            /* ban_reason 有值但与 allow_reasons 无交集 → 放行（CGNAT 核心逻辑） */
+        }
     }
     pthread_mutex_unlock(&g_ban_lock);
     return hit;
@@ -1718,16 +1804,30 @@ int security_is_blocked(const nsbc_sa_t *src)
     char ip[INET6_ADDRSTRLEN] = {0};
     sa_to_ip_str(src, ip, sizeof(ip));
     if (!ip[0]) return 0;
+
+    /* === Layer 0: GeoIP deny CIDR（最高优先级，先于一切）===
+     * 命中 → 直接 silent drop，不进入后续任何逻辑 */
+    if (ip_in_deny_cidr(ip)) return 1;
+
+    /* === Layer 0: GeoIP allowlist（可信来源跳过整个 auto-ban 路径）===
+     * 命中 → 放行 + 跳过 ban_is_banned（allowlist 里的 IP 不应该被动态封禁）
+     * 这是用户诉求的核心修复：GeoIP allowlist 在 auto-ban 之前检查 */
+    if (ip_in_allowlist(ip)) return 0;
+
     /* 0. 私网跳过 —— auto-ban producer 端已经 skip，这里再加一层入口 skip
      *    双保险：动态 ban 表 + 静态 CIDR 黑名单都不应该封私网段
      *    （管理员不太可能把整个 10.0.0.0/8 配成黑名单，那会封掉内网所有设备）。 */
     if (ban_is_private_ip(ip)) return 0;
-    /* 1. 动态封禁表（auto-ban） */
-    if (ban_is_banned(ip)) {
+    /* 1. 动态封禁表（auto-ban）—— CGNAT 关键修复：
+     *    只 block BAN_REASON_AUTH_FAIL / BAN_REASON_REG_REQ / BAN_REASON_INV_REQ
+     *    排除 BAN_REASON_INV_FLOOD（INVITE 主动频率）—— 运营商 NAT 把多个用户汇
+     *    聚到同一出口 IP，其中一人发 INVITE flood 不能把同 IP 的正常 REGISTER
+     *    也封死。INVITE flood ban 延后到 b2bua INVITE 入口再 block。 */
+    if (ban_is_banned(ip, BAN_REASON_AUTH_FAIL | BAN_REASON_REG_REQ | BAN_REASON_INV_REQ)) {
         static unsigned dbg = 0;
         if (dbg++ % 1024 == 0)
             log_notice("security",
-                       "security_is_blocked ip=%s via ban_is_banned (ban_until<=now? check)",
+                       "security_is_blocked ip=%s via ban_is_banned (auth_fail|reg_req|inv_req)",
                        ip);
         return 1;
     }
@@ -1741,6 +1841,28 @@ int security_is_blocked(const nsbc_sa_t *src)
                        ip, g_cfg.block_on_register, g_cfg.block_on_invite);
         return 1;
     }
+    return 0;
+}
+
+/* INVITE 入口专用 ban 检查（b2bua.c txn_server_input 之前调用）。
+ * 与 security_is_blocked 的区别：
+ *   security_is_blocked → reactor 层前置，排除 INVITE flood ban（CGNAT 放行 REGISTER）
+ *   security_check_inv_ban → INVITE 入口，所有 ban 原因都生效（inv flood 就是用来 block INVITE 的）
+ * 静态 CIDR 黑名单在 INVITE 路径继续生效（deny CIDR 里的 INVITE 应该被封）。 */
+int security_check_inv_ban(const nsbc_sa_t *src)
+{
+    if (!src) return 0;
+    char ip[INET6_ADDRSTRLEN] = {0};
+    sa_to_ip_str(src, ip, sizeof(ip));
+    if (!ip[0]) return 0;
+
+    /* GeoIP deny CIDR（最高优先级） */
+    if (ip_in_deny_cidr(ip)) return 1;
+
+    /* 动态封禁表 — 所有 ban_reason 都 block INVITE */
+    if (ban_is_banned(ip, 0x0F /* BAN_REASON_ALL */))
+        return 1;
+
     return 0;
 }
 
@@ -1956,8 +2078,9 @@ static int sec_guard_cb(const char *src_ip, b2b_guard_evt_t evt, void *ud)
         return NSBC_OK;  /* 纯上报，拦截在 ban_is_banned 处生效 */
     }
 
-    /* B2B_GUARD_INVITE：动态封禁 + 静态 CIDR 黑名单 */
-    if (g_cfg.auto_ban && ban_is_banned(src_ip)) {
+    /* B2B_GUARD_INVITE：动态封禁 + 静态 CIDR 黑名单
+     * 所有 ban_reason 都 block INVITE（inv flood ban 本来就是用来封 INVITE 的） */
+    if (g_cfg.auto_ban && ban_is_banned(src_ip, 0x0F /* BAN_REASON_ALL */)) {
         static unsigned ban_drop_n = 0;
         if (ban_drop_n++ % 512 == 0)
             log_notice("security",

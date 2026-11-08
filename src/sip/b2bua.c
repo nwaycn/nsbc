@@ -3789,6 +3789,20 @@ void handle_new_invite(b2b_core_t *co, sip_txn_t *t,
         if (gip[0] && b2b_guard_check(gip, B2B_GUARD_INVITE) == NSBC_PERM_DENIED)
             return;
 
+        /* INVITE 专用动态封禁检查 — CGNAT 核心修复：
+         * security_is_blocked（reactor 层前置）已排除 BAN_REASON_INV_FLOOD，
+         * 让正常 REGISTER 不被连坐。但 INVITE 必须 block 所有 ban 原因——
+         * inv flood ban 本来就是用来 block INVITE 的。 */
+        if (!is_emergency && security_check_inv_ban(src)) {
+            static unsigned inv_blk = 0;
+            if (inv_blk++ % 1024 == 0) {
+                log_notice("b2bua",
+                           "INVITE ban: security_check_inv_ban srcip=%s (inv flood or auth fail)",
+                           gip);
+            }
+            return;
+        }
+
         /* NIP 完整围栏：method + IP + UA + 主叫 + 被叫
          * 优先级：method 禁用 → deny 全表 → allowlist 未命中
          * 命中一律静默丢弃（不回任何 SIP 响应，防 SBC 指纹暴露）。 */

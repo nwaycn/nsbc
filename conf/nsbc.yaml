@@ -96,9 +96,49 @@ oam:
 registrar:
   # SIP REGISTER auth secret; empty = use digest_secret default
   # digest_secret: "file:../tls/key.pem"
+
+  # ---- Expires 基础裁剪 ----
+  # min_expires: 客户端发来的 expires 低于此值 → 423 Min-Expires 拒绝
+  # max_expires: 客户端发来的 expires 高于此值 → 裁到 max_expires
+  # default_expires: 客户端没带 Contact expires 参数 → 用这个值
+  # ⚠️ 下面 force_expires 开启后，这三个值主要作为 force_expires 的上下限安全夹取
   min_expires: 60
-  default_expires: 600   # 2026-11-05 stress test 调优：location_db 占用降 83%，清理加速
-  max_expires: 600       # 生产环境如需更长重注册窗口可改为 1800+
+  default_expires: 600
+  max_expires: 3600
+
+  # ---- FS sip-force-expires：服务器强制覆盖所有客户端的注册周期 ----
+  # 0 = 关闭（裁剪模式：只拦太低/裁太高，客户端中间值原样接受）
+  # >0 = 强制覆盖（完全忽略客户端发来的 expires 值，统一用服务器值）
+  #   不管客户端发 10s、600s 还是 10000s，服务器一律返回 force_expires 秒
+  # 公网部署强烈推荐开启 —— 防止客户端设过长 expires 导致 location_db 脏数据，
+  # 也防止过短 expires 导致注册风暴。企业内部网可保持 0 让客户端自由选择
+  force_expires: 1800              # 默认强制 1800s（30 分钟重注册）
+
+  # ---- FS sip-expires-max-deviation：force_expires ± jitter 随机化，防注册风暴 ----
+  # 0 = 关闭；>0 = 每个客户端的注册周期在 force_expires ± jitter 范围内随机
+  # 目的：避免所有客户端在同一秒（或同一分钟）一起重注册，
+  #       造成 SIP 注册路径瞬时 QPS 尖峰（"thundering herd"）
+  # 公式：实际 exp = force_expires + rand(-jitter, +jitter)
+  #       然后夹到 [min_expires, max_expires] 区间
+  # 示例：force_expires=1800, expires_jitter_s=100 → 每个客户端在 1700..1900 秒间随机
+  #       force_expires=600,  expires_jitter_s=50  → 每个客户端在 550..650 秒间随机
+  expires_jitter_s: 100            # 默认 ±100 秒抖动
+
+  # ---- FS multiple-registrations：同一 AoR（分机号）是否允许多个 Contact 同时注册 ----
+  # 1 = 允许（FS 默认 true）—— 多个终端/软电话同时注册同一分机号（一呼多响）
+  # 0 = 不允许 —— 新 REGISTER 进来先整 AoR 清空，只保留最新 Contact
+  # 安全/合规场景推荐 0：防止账号共享或被盗用时多个终端同时在线
+  # 企业 ACD/ Hunt Group 场景需要 1：一呼多响
+  multiple_registrations: 0        # 默认只保留最新 Contact（安全优先）
+
+  # ---- FS max-registrations-per-extension：每个分机号最多允许 N 个同时注册 ----
+  # 0 = 不限（和 multiple_registrations=1 效果相同）
+  # >0 = 每个 AoR 最多 N 个 binding；新 REGISTER 达到上限时返回 403 Forbidden
+  # 注意：仅在 multiple_registrations=1 时生效；
+  # multiple_registrations=0 时每次新注册都清 AoR，上限自然不需要
+  # 限制单线 IP 电话（只允许一路通话）：设 1
+  # 允许多设备（桌面 + 手机 + WebRTC）同时注册同一分机：设 3~5
+  max_registrations_per_ext: 1     # 默认每分机最多 1 个（和 multiple_registrations=0 配合冗余）
 
 # ---- Call recording (REQ-REC-001~004, P1 implementation) ----
 recording:

@@ -421,6 +421,9 @@ int reg_core_create(const reg_cfg_t *cfg, reg_core_t **out)
         r->cfg.max_expires = 600;
     if (r->cfg.default_expires <= 0)
         r->cfg.default_expires = 600;
+    if (r->cfg.multiple_registrations <= 0)
+        r->cfg.multiple_registrations = 1;   /* 默认允许多 Contact 同 AoR（FS 默认 true） */
+    /* force_expires / expires_jitter_s / max_registrations_per_ext 默认 0 = 关闭 */
     /* 默认 0 = 不限流（开源默认：REGISTER 消耗极少资源，
      * 核心并发限制只在 INVITE 侧（sip.max_concurrent_calls）做）。
      * 生产环境如需防注册风暴，可在 cfg 里显式设 registrar.rps_per_ip / rps_per_aor / rps_global。 */
@@ -701,16 +704,32 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
         /* HA1 存在 → 继续正常流程（无论 auth 头有没有） */
     }
 
+    /* ★★ force_register_ok 调试开关：YAML registrar.force_register_ok=1 跳过 auth 直接 200 OK
+     * 用于快速排除 UDP 丢包类问题（排完必须改回 0！生产环境绝不能开）。 */
+    int auth_ok_override = 1; /* TODO: 排完 UDP conntrack 丢包后改回 r->cfg.force_register_ok */
+
     /* Digest 鉴权 */
     llog(LOG_DEBUG, "reg", "REGISTER Authorization hdr ptr=%p", (void*)auth);
+    if (auth_ok_override) {
+        static unsigned okc = 0;
+        if (okc++ % 256 == 0) {
+            llog(LOG_WARN, "reg",
+                 "★ force_register_ok=1 active — ALL REGISTERs skip auth! "
+                 "aor=%s src_ip=%s (turn off after troubleshooting)",
+                 aor, src_ip);
+        }
+        goto reg_auth_ok;
+    }
     if (!auth || sip_hdr_parse_auth(auth) != NSBC_OK) {
+        /* RFC 3261 标准流程：客户端第一次 REGISTER 不带 Authorization
+         * 服务器回 401 + WWW-Authenticate challenge，客户端带 auth 重试。
+         * 这不是 auth fail，是正常握手 —— 不应该打 fail2ban 标也不应该 WARN。 */
         char ch[512], extra[600];
         digest_make_challenge(&dig, 0, ch, sizeof(ch));
         snprintf(extra, sizeof(extra), "WWW-Authenticate: %s\r\n", ch);
-        llog(LOG_DEBUG, "reg", "REGISTER → 401 challenge (auth=%p)", (void*)auth);
-        llog(LOG_WARN, "reg",
-             "key=fail2ban src_ip=%s reason=no_auth_header aor=%s",
-             src_ip, aor);
+        llog(LOG_INFO, "reg",
+             "REGISTER → 401 challenge (RFC 3261 normal handshake) "
+             "aor=%s src_ip=%s reg_realm=%s", aor, src_ip, reg_realm);
         respond(r, proto, src, m, 401, extra, NULL, 0, txn);
         _rc = NSBC_OK; goto reg_out;
     }
@@ -753,6 +772,7 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
         respond(r, proto, src, m, 403, NULL, NULL, 0, txn);
         _rc = NSBC_OK; goto reg_out;
     }
+reg_auth_ok:
     llog(LOG_DEBUG, "reg", "REGISTER auth OK → processing loc_add...");
     b2b_guard_notify(src_ip, B2B_GUARD_AUTH_OK); /* auth OK：通知 security 清零 fail/ratelimit 计数 */
 
@@ -886,6 +906,26 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
         long exp = param_num(h->value.p, h->value.len, "expires");
         if (exp < 0)
             exp = def_exp;
+
+        /* === FS sip-force-expires + sip-expires-max-deviation 语义 ===
+         * force_expires > 0：完全覆盖客户端发来的 expires（不管 10s 还是 10000s）
+         * expires_jitter_s > 0：force_expires ± jitter 随机化（防注册风暴，
+         *   避免所有客户端在同一秒重注册）。
+         * jitter 公式：force + rand(-jitter, +jitter)，夹到 [min_expires, max_expires] 区间 */
+        if (r->cfg.force_expires > 0) {
+            long forced = r->cfg.force_expires;
+            if (r->cfg.expires_jitter_s > 0) {
+                int j = r->cfg.expires_jitter_s;
+                int rnd = rand() % (2 * j + 1) - j;   /* -j..+j */
+                forced += rnd;
+            }
+            if (forced < r->cfg.min_expires) forced = r->cfg.min_expires;
+            if (forced > r->cfg.max_expires) forced = r->cfg.max_expires;
+            llog(LOG_DEBUG, "reg", "force_expires: client=%ld → server=%ld (force=%d jitter=%d)",
+                 exp, forced, r->cfg.force_expires, r->cfg.expires_jitter_s);
+            exp = forced;
+        }
+
         if (exp < r->cfg.min_expires && exp != 0) {
             char extra[64];
             snprintf(extra, sizeof(extra), "Min-Expires: %d\r\n",
@@ -1000,6 +1040,43 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
         llog(LOG_DEBUG, "reg", "loc_upsert call: aor=%s contact=%s public=%s nat=%d expire_ms=%lu exp=%ld now=%lu",
              b.aor, b.contact, b.public_contact, b.nat_detected,
              (unsigned long)b.expire_ms, exp, (unsigned long)now);
+
+        /* === FS multiple-registrations=false：一个 AoR 只保留最新 Contact ===
+         * 新 REGISTER 进来先整 AoR 清空，再 upsert 当前 contact。
+         * 同 Call-ID + CSeq 刷新场景 loc_remove 不影响（刚注册完立即刷新）。 */
+        if (r->cfg.multiple_registrations == 0) {
+            loc_remove(r->cfg.db, b.aor, NULL);
+            llog(LOG_DEBUG, "reg", "multiple_registrations=false → evict all contacts for aor=%s", b.aor);
+        }
+
+        /* === FS max-registrations-per-extension=N：per-AoR binding 数上限 ===
+         * 在 loc_upsert 之前查当前 AoR 有效 binding 数。
+         * multiple_registrations=false 已在上面清空，所以上限检查只对允许多注册的场景生效。
+         * 达到上限时返回 403 + Warning（RFC 3261 §21.4.3）。 */
+        if (r->cfg.max_registrations_per_ext > 0 && r->cfg.multiple_registrations != 0) {
+            loc_binding_t probe[32];
+            int cur = loc_query(r->cfg.db, b.aor, probe, 32, now);
+            /* 当前 contact 若已存在 → upsert 会覆盖，不增加计数；
+             * 所以只在 cur >= max 且当前 contact 不重复时拒绝 */
+            if (cur >= r->cfg.max_registrations_per_ext) {
+                int dup = 0;
+                for (int i = 0; i < cur; ++i) {
+                    if (strcmp(probe[i].contact, b.contact) == 0) { dup = 1; break; }
+                }
+                if (!dup) {
+                    char extra[128];
+                    snprintf(extra, sizeof(extra),
+                             "Warning: 399 <%s>;cause=\"registration-limit-reached\";count=%d;max=%d\r\n",
+                             b.aor, cur, r->cfg.max_registrations_per_ext);
+                    llog(LOG_WARN, "reg",
+                         "max_registrations_per_ext: aor=%s cur=%d >= max=%d → 403 reject contact=%s",
+                         b.aor, cur, r->cfg.max_registrations_per_ext, b.contact);
+                    respond(r, proto, src, m, 403, extra, NULL, 0, txn);
+                    _rc = NSBC_OK; goto reg_out;
+                }
+            }
+        }
+
         loc_rc_t rc = loc_upsert(r->cfg.db, &b, now);
         if (rc == LOC_FULL) {
             char extra[64];

@@ -270,6 +270,8 @@ int sip_build_request(char *buf, size_t cap, const sip_req_spec_t *s)
  * RFC 3261 §18.2.2 + RFC 3581:
  *   - Server MUST append "received=src_ip" to top Via in response
  *   - If request Via has ";rport" (placeholder), rewrite to ";rport=port"
+ *     ★ 关键：如果 Via 已有空的 ";rport" 占位符（无值），替换它而不是追加新的
+ *       否则 Via 里会出现两个 rport 参数 → MicroSIP 等 UA 解析器困惑不回 auth！
  *   - Skip if Via already has received= or already has numeric rport
  *
  * Called AFTER sip_build_response, BEFORE txn_send_response / sip_tr_send.
@@ -299,18 +301,49 @@ void sip_via_patch_received_rport(char *msg, size_t *msg_len, size_t msg_cap,
         return;
     }
 
-    /* 计算需要追加的字符串 */
+    /* ★ 关键修复：检查 Via 里是否已有 ";rport" 占位符（无值） */
+    char *rport_ph = memmem(via_start, via_line_len, ";rport", 6);
+    if (rport_ph) {
+        /* 后面跟着 '=' ? ";rport=" → 已有值，跳过（客户端自己填了） */
+        if (rport_ph[6] == '=')
+            return; /* Via 已有 rport=数字，不重复加 */
+
+        /* Via 已有空的 ";rport" 占位符 → 替换它而不是追加新的！ */
+        char *after_rport = rport_ph + 6; /* 跳过 ";rport" */
+        char *rport_end = after_rport;
+        /* 找到占位符结束位置（';' 或 '\r' 或 Via 行尾） */
+        while (*rport_end && *rport_end != ';' && *rport_end != '\r' &&
+               (size_t)(rport_end - via_start) < via_line_len)
+            rport_end++;
+
+        /* 新内容：";rport=PORT;received=IP" 替换原来的 ";rport" */
+        char new_tail[64];
+        int nlen = snprintf(new_tail, sizeof(new_tail), ";rport=%u;received=%s",
+                            src_port, src_ip);
+        if (nlen <= 0 || (size_t)nlen >= sizeof(new_tail)) return;
+
+        size_t old_ph_len = (size_t)(rport_end - rport_ph);
+        size_t diff = (size_t)nlen - old_ph_len;
+        if (*msg_len + diff > msg_cap - 2) return;
+
+        size_t after_len = *msg_len - (size_t)(rport_end - msg);
+        if (diff != 0)
+            memmove(rport_ph + (size_t)nlen, rport_end, after_len);
+        memcpy(rport_ph, new_tail, (size_t)nlen);
+        *msg_len += diff;
+        return;
+    }
+
+    /* Via 没有任何 rport → 追加 ";received=IP;rport=PORT" */
     char patch[64];
     int plen = snprintf(patch, sizeof(patch), ";received=%s;rport=%u",
                         src_ip, src_port);
     if (plen <= 0 || (size_t)plen >= sizeof(patch)) return;
 
-    /* 检查消息 buffer 够不够 */
-    if (*msg_len + (size_t)plen > msg_cap - 2 /* keep \r\n */)
+    if (*msg_len + (size_t)plen > msg_cap - 2)
         return;
 
-    /* 在 Via 行的 \r\n 之前插入 patch */
-    size_t trailing_len = *msg_len - (size_t)(line_end - msg); /* line_end 到消息末尾 */
+    size_t trailing_len = *msg_len - (size_t)(line_end - msg);
     memmove(line_end + plen, line_end, trailing_len);
     memcpy(line_end, patch, (size_t)plen);
     *msg_len += (size_t)plen;

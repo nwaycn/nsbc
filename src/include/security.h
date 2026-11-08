@@ -136,6 +136,17 @@ int security_fence_mode_get(void);
  * 性能敏感：内部原子读 fence_mode + 哈希桶链表，无 parse 成本。 */
 int security_is_blocked(const nsbc_sa_t *src);
 
+/* INVITE 入口专用 ban 检查（b2bua.c INVITE 处理前调用）：
+ * 与 security_is_blocked 的关键区别：
+ *   security_is_blocked → reactor 层前置，**排除 INVITE flood ban**
+ *     （CGNAT 关键修复：运营商 NAT 把多用户汇聚到同出口 IP，
+ *      其中一人发 INVITE flood 不能把同 IP 的正常 REGISTER 也封死）
+ *   security_check_inv_ban → INVITE 入口，**所有 ban_reason 都生效**
+ *     （inv flood 本来就是用来 block INVITE 的）
+ * 设计意图：ban 表内各计数器共享一个 ban_until，但按 ban_reason 区分
+ * 允许哪些协议层检查时命中。 */
+int security_check_inv_ban(const nsbc_sa_t *src);
+
 /* CDR END emit 时查：源 IP 是否被标记为恶意（ban / blacklist / rate-limit）。
  * @param ip           源 IP 字符串（纯 IP，无端口）
  * @param reason_out   输出威胁原因（最多 31 字符 + \0），如 "ban", "blacklist", "ratelimit"
