@@ -52,6 +52,7 @@
 #define BAN_REASON_AUTH_FAIL  0x02   /* REGISTER digest auth fail 超阈值 */
 #define BAN_REASON_REG_REQ    0x04   /* REGISTER 请求频率超阈值（ratelimit_registrations） */
 #define BAN_REASON_INV_REQ    0x08   /* 被动：INVITE/REGISTER txn slab 分配失败计数 */
+#define BAN_REASON_ALL        0x0F   /* 所有 ban 原因（0x01|0x02|0x04|0x08） */
 
 static int  ban_is_private_ip(const char *ip_str); /* 私网/loopback — 跳过 auto-ban */
 static int  ban_is_banned(const char *ip, int allow_reasons);
@@ -1866,7 +1867,7 @@ int security_check_inv_ban(const nsbc_sa_t *src)
     if (ip_in_deny_cidr(ip)) return 1;
 
     /* 动态封禁表 — 所有 ban_reason 都 block INVITE */
-    if (ban_is_banned(ip, 0x0F /* BAN_REASON_ALL */))
+    if (ban_is_banned(ip, BAN_REASON_ALL))
         return 1;
 
     return 0;
@@ -2086,7 +2087,7 @@ static int sec_guard_cb(const char *src_ip, b2b_guard_evt_t evt, void *ud)
 
     /* B2B_GUARD_INVITE：动态封禁 + 静态 CIDR 黑名单
      * 所有 ban_reason 都 block INVITE（inv flood ban 本来就是用来封 INVITE 的） */
-    if (g_cfg.auto_ban && ban_is_banned(src_ip, 0x0F /* BAN_REASON_ALL */)) {
+    if (g_cfg.auto_ban && ban_is_banned(src_ip, BAN_REASON_ALL)) {
         static unsigned ban_drop_n = 0;
         if (ban_drop_n++ % 512 == 0)
             log_notice("security",

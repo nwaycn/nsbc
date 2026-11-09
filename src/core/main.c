@@ -422,6 +422,10 @@ int main(int argc, char **argv)
     mallopt(M_TRIM_THRESHOLD, 1024 * 1024);      /* 空闲 1MB 就还给 OS */
 #endif
 
+    /* 全局随机数种子 — registrar expires_jitter_s / 其他随机化依赖
+     * 没 srand() → rand() 每次启动返回相同序列，jitter 失效 */
+    srand((unsigned int)time(NULL));
+
     /* 离线子命令（不进启动序列；主版本不符时守护进程拒绝启动，迁移必须
      * 能独立运行，故不走 control socket）。 */
     if (argc >= 3 && strcmp(argv[1], "config") == 0 &&

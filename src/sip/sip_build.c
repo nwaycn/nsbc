@@ -316,8 +316,9 @@ void sip_via_patch_received_rport(char *msg, size_t *msg_len, size_t msg_cap,
                (size_t)(rport_end - via_start) < via_line_len)
             rport_end++;
 
-        /* 新内容：";rport=PORT;received=IP" 替换原来的 ";rport" */
-        char new_tail[64];
+        /* 新内容：";rport=PORT;received=IP" 替换原来的 ";rport"
+         * buffer 必须 ≥ 65：IPv6 最长 45 + ";rport=65535;received=" 16 = 61 */
+        char new_tail[128];
         int nlen = snprintf(new_tail, sizeof(new_tail), ";rport=%u;received=%s",
                             src_port, src_ip);
         if (nlen <= 0 || (size_t)nlen >= sizeof(new_tail)) return;
@@ -334,8 +335,9 @@ void sip_via_patch_received_rport(char *msg, size_t *msg_len, size_t msg_cap,
         return;
     }
 
-    /* Via 没有任何 rport → 追加 ";received=IP;rport=PORT" */
-    char patch[64];
+    /* Via 没有任何 rport → 追加 ";received=IP;rport=PORT"
+     * buffer 必须 ≥ 65：IPv6 最长 45 + ";received=;rport=65535" 20 = 65 */
+    char patch[128];
     int plen = snprintf(patch, sizeof(patch), ";received=%s;rport=%u",
                         src_ip, src_port);
     if (plen <= 0 || (size_t)plen >= sizeof(patch)) return;
