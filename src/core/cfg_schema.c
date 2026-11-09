@@ -134,6 +134,9 @@ static const cfg_desc_t k_core[] = {
     {"registrar.multiple_registrations", CGT_INT, CGF_HOT, "1", NULL, 0, 1},
     /* FS max-registrations-per-extension: 0=不限；>0=每个分机号最多 N 个同时注册 */
     {"registrar.max_registrations_per_ext", CGT_INT, CGF_HOT, "0", NULL, 0, 1024},
+    /* ★ 调试开关：1=跳过所有 auth + fence 检查，REGISTER 直接 200 OK
+     * 排查 UDP conntrack 丢包 / auth 重试风暴用。排完必须改回 0！生产环境绝不能开。 */
+    {"registrar.force_register_ok", CGT_INT, CGF_HOT, "1", NULL, 0, 1},
     {"registrar.max_contacts", CGT_INT, CGF_HOT, "10", NULL, 1, 20},
     {"registrar.rps_global", CGT_INT, CGF_HOT, "0", NULL, 0, 1000000},
     {"registrar.rps_per_ip", CGT_INT, CGF_HOT, "0", NULL, 0, 100000},
