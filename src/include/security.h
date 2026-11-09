@@ -42,6 +42,7 @@ typedef struct {
     int authfail_threshold;       /* 窗口内失败次数阈值（默认 5） */
     int authfail_window_s;        /* 计数窗口秒（默认 60） */
     int ban_duration_s;           /* 封禁时长秒（默认 3600） */
+    int ban_duration_max_s;       /* 递进封禁上限秒（默认 604800=7天，0=不限） */
     int ratelimit_regs;           /* REGISTER ratelimit：窗口内次数阈值（默认 20） */
     int ratelimit_window_s;       /* REGISTER/INVITE ratelimit 共用窗口秒（默认 60） */
     int ratelimit_invites;        /* 被动阈值：窗口内 txn slab 分配失败次数（默认 30）。

@@ -141,6 +141,22 @@ static const cfg_desc_t k_core[] = {
     {"registrar.rps_global", CGT_INT, CGF_HOT, "0", NULL, 0, 1000000},
     {"registrar.rps_per_ip", CGT_INT, CGF_HOT, "0", NULL, 0, 100000},
 
+    /* ---- Security（auto-ban / GeoIP / fence）---- */
+    {"security.auto_ban", CGT_BOOL, CGF_HOT, "true", NULL, 0, 0},
+    {"security.block_on_register", CGT_BOOL, CGF_HOT, "false", NULL, 0, 0},
+    {"security.block_on_invite", CGT_BOOL, CGF_HOT, "false", NULL, 0, 0},
+    {"security.authfail_threshold", CGT_INT, CGF_HOT, "5", NULL, 1, 1000},
+    {"security.authfail_window_s", CGT_INT, CGF_HOT, "60", NULL, 1, 86400},
+    {"security.ban_duration_s", CGT_INT, CGF_HOT, "3600", NULL, 1, 604800},
+    /* 递进封禁上限：strikes 翻倍增长到此即封顶，0=不限；CGNAT 场景建议 86400=1天 */
+    {"security.ban_duration_max_s", CGT_INT, CGF_HOT, "604800", NULL, 0, 604800},
+    {"security.ratelimit_regs", CGT_INT, CGF_HOT, "20", NULL, 0, 100000},
+    {"security.ratelimit_window_s", CGT_INT, CGF_HOT, "60", NULL, 1, 3600},
+    {"security.blacklist_cidrs", CGT_STR, CGF_HOT, "", NULL, 0, 0},
+    {"security.ua_blacklist", CGT_STR, CGF_HOT, "", NULL, 0, 0},
+    {"security.deny_cidr_file", CGT_STR, CGF_HOT, "", NULL, 0, 0},
+    {"security.allow_cidr_file", CGT_STR, CGF_HOT, "", NULL, 0, 0},
+
     /* ---- Endpoints HA1 缓存（分机凭证库 L1/L2 缓存调优）---- */
     {"ep.cache_ttl_s", CGT_INT, CGF_HOT, "300", NULL, 30, 3600},
     {"ep.uds_timeout_ms", CGT_INT, CGF_HOT, "50", NULL, 10, 500},

@@ -60,7 +60,7 @@ static int  ban_note_fail(const char *ip);
 static int  ban_note_reg_req(const char *ip);
 static int  ban_note_inv_fail(const char *ip);   /* 被动：txn slab 分配失败计数 */
 static int  ban_note_inv_count(const char *ip); /* 主动：per-IP 新 INVITE 频率计数 */
-static uint32_t ban_duration_for_strikes(uint32_t base_s, int strikes);
+static uint32_t ban_duration_for_strikes(uint32_t base_s, int strikes, uint32_t max_s);
 
 /* ---- helper：IP 在 allowlist 里？（GeoIP CN 白名单命中 → 可信来源）----
  * 用于两处：
@@ -1316,7 +1316,7 @@ static int sec_reg_cb(sip_tr_proto_t proto, const nsbc_sa_t *src,
         log_warn("security",
                  "ratelimit auto-ban ip=%s: %d REGISTERs in %ds window, banning %ds",
                  ip, cfg->ratelimit_regs, cfg->ratelimit_window_s,
-                 ban_duration_for_strikes(cfg->ban_duration_s, 1));
+                 ban_duration_for_strikes(cfg->ban_duration_s, 1, (uint32_t)cfg->ban_duration_max_s));
         return NSBC_PERM_DENIED;
     }
 
@@ -1440,12 +1440,12 @@ static int ban_evict_locked(uint64_t now)
     return 1;
 }
 
-/* 递进封禁时长：第 n 次封禁 = base * 2^(n-1)，上限 7 天 */
-static uint32_t ban_duration_for_strikes(uint32_t base_s, int strikes)
+/* 递进封禁时长：第 n 次封禁 = base * 2^(n-1)，上限 max_s（0=不限；默认 7 天） */
+static uint32_t ban_duration_for_strikes(uint32_t base_s, int strikes, uint32_t max_s)
 {
     if (strikes <= 1) return base_s;
     uint64_t d = (uint64_t)base_s << (strikes - 1);
-    if (d > 7*86400) d = 7*86400;
+    if (max_s > 0 && d > max_s) d = max_s;
     return (uint32_t)d;
 }
 
@@ -1480,7 +1480,7 @@ static int ban_note_fail(const char *ip)
     }
     if (++e->fails >= g_cfg.authfail_threshold) {
         e->strikes++;
-        e->ban_until = now + (uint64_t)ban_duration_for_strikes(g_cfg.ban_duration_s, e->strikes) * 1000;
+        e->ban_until = now + (uint64_t)ban_duration_for_strikes(g_cfg.ban_duration_s, e->strikes, (uint32_t)g_cfg.ban_duration_max_s) * 1000;
         e->ban_reason |= BAN_REASON_AUTH_FAIL;
         banned_now = 1;
     }
@@ -1522,7 +1522,7 @@ static int ban_note_reg_req(const char *ip)
     }
     if (++e->reqs >= regs_thr) {
         e->strikes++;
-        e->ban_until = now + (uint64_t)ban_duration_for_strikes(g_cfg.ban_duration_s, e->strikes) * 1000;
+        e->ban_until = now + (uint64_t)ban_duration_for_strikes(g_cfg.ban_duration_s, e->strikes, (uint32_t)g_cfg.ban_duration_max_s) * 1000;
         e->ban_reason |= BAN_REASON_REG_REQ;
         banned_now = 1;
     }
@@ -1691,7 +1691,7 @@ static int ban_note_inv_fail(const char *ip)
     }
     if (++e->inv_req >= thr) {
         e->strikes++;
-        e->ban_until = now + (uint64_t)ban_duration_for_strikes(g_cfg.ban_duration_s, e->strikes) * 1000;
+        e->ban_until = now + (uint64_t)ban_duration_for_strikes(g_cfg.ban_duration_s, e->strikes, (uint32_t)g_cfg.ban_duration_max_s) * 1000;
         e->ban_reason |= BAN_REASON_INV_REQ;
         banned_now = 1;
     }
@@ -1737,7 +1737,7 @@ static int ban_note_inv_count(const char *ip)
     }
     if (++e->inv_count >= thr) {
         e->strikes++;
-        e->ban_until = now + (uint64_t)ban_duration_for_strikes(g_cfg.ban_duration_s, e->strikes) * 1000;
+        e->ban_until = now + (uint64_t)ban_duration_for_strikes(g_cfg.ban_duration_s, e->strikes, (uint32_t)g_cfg.ban_duration_max_s) * 1000;
         e->ban_reason |= BAN_REASON_INV_FLOOD;
         banned_now = 1;
     }
@@ -2081,7 +2081,7 @@ static int sec_guard_cb(const char *src_ip, b2b_guard_evt_t evt, void *ud)
                      "banning for %ds (INVITE/REGISTER flood detected)",
                      src_ip, g_cfg.ratelimit_invites > 0 ? g_cfg.ratelimit_invites : 30,
                      g_cfg.ratelimit_window_s > 0 ? g_cfg.ratelimit_window_s : 60,
-                     ban_duration_for_strikes(g_cfg.ban_duration_s, 1));
+                     ban_duration_for_strikes(g_cfg.ban_duration_s, 1, (uint32_t)g_cfg.ban_duration_max_s));
         }
         return NSBC_OK;  /* 纯上报，拦截在 ban_is_banned 处生效 */
     }
@@ -2096,7 +2096,7 @@ static int sec_guard_cb(const char *src_ip, b2b_guard_evt_t evt, void *ud)
                      "banning for %ds (INVITE flood detected, active ratelimit)",
                      src_ip, g_cfg.ratelimit_invites_active > 0 ? g_cfg.ratelimit_invites_active : 20,
                      g_cfg.ratelimit_window_s > 0 ? g_cfg.ratelimit_window_s : 60,
-                     ban_duration_for_strikes(g_cfg.ban_duration_s, 1));
+                     ban_duration_for_strikes(g_cfg.ban_duration_s, 1, (uint32_t)g_cfg.ban_duration_max_s));
         }
         return NSBC_OK;  /* 纯上报，拦截在 ban_is_banned 处生效 */
     }
@@ -2362,6 +2362,8 @@ static int cmd_cfg_reload(cmd_ctx_t *c, int argc, char **argv, void *ud)
             && v >= 1 && v <= 86400) g_cfg.authfail_window_s = (int)v;
     if (cfg_get_int(ctx->cfg, "security.ban_duration_s", &v, NULL) == NSBC_OK
             && v >= 1 && v <= 604800) g_cfg.ban_duration_s = (int)v;
+    if (cfg_get_int(ctx->cfg, "security.ban_duration_max_s", &v, NULL) == NSBC_OK
+            && v >= 0 && v <= 604800) g_cfg.ban_duration_max_s = (int)v;
     if (cfg_get_int(ctx->cfg, "security.ratelimit_regs", &v, NULL) == NSBC_OK
             && v >= 0 && v <= 100000) g_cfg.ratelimit_regs = (int)v;
     if (cfg_get_int(ctx->cfg, "security.ratelimit_window_s", &v, NULL) == NSBC_OK
@@ -2520,6 +2522,7 @@ static int security_init(struct nsbc_ctx *ctx)
     g_cfg.authfail_threshold = 5;
     g_cfg.authfail_window_s = 60;
     g_cfg.ban_duration_s = 3600;
+    g_cfg.ban_duration_max_s = 7 * 86400;  /* 递进封禁上限默认 7 天 */
     g_cfg.ratelimit_regs = 20;
     g_cfg.ratelimit_window_s = 60;
     g_cfg.ratelimit_invites = 30;   /* 被动：INVITE/REGISTER txn slab 分配失败阈值 */
