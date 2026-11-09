@@ -6881,13 +6881,19 @@ int b2b_originate(b2b_core_t *co, const b2b_orig_t *o, b2b_call_t **out)
                     nsbc_sa_t peer_unused[2];
                     /* REQ-ORIGINATE-003 race 修复：WebRTC/DTLS 呼叫 LEG_CONFIRMED
                      * 到了但 relay 还没建好（async setup），加重试循环。
-                     * 每 50ms 一次，最多 2s —— DTLS 通常 200-500ms 内就绪。 */
+                     * 每 50ms 一次，总等待 b2b.relay_wait_ms（默认 2000ms）。 */
                     int lrc = NSBC_NOENT;
-                    for (int retry = 0; retry < 40; retry++) {
-                        lrc = bridge_lookup_relay(m, c, &relay, peer_unused);
-                        if (lrc == NSBC_OK && relay) break;
-                        if (co->stopping) break;
-                        usleep(50000); /* 50ms */
+                    {
+                        long wait_ms = 2000, poll_us = 50000;
+                        if (ctx) cfg_get_int(ctx->cfg, "b2b.relay_wait_ms", &wait_ms, NULL);
+                        if (wait_ms < 100) wait_ms = 2000;
+                        int max_retry = (int)(wait_ms * 1000 / poll_us);
+                        for (int retry = 0; retry < max_retry; retry++) {
+                            lrc = bridge_lookup_relay(m, c, &relay, peer_unused);
+                            if (lrc == NSBC_OK && relay) break;
+                            if (co->stopping) break;
+                            usleep(poll_us);
+                        }
                     }
                     if (lrc == NSBC_OK && relay) {
                         rtp_relay_set_echo(relay, 1);

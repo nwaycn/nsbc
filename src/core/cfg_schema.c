@@ -65,6 +65,10 @@ static const cfg_desc_t k_core[] = {
     {"net.sip_tls_port", CGT_INT, CGF_RESTART, "5061", NULL, 1, 65535},
     {"net.sip_max_msg", CGT_INT, CGF_RESTART, "16384", NULL, 2048, 65535},
     {"net.tcp_conn_max", CGT_INT, CGF_HOT, "100000", NULL, 64, 2000000},
+    /* 每 IP 并发连接上限，防 SYN flood；0=默认 50 */
+    {"net.tcp_conn_per_ip", CGT_INT, CGF_HOT, "50", NULL, 0, 4096},
+    /* TCP/TLS idle 超时毫秒（运营商 NAT 超时通常 60-300s，30000=30s 偏保守） */
+    {"net.tcp_idle_timeout_ms", CGT_INT, CGF_HOT, "30000", NULL, 5000, 600000},
     {"net.tls_enabled", CGT_BOOL, CGF_RESTART, "false", NULL, 0, 0},
     {"net.tls_cert", CGT_STR, CGF_RESTART, "/etc/nsbc/tls/cert.pem", NULL, 0,
      0},
@@ -121,6 +125,10 @@ static const cfg_desc_t k_core[] = {
     {"sip.ws.enabled", CGT_BOOL, CGF_RESTART, "true", NULL, 0, 0},
     {"sip.ws.port", CGT_INT, CGF_RESTART, "5062", NULL, 1, 65535},
     {"sip.ws.tls", CGT_BOOL, CGF_RESTART, "true", NULL, 0, 0},
+
+    /* ---- B2BUA 核心 ---- */
+    /* relay 异步创建等待上限毫秒（DTLS/WebRTC 场景 relay 异步建） */
+    {"b2b.relay_wait_ms", CGT_INT, CGF_HOT, "2000", NULL, 100, 30000},
 
     /* ---- 注册 ---- */
     {"registrar.min_expires", CGT_INT, CGF_HOT, "60", NULL, 10, 3600},
