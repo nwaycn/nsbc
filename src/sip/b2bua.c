@@ -188,6 +188,8 @@ static int b2b_is_private_ip(const char *ip)
     if ((h & 0xFFF00000u) == 0xAC100000u) return 1;  /* 172.16.0.0/12 */
     if ((h & 0xFFFF0000u) == 0xC0A80000u) return 1;  /* 192.168.0.0/16 */
     if ((h & 0xFFC00000u) == 0x64400000u) return 1;  /* 100.64.0.0/10 CGNAT */
+    if ((h & 0xFF000000u) == 0x1E000000u) return 1;  /* 30.0.0.0/8 运营商CGNAT(电信/联通) */
+    if ((h & 0xFF000000u) == 0x70000000u) return 1;  /* 112.0.0.0/8 运营商CGNAT(移动) */
     if ((h & 0xFF000000u) == 0x7F000000u) return 1;  /* 127.0.0.0/8 回环 */
     if ((h & 0xFFFF0000u) == 0xA9FE0000u) return 1;  /* 169.254.0.0/16 LinkLocal */
     return 0;
@@ -1778,6 +1780,24 @@ static void respond_a(b2b_call_t *c, int status, const char *body,
                                body, bodylen);
     if (n < 0)
         goto out;
+    /* NAT: RFC 3261 §18.2.2 — Via 响应补 received=src_ip;rport=src_port
+     * ★ respond_a 之前完全漏了这个！导致 180 Ringing / 200 OK(INVITE)
+     *   的 Via 是空 ";rport"，MicroSIP 等 UA 不认 NAT 地址 → 媒体不通 →
+     *   收到 200 OK 后立刻 BYE 挂断。 */
+    {
+        const nsbc_sa_t *peer = txn_peer(t);
+        char src_ip[INET6_ADDRSTRLEN] = "";
+        uint16_t src_port = peer ? nsbc_sa_port(peer) : 0;
+        if (peer && peer->ss.ss_family == AF_INET) {
+            inet_ntop(AF_INET, &((const struct sockaddr_in *)&peer->ss)->sin_addr,
+                      src_ip, sizeof(src_ip));
+        } else if (peer && peer->ss.ss_family == AF_INET6) {
+            inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)&peer->ss)->sin6_addr,
+                      src_ip, sizeof(src_ip));
+        }
+        size_t len = (size_t)n;
+        sip_via_patch_received_rport(out, &len, sizeof(out), src_ip, src_port);
+    }
     int trc = txn_send_response(t, out, (size_t)n, now_ms());
     llog(LOG_INFO, "b2b", "respond_a: txn_send_response rc=%d n=%zu t=%p status=%d", trc, (size_t)n, t, status);
 out:
