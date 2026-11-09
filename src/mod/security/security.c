@@ -1807,7 +1807,13 @@ int security_is_blocked(const nsbc_sa_t *src)
 
     /* === Layer 0: GeoIP deny CIDR（最高优先级，先于一切）===
      * 命中 → 直接 silent drop，不进入后续任何逻辑 */
-    if (ip_in_deny_cidr(ip)) return 1;
+    if (ip_in_deny_cidr(ip)) {
+        static unsigned dcnt = 0;
+        if (dcnt++ % 1024 == 0)
+            log_notice("security",
+                       "security_is_blocked ip=%s via deny CIDR (GeoIP)", ip);
+        return 1;
+    }
 
     /* === Layer 0: GeoIP allowlist（可信来源跳过整个 auto-ban 路径）===
      * 命中 → 放行 + 跳过 ban_is_banned（allowlist 里的 IP 不应该被动态封禁）

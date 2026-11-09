@@ -592,8 +592,9 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
      * REGISTER 之前漏掉了 → 拨号规则里配的 allow/deny CIDR、method 禁用对注册无效
      * → 公网扫号器能绕过 allow CIDR 直接撞库 → fail2ban。
      * 放在 profile ACL 之后（profile ACL 是更底层的端口/IP 归属）、任何实质性处理之前。
-     * 命中则 silent drop（不回 SIP 响应，防 SBC 指纹暴露，与 INVITE 一致）。 */
-    {
+     * 命中则 silent drop（不回 SIP 响应，防 SBC 指纹暴露，与 INVITE 一致）。
+     * force_register_ok=1 调试期整体跳过 fence——auth 都跳了，allowlist 不应该再挡。 */
+    if (!(r->cfg.force_register_ok)) {
         char f_ua[128] = {0};
         char f_from[64] = {0};   /* From user part — 注册者分机号 */
         char f_to[64]   = {0};   /* To user part   — 被注册 AoR */
@@ -615,6 +616,10 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
         fctx.callee = f_to[0]   ? f_to   : NULL;
         security_check_fence(&fctx);
         if (fctx.hit != BLACKLIST_OK) {
+            llog(LOG_INFO, "reg",
+                 "REGISTER → drop by security fence hit=%d"
+                 " aor=%s from=%s src_ip=%s ua=%s",
+                 fctx.hit, f_to, f_from, src_ip, f_ua);
             security_fence_log_drop(fctx.hit, src_ip, f_ua, "REGISTER", f_from, f_to);
             _rc = NSBC_OK; goto reg_out;  /* silent drop，不回任何响应 */
         }
@@ -704,9 +709,9 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
         /* HA1 存在 → 继续正常流程（无论 auth 头有没有） */
     }
 
-    /* ★★ force_register_ok 调试开关：YAML registrar.force_register_ok=1 跳过 auth 直接 200 OK
-     * 用于快速排除 UDP 丢包类问题（排完必须改回 0！生产环境绝不能开）。 */
-    int auth_ok_override = 1; /* TODO: 排完 UDP conntrack 丢包后改回 r->cfg.force_register_ok */
+    /* ★★ force_register_ok：读 YAML registrar.force_register_ok（默认 1=跳过 auth）
+     * 生产环境设 0 让正常 digest auth 生效。 */
+    int auth_ok_override = (r->cfg.force_register_ok != 0);
 
     /* Digest 鉴权 */
     llog(LOG_DEBUG, "reg", "REGISTER Authorization hdr ptr=%p", (void*)auth);
