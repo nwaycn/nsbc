@@ -1608,16 +1608,26 @@ static int ban_is_private_ip(const char *ip_str)
  * 从 g_allow_cidr[] / g_deny_cidr[] 表里查，加读锁。
  * 表为空 → 返回 0（不命中）。
  * allowlist 命中 → 整个 auto-ban 路径跳过（reactor 收包放行 + fail2ban 不计数）。
- * deny CIDR 命中 → security_is_blocked 里直接 silent drop。 */
+ * deny CIDR 命中 → security_is_blocked 里直接 silent drop。
+ *
+ * ★ 关键：sockaddr 必须带正确的 sa_family，否则 bl_ip_match 按 AF_INET6
+ * 解析 IPv4 地址会匹配失败。先试 AF_INET，不行再 AF_INET6。 */
 static int ip_in_allowlist(const char *ip_str)
 {
     if (!ip_str || !ip_str[0] || g_allow_cidr_n == 0) return 0;
-    struct sockaddr_in6 sa = {0};
-    if (inet_pton(AF_INET6, ip_str, &sa.sin6_addr) != 1) return 0;
+    struct sockaddr_in6 sa6 = {0};
+    sa6.sin6_family = AF_INET6;
+    if (inet_pton(AF_INET, ip_str, &sa6.sin6_addr.s6_addr[12]) == 1) {
+        /* IPv4 → 转 IPv4-mapped IPv6（::ffff:x.x.x.x），前 10 字节 0 + 2 字节 0xff */
+        sa6.sin6_addr.s6_addr[10] = 0xff;
+        sa6.sin6_addr.s6_addr[11] = 0xff;
+    } else if (inet_pton(AF_INET6, ip_str, &sa6.sin6_addr) != 1) {
+        return 0;  /* 解析失败，不命中 */
+    }
     pthread_rwlock_rdlock(&g_bl_rwlock);
     int hit = 0;
     for (int i = 0; i < g_allow_cidr_n; ++i) {
-        if (bl_ip_match((struct sockaddr *)&sa, &g_allow_cidr[i])) { hit = 1; break; }
+        if (bl_ip_match((struct sockaddr *)&sa6, &g_allow_cidr[i])) { hit = 1; break; }
     }
     pthread_rwlock_unlock(&g_bl_rwlock);
     return hit;
@@ -1626,12 +1636,18 @@ static int ip_in_allowlist(const char *ip_str)
 static int ip_in_deny_cidr(const char *ip_str)
 {
     if (!ip_str || !ip_str[0] || g_deny_cidr_n == 0) return 0;
-    struct sockaddr_in6 sa = {0};
-    if (inet_pton(AF_INET6, ip_str, &sa.sin6_addr) != 1) return 0;
+    struct sockaddr_in6 sa6 = {0};
+    sa6.sin6_family = AF_INET6;
+    if (inet_pton(AF_INET, ip_str, &sa6.sin6_addr.s6_addr[12]) == 1) {
+        sa6.sin6_addr.s6_addr[10] = 0xff;
+        sa6.sin6_addr.s6_addr[11] = 0xff;
+    } else if (inet_pton(AF_INET6, ip_str, &sa6.sin6_addr) != 1) {
+        return 0;
+    }
     pthread_rwlock_rdlock(&g_bl_rwlock);
     int hit = 0;
     for (int i = 0; i < g_deny_cidr_n; ++i) {
-        if (bl_ip_match((struct sockaddr *)&sa, &g_deny_cidr[i])) { hit = 1; break; }
+        if (bl_ip_match((struct sockaddr *)&sa6, &g_deny_cidr[i])) { hit = 1; break; }
     }
     pthread_rwlock_unlock(&g_bl_rwlock);
     return hit;
