@@ -41,6 +41,7 @@ typedef struct {
     int multiple_registrations; /* FS multiple-registrations: 1=允许多 Contact 同 AoR（默认）；0=只保留最新 */
     int max_registrations_per_ext; /* FS max-registrations-per-extension: 0=不限；>0=每个分机号最多 N 个同时注册 */
     int force_register_ok; /* ★ 调试开关：1=跳过所有 auth 检查，直接让 REGISTER 200 OK（排查 UDP 401 丢包用，排完必须关！） */
+    int nat_expires_short; /* NAT 场景强制短 expires（秒）：0=不强制；>0=检测到 NAT 时把 exp 压到 min(exp, nat_expires_short)。默认 120s=2min，让客户端每 1min 刷新一次，远快于家用 NAT UDP conntrack 300s 超时 */
     int ip_cps;          /* 单 IP 每秒 REGISTER 上限，0 = 不限（开源默认 0） */
     int aor_cps;         /* 单 AoR 每秒上限，0 = 不限（开源默认 0） */
     int global_cps;      /* 全局每秒上限，0 = 不限（开源默认 0） */

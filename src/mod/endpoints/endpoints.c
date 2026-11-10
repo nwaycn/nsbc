@@ -167,7 +167,8 @@ static __thread char tls_ha1[EP_HA1_LEN + 1];
 #define EP_DEF_UDS_TIMEOUT_MS    50   /* L2 查询超时（阻塞 reactor 的容忍上限） */
 #define EP_DEF_NEG_TTL_MS     10000   /* not_found/disabled 负缓存 TTL */
 #define EP_DEF_NEG_TTL_ERR_MS  2000   /* db_error/uds 失败负缓存 TTL */
-#define EP_DEF_HA1_POS_TTL_MS 300000  /* 正缓存 TTL = 300s */
+#define EP_DEF_HA1_POS_TTL_MS 3600000  /* 正缓存 TTL = 1h（密码改了最多 1h 内生效；
+                                          * 太短（旧 300s=5min）导致每 5min 必走一次 UDS 查询） */
 
 /* 运行时值 — ep_init 从 cfg 读取后覆盖默认值 */
 static int g_ep_uds_timeout_ms = EP_DEF_UDS_TIMEOUT_MS;

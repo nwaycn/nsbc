@@ -4094,8 +4094,9 @@ void handle_new_invite(b2b_core_t *co, sip_txn_t *t,
      * （之前 signaling.c resolve_cb 错把 R-URI user = 被叫 塞进 orig_number
      *  → 呼叫表显示 "1001 / 1001"，两个都是被叫） */
     tok_from_user(m, c->orig_number, sizeof(c->orig_number));
-    llog(LOG_INFO, "b2b", "new_invite: from_user=%s ruri_user=?",
-         c->orig_number);
+    llog(LOG_INFO, "b2b", "new_invite: from_user=%s ruri_user=%.*s",
+         c->orig_number,
+         (int)m->ruri.user.len, m->ruri.user.p ? m->ruri.user.p : "");
     sip_hdr_t *cseq = sip_hdr_get(m, SIP_H_CSEQ);
     if (cseq && sip_hdr_parse_cseq(cseq) == NSBC_OK)
         a->cseq = cseq->u.cseq.number;
@@ -4236,7 +4237,11 @@ void handle_new_invite(b2b_core_t *co, sip_txn_t *t,
             if (dp_rc != NSBC_OK) {
                 /* ★ 规则不命中 → silent drop，防 SBC 指纹暴露
                  * 走 call_destroy 统一清理（tbl_unlink / concurrent_dec / active_calls dec）
-                 * co->total 不撤回：历史累计值，即使 drop 也应计入 */
+                 * co->total 不撤回：历史累计值，即使 drop 也应计入
+                 *
+                 * ★ SEC-UDP-SCAN-001：dp_precheck 失败 = 拨不知道的号 → 扫号探测。
+                 * 累计 per-IP guard 计数，security fail2ban 超阈值自动 ban。
+                 * 正常场景（新号未配规则）不会短时间大量失败，攻击者扫号才会。 */
                 llog(LOG_NOTICE, "b2b",
                      "dp_precheck: NO RULE MATCHED → silent drop "
                      "callid=%s called=%s caller=%s prof=%s src_ip=%s dp_rc=%d",
@@ -4245,6 +4250,7 @@ void handle_new_invite(b2b_core_t *co, sip_txn_t *t,
                      dcall_pre.caller ? dcall_pre.caller : "-",
                      c->prof->name,
                      ip_buf, dp_rc);
+                b2b_guard_notify(ip_buf, B2B_GUARD_INVITE_COUNT);
                 a->state = LEG_TERMINATED;
                 call_destroy(c);
                 return;

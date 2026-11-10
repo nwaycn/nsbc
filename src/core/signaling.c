@@ -73,6 +73,7 @@ typedef struct sig_runtime {
     tw_node_t sweep_node;
     char local_host[128]; /* 监听/SDP 广告地址 */
     char realm[128];
+    int force_register_ok; /* 调试开关拷贝：force_register_ok=1 时 INVITE 主叫验证跳过 ep_lookup+loc_query */
 } sig_runtime_t;
 
 /* ------------------------------------------------------------------ */
@@ -562,28 +563,45 @@ static int resolve_cb(b2b_call_t *call, const char *ruri, size_t ruri_len,
                      check_realm);
                 return NSBC_PERM_DENIED;
             }
-            const struct ep_ext *ep = ep_lookup(caller_buf, check_realm);
-            if (!ep) {
-                llog(LOG_NOTICE, "sig",
-                     "caller VALIDATION_FAIL caller=%s realm=%s profile=internal → PERM_DENIED (silent drop)",
-                     caller_buf, check_realm);
-                return NSBC_PERM_DENIED;
-            }
-            /* ★ 2026-10-17：internal profile 主叫必须有活跃注册。
-             * nsbcd 重启后 location 表清空，但 endpoints 表还在 → 未注册分机
-             * 也能呼叫。loc_query 返回 0 条活跃绑定 = 未注册 → PERM_DENIED。
-             * external profile (auth_calls=0) 跳过——运营商保证合法性。 */
-            if (s->loc) {
-                char caller_aor[LOC_AOR_MAX];
-                snprintf(caller_aor, sizeof(caller_aor), "%s@%s",
-                         caller_buf, check_realm);
-                loc_binding_t dummy;
-                int n = loc_query(s->loc, caller_aor, &dummy, 1, nsbc_now_ms());
-                if (n == 0) {
+            /* ★ REQ-FORCE-REG-001：force_register_ok=1 时跳过 ep_lookup + loc_query。
+             * force_register_ok 是调试开关（YAML 一行跳过所有 REGISTER auth 检查），
+             * 但之前只跳过注册路径——注册成功后 INVITE 进来 signaling 层的主叫验证
+             * 还会查 Rust 侧 endpoints 表 + location 表。
+             * force_register_ok 场景下 endpoints 表可能为空（分机只注册过、没在 Web 管理创建）→
+             * ep_lookup 返回 NULL → PERM_DENIED → silent drop → 客户端"错误网关"。
+             * loc_query 同理——虽然 force_register_ok 让 loc_add 成功了，但也跳过它保持语义一致。 */
+            int force_ok = (s->force_register_ok != 0) ? 1 : 0;
+            if (!force_ok) {
+                const struct ep_ext *ep = ep_lookup(caller_buf, check_realm);
+                if (!ep) {
                     llog(LOG_NOTICE, "sig",
-                         "caller NOT_REGISTERED caller=%s realm=%s aor=%s profile=internal → PERM_DENIED (silent drop)",
-                         caller_buf, check_realm, caller_aor);
+                         "caller VALIDATION_FAIL caller=%s realm=%s profile=internal → PERM_DENIED (silent drop)",
+                         caller_buf, check_realm);
                     return NSBC_PERM_DENIED;
+                }
+                /* ★ 2026-10-17：internal profile 主叫必须有活跃注册。
+                 * nsbcd 重启后 location 表清空，但 endpoints 表还在 → 未注册分机
+                 * 也能呼叫。loc_query 返回 0 条活跃绑定 = 未注册 → PERM_DENIED。
+                 * external profile (auth_calls=0) 跳过——运营商保证合法性。 */
+                if (s->loc) {
+                    char caller_aor[LOC_AOR_MAX];
+                    snprintf(caller_aor, sizeof(caller_aor), "%s@%s",
+                             caller_buf, check_realm);
+                    loc_binding_t dummy;
+                    int n = loc_query(s->loc, caller_aor, &dummy, 1, nsbc_now_ms());
+                    if (n == 0) {
+                        llog(LOG_NOTICE, "sig",
+                             "caller NOT_REGISTERED caller=%s realm=%s aor=%s profile=internal → PERM_DENIED (silent drop)",
+                             caller_buf, check_realm, caller_aor);
+                        return NSBC_PERM_DENIED;
+                    }
+                }
+            } else {
+                static unsigned skc_sig = 0;
+                if (skc_sig++ % 256 == 0) {
+                    llog(LOG_DEBUG, "sig",
+                         "force_register_ok=1 → skip ep_lookup+loc_query caller=%s realm=%s",
+                         caller_buf, check_realm);
                 }
             }
         }
@@ -1724,6 +1742,7 @@ static int sig_start(struct nsbc_ctx *ctx)
     cfg_get_int(cfg, "registrar.multiple_registrations", &multi, NULL);
     cfg_get_int(cfg, "registrar.max_registrations_per_ext", &max_ext, NULL);
     cfg_get_int(cfg, "registrar.force_register_ok", &force_ok, NULL);
+    s->force_register_ok = (int)force_ok; /* ★ 缓存到 sig_runtime，避免 resolve_cb 访问不透明 reg_core_t 内部 */
     cfg_get_int(cfg, "registrar.rps_per_ip", &ipcps, NULL);
     cfg_get_int(cfg, "registrar.rps_per_aor", &aorcps, NULL);
     cfg_get_int(cfg, "registrar.rps_global", &gcps, NULL);

@@ -587,10 +587,19 @@ int dtls_ice_handle_stun(dtls_server_t *d, const uint8_t *pkt, size_t pkt_len,
                           1 /* ICE-CONTROLLED 强制 */, resp, sizeof(resp));
     if (n <= 0) return NSBC_ERR;
 
-    /* ===== STUN HEX DUMP — 请求入 + 响应出 ===== */
+    /* ===== STUN 日志 — 入/出包 节流 =====
+     * WebRTC ICE keepalive 默认每 2-3s 一次，每条打 INFO 会严重刷屏
+     * （一小时 ≈ 1333 条 INFO）。改成：实际内容打 DEBUG，
+     * 每 60 次（≈ 3min）打一条 INFO 摘要，方便诊断同时不吵。 */
     {
-        llog(LOG_INFO, "dtls", "STUN RX fd=%d len=%zu ufrag=%s pwd=%s",
-             d->fd, pkt_len, d->cfg.ice_ufrag, d->cfg.ice_pwd ? d->cfg.ice_pwd : "(null)");
+        static unsigned stun_rx_total = 0;
+        if (stun_rx_total++ % 60 == 0) {
+            llog(LOG_INFO, "dtls",
+                 "STUN RX/OK fd=%d ufrag=%s keepalive#%u (stun_resp sendto=%zd)",
+                 d->fd, d->cfg.ice_ufrag, stun_rx_total,
+                 (ssize_t)n);
+        }
+        /* HEX dump 只在 DEBUG 打 */
         for (int i = 0; i < (int)pkt_len; i += 16) {
             char hex[128] = {0}; int off = 0;
             for (int j = i; j < i + 16 && j < (int)pkt_len; ++j)

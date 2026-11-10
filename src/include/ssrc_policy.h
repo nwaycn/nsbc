@@ -45,6 +45,8 @@ typedef struct {
     uint32_t local_ssrc;       /* 本侧出向 SSRC（collision 检测） */
     uint32_t aux_pt[8];        /* RTX/FEC payload type 集合 */
     int n_aux_pt;
+    uint8_t  video_pt[8];      /* video m-line 的 payload type 集合 */
+    int n_video_pt;
     uint64_t switch_idle_ms;   /* 主源静默多久允许切换，默认 5000 */
     int max_sources;           /* 默认 SSRC_POLICY_MAX_SRC */
 } ssrc_policy_cfg_t;
@@ -70,6 +72,11 @@ void ssrc_policy_init(ssrc_policy_t *p, const ssrc_policy_cfg_t *cfg);
 /* BUNDLE 显式登记合法 SSRC（SDP a=ssrc 学习后调用） */
 void ssrc_policy_admit(ssrc_policy_t *p, uint32_t ssrc, int aux);
 void ssrc_policy_set_aux_pt(ssrc_policy_t *p, uint8_t pt);
+
+/* video PT 白名单：从 SDP m=video 行 fmt-list 提取的 PT 集合，
+ * 让全新 SSRC（传统 SIP 不带 a=ssrc:）也能通过 policy 放行。
+ * 多次调用累加，上限 8 个。 */
+void ssrc_policy_set_video_pt(ssrc_policy_t *p, uint8_t pt);
 
 /* re-INVITE/UPDATE 媒体重指：保留 CNAME 偏好，允许一次重新学习 */
 void ssrc_policy_retarget(ssrc_policy_t *p);

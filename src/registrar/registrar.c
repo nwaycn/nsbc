@@ -693,11 +693,16 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
     sip_hdr_t *auth = sip_hdr_get(m, SIP_H_AUTHORIZATION);
     {
         const char *ha1_found = NULL;
-        if (dig.ha1_cb && u->user.p && u->user.len > 0) {
+        /* ★ force_register_ok=1 跳过 ha1 查表 —— 调试期允许任何 AoR 直接注册，
+         * 不因 Rust 侧 UDS 超时 / ha1 cache miss 导致 silent drop。
+         * 这是之前发现的 BUG：force_register_ok 只跳过 auth 验证，
+         * 但 ha1_cb 在它前面 → UDS 查不到 ha1 就 silent drop → 客户端无响应 → "错误网关"。 */
+        int skip_ha1_check = (r->cfg.force_register_ok != 0);
+        if (!skip_ha1_check && dig.ha1_cb && u->user.p && u->user.len > 0) {
             ha1_found = dig.ha1_cb(reg_realm, strlen(reg_realm),
                                    u->user.p, u->user.len, dig.ha1_ud);
         }
-        if (!ha1_found) {
+        if (!skip_ha1_check && !ha1_found) {
             /* 用户不存在 → silent drop（既不发 401 也不发 403） */
             llog(LOG_NOTICE, "reg",
                  "REGISTER → silent drop: user NOT FOUND "
@@ -705,6 +710,13 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
                  aor, u->user.len, reg_realm,
                  src_ip, auth ? 1 : 0);
             _rc = NSBC_OK; goto reg_out;
+        }
+        if (skip_ha1_check) {
+            static unsigned skc = 0;
+            if (skc++ % 256 == 0) {
+                llog(LOG_DEBUG, "reg",
+                     "force_register_ok=1 → skip ha1 user-exists check aor=%s", aor);
+            }
         }
         /* HA1 存在 → 继续正常流程（无论 auth 头有没有） */
     }
@@ -1018,6 +1030,29 @@ reg_auth_ok:
 
         /* 4. NAT 检测 + received 优先级：Via received > src IP */
         b.nat_detected = nat_detect(c_host, via_recv, via_rport, src_ip, src_port);
+        /* ★ REQ-NAT-EXPIRE-001：NAT 场景强制短 expires。
+         * 家用路由器 NAT UDP conntrack 默认 ~300s 超时，
+         * 如果默认 expires=600s → FreeSWITCH 每 300s 刷新一次 → 刚好卡在 NAT 超时边缘 →
+         * NAT 映射先过期 → NSBC 200 OK 发出去但 conntrack 没条目 → 包到不了分机 → 客户端超时 → "错误网关"。
+         * 解决：检测到 NAT 时把 exp 压到 nat_expires_short（默认 120s），
+         * 客户端每 60s 刷新一次 → 远快于 NAT 超时 → 映射持续活跃。
+         * force_expires > 0 时用户手动强制了，优先尊重。 */
+        if (b.nat_detected && r->cfg.nat_expires_short > 0 && r->cfg.force_expires == 0) {
+            if (exp > r->cfg.nat_expires_short) {
+                long old_exp = exp;
+                exp = r->cfg.nat_expires_short;
+                /* 重新夹逼 min/max：短 expires 也不能低于 min_expires */
+                if (exp < r->cfg.min_expires) exp = r->cfg.min_expires;
+                b.expire_ms = now + (uint64_t)exp * 1000;
+                static unsigned nc_override = 0;
+                if (nc_override++ % 256 == 0) {
+                    llog(LOG_INFO, "reg",
+                         "NAT detected → short expires override aor=%s exp=%ld→%ld "
+                         "contact=%s nat_expires_short=%d",
+                         b.aor, old_exp, exp, b.contact, r->cfg.nat_expires_short);
+                }
+            }
+        }
         /* received_ip 优先 Via received（存在），否则 src IP */
         if (via_recv[0]) {
             snprintf(b.received_ip, sizeof(b.received_ip), "%s", via_recv);
@@ -1034,8 +1069,27 @@ reg_auth_ok:
                      c_user[0] ? c_user : "",  /* user 可能为空（anonymous） */
                      b.received_ip, b.received_port,
                      proto_str(proto));
-            llog(LOG_INFO, "reg", "NAT detected contact=%s public_contact=%s src=%s:%u via_recv=%s",
-                 b.contact, b.public_contact, src_ip, src_port, via_recv);
+            /* REQ-LOG-001：NAT detected 日志节流 — 同一 aor+public_contact 30s 只打一条。
+             * FreeSWITCH 终端启动时会在 1s 内发 3-5 条 REGISTER（重试），
+             * 每条都命中 NAT → 日志刷屏。但 public_contact 变了（端口变）必须打新的。 */
+            {
+                static char last_aor[128] = {0}, last_pub[256] = {0};
+                static uint64_t last_log_ms = 0;
+                uint64_t now_ms = now * 1000ULL;
+                int same = (strcmp(last_aor, b.aor) == 0 && strcmp(last_pub, b.public_contact) == 0);
+                if (!same || now_ms - last_log_ms > 30000) {
+                    strncpy(last_aor, b.aor, sizeof(last_aor) - 1);
+                    strncpy(last_pub, b.public_contact, sizeof(last_pub) - 1);
+                    last_log_ms = now_ms;
+                    llog(LOG_INFO, "reg",
+                         "NAT detected contact=%s → public_contact=%s src=%s via_recv=%s",
+                         b.contact, b.public_contact, src_ip, via_recv);
+                } else {
+                    llog(LOG_DEBUG, "reg",
+                         "NAT detected (throttled) aor=%s public=%s",
+                         b.aor, b.public_contact);
+                }
+            }
         } else {
             /* 公网直连（含 WS/WSS）：public_contact = 原始 Contact */
             snprintf(b.public_contact, sizeof(b.public_contact), "%s", b.contact);

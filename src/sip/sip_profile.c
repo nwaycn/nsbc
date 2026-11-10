@@ -482,8 +482,29 @@ int sip_profiles_reload_json(const char *json, char *out_err, size_t err_sz)
         return NSBC_INVAL;
     }
 
+    /* ★ REQ-PROFILE-DEDUP-001：新旧内容相同直接跳过。
+     * Rust 侧 Web 管理面板可能每分钟轮询 DB 就推一次 profiles.reload，
+     * 即使 JSON 完全没变也触发 → 每次 calloc 新数组 + retire 旧数组 + 打一堆 INFO。
+     * 这里用 static 记住上一次的 JSON 字符串，完全相同则秒返 NSBC_OK。
+     * JSON 只有 ~1.4KB，strdup 成本可忽略。 */
+    static char *g_last_json = NULL;
+    static size_t g_last_len = 0;
+    size_t cur_len = strlen(json);
+    if (g_last_json && g_last_len == cur_len && memcmp(g_last_json, json, cur_len) == 0) {
+        static unsigned ndup = 0;
+        if (ndup++ % 60 == 0) {
+            llog(LOG_DEBUG, "sip-profile",
+                 "reload_json: SAME as last (%zu bytes) → skip (dup#%u)",
+                 cur_len, ndup);
+        }
+        return NSBC_OK;
+    }
+    free(g_last_json);
+    g_last_json = strdup(json);
+    g_last_len = cur_len;
+
     /* ★ 诊断日志：打完整 JSON，看 external_sip_ip / external_rtp_ip 有没有 */
-    llog(LOG_INFO, "sip-profile", "reload_json len=%zu body=%.800s", strlen(json), json);
+    llog(LOG_INFO, "sip-profile", "reload_json len=%zu body=%.800s", cur_len, json);
 
     /* ---- [1] 解析 JSON 数组 ---- */
     cJSON *root = cJSON_Parse(json);
@@ -743,22 +764,40 @@ sip_profile_t *sip_profile_match_src(const char *src_ip, int *verdict)
 sip_profile_t *sip_profile_match_port(uint16_t udp_port, uint16_t tcp_port)
 {
     pthread_rwlock_rdlock(&g.rwlock);
-    sip_profile_t *found = NULL;
-    sip_profile_t *ext_pref = NULL;  /* auth_calls=0 优先 */
+    sip_profile_t *int_pref = NULL;   /* auth_calls=1 internal — 接受 REGISTER */
+    sip_profile_t *ext_pref = NULL;   /* auth_calls=0 external — 拒绝 REGISTER，接受 trunk INVITE */
+    int conflict_seen = 0;
     for (unsigned i = 0; i < g.count; ++i) {
         sip_profile_t *p = &g.prof[i];
         if (p->state != SIP_PROFILE_OK || !p->enabled) continue;
         if ((udp_port > 0 && p->enable_udp && p->sip_udp_port == udp_port) ||
             (tcp_port > 0 && p->enable_tcp && p->sip_tcp_port == tcp_port)) {
             if (p->auth_calls == 0) {
-                ext_pref = p;
-                break;  /* auth_calls=0 即 external-like → 直接赢 */
+                if (!ext_pref) ext_pref = p;
+                else conflict_seen = 1;
+            } else {
+                if (!int_pref) int_pref = p;
+                else conflict_seen = 1;
             }
-            if (!found) found = p;  /* 兜底：auth_calls=1 的 internal */
         }
     }
     pthread_rwlock_unlock(&g.rwlock);
-    return ext_pref ? ext_pref : found;
+
+    /* ★ REQ-PROFILE-001：internal 优先 external。
+     * 5060 通常绑 internal (auth_calls=1)，5080 绑 external (auth_calls=0)。
+     * 如果两个 profile 绑同一个端口（配置错误），internal 赢（保护 REGISTER 通道）。
+     * 之前的逻辑是 auth_calls=0 直接 break 跳出循环 → 当 Rust 侧 reload 后
+     * profile 数组顺序变了，internal 可能被 external 遮蔽 → REGISTER 全部 403。 */
+    if (conflict_seen) {
+        static int diag_conflict_seen = 0;
+        if (!diag_conflict_seen++) {
+            llog(LOG_WARN, "prof",
+                 "sip_profile_match_port: multiple enabled profiles bind udp=%u tcp=%u "
+                 "(auth_calls=1 wins for REGISTER path)",
+                 (unsigned)udp_port, (unsigned)tcp_port);
+        }
+    }
+    return int_pref ? int_pref : ext_pref;
 }
 
 /*

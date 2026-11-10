@@ -145,6 +145,11 @@ static const cfg_desc_t k_core[] = {
     /* ★ 调试开关：1=跳过所有 auth + fence 检查，REGISTER 直接 200 OK
      * 排查 UDP conntrack 丢包 / auth 重试风暴用。排完必须改回 0！生产环境绝不能开。 */
     {"registrar.force_register_ok", CGT_INT, CGF_HOT, "1", NULL, 0, 1},
+    /* NAT 场景强制短 expires：0=不强制；>0=检测到 NAT 时 exp 压到 min(exp, val)。
+     * 默认 120s=2min → 客户端每 60s 刷新 REGISTER（expires/2），
+     * 远快于家用 NAT UDP conntrack 300s 超时 → 保持 NAT 映射活跃。
+     * 公网直连分机（无 NAT 检测）不受影响。 */
+    {"registrar.nat_expires_short", CGT_INT, CGF_HOT, "120", NULL, 0, 3600},
     {"registrar.max_contacts", CGT_INT, CGF_HOT, "10", NULL, 1, 20},
     {"registrar.rps_global", CGT_INT, CGF_HOT, "0", NULL, 0, 1000000},
     {"registrar.rps_per_ip", CGT_INT, CGF_HOT, "0", NULL, 0, 100000},

@@ -73,6 +73,10 @@ typedef struct cnode {
     codec_id_t         dst_codec[2]; /* 对侧期望的 codec（从 answer SDP 提取） */
     uint8_t            pt_allowed[2][8]; /* 每侧允许通过的 PT（从 answer SDP fmt-list） */
     int                pt_allowed_count[2];
+
+
+    uint8_t            video_pt_allowed[2][8];
+    int                video_pt_allowed_count[2];
     /* ★ PT rewrite：同 codec 不同 PT（如 WebRTC G729 PT=96 → SIP G729 PT=18）
      * 只改 RTP header 的 PT 字节，不做 PCM 往返转码。比 transcode 快得多。 */
     struct { uint8_t src_pt; uint8_t dst_pt; } pt_rewrite[2];
@@ -307,6 +311,31 @@ static void admit_ssrc_from_sdp(rtp_relay_t *r, int side,
                             ssrc_policy_set_aux_pt(pol, (uint8_t)pt);
                     }
                 }
+            }
+        }
+
+        /* ★ REQ-MEDIA-VIDEO-003：m=video <port> <proto> <pt1> <pt2> ...
+         * 提取所有 video payload type 进 ssrc_policy video_pt[] 白名单。
+         * 让后续到达的全新 video SSRC（传统 SIP 不带 a=ssrc:）也能通过 policy。 */
+        if (llen >= 8 && strncmp(p, "m=video ", 8) == 0) {
+            const char *tok = p + 8;  /* 跳过 "m=video " */
+            const char *line_end_ptr = p + llen;
+            /* skip port token */
+            while (tok < line_end_ptr && *tok != ' ') ++tok;
+            while (tok < line_end_ptr && *tok == ' ') ++tok;
+            /* skip proto token */
+            while (tok < line_end_ptr && *tok != ' ') ++tok;
+            while (tok < line_end_ptr && *tok == ' ') ++tok;
+            /* fmt-list：逐个提取 PT 数字 */
+            char *tail = NULL;
+            while (tok < line_end_ptr) {
+                unsigned long v = strtoul(tok, &tail, 10);
+                if (tail == tok) break;  /* 不再是数字，fmt-list 结束 */
+                if (v < 256) {
+                    ssrc_policy_set_video_pt(pol, (uint8_t)v);
+                }
+                tok = tail;
+                while (tok < line_end_ptr && *tok == ' ') ++tok;
             }
         }
 
@@ -603,7 +632,7 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
             is_rtcp = pkt_rtcp;
             /* ★ 关键 INFO 日志：确认 unprotect 真的在跑。
              * 之前是 DEBUG 级别，混在海量 TC-GUARD 里看不到。 */
-             
+
         }
         /* ★ REQ-MEDIA-SEC-005b：srtp_lane 但 srtp 会话还没建立 → 直接 drop。
          * 之前注释说"握手未完的早到媒体当明文处理"——但浏览器发的是加密 SRTP，
@@ -917,7 +946,12 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
             if (r->node && r->node->transcode[side] &&
                 !pt_in_list((uint8_t)pkt.pt,
                             r->node->pt_allowed[other],
-                            r->node->pt_allowed_count[other])) {
+                            r->node->pt_allowed_count[other]) &&
+                /* ★ REQ-MEDIA-VIDEO-003：video PT 在 video_pt_allowed 里 → 跳过 transcode！
+                 * video codec registry 没注册 transcode，H.264 payload 喂给 G.711 session 会崩。 */
+                !pt_in_list((uint8_t)pkt.pt,
+                            r->node->video_pt_allowed[other],
+                            r->node->video_pt_allowed_count[other])) {
                 transcode_sess_t *tc = r->node->transcode[side];
                 size_t new_out_len = 0;
                 uint8_t old_pt = (uint8_t)pkt.pt;
@@ -3566,6 +3600,90 @@ static int sdp_extract_audio_codecs(const char *sdp, size_t len,
     return 0;
 }
 
+/* REQ-MEDIA-VIDEO-003：从 SDP 所有 m=video 行的 fmt-list 提取 PT。
+ * 复用 audio 版本的 sdp_parse + fallback raw scan 双路径，
+ * 但只返回 PT（不需要 codec_id——video 转码没注册）。
+ * 多次 m=video（rare but 合法）的 PT 合并去重。 */
+static int sdp_extract_video_codecs(const char *sdp, size_t len,
+                                    uint8_t *out_pts, int out_cap)
+{
+    int n = 0;
+    sdp_t s;
+    if (sdp_parse(&s, sdp, len) == NSBC_OK) {
+        for (int i = 0; i < s.nmedia && n < out_cap; ++i) {
+            sdp_media_t *m = &s.media[i];
+            if (m->type != SDP_M_VIDEO) continue;
+            if (!m->codecs_built)
+                sdp_media_build_codecs(&s, m);
+            for (int j = 0; j < m->ncodecs && n < out_cap; ++j) {
+                uint8_t pt = (uint8_t)m->codecs[j].pt;
+                /* 去重 */
+                int dup = 0;
+                for (int k = 0; k < n; ++k)
+                    if (out_pts[k] == pt) { dup = 1; break; }
+                if (!dup) {
+                    out_pts[n++] = pt;
+                    llog(LOG_INFO, "media",
+                         "sdp_extract_video_codecs: video media[%d] codec[%d] pt=%u",
+                         i, j, (unsigned)pt);
+                }
+            }
+        }
+    }
+    if (n > 0) {
+        llog(LOG_INFO, "media", "sdp_extract_video_codecs: return n=%d PTs (via sdp_parse)", n);
+        return n;
+    }
+
+    /* Fallback：sdp_parse 失败或没找到 video m-line —— raw scan */
+    const char *p = sdp;
+    const char *end = sdp + len;
+    while (p < end && n < out_cap) {
+        if ((size_t)(end - p) >= 8 &&
+            p[0] == 'm' && p[1] == '=' &&
+            strncmp(p + 2, "video", 5) == 0 &&
+            (p[7] == ' ' || p[7] == '\t')) {
+            const char *q = p + 8; /* 跳过 "m=video " */
+            /* 跳过 port 和 proto */
+            int field = 0;
+            while (q < end && field < 2) {
+                while (q < end && *q != ' ' && *q != '\r' && *q != '\n') ++q;
+                ++field;
+                if (q < end && *q == ' ') ++q;
+            }
+            /* fmt-list */
+            while (q < end && *q != '\r' && *q != '\n' && n < out_cap) {
+                while (q < end && (*q == ' ' || *q == '\t')) ++q;
+                if (q >= end || *q == '\r' || *q == '\n') break;
+                const char *fs = q;
+                while (q < end && *q != ' ' && *q != '\r' && *q != '\n') ++q;
+                char buf[16];
+                size_t fl = (size_t)(q - fs);
+                if (fl >= sizeof(buf)) fl = sizeof(buf) - 1;
+                memcpy(buf, fs, fl); buf[fl] = '\0';
+                char *ep = NULL;
+                long pt = strtol(buf, &ep, 10);
+                if (ep != buf && pt >= 0 && pt <= 255) {
+                    int dup = 0;
+                    for (int k = 0; k < n; ++k)
+                        if (out_pts[k] == (uint8_t)pt) { dup = 1; break; }
+                    if (!dup) out_pts[n++] = (uint8_t)pt;
+                }
+            }
+        }
+        while (p < end && *p != '\n') ++p;
+        if (p < end && *p == '\n') ++p;
+    }
+    if (n > 0)
+        llog(LOG_INFO, "media",
+             "sdp_extract_video_codecs: FALLBACK raw scan got n=%d PTs", n);
+    else
+        llog(LOG_DEBUG, "media",
+             "sdp_extract_video_codecs: no video m-line, nmedia=%zu",
+             sdp_parse(&s, sdp, len) == NSBC_OK ? (size_t)s.nmedia : 0);
+    return n;
+}
+
 /* 在候选 codec 列表里找一个目标：与 src 不同、在 registry 里已注册、
  * 优先选另一个列表里也有的（offer 和 answer 都支持的 codec 作为"中转点"）。
  * P0 每次返回第一个命中的候选即可（单方向只建一个转码会话）。 */
@@ -3654,6 +3772,12 @@ int bridge_confirm(bridge_mgr_t *m, void *call, const char *offer,
     int offer_n = sdp_extract_audio_codecs(offer, offer_len, offer_pts, offer_cids, 8);
     int answer_n = sdp_extract_audio_codecs(answer, answer_len, answer_pts, answer_cids, 8);
 
+    /* ★ REQ-MEDIA-VIDEO-003：video PT 提取 —— 独立于 audio codec，
+     * 因为 pt_allowed[8] 槽给 audio 用刚好够。video PT 单独存 video_pt_allowed。 */
+    uint8_t offer_video_pts[8], answer_video_pts[8];
+    int offer_video_n = sdp_extract_video_codecs(offer, offer_len, offer_video_pts, 8);
+    int answer_video_n = sdp_extract_video_codecs(answer, answer_len, answer_video_pts, 8);
+
     br_shard_t *s = &m->sh[ptr_shard(call)];
     pthread_mutex_lock(&s->lock);
     cnode_t *e = entry_find(m, call);
@@ -3676,6 +3800,18 @@ int bridge_confirm(bridge_mgr_t *m, void *call, const char *offer,
         memcpy(e->pt_allowed[0], offer_pts, (size_t)offer_n);
         e->pt_allowed_count[1] = answer_n;
         memcpy(e->pt_allowed[1], answer_pts, (size_t)answer_n);
+
+
+
+        e->video_pt_allowed_count[0] = offer_video_n;
+        memcpy(e->video_pt_allowed[0], offer_video_pts, (size_t)offer_video_n);
+        e->video_pt_allowed_count[1] = answer_video_n;
+        memcpy(e->video_pt_allowed[1], answer_video_pts, (size_t)answer_video_n);
+        if (offer_video_n > 0 || answer_video_n > 0) {
+            llog(LOG_INFO, "media",
+                 "★BRIDGE_VIDEO_PTS call=%p offer_video_n=%d answer_video_n=%d",
+                 call, offer_video_n, answer_video_n);
+        }
 
         /* ★ DTMF RFC4733：扫描 offer/answer SDP 提取 telephone-event PT
          * 顶层 static find_dtmf_pt（函数外定义）负责实际解析 */
@@ -3880,6 +4016,18 @@ int bridge_confirm(bridge_mgr_t *m, void *call, const char *offer,
         llog(LOG_INFO, "media", "  pt_allowed[1]=(n=%d)[", e->pt_allowed_count[1]);
         for (int i = 0; i < e->pt_allowed_count[1]; ++i)
             llog(LOG_INFO, "media", "  pt_allowed[1][%d]=%u", i, e->pt_allowed[1][i]);
+        if (e->video_pt_allowed_count[0] || e->video_pt_allowed_count[1]) {
+            llog(LOG_INFO, "media",
+                 "  video_pt_allowed[0]=(n=%d)[", e->video_pt_allowed_count[0]);
+            for (int i = 0; i < e->video_pt_allowed_count[0]; ++i)
+                llog(LOG_INFO, "media",
+                     "  video_pt_allowed[0][%d]=%u", i, e->video_pt_allowed[0][i]);
+            llog(LOG_INFO, "media",
+                 "  video_pt_allowed[1]=(n=%d)[", e->video_pt_allowed_count[1]);
+            for (int i = 0; i < e->video_pt_allowed_count[1]; ++i)
+                llog(LOG_INFO, "media",
+                     "  video_pt_allowed[1][%d]=%u", i, e->video_pt_allowed[1][i]);
+        }
     }
     pthread_mutex_unlock(&s->lock);
     return NSBC_OK;
