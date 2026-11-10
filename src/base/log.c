@@ -287,7 +287,11 @@ static void *logger_main(void *arg)
             r = r->next;
         }
         pthread_mutex_unlock(&g_reg_lock);
-        if (g_fd >= 0) {
+        /* REQ-PERF-LOG-001：fsync 仅在有日志写入时执行。
+         * 之前即使 ring 空着（any==0），每 5ms 循环也 fsync 一次 →
+         * 每秒 200 次 fsync，机械盘上每次 1-5ms → 一个核被刷满。
+         * 没日志时只做 reopen 检查 + 5ms 睡眠，零 syscall。 */
+        if (any && g_fd >= 0) {
             if (fsync(g_fd) < 0 && errno != EINTR) {
                 static time_t last_fsync_warn;
                 time_t now = time(NULL);
@@ -297,12 +301,12 @@ static void *logger_main(void *arg)
                     last_fsync_warn = now;
                 }
             }
+        }
+        if (g_fd >= 0 && g_cur_size >= g_rotate_max) {
             /* ---- size-based rotate 检查 ----
              * drain 完所有 ring + fsync 完成后才触发：此时 ring 空、磁盘已落、
              * fd 状态安全。do_rotate 内部 self-close + rename + open，失败回退旧 fd。 */
-            if (g_cur_size >= g_rotate_max) {
-                do_rotate();
-            }
+            do_rotate();
         }
         /* SIGHUP-triggered reopen (logrotate postrotate hook compatibility).
          * Signal handler only sets g_reopen_pending (async-signal-safe).

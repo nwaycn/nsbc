@@ -519,7 +519,9 @@ static void uds_handle_core_cmd(uint32_t ticket, const char *line, size_t len)
         .io_ud = &io,
     };
 
-    llog(LOG_NOTICE, "uds-cmd", "CMD_REQ argv0='%s' argv1_len=%zu ticket=%u",
+    /* Rust 端 periodic push 每 60s 推全量命令（N 条/次），NOTICE 级会刷屏。
+     * 高频 CMD_REQ 详情降 DEBUG；CMD_REQ 本身的成功/失败由各 cmd handler 自打。 */
+    llog(LOG_DEBUG, "uds-cmd", "CMD_REQ argv0='%s' argv1_len=%zu ticket=%u",
          argv0, argv1_len, ticket);
 
     /* 把 argv1 拷贝到临时 buffer（cmd_execute 可能原地修改 argv[1]） */

@@ -144,11 +144,19 @@ int sip_profile_bind(sip_profile_t *prof)
         return NSBC_ERR;
     }
 
+    /* Rust periodic push 每分钟重推全部 profile → 本函数被反复调用，
+     * 每次都打 NOTICE 会刷屏（实测 558 条 / 5w 行日志）。仅在
+     * state 从非 OK → OK 转变时打一条；重复 OK 降 DEBUG。 */
+    int was_ok = (prof->state == SIP_PROFILE_OK);
     prof->state = SIP_PROFILE_OK;
-    llog(LOG_NOTICE, "sip-profile", "%s: OK UDP=%s:%u TCP=%s:%u RTP=%u-%u (shared transport)",
-         prof->name, prof->sip_ip, prof->sip_udp_port,
-         prof->sip_ip, prof->sip_tcp_port,
-         prof->rtp_port_start, prof->rtp_port_end);
+    if (!was_ok) {
+        llog(LOG_NOTICE, "sip-profile", "%s: OK UDP=%s:%u TCP=%s:%u RTP=%u-%u (shared transport)",
+             prof->name, prof->sip_ip, prof->sip_udp_port,
+             prof->sip_ip, prof->sip_tcp_port,
+             prof->rtp_port_start, prof->rtp_port_end);
+    } else {
+        llog(LOG_DEBUG, "sip-profile", "%s: re-OK (state unchanged)", prof->name);
+    }
     return NSBC_OK;
 }
 

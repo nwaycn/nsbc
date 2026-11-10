@@ -973,8 +973,9 @@ static void dispatch(ctl_conn_t *c, char *line)
     if (*line == '\0')
         return;
 
-    /* ---- 临时诊断：打印收到的原始命令行 ----
-     * 仅在非 show 命令时打，避免日志洪水。arg 长度截断到 200 字节。*/
+    /* ---- 历史诊断代码：每条 UDS 命令打 INFO，Rust 周期 push 时刷屏 6588+/5w 行。
+     * 已定位为正常周期行为，直接整块注释掉（保留代码备查）。排障时手动打开。---- */
+#if 0
     {
         const char *arg_preview = strchr(line, ' ');
         int arg_len = arg_preview ? (int)(strlen(line) - (arg_preview - line) - 1) : 0;
@@ -987,6 +988,7 @@ static void dispatch(ctl_conn_t *c, char *line)
         llog(LOG_INFO, "oam", "dispatch raw: cmd='%s' arg_len=%d arg_head='%s...' g_cmd_reg=%p",
              line, arg_len, preview, (void*)g_cmd_reg);
     }
+#endif
 
     char *arg = line;
     while (*arg && *arg != ' ')
