@@ -390,6 +390,21 @@ int recording_apply_dp_action(rec_mgr_t *mgr, uint8_t rec_action,
         const rec_mgr_cfg_t *mcfg = rec_mgr_get_cfg(mgr);
         const char *bd = mcfg ? mcfg->base_dir : "";
 
+        /* ★ HOT-RELOAD: recording.format 是 CGF_HOT —— 每次 stop 从 YAML 重读，
+         *   YAML reload 后下次录音自动用新格式，不用重启 nsbcd。 */
+        rec_fmt_t live_fmt = mcfg ? mcfg->fmt : REC_FMT_WAV_PCM;
+        if (g_ctx && g_ctx->cfg) {
+            const char *fmt_s = NULL;
+            if (cfg_get_str(g_ctx->cfg, "recording.format", &fmt_s, NULL) == NSBC_OK && fmt_s) {
+                if (strcmp(fmt_s, "mp3") == 0)      live_fmt = REC_FMT_MP3;
+                else if (strcmp(fmt_s, "mp4") == 0) live_fmt = REC_FMT_MP4_AAC;
+                else if (strcmp(fmt_s, "opus") == 0) live_fmt = REC_FMT_OGG_OPUS;
+                else                                 live_fmt = REC_FMT_WAV_PCM;
+            }
+        }
+        llog(LOG_DEBUG, "rec", "recording STOP callid=%s live_fmt=%d (%s)",
+             callid, live_fmt, rec_fmt_ext(live_fmt));
+
         /* REQ-REC-007：先从 bucket 拿模板/caller/callee（rec_stop 会 free sess）
          * 入参可能为 NULL（hangup/call_destroy 兜底路径没传）—— fallback 用 bucket 缓存 */
         char sess_tpl[128] = {0}, sess_caller[64] = {0}, sess_callee[64] = {0};
@@ -456,16 +471,18 @@ int recording_apply_dp_action(rec_mgr_t *mgr, uint8_t rec_action,
                 unlink(b_path);
 
                 /* ★ ffmpeg 后处理：fmt != WAV → 转码成 mp3/opus/mp4
-                 * merge_stereo_wav 输出的是中间 WAV，转码成功后删它，rec_path_out 指向新文件。 */
-                if (mcfg && mcfg->fmt != REC_FMT_WAV_PCM) {
-                    const char *target_ext = rec_fmt_ext(mcfg->fmt);
+                 * merge_stereo_wav 输出的是中间 WAV，转码成功后删它，rec_path_out 指向新文件。
+                 * 用 live_fmt（YAML 热读值）而非 mcfg->fmt（启动时快照），
+                 * 这样 reload 后下次录音自动切格式，不用重启。 */
+                if (live_fmt != REC_FMT_WAV_PCM) {
+                    const char *target_ext = rec_fmt_ext(live_fmt);
                     char final_path[REC_PATH_MAX];
                     /* 把 mix_path 最后的 .wav 替换成目标后缀 */
                     snprintf(final_path, sizeof(final_path), "%s", mix_path);
                     char *dot = strrchr(final_path, '.');
                     if (dot) snprintf(dot, sizeof(final_path) - (dot - final_path), ".%s", target_ext);
 
-                    if (ffmpeg_convert(mix_path, final_path, mcfg->fmt) == NSBC_OK) {
+                    if (ffmpeg_convert(mix_path, final_path, live_fmt) == NSBC_OK) {
                         llog(LOG_INFO, "rec", "recording CONVERT callid=%s → .%s", callid, target_ext);
                         unlink(mix_path);  /* 删中间 WAV */
                         if (rec_path_out && path_cap > 0)
@@ -486,14 +503,14 @@ int recording_apply_dp_action(rec_mgr_t *mgr, uint8_t rec_action,
             }
         } else if (a_path[0]) {
             /* 单 leg：只有 mono WAV，也走 ffmpeg 转码 */
-            if (mcfg && mcfg->fmt != REC_FMT_WAV_PCM) {
-                const char *target_ext = rec_fmt_ext(mcfg->fmt);
+            if (live_fmt != REC_FMT_WAV_PCM) {
+                const char *target_ext = rec_fmt_ext(live_fmt);
                 char final_path[REC_PATH_MAX];
                 snprintf(final_path, sizeof(final_path), "%s", a_path);
                 char *dot = strrchr(final_path, '.');
                 if (dot) snprintf(dot, sizeof(final_path) - (dot - final_path), ".%s", target_ext);
 
-                if (ffmpeg_convert(a_path, final_path, mcfg->fmt) == NSBC_OK) {
+                if (ffmpeg_convert(a_path, final_path, live_fmt) == NSBC_OK) {
                     llog(LOG_INFO, "rec", "recording CONVERT mono callid=%s → .%s", callid, target_ext);
                     unlink(a_path);
                     if (rec_path_out && path_cap > 0)
