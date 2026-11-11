@@ -64,7 +64,22 @@ app.component('config-editor', {
             <el-tag type="info">{{ editLayer }}</el-tag>
           </el-form-item>
           <el-form-item :label="t('New Value')">
+            <!-- Enum keys: dropdown for safe selection; text-input for all others -->
+            <el-select
+              v-if="enumOptions"
+              v-model="editValue"
+              @change="clearValidate"
+              style="width:100%"
+            >
+              <el-option
+                v-for="opt in enumOptions"
+                :key="opt.value"
+                :label="opt.label"
+                :value="opt.value"
+              />
+            </el-select>
             <el-input
+              v-else
               v-model="editValue"
               type="textarea"
               :rows="3"
@@ -107,6 +122,26 @@ app.component('config-editor', {
     const validOk = Vue.ref(false);
     const validating = Vue.ref(false);
     const setting = Vue.ref(false);
+
+    /* Enum key → dropdown options map (kept in sync with src/core/cfg_schema.c enum lists) */
+    const ENUM_OPTIONS = {
+      'recording.format': [
+        { value: 'wav',  label: 'WAV PCM (原生, 无依赖)' },
+        { value: 'mp3',  label: 'MP3 (libmp3lame, 通用播放器兼容)' },
+        { value: 'opus', label: 'Opus (OGG Opus, 省存储, 专利无关)' },
+        { value: 'mp4',  label: 'MP4 AAC (AAC 音频轨, .mp4 容器, 可被 <audio> 直接播放)' },
+      ],
+      'recording.mode': [
+        { value: 'single',  label: '单声道 (mix 两路 PCM)' },
+        { value: 'mixed',   label: '混合单声道 (两路叠加)' },
+        { value: 'separate', label: '双声道 (L=A路, R=B路)' },
+      ],
+      'force_register_ok': [
+        { value: '0', label: '0 — 启用 digest auth + security fence' },
+        { value: '1', label: '1 — 跳过 auth (IAD/国产 SIP 设备必选)' },
+      ],
+    };
+    const enumOptions = Vue.computed(() => ENUM_OPTIONS[editKey.value] || null);
 
     const load = async () => {
       loading.value = true;
@@ -177,6 +212,7 @@ app.component('config-editor', {
     return {
       items, listens, loading,
       dialogVisible, editKey, editValue, editLayer,
+      enumOptions,
       validateMsg, validOk, validating, setting,
       load, openEdit, clearValidate, doValidate, doSet,
     };
