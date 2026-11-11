@@ -19,6 +19,8 @@
 #include "sip_common.h"   /* sip_ci_eq */
 #include "media_bug.h"
 #include "media_codec.h"   /* codec registry + transcode engine */
+#include "rtp_reasm.h"     /* M1: H.264 RTP 重组器（视频录制前置） */
+#include "recorder.h"      /* M1: rec_feed_video —— 视频帧喂录音 sess */
 #ifdef NSBC_WITH_OPENSSL
 #include "openssl_compat.h" /* NSBC_OPENSSL_HAS_DTLS_FEED 版本探测（先于 dtls_srtp.h） */
 #endif
@@ -40,6 +42,12 @@
 #define SSRC_MAP_N 16
 #define RELAY_BUF 2048
 #define MB_REC_HOOK_MAX 4
+
+/* M1 视频帧 hook 的回调上下文 —— vid_reasm 完整帧回调用 */
+typedef struct vid_hook_ud {
+    struct cnode *node;
+    int           side;
+} vid_hook_ud_t;
 
 typedef struct cnode {
     struct cnode *next;
@@ -77,6 +85,10 @@ typedef struct cnode {
 
     uint8_t            video_pt_allowed[2][8];
     int                video_pt_allowed_count[2];
+    /* M1 视频录制：H.264 RTP 重组器（bridge_confirm 检测到 H.264 时创建，
+     * bridge_release_call 销毁）。side=0 = A 腿方向（录制 A→B 视频）。 */
+    vid_reasm_t       *vid_reasm[2];
+    vid_hook_ud_t      vid_ud[2];
     /* ★ PT rewrite：同 codec 不同 PT（如 WebRTC G729 PT=96 → SIP G729 PT=18）
      * 只改 RTP header 的 PT 字节，不做 PCM 往返转码。比 transcode 快得多。 */
     struct { uint8_t src_pt; uint8_t dst_pt; } pt_rewrite[2];
@@ -434,6 +446,23 @@ static int pt_in_list(uint8_t pt, const uint8_t *list, int count)
     return 0;
 }
 
+/* M1 视频帧回调 —— vid_reasm 重组出完整 H.264 access unit 后调用。
+ * 只录 side=0（A→B 方向）：call->rec[0] 是 leg A 的录音 sess，
+ * 其 rec_open_t.video=1（recording.c start 路径设置）。 */
+static void bridge_video_frame_cb(void *ud, const uint8_t *frame,
+                                  size_t len, uint32_t ts)
+{
+    vid_hook_ud_t *u = (vid_hook_ud_t *)ud;
+    if (u == NULL || u->node == NULL || u->node->call == NULL)
+        return;
+    if (u->side != 0)
+        return;  /* M1 只录 A 腿方向；side=1 reasm 预留 */
+    b2b_call_t *call = (b2b_call_t *)u->node->call;
+    rec_sess_t *sess = (rec_sess_t *)call->rec[0];
+    if (sess != NULL)
+        rec_feed_video(sess, frame, len, ts);
+}
+
 /* PT → codec_id 映射（G.711 + G.729 + G.722 静态 PT 基线）
  * 静态 PT 未命中（WebRTC 动态 PT 96+）时返回 CODEC_NONE，
  * 由 sdp_extract_audio_codecs 用 rtpmap enc name 二次映射。 */
@@ -633,6 +662,26 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
             /* ★ 关键 INFO 日志：确认 unprotect 真的在跑。
              * 之前是 DEBUG 级别，混在海量 TC-GUARD 里看不到。 */
 
+        }
+
+        /* ★ M1 视频录制 hook —— SRTP unprotect 之后、latch/转发门控之前。
+         * 此处 buf 已是明文 RTP：先取 PT 字节做零开销预筛（非 video PT 直接过），
+         * 命中 video_pt_allowed 才 rtp_parse + 喂 H.264 重组器。
+         * latch 未就绪 / precondition / direction gate 均不影响录制路径。 */
+        if (!is_rtcp && n >= 2 && r->node != NULL &&
+            r->node->vid_reasm[side] != NULL) {
+            uint8_t vpt = (uint8_t)(buf[1] & 0x7F);
+            if (pt_in_list(vpt, r->node->video_pt_allowed[side],
+                           r->node->video_pt_allowed_count[side])) {
+                rtp_pkt_t pkt;
+                if (rtp_parse(buf, (size_t)n, &pkt) == NSBC_OK &&
+                    pkt.version == 2) {
+                    vid_reasm_feed(r->node->vid_reasm[side],
+                                   pkt.payload, pkt.payload_len,
+                                   pkt.marker, pkt.seq, pkt.ts,
+                                   nsbc_now_ms());
+                }
+            }
         }
         /* ★ REQ-MEDIA-SEC-005b：srtp_lane 但 srtp 会话还没建立 → 直接 drop。
          * 之前注释说"握手未完的早到媒体当明文处理"——但浏览器发的是加密 SRTP，
@@ -3381,6 +3430,14 @@ void bridge_release_call(bridge_mgr_t *m, void *call)
                 }
                 e->dtmf_pt[si] = 0;
             }
+            /* M1 视频重组器清理（rtp_relay_stop 已置 dead=1，
+             * relay_recv_one 循环退出后才走到这里 —— 无并发 feed） */
+            for (int si = 0; si < 2; ++si) {
+                if (e->vid_reasm[si]) {
+                    vid_reasm_destroy(e->vid_reasm[si]);
+                    e->vid_reasm[si] = NULL;
+                }
+            }
             free(e);
             return;
         }
@@ -3600,6 +3657,19 @@ static int sdp_extract_audio_codecs(const char *sdp, size_t len,
     return 0;
 }
 
+/* M1：SDP 里是否出现 H.264 编码名（rtpmap enc name，大小写不敏感）。
+ * 只做存在性检测 —— PT 与编码名的精确映射由 vid_reasm 按实际 RTP 流处理。 */
+static int sdp_has_h264(const char *sdp, size_t len)
+{
+    if (sdp == NULL || len < 4) return 0;
+    for (size_t i = 0; i + 3 < len; ++i) {
+        if ((sdp[i] == 'H' || sdp[i] == 'h') &&
+            sdp[i + 1] == '2' && sdp[i + 2] == '6' && sdp[i + 3] == '4')
+            return 1;
+    }
+    return 0;
+}
+
 /* REQ-MEDIA-VIDEO-003：从 SDP 所有 m=video 行的 fmt-list 提取 PT。
  * 复用 audio 版本的 sdp_parse + fallback raw scan 双路径，
  * 但只返回 PT（不需要 codec_id——video 转码没注册）。
@@ -3811,6 +3881,35 @@ int bridge_confirm(bridge_mgr_t *m, void *call, const char *offer,
             llog(LOG_INFO, "media",
                  "★BRIDGE_VIDEO_PTS call=%p offer_video_n=%d answer_video_n=%d",
                  call, offer_video_n, answer_video_n);
+        }
+
+        /* ★ M1 视频录制：offer+answer 都带 H.264 且 relay 已锚定 →
+         * 创建 side=0（A 腿）重组器。side=1 槽位预留（本期只录 A→B 方向）。
+         * re-INVITE 去掉 video / 换成 VP8 → 销毁重组器（dropping 模式自然结束）。 */
+        const int h264_ok =
+            sdp_has_h264(offer, offer_len) && sdp_has_h264(answer, answer_len);
+        if (h264_ok && offer_video_n > 0 && answer_video_n > 0) {
+            if (e->vid_reasm[0] == NULL) {
+                e->vid_ud[0].node = e;
+                e->vid_ud[0].side = 0;
+                if (vid_reasm_create(&e->vid_reasm[0],
+                                     bridge_video_frame_cb,
+                                     &e->vid_ud[0]) == NSBC_OK) {
+                    llog(LOG_INFO, "media",
+                         "★VIDEO_REASM call=%p side=0 CREATED (H.264 relay recording)",
+                         call);
+                } else {
+                    llog(LOG_WARN, "media",
+                         "★VIDEO_REASM call=%p side=0 CREATE FAIL — video recording disabled",
+                         call);
+                }
+            }
+        } else if (e->vid_reasm[0] != NULL) {
+            vid_reasm_destroy(e->vid_reasm[0]);
+            e->vid_reasm[0] = NULL;
+            llog(LOG_INFO, "media",
+                 "★VIDEO_REASM call=%p side=0 DESTROYED (no H.264 in renegotiated SDP)",
+                 call);
         }
 
         /* ★ DTMF RFC4733：扫描 offer/answer SDP 提取 telephone-event PT

@@ -416,7 +416,8 @@ app.component('cdrs-live', {
             </td>
             <td class="px-3 py-2 text-xs">
               <template v-if="getRecUrl(row)">
-                <audio :src="getRecUrl(row)" controls preload="none" class="h-6 align-middle"></audio>
+                <video v-if="isVideoRec(row)" :src="getRecUrl(row)" controls preload="none" class="h-20 align-middle"></video>
+                <audio v-else :src="getRecUrl(row)" controls preload="none" class="h-6 align-middle"></audio>
                 <a :href="getRecUrl(row)" download target="_blank" class="ml-2 text-blue-600 hover:underline">
                   <i class="fa-solid fa-download"></i>
                 </a>
@@ -501,6 +502,10 @@ app.component('cdrs-live', {
       if (!recPath) return null;
       return '/recordings/' + recPath.replace(/^\/+/, '');
     }
+    function isVideoRec(row) {
+      const url = getRecUrl(row);
+      return !!url && url.toLowerCase().endsWith('.mp4');
+    }
     function ringTime(startIso, answerIso) {
       if (!answerIso) return '-';
       const d = Math.round((isoMs(answerIso) - isoMs(startIso)) / 1000);
@@ -553,7 +558,7 @@ app.component('cdrs-live', {
     onMounted(() => { load(); timer = setInterval(() => load(true), 10000); });
     onBeforeUnmount(() => clearInterval(timer));
     return { rows, total, loading, error, pageSize, currentPage, totalPages, goPage,
-             getRecUrl, getMeta, ringTime, formatBillsec, fmtIso, isoMs,
+             getRecUrl, isVideoRec, getMeta, ringTime, formatBillsec, fmtIso, isoMs,
              tabs, activeTab, q, sortBy, sortDir, resetFilters,
              load };  // ← load + pageSize 必须都 return，模板 v-if="total > pageSize" 靠它
   },

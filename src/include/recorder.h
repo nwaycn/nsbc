@@ -68,6 +68,9 @@ typedef struct {
     char       rec_path_template[128];
     char       caller[64];   /* 主叫号，供 {caller} 替换 */
     char       callee[64];   /* 被叫号，供 {callee} 替换 */
+    /* M1 视频录制：1=本 sess 启用视频轨（.h264 异步写 + stop 时 ffmpeg 合成 mp4）。
+     * 仅 leg=0 的 sess 置 1 —— 视频录 A→B 方向，与音频分腿 mono 架构正交。 */
+    int        video;
 } rec_open_t;
 
 int  rec_mgr_create(const rec_mgr_cfg_t *cfg, rec_mgr_t **out);
@@ -94,6 +97,20 @@ int  rec_feed(rec_sess_t *s, int leg, const media_frame_t *frm);
  * leg=0/1。rec_open 成功后即可调，内部若未开 raw_fp 则自动 open（延迟创建）。 */
 int  rec_feed_raw(rec_sess_t *s, int leg, const void *payload,
                   size_t len, int payload_type);
+
+/* M1 视频录制：喂重组后的 H.264 Annex-B 帧（media_bridge video hook 调用）。
+ * annexb 指向 vid_reasm 内部 buffer，本函数内部 memcpy 进 per-sess slot，
+ * 回调返回后调用方可复用 buffer。满 slot 丢帧 + 计数，不阻塞媒体线程。 */
+int  rec_feed_video(rec_sess_t *s, const uint8_t *annexb, size_t len,
+                    uint32_t rtp_ts);
+
+/* M1：返回视频文件最终路径（首帧落盘后有效；NULL=无视频轨）。
+ * 必须在 rec_stop 之前调用 —— rec_stop 会 free sess。 */
+const char *rec_video_path(const rec_sess_t *s);
+
+/* M1：全局 rec_writer 线程（16 线程清单）—— recording_init/fini 调用 */
+int  rec_video_writer_start(void);
+void rec_video_writer_stop(void);
 
 /* 静音检测切段（VAD 长静是否停文件，策略由调用方决定） */
 int  rec_is_silence(const media_frame_t *frm, int threshold_dbov);

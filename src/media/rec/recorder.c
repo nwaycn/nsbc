@@ -13,6 +13,7 @@
 #include "recorder.h"
 #include "nsbc_common.h"
 #include "log.h"
+#include "mem.h"           /* mem_mpsc —— M1 rec_writer 全局队列 */
 #include "g711.h"          /* G.711 A-law/μ-law 查表解码 */
 
 #include <stdio.h>
@@ -53,6 +54,28 @@ struct rec_mgr {
     rec_stat_t     st;      /* OAM 计数：active/total/failed/bytes */
 };
 
+/* ---------- M1 视频轨：全局 rec_writer 线程 + per-sess 双 slot ---------- */
+
+#define REC_VIDEO_SLOTS      2
+#define REC_VIDEO_FRAME_MAX  (512 * 1024)   /* 与 vid_reasm 帧上限一致 */
+
+typedef struct rec_video_msg {
+    struct rec_sess *s;
+    int              slot;
+} rec_video_msg_t;
+
+typedef struct rec_video_slot {
+    uint8_t         *buf;
+    size_t           len;
+    uint32_t         ts;
+    _Atomic int      busy;   /* 0=free 1=在途（媒体线程填，writer 写完清零） */
+    rec_video_msg_t  msg;    /* 挂在 slot 上，push 进全局 MPSC 队列 */
+} rec_video_slot_t;
+
+static mem_mpsc_t *g_video_q;
+static pthread_t   g_video_thr;
+static _Atomic int g_video_run;
+
 /* ---------- rec_sess 扩展 ---------- */
 
 struct rec_sess {
@@ -80,6 +103,18 @@ struct rec_sess {
     char             raw_ext[8];
     uint64_t         raw_bytes;   /* 原始 payload 累计字节（独立计数，不污染 WAV 头） */
     pthread_mutex_t  lock;        /* 仅保护 segment close/open 和 fclose/rewind 等非线程安全 FILE* 操作 */
+    /* ---------- M1 视频轨（H.264 → mp4） ----------
+     * 数据流：media_bridge vid_reasm 完整帧 → rec_feed_video（memcpy 进 slot，
+     * 媒体线程零阻塞）→ 全局 rec_writer 线程 fwrite .h264 → stop 时 ffmpeg 合成。
+     * slot 数 2：一个在写、一个在填；writer 慢则丢帧（video_drops 计数）。 */
+    int              video_enabled;
+    char             video_path[REC_PATH_MAX]; /* <date_dir>/<callid>_<leg>.h264 */
+    FILE            *video_fp;      /* 仅 rec_writer 线程 open/write，rec_stop pending==0 后 close */
+    int              video_opened;  /* 首帧落盘后置 1（rec_video_path 依据） */
+    uint64_t         video_bytes;
+    uint64_t         video_drops;   /* slot 满 / 队列满 / 帧超限 丢弃计数 */
+    _Atomic int      video_pending; /* 在途帧数（媒体线程 ++，writer --，stop 等 0） */
+    struct rec_video_slot *video_slots;
 };
 
 /* ---------- segment helpers（在 lock 保护下调用） ---------- */
@@ -217,6 +252,145 @@ const rec_mgr_cfg_t *rec_mgr_get_cfg(rec_mgr_t *m)
     return m ? &m->cfg : NULL;
 }
 
+/* ---------- M1 视频轨：全局 rec_writer 线程 ---------- */
+
+static void *rec_video_writer_main(void *arg)
+{
+    (void)arg;
+    while (__atomic_load_n(&g_video_run, __ATOMIC_RELAXED)) {
+        rec_video_msg_t *m = NULL;
+        if (mem_mpsc_pop(g_video_q, (void **)&m) == NSBC_OK && m != NULL) {
+            rec_sess_t       *s    = m->s;
+            rec_video_slot_t *slot = &s->video_slots[m->slot];
+
+            /* 延迟 open .h264（首帧到达时；writer 线程独占，无需锁） */
+            if (s->video_fp == NULL && s->video_path[0] != '\0') {
+                s->video_fp = fopen(s->video_path, "wb");
+                if (s->video_fp != NULL) {
+                    (void)setvbuf(s->video_fp, NULL, _IOFBF, 256 * 1024);
+                    s->video_opened = 1;
+                    llog(LOG_INFO, "rec", "video_fp OPEN path=%s", s->video_path);
+                } else {
+                    llog(LOG_WARN, "rec",
+                         "video fopen FAIL path=%s errno=%d — video track lost",
+                         s->video_path, errno);
+                }
+            }
+            if (s->video_fp != NULL) {
+                if (fwrite(slot->buf, 1, slot->len, s->video_fp) == slot->len) {
+                    s->video_bytes += slot->len;
+                } else {
+                    llog(LOG_WARN, "rec",
+                         "video fwrite FAIL len=%zu errno=%d", slot->len, errno);
+                }
+            }
+            /* slot 归还 + pending--（rec_stop 等 pending==0 后才 close video_fp） */
+            __atomic_store_n(&slot->busy, 0, __ATOMIC_RELEASE);
+            __atomic_fetch_sub(&s->video_pending, 1, __ATOMIC_RELEASE);
+        } else {
+            usleep(1000);  /* 空转 1ms —— 专用写盘线程，不占 reactor */
+        }
+    }
+    return NULL;
+}
+
+int rec_video_writer_start(void)
+{
+    if (g_video_q != NULL) return NSBC_OK;  /* 幂等 */
+    g_video_q = mem_mpsc_create(1024, NULL);
+    if (g_video_q == NULL) return NSBC_NOMEM;
+    __atomic_store_n(&g_video_run, 1, __ATOMIC_RELEASE);
+    if (pthread_create(&g_video_thr, NULL, rec_video_writer_main, NULL) != 0) {
+        mem_mpsc_destroy(g_video_q);
+        g_video_q = NULL;
+        __atomic_store_n(&g_video_run, 0, __ATOMIC_RELEASE);
+        return NSBC_ERR;
+    }
+    llog(LOG_INFO, "rec", "rec_video_writer thread started (tid=%lu)",
+         (unsigned long)g_video_thr);
+    return NSBC_OK;
+}
+
+void rec_video_writer_stop(void)
+{
+    if (g_video_q == NULL) return;
+    __atomic_store_n(&g_video_run, 0, __ATOMIC_RELEASE);
+    pthread_join(g_video_thr, NULL);
+    mem_mpsc_destroy(g_video_q);
+    g_video_q = NULL;
+    llog(LOG_INFO, "rec", "rec_video_writer thread stopped");
+}
+
+/* ---------- M1 视频轨：媒体线程快路径 ---------- */
+
+int rec_feed_video(rec_sess_t *s, const uint8_t *annexb, size_t len,
+                   uint32_t rtp_ts)
+{
+    if (s == NULL || annexb == NULL || len == 0) return NSBC_INVAL;
+    /* ★ 关闭中快路径 —— rec_stop 已置 closing=1，立即返回 */
+    if (__atomic_load_n(&s->closing, __ATOMIC_RELAXED)) return NSBC_OK;
+    if (!s->video_enabled || g_video_q == NULL) return NSBC_OK;
+    if (s->state != REC_ST_RECORDING) return NSBC_OK;
+    if (len > REC_VIDEO_FRAME_MAX) {
+        ++s->video_drops;
+        return NSBC_OK;
+    }
+
+    /* 首帧惰性分配双 slot（一次性，之后热路径零 malloc） */
+    if (s->video_slots == NULL) {
+        rec_video_slot_t *slots =
+            (rec_video_slot_t *)calloc(REC_VIDEO_SLOTS, sizeof(*slots));
+        if (slots == NULL) return NSBC_NOMEM;
+        for (int i = 0; i < REC_VIDEO_SLOTS; ++i) {
+            slots[i].buf = (uint8_t *)malloc(REC_VIDEO_FRAME_MAX);
+            if (slots[i].buf == NULL) {
+                for (int j = 0; j < i; ++j) free(slots[j].buf);
+                free(slots);
+                return NSBC_NOMEM;
+            }
+            slots[i].msg.s    = s;
+            slots[i].msg.slot = i;
+        }
+        s->video_slots = slots;
+    }
+
+    /* 找空闲 slot（CAS 抢占；两 slot 全忙 → 丢帧，writer 落后于帧率时发生） */
+    rec_video_slot_t *slot = NULL;
+    for (int i = 0; i < REC_VIDEO_SLOTS; ++i) {
+        int expected = 0;
+        if (__atomic_compare_exchange_n(&s->video_slots[i].busy, &expected, 1,
+                                        0, __ATOMIC_ACQ_REL,
+                                        __ATOMIC_RELAXED)) {
+            slot = &s->video_slots[i];
+            break;
+        }
+    }
+    if (slot == NULL) {
+        ++s->video_drops;
+        return NSBC_OK;
+    }
+
+    memcpy(slot->buf, annexb, len);
+    slot->len = len;
+    slot->ts  = rtp_ts;
+
+    __atomic_fetch_add(&s->video_pending, 1, __ATOMIC_RELAXED);
+    if (mem_mpsc_push(g_video_q, &slot->msg) != NSBC_OK) {
+        /* 队列满（1024 in-flight）—— 丢帧回滚 */
+        __atomic_fetch_sub(&s->video_pending, 1, __ATOMIC_RELAXED);
+        __atomic_store_n(&slot->busy, 0, __ATOMIC_RELEASE);
+        ++s->video_drops;
+        return NSBC_OK;
+    }
+    return NSBC_OK;
+}
+
+const char *rec_video_path(const rec_sess_t *s)
+{
+    return (s != NULL && s->video_opened && s->video_path[0] != '\0')
+               ? s->video_path : NULL;
+}
+
 /* ---------- rec_open ---------- */
 
 int rec_open(rec_mgr_t *m, const rec_open_t *req, rec_sess_t **out)
@@ -248,6 +422,14 @@ int rec_open(rec_mgr_t *m, const rec_open_t *req, rec_sess_t **out)
     if (req->leg_mask & 1)      snprintf(s->leg_sfx, sizeof(s->leg_sfx), "a");
     else if (req->leg_mask & 2) snprintf(s->leg_sfx, sizeof(s->leg_sfx), "b");
     else                        snprintf(s->leg_sfx, sizeof(s->leg_sfx), "x");
+
+    /* M1 视频轨：leg=0 的 sess 启用 .h264 侧车文件（recording.c 侧 req.video=1）。
+     * 路径与音频同目录：<date_dir>/<callid>_<leg>.h264 —— 不分段（视频一个文件）。 */
+    if (req->video) {
+        s->video_enabled = 1;
+        snprintf(s->video_path, sizeof(s->video_path),
+                 "%s/%s_%s.h264", s->date_dir, req->callid, s->leg_sfx);
+    }
 
     /* 3. 找空�?seq 开当前 segment */
     for (int seq = 0; seq < REC_SEQ_MAX; ++seq) {
@@ -408,9 +590,25 @@ int rec_feed(rec_sess_t *s, int leg, const media_frame_t *frm)
 int rec_stop(rec_sess_t *s, char *path_out, size_t path_cap, uint64_t *bytes_out)
 {
     if (s == NULL) return NSBC_INVAL;
-    /* ★ 先置 closing=1 —— 媒体线程的 rec_feed/rec_feed_raw 快路径检测到后立即 return，
-     * 不会再进入 s->lock。从这一刻起 mutex 不会再被争用，可以安全 destroy。 */
+    /* ★ 先置 closing=1 —— 媒体线程的 rec_feed/rec_feed_raw/rec_feed_video 快路径
+     * 检测到后立即 return，不会再进入 s->lock。从这一刻起 mutex 不会再被争用。 */
     __atomic_store_n(&s->closing, 1, __ATOMIC_RELAXED);
+
+    /* M1 视频轨：等 rec_writer 线程把在途帧写完（pending 由媒体线程 ++，
+     * writer 写完 --）。writer 存活期间这里最多等帧间隔（~33ms）量级。 */
+    if (s->video_slots != NULL) {
+        int guard = 0;
+        while (__atomic_load_n(&s->video_pending, __ATOMIC_RELAXED) > 0) {
+            usleep(1000);
+            if (++guard > 5000) {  /* 5s 兜底：writer 卡死也不挂 stop 路径 */
+                llog(LOG_ERR, "rec",
+                     "video pending drain timeout=%d — force close (bytes may be truncated)",
+                     guard);
+                break;
+            }
+        }
+    }
+
     pthread_mutex_lock(&s->lock);
 
     int rc = segment_close_locked(s);
@@ -443,6 +641,26 @@ int rec_stop(rec_sess_t *s, char *path_out, size_t path_cap, uint64_t *bytes_out
             __atomic_fetch_add(&s->mgr->st.failed, 1, __ATOMIC_RELAXED);
         __atomic_fetch_add(&s->mgr->st.bytes_written, s->total_bytes, __ATOMIC_RELAXED);
     }
+
+    /* M1 视频轨收尾：pending 已 drain 到 0，writer 不再持有 s ——
+     * close .h264 + free 双 slot。无帧到达（video_fp==NULL）则直接跳过。 */
+    if (s->video_fp != NULL) {
+        fflush(s->video_fp);
+        fsync(fileno(s->video_fp));
+        fclose(s->video_fp);
+        s->video_fp = NULL;
+        llog(LOG_INFO, "rec",
+             "video_fp CLOSE path=%s bytes=%llu drops=%llu",
+             s->video_path, (unsigned long long)s->video_bytes,
+             (unsigned long long)s->video_drops);
+    }
+    if (s->video_slots != NULL) {
+        for (int i = 0; i < REC_VIDEO_SLOTS; ++i)
+            free(s->video_slots[i].buf);
+        free(s->video_slots);
+        s->video_slots = NULL;
+    }
+
     free(s);
     return rc;
 }

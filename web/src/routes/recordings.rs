@@ -199,7 +199,7 @@ async fn download_recording<C: CoreApi + Clone + 'static>(
         Some("wav")   => "audio/wav",
         Some("mp3")   => "audio/mpeg",
         Some("opus")  => "audio/ogg",
-        Some("mp4")   => "audio/mp4",
+        Some("mp4")   => "video/mp4",  /* M1: mp4 可含 H.264 视频轨；音频-only 同样兼容 */
         Some("g711a") | Some("g711u") | Some("pcm") | Some("raw") => "application/octet-stream",
         _             => "application/octet-stream",
     };
