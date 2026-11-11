@@ -4,10 +4,17 @@
  * 选中座席经 b2b 振铃，接起 cq_answered + agent_answer；挂机 cq_finish
  * → agent_release（WRAP）。等待音/MoH 走 player；溢出目标经 dialplan
  * 重新进入路由（IVR/VM/另一队列）。
- * 粗骨架：队列/等待者定槽数组线性扫描，锁与持久化在接线批补。
+ *
+ * 并发模型（P1 修复）：
+ *   cc_mgr_t 内部加 pthread_mutex_t cq_lock，保护 slots[]/wait[]/n_wait
+ *   等数组的并发读写（enqueue/dispatch/abandon/tick_overflow 可能被
+ *   多个 worker 线程同时调）。
+ *   加锁顺序：cq_lock → pool_lock（agent 函数内部持 pool_lock，
+ *   queue 函数调 agent 函数前已持 cq_lock），无反向依赖→不死锁。
  */
 #include "queue.h"
 #include "log.h"
+#include <pthread.h>
 #include <cjson/cJSON.h>   /* cJSON_Parse + cJSON_GetObjectItem + cJSON_ArrayForEach */
 
 /* 共享 stub_mods.c 同逻辑：json truthy helper（static inline，避免跨文件 linkage） */
@@ -33,6 +40,7 @@ struct cc_mgr {
     agent_pool_t *pool;
     cq_slot_t     slots[CQ_QUEUE_CAP];
     int           n;
+    pthread_mutex_t cq_lock;  /* P1 并发保护：所有公开入口持锁 */
 };
 
 int cq_create(agent_pool_t *pool, cc_mgr_t **out)
@@ -43,11 +51,15 @@ int cq_create(agent_pool_t *pool, cc_mgr_t **out)
     if (*out == NULL)
         return NSBC_NOMEM;
     (*out)->pool = pool;
+    pthread_mutex_init(&(*out)->cq_lock, NULL);  /* P1 */
     return NSBC_OK;
 }
 
 void cq_destroy(cc_mgr_t *m)
 {
+    if (m == NULL)
+        return;
+    pthread_mutex_destroy(&m->cq_lock);  /* P1 */
     free(m);
 }
 
@@ -72,30 +84,41 @@ int cq_add(cc_mgr_t *m, const cq_queue_t *q)
     if (m == NULL || q == NULL || q->name[0] == '\0' ||
         q->n_members <= 0 || q->n_members > CQ_MEMB_MAX)
         return NSBC_INVAL;
+    pthread_mutex_lock(&m->cq_lock);  /* P1 */
     s = slot_find(m, q->tenant, q->name);
     if (s != NULL) {
         s->q = *q;
+        pthread_mutex_unlock(&m->cq_lock);
         return NSBC_OK;
     }
-    if (m->n >= CQ_QUEUE_CAP)
+    if (m->n >= CQ_QUEUE_CAP) {
+        pthread_mutex_unlock(&m->cq_lock);
         return NSBC_NOSPC;
+    }
     m->slots[m->n].q = *q;
     ++m->n;
+    pthread_mutex_unlock(&m->cq_lock);
     return NSBC_OK;
 }
 
 int cq_remove(cc_mgr_t *m, const char *tenant, const char *name)
 {
     int i;
+    if (m == NULL) return NSBC_INVAL;
+    pthread_mutex_lock(&m->cq_lock);  /* P1 */
     for (i = 0; i < m->n; ++i) {
         if (strcmp(m->slots[i].q.tenant, tenant) == 0 &&
             strcmp(m->slots[i].q.name, name) == 0) {
-            if (m->slots[i].n_wait > 0)
+            if (m->slots[i].n_wait > 0) {
+                pthread_mutex_unlock(&m->cq_lock);
                 return NSBC_AGAIN;
+            }
             m->slots[i] = m->slots[--m->n];
+            pthread_mutex_unlock(&m->cq_lock);
             return NSBC_OK;
         }
     }
+    pthread_mutex_unlock(&m->cq_lock);
     return NSBC_NOENT;
 }
 
@@ -126,13 +149,19 @@ int cq_enqueue(cc_mgr_t *m, const char *tenant, const char *name,
     cq_slot_t *s;
     if (m == NULL || w.call_key == NULL)
         return NSBC_INVAL;
+    pthread_mutex_lock(&m->cq_lock);  /* P1 */
     s = slot_find(m, tenant, name);
-    if (s == NULL || !s->q.enabled)
+    if (s == NULL || !s->q.enabled) {
+        pthread_mutex_unlock(&m->cq_lock);
         return s == NULL ? NSBC_NOENT : NSBC_PERM_DENIED;
-    if (s->n_wait >= CQ_WAIT_MAX)
+    }
+    if (s->n_wait >= CQ_WAIT_MAX) {
+        pthread_mutex_unlock(&m->cq_lock);
         return NSBC_NOSPC;
+    }
     s->wait[s->n_wait++] = w;
     ++s->st.total_enqueued;
+    pthread_mutex_unlock(&m->cq_lock);
     return NSBC_OK;
 }
 
@@ -141,23 +170,31 @@ int cq_abandon(cc_mgr_t *m, void *call_key)
     int si, wi;
     if (m == NULL || call_key == NULL)
         return NSBC_INVAL;
+    pthread_mutex_lock(&m->cq_lock);  /* P1 */
     for (si = 0; si < m->n; ++si) {
         cq_slot_t *s = &m->slots[si];
         for (wi = 0; wi < s->n_wait; ++wi) {
             if (s->wait[wi].call_key == call_key) {
                 s->wait[wi] = s->wait[--s->n_wait];
                 ++s->st.total_abandoned;
+                pthread_mutex_unlock(&m->cq_lock);
                 return NSBC_OK;
             }
         }
     }
+    pthread_mutex_unlock(&m->cq_lock);
     return NSBC_NOENT;
 }
 
 int cq_waiting_count(cc_mgr_t *m, const char *tenant, const char *name)
 {
-    cq_slot_t *s = slot_find(m, tenant, name);
-    return s == NULL ? 0 : s->n_wait;
+    cq_slot_t *s;
+    if (m == NULL) return 0;
+    pthread_mutex_lock(&m->cq_lock);  /* P1 */
+    s = slot_find(m, tenant, name);
+    int n = s == NULL ? 0 : s->n_wait;
+    pthread_mutex_unlock(&m->cq_lock);
+    return n;
 }
 
 /* 收集技能匹配且 IDLE 的成员（粗骨架直接读 agent 快照，线程化后
@@ -198,15 +235,13 @@ int cq_dispatch(cc_mgr_t *m, const char *tenant, const char *name,
     if (m == NULL || out_ext == NULL || out_cap <= 0 || out_call_key == NULL)
         return NSBC_INVAL;
     (void)now_ms;
+    pthread_mutex_lock(&m->cq_lock);  /* P1: cq_lock → pool_lock（agent 函数内部） */
     s = slot_find(m, tenant, name);
-    if (s == NULL)
-        return NSBC_NOENT;
+    if (s == NULL) { pthread_mutex_unlock(&m->cq_lock); return NSBC_NOENT; }
     w = head_waiter(s);
-    if (w == NULL)
-        return 0;
+    if (w == NULL) { pthread_mutex_unlock(&m->cq_lock); return 0; }
     n = collect_idle(m, s, idle, CQ_MEMB_MAX);
-    if (n == 0)
-        return 0;
+    if (n == 0) { pthread_mutex_unlock(&m->cq_lock); return 0; }
     switch (s->q.strategy) {
     case CQ_STRATEGY_LEAST_RECENT:
         for (i = 1; i < n; ++i) {
@@ -233,12 +268,16 @@ int cq_dispatch(cc_mgr_t *m, const char *tenant, const char *name,
             (void)agent_reserve(m->pool, tenant, idle[i].ext, now_ms);
         }
         *out_call_key = w->call_key;
+        pthread_mutex_unlock(&m->cq_lock);
         return lim;
     }
     pick_ext(&idle[pick], out_ext, 0);
-    if (agent_reserve(m->pool, tenant, idle[pick].ext, now_ms) != NSBC_OK)
+    if (agent_reserve(m->pool, tenant, idle[pick].ext, now_ms) != NSBC_OK) {
+        pthread_mutex_unlock(&m->cq_lock);
         return 0;
+    }
     *out_call_key = w->call_key;
+    pthread_mutex_unlock(&m->cq_lock);
     return 1;
 }
 
@@ -260,16 +299,16 @@ int cq_answered(cc_mgr_t *m, const char *tenant, const char *name,
     cq_slot_t *s;
     cq_waiter_t *w;
     uint64_t waited;
-    if (m == NULL)
-        return NSBC_INVAL;
+    if (m == NULL) return NSBC_INVAL;
+    pthread_mutex_lock(&m->cq_lock);  /* P1 */
     s = slot_find(m, tenant, name);
-    if (s == NULL)
-        return NSBC_NOENT;
-    if (agent_answer(m->pool, tenant, ext, answered_ms) != NSBC_OK)
+    if (s == NULL) { pthread_mutex_unlock(&m->cq_lock); return NSBC_NOENT; }
+    if (agent_answer(m->pool, tenant, ext, answered_ms) != NSBC_OK) {
+        pthread_mutex_unlock(&m->cq_lock);
         return NSBC_PROTO;
+    }
     w = head_waiter(s);
-    if (w == NULL)
-        return NSBC_NOENT;
+    if (w == NULL) { pthread_mutex_unlock(&m->cq_lock); return NSBC_NOENT; }
     waited = answered_ms - w->enqueue_ms;
     w->connect_ms = answered_ms;
     ++s->st.total_answered;
@@ -278,16 +317,21 @@ int cq_answered(cc_mgr_t *m, const char *tenant, const char *name,
     if (sla_s > 0 && waited <= (uint64_t)sla_s * 1000u)
         ++s->st.answered_within_sla;
     (void)waiter_remove(s, w->call_key);
+    pthread_mutex_unlock(&m->cq_lock);
     return NSBC_OK;
 }
 
 int cq_finish(cc_mgr_t *m, const char *tenant, const char *name,
               const char *ext, uint64_t now_ms)
 {
-    const cq_slot_t *s = slot_find(m, tenant, name);
-    if (s == NULL)
-        return NSBC_NOENT;
-    return agent_release(m->pool, tenant, ext, now_ms, s->q.wrap_time_s);
+    const cq_slot_t *s;
+    if (m == NULL) return NSBC_INVAL;
+    pthread_mutex_lock(&m->cq_lock);  /* P1: 读 wrap_time_s 需要锁保护 */
+    s = slot_find(m, tenant, name);
+    if (s == NULL) { pthread_mutex_unlock(&m->cq_lock); return NSBC_NOENT; }
+    int wrap_s = s->q.wrap_time_s;
+    pthread_mutex_unlock(&m->cq_lock);
+    return agent_release(m->pool, tenant, ext, now_ms, wrap_s);
 }
 
 int cq_tick_overflow(cc_mgr_t *m, const char *tenant, const char *name,
@@ -295,11 +339,13 @@ int cq_tick_overflow(cc_mgr_t *m, const char *tenant, const char *name,
 {
     cq_slot_t *s;
     int i, moved = 0;
-    if (m == NULL)
-        return NSBC_INVAL;
+    if (m == NULL) return NSBC_INVAL;
+    pthread_mutex_lock(&m->cq_lock);  /* P1 */
     s = slot_find(m, tenant, name);
-    if (s == NULL || s->q.max_wait_s <= 0)
+    if (s == NULL || s->q.max_wait_s <= 0) {
+        pthread_mutex_unlock(&m->cq_lock);
         return s == NULL ? NSBC_NOENT : 0;
+    }
     /* 倒序压缩：超时者交溢出（目标路由由组合根执行，这里只移除） */
     for (i = s->n_wait - 1; i >= 0; --i) {
         if (now_ms - s->wait[i].enqueue_ms >=
@@ -309,6 +355,7 @@ int cq_tick_overflow(cc_mgr_t *m, const char *tenant, const char *name,
             ++moved;
         }
     }
+    pthread_mutex_unlock(&m->cq_lock);
     return moved;
 }
 
@@ -389,6 +436,7 @@ int queue_table_reload_json(const char *json, char *out_err, size_t err_sz)
         return NSBC_INVAL;
     }
     cc_mgr_t *m = (cc_mgr_t *)ctx->cq_mgr;
+    pthread_mutex_lock(&m->cq_lock);  /* P1: 整表 reload 持 cq_lock */
     /* 两阶段：先清旧槽（直接置 n=0，caller 确保没 waiter），再逐个 cq_add */
     m->n = 0;
     int idx = 0;
@@ -406,6 +454,7 @@ int queue_table_reload_json(const char *json, char *out_err, size_t err_sz)
         if (!j || !cJSON_IsString(j) || !j->valuestring[0]) {
             snprintf(out_err, err_sz, "item[%d] missing name", idx);
             cJSON_Delete(root);
+            pthread_mutex_unlock(&m->cq_lock);  /* P1: 错误路径也要解锁 */
             return -1;
         }
         snprintf(q.name, sizeof(q.name), "%s", j->valuestring);
@@ -445,6 +494,7 @@ int queue_table_reload_json(const char *json, char *out_err, size_t err_sz)
         ++idx;
     }
     cJSON_Delete(root);
+    pthread_mutex_unlock(&m->cq_lock);  /* P1 */
     llog(LOG_INFO, "queue", "reload: loaded %d queues (cap=%d)", idx, CQ_QUEUE_CAP);
     return NSBC_OK;
 }

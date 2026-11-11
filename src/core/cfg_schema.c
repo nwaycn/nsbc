@@ -143,8 +143,11 @@ static const cfg_desc_t k_core[] = {
     /* FS max-registrations-per-extension: 0=不限；>0=每个分机号最多 N 个同时注册 */
     {"registrar.max_registrations_per_ext", CGT_INT, CGF_HOT, "0", NULL, 0, 1024},
     /* ★ 调试开关：1=跳过所有 auth + fence 检查，REGISTER 直接 200 OK
-     * 排查 UDP conntrack 丢包 / auth 重试风暴用。排完必须改回 0！生产环境绝不能开。 */
-    {"registrar.force_register_ok", CGT_INT, CGF_HOT, "1", NULL, 0, 1},
+     * 排查 UDP conntrack 丢包 / auth 重试风暴用。排完必须改回 0！生产环境绝不能开。
+     *
+     * 安全：默认值必须是 0（关闭）。任何部署漏配 YAML 时不应自动跳过
+     * digest auth / security fence / ha1 user-exists 三项核心安全检查。 */
+    {"registrar.force_register_ok", CGT_INT, CGF_HOT, "0", NULL, 0, 1},
     /* NAT 场景强制短 expires：0=不强制；>0=检测到 NAT 时 exp 压到 min(exp, val)。
      * 默认 120s=2min → 客户端每 60s 刷新 REGISTER（expires/2），
      * 远快于家用 NAT UDP conntrack 300s 超时 → 保持 NAT 映射活跃。

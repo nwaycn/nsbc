@@ -2,6 +2,7 @@
 #include "mem.h"
 
 #include <pthread.h>
+#include <stdatomic.h>   /* P1: _Atomic */
 #include "nsbc_atomic.h"
 
 #define N_EPOCHS 3
@@ -26,6 +27,8 @@ struct mem_rcu {
     mem_rcu_reader_t *readers;
     uint64_t nretired;
     uint64_t nreclaimed;
+    _Atomic int destroyed;           /* P1: 销毁标记 — 1=thread_join 拒绝，thread_leave 跳过链表操作 */
+    _Atomic int refcount;            /* P1: 引用计数 — 初始 1(destroy 方持)，join+1，destroy-1，leave-1，到 0 才 free r */
 };
 
 mem_rcu_t *mem_rcu_create(void)
@@ -38,6 +41,9 @@ mem_rcu_t *mem_rcu_create(void)
         return NULL;
     }
     r->epoch = (0);
+    /* P1: 初始化引用计数 = 1（destroy 方持有）
+     * 初始 destroyed=0 — calloc 已清零 */
+    atomic_init(&r->refcount, 1);
     return r;
 }
 
@@ -58,18 +64,30 @@ void mem_rcu_destroy(mem_rcu_t *r)
 {
     if (!r)
         return;
-    /* 停机强制释放：调用契约要求此时所有读者线程已退出临界区 */
+    /* P1: 先置 destroyed=1 + 释放 limbo 链表 —
+     * 让未退出的 reader 线程 thread_leave 跳过对 r->lock / r->readers 的访问 */
+    atomic_store(&r->destroyed, 1);
     pthread_mutex_lock(&r->lock);
     for (int i = 0; i < N_EPOCHS; i++)
         free_list(r, &r->limbo[i]);
     pthread_mutex_unlock(&r->lock);
-    pthread_mutex_destroy(&r->lock);
-    free(r);
+
+    /* P1: 释放 destroy 方自己持有的引用 */
+    int rc = atomic_fetch_sub(&r->refcount, 1);
+    if (rc == 1) {
+        /* 引用计数归零 — 没有未退出的 reader 线程 */
+        pthread_mutex_destroy(&r->lock);
+        free(r);
+    }
+    /* else: 还有 reader 线程持有 refcount，等最后一个 thread_leave 来 free */
 }
 
 mem_rcu_reader_t *mem_rcu_thread_join(mem_rcu_t *r)
 {
     if (!r)
+        return NULL;
+    /* P1: 如果已经 destroyed，拒绝新 reader 加入 */
+    if (atomic_load(&r->destroyed))
         return NULL;
     mem_rcu_reader_t *rd =
         (mem_rcu_reader_t *)calloc(1, sizeof(*rd));
@@ -77,6 +95,9 @@ mem_rcu_reader_t *mem_rcu_thread_join(mem_rcu_t *r)
         return NULL;
     rd->state = (0);
     rd->rcu = r;
+
+    /* P1: 持有一个引用 */
+    atomic_fetch_add(&r->refcount, 1);
 
     pthread_mutex_lock(&r->lock);
     rd->gnext = r->readers;
@@ -90,14 +111,31 @@ void mem_rcu_thread_leave(mem_rcu_reader_t *rd)
     if (!rd)
         return;
     mem_rcu_t *r = rd->rcu;
-    pthread_mutex_lock(&r->lock);
-    mem_rcu_reader_t **pp = &r->readers;
-    while (*pp && *pp != rd)
-        pp = &(*pp)->gnext;
-    if (*pp)
-        *pp = rd->gnext;
-    pthread_mutex_unlock(&r->lock);
+
+    /* P1: 只有 r 没被 destroyed 时才安全访问 r->lock / r->readers。
+     * destroyed=1 时 destroy 方可能已经释放了 limbo，但 refcount>0 时 r 本身
+     * 还活着（不会 free），所以读 destroyed 是安全的。 */
+    if (r != NULL && !atomic_load(&r->destroyed)) {
+        pthread_mutex_lock(&r->lock);
+        mem_rcu_reader_t **pp = &r->readers;
+        while (*pp && *pp != rd)
+            pp = &(*pp)->gnext;
+        if (*pp)
+            *pp = rd->gnext;
+        pthread_mutex_unlock(&r->lock);
+    }
+    /* destroyed=1: 跳过链表摘除（destroy 方可能已经在处理/整个 readers 不重要了） */
+
     free(rd);
+
+    /* P1: 释放自己的引用 — 如果是最后一个引用，free r */
+    if (r != NULL) {
+        int rc = atomic_fetch_sub(&r->refcount, 1);
+        if (rc == 1) {
+            pthread_mutex_destroy(&r->lock);
+            free(r);
+        }
+    }
 }
 
 void mem_rcu_read_lock(mem_rcu_reader_t *rd)

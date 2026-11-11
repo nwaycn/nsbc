@@ -785,13 +785,16 @@ static void *ws_accept_thread(void *ud)
                     unsigned long err = ERR_get_error();
                     char err_buf[256];
                     ERR_error_string_n(err, err_buf, sizeof(err_buf));
-                    llog(LOG_INFO, "ws", "TLS handshake fail (timeout/slowloris): err=%ld %s — fallback to plain WS", err, err_buf);
-                    /* REQ-ARCH-FALLBACK-001：TLS 失败时不关 fd — 浏览器可能自签证书拒签后自动 fallback 到 WS，
-                     * 或者用户本来就想连 ws://。清理 ssl/rbio 后继续当非 TLS 连接处理。
-                     * worker 里所有 SSL 操作都有 if(c->ssl) 判空保护，ssl=NULL 时自动走 recv/send 路径。 */
-                    SSL_free(ssl); ssl = NULL;   /* SSL_free 会连带 free BIO */
+                    llog(LOG_WARN, "ws",
+                         "TLS handshake fail: err=%ld %s — dropping peer (no plain fallback)",
+                         err, err_buf);
+                    /* 安全修复 P0-3：TLS 失败直接 close(fd)，**禁止 fallback 到明文 WS**。
+                     * REQ-ARCH-FALLBACK-001 设计原则：一旦启用 TLS，就不能降级到明文——
+                     * 攻击者 MITM 劫持自签证书拒签的浏览器时，降级明文 = 全部流量裸奔。 */
+                    SSL_free(ssl); ssl = NULL;   /* SSL_free 连带 free BIO */
                     rbio = NULL;
-                    /* 不 close(fd)，不 continue — 让它当纯 WS 连接继续走下面流程 */
+                    close(fd);
+                    continue;                    /* 跳过当前 peer，下一轮 accept */
                 } else {
                     /* TLS 成功后取消 SO_RCVTIMEO */
                     tv.tv_sec = 0; tv.tv_usec = 0;

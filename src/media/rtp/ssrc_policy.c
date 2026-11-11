@@ -76,6 +76,7 @@ static src_entry_t *alloc_entry(ssrc_policy_t *p, uint32_t ssrc,
 
 void ssrc_policy_admit(ssrc_policy_t *p, uint32_t ssrc, int aux)
 {
+    SSRC_LOCK(p);  /* P1: 并发保护 — SIP 线程 call ↔ reactor on_rtp */
     src_entry_t *e = find(p, ssrc);
     if (!e)
         e = alloc_entry(p, ssrc, 0);
@@ -93,6 +94,7 @@ void ssrc_policy_admit(ssrc_policy_t *p, uint32_t ssrc, int aux)
             p->learned_primary = 1;
         }
     }
+    SSRC_UNLOCK(p);
 }
 
 void ssrc_policy_set_aux_pt(ssrc_policy_t *p, uint8_t pt)
@@ -128,9 +130,12 @@ void ssrc_policy_set_local(ssrc_policy_t *p, uint32_t local_ssrc)
 src_decision_t ssrc_policy_on_rtp(ssrc_policy_t *p, uint32_t ssrc,
                                   uint8_t pt, uint64_t now_ms)
 {
+    SSRC_LOCK(p);  /* P1: 并发保护 — SIP 线程 admit ↔ reactor RTP 回调 */
+
     /* RFC3550 §8.2 collision */
     if (ssrc == p->cfg.local_ssrc && ssrc != 0) {
         ++p->collision_drops;
+        SSRC_UNLOCK(p);
         return SRC_DEC_DROP;
     }
 
@@ -142,8 +147,10 @@ src_decision_t ssrc_policy_on_rtp(ssrc_policy_t *p, uint32_t ssrc,
         e->last_ms = now_ms;
         if (aux_pt)
             e->aux = 1;
-        return e->primary ? SRC_DEC_PRIMARY
+        src_decision_t dec = e->primary ? SRC_DEC_PRIMARY
                           : (e->aux ? SRC_DEC_AUX : SRC_DEC_DROP);
+        SSRC_UNLOCK(p);
+        return dec;
     }
 
     /* 全新 SSRC */
@@ -151,9 +158,11 @@ src_decision_t ssrc_policy_on_rtp(ssrc_policy_t *p, uint32_t ssrc,
         e = alloc_entry(p, ssrc, now_ms);
         if (e) {
             e->aux = 1;
+            SSRC_UNLOCK(p);
             return SRC_DEC_AUX;
         }
         ++p->inject_drops;
+        SSRC_UNLOCK(p);
         return SRC_DEC_DROP;
     }
 
@@ -161,10 +170,12 @@ src_decision_t ssrc_policy_on_rtp(ssrc_policy_t *p, uint32_t ssrc,
         e = alloc_entry(p, ssrc, now_ms);
         if (!e) {
             ++p->inject_drops;
+            SSRC_UNLOCK(p);
             return SRC_DEC_DROP;
         }
         e->primary = 1;
         p->learned_primary = 1;
+        SSRC_UNLOCK(p);
         return SRC_DEC_PRIMARY;
     }
 
@@ -183,9 +194,11 @@ src_decision_t ssrc_policy_on_rtp(ssrc_policy_t *p, uint32_t ssrc,
         e = alloc_entry(p, ssrc, now_ms);
         if (e) {
             e->primary = 1;
+            SSRC_UNLOCK(p);
             return SRC_DEC_PRIMARY;
         }
         ++p->inject_drops;
+        SSRC_UNLOCK(p);
         return SRC_DEC_DROP;
     }
 
@@ -199,32 +212,39 @@ src_decision_t ssrc_policy_on_rtp(ssrc_policy_t *p, uint32_t ssrc,
         e = alloc_entry(p, ssrc, now_ms);
         if (!e) {
             ++p->inject_drops;
+            SSRC_UNLOCK(p);
             return SRC_DEC_DROP;
         }
         e->primary = 1;
         ++p->switches;
+        SSRC_UNLOCK(p);
         return SRC_DEC_NEW_PRIMARY;
     }
 
     ++p->inject_drops;
+    SSRC_UNLOCK(p);
     return SRC_DEC_DROP;
 }
 
 int ssrc_policy_on_cname(ssrc_policy_t *p, uint32_t ssrc, const char *cname,
                          size_t clen, uint64_t now_ms)
 {
+    SSRC_LOCK(p);  /* P1: 并发保护 */
     if (clen >= SSRC_CNAME_MAX)
         clen = SSRC_CNAME_MAX - 1;
     src_entry_t *e = find(p, ssrc);
     if (!e) {
         /* RTCP 先到：预登记，等 RTP 学习时核对 */
         e = alloc_entry(p, ssrc, now_ms);
-        if (!e)
+        if (!e) {
+            SSRC_UNLOCK(p);
             return 0;
+        }
     }
     if (e->cname_set && (strlen(e->cname) != clen ||
                          memcmp(e->cname, cname, clen))) {
         ++p->cname_drops;
+        SSRC_UNLOCK(p);
         return 0;
     }
     if (!e->cname_set) {
@@ -232,6 +252,7 @@ int ssrc_policy_on_cname(ssrc_policy_t *p, uint32_t ssrc, const char *cname,
         e->cname[clen] = '\0';
         e->cname_set = 1;
     }
+    SSRC_UNLOCK(p);
     return 1;
 }
 

@@ -6,8 +6,15 @@
  *  - 窗口为"自首呼起 1h 固定窗"，非滑动窗（按 win_start 滚动清零）；
  *  - P1 的 ASR/短通话只在 call_end 累积，自动封禁动作未实装（转人工
  *    审计/事件上报），仅做阈值置位。
+ *
+ * 并发模型（P1 修复）：
+ *  - fraud_guard_t 内部加 pthread_rwlock_t；
+ *  - 所有公开入口持写锁（subj_get 可能写 n_subs，用读锁会遗漏并发创建）；
+ *  - fraud_rule_add/remove 有独立保护（任务要求不动）。
  */
 #include "fraud.h"
+
+#include <pthread.h>
 
 typedef struct {
     int used;
@@ -25,6 +32,7 @@ struct fraud_guard {
     int n_rules;
     subj_slot_t subs[FRAUD_SUBJ_CAP];
     int n_subs;
+    pthread_rwlock_t rwlock;  /* P1 并发保护：所有公开入口持写锁（subj_get 会写 n_subs） */
 };
 
 int fraud_create(fraud_guard_t **out)
@@ -32,11 +40,19 @@ int fraud_create(fraud_guard_t **out)
     if (out == NULL)
         return NSBC_INVAL;
     *out = (fraud_guard_t *)calloc(1, sizeof(fraud_guard_t));
-    return *out != NULL ? NSBC_OK : NSBC_NOMEM;
+    if (*out == NULL)
+        return NSBC_NOMEM;
+    /* P1：初始化读写锁 */
+    pthread_rwlock_init(&(*out)->rwlock, NULL);
+    return NSBC_OK;
 }
 
 void fraud_destroy(fraud_guard_t *g)
 {
+    if (g == NULL)
+        return;
+    /* P1：销毁读写锁 */
+    pthread_rwlock_destroy(&g->rwlock);
     free(g);
 }
 
@@ -130,9 +146,12 @@ int fraud_check(fraud_guard_t *g, const char *key, const char *called,
     int i;
     if (g == NULL || key == NULL || called == NULL)
         return NSBC_INVAL;
+    pthread_rwlock_wrlock(&g->rwlock);  /* P1: 写锁 — subj_get 可能写 n_subs */
     s = subj_get(g, key);
-    if (s == NULL)
+    if (s == NULL) {
+        pthread_rwlock_unlock(&g->rwlock);
         return NSBC_NOSPC;
+    }
     roll_window(&s->c, now_ms);
     for (i = 0; i < g->n_rules; ++i) {
         const fraud_rule_t *r;
@@ -177,6 +196,7 @@ int fraud_check(fraud_guard_t *g, const char *key, const char *called,
         denied = 1;
     if (hit_action != NULL)
         *hit_action = denied ? FRAUD_ACT_DENY : FRAUD_ACT_ALLOW;
+    pthread_rwlock_unlock(&g->rwlock);
     return denied ? NSBC_PERM_DENIED : NSBC_OK;
 }
 
@@ -185,12 +205,16 @@ void fraud_call_begin(fraud_guard_t *g, const char *key, uint64_t now_ms)
     subj_slot_t *s;
     if (g == NULL || key == NULL)
         return;
+    pthread_rwlock_wrlock(&g->rwlock);  /* P1: 写锁 */
     s = subj_get(g, key);
-    if (s == NULL)
+    if (s == NULL) {
+        pthread_rwlock_unlock(&g->rwlock);
         return;
+    }
     roll_window(&s->c, now_ms);
     ++s->c.concurrent;
     ++s->c.calls_in_win;
+    pthread_rwlock_unlock(&g->rwlock);
 }
 
 void fraud_call_end(fraud_guard_t *g, const char *key, int answered,
@@ -200,9 +224,12 @@ void fraud_call_end(fraud_guard_t *g, const char *key, int answered,
     subj_slot_t *s;
     if (g == NULL || key == NULL)
         return;
+    pthread_rwlock_wrlock(&g->rwlock);  /* P1: 写锁 */
     s = subj_get(g, key);
-    if (s == NULL)
+    if (s == NULL) {
+        pthread_rwlock_unlock(&g->rwlock);
         return;
+    }
     if (s->c.day_epoch != today_epoch) {
         s->c.day_epoch = today_epoch;
         s->c.spend_today_uc = 0;
@@ -214,6 +241,7 @@ void fraud_call_end(fraud_guard_t *g, const char *key, int answered,
     if (answered && billsec < 10)
         ++s->c.short_in_win;
     s->c.spend_today_uc += spend_uc;
+    pthread_rwlock_unlock(&g->rwlock);
     (void)now_ms;
     /* TODO(P1)：ASR/短通话阈值命中→事件上报+自动 WATCH/DENY */
 }
@@ -224,12 +252,15 @@ int fraud_counters(fraud_guard_t *g, const char *key,
     int i;
     if (g == NULL || key == NULL || out == NULL)
         return NSBC_INVAL;
+    pthread_rwlock_rdlock(&g->rwlock);  /* P1: 读锁 — 纯读 */
     for (i = 0; i < g->n_subs; ++i) {
         if (g->subs[i].used && strcmp(g->subs[i].c.key, key) == 0) {
             *out = g->subs[i].c;
+            pthread_rwlock_unlock(&g->rwlock);
             return NSBC_OK;
         }
     }
+    pthread_rwlock_unlock(&g->rwlock);
     return NSBC_NOENT;
 }
 

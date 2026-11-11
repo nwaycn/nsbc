@@ -648,12 +648,51 @@ static void dispatch_frame(const uint8_t *frame, size_t len)
 }
 
 /* datagram 收帧 —— 天然一帧一 recv，分片帧在 dispatch_frame 里累积/完成。
- * recv 返回 0 或 errno=ECONNREFUSED 表示对端路径不存在（Rust 端还没 bind 好）。
- * 其他错误返回 -1 → 上层 reconnect。每次收完帧检查分片超时。 */
+ * recvmsg 替代 recv：用 SCM_CREDENTIALS 拿 peer uid，非 root 发来的 datagram
+ * 直接丢弃（安全修复 P0-5）。Linux ≥ 2.6.8 支持，Ubuntu 22.04 肯定可用。
+ * 内核不支持时（CMSG_FIRSTHDR 返回 NULL）退回到"仅本机可达"信任模型。 */
 static int recv_cmd_once(void)
 {
     uint8_t frame[NSBC_MAX_FRAME];
-    ssize_t n = recv(g.fd_cmd, frame, sizeof(frame), 0);
+
+    /* 安全修复 P0-5：用 recvmsg 拿 peer uid */
+    struct iovec iov = { .iov_base = frame, .iov_len = sizeof(frame) };
+    char ctrl[CMSG_SPACE(sizeof(struct ucred))];
+    struct msghdr msg = {
+        .msg_iov        = &iov,
+        .msg_iovlen     = 1,
+        .msg_control    = ctrl,
+        .msg_controllen = sizeof(ctrl),
+    };
+    ssize_t n = recvmsg(g.fd_cmd, &msg, 0);
+
+    /* 内核不支持 SCM_CREDENTIALS 时跳过校验 */
+    if (n > 0) {
+        struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+        int uid_ok = 1;  /* 无 cmsg = 内核不支持 = 信任（退避） */
+        uid_t peer_uid = (uid_t)-1;
+        while (cmsg) {
+            if (cmsg->cmsg_level == SOL_SOCKET &&
+                cmsg->cmsg_type  == SCM_CREDENTIALS) {
+                struct ucred *uc = (struct ucred *)CMSG_DATA(cmsg);
+                peer_uid = uc->uid;
+                if (peer_uid != 0) {
+                    uid_ok = 0;
+                    llog(LOG_WARN, "uds",
+                         "drop datagram from non-root uid=%u "
+                         "(CMD_REQ requires peer uid=0)",
+                         (unsigned)peer_uid);
+                }
+                break;  /* 只取第一个 SCM_CREDENTIALS */
+            }
+            cmsg = CMSG_NXTHDR(&msg, cmsg);
+        }
+        if (!uid_ok) {
+            frag_check_timeout();
+            return 0;  /* 丢弃这帧，不触发上层重连 */
+        }
+    }
+
     frag_check_timeout();  /* 每次收前先检查上一个分片是否超时 */
     if (n > 0) {
         g.last_recv_ms = nsbc_now_ms();

@@ -7,7 +7,22 @@
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#include "tls_io.h"
+#include "log.h"                 /* 安全修复 P0-6：统一 llog 宏，禁止 fprintf(stderr) */
 #include "openssl_compat.h"   /* 版本兼容层（自动 include err.h/ssl.h/evp.h）*/
+
+/* 安全修复 P0-6：统一的 OpenSSL 错误栈日志 helper。
+ * 原来代码用 ERR_print_errors_fp(stderr) — 绕过 llog 体系直接写 stderr，
+ * 生产环境 stderr 被收集到日志系统 = 密钥路径泄漏 + 日志量爆炸。
+ * 现在用 ERR_error_string_n 取到本地 buffer 再 llog。 */
+static void tls_log_openssl_err(const char *where)
+{
+    unsigned long e = ERR_get_error();
+    if (e == 0) return;
+    char buf[256];
+    ERR_error_string_n(e, buf, sizeof(buf));
+    llog(LOG_ERR, "tls", "openssl err at %s: code=%lu %s", where, e, buf);
+}
 
 struct tls_ctx {
     SSL_CTX *ssl;
@@ -26,29 +41,35 @@ tls_ctx_t *tls_ctx_server_new(const tls_cfg_t *cfg)
         return NULL;
 
     /* ---------- 前置检查：文件可读 + errno ---------- */
-    fprintf(stderr, "[tls] cert=%s  key=%s\n",
-            cfg->cert_pem ? cfg->cert_pem : "(null)",
-            cfg->key_pem  ? cfg->key_pem  : "(null)");
+    /* 安全修复 P0-6：入口 cfg 信息打 DEBUG，**私钥路径必须 REDACTED**。
+     * 之前用 fprintf(stderr) 直接输出 key_pem 完整路径——任何 stderr 被
+     * 收集到日志系统 = 密钥路径泄漏。 */
+    {
+        const char *cert = cfg->cert_pem ? cfg->cert_pem : "(null)";
+        llog(LOG_DEBUG, "tls", "cfg: cert=%s key=<REDACTED> min_tls=%d",
+             cert, cfg->min_tls12 ? 12 : 13);
+    }
     if (!cfg->cert_pem || !cfg->cert_pem[0]) {
-        fprintf(stderr, "[tls] cert_pem is empty\n");
+        llog(LOG_ERR, "tls", "cert_pem is empty");
         goto fail;
     }
     cert_fp = fopen(cfg->cert_pem, "rb");
     if (!cert_fp) {
-        fprintf(stderr, "[tls] failed to read certificate: %s (errno=%d: %s)\n",
-                cfg->cert_pem, errno, strerror(errno));
+        llog(LOG_ERR, "tls", "failed to read certificate: %s (errno=%d: %s)",
+             cfg->cert_pem, errno, strerror(errno));
         goto fail;
     }
     fclose(cert_fp); cert_fp = NULL;
 
     if (!cfg->key_pem || !cfg->key_pem[0]) {
-        fprintf(stderr, "[tls] key_pem is empty\n");
+        llog(LOG_ERR, "tls", "key_pem is empty");
         goto fail;
     }
     key_fp = fopen(cfg->key_pem, "rb");
     if (!key_fp) {
-        fprintf(stderr, "[tls] failed to read private key: %s (errno=%d: %s)\n",
-                cfg->key_pem, errno, strerror(errno));
+        /* 注意：不打印 cfg->key_pem 完整路径，只打 errno——路径已知是私钥文件 */
+        llog(LOG_ERR, "tls", "failed to read private key: errno=%d (%s)",
+             errno, strerror(errno));
         goto fail;
     }
     fclose(key_fp); key_fp = NULL;
@@ -59,8 +80,8 @@ tls_ctx_t *tls_ctx_server_new(const tls_cfg_t *cfg)
     /* ---------- OpenSSL TLS 上下文 ---------- */
     c->ssl = SSL_CTX_new(TLS_server_method());
     if (!c->ssl) {
-        fprintf(stderr, "[tls] SSL_CTX_new failed\n");
-        ERR_print_errors_fp(stderr);
+        llog(LOG_ERR, "tls", "SSL_CTX_new failed");
+        tls_log_openssl_err("SSL_CTX_new");
         goto fail;
     }
     /* 优先 TLS 1.3（RFC 8446），按 REQ-SIP-TCP-003 允许 1.2 回退 */
@@ -99,20 +120,22 @@ tls_ctx_t *tls_ctx_server_new(const tls_cfg_t *cfg)
     SSL_CTX_set_options(c->ssl, SSL_OP_NO_COMPRESSION | SSL_OP_SINGLE_DH_USE);
 
     if (SSL_CTX_use_certificate_chain_file(c->ssl, cfg->cert_pem) != 1) {
-        fprintf(stderr, "[tls] SSL_CTX_use_certificate_chain_file failed\n");
-        ERR_print_errors_fp(stderr);
+        llog(LOG_ERR, "tls", "SSL_CTX_use_certificate_chain_file failed (cert=%s)",
+             cfg->cert_pem ? cfg->cert_pem : "(null)");
+        tls_log_openssl_err("SSL_CTX_use_certificate_chain_file");
         goto fail_ssl;
     }
     if (SSL_CTX_use_PrivateKey_file(c->ssl, cfg->key_pem,
                                     SSL_FILETYPE_PEM) != 1) {
-        fprintf(stderr, "[tls] SSL_CTX_use_PrivateKey_file failed\n");
-        ERR_print_errors_fp(stderr);
+        /* 安全：不打印 cfg->key_pem 完整路径——这是私钥文件 */
+        llog(LOG_ERR, "tls", "SSL_CTX_use_PrivateKey_file failed");
+        tls_log_openssl_err("SSL_CTX_use_PrivateKey_file");
         goto fail_ssl;
     }
     /* 证书-私钥配对校验：防止证书/私钥来自不同对 */
     if (!SSL_CTX_check_private_key(c->ssl)) {
-        fprintf(stderr, "[tls] certificate does not match private key (check_private_key failed)\n");
-        ERR_print_errors_fp(stderr);
+        llog(LOG_ERR, "tls", "certificate does not match private key");
+        tls_log_openssl_err("SSL_CTX_check_private_key");
         goto fail_ssl;
     }
 
@@ -124,9 +147,10 @@ tls_ctx_t *tls_ctx_server_new(const tls_cfg_t *cfg)
                 : SSL_VERIFY_PEER,
             NULL);
     }
-    fprintf(stderr, "[tls] OK cert=%s key=%s min_tls=%d\n",
-            cfg->cert_pem, cfg->key_pem,
-            cfg->min_tls12 ? 12 : 13);
+    /* 安全修复 P0-6：OK 日志打 DEBUG，**私钥路径 REDACTED**。 */
+    llog(LOG_DEBUG, "tls", "ctx ready: cert=%s key=<REDACTED> min_tls=%d",
+         cfg->cert_pem ? cfg->cert_pem : "(null)",
+         cfg->min_tls12 ? 12 : 13);
     return c;
 fail_ssl:
     SSL_CTX_free(c->ssl);

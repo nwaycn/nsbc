@@ -530,8 +530,13 @@ int dtls_ice_handle_stun(dtls_server_t *d, const uint8_t *pkt, size_t pkt_len,
     uint16_t meth = type & 0xFFF;
     if (meth != STUN_METH_BINDING) return NSBC_ERR; /* 只处理 Binding */
 
-    /* 解析 USERNAME attribute（"ufrag:rag" — rag 是我们的 ufrag） */
+    /* 解析 USERNAME attribute（"ufrag:rag" — rag 是我们的 ufrag）
+     * 安全：RFC5389 STUN Length 字段是攻击者可控的 uint16_t，直接用会导致
+     * end 指针越过 pkt 末尾 → 越界读 alen 字段。必须先裁剪到 pkt_len - 20。 */
     uint16_t body_len = (uint16_t)((pkt[2] << 8) | pkt[3]);
+    size_t   avail    = pkt_len - 20;
+    if ((size_t)body_len > avail)
+        body_len = (uint16_t)avail;
     const uint8_t *body = pkt + 20;
     const uint8_t *end  = body + body_len;
     const char *req_ufrag = NULL;

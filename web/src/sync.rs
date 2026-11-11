@@ -17,6 +17,7 @@
 //! HA1 is sent down).
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -347,6 +348,42 @@ pub fn clear_all_cooldowns() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Dirty-only push：上次推送 JSON hash 相同则跳过（防周期性空转推 + 日志刷屏）
+// ---------------------------------------------------------------------------
+
+/// 每个 kind 记录上次 **成功推送** 的 JSON hash。push_kind 前对比 DB 新快照 hash，
+/// 相同 → 跳过（打 DEBUG "unchanged"），不同才真推。
+///
+/// 设计理由：
+///   之前 spawn_periodic_push 每 60s 推全部 14 kinds，DB 没变化时 14 次全空转 —
+///   Rust 端 serialize JSON → UDS sendto → C 端 reload handler memcmp 相同跳过，
+///   但 C 端还是要解析/遍历/分配，且每次 dispatch 打 INFO/NOTICE 刷屏。
+///   改成 dirty-only：只有 DB 真变了才推，C 端无额外开销。
+///
+/// mark_all_dirty() 在 HELLO（C 重连）时强制清空所有 hash —— C 重启后内存里
+/// 是空的，即使 JSON 内容没变也必须重新推。
+// ---------------------------------------------------------------------------
+fn kind_hashes() -> &'static Mutex<HashMap<Kind, u64>> {
+    static H: OnceLock<Mutex<HashMap<Kind, u64>>> = OnceLock::new();
+    H.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn json_hash(json: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    json.hash(&mut hasher);
+    hasher.finish()
+}
+
+pub fn mark_all_dirty() {
+    let mut h = kind_hashes().lock().unwrap();
+    if !h.is_empty() {
+        let n = h.len();
+        h.clear();
+        tracing::debug!(n, "dirty-only: mark {n} kinds dirty (C reconnected)");
+    }
+}
+
 /// Single-kind push: snapshot → CoreApi.reload_*; retry on failure with [500ms,1s,2s,4s,8s].
 /// Per-kind cooldown: a kind that fails at attempt==0 (CoreError) marks ONLY itself
 /// cooldown 15s — other kinds are unaffected. This prevents one kind's large-payload
@@ -361,8 +398,6 @@ async fn push_kind<C: CoreApi + Clone + Send + Sync>(
     bypass_cooldown: bool,
 ) -> Result<(), String> {
     // Per-kind cooldown bail — save CPU and disk I/O for THIS kind only.
-    // 但 push_all (C 连接) 必须绕过！否则周期同步先跑失败 → 14 kinds cooldown →
-    // C 刚连上触发的 push_all 立即全部被挡。
     if !bypass_cooldown && kind_in_cooldown(kind) {
         return Err(format!("core unreachable ({kind:?} cooldown)"));
     }
@@ -373,7 +408,6 @@ async fn push_kind<C: CoreApi + Clone + Send + Sync>(
         let (json, n) = match snapshot(st, kind).await {
             Ok(v) => v,
             Err(e) => {
-                // DB read failure also goes through retry (connection pool transient jitter)
                 tracing::warn!(kind = kind.name(), attempt, error = %e, "sync snapshot failed");
                 if attempt == DELAYS_MS.len() {
                     return Err(e);
@@ -382,6 +416,19 @@ async fn push_kind<C: CoreApi + Clone + Send + Sync>(
                 continue;
             }
         };
+
+        // ★ Dirty-only check：新快照 hash == 上次成功 push 的 hash → 跳过
+        // bypass_cooldown=true 也需要这个检查 —— 即便是 HELLO 全推，
+        // 如果 DB 没变过（Web 没重启过），也不需要再推一遍。
+        let h = json_hash(&json);
+        let already_pushed = kind_hashes().lock().unwrap()
+            .get(&kind).copied() == Some(h);
+        if already_pushed {
+            tracing::debug!(kind = kind.name(), count = n,
+                "dirty-only: skip (hash unchanged)");
+            return Ok(());
+        }
+
         let r = match kind {
             Kind::Extensions    => st.core.reload_extensions(&json).await,
             Kind::Trunks        => st.core.reload_trunks(&json).await,
@@ -400,8 +447,9 @@ async fn push_kind<C: CoreApi + Clone + Send + Sync>(
         };
         match r {
             Ok(()) => {
+                // ★ 成功后存 hash —— 下次相同 JSON 直接跳过
+                kind_hashes().lock().unwrap().insert(kind, h);
                 tracing::info!(kind = kind.name(), count = n, attempt, "pushed to core");
-                // Success clears this kind's cooldown (if any) so next trigger retries immediately
                 clear_kind_cooldown(kind);
                 return Ok(());
             }
@@ -481,9 +529,10 @@ pub async fn push_all<C: CoreApi + Clone + Send + Sync + 'static>(st: Arc<AppSta
     }
 }
 
-/// UDS HELLO entry point: core connects/reconnects → full push (background task, does not
-/// block HELLO_ACK).
+/// UDS HELLO entry point: core connects/reconnects → 清空所有 dirty hash（C 重启后
+/// 内存是空的，必须重新推）→ 全量 push（background task, does not block HELLO_ACK）.
 pub fn on_hello<C: CoreApi + Clone + Send + Sync + 'static>(st: Arc<AppState<C>>) {
+    mark_all_dirty();   // C 重启 → 强制所有 kind 重新推
     tokio::spawn(async move {
         push_all(st).await;
     });

@@ -828,7 +828,9 @@ static int respond_txn(b2b_core_t *co, sip_txn_t *t, int status,
         goto out;
     }
     /* NAT: RFC 3261 §18.2.2 — Via 响应补 received=src_ip;rport=src_port
-     * 让 NAT conntrack 更新，保证响应能回到正确的内网地址 */
+     * 让 NAT conntrack 更新，保证响应能回到正确的内网地址
+     * ★ BUG-FIX: patch 会增长消息，必须用 patch 后的 len 发送 */
+    size_t len = (size_t)n;
     {
         const nsbc_sa_t *peer = txn_peer(t);
         char src_ip[INET6_ADDRSTRLEN] = "";
@@ -840,10 +842,9 @@ static int respond_txn(b2b_core_t *co, sip_txn_t *t, int status,
             inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)&peer->ss)->sin6_addr,
                       src_ip, sizeof(src_ip));
         }
-        size_t len = (size_t)n;
         sip_via_patch_received_rport(out, &len, sizeof(out), src_ip, src_port);
     }
-    rc = txn_send_response(t, out, (size_t)n, now_ms());
+    rc = txn_send_response(t, out, len, now_ms());
 out:
     txn_unref(t);
     return rc;
@@ -1783,7 +1784,9 @@ static void respond_a(b2b_call_t *c, int status, const char *body,
     /* NAT: RFC 3261 §18.2.2 — Via 响应补 received=src_ip;rport=src_port
      * ★ respond_a 之前完全漏了这个！导致 180 Ringing / 200 OK(INVITE)
      *   的 Via 是空 ";rport"，MicroSIP 等 UA 不认 NAT 地址 → 媒体不通 →
-     *   收到 200 OK 后立刻 BYE 挂断。 */
+     *   收到 200 OK 后立刻 BYE 挂断。
+     * ★ BUG-FIX: patch 会增长消息，必须用 patch 后的 len 发送 */
+    size_t len = (size_t)n;
     {
         const nsbc_sa_t *peer = txn_peer(t);
         char src_ip[INET6_ADDRSTRLEN] = "";
@@ -1795,11 +1798,10 @@ static void respond_a(b2b_call_t *c, int status, const char *body,
             inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)&peer->ss)->sin6_addr,
                       src_ip, sizeof(src_ip));
         }
-        size_t len = (size_t)n;
         sip_via_patch_received_rport(out, &len, sizeof(out), src_ip, src_port);
     }
-    int trc = txn_send_response(t, out, (size_t)n, now_ms());
-    llog(LOG_INFO, "b2b", "respond_a: txn_send_response rc=%d n=%zu t=%p status=%d", trc, (size_t)n, t, status);
+    int trc = txn_send_response(t, out, len, now_ms());
+    llog(LOG_INFO, "b2b", "respond_a: txn_send_response rc=%d len=%zu t=%p status=%d", trc, len, t, status);
 out:
     txn_unref(t);
 }

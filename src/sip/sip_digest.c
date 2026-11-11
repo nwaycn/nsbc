@@ -114,8 +114,12 @@ int digest_make_challenge(const digest_cfg_t *d, int stale, char *out,
         return NSBC_ERR;
     int n = snprintf(
         out, outsz,
+        /* RFC 3261 §22.2 ABNF: algorithm = "algorithm" EQUAL ("MD5" / token)
+         * ABNF 里的引号是字面值标记，实际输出不带引号：algorithm=MD5 */
         "Digest realm=\"%s\", nonce=\"%s\", algorithm=MD5, qop=\"auth\"%s",
         d->realm, nonce, stale ? ", stale=true" : "");
+    llog(LOG_DEBUG, "dig", "challenge: len=%d nonce_len=%zu realm=%s",
+         n, strlen(nonce), d->realm);
     return (n > 0 && (size_t)n < outsz) ? NSBC_OK : NSBC_NOSPC;
 }
 

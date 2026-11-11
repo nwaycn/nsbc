@@ -6,6 +6,7 @@
 #include "metric_reg.h"
 #include "sip_build.h"
 #include "sip_profile.h"
+#include "nsbc_id.h"    /* nsbc_rand_token — 401/403 响应自动生成 To tag */
 #include "sip_txn.h"
 #include "security.h"   /* security_check_fence — REGISTER 也走全局围栏（deny + allow + method 禁用） */
 #include "uDS_client.h"
@@ -466,26 +467,43 @@ static void respond(reg_core_t *r, sip_tr_proto_t proto, const nsbc_sa_t *dst,
                     const sip_msg_t *req, int status, const char *extra,
                     const char *body, size_t bodylen, sip_txn_t *txn)
 {
+    /* RFC 3261 §8.2.6.2：REGISTER 2xx OK 响应 To 头可以不带 tag，
+     * 但所有其他响应（401/403/404/480/503 等）**必须带** tag ——
+     * 否则 MicroSIP/Yealink 等客户端不认这是对它 REGISTER 的有效响应，
+     * 直接丢弃，或者对于 401 不认为是 challenge → 不响应 digest。 */
+    char auto_to_tag[24] = {0};
+    const char *to_tag = NULL;
+    if (status >= 200 && status < 300) {
+        /* 2xx OK —— 可选 tag（B2BUA 场景加，普通 UAS 可以不加） */
+    } else {
+        /* 非 2xx —— 必须加 tag，防止客户端丢弃 */
+        nsbc_rand_token(auto_to_tag, sizeof(auto_to_tag), 10);
+        to_tag = auto_to_tag;
+    }
+
     char out[SIP_MAX_MSG];
-    int n = sip_build_response(out, sizeof(out), req, status, NULL, NULL,
+    int n = sip_build_response(out, sizeof(out), req, status, NULL, to_tag,
                                NULL, extra, body, bodylen);
     if (n <= 0) return;
     /* NAT: RFC 3261 §18.2.2 — Via 响应补 received=src_ip;rport=src_port
-     * 让 NAT conntrack 更新，保证响应能回到正确的内网地址 */
+     * 让 NAT conntrack 更新，保证响应能回到正确的内网地址
+     * ★ BUG-FIX: patch 会增长消息（;rport → ;rport=N;received=IP），
+     *   必须用 patch 后的 len 发送，否则尾部被截断 → 客户端收到残缺
+     *   SIP 消息 → Wireshark 报 malformed → MicroSIP 无法解析 challenge */
+    size_t len = (size_t)n;
     if (dst) {
         char src_ip[INET6_ADDRSTRLEN] = "";
         uint16_t src_port = 0;
         sa_to_str(dst, src_ip, sizeof(src_ip), &src_port);
-        size_t len = (size_t)n;
         sip_via_patch_received_rport(out, &len, sizeof(out), src_ip, src_port);
     }
     /* 优先走 txn 层：自动缓存响应 + 吸收同 branch 重传 */
     if (txn) {
         txn_ref(txn);  /* ★ 防竞态：protect txn_send_response 期间 txn 不被释放 */
-        txn_send_response(txn, out, (size_t)n, nsbc_now_ms());
+        txn_send_response(txn, out, len, nsbc_now_ms());
         txn_unref(txn);
     } else {
-        sip_tr_send(r->cfg.tr, proto, out, (size_t)n, dst);
+        sip_tr_send(r->cfg.tr, proto, out, len, dst);
     }
 }
 
@@ -644,20 +662,43 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
              (int)u->user.len, u->user.p,
              (int)aor_host_len, aor_host);
 
-    /* ---- 从 REGISTER 请求 To 头里提取 realm（= URI host）----
-     * 这是多租户的 tenant 标识，digest_verify 用它查 HA1，loc_add 也用它当 AoR host。
-     * 之前错误地用 profile realm / 全局 cfg.realm → tenant 1004 注册 @a.com 但
-     * HA1 查表用 realm=nsbc.local → user_unknown → 403。 */
+    /* ---- realm 提取：Digest challenge 必须和客户端配置的 realm 一致 ----
+     *
+     * 多租户架构：To 头 host = 租户 domain（nsbc.local / a.com），
+     * Web DB 里 HA1 按 (user, realm) 存 → digest_verify 必须用这个 realm。
+     *
+     * IP 地址作 realm 客户端不认 → To host 是 IP 时退回 cfg.realm。
+     *
+     * ★ 关键：challenge realm 必须 = 客户端配的 SIP Domain。
+     *   MicroSIP 配 Domain=nsbc.local → challenge 给 realm="nsbc.local" 才能认。
+     *   之前 force_register_ok=1 跳过 auth 时这个 bug 永远不暴露！ */
     char reg_realm[64];
-    if (u->host.p && u->host.len && u->host.len < sizeof(reg_realm)) {
-        memcpy(reg_realm, u->host.p, u->host.len);
-        reg_realm[u->host.len] = '\0';
+    char host_tmp[64] = {0};
+    const char *host_override = NULL;
+    if (u->host.p && u->host.len > 0) {
+        size_t hlen = u->host.len < sizeof(host_tmp) - 1
+                    ? u->host.len : sizeof(host_tmp) - 1;
+        memcpy(host_tmp, u->host.p, hlen);
+        host_tmp[hlen] = '\0';
+        struct sockaddr_in sin4;
+        struct sockaddr_in6 sin6;
+        if (inet_pton(AF_INET, host_tmp, &sin4.sin_addr) != 1 &&
+            inet_pton(AF_INET6, host_tmp, &sin6.sin6_addr) != 1) {
+            host_override = host_tmp;
+        }
+    }
+    if (host_override) {
+        snprintf(reg_realm, sizeof(reg_realm), "%s", host_override);
     } else if (r->cfg.realm && r->cfg.realm[0]) {
         snprintf(reg_realm, sizeof(reg_realm), "%s", r->cfg.realm);
     } else {
         snprintf(reg_realm, sizeof(reg_realm), "nsbc.local");
     }
-    llog(LOG_DEBUG, "reg", "REGISTER aor=%s tenant_realm=%s", aor, reg_realm);
+    llog(LOG_DEBUG, "reg",
+         "REGISTER aor=%s realm=%s (to_host=%s cfg.realm=%s)",
+         aor, reg_realm,
+         host_override ? host_override : "(cfg fallback)",
+         r->cfg.realm ? r->cfg.realm : "nsbc.local");
 
     /* 三级令牌桶 */
     if (!tb_take(&r->ip[sa_key(src) & (TB_IP_N - 1)], sa_key(src),
@@ -712,8 +753,9 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
             _rc = NSBC_OK; goto reg_out;
         }
         if (skip_ha1_check) {
-            static unsigned skc = 0;
-            if (skc++ % 256 == 0) {
+            static _Atomic unsigned skc = 0;  /* P1: _Atomic — 多 worker 并发 ++ */
+            unsigned sk = atomic_fetch_add(&skc, 1);
+            if (sk % 256 == 0) {
                 llog(LOG_DEBUG, "reg",
                      "force_register_ok=1 → skip ha1 user-exists check aor=%s", aor);
             }
@@ -728,8 +770,9 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
     /* Digest 鉴权 */
     llog(LOG_DEBUG, "reg", "REGISTER Authorization hdr ptr=%p", (void*)auth);
     if (auth_ok_override) {
-        static unsigned okc = 0;
-        if (okc++ % 256 == 0) {
+        static _Atomic unsigned okc = 0;  /* P1: _Atomic — 多 worker 并发 ++ */
+        unsigned ok = atomic_fetch_add(&okc, 1);
+        if (ok % 256 == 0) {
             llog(LOG_WARN, "reg",
                  "★ force_register_ok=1 active — ALL REGISTERs skip auth! "
                  "aor=%s src_ip=%s (turn off after troubleshooting)",
@@ -739,14 +782,31 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
     }
     if (!auth || sip_hdr_parse_auth(auth) != NSBC_OK) {
         /* RFC 3261 标准流程：客户端第一次 REGISTER 不带 Authorization
-         * 服务器回 401 + WWW-Authenticate challenge，客户端带 auth 重试。
-         * 这不是 auth fail，是正常握手 —— 不应该打 fail2ban 标也不应该 WARN。 */
+         * 服务器回 401 + WWW-Authenticate challenge，客户端带 auth 重试。 */
         char ch[512], extra[600];
         digest_make_challenge(&dig, 0, ch, sizeof(ch));
         snprintf(extra, sizeof(extra), "WWW-Authenticate: %s\r\n", ch);
-        llog(LOG_INFO, "reg",
-             "REGISTER → 401 challenge (RFC 3261 normal handshake) "
-             "aor=%s src_ip=%s reg_realm=%s", aor, src_ip, reg_realm);
+
+        /* ★★ 诊断日志 — 精确区分 "客户端没发 auth 头" vs "发了但解析失败"
+         * 同时打印完整 challenge 字符串，方便确认格式对不对。 */
+        if (!auth) {
+            static __thread uint64_t bare_ms = 0;
+            uint64_t now = nsbc_now_ms();
+            if (now - bare_ms > 3000) {   /* 每 3 秒聚合一条 */
+                llog(LOG_DEBUG, "reg",
+                     "REGISTER → 401 challenge (RFC 3261 handshake, no auth hdr) "
+                     "aor=%s src_ip=%s realm=%s\n"
+                     "  WWW-Authenticate: %s",
+                     aor, src_ip, reg_realm, ch);
+                bare_ms = now;
+            }
+        } else {
+            llog(LOG_WARN, "reg",
+                 "REGISTER → 401 challenge (client SENT Authorization but PARSE FAILED) "
+                 "aor=%s src_ip=%s realm=%s auth_hdr_len=%zu",
+                 aor, src_ip, reg_realm, auth->value.len);
+        }
+
         respond(r, proto, src, m, 401, extra, NULL, 0, txn);
         _rc = NSBC_OK; goto reg_out;
     }
@@ -1044,8 +1104,9 @@ reg_auth_ok:
                 /* 重新夹逼 min/max：短 expires 也不能低于 min_expires */
                 if (exp < r->cfg.min_expires) exp = r->cfg.min_expires;
                 b.expire_ms = now + (uint64_t)exp * 1000;
-                static unsigned nc_override = 0;
-                if (nc_override++ % 256 == 0) {
+                static _Atomic unsigned nc_override = 0;  /* P1: _Atomic — 多 worker 并发 ++ */
+                unsigned nc = atomic_fetch_add(&nc_override, 1);
+                if (nc % 256 == 0) {
                     llog(LOG_INFO, "reg",
                          "NAT detected → short expires override aor=%s exp=%ld→%ld "
                          "contact=%s nat_expires_short=%d",
@@ -1073,8 +1134,11 @@ reg_auth_ok:
              * FreeSWITCH 终端启动时会在 1s 内发 3-5 条 REGISTER（重试），
              * 每条都命中 NAT → 日志刷屏。但 public_contact 变了（端口变）必须打新的。 */
             {
-                static char last_aor[128] = {0}, last_pub[256] = {0};
-                static uint64_t last_log_ms = 0;
+                /* P1: static __thread — 每个 worker 线程独立节流，避免跨线程竞态。
+                 * GCC 要求函数内 __thread 必须配 static（file-scope 隐式有 static）。 */
+                static __thread char last_aor[128];
+                static __thread char last_pub[256];
+                static __thread uint64_t last_log_ms;
                 uint64_t now_ms = now * 1000ULL;
                 int same = (strcmp(last_aor, b.aor) == 0 && strcmp(last_pub, b.public_contact) == 0);
                 if (!same || now_ms - last_log_ms > 30000) {

@@ -5,6 +5,13 @@
  *
  * 状态表：固定大小数组 + call_key 线性探查哈希。
  * 每帧工作：查表 → rtp_parse → pt=0/8 → g711_decode → RMS → 状态机 → 变化时 ring_push。
+ *
+ * 并发模型（P1 修复）：
+ *   - g_states 数组加全局 pthread_mutex_t g_states_lock — OAM 线程
+ *     （vad_start_for_call/vad_stop_for_call）和热路径（vad_on_rtp_frame）
+ *     并发读写 g_states[idx].active/call_key/threshold/state 时持锁。
+ *     锁内只做简单赋值（<10ns），不会阻塞；
+ *   - g_ring.shutdown 从 volatile 改成 _Atomic int，跨线程可见性保证。
  */
 
 #include "vad_engine.h"
@@ -18,6 +25,7 @@
 
 #include <math.h>
 #include <pthread.h>
+#include <stdatomic.h>      /* P1: _Atomic */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,10 +40,11 @@ typedef struct {
     vad_state_t  state[VAD_LEGS_PER_CALL];
     int          hangover_frames[VAD_LEGS_PER_CALL]; /* 连续同状态帧数 */
     uint16_t     last_rms[VAD_LEGS_PER_CALL];        /* 上一帧 RMS（诊断） */
-    volatile int active;
+    int          active;
 } vad_call_state_t;
 
 static vad_call_state_t g_states[VAD_MAX_CALLS];
+static pthread_mutex_t g_states_lock;  /* P1: 全局状态表锁 */
 
 /* ===== MPSC ring（状态变化异步推送）===== */
 typedef struct {
@@ -44,7 +53,7 @@ typedef struct {
     uint32_t    tail;           /* producer 写 */
     pthread_cond_t not_empty;
     pthread_mutex_t lock;      /* consumer 侧用（热路径 producer 无锁） */
-    volatile int  shutdown;
+    _Atomic int  shutdown;      /* P1: _Atomic — 跨线程可见性 */
 } vad_ring_t;
 
 static vad_ring_t g_ring;
@@ -57,7 +66,8 @@ static inline uint64_t now_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
-/* call_key → 槽索引（线性探查，空槽 = NULL） */
+/* call_key → 槽索引（线性探查，空槽 = NULL）
+ * 调用者须已持 g_states_lock（P1 并发保护）。 */
 static int find_or_alloc_slot(void *call_key) {
     uintptr_t h = ((uintptr_t)call_key) >> 4; /* 低地址对齐 */
     for (int i = 0; i < VAD_MAX_CALLS; ++i) {
@@ -80,6 +90,7 @@ static int find_or_alloc_slot(void *call_key) {
     return -1; /* 满了 */
 }
 
+/* 调用者须已持 g_states_lock（P1 并发保护）。 */
 static int find_slot(void *call_key) {
     uintptr_t h = ((uintptr_t)call_key) >> 4;
     for (int i = 0; i < VAD_MAX_CALLS; ++i) {
@@ -170,10 +181,6 @@ void vad_on_rtp_frame(media_bug_frame_t *frame, void *ud) {
     /* 只处理 A/B 腿（0 或 1） */
     if (frame->leg != 0 && frame->leg != 1) return;
 
-    /* 查状态槽（热路径：查表是 O(1)，预分配数组直接索引） */
-    int idx = find_slot(frame->call_key);
-    if (idx < 0) return; /* 不在监控列表里 */
-
     /* 自己 rtp_parse（media_bug dispatch 没填 pt/ssrc/seq/ts） */
     rtp_pkt_t pkt;
     nsbc_rc_t prc = rtp_parse(frame->data, frame->data_len, &pkt);
@@ -204,9 +211,14 @@ void vad_on_rtp_frame(media_bug_frame_t *frame, void *ud) {
 
     if (samples == 0) return;
 
-    /* RMS → 状态机 */
+    /* RMS → 状态机
+     * P1: 持 g_states_lock — 保护 find_slot + vad_state_step 对 g_states 的读写 */
     uint16_t rms = compute_rms_pcm(pcm, samples);
-    vad_state_step(&g_states[idx], frame->leg, rms);
+    pthread_mutex_lock(&g_states_lock);
+    int idx = find_slot(frame->call_key);
+    if (idx >= 0)
+        vad_state_step(&g_states[idx], frame->leg, rms);
+    pthread_mutex_unlock(&g_states_lock);
 }
 
 /* ===== Worker 线程：异步推 data.sock VAD_EVENT（P1 升级）=====
@@ -217,7 +229,7 @@ static void *vad_worker(void *arg) {
     (void)arg;
     llog(LOG_NOTICE, "vad", "worker started (P1: data.sock VAD_EVENT push)");
 
-    while (!g_ring.shutdown) {
+    while (!atomic_load(&g_ring.shutdown)) {  /* P1: _Atomic 读 */
         uint32_t tail = __atomic_load_n(&g_ring.tail, __ATOMIC_ACQUIRE);
         if (g_ring.head == tail) {
             pthread_mutex_lock(&g_ring.lock);
@@ -265,6 +277,9 @@ int vad_engine_init(void) {
         return rc;
     }
 
+    /* P1: 初始化全局状态表锁 */
+    pthread_mutex_init(&g_states_lock, NULL);
+
     /* 初始化 ring */
     memset(&g_ring, 0, sizeof(g_ring));
     pthread_mutex_init(&g_ring.lock, NULL);
@@ -278,7 +293,7 @@ int vad_engine_init(void) {
 }
 
 void vad_engine_shutdown(void) {
-    g_ring.shutdown = 1;
+    atomic_store(&g_ring.shutdown, 1);  /* P1: _Atomic 写 */
     pthread_cond_signal(&g_ring.not_empty);
     pthread_join(g_worker_tid, NULL);
 
@@ -288,8 +303,11 @@ void vad_engine_shutdown(void) {
     /* 注销 media_bug consumer */
     media_bug_unregister_global_consumer(&kVadConsumer);
 
-    /* 清空状态表 */
+    /* P1: 清空状态表（持锁） */
+    pthread_mutex_lock(&g_states_lock);
     memset(g_states, 0, sizeof(g_states));
+    pthread_mutex_unlock(&g_states_lock);
+    pthread_mutex_destroy(&g_states_lock);
 
     llog(LOG_NOTICE, "vad", "vad_engine shutdown complete");
 }
@@ -297,8 +315,10 @@ void vad_engine_shutdown(void) {
 /* ===== OAM 控制 ===== */
 int vad_start_for_call(void *call_key, int leg_mask, uint16_t threshold) {
     if (!call_key) return -1;
+    pthread_mutex_lock(&g_states_lock);  /* P1 */
     int idx = find_or_alloc_slot(call_key);
     if (idx < 0) {
+        pthread_mutex_unlock(&g_states_lock);
         llog(LOG_WARN, "vad", "VAD state table full (%d slots)", VAD_MAX_CALLS);
         return -1;
     }
@@ -311,35 +331,42 @@ int vad_start_for_call(void *call_key, int leg_mask, uint16_t threshold) {
 
     llog(LOG_NOTICE, "vad", "vad_start call=%p leg_mask=%d threshold=%u slot=%d",
          call_key, leg_mask, g_states[idx].threshold, idx);
+    pthread_mutex_unlock(&g_states_lock);
     return 0;
 }
 
 int vad_stop_for_call(void *call_key) {
     if (!call_key) return -1;
+    pthread_mutex_lock(&g_states_lock);  /* P1 */
     int idx = find_slot(call_key);
-    if (idx < 0) return 0; /* 本来就没监控 */
-
-    g_states[idx].active = 0;
-    g_states[idx].call_key = NULL;
+    if (idx >= 0) {
+        g_states[idx].active = 0;
+        g_states[idx].call_key = NULL;
+    }
+    pthread_mutex_unlock(&g_states_lock);
 
     llog(LOG_NOTICE, "vad", "vad_stop call=%p slot=%d", call_key, idx);
-    return 0;
+    return idx >= 0 ? 0 : 0;  /* 本来就没监控也算 OK */
 }
 
 void vad_stop_all(void) {
+    pthread_mutex_lock(&g_states_lock);  /* P1 */
     for (int i = 0; i < VAD_MAX_CALLS; ++i) {
         if (g_states[i].active) {
             g_states[i].active = 0;
             g_states[i].call_key = NULL;
         }
     }
+    pthread_mutex_unlock(&g_states_lock);
 }
 
 /* ===== OAM 状态输出 ===== */
 int vad_status(char *out, size_t outsz) {
     int active = 0;
+    pthread_mutex_lock(&g_states_lock);  /* P1: 读 active 也要锁保护 */
     for (int i = 0; i < VAD_MAX_CALLS; ++i)
         if (g_states[i].active) ++active;
+    pthread_mutex_unlock(&g_states_lock);
 
     return snprintf(out, outsz,
         "vad_engine: active_calls=%d ring_head=%u ring_tail=%u threshold_default=%u\n",

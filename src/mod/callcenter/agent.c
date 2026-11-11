@@ -8,12 +8,20 @@
  *   挂机  ONCALL → WRAP（wrap_time_s>0）否则直接 IDLE
  *   整理到 由 agent_release 在时间轮回调再切 IDLE——本批 release 直接
  *   完成 WRAP→IDLE 落位（定时器在接线批挂）。
+ *
+ * 并发模型（P1 修复）：
+ *   agent_pool_t 内部加 pthread_mutex_t pool_lock，保护 agents[] 数组
+ *   的并发读写（find → 状态变更 → n++ 不是原子）。
+ *   单 agent 粒度的 agent_lock 暂不加（本模块无此成员，任务说"保留它"
+ *   — 这里的保留指不引入，pool_lock 是新增）。
  */
 #include "agent.h"
+#include <pthread.h>
 
 struct agent_pool {
     agent_t agents[AGENT_CAP];
     int n;
+    pthread_mutex_t pool_lock;  /* P1 并发保护：所有公开入口持锁 */
 };
 
 int agent_pool_create(agent_pool_t **out)
@@ -21,11 +29,18 @@ int agent_pool_create(agent_pool_t **out)
     if (out == NULL)
         return NSBC_INVAL;
     *out = (agent_pool_t *)calloc(1, sizeof(agent_pool_t));
-    return *out != NULL ? NSBC_OK : NSBC_NOMEM;
+    if (*out == NULL)
+        return NSBC_NOMEM;
+    /* P1: 初始化池锁 */
+    pthread_mutex_init(&(*out)->pool_lock, NULL);
+    return NSBC_OK;
 }
 
 void agent_pool_destroy(agent_pool_t *p)
 {
+    if (p == NULL)
+        return;
+    pthread_mutex_destroy(&p->pool_lock);
     free(p);
 }
 
@@ -45,6 +60,7 @@ int agent_upsert(agent_pool_t *p, const agent_t *a)
     agent_t *e;
     if (p == NULL || a == NULL || a->ext[0] == '\0')
         return NSBC_INVAL;
+    pthread_mutex_lock(&p->pool_lock);  /* P1: 池锁 */
     e = find(p, a->tenant, a->ext);
     if (e != NULL) {
         agent_state_t st = e->state; /* 配置更新不改登录态 */
@@ -52,13 +68,17 @@ int agent_upsert(agent_pool_t *p, const agent_t *a)
         *e = *a;
         e->state = st;
         e->state_since_ms = since;
+        pthread_mutex_unlock(&p->pool_lock);
         return NSBC_OK;
     }
-    if (p->n >= AGENT_CAP)
+    if (p->n >= AGENT_CAP) {
+        pthread_mutex_unlock(&p->pool_lock);
         return NSBC_NOSPC;
+    }
     p->agents[p->n] = *a;
     /* calloc 归零：state 缺省即 AGENT_OFFLINE(=0)，无需重复赋值 */
     ++p->n;
+    pthread_mutex_unlock(&p->pool_lock);
     return NSBC_OK;
 }
 
@@ -68,10 +88,14 @@ int agent_lookup(agent_pool_t *p, const char *tenant, const char *ext,
     const agent_t *a;
     if (p == NULL || tenant == NULL || ext == NULL || out == NULL)
         return NSBC_INVAL;
+    pthread_mutex_lock(&p->pool_lock);  /* P1: 池锁 */
     a = find(p, tenant, ext);
-    if (a == NULL)
+    if (a == NULL) {
+        pthread_mutex_unlock(&p->pool_lock);
         return NSBC_NOENT;
+    }
     *out = *a;
+    pthread_mutex_unlock(&p->pool_lock);
     return NSBC_OK;
 }
 
@@ -89,82 +113,114 @@ static int to_idle(agent_t *a, uint64_t now_ms)
 int agent_login(agent_pool_t *p, const char *tenant, const char *ext,
                 uint64_t now_ms)
 {
-    agent_t *a = find(p, tenant, ext);
-    if (a == NULL)
-        return NSBC_NOENT;
-    return to_idle(a, now_ms);
+    agent_t *a;
+    if (p == NULL) return NSBC_INVAL;
+    pthread_mutex_lock(&p->pool_lock);  /* P1: 池锁 */
+    a = find(p, tenant, ext);
+    if (a == NULL) { pthread_mutex_unlock(&p->pool_lock); return NSBC_NOENT; }
+    int rc = to_idle(a, now_ms);
+    pthread_mutex_unlock(&p->pool_lock);
+    return rc;
 }
 
 int agent_logout(agent_pool_t *p, const char *tenant, const char *ext)
 {
-    agent_t *a = find(p, tenant, ext);
-    if (a == NULL)
-        return NSBC_NOENT;
-    if (a->state == AGENT_ONCALL || a->state == AGENT_RESERVED)
+    agent_t *a;
+    if (p == NULL) return NSBC_INVAL;
+    pthread_mutex_lock(&p->pool_lock);  /* P1: 池锁 */
+    a = find(p, tenant, ext);
+    if (a == NULL) { pthread_mutex_unlock(&p->pool_lock); return NSBC_NOENT; }
+    if (a->state == AGENT_ONCALL || a->state == AGENT_RESERVED) {
+        pthread_mutex_unlock(&p->pool_lock);
         return NSBC_AGAIN;
+    }
     a->state = AGENT_OFFLINE;
     a->pause_reason = AGENT_PAUSE_NONE;
     a->state_since_ms = 0;
+    pthread_mutex_unlock(&p->pool_lock);
     return NSBC_OK;
 }
 
 int agent_pause(agent_pool_t *p, const char *tenant, const char *ext,
                 agent_pause_reason_t reason)
 {
-    agent_t *a = find(p, tenant, ext);
-    if (a == NULL)
-        return NSBC_NOENT;
-    if (a->state == AGENT_ONCALL || a->state == AGENT_RESERVED)
+    agent_t *a;
+    if (p == NULL) return NSBC_INVAL;
+    pthread_mutex_lock(&p->pool_lock);  /* P1: 池锁 */
+    a = find(p, tenant, ext);
+    if (a == NULL) { pthread_mutex_unlock(&p->pool_lock); return NSBC_NOENT; }
+    if (a->state == AGENT_ONCALL || a->state == AGENT_RESERVED) {
+        pthread_mutex_unlock(&p->pool_lock);
         return NSBC_AGAIN;
+    }
     a->state = AGENT_PAUSED;
     a->pause_reason = reason;
+    pthread_mutex_unlock(&p->pool_lock);
     return NSBC_OK;
 }
 
 int agent_resume(agent_pool_t *p, const char *tenant, const char *ext,
                  uint64_t now_ms)
 {
-    agent_t *a = find(p, tenant, ext);
-    if (a == NULL)
-        return NSBC_NOENT;
-    return to_idle(a, now_ms);
+    agent_t *a;
+    if (p == NULL) return NSBC_INVAL;
+    pthread_mutex_lock(&p->pool_lock);  /* P1: 池锁 */
+    a = find(p, tenant, ext);
+    if (a == NULL) { pthread_mutex_unlock(&p->pool_lock); return NSBC_NOENT; }
+    int rc = to_idle(a, now_ms);
+    pthread_mutex_unlock(&p->pool_lock);
+    return rc;
 }
 
 int agent_reserve(agent_pool_t *p, const char *tenant, const char *ext,
                   uint64_t now_ms)
 {
-    agent_t *a = find(p, tenant, ext);
-    if (a == NULL)
-        return NSBC_NOENT;
-    if (a->state != AGENT_IDLE)
+    agent_t *a;
+    if (p == NULL) return NSBC_INVAL;
+    pthread_mutex_lock(&p->pool_lock);  /* P1: 池锁 */
+    a = find(p, tenant, ext);
+    if (a == NULL) { pthread_mutex_unlock(&p->pool_lock); return NSBC_NOENT; }
+    if (a->state != AGENT_IDLE) {
+        pthread_mutex_unlock(&p->pool_lock);
         return NSBC_AGAIN;
+    }
     a->state = AGENT_RESERVED;
     a->state_since_ms = now_ms;
+    pthread_mutex_unlock(&p->pool_lock);
     return NSBC_OK;
 }
 
 int agent_answer(agent_pool_t *p, const char *tenant, const char *ext,
                  uint64_t now_ms)
 {
-    agent_t *a = find(p, tenant, ext);
-    if (a == NULL)
-        return NSBC_NOENT;
-    if (a->state != AGENT_RESERVED)
+    agent_t *a;
+    if (p == NULL) return NSBC_INVAL;
+    pthread_mutex_lock(&p->pool_lock);  /* P1: 池锁 */
+    a = find(p, tenant, ext);
+    if (a == NULL) { pthread_mutex_unlock(&p->pool_lock); return NSBC_NOENT; }
+    if (a->state != AGENT_RESERVED) {
+        pthread_mutex_unlock(&p->pool_lock);
         return NSBC_INVAL;
+    }
     a->state = AGENT_ONCALL;
     a->state_since_ms = now_ms;
     ++a->answered_total;
+    pthread_mutex_unlock(&p->pool_lock);
     return NSBC_OK;
 }
 
 int agent_release(agent_pool_t *p, const char *tenant, const char *ext,
                   uint64_t now_ms, int wrap_time_s)
 {
-    agent_t *a = find(p, tenant, ext);
-    if (a == NULL)
-        return NSBC_NOENT;
-    if (a->state != AGENT_ONCALL)
+    agent_t *a;
+    if (p == NULL) return NSBC_INVAL;
+    pthread_mutex_lock(&p->pool_lock);  /* P1: 池锁 */
+    a = find(p, tenant, ext);
+    if (a == NULL) { pthread_mutex_unlock(&p->pool_lock); return NSBC_NOENT; }
+    if (a->state != AGENT_ONCALL) {
+        pthread_mutex_unlock(&p->pool_lock);
         return NSBC_INVAL;
+    }
     a->last_call_end_ms = now_ms;
     if (wrap_time_s > 0) {
         a->state = AGENT_WRAP;
@@ -173,6 +229,7 @@ int agent_release(agent_pool_t *p, const char *tenant, const char *ext,
         a->state = AGENT_IDLE;
         a->state_since_ms = now_ms;
     }
+    pthread_mutex_unlock(&p->pool_lock);
     return NSBC_OK;
 }
 

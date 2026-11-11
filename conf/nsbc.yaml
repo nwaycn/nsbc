@@ -97,6 +97,14 @@ registrar:
   # SIP REGISTER auth secret; empty = use digest_secret default
   # digest_secret: "file:../tls/key.pem"
 
+  # ★ 安全开关：跳过 REGISTER 所有 auth + fence 检查
+  # 1 = 跳过 digest auth + security fence + ha1 user-exists（REGISTER 直接 200 OK）
+  # 0 = 正常走 digest auth 握手（安全默认值，P0-1 修复后 schema 默认从 1→0）
+  #
+  # 生产环境必须显式配置。如果客户端未配置 SIP 密码，把这行改成 force_register_ok: 1
+  # 排完后请务必改回 0，并在 Web 端给分机设置密码
+  force_register_ok: 1
+
   # ---- Expires 基础裁剪 ----
   # min_expires: 客户端发来的 expires 低于此值 → 423 Min-Expires 拒绝
   # max_expires: 客户端发来的 expires 高于此值 → 裁到 max_expires

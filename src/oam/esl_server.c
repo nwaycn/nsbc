@@ -266,13 +266,15 @@ static int parse_event_cmd(esl_conn_t *c, const char *line)
 static int parse_auth_cmd(esl_conn_t *c, const char *line)
 {
     if (strncmp(line, "auth", 4) != 0) return -1;
+    /* 安全修复 P0-4：去掉 !g_password 自动认证分支。TCP 必须配置密码才能启动
+     * （init 里已做检查）。如果密码没配，说明初始化有 bug，拒绝即可。 */
     if (!g_password || g_password[0] == '\0') {
-        c->authed = 1;
-        conn_send(c, "+OK accepted (no password configured)\n\n", 39);
+        conn_send(c, "-ERR server not configured\n\n", 28);
         return 0;
     }
     const char *pw = line + 4;
     while (*pw == ' ') pw++;
+    /* TODO: 后续改 constant-time compare（CRYPTO_memcmp）防时序攻击 */
     if (strcmp(pw, g_password) == 0) {
         c->authed = 1;
         conn_send(c, "+OK accepted\n\n", 14);
@@ -554,7 +556,20 @@ nsbc_rc_t esl_start(void *reactor, const esl_cfg_t *cfg, cmd_reg_t *reg)
         g_password = cfg->password;
     } else {
         snprintf(g_uds_path, sizeof(g_uds_path), "/var/run/nsbc/esl.sock");
-        snprintf(g_tcp_addr, sizeof(g_tcp_addr), "0.0.0.0:8021");
+        /* 安全修复 P0-4：默认 TCP 监听 127.0.0.1，不是 0.0.0.0。
+         * 任何部署漏配 tcp_addr 时，ESL API 不对外暴露。 */
+        snprintf(g_tcp_addr, sizeof(g_tcp_addr), "127.0.0.1:8021");
+    }
+
+    /* 安全修复 P0-4：TCP 口必须配置密码。无密码时跳过 TCP 监听（UDS 已
+     * 有 chmod 0600，本机运维用 UDS 即可）。
+     * 之前：无密码自动认证（!g_password → c->authed=1），等于匿名 admin。 */
+    if (g_tcp_addr[0] && (!g_password || g_password[0] == '\0')) {
+        llog(LOG_WARN, "esl",
+             "TCP listener disabled: password not configured "
+             "(UDS path %s still available for local admin)",
+             g_uds_path[0] ? g_uds_path : "(none)");
+        g_tcp_addr[0] = '\0';
     }
 
     /* UDS */
