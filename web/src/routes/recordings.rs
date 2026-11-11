@@ -103,7 +103,9 @@ where
 }
 
 /// Allowed recording file extensions only (whitelist, prevent arbitrary file download).
-const ALLOWED_EXTS: &[&str] = &["wav", "g711a", "g711u", "pcm", "raw"];
+/// mp3/opus/mp4 are produced by the ffmpeg post-convert pipeline (recording.format
+/// or per-rule "record start format=mp4").
+const ALLOWED_EXTS: &[&str] = &["wav", "g711a", "g711u", "pcm", "raw", "mp3", "opus", "mp4"];
 
 async fn download_recording<C: CoreApi + Clone + 'static>(
     State(st): State<Arc<AppState<C>>>,
@@ -195,6 +197,9 @@ async fn download_recording<C: CoreApi + Clone + 'static>(
 
     let ctype = match canon.extension().and_then(|e| e.to_str()) {
         Some("wav")   => "audio/wav",
+        Some("mp3")   => "audio/mpeg",
+        Some("opus")  => "audio/ogg",
+        Some("mp4")   => "audio/mp4",
         Some("g711a") | Some("g711u") | Some("pcm") | Some("raw") => "application/octet-stream",
         _             => "application/octet-stream",
     };
