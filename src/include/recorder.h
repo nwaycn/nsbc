@@ -33,7 +33,8 @@ typedef enum {
 typedef enum {
     REC_FMT_WAV_PCM = 0,  /* P1 基线容器 */
     REC_FMT_OGG_OPUS,     /* P1 节省存储（专利无关） */
-    REC_FMT_MP3           /* P2/商业（专利许可风险登记） */
+    REC_FMT_MP3,          /* P2/商业（专利许可风险登记） */
+    REC_FMT_MP4_AAC       /* 选后缀=mp4 时：AAC 音频轨容器（视频轨需实时 hook，后补） */
 } rec_fmt_t;
 
 typedef enum {

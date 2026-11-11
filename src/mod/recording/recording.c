@@ -30,6 +30,8 @@ extern bridge_mgr_t *sig_bridge_instance(struct nsbc_ctx *ctx);
 #include <unistd.h>   /* unlink() */
 #include <limits.h>
 #include <stddef.h>
+#include <ctype.h>
+#include <sys/wait.h>   /* waitpid — ffmpeg 后处理 */
 #define REC_BUCKET_BITS 10
 #define REC_BUCKET_CNT  (1 << REC_BUCKET_BITS)
 
@@ -49,6 +51,88 @@ static struct nsbc_ctx *g_ctx = NULL;
 
 /* forward declarations（文件后半段定义，前半段要用）*/
 static void reg_del(const char *callid, int leg);
+
+/* === fmt → 文件后缀映射 === */
+static const char *rec_fmt_ext(rec_fmt_t fmt)
+{
+    switch (fmt) {
+        case REC_FMT_OGG_OPUS: return "opus";
+        case REC_FMT_MP3:      return "mp3";
+        case REC_FMT_MP4_AAC:  return "mp4";
+        case REC_FMT_WAV_PCM:
+        default:               return "wav";
+    }
+}
+
+/* === ffmpeg 后处理：WAV → 目标格式 ===
+ *
+ * 仅在 recording.format != wav 时调。fork + exec ffmpeg，
+ * 父进程阻塞 waitpid（录音 stop 走 callctrl 线程，不阻塞媒体快路径）。
+ * 成功后删 WAV 源文件，out_path 指向新文件。
+ *
+ * 依赖：ffmpeg 必须在 PATH 里。Ubuntu/Debian 可 apt install ffmpeg。
+ *      mp3 → libmp3lame，mp4_aac → aac（ffmpeg 内置，不用额外库）。
+ * mp4 当前只 mux 音频轨（AAC）。视频轨需后续实时 hook 补：
+ *   检测 bridge 里的 video_ssrc → 把收到的 H.264/H.265 帧也喂入 ffmpeg stdin
+ *   → ffmpeg 同时编码 video + audio → 输出完整 mp4。 */
+static int ffmpeg_convert(const char *wav_path, const char *out_path, rec_fmt_t fmt)
+{
+    if (!wav_path || !out_path) return NSBC_INVAL;
+
+    const char *audio_codec;
+    const char *extra_args = "";
+    switch (fmt) {
+        case REC_FMT_OGG_OPUS: audio_codec = "libopus"; extra_args = "-c:a libopus -b:a 64k"; break;
+        case REC_FMT_MP3:      audio_codec = "libmp3lame"; extra_args = "-c:a libmp3lame -b:a 128k"; break;
+        case REC_FMT_MP4_AAC:  audio_codec = "aac"; extra_args = "-c:a aac -b:a 128k -movflags +faststart"; break;
+        case REC_FMT_WAV_PCM:
+        default: return NSBC_OK;  /* 不需要转 */
+    }
+    (void)audio_codec;  /* extra_args 已包含 -c:a */
+
+    /* fork + exec ffmpeg -y -i wav -c:a ... out_path */
+    pid_t pid = fork();
+    if (pid < 0) {
+        llog(LOG_WARN, "rec", "ffmpeg_convert: fork failed errno=%d", errno);
+        return NSBC_ERR;
+    }
+    if (pid == 0) {
+        /* 子进程：exec ffmpeg。argv 全部 const char*，cast 到 char* 给 execv */
+        char *argv[12]; int ai = 0;
+        argv[ai++] = (char *)"ffmpeg";
+        argv[ai++] = (char *)"-y";       /* 覆盖输出文件 */
+        argv[ai++] = (char *)"-i";
+        argv[ai++] = (char *)wav_path;
+        /* extra_args 带 -c:a 和码率 */
+        char extra_copy[256];
+        snprintf(extra_copy, sizeof(extra_copy), "%s", extra_args);
+        /* 按空格拆分 extra_args */
+        char *tok = strtok(extra_copy, " ");
+        while (tok && ai < 10) {
+            argv[ai++] = tok;
+            tok = strtok(NULL, " ");
+        }
+        argv[ai++] = (char *)out_path;
+        argv[ai] = NULL;
+        execvp("ffmpeg", argv);
+        /* execvp 失败 → 子进程 exit(127) */
+        _exit(127);
+    }
+    /* 父进程 wait */
+    int status = 0;
+    pid_t w = waitpid(pid, &status, 0);
+    if (w < 0) {
+        llog(LOG_WARN, "rec", "ffmpeg_convert: waitpid failed errno=%d", errno);
+        return NSBC_ERR;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        llog(LOG_WARN, "rec", "ffmpeg_convert: ffmpeg exited status=%d",
+             WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        return NSBC_ERR;
+    }
+    llog(LOG_INFO, "rec", "ffmpeg_convert OK wav=%s → %s", wav_path, out_path);
+    return NSBC_OK;
+}
 
 /* 复合 key：callid:leg（分腿独立录制，P0 之前单 key 会撞分腿 open） */
 static void make_key(char *out, size_t outsz, const char *callid, int leg)
@@ -171,7 +255,9 @@ static app_rc_t app_record_exec(app_ctx_t *c, const char *data, void *ud)
         snprintf(req.caller, sizeof(req.caller), "%s", caller);
         snprintf(req.callee, sizeof(req.callee), "%s", callee);
         snprintf(req.rec_path_template, sizeof(req.rec_path_template),
-                 "{date}/{caller}-{callee}-{callid}.wav");
+                 "{date}/{caller}-{callee}-{callid}.{ext}");
+        /* 注意：resolve_rec_path_template 的 {ext} 默认返回 "wav"，
+         * recording_apply_dp_action(stop) 里会根据 mgr->cfg.fmt 替换后缀 */
 
         int rc = rec_open(mgr, &req, &sess);
         if (rc != NSBC_OK || !sess) {
@@ -368,16 +454,59 @@ int recording_apply_dp_action(rec_mgr_t *mgr, uint8_t rec_action,
                 llog(LOG_INFO, "rec", "recording MERGE callid=%s mix=%s", callid, mix_path);
                 unlink(a_path);
                 unlink(b_path);
-                if (rec_path_out && path_cap > 0)
-                    snprintf(rec_path_out, path_cap, "%s", strip_base_dir(mix_path, bd));
+
+                /* ★ ffmpeg 后处理：fmt != WAV → 转码成 mp3/opus/mp4
+                 * merge_stereo_wav 输出的是中间 WAV，转码成功后删它，rec_path_out 指向新文件。 */
+                if (mcfg && mcfg->fmt != REC_FMT_WAV_PCM) {
+                    const char *target_ext = rec_fmt_ext(mcfg->fmt);
+                    char final_path[REC_PATH_MAX];
+                    /* 把 mix_path 最后的 .wav 替换成目标后缀 */
+                    snprintf(final_path, sizeof(final_path), "%s", mix_path);
+                    char *dot = strrchr(final_path, '.');
+                    if (dot) snprintf(dot, sizeof(final_path) - (dot - final_path), ".%s", target_ext);
+
+                    if (ffmpeg_convert(mix_path, final_path, mcfg->fmt) == NSBC_OK) {
+                        llog(LOG_INFO, "rec", "recording CONVERT callid=%s → .%s", callid, target_ext);
+                        unlink(mix_path);  /* 删中间 WAV */
+                        if (rec_path_out && path_cap > 0)
+                            snprintf(rec_path_out, path_cap, "%s", strip_base_dir(final_path, bd));
+                    } else {
+                        llog(LOG_WARN, "rec", "recording CONVERT failed callid=%s — keeping WAV", callid);
+                        if (rec_path_out && path_cap > 0)
+                            snprintf(rec_path_out, path_cap, "%s", strip_base_dir(mix_path, bd));
+                    }
+                } else {
+                    if (rec_path_out && path_cap > 0)
+                        snprintf(rec_path_out, path_cap, "%s", strip_base_dir(mix_path, bd));
+                }
             } else {
                 llog(LOG_WARN, "rec", "recording MERGE failed callid=%s — mono files kept", callid);
                 if (rec_path_out && b_path[0] && path_cap > 0)
                     snprintf(rec_path_out, path_cap, "%s", strip_base_dir(b_path, bd));
             }
         } else if (a_path[0]) {
-            if (rec_path_out && path_cap > 0)
-                snprintf(rec_path_out, path_cap, "%s", strip_base_dir(a_path, bd));
+            /* 单 leg：只有 mono WAV，也走 ffmpeg 转码 */
+            if (mcfg && mcfg->fmt != REC_FMT_WAV_PCM) {
+                const char *target_ext = rec_fmt_ext(mcfg->fmt);
+                char final_path[REC_PATH_MAX];
+                snprintf(final_path, sizeof(final_path), "%s", a_path);
+                char *dot = strrchr(final_path, '.');
+                if (dot) snprintf(dot, sizeof(final_path) - (dot - final_path), ".%s", target_ext);
+
+                if (ffmpeg_convert(a_path, final_path, mcfg->fmt) == NSBC_OK) {
+                    llog(LOG_INFO, "rec", "recording CONVERT mono callid=%s → .%s", callid, target_ext);
+                    unlink(a_path);
+                    if (rec_path_out && path_cap > 0)
+                        snprintf(rec_path_out, path_cap, "%s", strip_base_dir(final_path, bd));
+                } else {
+                    llog(LOG_WARN, "rec", "recording CONVERT mono failed callid=%s — keeping WAV", callid);
+                    if (rec_path_out && path_cap > 0)
+                        snprintf(rec_path_out, path_cap, "%s", strip_base_dir(a_path, bd));
+                }
+            } else {
+                if (rec_path_out && path_cap > 0)
+                    snprintf(rec_path_out, path_cap, "%s", strip_base_dir(a_path, bd));
+            }
         }
 
         return rc_all;
@@ -453,8 +582,12 @@ static int recording_init(struct nsbc_ctx *ctx)
         if (lv > 0) mc.max_bytes = (uint64_t)lv * 1024 * 1024;
 
         (void)cfg_get_str(ctx->cfg, "recording.format", &s, NULL);
-        if (s && strcmp(s, "opus") == 0) mc.fmt = REC_FMT_OGG_OPUS;
-        else mc.fmt = REC_FMT_WAV_PCM;
+        if (s) {
+            if (strcmp(s, "opus") == 0)      mc.fmt = REC_FMT_OGG_OPUS;
+            else if (strcmp(s, "mp3") == 0)  mc.fmt = REC_FMT_MP3;
+            else if (strcmp(s, "mp4") == 0)  mc.fmt = REC_FMT_MP4_AAC;
+            else                              mc.fmt = REC_FMT_WAV_PCM;
+        }
     }
 
     rec_mgr_t *mgr = NULL;

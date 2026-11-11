@@ -626,6 +626,8 @@ int resolve_rec_path_template(char *out, size_t out_cap,
             else if (!strcmp(var, "yyyy"))   val = yyyy;
             else if (!strcmp(var, "mm"))     val = mm;
             else if (!strcmp(var, "dd"))     val = dd;
+            else if (!strcmp(var, "ext") || !strcmp(var, "suffix"))
+                                              val = "wav";  /* 调用方覆盖——rec_open 时传 fmt 相关后缀 */
             else {
                 /* 未知变量 → 原样输出 {xxx} */
                 if (pos + varlen + 2 >= out_cap) break;
