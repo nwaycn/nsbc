@@ -464,6 +464,38 @@ static app_rc_t app_endless_playback(app_ctx_t *c, const char *data, void *ud)
     return rc == NSBC_OK ? APP_RC_OK : APP_RC_FAILED;
 }
 
+/* ---- ringback（回铃音：接通自动停的循环放音）----
+ *
+ * 与 playback / endless_playback 的核心区别：
+ *   ringback       —— 非阻塞 + 循环放音；B 腿接通（b2bua 收到 200 OK
+ *                    LEG_CONFIRMED）时自动 pb_stop_if_playing 停止。
+ *                    用于"转分机的同时放回铃音"场景：配在 bridge/transfer
+ *                    之前，分机接起瞬间回铃音自动切断。
+ *   playback       —— 播完 EOF 自然结束（不会被接通打断）。
+ *   endless_playback —— 无限循环直到 uuid_break（MoH 场景）。
+ *
+ * 用法（dialplan app_chain）：
+ *   [{"app":"ringback","data":"/var/sounds/ringback.wav"},
+ *    {"app":"bridge","data":"user/1000"}]
+ *
+ * b2bua.c 三个 LEG_CONFIRMED 点（B 腿 200 OK / A 腿 originate 200 OK /
+ * A 腿 ACK）都调 pb_stop_if_playing(c) —— 对 playback 不影响（chain 里
+ * playback 通常在 answer 前已播完，且接通时停掉残留放音也是正确语义）。 */
+static app_rc_t app_ringback(app_ctx_t *c, const char *data, void *ud)
+{
+    (void)ud;
+    if (!cv_call_alive(c)) return APP_RC_FAILED;
+    if (!data || data[0] == '\0' || strlen(data) > 256) return APP_RC_FAILED;
+
+    /* 同一 call_key 只能有一个 pb_ctx：先停再放 */
+    pb_stop_if_playing(c->call_key);
+
+    /* 非阻塞：循环放音，chain 立即继续执行下一 app（bridge/transfer）。
+     * 接通停止由 b2bua.c LEG_CONFIRMED 路径的 pb_stop_if_playing 完成。 */
+    int rc = pb_start(c->call_key, data, c->leg, /*loop=*/1, NULL);
+    return rc == NSBC_OK ? APP_RC_OK : APP_RC_FAILED;
+}
+
 /* ---- §8 uuid_break（双模：Dialplan app + ESL api）----
  * 打断当前 Leg 的 playback / sleep / 非阻塞动作。
  * 底层：pb_stop_if_playing + dp_sleep_cancel + esl_event_fire(PAYBACK_STOP)
@@ -797,6 +829,7 @@ static const app_desc_t builtin_apps[] = {
     { "att_xfer",           "出席/咨询转移",                                    app_att_xfer,          NULL },
     { "gentones",           "生成特定音调序列",                                 app_gentones,          NULL },
     { "endless_playback",   "循环播放音频（uuid_break 可中断）",                app_endless_playback,  NULL },
+    { "ringback",           "回铃音（循环放音，B 腿接通时自动停止；配在 bridge/transfer 之前）", app_ringback, NULL },
     { "uuid_break",         "打断当前 call 的 playback/sleep（双模：DP app + ESL api）", app_uuid_break, NULL },
     { "read",               "DTMF 收号（P0 占位，P1 实装）",                     app_read,              NULL },
     { "ivr",                "启动 IVR 菜单 session；data=<menu_name>",          app_ivr,               NULL },

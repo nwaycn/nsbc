@@ -12,6 +12,7 @@
 #include "recording.h"
 #include "app_ctx.h"   /* struct nsbc_ctx 完整定义 */
 #include "cfg.h"
+#include "chan_var.h"  /* per-rule rec_fmt：chan_var_get/set */
 #include "log.h"
 
 /* === Phase 0 自注册依赖 === */
@@ -227,13 +228,36 @@ static app_rc_t app_record_exec(app_ctx_t *c, const char *data, void *ud)
     int leg = c->leg;
     if (leg < 0 || leg > 1) return APP_RC_FAILED;
 
-    /* 解析 action："start"(默认) / "stop" */
+    /* 解析 action："start"(默认) / "stop"
+     * data 还可带 per-rule 录音格式："start format=mp4" / "stop format=mp4"。
+     * format 覆盖全局 recording.format（仅本通通话生效），存 chan_var rec_fmt。 */
     int action = 1;
+    char fmt_override[16] = {0};
     if (data) {
         while (*data == ' ' || *data == '\t') ++data;
         if (strncasecmp(data, "stop", 4) == 0) action = 2;
         else if (strncasecmp(data, "start", 5) == 0) action = 1;
+        const char *f = strstr(data, "format=");
+        if (f) {
+            f += 7;
+            size_t i = 0;
+            while (f[i] && f[i] != ' ' && f[i] != '\t' && i < sizeof(fmt_override) - 1) {
+                fmt_override[i] = (char)tolower((unsigned char)f[i]);
+                ++i;
+            }
+            fmt_override[i] = '\0';
+        }
     }
+    /* per-rule format 合法值校验 */
+    if (fmt_override[0] &&
+        strcmp(fmt_override, "wav") != 0 && strcmp(fmt_override, "mp3") != 0 &&
+        strcmp(fmt_override, "opus") != 0 && strcmp(fmt_override, "mp4") != 0) {
+        llog(LOG_WARN, "rec", "app_record: bad format='%s' (wav|mp3|opus|mp4) — ignored",
+             fmt_override);
+        fmt_override[0] = '\0';
+    }
+    if (fmt_override[0] && c->vars)
+        chan_var_set(c->vars, leg, "rec_fmt", fmt_override);
 
     if (action == 1) {
         rec_sess_t *sess = NULL;
@@ -282,6 +306,42 @@ static app_rc_t app_record_exec(app_ctx_t *c, const char *data, void *ud)
             rec_stop(sess, final_path, sizeof(final_path), &bytes);
             llog(LOG_INFO, "rec", "app_record STOP callid=%s leg=%d path=%s bytes=%llu",
                  call->leg[0].callid, leg, final_path, (unsigned long long)bytes);
+
+            /* ★ per-rule / global 录音格式：非 wav → ffmpeg 后处理转码。
+             * 优先级：chan_var rec_fmt（per-rule "format=mp4"）> 全局 recording.format */
+            rec_fmt_t fmt = REC_FMT_WAV_PCM;
+            {
+                char fv[16] = "";
+                if (c->vars &&
+                    chan_var_get(c->vars, leg, "rec_fmt", fv, sizeof(fv)) == NSBC_OK && fv[0]) {
+                    if      (!strcmp(fv, "mp3"))  fmt = REC_FMT_MP3;
+                    else if (!strcmp(fv, "mp4"))  fmt = REC_FMT_MP4_AAC;
+                    else if (!strcmp(fv, "opus")) fmt = REC_FMT_OGG_OPUS;
+                } else if (g_ctx && g_ctx->cfg) {
+                    const char *fmt_s = NULL;
+                    if (cfg_get_str(g_ctx->cfg, "recording.format", &fmt_s, NULL) == NSBC_OK && fmt_s) {
+                        if      (!strcmp(fmt_s, "mp3"))  fmt = REC_FMT_MP3;
+                        else if (!strcmp(fmt_s, "mp4"))  fmt = REC_FMT_MP4_AAC;
+                        else if (!strcmp(fmt_s, "opus")) fmt = REC_FMT_OGG_OPUS;
+                    }
+                }
+            }
+            if (fmt != REC_FMT_WAV_PCM && final_path[0]) {
+                const char *target_ext = rec_fmt_ext(fmt);
+                char out_path[512];
+                snprintf(out_path, sizeof(out_path), "%s", final_path);
+                char *dot = strrchr(out_path, '.');
+                if (dot) snprintf(dot, sizeof(out_path) - (size_t)(dot - out_path),
+                                  ".%s", target_ext);
+                if (ffmpeg_convert(final_path, out_path, fmt) == NSBC_OK) {
+                    llog(LOG_INFO, "rec", "app_record CONVERT callid=%s leg=%d → .%s",
+                         call->leg[0].callid, leg, target_ext);
+                    unlink(final_path);  /* 删中间 WAV */
+                } else {
+                    llog(LOG_WARN, "rec", "app_record CONVERT failed callid=%s leg=%d — keeping WAV",
+                         call->leg[0].callid, leg);
+                }
+            }
         }
     }
     return APP_RC_OK;

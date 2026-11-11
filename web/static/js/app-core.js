@@ -690,9 +690,10 @@ const AppChainEditor = {
       answer:              'Answer inbound (send 200 OK)',
       pre_answer:          'Early media pre-answer (183, no 200 OK)',
       bridge:              'Bridge to sofia/gateway/<gw>/<ext>',
-      playback:            'Play a single audio file',
+      playback:            'Play a single audio file (plays to completion)',
+      ringback:            'Ringback tone: loops while routing, auto-stops when B-leg answers (put BEFORE bridge/transfer)',
       post_playback:       'Play after answer (phase marker)',
-      record:              'Record current call audio',
+      record:              'Record current call audio (data: "start format=mp4" for per-rule format)',
       transfer:            'Transfer current call (REFER or 302)',
       set:                 'Set channel variable var=value',
       conference:          'Join conference <room>@<profile>',
@@ -708,7 +709,7 @@ const AppChainEditor = {
 
     /* 按执行阶段Group（引导用户构建合理顺序） */
     const appGroups = computed(() => [
-      { label: t('— Early Media / Answer Phase —'), apps: ['pre_answer', 'playback', 'post_playback', 'sleep', 'answer', 'endless_playback', 'read', 'play_and_get_digits'] },
+      { label: t('— Early Media / Answer Phase —'), apps: ['pre_answer', 'ringback', 'playback', 'post_playback', 'sleep', 'answer', 'endless_playback', 'read', 'play_and_get_digits'] },
       { label: t('— Routing / Bridge Phase —'),        apps: ['bridge', 'transfer', 'att_xfer', 'conference', 'park'] },
       { label: t('— Variables / Control —'),            apps: ['set', 'uuid_break', 'gentones'] },
       { label: t('— Media / Recording —'),            apps: ['record'] },
@@ -721,10 +722,11 @@ const AppChainEditor = {
     const chain = ref([]);
 
     function appHint(name)  { return APP_DESCS[name] || ''; }
-    function needsData(name){ return ['playback','post_playback','endless_playback','sleep','bridge','transfer','conference','set','gentones','record','play_and_get_digits','read'].includes(name); }
+    function needsData(name){ return ['playback','ringback','post_playback','endless_playback','sleep','bridge','transfer','conference','set','gentones','record','play_and_get_digits','read'].includes(name); }
     function dataPlaceholder(name) {
       const H = {
         playback:             'welcome.wav or /path/to/file.wav',
+        ringback:             'ringback.wav (loops, auto-stops on answer)',
         post_playback:        'announce.wav',
         endless_playback:     'hold_music.wav',
         sleep:                '1500 (ms)',
@@ -733,7 +735,7 @@ const AppChainEditor = {
         conference:           'my_room@default',
         set:                  'var_name=value',
         gentones:             '1004,1500,800',
-        record:               '/var/recording/callid.wav',
+        record:               'start format=mp4 (or stop / start format=mp3|opus|wav)',
         play_and_get_digits:  'prompt.wav 3 5000',
         read:                 '5 10000',
       };

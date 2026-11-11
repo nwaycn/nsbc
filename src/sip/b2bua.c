@@ -19,6 +19,7 @@
 #include "log.h"
 #include "media_bug.h"
 #include "media_bridge.h"   /* REQ-ORIGINATE-003 &echo: bridge_lookup_relay + rtp_relay_set_echo */
+#include "playback_engine.h"  /* ringback app：LEG_CONFIRMED 接通点自动停放音 */
 #include "metric_reg.h"
 #include "nsbc_id.h"
 #include "recorder.h"
@@ -2367,6 +2368,8 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                     a->answer_len = m->body.len;
                 }
                 a->state = LEG_CONFIRMED;
+                /* ★ ringback：originate A 腿接通 → 停残留放音 */
+                pb_stop_if_playing(c);
                 send_ack_leg(c, 0);
                 call_unlock(c);
                 return;
@@ -2555,6 +2558,13 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                     c->leg[1].answer_len = abl;
                 }
                 c->leg[1].state = LEG_CONFIRMED;
+
+                /* ★ ringback：B 腿接通瞬间停掉 A 腿回铃音放音。
+                 * playback 场景不受影响（chain 里 playback 在 answer 前已
+                 * EOF 自然结束；残留放音在接通时切断也是正确语义）。
+                 * pb_stop_if_playing 内部 call_key 查 pb 表，不碰 b2bua
+                 * call lock，持锁调用无死锁风险。 */
+                pb_stop_if_playing(c);
 
                 /* 存 Bob 200 OK 的 Session-Expires 到 B leg（P0 透传 + P1 协商都需要） */
                 {
@@ -6242,6 +6252,8 @@ void b2b_on_rx(void *ud, sip_tr_proto_t proto, const nsbc_sa_t *src,
                                      c->leg[0].callid);
                             }
                             c->leg[0].state = LEG_CONFIRMED;
+                            /* ★ ringback：A 腿 ACK 双腿 CONFIRMED → 停残留放音（幂等兜底） */
+                            pb_stop_if_playing(c);
                             /* CDR ANSWER 幂等 */
                             if (c->answer_ms == 0) {
                                 c->answer_ms = now_ms();
