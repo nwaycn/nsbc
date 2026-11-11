@@ -150,18 +150,21 @@ loc_rc_t loc_upsert(loc_db_t *db, const loc_binding_t *b, uint64_t now_ms)
     loc_node_t *match = NULL;
     loc_node_t *lru = NULL;  /* 同 AoR 中 expire 最早的（LRU victim） */
     for (loc_node_t *p = aor->bindings; p; p = p->next) {
-        /* 同 Call-ID 属同一注册事务系列：CSeq 必须单调。先判次序，
-         * 再谈 contact 匹配，否则回退请求会被当刷新吞掉 */
-        if (!strcmp(p->b.callid, b->callid)) {
+        /* 同 Call-ID 属同一注册事务系列：
+         * - CSeq 回退 → LOC_STALE_CSEQ（拒绝）
+         * - CSeq 相同 → 幂等重传，覆盖
+         * - CSeq 更大 → 同一终端刷新/重连，**必须覆盖旧 binding**
+         *   否则 WebRTC 每次断线重连生成新的随机 contact，
+         *   但 Call-ID 不变 → 不覆盖 → 累积多条 → 触发 max 上限。 */
+        if (!strcmp(p->b.callid, b->callid) && p->b.callid[0]) {
             if (b->cseq < p->b.cseq) {
                 aor_unlink_empty(bucket, aor);
                 pthread_mutex_unlock(&s->lock);
                 return LOC_STALE_CSEQ; /* 同 Call-ID CSeq 回退：拒绝 */
             }
-            if (b->cseq == p->b.cseq) {
-                match = p; /* 同 CSeq：幂等重传 */
-                break;
-            }
+            /* 同 Call-ID：不管 CSeq 相同还是递增，都覆盖（同一终端刷新） */
+            match = p;
+            break;
         }
         if (!strcmp(p->b.contact, b->contact) ||
             (b->instance[0] && p->b.instance[0] &&

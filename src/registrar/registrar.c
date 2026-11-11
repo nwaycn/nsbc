@@ -1175,16 +1175,22 @@ reg_auth_ok:
         /* === FS max-registrations-per-extension=N：per-AoR binding 数上限 ===
          * 在 loc_upsert 之前查当前 AoR 有效 binding 数。
          * multiple_registrations=false 已在上面清空，所以上限检查只对允许多注册的场景生效。
-         * 达到上限时返回 403 + Warning（RFC 3261 §21.4.3）。 */
+         * 达到上限时返回 403 + Warning（RFC 3261 §21.4.3）。
+         *
+         * ★ BUG-FIX: dup 判断只看 contact 字符串 → WebRTC 场景每次断线重连
+         *   都生成新的随机 contact（sip:rand1@rand2.invalid;transport=ws），
+         *   永远不 dup → 累积多条 → 最终触发 max 上限。
+         *
+         *   现在 dup 判断 = contact 完全相同 OR 同一个 Call-ID（同一终端的刷新）。 */
         if (r->cfg.max_registrations_per_ext > 0 && r->cfg.multiple_registrations != 0) {
             loc_binding_t probe[32];
             int cur = loc_query(r->cfg.db, b.aor, probe, 32, now);
-            /* 当前 contact 若已存在 → upsert 会覆盖，不增加计数；
-             * 所以只在 cur >= max 且当前 contact 不重复时拒绝 */
             if (cur >= r->cfg.max_registrations_per_ext) {
                 int dup = 0;
                 for (int i = 0; i < cur; ++i) {
                     if (strcmp(probe[i].contact, b.contact) == 0) { dup = 1; break; }
+                    /* 同一个 Call-ID → 同一终端刷新（覆盖旧 binding） */
+                    if (b.callid[0] && strcmp(probe[i].callid, b.callid) == 0) { dup = 1; break; }
                 }
                 if (!dup) {
                     char extra[128];
