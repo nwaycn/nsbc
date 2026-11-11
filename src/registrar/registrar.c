@@ -1231,15 +1231,33 @@ reg_auth_ok:
         _rc = NSBC_OK; goto reg_out;
     }
 
-    /* 200 回显当前绑定 */
+    /* 200 回显当前绑定
+     * ★ BUG-FIX: 必须带顶层 Expires: N 头（RFC 3261 §10.2 明确要求）。
+     * 只在 Contact 里带 ;expires= 参数客户端不认——MicroSIP 等 UA
+     * 不看 Contact 里的 expires 参数，只看顶层 Expires 头。
+     * NAT 场景我们压短了 expires（如 300→120），但客户端按自己的
+     * 默认 300s 刷新 → binding 在 120s 后过期 → 客户端发现注册失效
+     * → 弹出"错误网关"。加上 Expires: 120 头告诉客户端新的有效期 →
+     * 客户端每 60s（120/2）刷新一次 → NAT 映射持续活跃。 */
     loc_binding_t list[16];
     int n = loc_query(r->cfg.db, aor, list, 16, now);
-    char extra[4096]; /* 扩大：hdr_prefix(1024) + Contact 链(3072) */
+    char extra[4096]; /* 扩大：Expires(32) + hdr_prefix(1024) + Contact 链(3072) */
     size_t used = 0;
     /* Service-Route + Path prepend */
     if (hdr_prefix[0]) {
         snprintf(extra, sizeof(extra), "%s", hdr_prefix);
         used = strlen(extra);
+    }
+    /* 顶层 Expires: N —— 取所有 binding 中最大的剩余有效期（RFC 3261 §10.2） */
+    long max_e = 0;
+    for (int i = 0; i < n; ++i) {
+        long e = (long)((list[i].expire_ms - now) / 1000);
+        if (e > max_e) max_e = e;
+    }
+    if (max_e > 0) {
+        int w = snprintf(extra + used, sizeof(extra) - used,
+                         "Expires: %ld\r\n", max_e);
+        if (w > 0) used += (size_t)w;
     }
     for (int i = 0; i < n; ++i) {
         long e = (long)((list[i].expire_ms - now) / 1000);
