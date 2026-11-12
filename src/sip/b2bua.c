@@ -2537,6 +2537,11 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
             if (st >= 200 && st < 300) {
                 const char *ab = m->body.p;
                 size_t abl = m->body.len;
+                /* ★ ASAN-FIX (stack-use-after-scope): buf 必须声明在 ab/abl 同一层，
+                 * 因为 inner block 里 hook 跑了之后 L2574 把 ab 指向 buf，
+                 * 然后 L2575 block 结束，L2577 memcpy 就用悬空指针了。
+                 * 移到外层后 buf 生命周期覆盖整个 200 OK answer 处理块。 */
+                char buf[B2B_SDP_MAX]; buf[0] = '\0';
                 if (m->body.len && m->body.len > B2B_SDP_MAX) {
                     finish_with_a_response(c, 488, NULL, 0);
                     call_unlock(c);
@@ -2552,7 +2557,7 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                  *   hook 回调指针在 init 时注册一次、shutdown 时 rm，运行期稳定，
                  *   快照语义完全安全。 */
                 if (m->body.len && g_sdp_hook_n[B2B_SDP_ANSWER] > 0) {
-                    char buf[B2B_SDP_MAX]; buf[0] = '\0';
+                    buf[0] = '\0';   /* 外层已声明，这里只重置 */
                     b2b_sdp_hook_slot_t hsnap[B2B_SDP_HOOK_MAX];
                     int hn;
                     pthread_mutex_lock(&g_sdp_hook_lock);
