@@ -179,6 +179,11 @@
       <div class="row" style="margin-bottom:4px">
         <span class="status" id="callStatus">Idle</span>
       </div>
+      <div class="row" style="flex-wrap:wrap;font-size:12px;color:#94a3b8;margin-bottom:8px">
+        <span style="margin-right:14px">📞 呼叫: <span id="tmCallStart" style="color:#cbd5e1">—</span></span>
+        <span style="margin-right:14px">⏱ 接续: <span id="tmPostDial" style="color:#cbd5e1">—</span></span>
+        <span>🟢 通话中: <span id="tmCallDur" style="color:#4ade80;font-variant-numeric:tabular-nums">—</span></span>
+      </div>
       <div id="dtmfDisplay"></div>
       <div class="dialpad">
         <button onclick="doDialKey('1')">1</button>
@@ -214,6 +219,6 @@
   </div>
 
 </div>
-<script src="js/nsbc-phone.js?v=20261018b"></script>
+<script src="js/nsbc-phone.js?v=20261112a"></script>
 </body>
 </html>

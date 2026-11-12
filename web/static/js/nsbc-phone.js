@@ -22,6 +22,56 @@ let remoteStream = null;
 let dc = null, dcOpen = false;
 let isHangingUp = false;
 
+// ============ 通话计时（呼叫时间 / 接续时长 / 通话时长）============
+const _tm = { callAt: 0, acceptAt: 0, ticker: null };
+function _fmtHHMMSS(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  const pad = n => n < 10 ? '0' + n : '' + n;
+  return (h > 0 ? h + ':' + pad(m) + ':' + pad(sec) : pad(m) + ':' + pad(sec));
+}
+function _fmtClock(ts) {
+  if (!ts) return '—';
+  const d = new Date(ts);
+  const pad = n => n < 10 ? '0' + n : '' + n;
+  return pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+}
+function _startCallTimer() {
+  _stopCallTimer();
+  _tm.ticker = setInterval(() => {
+    const el = document.getElementById('tmCallDur');
+    if (el && _tm.acceptAt) el.textContent = _fmtHHMMSS(Date.now() - _tm.acceptAt);
+  }, 1000);
+}
+function _stopCallTimer() {
+  if (_tm.ticker) { clearInterval(_tm.ticker); _tm.ticker = null; }
+}
+function _resetCallTimerUI() {
+  const a = document.getElementById('tmCallStart'); if (a) a.textContent = '—';
+  const b = document.getElementById('tmPostDial');   if (b) b.textContent = '—';
+  const c = document.getElementById('tmCallDur');    if (c) c.textContent = '—';
+  _tm.callAt = _tm.acceptAt = 0;
+  _stopCallTimer();
+}
+function _markCallStart() {
+  _resetCallTimerUI();
+  _tm.callAt = Date.now();
+  const el = document.getElementById('tmCallStart');
+  if (el) el.textContent = _fmtClock(_tm.callAt);
+  log('info', `⏱ 呼叫发起 ${_fmtClock(_tm.callAt)}`);
+}
+function _markCallAccepted() {
+  if (!_tm.callAt) _tm.callAt = Date.now();  // 兜底（callee 路径没有 outbound mark）
+  _tm.acceptAt = Date.now();
+  const postDial = _tm.acceptAt - _tm.callAt;
+  const a = document.getElementById('tmPostDial');
+  const d = document.getElementById('tmCallDur');
+  if (a) a.textContent = _fmtHHMMSS(postDial);
+  if (d) d.textContent = '00:00';
+  _startCallTimer();
+  log('ok', `⏱ 接续完成，Post-Delay=${_fmtHHMMSS(postDial)} 通话开始计时`);
+}
+
 // ============ Ringing音（Web Audio 合成，无需外部文件） ============
 // 经典 440+480Hz 双音Ringing（Bell 风格），2s on / 4s off 循环
 let _ringAC = null, _ringTimer = null, _ringGain = null;
@@ -511,6 +561,7 @@ function makeSessionHandlers(isCallee) {
 function onSessionConfirmed(session, isCallee) {
   currentSession = session;
   pendingSession = null;
+  _markCallAccepted();   // ★ 应答/Established：接续时长锁定 + 通话计时开始
   const cs = $('callStatus'); if (cs) cs.textContent = 'Active ✅';
   const bh = $('btnHang'); if (bh) bh.disabled = false;
   const inc = $('incoming'); if (inc) inc.classList.remove('show');
@@ -658,6 +709,7 @@ async function doRegister() {
       if (e.originator === 'remote') {
         log('warn', `📞 INCOMING from ${from}`);
         pendingSession = session;
+        _markCallStart();    // ★ Incoming 收到 INVITE → 被叫侧呼叫时间戳
         const inf = $('inFrom'); if (inf) inf.textContent = from;
         const inc = $('incoming'); if (inc) inc.classList.add('show');
         bindSessionNonPC(session, true, false);
@@ -708,6 +760,7 @@ async function doCall() {
   if (!target.includes('@')) target = target + '@' + getSipDomain();
 
   log('tx', `📤 INVITE → ${target}`);
+  _markCallStart();    // ★ Outgoing 发起 INVITE → 呼叫时间戳
   const cs = $('callStatus'); if (cs) cs.textContent = 'Calling...';
   const bc = $('btnCall'); if (bc) bc.disabled = true;
 
@@ -806,7 +859,14 @@ async function doHangup() {
 
 function onCallEnd(reason) {
   _destroyRingTone();   // ★ 彻底停Ringing + 关闭 AudioContext，防止资源残留
-  log('info', 'CALL END: ' + reason);
+  _stopCallTimer();     // ★ 停通话计时
+  if (_tm.callAt && _tm.acceptAt) {
+    const dur = Date.now() - _tm.acceptAt;
+    log('info', `📴 CALL END: ${reason}  通话时长=${_fmtHHMMSS(dur)}`);
+  } else {
+    log('info', 'CALL END: ' + reason);
+  }
+  _resetCallTimerUI();  // ★ 清除计时 UI
   const cs = $('callStatus'); if (cs) cs.textContent = 'Idle';
   const bc = $('btnCall'); if (bc) bc.disabled = !ua;
   const bh = $('btnHang'); if (bh) bh.disabled = true;
