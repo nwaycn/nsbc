@@ -20,6 +20,7 @@
 #include "media_bug.h"
 #include "media_codec.h"   /* codec registry + transcode engine */
 #include "rtp_reasm.h"     /* M1: H.264 RTP 重组器（视频录制前置） */
+#include "media_video.h"   /* P0: video_build_pli — RTCP PLI 关键帧请求 */
 #include "recorder.h"      /* M1: rec_feed_video —— 视频帧喂录音 sess */
 #ifdef NSBC_WITH_OPENSSL
 #include "openssl_compat.h" /* NSBC_OPENSSL_HAS_DTLS_FEED 版本探测（先于 dtls_srtp.h） */
@@ -681,6 +682,38 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
                                    pkt.payload, pkt.payload_len,
                                    pkt.marker, pkt.seq, pkt.ts,
                                    nsbc_now_ms());
+
+                    /* ★ P0：vid_reasm 检测到 seq gap / frame_drop → 请求 RTCP PLI
+                     *   Chrome SVC WebRTC 只发初始 IDR，丢包后参考链永久断裂 → 花屏。
+                     *   发 PLI 请求新关键帧，Chrome 收到后立即发新 IDR → 参考链重置。
+                     *   限频：同 side 间隔 ≥ 2 秒才发（避免淹没 RTCP 通道）。 */
+                    if (vid_reasm_consume_pli_request(r->node->vid_reasm[side])) {
+                        static uint64_t last_pli_ms[2] = {0};
+                        uint64_t now = nsbc_now_ms();
+                        if (now - last_pli_ms[side] >= 2000) {
+                            last_pli_ms[side] = now;
+                            uint8_t pli_buf[64];
+                            size_t pli_len = 0;
+                            if (video_build_pli(pkt.ssrc, 0, pli_buf, sizeof(pli_buf), &pli_len) == NSBC_OK) {
+                                uint8_t pli_send[64];
+                                size_t pli_send_len = pli_len;
+                                memcpy(pli_send, pli_buf, pli_len);
+                                if (r->srtp[side]) {
+                                    nsbc_srtp_protect_rtcp(r->srtp[side], pli_send, &pli_send_len, sizeof(pli_send));
+                                }
+                                const nsbc_sa_t *dst = r->latched[side] ? &r->latch[side]
+                                                     : (r->have_peer[side] ? &r->peer[side]
+                                                     : &r->latch[side]);
+                                if (dst->ss.ss_family != AF_UNSPEC && dst->len > 0) {
+                                    ssize_t pret = sendto(r->fd_rtp[side], pli_send, pli_send_len, MSG_NOSIGNAL,
+                                                          (const struct sockaddr *)&dst->ss, dst->len);
+                                    llog(LOG_INFO, "relay",
+                                         "★ PLI_SENT side=%d media_ssrc=0x%08x send_len=%zu ret=%zd",
+                                         side, pkt.ssrc, pli_send_len, pret);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

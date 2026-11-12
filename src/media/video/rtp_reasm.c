@@ -29,6 +29,7 @@ struct vid_reasm {
     int            in_fu;      /* 1 = FU-A 分片进行中（S 已见 E 未到） */
     vid_frame_cb_t cb;
     void          *ud;
+    int            need_pli;   /* 1 = 上次丢包导致 frame_drop，上层应发 RTCP PLI 请求新 IDR */
 };
 
 /* ---------- 内部 append helpers（返回 0=OK, -1=溢出） ---------- */
@@ -87,6 +88,8 @@ static void frame_drop(vid_reasm_t *r)
     r->in_fu    = 0;
     /* ★ have_ts/r->ts 刻意保留：dropping 恢复靠"新 timestamp = 新帧"检测，
      * 清掉会把恢复路径降级成"只能等 marker"——丢尾包时整条流冻结。 */
+    /* ★ P0：任何 frame_drop 都意味着解码器参考链可能断裂 → 请求 RTCP PLI */
+    r->need_pli = 1;
 }
 
 /* ---------- lifecycle ---------- */
@@ -160,7 +163,7 @@ void vid_reasm_feed(vid_reasm_t *r, const uint8_t *payload, size_t len,
         if (diff == 0)
             return;              /* 重复包 —— 不落盘不丢帧 */
         if (diff < 0 || diff > 1) {
-            frame_drop(r);
+            frame_drop(r);       /* frame_drop 内统一设 need_pli=1 */
             return;
         }
     }
@@ -270,4 +273,12 @@ void vid_reasm_feed(vid_reasm_t *r, const uint8_t *payload, size_t len,
         else
             frame_flush(r);
     }
+}
+
+int vid_reasm_consume_pli_request(vid_reasm_t *r)
+{
+    if (r == NULL) return 0;
+    int v = r->need_pli;
+    r->need_pli = 0;
+    return v;
 }

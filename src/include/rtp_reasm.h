@@ -34,6 +34,11 @@ void vid_reasm_destroy(vid_reasm_t *r);
 void vid_reasm_feed(vid_reasm_t *r, const uint8_t *payload, size_t len,
                     int marker, uint16_t seq, uint32_t ts, uint64_t now_ms);
 
+/* 消费丢包事件：返回 1 表示上次 frame_drop 是因为 seq 丢失/乱序/FU 截断，
+ * 上层应发 RTCP PLI 请求新 IDR 关键帧；返回 0 表示正常。
+ * 调用后自动清掉标志（一次性）。 */
+int vid_reasm_consume_pli_request(vid_reasm_t *r);
+
 #ifdef __cplusplus
 }
 #endif

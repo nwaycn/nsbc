@@ -5,6 +5,7 @@
  * 端口：视频/屏幕辅流（H.239 式 content）为独立 m 段，端口表各分配。
  */
 #include "media_video.h"
+#include <arpa/inet.h>   /* htonl */
 
 struct video_fwd {
     video_stream_t s;
@@ -59,15 +60,34 @@ int video_fwd_on_packet(video_fwd_t *v, const rtp_pkt_t *pkt, uint8_t *out, size
 
 int video_build_pli(uint32_t media_ssrc, uint32_t src_ssrc, uint8_t *out, size_t cap, size_t *out_len)
 {
-    /* TODO(P3)：RFC4585 通用 NACK 头 V=2/P/FMT=1/PT=PSFB(206)，
-     * 体仅 SSRC 字段（12B 反馈头），FCI 空。 */
-    (void)media_ssrc;
-    (void)src_ssrc;
-    (void)cap;
+    /* RFC 4585 §6.1: PLI = Picture Loss Indication
+     *   0                   1                   2                   3
+     *   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+     * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+     * |V=2|P| FMT=1   | PT=206(PSFB) |         length=2              |
+     * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+     * |                        Sender SSRC                            |
+     * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+     * |                         Media SSRC                            |
+     * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+     * 总 12 字节，无 FCI（Feedback Control Information）。 */
     if (out == NULL || out_len == NULL)
         return NSBC_INVAL;
-    *out_len = 0;
-    return NSBC_NOTSUP;
+    if (cap < 12)
+        return NSBC_NOSPC;
+
+    out[0] = 0x81;                 /* V=2, P=0, FMT=1 (PLI) */
+    out[1] = 206;                  /* PT=PSFB */
+    out[2] = 0x00;                 /* length high */
+    out[3] = 0x02;                 /* length low (32-bit words - 1) */
+
+    uint32_t s = htonl(src_ssrc);      /* Sender SSRC (nsbcd) */
+    uint32_t m = htonl(media_ssrc);    /* Media SSRC (Chrome) */
+    memcpy(out + 4, &s, 4);
+    memcpy(out + 8, &m, 4);
+
+    *out_len = 12;
+    return NSBC_OK;
 }
 
 int video_build_fir(uint32_t media_ssrc, uint32_t src_ssrc, uint8_t seq, uint8_t *out, size_t cap, size_t *out_len)
