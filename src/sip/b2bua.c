@@ -3367,11 +3367,19 @@ static void send_bye_leg(b2b_call_t *c, int leg)
         }
     }
 
+    char bye_dst_ip[INET6_ADDRSTRLEN] = {0};
+    uint16_t bye_dst_port = 0;
+    sa_ip_copy(&l->dst, bye_dst_ip, sizeof(bye_dst_ip));
+    if (l->dst.ss_family == AF_INET)
+        bye_dst_port = ntohs(((const struct sockaddr_in *)&l->dst.ss)->sin_port);
+    else if (l->dst.ss_family == AF_INET6)
+        bye_dst_port = ntohs(((const struct sockaddr_in6 *)&l->dst.ss)->sin6_port);
+
     llog(LOG_INFO, "b2b",
          "★BYE_SEND leg=%d cseq=%ld branch=%s from_tag=[%s] to_tag=[%s] "
          "dst=%s:%d reliable=%d",
          leg, cs, branch, check_from_tag, check_to_tag,
-         co->cfg.local_host, co->cfg.local_udp_port, l->reliable);
+         bye_dst_ip, bye_dst_port, l->reliable);
 
     /* ★ 关键一致性检查：From tag 和 To tag 不应该相同！
      * 如果相同说明 build_dlg_req 里 tag 方向搞反了 → 对端 481 */
