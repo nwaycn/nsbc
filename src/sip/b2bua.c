@@ -5225,20 +5225,34 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                  "★BYE_FWD: leg=%d other=%d (state=%d) → send_bye_leg(other)",
                  leg, other, c->leg[other].state);
             send_bye_leg(c, other);
+            /* ★ 关键：send_bye_leg 返回后立即 call_destroy，
+             * 不等待另一腿的 BYE 200 OK 响应。
+             *
+             * RFC 3261 §15.3：B2BUA 作为 BYE UAS（收到 leg 的 BYE）回 200 OK 后
+             * 立即进入 TERMINATED — 这侧 dialog 已被确认结束。作为 BYE UAC
+             * 发 BYE 给另一腿只是 best-effort 礼貌通知，不应该阻塞 call 销毁。
+             *
+             * 历史 bug：之前等 cli_tu 回调才 call_destroy → 另一腿不回 BYE
+             * 就永久挂死。实锤复现：Call db1f0ae2 (WebRTC→SIP) BYE 发给
+             * leg=0 reliable=0 UDP dst=10.0.0.80:5060 (错了，应该是远端 SIP UA)
+             * → 永远等不到 200 OK → cli_tu 永不触发 → 挂死。
+             *
+             * send_bye_leg 返回时 BYE NICT 已被 txn_client_new 立即发送，
+             * 网络上已经有了（best-effort）。call_destroy 会 detach/out_txn，
+             * 但 BYE 报文已经发出，对端有机会收到并回 200 OK（只是我们不再等）。
+             */
+            llog(LOG_INFO, "b2b",
+                 "★BYE_DESTROY_IMMED: leg=%d other=%d → call_destroy (BYE best-effort sent)",
+                 leg, other);
         } else {
             llog(LOG_INFO, "b2b",
                  "★BYE_IMMEDIATE_DESTROY: leg=%d other=%d state=%d (NOT CONFIRMED) → call_destroy",
                  leg, other, c->leg[other].state);
-            c->leg[other].state = LEG_TERMINATED;
-            c->leg[leg].state = LEG_TERMINATED;
-            call_unlock(c);
-            call_destroy(c);
-            return;
         }
-        /* 注意：不设 leg[leg].state = LEG_TERMINATED — 保留 TERMINATING
-         * 状态让 cli_tu 在对端 BYE 200 OK 回来时能通过条件检查
-         * （cli_tu 用 IS_BYE_OUT 统一判定）。 */
+        c->leg[other].state = LEG_TERMINATED;
+        c->leg[leg].state = LEG_TERMINATED;
         call_unlock(c);
+        call_destroy(c);
         return;
     }
 
