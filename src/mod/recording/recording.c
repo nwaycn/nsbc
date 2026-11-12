@@ -215,27 +215,33 @@ static int ffmpeg_convert_av(const char *wav_path,
              * h264_a 输入 index=1（A leg 放左），h264_b 输入 index=2（B leg 放右）
              * filter_complex: 两路缩放到相同高度 720p，然后 hstack 左右拼接
              * scale=-2:720 — 宽度按比例缩放但对齐偶数（libx264 要求）
-             * ★ P0：-framerate 帧率/音频时长 —— raw .h264 无时间戳，默认 25fps
-             *   demux 会把变速率流压短 → hstack 输入提前 EOF → 画面静止。
+             * ★ P0 时间轴修复（2026-11-12 现场实验实锤）：
+             *   raw .h264 的 demux 帧率由浏览器 SPS VUI 决定（实测 60fps），
+             *   `-framerate` 输入选项会被它覆盖（实测无效）→ 1511 帧被压进
+             *   25.2s，合成视频 25s 后两腿全冻结（音频 50.8s）。
+             *   setpts=N/(fps*TB) 按帧序号重排 PTS：帧 i 的 PTS 恒为 i/fps，
+             *   完全无视 SPS 标称帧率 —— 实验验证 1510 帧 → 60.4s ✓。
+             *   fps = 帧数/音频时长（wav_duration_sec + rec_video_frames）。
              * ★ P0：argv 数组按实项数配额（原 [24] 实写 27 项 = 子进程栈溢出）。 */
             char fa[16], fb[16];
             snprintf(fa, sizeof(fa), "%.3f", fps_a > 0 ? fps_a : 25.0);
             snprintf(fb, sizeof(fb), "%.3f", fps_b > 0 ? fps_b : 25.0);
+            char filt[256];
+            snprintf(filt, sizeof(filt),
+                     "[1:v]setpts=N/(%.3f*TB),scale=-2:720[a];"
+                     "[2:v]setpts=N/(%.3f*TB),scale=-2:720[b];"
+                     "[a][b]hstack=inputs=2[vout]", fa, fb);
             char *argv[36]; int ai = 0;
             argv[ai++] = (char *)"ffmpeg";
             argv[ai++] = (char *)"-y";
             argv[ai++] = (char *)"-i";
             argv[ai++] = (char *)wav_path;
-            argv[ai++] = (char *)"-framerate";
-            argv[ai++] = fa;
             argv[ai++] = (char *)"-i";
             argv[ai++] = (char *)h264_a;
-            argv[ai++] = (char *)"-framerate";
-            argv[ai++] = fb;
             argv[ai++] = (char *)"-i";
             argv[ai++] = (char *)h264_b;
             argv[ai++] = (char *)"-filter_complex";
-            argv[ai++] = (char *)"[1:v]scale=-2:720[a];[2:v]scale=-2:720[b];[a][b]hstack=inputs=2[vout]";
+            argv[ai++] = filt;
             argv[ai++] = (char *)"-map";
             argv[ai++] = (char *)"0:a";
             argv[ai++] = (char *)"-map";
@@ -257,26 +263,33 @@ static int ffmpeg_convert_av(const char *wav_path,
             execvp("ffmpeg", argv);
             _exit(127);
         } else {
-            /* ======== 单视频 copy 路径（零损失）========
-             * ★ -framerate 同双视频路径 —— 变速率流不能按默认 25fps demux */
+            /* ======== 单视频路径（libx264 重编码）========
+             * ★ 原 copy 直存有同样的 25s 冻结问题（SPS VUI demux 帧率压缩
+             *   时间轴），copy 无法重排 PTS → 必须重编码走 setpts（与 dual 同方案）。 */
             const char *h264 = (h264_a && h264_a[0]) ? h264_a : h264_b;
             char fa[16];
             snprintf(fa, sizeof(fa), "%.3f", fps_v > 0 ? fps_v : 25.0);
+            char filt[96];
+            snprintf(filt, sizeof(filt), "setpts=N/(%.3f*TB)", fa);
             char *argv[28]; int ai = 0;
             argv[ai++] = (char *)"ffmpeg";
             argv[ai++] = (char *)"-y";
             argv[ai++] = (char *)"-i";
             argv[ai++] = (char *)wav_path;
-            argv[ai++] = (char *)"-framerate";
-            argv[ai++] = fa;
             argv[ai++] = (char *)"-i";
             argv[ai++] = (char *)h264;
             argv[ai++] = (char *)"-map";
             argv[ai++] = (char *)"0:a";
             argv[ai++] = (char *)"-map";
             argv[ai++] = (char *)"1:v";
+            argv[ai++] = (char *)"-vf";
+            argv[ai++] = filt;
             argv[ai++] = (char *)"-c:v";
-            argv[ai++] = (char *)"copy";
+            argv[ai++] = (char *)"libx264";
+            argv[ai++] = (char *)"-preset";
+            argv[ai++] = (char *)"veryfast";
+            argv[ai++] = (char *)"-crf";
+            argv[ai++] = (char *)"23";
             argv[ai++] = (char *)"-c:a";
             argv[ai++] = (char *)"aac";
             argv[ai++] = (char *)"-b:a";
@@ -524,10 +537,10 @@ static app_rc_t app_record_exec(app_ctx_t *c, const char *data, void *ud)
                 llog(LOG_INFO, "rec", "app_record AV-MUX leg=%d dur=%.1fs frames=%llu fps=%.2f",
                      leg, dur, (unsigned long long)vframes, fps);
                 if (ffmpeg_convert_av(final_path, video_path, NULL, fps, fps, out_path) == NSBC_OK) {
-                    llog(LOG_INFO, "rec", "app_record AV-MUX callid=%s leg=%d → mp4",
-                         call->leg[0].callid, leg);
-                    unlink(final_path);  /* 删中间 WAV */
-                    unlink(video_path);  /* 删中间 H.264 */
+                    /* 调试期保留中间文件（同 stop 路径说明） */
+                    llog(LOG_INFO, "rec",
+                         "app_record AV-MUX callid=%s leg=%d → mp4 (intermediates kept: %s, %s)",
+                         call->leg[0].callid, leg, final_path, video_path);
                 } else {
                     llog(LOG_WARN, "rec",
                          "app_record AV-MUX failed callid=%s leg=%d — keeping WAV+H264",
@@ -750,9 +763,10 @@ int recording_apply_dp_action(rec_mgr_t *mgr, uint8_t rec_action,
             snprintf(mix_path, sizeof(mix_path), "%s/%s", mix_dir, mix_name);
 
             if (merge_stereo_wav(a_path, b_path, mix_path) == NSBC_OK) {
-                llog(LOG_INFO, "rec", "recording MERGE callid=%s mix=%s", callid, mix_path);
-                unlink(a_path);
-                unlink(b_path);
+                /* ★ 调试期保留 mono A/B WAV —— 音频问题定位需逐腿对照 */
+                llog(LOG_INFO, "rec",
+                     "recording MERGE callid=%s mix=%s (mono kept: %s, %s)",
+                     callid, mix_path, a_path, b_path);
 
                 /* ★ M1+ 视频轨优先：mix WAV + 一或两条 H.264 → mp4
                  * 无视 live_fmt —— 视频必须 mp4 容器；h264_b 存在则合成双 video track */
@@ -777,10 +791,14 @@ int recording_apply_dp_action(rec_mgr_t *mgr, uint8_t rec_action,
                                                   fps_a, fps_b,
                                                   final_path);
                     if (rc_av == NSBC_OK) {
-                        llog(LOG_INFO, "rec", "recording AV-MUX callid=%s → mp4", callid);
-                        unlink(mix_path);   /* 删中间 WAV */
-                        if (video_paths[0][0]) unlink(video_paths[0]);
-                        if (video_paths[1][0]) unlink(video_paths[1]);
+                        /* ★ 调试期保留中间文件（mix WAV + 两条腿 .h264）：
+                         * 录音问题定位全靠中间产物对照（2026-11-12 两轮取证
+                         * 均因中间文件被删而受阻）。功能调稳后恢复删除。 */
+                        llog(LOG_INFO, "rec",
+                             "recording AV-MUX callid=%s → mp4 (intermediates kept: %s, %s, %s)",
+                             callid, mix_path,
+                             video_paths[0][0] ? video_paths[0] : "-",
+                             video_paths[1][0] ? video_paths[1] : "-");
                         if (rec_path_out && path_cap > 0)
                             snprintf(rec_path_out, path_cap, "%s", strip_base_dir(final_path, bd));
                     } else {
@@ -798,8 +816,7 @@ int recording_apply_dp_action(rec_mgr_t *mgr, uint8_t rec_action,
                     if (dot) snprintf(dot, sizeof(final_path) - (dot - final_path), ".%s", target_ext);
 
                     if (ffmpeg_convert(mix_path, final_path, live_fmt) == NSBC_OK) {
-                        llog(LOG_INFO, "rec", "recording CONVERT callid=%s → .%s", callid, target_ext);
-                        unlink(mix_path);  /* 删中间 WAV */
+                        llog(LOG_INFO, "rec", "recording CONVERT callid=%s → .%s (mix kept)", callid, target_ext);
                         if (rec_path_out && path_cap > 0)
                             snprintf(rec_path_out, path_cap, "%s", strip_base_dir(final_path, bd));
                     } else {
@@ -848,10 +865,9 @@ int recording_apply_dp_action(rec_mgr_t *mgr, uint8_t rec_action,
                                               fps_same, fps_other,
                                               final_path);
                 if (rc_av == NSBC_OK) {
-                    llog(LOG_INFO, "rec", "recording AV-MUX mono callid=%s → mp4", callid);
-                    unlink(audio);
-                    if (video_paths[0][0]) unlink(video_paths[0]);
-                    if (video_paths[1][0]) unlink(video_paths[1]);
+                    /* 调试期保留中间文件（同上） */
+                    llog(LOG_INFO, "rec",
+                         "recording AV-MUX mono callid=%s → mp4 (intermediates kept)", callid);
                     if (rec_path_out && path_cap > 0)
                         snprintf(rec_path_out, path_cap, "%s", strip_base_dir(final_path, bd));
                 } else {

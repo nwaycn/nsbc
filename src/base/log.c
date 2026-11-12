@@ -341,7 +341,13 @@ static void *logger_main(void *arg)
             break;
         }
         struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
+        /* ★ P0：与 g_cond 的 MONOTONIC 时钟配对（见 log_init）。
+         * 原实现用 CLOCK_REALTIME：NTP 校时把系统时钟回拨后，
+         * timedwait 的绝对截止点落到"未来"，logger 线程长睡不醒 →
+         * ring 不再 drain → 主日志断流，而 audit 直写/业务全正常
+         * （2026-11-12 现场 gdb 实锤：logger 卡在 g_cond 的
+         * FUTEX_CLOCK_REALTIME futex 等待，主日志停写 20+ 分钟）。 */
+        clock_gettime(CLOCK_MONOTONIC, &ts);
         ts.tv_nsec += 5 * 1000000L;
         if (ts.tv_nsec >= 1000000000L) {
             ts.tv_nsec -= 1000000000L;
@@ -395,6 +401,15 @@ int log_init(const char *path, log_level_t level, uint32_t ring_slots)
     }
     g_fd = nfd;
     g_running = 1;
+    /* ★ P0 RACE-FIX：cond 时钟切到 CLOCK_MONOTONIC —— timedwait 的超时
+     * 与系统墙上时钟解耦，NTP 回拨/校时不再让 logger 线程睡过头。 */
+    {
+        pthread_condattr_t cattr;
+        pthread_condattr_init(&cattr);
+        pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC);
+        pthread_cond_init(&g_cond, &cattr);
+        pthread_condattr_destroy(&cattr);
+    }
     pthread_once(&g_key_once, key_once);
     if (pthread_create(&g_thr, NULL, logger_main, NULL) != 0) {
         g_running = 0;
