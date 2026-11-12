@@ -230,6 +230,19 @@ static int ffmpeg_convert_av(const char *wav_path,
                      "[a][b]hstack=inputs=2[vout]",
                      fps_a > 0 ? fps_a : 25.0,
                      fps_b > 0 ? fps_b : 25.0);
+            /* ★ P0：Chrome SVC WebRTC 正常只发初始 IDR，后续依赖 RTCP PLI 请求
+             *   新关键帧（nsbcd 未实现 PLI）→ sidecar 里只有 1 个 IDR 覆盖全程。
+             *   任何 P 帧丢弃都会导致后续解码链断裂 → 花屏到底。
+             *   解决：libx264 重编码时强制关键帧间隔 = 输出 fps
+             *   （每秒一个关键帧），重编码层面兜底花屏恢复。
+             *   取两路 fps 较大值作输出关键帧间隔，防止较低 fps 一侧
+             *   关键帧间隔过长。 */
+            int keyint_a = (int)(fps_a > 0 ? fps_a : 25.0);
+            int keyint_b = (int)(fps_b > 0 ? fps_b : 25.0);
+            int keyint = keyint_a > keyint_b ? keyint_a : keyint_b;
+            char gstr[16], kstr[16];
+            snprintf(gstr, sizeof(gstr), "%d", keyint);
+            snprintf(kstr, sizeof(kstr), "%d", keyint);
             char *argv[36]; int ai = 0;
             argv[ai++] = (char *)"ffmpeg";
             argv[ai++] = (char *)"-y";
@@ -251,6 +264,10 @@ static int ffmpeg_convert_av(const char *wav_path,
             argv[ai++] = (char *)"veryfast";
             argv[ai++] = (char *)"-crf";
             argv[ai++] = (char *)"23";
+            argv[ai++] = (char *)"-g";
+            argv[ai++] = gstr;
+            argv[ai++] = (char *)"-keyint_min";
+            argv[ai++] = kstr;
             argv[ai++] = (char *)"-c:a";
             argv[ai++] = (char *)"aac";
             argv[ai++] = (char *)"-b:a";
@@ -269,7 +286,12 @@ static int ffmpeg_convert_av(const char *wav_path,
             char filt[96];
             snprintf(filt, sizeof(filt), "setpts=N/(%.3f*TB)",
                      fps_v > 0 ? fps_v : 25.0);
-            char *argv[28]; int ai = 0;
+            /* ★ 同 dual 路径强制关键帧（Chrome SVC 只发初始 IDR 兜底） */
+            int keyint_s = (int)(fps_v > 0 ? fps_v : 25.0);
+            char gstr[16], kstr[16];
+            snprintf(gstr, sizeof(gstr), "%d", keyint_s);
+            snprintf(kstr, sizeof(kstr), "%d", keyint_s);
+            char *argv[32]; int ai = 0;
             argv[ai++] = (char *)"ffmpeg";
             argv[ai++] = (char *)"-y";
             argv[ai++] = (char *)"-i";
@@ -288,6 +310,10 @@ static int ffmpeg_convert_av(const char *wav_path,
             argv[ai++] = (char *)"veryfast";
             argv[ai++] = (char *)"-crf";
             argv[ai++] = (char *)"23";
+            argv[ai++] = (char *)"-g";
+            argv[ai++] = gstr;
+            argv[ai++] = (char *)"-keyint_min";
+            argv[ai++] = kstr;
             argv[ai++] = (char *)"-c:a";
             argv[ai++] = (char *)"aac";
             argv[ai++] = (char *)"-b:a";

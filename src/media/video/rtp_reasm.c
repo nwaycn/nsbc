@@ -46,6 +46,17 @@ static int raw_append(vid_reasm_t *r, const uint8_t *p, size_t n)
 static int annexb_append(vid_reasm_t *r, const uint8_t *nal, size_t n)
 {
     static const uint8_t sc[4] = { 0, 0, 0, 1 };
+    /* ★ AUD 预注入：裸流 demux 帧边界歧义根因 —— WebRTC SVC 编码输出只有
+     *   初始 IDR，后续依赖 RTCP PLI 请求才发新关键帧。Chrome 在 SVC 模式下
+     *   每帧带 Prefix NAL (type=14)，但 ffmpeg demux Annex-B 裸流时帧边界
+     *   判定不稳定，帧间无标记会导致粘帧/拆帧 → 解码器花屏。
+     *   AUD (type=9) 是 H.264 标准的帧边界显式标记，告诉 demux "这就是
+     *   一个 access unit 的开始"。只在帧首 NAL (len==0) 时注入。 */
+    if (r->len == 0) {
+        static const uint8_t aud[5] = { 0, 0, 0, 1, 9 };
+        if (r->cap < sizeof(aud) + 4 + n) return -1;
+        if (raw_append(r, aud, sizeof(aud)) != 0) return -1;
+    }
     if (r->len + 4 + n > r->cap) return -1;
     if (raw_append(r, sc, 4) != 0) return -1;
     return raw_append(r, nal, n);
@@ -214,6 +225,14 @@ void vid_reasm_feed(vid_reasm_t *r, const uint8_t *payload, size_t len,
             if (r->in_fu) {  /* 上个 FU-A 还没 E 就来了新 S —— 截断，丢整帧 */
                 frame_drop(r);
                 return;
+            }
+            /* ★ AUD 预注入（帧首 FU-A：同 annexb_append 逻辑） */
+            if (r->len == 0) {
+                static const uint8_t aud[5] = { 0, 0, 0, 1, 9 };
+                if (raw_append(r, aud, sizeof(aud)) != 0) {
+                    frame_drop(r);
+                    return;
+                }
             }
             const uint8_t nal_hdr = (uint8_t)((payload[0] & 0xE0) | (fu_hdr & 0x1F));
             static const uint8_t sc[4] = { 0, 0, 0, 1 };
