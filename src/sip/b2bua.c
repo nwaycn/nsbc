@@ -3367,13 +3367,15 @@ static void send_bye_leg(b2b_call_t *c, int leg)
         }
     }
 
-    char bye_dst_ip[INET6_ADDRSTRLEN] = {0};
-    uint16_t bye_dst_port = 0;
-    sa_ip_copy(&l->dst, bye_dst_ip, sizeof(bye_dst_ip));
-    if (l->dst.ss_family == AF_INET)
-        bye_dst_port = ntohs(((const struct sockaddr_in *)&l->dst.ss)->sin_port);
-    else if (l->dst.ss_family == AF_INET6)
-        bye_dst_port = ntohs(((const struct sockaddr_in6 *)&l->dst.ss)->sin6_port);
+    char bye_dst_ip[INET6_ADDRSTRLEN] = "";
+    uint16_t bye_dst_port = nsbc_sa_port(&l->dst);
+    if (l->dst.ss.ss_family == AF_INET) {
+        inet_ntop(AF_INET, &((const struct sockaddr_in *)&l->dst.ss)->sin_addr,
+                  bye_dst_ip, sizeof(bye_dst_ip));
+    } else if (l->dst.ss.ss_family == AF_INET6) {
+        inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)&l->dst.ss)->sin6_addr,
+                  bye_dst_ip, sizeof(bye_dst_ip));
+    }
 
     llog(LOG_INFO, "b2b",
          "★BYE_SEND leg=%d cseq=%ld branch=%s from_tag=[%s] to_tag=[%s] "
