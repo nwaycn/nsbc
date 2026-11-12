@@ -108,6 +108,11 @@ int  rec_feed_video(rec_sess_t *s, const uint8_t *annexb, size_t len,
  * 必须在 rec_stop 之前调用 —— rec_stop 会 free sess。 */
 const char *rec_video_path(const rec_sess_t *s);
 
+/* M1：返回落盘成功的视频帧数（writer 线程计数）。
+ * ffmpeg 合成时用它换算真实 fps（raw .h264 无时间戳，默认按 25fps demux
+ * 会把变速率流压短 → 画面提前静止）。必须在 rec_stop 之前调用。 */
+uint64_t rec_video_frames(const rec_sess_t *s);
+
 /* M1：全局 rec_writer 线程（16 线程清单）—— recording_init/fini 调用 */
 int  rec_video_writer_start(void);
 void rec_video_writer_stop(void);

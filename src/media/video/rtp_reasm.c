@@ -6,8 +6,9 @@
  *
  * 快路径零 malloc：buffer 在 create 时一次性分配（bridge_confirm 控制路径）。
  * 帧判定：marker=1 或 ts 变化；100ms 无 marker 超时强制 flush；
- *         512KB 帧上限 + seq 回退 → 丢整帧（dropping 模式等下一个 marker/新 ts）。
- */
+ *         512KB 帧上限 + seq 回退/丢失/重复 → 丢整帧（dropping 模式等下一个 marker/新 ts）。
+ * ★ P0 修复：seq 丢失（gap>1）检测 —— 无重传/无 FEC 链路上半截 NAL 落盘
+ *   会打断裂码器参考链（花屏 + 后续画面冻结），必须丢整帧。 */
 
 #include "rtp_reasm.h"
 #include "log.h"
@@ -65,9 +66,10 @@ static void frame_flush(vid_reasm_t *r)
 static void frame_drop(vid_reasm_t *r)
 {
     r->len      = 0;
-    r->have_ts  = 0;
     r->dropping = 1;
     r->in_fu    = 0;
+    /* ★ have_ts/r->ts 刻意保留：dropping 恢复靠"新 timestamp = 新帧"检测，
+     * 清掉会把恢复路径降级成"只能等 marker"——丢尾包时整条流冻结。 */
 }
 
 /* ---------- lifecycle ---------- */
@@ -104,28 +106,43 @@ void vid_reasm_feed(vid_reasm_t *r, const uint8_t *payload, size_t len,
     if (r == NULL || payload == NULL || len < 2) return;
 
     /* dropping 恢复：marker = 坏帧的尾包（连同它一起丢）；
-     * 新 timestamp = 新帧开始（从这包重新积累） */
+     * 新 timestamp = 新帧开始（从这包重新积累）。
+     * ★ 恢复时必须重置 have_seq：last_seq 停在坏帧附近，残留旧基准会把
+     *   恢复帧的首包再判成 gap>1 → 再次 frame_drop → 无限循环冻结。 */
     if (r->dropping) {
         if (marker) {
             r->dropping = 0;
             r->len      = 0;
             r->have_ts  = 0;
+            r->have_seq = 0;
             return;  /* 尾包也丢弃，避免半截 NAL 混进下一帧 */
         }
-        if (r->have_ts && ts != r->ts) {
+        if (!r->have_ts) {  /* 坏帧首片也丢了 —— 记下坏帧 ts 供新 ts 检测 */
+            r->ts      = ts;
+            r->have_ts = 1;
+            return;
+        }
+        if (ts != r->ts) {
             r->dropping = 0;
             r->len      = 0;
             r->have_ts  = 0;
+            r->have_seq = 0;
             /* 落到正常路径处理这包（新帧第一片） */
         } else {
-            return;  /* 继续丢弃残帧碎片 */
+            return;  /* 同一坏帧的后续碎片 —— 继续丢 */
         }
     }
 
-    /* seq 回退（重传/乱序）→ 丢当前帧，等恢复 */
+    /* ★ P0：seq 丢失/乱序/重复检测（花屏根因）。
+     *   diff > 1 —— 中间包丢失（无重传/无 FEC），当前帧必然缺片，
+     *              半截 NAL 落盘 → 解码器参考链断裂 → 花屏/画面冻结。
+     *   diff < 0 —— 乱序/重传：当前帧按缺片处理，丢整帧。
+     *   diff == 0 —— 重复包：静默丢弃（重复分片落盘同样花屏）。 */
     if (r->have_seq) {
         int16_t diff = (int16_t)(seq - r->last_seq);
-        if (diff < 0) {
+        if (diff == 0)
+            return;              /* 重复包 —— 不落盘不丢帧 */
+        if (diff < 0 || diff > 1) {
             frame_drop(r);
             return;
         }

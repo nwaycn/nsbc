@@ -112,7 +112,9 @@ struct rec_sess {
     FILE            *video_fp;      /* 仅 rec_writer 线程 open/write，rec_stop pending==0 后 close */
     int              video_opened;  /* 首帧落盘后置 1（rec_video_path 依据） */
     uint64_t         video_bytes;
+    uint64_t         video_frames;  /* ★ 落盘成功帧数（writer 线程独占写）—— ffmpeg 合成时按 帧数/音频时长 换算真实 fps */
     uint64_t         video_drops;   /* slot 满 / 队列满 / 帧超限 丢弃计数 */
+    int              pt_warned;     /* 非 G.711 PT 只告警一次（视频 PT 已在 bridge 过滤，这里只剩音频） */
     _Atomic int      video_pending; /* 在途帧数（媒体线程 ++，writer --，stop 等 0） */
     struct rec_video_slot *video_slots;
 };
@@ -279,6 +281,7 @@ static void *rec_video_writer_main(void *arg)
             if (s->video_fp != NULL) {
                 if (fwrite(slot->buf, 1, slot->len, s->video_fp) == slot->len) {
                     s->video_bytes += slot->len;
+                    ++s->video_frames;  /* raw .h264 无时间戳，ffmpeg demux 需真实帧率 */
                 } else {
                     llog(LOG_WARN, "rec",
                          "video fwrite FAIL len=%zu errno=%d", slot->len, errno);
@@ -389,6 +392,11 @@ const char *rec_video_path(const rec_sess_t *s)
 {
     return (s != NULL && s->video_opened && s->video_path[0] != '\0')
                ? s->video_path : NULL;
+}
+
+uint64_t rec_video_frames(const rec_sess_t *s)
+{
+    return (s != NULL) ? s->video_frames : 0;
 }
 
 /* ---------- rec_open ---------- */
@@ -708,6 +716,14 @@ int rec_feed_raw(rec_sess_t *s, int leg, const void *payload,
         case 0:  pcm_samples = g711_ulaw_decode((const uint8_t *)payload, len, pcm_buf); break;
         case 8:  pcm_samples = g711_alaw_decode((const uint8_t *)payload, len, pcm_buf); break;
         default: pcm_samples = 0;  /* 非 G711 PT 暂不支持 PCM 解码 */
+    }
+    /* ★ 诊断（每 sess 一次）：音频 PT 解不了 → WAV 轨道是空的。
+     * 这正是"合并后缺了某一边说话声"的第一嫌疑点 —— PT 链路不对马上能看到。 */
+    if (pcm_samples == 0 && !s->pt_warned) {
+        s->pt_warned = 1;
+        llog(LOG_WARN, "rec",
+             "rec_feed_raw: audio pt=%d not G.711 — PCM track empty for this leg (codec unsupported by recorder)",
+             payload_type);
     }
 
     /* ★ feed_mode 锁：只允许一条路径（PCM 或 G711_RAW）写 fp

@@ -7,7 +7,7 @@
  * 输出：完整 access unit 的 Annex-B 字节流（00 00 00 01 前缀）
  *
  * 帧判定：marker=1 或 timestamp 变化；100ms 无 marker 超时强制 flush。
- * 安全上限：单帧 512KB，超限丢整帧；seq 回退丢整帧。
+ * 安全上限：单帧 512KB，超限丢整帧；seq 丢失(gap>1)/回退/重复 → 丢整帧。
  */
 
 #include "nsbc_common.h"

@@ -148,24 +148,61 @@ static int ffmpeg_convert(const char *wav_path, const char *out_path, rec_fmt_t 
  *   ffmpeg -y -i wav -i h264_a -map 0:a -map 1:v -c:v copy -c:a aac -b:a 128k -movflags +faststart out
  *   零质量损失（H.264 copy 直存），性能最优。
  *
- * 双视频 (h264_a + h264_b) — 画中画 PIP 融合：
+ * 双视频 (h264_a + h264_b) — 左右并排 hstack 完整合成：
  *   ffmpeg -y -i wav -i h264_a -i h264_b \
- *     -filter_complex "[2:v]scale=iw/2:-1[pip];[1:v][pip]overlay=W-w-20:H-h-20[vout]" \
+ *     -filter_complex "[1:v]scale=-2:720[a];[2:v]scale=-2:720[b];[a][b]hstack=inputs=2[vout]" \
  *     -map 0:a -map "[vout]" -c:v libx264 -preset veryfast -crf 23 \
  *     -c:a aac -b:a 128k -movflags +faststart out
- *   B 腿画面缩放到 A 腿画面右下角 1/2 宽；单输出轨道。
+ *   A 腿画面完整放左，B 腿画面完整放右；两路等比缩放到 720p 高度对齐。
  *   注意：双路不同分辨率 → libx264 重编码是唯一融合选项；crf=23 中等质量，
  *   preset=veryfast 降低 CPU 占用（通话结束才跑，非实时路径）。
  *
  * 同步 fork+wait —— 只在 rec_stop（callctrl 线程）调用，不在媒体路径。 */
+
+/* ★ M2 修复"画面提前静止"：读 WAV 44B 头算音频时长（秒）。
+ * raw .h264 裸流不带时间戳，ffmpeg 默认按 25fps demux —— 浏览器变速率流
+ * （带宽自适应可低到 5fps）会被压成 1/N 时长 → 输入提前 EOF → hstack 重复
+ * 最后一帧 = 左/右侧画面中途静止。用 帧数/音频时长 换算真实 fps 修正。 */
+static double wav_duration_sec(const char *path)
+{
+    if (!path || !path[0]) return 0.0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0.0;
+    uint8_t h[44];
+    if (fread(h, 1, 44, f) != 44 ||
+        memcmp(h, "RIFF", 4) != 0 || memcmp(h + 8, "WAVE", 4) != 0) {
+        fclose(f);
+        return 0.0;
+    }
+    int rate = (int)(h[24] | (h[25] << 8) | (h[26] << 16) | ((uint32_t)h[27] << 24));
+    int ch   = (int)(h[22] | (h[23] << 8));
+    uint32_t dsz = (uint32_t)(h[40] | (h[41] << 8) | (h[42] << 16) | ((uint32_t)h[43] << 24));
+    fclose(f);
+    if (rate <= 0 || ch <= 0 || dsz == 0) return 0.0;
+    return (double)dsz / (double)(rate * ch * 2);
+}
+
+/* 帧数/时长 → 真实 fps（夹在 [1,60]，异常回落 25） */
+static double rec_fps_clamp(uint64_t frames, double dur)
+{
+    if (frames == 0 || dur <= 0.0) return 25.0;
+    double fps = (double)frames / dur;
+    if (fps < 1.0)  fps = 1.0;    /* 帧比时长还少 → 慢放也别提前 EOF */
+    if (fps > 60.0) fps = 60.0;
+    return fps;
+}
+
 static int ffmpeg_convert_av(const char *wav_path,
                              const char *h264_a, const char *h264_b,
+                             double fps_a, double fps_b,
                              const char *out_path)
 {
     if (!wav_path || !out_path) return NSBC_INVAL;
     if (!h264_a && !h264_b) return NSBC_INVAL;
 
     int dual = (h264_a && h264_a[0] && h264_b && h264_b[0]) ? 1 : 0;
+    /* 单视频时用对应那条腿的 fps（h264_a 优先） */
+    double fps_v = (h264_a && h264_a[0]) ? fps_a : fps_b;
 
     pid_t pid = fork();
     if (pid < 0) {
@@ -174,20 +211,31 @@ static int ffmpeg_convert_av(const char *wav_path,
     }
     if (pid == 0) {
         if (dual) {
-            /* ======== 双视频 PIP 融合路径（libx264 重编码）========
-             * h264_a 输入 index=1，h264_b 输入 index=2
-             * filter_complex: [2:v]scale=iw/2:-1[pip];[1:v][pip]overlay=W-w-20:H-h-20[vout] */
-            char *argv[24]; int ai = 0;
+            /* ======== 双视频 hstack 左右并排（libx264 重编码）========
+             * h264_a 输入 index=1（A leg 放左），h264_b 输入 index=2（B leg 放右）
+             * filter_complex: 两路缩放到相同高度 720p，然后 hstack 左右拼接
+             * scale=-2:720 — 宽度按比例缩放但对齐偶数（libx264 要求）
+             * ★ P0：-framerate 帧率/音频时长 —— raw .h264 无时间戳，默认 25fps
+             *   demux 会把变速率流压短 → hstack 输入提前 EOF → 画面静止。
+             * ★ P0：argv 数组按实项数配额（原 [24] 实写 27 项 = 子进程栈溢出）。 */
+            char fa[16], fb[16];
+            snprintf(fa, sizeof(fa), "%.3f", fps_a > 0 ? fps_a : 25.0);
+            snprintf(fb, sizeof(fb), "%.3f", fps_b > 0 ? fps_b : 25.0);
+            char *argv[36]; int ai = 0;
             argv[ai++] = (char *)"ffmpeg";
             argv[ai++] = (char *)"-y";
             argv[ai++] = (char *)"-i";
             argv[ai++] = (char *)wav_path;
+            argv[ai++] = (char *)"-framerate";
+            argv[ai++] = fa;
             argv[ai++] = (char *)"-i";
             argv[ai++] = (char *)h264_a;
+            argv[ai++] = (char *)"-framerate";
+            argv[ai++] = fb;
             argv[ai++] = (char *)"-i";
             argv[ai++] = (char *)h264_b;
             argv[ai++] = (char *)"-filter_complex";
-            argv[ai++] = (char *)"[2:v]scale=iw/2:-1[pip];[1:v][pip]overlay=W-w-20:H-h-20[vout]";
+            argv[ai++] = (char *)"[1:v]scale=-2:720[a];[2:v]scale=-2:720[b];[a][b]hstack=inputs=2[vout]";
             argv[ai++] = (char *)"-map";
             argv[ai++] = (char *)"0:a";
             argv[ai++] = (char *)"-map";
@@ -209,13 +257,18 @@ static int ffmpeg_convert_av(const char *wav_path,
             execvp("ffmpeg", argv);
             _exit(127);
         } else {
-            /* ======== 单视频 copy 路径（零损失）======== */
+            /* ======== 单视频 copy 路径（零损失）========
+             * ★ -framerate 同双视频路径 —— 变速率流不能按默认 25fps demux */
             const char *h264 = (h264_a && h264_a[0]) ? h264_a : h264_b;
-            char *argv[20]; int ai = 0;
+            char fa[16];
+            snprintf(fa, sizeof(fa), "%.3f", fps_v > 0 ? fps_v : 25.0);
+            char *argv[28]; int ai = 0;
             argv[ai++] = (char *)"ffmpeg";
             argv[ai++] = (char *)"-y";
             argv[ai++] = (char *)"-i";
             argv[ai++] = (char *)wav_path;
+            argv[ai++] = (char *)"-framerate";
+            argv[ai++] = fa;
             argv[ai++] = (char *)"-i";
             argv[ai++] = (char *)h264;
             argv[ai++] = (char *)"-map";
@@ -243,9 +296,10 @@ static int ffmpeg_convert_av(const char *wav_path,
         return NSBC_ERR;
     }
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        llog(LOG_WARN, "rec", "ffmpeg_convert_av: ffmpeg failed exit=%d mode=%s wav=%s h264_a=%s h264_b=%s → %s",
+        llog(LOG_WARN, "rec", "ffmpeg_convert_av: ffmpeg failed exit=%d mode=%s fps_a=%.2f fps_b=%.2f wav=%s h264_a=%s h264_b=%s → %s",
              WIFEXITED(status) ? WEXITSTATUS(status) : -1,
-             dual ? "dual_pip" : "single_copy",
+             dual ? "dual_hstack" : "single_copy",
+             fps_a, fps_b,
              wav_path, h264_a ? h264_a : "-", h264_b ? h264_b : "-", out_path);
         if (WIFEXITED(status) && WEXITSTATUS(status) == 127) {
             llog(LOG_ERR, "rec",
@@ -253,8 +307,9 @@ static int ffmpeg_convert_av(const char *wav_path,
         }
         return NSBC_ERR;
     }
-    llog(LOG_INFO, "rec", "ffmpeg_convert_av OK mode=%s wav=%s h264_a=%s h264_b=%s → %s",
-         dual ? "dual_pip" : "single_copy",
+    llog(LOG_INFO, "rec", "ffmpeg_convert_av OK mode=%s fps_a=%.2f fps_b=%.2f wav=%s h264_a=%s h264_b=%s → %s",
+         dual ? "dual_hstack" : "single_copy",
+         fps_a, fps_b,
          wav_path, h264_a ? h264_a : "-", h264_b ? h264_b : "-", out_path);
     return NSBC_OK;
 }
@@ -424,6 +479,7 @@ static app_rc_t app_record_exec(app_ctx_t *c, const char *data, void *ud)
             char final_path[512]; uint64_t bytes = 0;
             /* M1: rec_stop 会 free sess —— 视频路径必须先取出来 */
             char video_path[REC_PATH_MAX] = {0};
+            uint64_t vframes = rec_video_frames(sess);
             const char *vp = rec_video_path(sess);
             if (vp && vp[0])
                 snprintf(video_path, sizeof(video_path), "%s", vp);
@@ -463,7 +519,11 @@ static app_rc_t app_record_exec(app_ctx_t *c, const char *data, void *ud)
                 snprintf(out_path, sizeof(out_path), "%s", final_path);
                 char *dot = strrchr(out_path, '.');
                 if (dot) snprintf(dot, sizeof(out_path) - (size_t)(dot - out_path), ".mp4");
-                if (ffmpeg_convert_av(final_path, video_path, NULL, out_path) == NSBC_OK) {
+                double dur = wav_duration_sec(final_path);
+                double fps = rec_fps_clamp(vframes, dur);
+                llog(LOG_INFO, "rec", "app_record AV-MUX leg=%d dur=%.1fs frames=%llu fps=%.2f",
+                     leg, dur, (unsigned long long)vframes, fps);
+                if (ffmpeg_convert_av(final_path, video_path, NULL, fps, fps, out_path) == NSBC_OK) {
                     llog(LOG_INFO, "rec", "app_record AV-MUX callid=%s leg=%d → mp4",
                          call->leg[0].callid, leg);
                     unlink(final_path);  /* 删中间 WAV */
@@ -636,10 +696,12 @@ int recording_apply_dp_action(rec_mgr_t *mgr, uint8_t rec_action,
 
         /* M1+: 两条腿视频路径在 rec_stop(free) 前取出 */
         char video_paths[2][REC_PATH_MAX] = {{0}};
+        uint64_t video_frames[2] = {0, 0};
         for (int leg = 0; leg < 2; ++leg) {
             rec_sess_t *s = reg_get(callid, leg);
             if (s == NULL) continue;
             const char *vp = rec_video_path(s);
+            video_frames[leg] = rec_video_frames(s);
             if (vp && vp[0])
                 snprintf(video_paths[leg], sizeof(video_paths[leg]), "%s", vp);
             char final_path[REC_PATH_MAX];
@@ -699,9 +761,20 @@ int recording_apply_dp_action(rec_mgr_t *mgr, uint8_t rec_action,
                     snprintf(final_path, sizeof(final_path), "%s", mix_path);
                     char *dot = strrchr(final_path, '.');
                     if (dot) snprintf(dot, sizeof(final_path) - (dot - final_path), ".mp4");
+                    /* ★ 帧数/音频时长 → 真实 fps：raw .h264 无时间戳，
+                     * 默认 25fps demux 会把变速率流压短 → 画面提前静止 */
+                    double dur = wav_duration_sec(mix_path);
+                    double fps_a = rec_fps_clamp(video_frames[0], dur);
+                    double fps_b = rec_fps_clamp(video_frames[1], dur);
+                    llog(LOG_INFO, "rec",
+                         "recording AV-MUX callid=%s dur=%.1fs frames=%llu/%llu fps=%.2f/%.2f",
+                         callid, dur,
+                         (unsigned long long)video_frames[0],
+                         (unsigned long long)video_frames[1], fps_a, fps_b);
                     int rc_av = ffmpeg_convert_av(mix_path,
                                                   video_paths[0][0] ? video_paths[0] : NULL,
                                                   video_paths[1][0] ? video_paths[1] : NULL,
+                                                  fps_a, fps_b,
                                                   final_path);
                     if (rc_av == NSBC_OK) {
                         llog(LOG_INFO, "rec", "recording AV-MUX callid=%s → mp4", callid);
@@ -763,8 +836,17 @@ int recording_apply_dp_action(rec_mgr_t *mgr, uint8_t rec_action,
                 char *dot = strrchr(final_path, '.');
                 if (dot) snprintf(dot, sizeof(final_path) - (dot - final_path), ".mp4");
                 /* h264_a 放同腿视频，h264_b 放另一条（可能为 NULL）—— ffmpeg_convert_av
-                 * 单视频分支优先 h264_a；双视频时走 PIP 融合 */
-                int rc_av = ffmpeg_convert_av(audio, h264_same, h264_other, final_path);
+                 * 单视频分支优先 h264_a；双视频时走 hstack 左右并排。
+                 * ★ 帧数/音频时长 → 真实 fps（同双腿 mix 路径）：
+                 * h264_same 恒占 h264_a 槽位 → fps_a 恒用同腿帧率 */
+                double dur_mono = wav_duration_sec(audio);
+                double fps_same = rec_fps_clamp(
+                    a_path[0] ? video_frames[0] : video_frames[1], dur_mono);
+                double fps_other = rec_fps_clamp(
+                    a_path[0] ? video_frames[1] : video_frames[0], dur_mono);
+                int rc_av = ffmpeg_convert_av(audio, h264_same, h264_other,
+                                              fps_same, fps_other,
+                                              final_path);
                 if (rc_av == NSBC_OK) {
                     llog(LOG_INFO, "rec", "recording AV-MUX mono callid=%s → mp4", callid);
                     unlink(audio);

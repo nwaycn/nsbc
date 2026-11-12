@@ -446,19 +446,20 @@ static int pt_in_list(uint8_t pt, const uint8_t *list, int count)
     return 0;
 }
 
-/* M1 视频帧回调 —— vid_reasm 重组出完整 H.264 access unit 后调用。
- * 只录 side=0（A→B 方向）：call->rec[0] 是 leg A 的录音 sess，
- * 其 rec_open_t.video=1（recording.c start 路径设置）。 */
+/* M1+ 视频帧回调 —— vid_reasm 重组出完整 H.264 access unit 后调用。
+ * side=0 → call->rec[0]（A 腿音频录音 sess）
+ * side=1 → call->rec[1]（B 腿音频录音 sess）
+ * 两条腿都挂 video=1（recording.c start 时设置）；无 rec_sess（纯视频通话无录音）则跳过。 */
 static void bridge_video_frame_cb(void *ud, const uint8_t *frame,
                                   size_t len, uint32_t ts)
 {
     vid_hook_ud_t *u = (vid_hook_ud_t *)ud;
     if (u == NULL || u->node == NULL || u->node->call == NULL)
         return;
-    if (u->side != 0)
-        return;  /* M1 只录 A 腿方向；side=1 reasm 预留 */
     b2b_call_t *call = (b2b_call_t *)u->node->call;
-    rec_sess_t *sess = (rec_sess_t *)call->rec[0];
+    int leg = u->side;  /* side=0 → leg A, side=1 → leg B */
+    if (leg < 0 || leg > 1) return;
+    rec_sess_t *sess = (rec_sess_t *)call->rec[leg];
     if (sess != NULL)
         rec_feed_video(sess, frame, len, ts);
 }
@@ -919,6 +920,20 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
                          side, pkt.ssrc, (unsigned)pkt.pt, (unsigned)r->drops);
                 }
                 ++r->drops;
+                /* ★ REQ-REC-009：被 ssrc_policy 丢弃的 G.711 音频包也要喂录音。
+                 * 录音是旁路采集，不该被转发面门控截断（与视频 vid_reasm hook
+                 * 放在门控之前同理）。WebRTC 断线重连/换设备会换 SSRC —— policy
+                 * 未学习新源期间丢的包，之前直接导致"这边说话声没录上"。
+                 * 只放行静态 G.711 PT（0/8）：rec_feed_raw 只解 G.711；
+                 * 动态 PT 的解码依赖后级 transcode，被丢的包没有后级。
+                 * 转发与录音互斥（这里喂完就 continue，不会双重写）。 */
+                if (r->m->cfg.rec_feed_fn && r->node && r->node->call &&
+                    ((uint8_t)pkt.pt == 0 || (uint8_t)pkt.pt == 8)) {
+                    r->m->cfg.rec_feed_fn(r->m->cfg.rec_feed_ud,
+                                          r->node->call,
+                                          pkt.payload, pkt.payload_len,
+                                          side, (int)pkt.pt);
+                }
                 continue;
             }
 
@@ -1071,7 +1086,13 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
              * 在 SSRC 重写之前喂（payload 与 SSRC 无关，保持原始）。
              * call_key=r->node->call（b2b_call_t*，供回调反查 rec_sess_t）。
              * cfg.rec_feed_fn 为 NULL 时跳过（未接线）。 */
-            if (r->m->cfg.rec_feed_fn && pkt.payload && pkt.payload_len) {
+            if (r->m->cfg.rec_feed_fn && pkt.payload && pkt.payload_len &&
+                /* ★ video PT 不进录音 raw 通道（G.711 sidecar）——
+                 * H.264 走 vid_reasm → rec_feed_video 专用链路，
+                 * 喂进来只会污染 raw 文件 + 触发无意义的 PT 告警 */
+                !(r->node && pt_in_list((uint8_t)pkt.pt,
+                                        r->node->video_pt_allowed[side],
+                                        r->node->video_pt_allowed_count[side]))) {
                 r->m->cfg.rec_feed_fn(r->m->cfg.rec_feed_ud,
                                       r->node ? r->node->call : NULL,
                                       pkt.payload, pkt.payload_len,
@@ -3883,33 +3904,39 @@ int bridge_confirm(bridge_mgr_t *m, void *call, const char *offer,
                  call, offer_video_n, answer_video_n);
         }
 
-        /* ★ M1 视频录制：offer+answer 都带 H.264 且 relay 已锚定 →
-         * 创建 side=0（A 腿）重组器。side=1 槽位预留（本期只录 A→B 方向）。
+        /* ★ M1+ 视频录制：offer+answer 都带 H.264 且 relay 已锚定 →
+         * side=0（A→B）和 side=1（B→A）双向创建重组器。
          * re-INVITE 去掉 video / 换成 VP8 → 销毁重组器（dropping 模式自然结束）。 */
         const int h264_ok =
             sdp_has_h264(offer, offer_len) && sdp_has_h264(answer, answer_len);
         if (h264_ok && offer_video_n > 0 && answer_video_n > 0) {
-            if (e->vid_reasm[0] == NULL) {
-                e->vid_ud[0].node = e;
-                e->vid_ud[0].side = 0;
-                if (vid_reasm_create(&e->vid_reasm[0],
-                                     bridge_video_frame_cb,
-                                     &e->vid_ud[0]) == NSBC_OK) {
-                    llog(LOG_INFO, "media",
-                         "★VIDEO_REASM call=%p side=0 CREATED (H.264 relay recording)",
-                         call);
-                } else {
-                    llog(LOG_WARN, "media",
-                         "★VIDEO_REASM call=%p side=0 CREATE FAIL — video recording disabled",
-                         call);
+            for (int side = 0; side < 2; ++side) {
+                if (e->vid_reasm[side] == NULL) {
+                    e->vid_ud[side].node = e;
+                    e->vid_ud[side].side = side;
+                    if (vid_reasm_create(&e->vid_reasm[side],
+                                         bridge_video_frame_cb,
+                                         &e->vid_ud[side]) == NSBC_OK) {
+                        llog(LOG_INFO, "media",
+                             "★VIDEO_REASM call=%p side=%d CREATED (H.264 relay recording)",
+                             call, side);
+                    } else {
+                        llog(LOG_WARN, "media",
+                             "★VIDEO_REASM call=%p side=%d CREATE FAIL — video recording disabled",
+                             call, side);
+                    }
                 }
             }
-        } else if (e->vid_reasm[0] != NULL) {
-            vid_reasm_destroy(e->vid_reasm[0]);
-            e->vid_reasm[0] = NULL;
-            llog(LOG_INFO, "media",
-                 "★VIDEO_REASM call=%p side=0 DESTROYED (no H.264 in renegotiated SDP)",
-                 call);
+        } else {
+            for (int side = 0; side < 2; ++side) {
+                if (e->vid_reasm[side] != NULL) {
+                    vid_reasm_destroy(e->vid_reasm[side]);
+                    e->vid_reasm[side] = NULL;
+                    llog(LOG_INFO, "media",
+                         "★VIDEO_REASM call=%p side=%d DESTROYED (no H.264 in renegotiated SDP)",
+                         call, side);
+                }
+            }
         }
 
         /* ★ DTMF RFC4733：扫描 offer/answer SDP 提取 telephone-event PT
