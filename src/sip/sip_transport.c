@@ -1241,8 +1241,26 @@ int sip_tr_send(sip_transport_t *t, sip_tr_proto_t proto,
             llog(LOG_WARN, "sip-tr", "UDP send: no udp fds!");
             return NSBC_NOTSUP;
         }
+        /* ★ 诊断：打印 dst 地址细节 + net_tx_batch 返回值 */
+        {
+            char d_ip[INET6_ADDRSTRLEN] = "-";
+            uint16_t d_port = 0;
+            if (dst->ss.ss_family == AF_INET) {
+                struct sockaddr_in *sin = (struct sockaddr_in *)&dst->ss;
+                inet_ntop(AF_INET, &sin->sin_addr, d_ip, sizeof(d_ip));
+                d_port = ntohs(sin->sin_port);
+            } else if (dst->ss.ss_family == AF_INET6) {
+                struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&dst->ss;
+                inet_ntop(AF_INET6, &sin6->sin6_addr, d_ip, sizeof(d_ip));
+                d_port = ntohs(sin6->sin6_port);
+            }
+            llog(LOG_INFO, "sip-tr",
+                 "★UDP_TX dst_fam=%d dst_len=%u dst=%s:%u buf_len=%zu → fd=%d",
+                 dst->ss.ss_family, (unsigned)dst->len, d_ip, d_port, len, udp);
+        }
         net_tx_dgram_t dg = {buf, len, *dst};
         int n = net_tx_batch(udp, &dg, 1);
+        llog(LOG_INFO, "sip-tr", "★UDP_TX_RC n=%d (expect 1=ok, 0=EAGAIN, -1=err)", n);
         return n == 1 ? NSBC_OK : NSBC_AGAIN;
     }
     /* ---- SIP over WebSocket (RFC 7118) ---- */

@@ -98,15 +98,27 @@ int net_tx_batch(int fd, const net_tx_dgram_t *dg, int n)
                    (struct sockaddr *)&dg[i].dst.ss, dg[i].dst.len);
         if (rc >= 0) {
             ++sent;
-        } else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+        } else if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            /* ★ 诊断：非阻塞 UDP sendto EAGAIN —— 之前静默跳过，现在打日志 */
             char ip[INET6_ADDRSTRLEN] = "-";
             if (dg[i].dst.ss.ss_family == AF_INET) {
                 struct sockaddr_in *sin = (struct sockaddr_in *)&dg[i].dst.ss;
                 inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip));
             }
             llog(LOG_WARN, "net",
-                 "sendto fd=%d len=%zu dst=%s failed errno=%d(%s)",
-                 fd, dg[i].len, ip, errno, strerror(errno));
+                 "★sendto_EAGAIN fd=%d len=%zu dst=%s errno=%d(%s) dst_len=%u",
+                 fd, dg[i].len, ip, errno, strerror(errno),
+                 (unsigned)dg[i].dst.len);
+        } else {
+            char ip[INET6_ADDRSTRLEN] = "-";
+            if (dg[i].dst.ss.ss_family == AF_INET) {
+                struct sockaddr_in *sin = (struct sockaddr_in *)&dg[i].dst.ss;
+                inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip));
+            }
+            llog(LOG_WARN, "net",
+                 "★sendto_ERR fd=%d len=%zu dst=%s failed errno=%d(%s) dst_len=%u",
+                 fd, dg[i].len, ip, errno, strerror(errno),
+                 (unsigned)dg[i].dst.len);
             break;
         }
     }

@@ -1049,16 +1049,28 @@ static int build_dlg_req(b2b_core_t *co, b2b_leg_t *l,
         snprintf(contact, sizeof(contact), "<sip:%s:%d>", adv_host, dlg_port);
     }
     sip_req_spec_t s; memset(&s, 0, sizeof(s));
-    /* REQ-SIP-RURI-001：Request-URI 不允许 <>（name-addr 只用于 From/To/Contact 头）。
-     * dlg->target 来自 200 OK Contact 头（<sip:...>），会带 <>，
-     * 如果不剥掉 → SIP.js Parser 解析首行 "BYE <sip:...> SIP/2.0" 失败丢弃整条消息。 */
+    /* REQ-SIP-RURI-001：Request-URI 不允许 name-addr 格式（<> 尖括号 + 显示名）。
+     * RFC 3261 §25.1: Request-Line = Method SP Request-URI SP SIP-Version CRLF
+     * Request-URI 必须是纯 absoluteURI，不能是 "xxx" <sip:...>。
+     *
+     * dlg->target 来自对端 Contact 头，可能是:
+     *   - "<sip:user@host:port>"        → 尖括号包住
+     *   - "\"display\" <sip:user@host>"  → 显示名 + 尖括号（MicroSIP/PJSIP 常见）
+     *   - "sip:user@host:port"          → 已经是纯 URI
+     *
+     * 用 strrchr 找最后一对 <>，提取中间的纯 URI。找不到就原样用。 */
     char ruri_stripped[DLG_URI_MAX];
     if (ruri && ruri[0]) {
-        size_t rl = strlen(ruri);
-        if (rl >= 2 && ruri[0] == '<' && ruri[rl - 1] == '>') {
-            snprintf(ruri_stripped, sizeof(ruri_stripped), "%.*s",
-                     (int)(rl - 2), ruri + 1);
-            s.ruri = ruri_stripped;
+        char *lt = strrchr(ruri, '<');
+        char *gt = strrchr(ruri, '>');
+        if (lt && gt && gt > lt) {
+            size_t ul = (size_t)(gt - lt - 1);
+            if (ul < sizeof(ruri_stripped)) {
+                snprintf(ruri_stripped, sizeof(ruri_stripped), "%.*s", (int)ul, lt + 1);
+                s.ruri = ruri_stripped;
+            } else {
+                s.ruri = ruri;
+            }
         } else {
             s.ruri = ruri;
         }
@@ -2346,10 +2358,14 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
             tok_to_tag(m, a->peer_tag, DLG_TAG_MAX);
             dlg_uac_on_response(co->cfg.dlg, m);
             if (a->dlg) {
+                /* REQ-SIP-RURI-001: dlg->target 可能是 "xxx" <sip:...> name-addr 格式。
+                 * 用 strrchr 找最后一对 <> 提取纯 URI，兼容带/不带显示名。 */
                 const char *dt = a->dlg->target;
-                size_t dl = strlen(dt);
-                if (dl >= 2 && dt[0] == '<' && dt[dl - 1] == '>') {
-                    snprintf(a->target, sizeof(a->target), "%.*s", (int)(dl - 2), dt + 1);
+                char *lt = strrchr(dt, '<');
+                char *gt = strrchr(dt, '>');
+                if (lt && gt && gt > lt) {
+                    size_t ul = (size_t)(gt - lt - 1);
+                    snprintf(a->target, sizeof(a->target), "%.*s", (int)ul, lt + 1);
                 } else {
                     snprintf(a->target, sizeof(a->target), "%s", dt);
                 }
@@ -2499,14 +2515,15 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
             c->leg[1].last_prov_status = 0; /* 终态后重置去重标记 */
             if (c->leg[1].dlg) {
                 /* b 已在外层声明 */
-                /* dlg->target 来自 200 OK Contact 头（<sip:...> name-addr 格式），
-                 * Request-URI 不允许 <>，必须剥掉尖括号再存入 b->target，
-                 * 否则后续 BYE/ACK/INFO 等 dialog 内请求都会带 <> → SIP.js Parser 崩。 */
+                /* REQ-SIP-RURI-001: dlg->target 可能是 "xxx" <sip:...> name-addr 格式。
+                 * 用 strrchr 找最后一对 <> 提取纯 URI，兼容带/不带显示名。
+                 * 否则后续 BYE/ACK/INFO 等 dialog 内请求的 R-URI 都会带 <> → SIP Parser 崩。 */
                 const char *dt = b->dlg->target;
-                size_t dl = strlen(dt);
-                if (dl >= 2 && dt[0] == '<' && dt[dl - 1] == '>') {
-                    snprintf(b->target, sizeof(b->target), "%.*s",
-                             (int)(dl - 2), dt + 1);
+                char *lt = strrchr(dt, '<');
+                char *gt = strrchr(dt, '>');
+                if (lt && gt && gt > lt) {
+                    size_t ul = (size_t)(gt - lt - 1);
+                    snprintf(b->target, sizeof(b->target), "%.*s", (int)ul, lt + 1);
                 } else {
                     snprintf(b->target, sizeof(b->target), "%s", dt);
                 }
