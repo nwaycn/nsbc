@@ -1,0 +1,16 @@
+# NSBC SDK 对外暴露的 API 保留规则
+-keep class com.nway.nsbc.sdk.NsbcClient { public *; }
+-keep class com.nway.nsbc.sdk.NsbcClient$Listener { public *; }
+-keep class com.nway.nsbc.sdk.NsbcConfig { public *; }
+-keep class com.nway.nsbc.sdk.NsbcConfig$Builder { public *; }
+-keep class com.nway.nsbc.sdk.NsbcCall { public *; }
+-keep class com.nway.nsbc.sdk.NsbcLogger { public *; }
+-keep class com.nway.nsbc.sdk.NsbcError { public *; }
+-keep class com.nway.nsbc.sdk.CallState { public *; }
+-keep class com.nway.nsbc.sdk.RegistrationState { public *; }
+-keep class com.nway.nsbc.sdk.LogLevel { public *; }
+-keep class com.nway.nsbc.sdk.IceTransportPolicy { public *; }
+-keep class com.nway.nsbc.sdk.NsbcErrorCode { public *; }
+-keep interface com.nway.nsbc.sdk.media.MediaEngine { public *; }
+-keep interface com.nway.nsbc.sdk.media.MediaEngine$Listener { public *; }
+-dontwarn org.webrtc.**

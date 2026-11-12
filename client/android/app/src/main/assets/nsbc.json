@@ -1,0 +1,18 @@
+{
+  "server": "10.0.0.80",
+  "wssPort": 5062,
+  "wsPath": "/ws",
+  "useTls": true,
+  "realm": "nsbc.local",
+  "username": "1000",
+  "password": "secret123",
+  "stunServer": "stun:10.0.0.80:3478",
+  "videoEnabled": true,
+  "videoWidth": 1280,
+  "videoHeight": 720,
+  "videoFps": 30,
+  "mirrorLocalPreview": true,
+  "autoReconnect": true,
+  "allowSelfSignedCert": true,
+  "logLevel": "INFO"
+}

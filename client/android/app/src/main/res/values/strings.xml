@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">NSBC 软电话</string>
+
+    <!-- 通用 -->
+    <string name="btn_back">返回</string>
+    <string name="btn_settings">设置</string>
+    <string name="btn_save_connect">保存并连接</string>
+    <string name="btn_disconnect">断开连接</string>
+    <string name="btn_reset">恢复默认</string>
+
+    <!-- 注册状态 -->
+    <string name="status_unregistered">未注册</string>
+    <string name="status_registering">注册中…</string>
+    <string name="status_registered">已注册</string>
+    <string name="status_failed">注册失败</string>
+
+    <!-- 拨号盘 -->
+    <string name="dialer_hint">输入号码或分机</string>
+    <string name="btn_call">拨号</string>
+    <string name="btn_backspace">⌫</string>
+    <string name="recent_title">最近通话</string>
+    <string name="recent_empty">暂无通话记录</string>
+    <string name="toast_not_registered">尚未注册到 NSBC，请先到设置里连接</string>
+    <string name="toast_no_number">请输入要呼叫的号码</string>
+
+    <!-- 设置分组 -->
+    <string name="section_account">账号</string>
+    <string name="section_network">网络</string>
+    <string name="section_media">媒体</string>
+    <string name="section_advanced">高级</string>
+
+    <string name="hint_server">服务器地址</string>
+    <string name="hint_port">WSS 端口</string>
+    <string name="hint_realm">域 / Realm</string>
+    <string name="hint_user">用户名 / 分机</string>
+    <string name="hint_pass">密码</string>
+    <string name="hint_display">显示名（可选）</string>
+    <string name="hint_ws_path">WebSocket 路径</string>
+    <string name="hint_stun">STUN 服务器</string>
+    <string name="hint_turn">TURN 服务器</string>
+    <string name="hint_turn_user">TURN 用户名</string>
+    <string name="hint_turn_cred">TURN 密码</string>
+    <string name="hint_video_width">视频宽</string>
+    <string name="hint_video_height">视频高</string>
+    <string name="hint_video_fps">帧率</string>
+
+    <string name="label_tls">使用 TLS（WSS）</string>
+    <string name="label_ice">ICE 策略</string>
+    <string name="label_video">启用视频</string>
+    <string name="label_mirror">本地预览镜像</string>
+    <string name="label_auto_reconnect">断线自动重连</string>
+    <string name="label_self_signed">允许自签名证书</string>
+    <string name="label_log_level">日志级别</string>
+
+    <!-- 通话中 -->
+    <string name="call_connecting">正在呼叫…</string>
+    <string name="call_ringing">对方振铃…</string>
+    <string name="call_established">通话中</string>
+    <string name="btn_mute">静音</string>
+    <string name="btn_unmute">已静音</string>
+    <string name="btn_speaker">免提</string>
+    <string name="btn_speaker_on">免提开</string>
+    <string name="btn_video_off">关视频</string>
+    <string name="btn_video_on">开视频</string>
+    <string name="btn_switch">切换</string>
+    <string name="btn_hangup">挂断</string>
+
+    <!-- 来电 -->
+    <string name="incoming_label">来电</string>
+    <string name="btn_answer">接听</string>
+    <string name="btn_reject">拒接</string>
+</resources>

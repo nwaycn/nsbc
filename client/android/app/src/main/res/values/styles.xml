@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!-- 拨号盘按键 -->
+    <style name="NsbcKey">
+        <item name="android:layout_width">0dp</item>
+        <item name="android:layout_height">68dp</item>
+        <item name="android:layout_weight">1</item>
+        <item name="android:background">@drawable/bg_keypad</item>
+        <item name="android:includeFontPadding">false</item>
+        <item name="android:minWidth">0dp</item>
+        <item name="android:minHeight">0dp</item>
+        <item name="android:stateListAnimator">@null</item>
+        <item name="android:textAllCaps">false</item>
+        <item name="android:textColor">#E2E8F0</item>
+        <item name="android:textSize">24sp</item>
+    </style>
+
+    <!-- 设置输入框 -->
+    <style name="NsbcField">
+        <item name="android:layout_width">match_parent</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:background">@drawable/bg_field</item>
+        <item name="android:minHeight">46dp</item>
+        <item name="android:textColor">#F1F5F9</item>
+        <item name="android:textColorHint">#64748B</item>
+        <item name="android:textSize">14sp</item>
+        <item name="android:singleLine">true</item>
+    </style>
+
+    <!-- 通话中圆形操作键 -->
+    <style name="NsbcCallAction">
+        <item name="android:layout_width">0dp</item>
+        <item name="android:layout_height">56dp</item>
+        <item name="android:layout_weight">1</item>
+        <item name="android:background">@drawable/bg_secondary</item>
+        <item name="android:includeFontPadding">false</item>
+        <item name="android:minWidth">0dp</item>
+        <item name="android:minHeight">0dp</item>
+        <item name="android:paddingStart">0dp</item>
+        <item name="android:paddingEnd">0dp</item>
+        <item name="android:stateListAnimator">@null</item>
+        <item name="android:textAllCaps">false</item>
+        <item name="android:textColor">#E2E8F0</item>
+        <item name="android:textSize">11sp</item>
+    </style>
+</resources>
