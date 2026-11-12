@@ -3399,23 +3399,28 @@ static void send_bye_leg(b2b_call_t *c, int leg)
         l->state = LEG_TERMINATING;
         llog(LOG_INFO, "b2b", "★BYE_TXN_CREATED leg=%d txn=%p", leg, (void *)t);
 
-        /* ★ 关键修复：BYE 发出后把本腿的 inv_txn 清 NULL。
-         * 场景：leg[1] 的 INVITE NICT 收到 200 OK 后，txn 被 txn_mgr 释放，
-         * 紧接着 txn_client_new 分配 BYE NICT 时 **恰好拿到同一块内存地址**
-         * （malloc 内存池复用），导致 out_txn 和 inv_txn 指针值相同。
-         * cli_tu 里 inv_txn 检查排在 BYE out_txn 检查之前，先匹配劫持回调
-         * → 永远不进 BYE 分支 → call_destroy 永远不被调 → 通话挂死。
-         * WebRTC-WebRTC 场景 inv_txn/out_txn 恰好不同地址所以没复现。
-         * SIP-WebRTC 场景（leg[1] 是 WebRTC 腿，INVITE 时序不同）稳定复现。
+        /* ★ 关键修复：BYE 发出后无条件把本腿的 inv_txn 清 NULL。
          *
-         * 这里只清 inv_txn 指针，不 detach txn 对象 — txn_mgr 仍在跟踪它，
-         * 只是我们不再通过这个指针引用了。如果 txn_mgr 已经释放它，
-         * 设 NULL 之前访问是悬空指针；但 BYE 发送时 INVITE 肯定已完成
-         * （send_bye_leg 有 LEG_CONFIRMED 守卫），txn_mgr 早已置终态。 */
-        if (l->inv_txn && l->inv_txn != t) {
+         * 场景 1（直接劫持）：INVITE NICT 释放后 malloc 把同一块内存
+         * 分配给 BYE NICT → leg[].out_txn == leg[].inv_txn → cli_tu 里
+         * inv_txn 分支排在 BYE out_txn 分支前面，先匹配劫持回调 →
+         * BYE handler 永远不执行 → call_destroy 永远不被调 → 挂死。
+         *
+         * 场景 2（悬空指针）：即便 malloc 没复用同地址，INVITE NICT
+         * 早已被 txn_mgr 释放（NICT 收到 2xx 后 txn_mgr 会置终态），
+         * 但 leg[].inv_txn 还留着旧地址 → 悬空指针，随时可能 crash。
+         *
+         * 为什么**无条件清**：BYE 发送时 INVITE 肯定已完成
+         * （send_bye_leg 有 LEG_CONFIRMED 守卫）。留着 inv_txn 没有
+         * 任何合法用途——re-INVITE 走独立 txn，初始 INVITE 回调早就
+         * 执行完了。不清白不清。
+         *
+         * 历史 bug：之前写 if (inv_txn && inv_txn != t) 条件跳过了
+         * 恰好地址相同的场景（两次 call 都是这种情况！），所以修复没生效。 */
+        if (l->inv_txn) {
             llog(LOG_INFO, "b2b",
-                 "★BYE_CLEAR_INV_TXN leg=%d: inv_txn=%p was stale, clearing",
-                 leg, (void *)l->inv_txn);
+                 "★BYE_CLEAR_INV_TXN leg=%d: clearing stale inv_txn=%p (out_txn=%p)",
+                 leg, (void *)l->inv_txn, (void *)t);
             l->inv_txn = NULL;
         }
     } else {
