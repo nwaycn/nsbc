@@ -195,9 +195,9 @@ void vid_reasm_feed(vid_reasm_t *r, const uint8_t *payload, size_t len,
 
     const uint8_t nal_type = payload[0] & 0x1F;
 
-    /* type=12 EOB —— Chrome SVC 专用 End of Bitstream 标记，不属于 access unit 内容。
-     * 取证侧车有 4 个 EOB 混在帧数据里，落盘会打断 ffmpeg demux 帧边界。 */
-    if (nal_type == 12)
+    /* type=10 EOS, type=11 EOS, type=12 EOB —— Chrome SVC 专用流结束标记，
+     * 不属于 access unit 内容，落盘会打断 ffmpeg demux 帧边界。 */
+    if (nal_type == 10 || nal_type == 11 || nal_type == 12)
         return;
 
     /* FU-A 未结束（S 见 E 未到）却来了其他 NAL 类型 —— 上个 NAL 被截断，丢整帧 */

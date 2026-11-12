@@ -694,7 +694,10 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
                             last_pli_ms[side] = now;
                             uint8_t pli_buf[64];
                             size_t pli_len = 0;
-                            if (video_build_pli(pkt.ssrc, 0, pli_buf, sizeof(pli_buf), &pli_len) == NSBC_OK) {
+                            /* ★ Sender SSRC 不能填 0 —— Chrome 会忽略 Sender SSRC=0 的 PLI。
+                             * 用固定魔法值 0x4E534243 ("NSBC") 作为 nsbcd 作为 SFU 的 RTCP SSRC。
+                             * Media SSRC = pkt.ssrc（Chrome 发的媒体 SSRC）。 */
+                            if (video_build_pli(pkt.ssrc, 0x4E534243, pli_buf, sizeof(pli_buf), &pli_len) == NSBC_OK) {
                                 uint8_t pli_send[64];
                                 size_t pli_send_len = pli_len;
                                 memcpy(pli_send, pli_buf, pli_len);
