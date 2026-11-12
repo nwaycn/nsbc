@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NSBC 软电话</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <div id="app">
+    <!-- ============================ 1. 拨号 ============================ -->
+    <section id="screenDialer" class="screen dialer-screen">
+      <header class="topbar">
+        <div class="brand">NSBC 软电话</div>
+        <span id="statusChip" class="chip chip-gray">未注册</span>
+        <button id="settingsBtn" class="btn-ghost" type="button">设置</button>
+      </header>
+
+      <div id="accountText" class="account">未配置服务器</div>
+
+      <div id="dialedText" class="dialed" aria-label="拨号号码"></div>
+
+      <div class="keypad">
+        <button id="key1" class="key" data-key="1" type="button">1</button>
+        <button id="key2" class="key" data-key="2" type="button">2</button>
+        <button id="key3" class="key" data-key="3" type="button">3</button>
+        <button id="key4" class="key" data-key="4" type="button">4</button>
+        <button id="key5" class="key" data-key="5" type="button">5</button>
+        <button id="key6" class="key" data-key="6" type="button">6</button>
+        <button id="key7" class="key" data-key="7" type="button">7</button>
+        <button id="key8" class="key" data-key="8" type="button">8</button>
+        <button id="key9" class="key" data-key="9" type="button">9</button>
+        <button id="keyStar" class="key" data-key="*" type="button">*</button>
+        <button id="key0" class="key" data-key="0" type="button">0</button>
+        <button id="keyHash" class="key" data-key="#" type="button">#</button>
+      </div>
+
+      <div class="dial-actions">
+        <button id="backspaceBtn" class="btn-backspace" type="button" title="退格">⌫</button>
+        <button id="callBtn" class="btn-call" type="button">拨号</button>
+      </div>
+
+      <div class="section-title">最近通话</div>
+      <div class="recent-scroll">
+        <div id="recentEmpty" class="recent-empty">暂无通话记录</div>
+        <div id="recentList" class="recent-list"></div>
+      </div>
+    </section>
+
+    <!-- ============================ 2. 设置 ============================ -->
+    <section id="screenSettings" class="screen settings-screen" hidden>
+      <header class="topbar">
+        <button id="settingsBackBtn" class="btn-ghost" type="button">返回</button>
+        <div class="brand">设置</div>
+        <span class="spacer"></span>
+      </header>
+
+      <div class="settings-scroll">
+        <section class="card">
+          <h2 class="card-title">账号</h2>
+          <label class="field">
+            <span>服务器地址</span>
+            <input id="serverInput" type="text" placeholder="例如 10.0.0.80" autocomplete="off" spellcheck="false">
+          </label>
+          <label class="field">
+            <span>WSS 端口</span>
+            <input id="portInput" type="number" min="1" max="65535" placeholder="5062" autocomplete="off">
+          </label>
+          <label class="field">
+            <span>域 / Realm</span>
+            <input id="realmInput" type="text" placeholder="nsbc.local" autocomplete="off" spellcheck="false">
+          </label>
+          <label class="field">
+            <span>用户名 / 分机</span>
+            <input id="userInput" type="text" placeholder="1000" autocomplete="off" spellcheck="false">
+          </label>
+          <label class="field">
+            <span>密码</span>
+            <input id="passInput" type="password" placeholder="SIP Digest 密码" autocomplete="current-password">
+          </label>
+          <label class="field">
+            <span>显示名</span>
+            <input id="displayInput" type="text" placeholder="可选，默认同用户名" autocomplete="off">
+          </label>
+        </section>
+
+        <section class="card">
+          <h2 class="card-title">网络</h2>
+          <label class="switch-row">
+            <span>使用 TLS（WSS）</span>
+            <input id="tlsSwitch" type="checkbox">
+          </label>
+          <label class="field">
+            <span>WebSocket 路径</span>
+            <input id="pathInput" type="text" placeholder="/ws" autocomplete="off" spellcheck="false">
+          </label>
+          <label class="field">
+            <span>STUN 服务器</span>
+            <input id="stunInput" type="text" placeholder="stun:10.0.0.80:3478" autocomplete="off" spellcheck="false">
+          </label>
+          <label class="field">
+            <span>TURN 服务器</span>
+            <input id="turnInput" type="text" placeholder="turn:turn.example.com:3478" autocomplete="off" spellcheck="false">
+          </label>
+          <label class="field">
+            <span>TURN 用户名</span>
+            <input id="turnUserInput" type="text" autocomplete="off" spellcheck="false">
+          </label>
+          <label class="field">
+            <span>TURN 密码</span>
+            <input id="turnCredInput" type="password" autocomplete="off">
+          </label>
+          <label class="field">
+            <span>ICE 策略</span>
+            <select id="iceSelect">
+              <option value="ALL">全部（直连 + 中继）</option>
+              <option value="RELAY">仅中继（TURN）</option>
+            </select>
+          </label>
+        </section>
+
+        <section class="card">
+          <h2 class="card-title">媒体</h2>
+          <label class="switch-row">
+            <span>启用视频</span>
+            <input id="videoSwitch" type="checkbox">
+          </label>
+          <div class="field-row">
+            <label class="field">
+              <span>视频宽</span>
+              <input id="widthInput" type="number" min="160" max="1920" step="1">
+            </label>
+            <label class="field">
+              <span>视频高</span>
+              <input id="heightInput" type="number" min="120" max="1080" step="1">
+            </label>
+            <label class="field">
+              <span>帧率</span>
+              <input id="fpsInput" type="number" min="1" max="60" step="1">
+            </label>
+          </div>
+          <label class="switch-row">
+            <span>本地预览镜像</span>
+            <input id="mirrorSwitch" type="checkbox">
+          </label>
+        </section>
+
+        <section class="card">
+          <h2 class="card-title">高级</h2>
+          <label class="switch-row">
+            <span>断线自动重连</span>
+            <input id="reconnectSwitch" type="checkbox">
+          </label>
+          <label class="switch-row">
+            <span>允许自签名证书</span>
+            <input id="selfSignedSwitch" type="checkbox">
+          </label>
+          <label class="field">
+            <span>日志级别</span>
+            <select id="logSelect">
+              <option value="NONE">NONE</option>
+              <option value="ERROR">ERROR</option>
+              <option value="WARN">WARN</option>
+              <option value="INFO">INFO</option>
+              <option value="DEBUG">DEBUG</option>
+              <option value="VERBOSE">VERBOSE</option>
+            </select>
+          </label>
+        </section>
+
+        <div id="problemsText" class="problems" hidden></div>
+
+        <button id="saveConnectBtn" class="btn-primary" type="button">保存并连接</button>
+        <button id="disconnectBtn" class="btn-secondary" type="button">断开连接</button>
+        <button id="resetBtn" class="btn-text" type="button">恢复默认</button>
+      </div>
+    </section>
+
+    <!-- ============================ 3. 通话中 ============================ -->
+    <section id="screenCall" class="screen call-screen" hidden>
+      <video id="remoteVideo" class="remote-video" autoplay playsinline></video>
+      <div id="callAvatar" class="call-avatar">A</div>
+
+      <div class="call-top">
+        <div id="callName" class="call-name"></div>
+        <div id="callSubtitle" class="call-subtitle"></div>
+        <div id="callTimer" class="call-timer">00:00</div>
+      </div>
+
+      <div id="localContainer" class="pip" title="拖动可移动本地画面">
+        <video id="localVideo" class="local-video" autoplay playsinline muted></video>
+      </div>
+
+      <div class="call-actions">
+        <button id="muteBtn" class="action" type="button">静音</button>
+        <button id="speakerBtn" class="action" type="button">免提</button>
+        <button id="videoBtn" class="action" type="button">关视频</button>
+        <button id="switchBtn" class="action" type="button">切换摄像头</button>
+        <button id="hangupBtn" class="hangup" type="button">挂断</button>
+      </div>
+    </section>
+
+    <!-- ============================ 4. 来电 ============================ -->
+    <div id="incomingOverlay" class="incoming-overlay" hidden>
+      <div class="incoming-label">来电</div>
+      <div id="incomingAvatar" class="incoming-avatar">A</div>
+      <div id="incomingName" class="incoming-name"></div>
+      <div id="incomingUri" class="incoming-uri"></div>
+      <div class="incoming-actions">
+        <button id="rejectBtn" class="btn-danger" type="button">拒接</button>
+        <button id="answerBtn" class="btn-success" type="button">接听</button>
+      </div>
+    </div>
+
+    <div id="toast" class="toast"></div>
+  </div>
+
+  <script type="module" src="./renderer.js"></script>
+</body>
+</html>

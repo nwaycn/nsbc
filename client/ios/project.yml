@@ -1,0 +1,43 @@
+name: NsbcSoftphone
+options:
+  bundleIdPrefix: com.nway
+  deploymentTarget:
+    iOS: "14.0"
+  createIntermediateGroups: true
+
+packages:
+  WebRTC:
+    url: https://github.com/stasel/WebRTC
+    branch: master
+  NsbcSDK:
+    path: .
+
+targets:
+  NsbcSoftphone:
+    type: application
+    platform: iOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: NsbcSoftphone
+        excludes:
+          - Info.plist
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.nway.nsbc.softphone
+        INFOPLIST_FILE: NsbcSoftphone/Info.plist
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGN_STYLE: Automatic
+    dependencies:
+      - package: NsbcSDK
+        product: NsbcSDK
+      - package: WebRTC
+        product: WebRTC
+
+schemes:
+  NsbcSoftphone:
+    build:
+      targets:
+        NsbcSoftphone: all
+    run:
+      config: Debug

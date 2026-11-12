@@ -48,6 +48,8 @@ internal class SipEngine(
     private var regTag = ""
     private var regBranch = ""
     private var regRefreshRunnable: Runnable? = null
+    private var keepaliveRunnable: Runnable? = null
+    private val sessionId = SipUtils.newTag() + "@" + config.server
 
     // ---- 鉴权缓存（按 realm）----
     private class AuthChallenge(
@@ -96,6 +98,7 @@ internal class SipEngine(
 
     fun disconnect() {
         cancelRefresh()
+        cancelKeepalive()
         ctx?.let { c ->
             if (c.call.state == CallState.ESTABLISHED) sendBye(c) else sendCancel(c)
         }
@@ -118,6 +121,7 @@ internal class SipEngine(
 
     override fun onClosed(code: Int, reason: String) {
         cancelRefresh()
+        cancelKeepalive()
         registrationState = RegistrationState.UNREGISTERED
         events.onRegistrationChanged(registrationState, "连接关闭: $reason")
         events.onTransportClosed(reason)
@@ -125,6 +129,7 @@ internal class SipEngine(
 
     override fun onFailure(error: NsbcError) {
         cancelRefresh()
+        cancelKeepalive()
         registrationState = RegistrationState.FAILED
         events.onRegistrationChanged(registrationState, error.message)
         events.onTransportFailure(error)
@@ -142,7 +147,10 @@ internal class SipEngine(
             msg.method == "ACK" -> handleIncomingAck(msg)
             msg.method == "BYE" -> handleIncomingBye(msg)
             msg.method == "CANCEL" -> handleIncomingCancel(msg)
-            msg.method == "OPTIONS" -> reply(msg, 200, "OK")
+            msg.method == "OPTIONS" -> reply(msg, 200, "OK") {
+                it.addHeader("Allow", "INVITE, ACK, CANCEL, BYE, OPTIONS, MESSAGE")
+                it.addHeader("Supported", "replaces, outbound")
+            }
             msg.method == "MESSAGE" -> handleIncomingMessage(msg)
             else -> reply(msg, 405, "Method Not Allowed")
         }
@@ -164,7 +172,7 @@ internal class SipEngine(
         val req = SipMessage().apply {
             method = "REGISTER"
             requestUri = "sip:${config.realm}"
-            addHeader("Via", "SIP/2.0/$viaProtocol $localHost;branch=$regBranch")
+            addHeader("Via", "SIP/2.0/$viaProtocol $localHost;branch=$regBranch;rport")
             addHeader("Max-Forwards", "70")
             addHeader("From", "\"${displayName}\" <${config.sipUri}>;tag=$regTag")
             addHeader("To", "<${config.sipUri}>")
@@ -176,6 +184,8 @@ internal class SipEngine(
             )
             addHeader("Expires", config.registerExpiresSec.toString())
             addHeader("Allow", "INVITE, ACK, CANCEL, BYE, OPTIONS, MESSAGE")
+            addHeader("Supported", "replaces, outbound")
+            addHeader("Session-ID", sessionId)
             addHeader("User-Agent", USER_AGENT)
         }
         auth?.let { a ->
@@ -195,7 +205,7 @@ internal class SipEngine(
         val req = SipMessage().apply {
             method = "REGISTER"
             requestUri = "sip:${config.realm}"
-            addHeader("Via", "SIP/2.0/$viaProtocol $localHost;branch=$regBranch")
+            addHeader("Via", "SIP/2.0/$viaProtocol $localHost;branch=$regBranch;rport")
             addHeader("Max-Forwards", "70")
             addHeader("From", "\"${displayName}\" <${config.sipUri}>;tag=$regTag")
             addHeader("To", "<${config.sipUri}>")
@@ -203,6 +213,8 @@ internal class SipEngine(
             addHeader("CSeq", "$regCseq REGISTER")
             addHeader("Contact", "<${config.sipUri};transport=${config.contactTransport}>")
             addHeader("Expires", "0")
+            addHeader("Supported", "replaces, outbound")
+            addHeader("Session-ID", sessionId)
             addHeader("User-Agent", USER_AGENT)
         }
         regAuth?.let { a ->
@@ -216,6 +228,7 @@ internal class SipEngine(
 
     private fun scheduleRefresh(expiresSec: Int) {
         cancelRefresh()
+        cancelKeepalive()
         val delayMs = (expiresSec.coerceAtLeast(30) * 1000L) / 2
         val r = Runnable {
             if (registrationState == RegistrationState.REGISTERED && transport.isOpen) {
@@ -225,11 +238,62 @@ internal class SipEngine(
         }
         regRefreshRunnable = r
         handler.postDelayed(r, delayMs)
+        // 商业软电话标配：注册后每 30s 发一次 OPTIONS 做 NAT keepalive
+        scheduleKeepalive()
     }
 
     private fun cancelRefresh() {
         regRefreshRunnable?.let { handler.removeCallbacks(it) }
         regRefreshRunnable = null
+    }
+
+    private fun scheduleKeepalive() {
+        cancelKeepalive()
+        val r = object : Runnable {
+            override fun run() {
+                if (registrationState == RegistrationState.REGISTERED && transport.isOpen) {
+                    sendOptionsKeepalive()
+                    handler.postDelayed(this, 30_000)
+                }
+            }
+        }
+        handler.postDelayed(r, 30_000)
+        keepaliveRunnable = r
+    }
+
+    private fun cancelKeepalive() {
+        keepaliveRunnable?.let { handler.removeCallbacks(it) }
+        keepaliveRunnable = null
+    }
+
+    /**
+     * 发送 OPTIONS keepalive 到 SIP 服务器（RFC 5626 outbound 机制）。
+     * 使用独立 Call-ID，响应通过 handleResponse 的 CSeq/Call-ID 分支过滤，
+     * 200 静默处理；3 次无响应视作 NAT 失效，触发重注册。
+     */
+    private var keepaliveCallId: String = ""
+    private var keepaliveCseq: Long = 0
+    private var keepaliveMisses: Int = 0
+
+    private fun sendOptionsKeepalive() {
+        if (keepaliveCallId.isEmpty()) {
+            keepaliveCallId = SipUtils.newCallId(config.server)
+        }
+        keepaliveCseq++
+        val req = SipMessage().apply {
+            method = "OPTIONS"
+            requestUri = "sip:${config.realm}"
+            addHeader("Via", "SIP/2.0/$viaProtocol $localHost;branch=${SipUtils.newBranch()};rport")
+            addHeader("Max-Forwards", "70")
+            addHeader("From", "\"${displayName}\" <${config.sipUri}>;tag=$regTag")
+            addHeader("To", "<sip:${config.realm}>")
+            addHeader("Call-ID", keepaliveCallId)
+            addHeader("CSeq", "$keepaliveCseq OPTIONS")
+            addHeader("Supported", "replaces, outbound")
+            addHeader("Session-ID", sessionId)
+            addHeader("User-Agent", USER_AGENT)
+        }
+        transport.send(req.toWire())
     }
 
     // ============================================================== 响应处理
@@ -241,6 +305,24 @@ internal class SipEngine(
         when {
             // ---------- REGISTER 响应 ----------
             cseqMethod == "REGISTER" && callId == regCallId -> handleRegisterResponse(msg)
+
+            // ---------- OPTIONS keepalive 响应 ----------
+            cseqMethod == "OPTIONS" && callId == keepaliveCallId -> {
+                when (msg.statusCode) {
+                    200 -> {
+                        keepaliveMisses = 0
+                    }
+                    else -> {
+                        keepaliveMisses++
+                        NsbcLogger.w(tag, "keepalive 响应 ${msg.statusCode}（连续 $keepaliveMisses 次）")
+                        if (keepaliveMisses >= 3) {
+                            NsbcLogger.e(tag, "keepalive 连续 3 次无 200，视作 NAT 失效，触发重注册")
+                            cancelRefresh()
+                            sendRegister(regAuth)
+                        }
+                    }
+                }
+            }
 
             // ---------- INVITE 响应 ----------
             cseqMethod == "INVITE" && ctx?.callId == callId -> handleInviteResponse(msg)
@@ -403,7 +485,7 @@ internal class SipEngine(
         val req = SipMessage().apply {
             method = "INVITE"
             requestUri = c.remoteUri
-            addHeader("Via", "SIP/2.0/$viaProtocol $localHost;branch=${c.branch}")
+            addHeader("Via", "SIP/2.0/$viaProtocol $localHost;branch=${c.branch};rport")
             addHeader("Max-Forwards", "70")
             addHeader("From", "\"${displayName}\" <${config.sipUri}>;tag=${c.localTag}")
             addHeader("To", "<${c.remoteUri}>")
@@ -414,6 +496,8 @@ internal class SipEngine(
                 "<${config.sipUri};transport=${config.contactTransport}>"
             )
             addHeader("Allow", "INVITE, ACK, CANCEL, BYE, OPTIONS, MESSAGE")
+            addHeader("Supported", "replaces, outbound")
+            addHeader("Session-ID", sessionId)
             addHeader("User-Agent", USER_AGENT)
             body = c.localSdp ?: ""
             if (body.isNotEmpty()) addHeader("Content-Type", "application/sdp")
@@ -433,7 +517,7 @@ internal class SipEngine(
         val req = SipMessage().apply {
             method = "ACK"
             requestUri = c.remoteTarget ?: c.remoteUri
-            addHeader("Via", "SIP/2.0/$viaProtocol $localHost;branch=${SipUtils.newBranch()}")
+            addHeader("Via", "SIP/2.0/$viaProtocol $localHost;branch=${SipUtils.newBranch()};rport")
             addHeader("Max-Forwards", "70")
             addHeader("From", "\"${displayName}\" <${config.sipUri}>;tag=${c.localTag}")
             addHeader(
@@ -442,6 +526,8 @@ internal class SipEngine(
             )
             addHeader("Call-ID", c.callId)
             addHeader("CSeq", "${c.cseq} ACK")
+            addHeader("Supported", "replaces, outbound")
+            addHeader("Session-ID", sessionId)
             addHeader("User-Agent", USER_AGENT)
         }
         transport.send(req.toWire())
@@ -452,12 +538,14 @@ internal class SipEngine(
         val req = SipMessage().apply {
             method = "BYE"
             requestUri = c.remoteTarget ?: c.remoteUri
-            addHeader("Via", "SIP/2.0/$viaProtocol $localHost;branch=${SipUtils.newBranch()}")
+            addHeader("Via", "SIP/2.0/$viaProtocol $localHost;branch=${SipUtils.newBranch()};rport")
             addHeader("Max-Forwards", "70")
             addHeader("From", "\"${displayName}\" <${config.sipUri}>;tag=${c.localTag}")
             addHeader("To", "<${c.remoteUri}>" + (c.remoteTag?.let { ";tag=$it" } ?: ""))
             addHeader("Call-ID", c.callId)
             addHeader("CSeq", "${c.cseq} BYE")
+            addHeader("Supported", "replaces, outbound")
+            addHeader("Session-ID", sessionId)
             addHeader("User-Agent", USER_AGENT)
         }
         transport.send(req.toWire())
@@ -469,12 +557,14 @@ internal class SipEngine(
             method = "CANCEL"
             requestUri = c.remoteUri
             // CANCEL 使用与被取消 INVITE 相同的 branch
-            addHeader("Via", "SIP/2.0/$viaProtocol $localHost;branch=${c.branch}")
+            addHeader("Via", "SIP/2.0/$viaProtocol $localHost;branch=${c.branch};rport")
             addHeader("Max-Forwards", "70")
             addHeader("From", "\"${displayName}\" <${config.sipUri}>;tag=${c.localTag}")
             addHeader("To", "<${c.remoteUri}>")
             addHeader("Call-ID", c.callId)
             addHeader("CSeq", "${c.cseq} CANCEL")
+            addHeader("Supported", "replaces, outbound")
+            addHeader("Session-ID", sessionId)
             addHeader("User-Agent", USER_AGENT)
         }
         transport.send(req.toWire())

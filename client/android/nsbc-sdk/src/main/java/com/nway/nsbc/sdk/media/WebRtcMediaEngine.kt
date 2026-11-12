@@ -14,11 +14,14 @@ import org.webrtc.DefaultVideoDecoderFactory
 import org.webrtc.DefaultVideoEncoderFactory
 import org.webrtc.EglBase
 import org.webrtc.IceCandidate
+import org.webrtc.IceServer
 import org.webrtc.MediaConstraints
 import org.webrtc.MediaStream
 import org.webrtc.PeerConnection
 import org.webrtc.PeerConnectionFactory
 import org.webrtc.RtpReceiver
+import org.webrtc.RtpSender
+import org.webrtc.RtpTransceiver
 import org.webrtc.SdpObserver
 import org.webrtc.SessionDescription
 import org.webrtc.SurfaceTextureHelper
@@ -28,7 +31,6 @@ import org.webrtc.VideoSource
 import org.webrtc.VideoTrack
 import org.webrtc.AudioSource
 import org.webrtc.AudioTrack
-import org.webrtc.IceServer
 
 /**
  * 基于 Google WebRTC 的媒体引擎实现。
@@ -110,17 +112,11 @@ class WebRtcMediaEngine(private val appContext: Context) : MediaEngine {
             val pc = ensurePeerConnection()
             attachLocalTracks(pc, allowVideo = cfg.videoEnabled)
 
-            val constraints = MediaConstraints().apply {
-                mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveAudio", "true"))
-                mandatory.add(
-                    MediaConstraints.KeyValuePair(
-                        "OfferToReceiveVideo", cfg.videoEnabled.toString()
-                    )
-                )
-            }
-
+            // Unified Plan 下 MediaConstraints 的 OfferToReceiveAudio/Video 已废弃，
+            // 改用显式 addTransceiver 保证方向可控；已在 attachLocalTracks 内完成。
             pc.createOffer(object : SdpObserver {
                 override fun onCreateSuccess(desc: SessionDescription) {
+                    val sdp = filterOfferSdp(desc.description)
                     pc.setLocalDescription(object : SdpObserver {
                         override fun onSetSuccess() {
                             // 等待 ICE 收集完成后再返回完整 SDP（最多 3 秒）
@@ -130,7 +126,7 @@ class WebRtcMediaEngine(private val appContext: Context) : MediaEngine {
                             onReady(Result.failure(NsbcError(NsbcErrorCode.MEDIA_FAILED, "setLocalDescription 失败: $err")))
                         override fun onCreateSuccess(p0: SessionDescription?) {}
                         override fun onCreateFailure(p0: String?) {}
-                    }, desc)
+                    }, SessionDescription(desc.type, sdp))
                 }
 
                 override fun onCreateFailure(err: String?) =
@@ -138,7 +134,7 @@ class WebRtcMediaEngine(private val appContext: Context) : MediaEngine {
 
                 override fun onSetSuccess() {}
                 override fun onSetFailure(p0: String?) {}
-            }, constraints)
+            })
         } catch (t: Throwable) {
             onReady(Result.failure(NsbcError(NsbcErrorCode.MEDIA_FAILED, "创建 offer 异常: ${t.message}", t)))
         }
@@ -169,22 +165,23 @@ class WebRtcMediaEngine(private val appContext: Context) : MediaEngine {
             val pc = ensurePeerConnection()
             // 对端 offer 没有 m=video 时不能凭空加视频轨，否则 answer 段数多于 offer
             attachLocalTracks(pc, allowVideo = cfg.videoEnabled && remoteOfferHasVideo)
-            val constraints = MediaConstraints()
+            // Unified Plan 下 MediaConstraints 对 answer 无效，方向由远端 offer 决定
             pc.createAnswer(object : SdpObserver {
                 override fun onCreateSuccess(desc: SessionDescription) {
+                    val sdp = filterAnswerSdp(desc.description)
                     pc.setLocalDescription(object : SdpObserver {
                         override fun onSetSuccess() = waitIceComplete(pc, 0, onReady)
                         override fun onSetFailure(err: String?) =
                             onReady(Result.failure(NsbcError(NsbcErrorCode.MEDIA_FAILED, "setLocalDescription 失败: $err")))
                         override fun onCreateSuccess(p0: SessionDescription?) {}
                         override fun onCreateFailure(p0: String?) {}
-                    }, desc)
+                    }, SessionDescription(desc.type, sdp))
                 }
                 override fun onCreateFailure(err: String?) =
                     onReady(Result.failure(NsbcError(NsbcErrorCode.MEDIA_FAILED, "createAnswer 失败: $err")))
                 override fun onSetSuccess() {}
                 override fun onSetFailure(p0: String?) {}
-            }, constraints)
+            })
         } catch (t: Throwable) {
             onReady(Result.failure(NsbcError(NsbcErrorCode.MEDIA_FAILED, "创建 answer 异常: ${t.message}", t)))
         }
@@ -295,15 +292,19 @@ class WebRtcMediaEngine(private val appContext: Context) : MediaEngine {
         }
 
         val rtc = PeerConnection.RTCConfiguration(iceServers).apply {
-            // 现代 WebRTC 默认即 Unified Plan，无需显式设置
+            // Unified Plan 为 libwebrtc 默认，无需显式设置
             if (cfg.icePolicy == IceTransportPolicy.RELAY) {
                 iceTransportPolicy = PeerConnection.IceTransportPolicy.RELAY
             }
             bundlePolicy = PeerConnection.BundlePolicy.MAXBUNDLE
             rtcpMuxPolicy = PeerConnection.RtcpMuxPolicy.REQUIRE
+            // 预生成候选池加速首次 ICE 收集（商业软电话标配）
+            iceCandidatePoolSize = 10
         }
 
         val pc = f.createPeerConnection(rtc, object : PeerConnection.Observer {
+            private var iceRestartAttempted = false
+
             override fun onIceCandidate(candidate: IceCandidate) {
                 // Trickle ICE：本 SDK 采用「收集完成后一次性发送 offer」，
                 // 因此丢弃 trickle candidate，最终 candidate 已包含在 SDP 中。
@@ -314,6 +315,12 @@ class WebRtcMediaEngine(private val appContext: Context) : MediaEngine {
             override fun onIceConnectionChange(newState: PeerConnection.IceConnectionState) {
                 NsbcLogger.i(tag, "ICE 状态: $newState")
                 mainHandler.post { listener?.onIceStateChanged(newState.name.lowercase()) }
+                // ICE failed：商业软电话标配，尝试 iceRestart 触发重新收集候选
+                if (newState == PeerConnection.IceConnectionState.FAILED && !iceRestartAttempted) {
+                    iceRestartAttempted = true
+                    NsbcLogger.w(tag, "ICE failed，尝试 iceRestart")
+                    runCatching { pc.restartIce() }
+                }
             }
 
             override fun onIceConnectionReceivingChange(receiving: Boolean) {}
@@ -361,15 +368,20 @@ class WebRtcMediaEngine(private val appContext: Context) : MediaEngine {
         val f = factory ?: return
         val cfg = config ?: return
 
-        // 音频
+        // 音频：每通呼叫显式 addTransceiver 保证 Unified Plan 方向可控
         if (audioTrack == null) {
             val src = f.createAudioSource(MediaConstraints())
-            val track = f.createAudioTrack("audio0", src)
             audioSource = src
-            audioTrack = track
-            pc.addTrack(track, MEDIA_STREAM_ID)
-            track.setEnabled(micEnabled)
+            audioTrack = f.createAudioTrack("audio0", src)
         }
+        pc.addTransceiver("audio",
+            RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.SEND_RECV)
+        )
+        // 绑定本地音轨到新建 transceiver 的 sender
+        runCatching {
+            pc.transceivers.lastOrNull()?.sender?.setTrack(audioTrack, false)
+        }
+        audioTrack?.setEnabled(micEnabled)
 
         if (!allowVideo) {
             NsbcLogger.i(tag, "本次呼叫不协商视频")
@@ -378,7 +390,12 @@ class WebRtcMediaEngine(private val appContext: Context) : MediaEngine {
 
         // 视频：轨道创建一次复用，采集随通话/开关动态启停
         val track = ensureVideoTrack() ?: return
-        pc.addTrack(track, MEDIA_STREAM_ID)
+        pc.addTransceiver("video",
+            RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.SEND_RECV)
+        )
+        runCatching {
+            pc.transceivers.lastOrNull()?.sender?.setTrack(track, false)
+        }
         track.setEnabled(cameraEnabled)
         if (cameraEnabled) startCaptureIfNeeded()
         localRenderer?.let {
@@ -483,7 +500,58 @@ class WebRtcMediaEngine(private val appContext: Context) : MediaEngine {
         NsbcLogger.i(tag, "媒体引擎已释放")
     }
 
+    // ---------------------------------------------------------------- 商业级 SDP 过滤
+
+    /**
+     * Offer SDP 过滤（商业软电话兼容策略）：
+     *  - H.264 profile-level-id 非 baseline (42e01f) → 降级为 42e01f 并强制 packetization-mode=1
+     *  - opus maxplaybackrate=8000（移动网络节省带宽）
+     */
+    private fun filterOfferSdp(sdp: String): String {
+        var out = sdp
+        // 定位 m=video section，改 H.264 fmtp
+        out = out.replace(H264_FMTP_REGEX) { match ->
+            val line = match.value
+            val replaced = line.replace(
+                Regex("profile-level-id=[0-9a-fA-F]{6}"),
+                "profile-level-id=42e01f"
+            ).let { if ("packetization-mode" !in it) "$it;packetization-mode=1" else it }
+            if (replaced != line) NsbcLogger.d(tag, "H.264 fmtp 过滤: $line → $replaced")
+            replaced
+        }
+        // opus maxplaybackrate
+        out = out.replace(OPUS_FMTP_REGEX) { match ->
+            val line = match.value
+            if ("maxplaybackrate" in line) line else "$line;maxplaybackrate=8000"
+        }
+        return out
+    }
+
+    /**
+     * Answer SDP 过滤：只处理 opus maxplaybackrate 与 H.264 packetization-mode，
+     * 不降级 profile-level-id（那是 offer 才做的事）。
+     */
+    private fun filterAnswerSdp(sdp: String): String {
+        var out = sdp
+        out = out.replace(H264_FMTP_REGEX) { match ->
+            val line = match.value
+            if ("packetization-mode" in line) line else "$line;packetization-mode=1"
+        }
+        out = out.replace(OPUS_FMTP_REGEX) { match ->
+            val line = match.value
+            if ("maxplaybackrate" in line) line else "$line;maxplaybackrate=8000"
+        }
+        return out
+    }
+
     companion object {
         private const val MEDIA_STREAM_ID = "nsbc"
+
+        // 匹配 m=video section 内的 H.264 fmtp 行（profile-level-id 非 baseline 需降级）
+        private val H264_FMTP_REGEX =
+            Regex("""a=fmtp:\d+ profile-level-id=[0-9a-fA-F]{6}($|[^\r\n]*)""")
+        // 匹配 opus fmtp 行（通常 pt=111，但不固定 pt 号）
+        private val OPUS_FMTP_REGEX =
+            Regex("""a=fmtp:111[^\r\n]*""")
     }
 }

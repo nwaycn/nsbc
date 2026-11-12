@@ -1,0 +1,47 @@
+{
+  "name": "nsbc-softphone-desktop",
+  "version": "1.0.0",
+  "description": "NSBC 桌面软电话（Electron + SIP over WebSocket + WebRTC）",
+  "main": "main.js",
+  "private": true,
+  "author": "Nway",
+  "license": "UNLICENSED",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "dist:win": "electron-builder --win",
+    "dist:mac": "electron-builder --mac"
+  },
+  "devDependencies": {
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.nway.nsbc.desktop",
+    "productName": "NSBC 软电话",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "src/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "category": "public.app-category.business",
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "NSBC 软电话需要使用麦克风进行语音通话",
+        "NSCameraUsageDescription": "NSBC 软电话需要使用摄像头进行视频通话"
+      }
+    }
+  }
+}
