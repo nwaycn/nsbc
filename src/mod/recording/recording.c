@@ -223,14 +223,13 @@ static int ffmpeg_convert_av(const char *wav_path,
              *   完全无视 SPS 标称帧率 —— 实验验证 1510 帧 → 60.4s ✓。
              *   fps = 帧数/音频时长（wav_duration_sec + rec_video_frames）。
              * ★ P0：argv 数组按实项数配额（原 [24] 实写 27 项 = 子进程栈溢出）。 */
-            char fa[16], fb[16];
-            snprintf(fa, sizeof(fa), "%.3f", fps_a > 0 ? fps_a : 25.0);
-            snprintf(fb, sizeof(fb), "%.3f", fps_b > 0 ? fps_b : 25.0);
             char filt[256];
             snprintf(filt, sizeof(filt),
                      "[1:v]setpts=N/(%.3f*TB),scale=-2:720[a];"
                      "[2:v]setpts=N/(%.3f*TB),scale=-2:720[b];"
-                     "[a][b]hstack=inputs=2[vout]", fa, fb);
+                     "[a][b]hstack=inputs=2[vout]",
+                     fps_a > 0 ? fps_a : 25.0,
+                     fps_b > 0 ? fps_b : 25.0);
             char *argv[36]; int ai = 0;
             argv[ai++] = (char *)"ffmpeg";
             argv[ai++] = (char *)"-y";
@@ -267,10 +266,9 @@ static int ffmpeg_convert_av(const char *wav_path,
              * ★ 原 copy 直存有同样的 25s 冻结问题（SPS VUI demux 帧率压缩
              *   时间轴），copy 无法重排 PTS → 必须重编码走 setpts（与 dual 同方案）。 */
             const char *h264 = (h264_a && h264_a[0]) ? h264_a : h264_b;
-            char fa[16];
-            snprintf(fa, sizeof(fa), "%.3f", fps_v > 0 ? fps_v : 25.0);
             char filt[96];
-            snprintf(filt, sizeof(filt), "setpts=N/(%.3f*TB)", fa);
+            snprintf(filt, sizeof(filt), "setpts=N/(%.3f*TB)",
+                     fps_v > 0 ? fps_v : 25.0);
             char *argv[28]; int ai = 0;
             argv[ai++] = (char *)"ffmpeg";
             argv[ai++] = (char *)"-y";
