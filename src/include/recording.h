@@ -24,6 +24,9 @@ extern "C" {
  *       char rec_path[REC_PATH_MAX];
  *       recording_apply_dp_action(ctx->rec_mgr, res.rec_action,
  *                                 call->call_id, "dialplan",
+ *                                 res.rec_path_template,
+ *                                 res.rec_fmt,
+ *                                 call->caller, call->callee,
  *                                 rec_path, sizeof(rec_path));
  *       // stop 时回填 cdr->rec_path，供 poller 写 DB → cdr.metadata.rec_path
  *       cdr->rec_path[0] = '\0';
@@ -37,10 +40,15 @@ extern "C" {
  *
  * REQ-REC-007：rec_path_template 透传。dialplan 规则里配的路径模板
  * （"{caller}-{callee}-{callid}.wav" 之类），空串=用系统默认命名。
- * caller/callee 填主叫号/被叫号，供模板变量替换。 */
+ * caller/callee 填主叫号/被叫号，供模板变量替换。
+ *
+ * §19 rec_fmt：规则级录音格式覆盖。空串=用全局 recording.format；
+ * 有效值 wav/mp3/opus/mp4，仅对本通话生效。
+ * 优先级：rec_fmt（规则级） > recording.format（全局 YAML） > wav 兜底 */
 int recording_apply_dp_action(rec_mgr_t *mgr, uint8_t rec_action,
                               const char *callid, const char *reason,
                               const char *rec_path_template,
+                              const char *rec_fmt,
                               const char *caller, const char *callee,
                               char *rec_path_out, size_t path_cap);
 

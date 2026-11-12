@@ -658,7 +658,25 @@ const AppChainEditor = {
               <el-tag size="small" type="info" effect="plain" class="font-mono">{{ item.app }}</el-tag>
               <span class="text-[11px] text-slate-500">{{ appHint(item.app) }}</span>
             </div>
-            <el-input v-if="needsData(item.app)" v-model="item.data" size="small"
+            <!-- record app: 结构化选择器（action + format 下拉） -->
+            <div v-if="item.app === 'record'" class="flex items-center gap-2 flex-wrap">
+              <el-select :model-value="recordField(item, 'action')"
+                         @update:model-value="v => recordSet(item, 'action', v)"
+                         size="small" style="width:130px">
+                <el-option label="● start 开始录音" value="start" />
+                <el-option label="■ stop 停止录音"   value="stop" />
+              </el-select>
+              <el-select :model-value="recordField(item, 'format')"
+                         @update:model-value="v => recordSet(item, 'format', v)"
+                         size="small" style="width:150px" clearable placeholder="跟随全局默认">
+                <el-option label="wav  · 原生 PCM 无依赖"       value="wav" />
+                <el-option label="mp3  · 通用 128kbps"          value="mp3" />
+                <el-option label="opus · 省空间 ~1/10"          value="opus" />
+                <el-option label="mp4  · 音视频合成浏览器直放"  value="mp4" />
+              </el-select>
+            </div>
+            <!-- 其他 app: 通用 data 输入框 -->
+            <el-input v-else-if="needsData(item.app)" v-model="item.data" size="small"
                       :placeholder="dataPlaceholder(item.app)" clearable></el-input>
           </div>
           <div class="flex-none flex flex-col gap-0.5">
@@ -693,7 +711,7 @@ const AppChainEditor = {
       playback:            'Play a single audio file (plays to completion)',
       ringback:            'Ringback tone: loops while routing, auto-stops when B-leg answers (put BEFORE bridge/transfer)',
       post_playback:       'Play after answer (phase marker)',
-      record:              'Record current call audio (data: "start format=mp4" for per-rule format)',
+      record:              '录音：下拉选 start/stop + 格式（mp4 含视频合成）',
       transfer:            'Transfer current call (REFER or 302)',
       set:                 'Set channel variable var=value',
       conference:          'Join conference <room>@<profile>',
@@ -722,7 +740,7 @@ const AppChainEditor = {
     const chain = ref([]);
 
     function appHint(name)  { return APP_DESCS[name] || ''; }
-    function needsData(name){ return ['playback','ringback','post_playback','endless_playback','sleep','bridge','transfer','conference','set','gentones','record','play_and_get_digits','read'].includes(name); }
+    function needsData(name){ return ['playback','ringback','post_playback','endless_playback','sleep','bridge','transfer','conference','set','gentones','play_and_get_digits','read'].includes(name); }
     function dataPlaceholder(name) {
       const H = {
         playback:             'welcome.wav or /path/to/file.wav',
@@ -775,12 +793,33 @@ const AppChainEditor = {
       emit('update:modelValue', JSON.stringify(clean));
     }
 
+    /* record app 的 data 字符串 ↔ 结构化字段互转
+     *   data 格式: "start format=mp4" | "stop format=mp3" | "start" | ""
+     *   兼容 C 端 app_record_exec 解析逻辑（recording.c L349-L362）*/
+    function recordField(item, key) {
+      const s = (item.data || '').trim().toLowerCase();
+      let action = 'start', fmt = '';
+      if (s) {
+        if (s.startsWith('stop'))  action = 'stop';
+        else if (s.startsWith('start')) action = 'start';
+        const fm = s.match(/format=(\S+)/);
+        if (fm) fmt = fm[1];
+      }
+      return key === 'action' ? action : fmt;
+    }
+    function recordSet(item, key, val) {
+      const a = (key === 'action' ? val : recordField(item, 'action')) || 'start';
+      const f = (key === 'format' ? (val || '') : recordField(item, 'format')) || '';
+      item.data = f ? a + ' format=' + f : a;
+    }
+
     watch(() => props.modelValue, syncFrom);
     watch(chain, syncTo, { deep: true });
     syncFrom();
 
     return { chain, nextApp, appGroups, addApp, removeAt, moveUp, moveDown,
-             appHint, needsData, dataPlaceholder, preview };
+             appHint, needsData, dataPlaceholder, preview,
+             recordField, recordSet };
   },
 };
 

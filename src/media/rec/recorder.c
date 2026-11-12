@@ -612,12 +612,21 @@ int rec_stop(rec_sess_t *s, char *path_out, size_t path_cap, uint64_t *bytes_out
     pthread_mutex_lock(&s->lock);
 
     int rc = segment_close_locked(s);
-    /* REQ-REC-006：关�?raw_fp（G.711 原始路径�?*/
+    /* REQ-REC-006：关 raw_fp（G.711 原始路径）+ 清中间文件
+     * raw 是纯原始码流，WAV 解码版才是 recording_stop_merge 消费的主文件 */
     if (s->raw_fp) {
         fflush(s->raw_fp);
         fsync(fileno(s->raw_fp));
         fclose(s->raw_fp);
         s->raw_fp = NULL;
+        /* 拼路径删中间 raw 文件（与 rec_feed_raw 的延迟 open 路径模板一致） */
+        if (s->raw_ext[0]) {
+            char raw_path[REC_PATH_MAX];
+            snprintf(raw_path, sizeof(raw_path), "%s/%s_%s_raw.%s",
+                     s->date_dir, s->req.callid, s->leg_sfx, s->raw_ext);
+            if (unlink(raw_path) != 0 && errno != ENOENT)
+                llog(LOG_WARN, "rec", "unlink raw failed path=%s errno=%d", raw_path, errno);
+        }
     }
     s->state = rc == NSBC_OK ? REC_ST_STOPPED : REC_ST_FAILED;
 

@@ -128,23 +128,44 @@ static int ffmpeg_convert(const char *wav_path, const char *out_path, rec_fmt_t 
         return NSBC_ERR;
     }
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        llog(LOG_WARN, "rec", "ffmpeg_convert: ffmpeg exited status=%d",
-             WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        llog(LOG_WARN, "rec",
+             "ffmpeg_convert: ffmpeg failed exit=%d wav=%s → %s fmt=%d",
+             WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+             wav_path, out_path, fmt);
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 127) {
+            llog(LOG_ERR, "rec",
+                 "ffmpeg_convert: ffmpeg not found in PATH (exit 127) — install ffmpeg or check PATH");
+        }
         return NSBC_ERR;
     }
-    llog(LOG_INFO, "rec", "ffmpeg_convert OK wav=%s → %s", wav_path, out_path);
+    llog(LOG_INFO, "rec", "ffmpeg_convert OK wav=%s → %s (fmt=%d)", wav_path, out_path, fmt);
     return NSBC_OK;
 }
 
-/* M1：音频 WAV + 视频 H.264 → mp4（视频 copy 直存不转码）
- * ffmpeg -y -i <wav> -i <h264> -map 0:a -map 1:v -c:v copy -c:a aac \
- *        -b:a 128k -movflags +faststart <out>
- * 音频强制 AAC（mp4 容器 PCM 兼容性差）；视频 H.264 copy 零质量损失。
+/* M1+：音频 WAV + 一个或两个视频 H.264 → mp4
+ *
+ * 单视频 (h264_b==NULL)：
+ *   ffmpeg -y -i wav -i h264_a -map 0:a -map 1:v -c:v copy -c:a aac -b:a 128k -movflags +faststart out
+ *   零质量损失（H.264 copy 直存），性能最优。
+ *
+ * 双视频 (h264_a + h264_b) — 画中画 PIP 融合：
+ *   ffmpeg -y -i wav -i h264_a -i h264_b \
+ *     -filter_complex "[2:v]scale=iw/2:-1[pip];[1:v][pip]overlay=W-w-20:H-h-20[vout]" \
+ *     -map 0:a -map "[vout]" -c:v libx264 -preset veryfast -crf 23 \
+ *     -c:a aac -b:a 128k -movflags +faststart out
+ *   B 腿画面缩放到 A 腿画面右下角 1/2 宽；单输出轨道。
+ *   注意：双路不同分辨率 → libx264 重编码是唯一融合选项；crf=23 中等质量，
+ *   preset=veryfast 降低 CPU 占用（通话结束才跑，非实时路径）。
+ *
  * 同步 fork+wait —— 只在 rec_stop（callctrl 线程）调用，不在媒体路径。 */
-static int ffmpeg_convert_av(const char *wav_path, const char *h264_path,
+static int ffmpeg_convert_av(const char *wav_path,
+                             const char *h264_a, const char *h264_b,
                              const char *out_path)
 {
-    if (!wav_path || !h264_path || !out_path) return NSBC_INVAL;
+    if (!wav_path || !out_path) return NSBC_INVAL;
+    if (!h264_a && !h264_b) return NSBC_INVAL;
+
+    int dual = (h264_a && h264_a[0] && h264_b && h264_b[0]) ? 1 : 0;
 
     pid_t pid = fork();
     if (pid < 0) {
@@ -152,29 +173,68 @@ static int ffmpeg_convert_av(const char *wav_path, const char *h264_path,
         return NSBC_ERR;
     }
     if (pid == 0) {
-        char *argv[20]; int ai = 0;
-        argv[ai++] = (char *)"ffmpeg";
-        argv[ai++] = (char *)"-y";
-        argv[ai++] = (char *)"-i";
-        argv[ai++] = (char *)wav_path;
-        argv[ai++] = (char *)"-i";
-        argv[ai++] = (char *)h264_path;
-        argv[ai++] = (char *)"-map";
-        argv[ai++] = (char *)"0:a";
-        argv[ai++] = (char *)"-map";
-        argv[ai++] = (char *)"1:v";
-        argv[ai++] = (char *)"-c:v";
-        argv[ai++] = (char *)"copy";
-        argv[ai++] = (char *)"-c:a";
-        argv[ai++] = (char *)"aac";
-        argv[ai++] = (char *)"-b:a";
-        argv[ai++] = (char *)"128k";
-        argv[ai++] = (char *)"-movflags";
-        argv[ai++] = (char *)"+faststart";
-        argv[ai++] = (char *)out_path;
-        argv[ai] = NULL;
-        execvp("ffmpeg", argv);
-        _exit(127);
+        if (dual) {
+            /* ======== 双视频 PIP 融合路径（libx264 重编码）========
+             * h264_a 输入 index=1，h264_b 输入 index=2
+             * filter_complex: [2:v]scale=iw/2:-1[pip];[1:v][pip]overlay=W-w-20:H-h-20[vout] */
+            char *argv[24]; int ai = 0;
+            argv[ai++] = (char *)"ffmpeg";
+            argv[ai++] = (char *)"-y";
+            argv[ai++] = (char *)"-i";
+            argv[ai++] = (char *)wav_path;
+            argv[ai++] = (char *)"-i";
+            argv[ai++] = (char *)h264_a;
+            argv[ai++] = (char *)"-i";
+            argv[ai++] = (char *)h264_b;
+            argv[ai++] = (char *)"-filter_complex";
+            argv[ai++] = (char *)"[2:v]scale=iw/2:-1[pip];[1:v][pip]overlay=W-w-20:H-h-20[vout]";
+            argv[ai++] = (char *)"-map";
+            argv[ai++] = (char *)"0:a";
+            argv[ai++] = (char *)"-map";
+            argv[ai++] = (char *)"[vout]";
+            argv[ai++] = (char *)"-c:v";
+            argv[ai++] = (char *)"libx264";
+            argv[ai++] = (char *)"-preset";
+            argv[ai++] = (char *)"veryfast";
+            argv[ai++] = (char *)"-crf";
+            argv[ai++] = (char *)"23";
+            argv[ai++] = (char *)"-c:a";
+            argv[ai++] = (char *)"aac";
+            argv[ai++] = (char *)"-b:a";
+            argv[ai++] = (char *)"128k";
+            argv[ai++] = (char *)"-movflags";
+            argv[ai++] = (char *)"+faststart";
+            argv[ai++] = (char *)out_path;
+            argv[ai] = NULL;
+            execvp("ffmpeg", argv);
+            _exit(127);
+        } else {
+            /* ======== 单视频 copy 路径（零损失）======== */
+            const char *h264 = (h264_a && h264_a[0]) ? h264_a : h264_b;
+            char *argv[20]; int ai = 0;
+            argv[ai++] = (char *)"ffmpeg";
+            argv[ai++] = (char *)"-y";
+            argv[ai++] = (char *)"-i";
+            argv[ai++] = (char *)wav_path;
+            argv[ai++] = (char *)"-i";
+            argv[ai++] = (char *)h264;
+            argv[ai++] = (char *)"-map";
+            argv[ai++] = (char *)"0:a";
+            argv[ai++] = (char *)"-map";
+            argv[ai++] = (char *)"1:v";
+            argv[ai++] = (char *)"-c:v";
+            argv[ai++] = (char *)"copy";
+            argv[ai++] = (char *)"-c:a";
+            argv[ai++] = (char *)"aac";
+            argv[ai++] = (char *)"-b:a";
+            argv[ai++] = (char *)"128k";
+            argv[ai++] = (char *)"-movflags";
+            argv[ai++] = (char *)"+faststart";
+            argv[ai++] = (char *)out_path;
+            argv[ai] = NULL;
+            execvp("ffmpeg", argv);
+            _exit(127);
+        }
     }
     int status = 0;
     pid_t w = waitpid(pid, &status, 0);
@@ -183,12 +243,19 @@ static int ffmpeg_convert_av(const char *wav_path, const char *h264_path,
         return NSBC_ERR;
     }
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        llog(LOG_WARN, "rec", "ffmpeg_convert_av: ffmpeg exited status=%d",
-             WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        llog(LOG_WARN, "rec", "ffmpeg_convert_av: ffmpeg failed exit=%d mode=%s wav=%s h264_a=%s h264_b=%s → %s",
+             WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+             dual ? "dual_pip" : "single_copy",
+             wav_path, h264_a ? h264_a : "-", h264_b ? h264_b : "-", out_path);
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 127) {
+            llog(LOG_ERR, "rec",
+                 "ffmpeg_convert_av: ffmpeg not found in PATH (exit 127) — install ffmpeg or check PATH");
+        }
         return NSBC_ERR;
     }
-    llog(LOG_INFO, "rec", "ffmpeg_convert_av OK wav=%s h264=%s → %s",
-         wav_path, h264_path, out_path);
+    llog(LOG_INFO, "rec", "ffmpeg_convert_av OK mode=%s wav=%s h264_a=%s h264_b=%s → %s",
+         dual ? "dual_pip" : "single_copy",
+         wav_path, h264_a ? h264_a : "-", h264_b ? h264_b : "-", out_path);
     return NSBC_OK;
 }
 
@@ -331,7 +398,7 @@ static app_rc_t app_record_exec(app_ctx_t *c, const char *data, void *ud)
         memset(&req, 0, sizeof(req));
         req.mode = REC_MODE_SINGLE;
         req.leg_mask = (1 << leg);
-        req.video = (leg == 0) ? 1 : 0;  /* M1: 视频轨挂 leg A sess */
+        req.video = 1;  /* M1+: 两条腿都挂 video sess，rec_stop 各自产出 .h264 */
         snprintf(req.callid, sizeof(req.callid), "%s", call->leg[0].callid);
         snprintf(req.reason, sizeof(req.reason), "app_record");
         snprintf(req.caller, sizeof(req.caller), "%s", caller);
@@ -396,7 +463,7 @@ static app_rc_t app_record_exec(app_ctx_t *c, const char *data, void *ud)
                 snprintf(out_path, sizeof(out_path), "%s", final_path);
                 char *dot = strrchr(out_path, '.');
                 if (dot) snprintf(dot, sizeof(out_path) - (size_t)(dot - out_path), ".mp4");
-                if (ffmpeg_convert_av(final_path, video_path, out_path) == NSBC_OK) {
+                if (ffmpeg_convert_av(final_path, video_path, NULL, out_path) == NSBC_OK) {
                     llog(LOG_INFO, "rec", "app_record AV-MUX callid=%s leg=%d → mp4",
                          call->leg[0].callid, leg);
                     unlink(final_path);  /* 删中间 WAV */
@@ -486,6 +553,7 @@ static const char *strip_base_dir(const char *path, const char *base_dir)
 int recording_apply_dp_action(rec_mgr_t *mgr, uint8_t rec_action,
                               const char *callid, const char *reason,
                               const char *rec_path_template,
+                              const char *rec_fmt,
                               const char *caller, const char *callee,
                               char *rec_path_out, size_t path_cap)
 {
@@ -503,7 +571,7 @@ int recording_apply_dp_action(rec_mgr_t *mgr, uint8_t rec_action,
                      reason ? reason : "dialplan");
             req.mode = REC_MODE_SINGLE;
             req.leg_mask = (leg == 0) ? 1 : 2;
-            req.video = (leg == 0) ? 1 : 0;  /* M1: 视频轨挂 leg A sess */
+            req.video = 1;  /* M1+: 两条腿都挂 video sess */
             /* REQ-REC-007：路径模板变量透传 */
             if (rec_path_template && rec_path_template[0])
                 snprintf(req.rec_path_template, sizeof(req.rec_path_template), "%s", rec_path_template);
@@ -543,8 +611,16 @@ int recording_apply_dp_action(rec_mgr_t *mgr, uint8_t rec_action,
                 else                                 live_fmt = REC_FMT_WAV_PCM;
             }
         }
-        llog(LOG_DEBUG, "rec", "recording STOP callid=%s live_fmt=%d (%s)",
-             callid, live_fmt, rec_fmt_ext(live_fmt));
+        /* §19 rec_fmt: 规则级格式覆盖全局 —— 优先级 rec_fmt > 全局 > wav */
+        if (rec_fmt && rec_fmt[0]) {
+            if      (!strcmp(rec_fmt, "mp3"))  live_fmt = REC_FMT_MP3;
+            else if (!strcmp(rec_fmt, "mp4"))  live_fmt = REC_FMT_MP4_AAC;
+            else if (!strcmp(rec_fmt, "opus")) live_fmt = REC_FMT_OGG_OPUS;
+            else if (!strcmp(rec_fmt, "wav"))  live_fmt = REC_FMT_WAV_PCM;
+        }
+        llog(LOG_DEBUG, "rec", "recording STOP callid=%s live_fmt=%d (%s) rule_fmt=%s",
+             callid, live_fmt, rec_fmt_ext(live_fmt),
+             (rec_fmt && rec_fmt[0]) ? rec_fmt : "(global)");
 
         /* REQ-REC-007：先从 bucket 拿模板/caller/callee（rec_stop 会 free sess）
          * 入参可能为 NULL（hangup/call_destroy 兜底路径没传）—— fallback 用 bucket 缓存 */
@@ -558,16 +634,14 @@ int recording_apply_dp_action(rec_mgr_t *mgr, uint8_t rec_action,
         }
         pthread_mutex_unlock(&g_reg_lock);
 
-        /* M1: 视频路径在 rec_stop(free) 前取出 —— 只有 leg A 的 sess 有视频轨 */
-        char video_path[REC_PATH_MAX] = {0};
+        /* M1+: 两条腿视频路径在 rec_stop(free) 前取出 */
+        char video_paths[2][REC_PATH_MAX] = {{0}};
         for (int leg = 0; leg < 2; ++leg) {
             rec_sess_t *s = reg_get(callid, leg);
             if (s == NULL) continue;
-            if (leg == 0) {
-                const char *vp = rec_video_path(s);
-                if (vp && vp[0])
-                    snprintf(video_path, sizeof(video_path), "%s", vp);
-            }
+            const char *vp = rec_video_path(s);
+            if (vp && vp[0])
+                snprintf(video_paths[leg], sizeof(video_paths[leg]), "%s", vp);
             char final_path[REC_PATH_MAX];
             uint64_t bytes = 0;
             int rc = rec_stop(s, final_path, sizeof(final_path), &bytes);
@@ -618,16 +692,22 @@ int recording_apply_dp_action(rec_mgr_t *mgr, uint8_t rec_action,
                 unlink(a_path);
                 unlink(b_path);
 
-                /* ★ M1 视频轨优先：mix WAV + H.264 → mp4（无视 live_fmt —— 视频必须 mp4 容器） */
-                if (video_path[0]) {
+                /* ★ M1+ 视频轨优先：mix WAV + 一或两条 H.264 → mp4
+                 * 无视 live_fmt —— 视频必须 mp4 容器；h264_b 存在则合成双 video track */
+                if (video_paths[0][0] || video_paths[1][0]) {
                     char final_path[REC_PATH_MAX];
                     snprintf(final_path, sizeof(final_path), "%s", mix_path);
                     char *dot = strrchr(final_path, '.');
                     if (dot) snprintf(dot, sizeof(final_path) - (dot - final_path), ".mp4");
-                    if (ffmpeg_convert_av(mix_path, video_path, final_path) == NSBC_OK) {
+                    int rc_av = ffmpeg_convert_av(mix_path,
+                                                  video_paths[0][0] ? video_paths[0] : NULL,
+                                                  video_paths[1][0] ? video_paths[1] : NULL,
+                                                  final_path);
+                    if (rc_av == NSBC_OK) {
                         llog(LOG_INFO, "rec", "recording AV-MUX callid=%s → mp4", callid);
                         unlink(mix_path);   /* 删中间 WAV */
-                        unlink(video_path); /* 删中间 H.264 */
+                        if (video_paths[0][0]) unlink(video_paths[0]);
+                        if (video_paths[1][0]) unlink(video_paths[1]);
                         if (rec_path_out && path_cap > 0)
                             snprintf(rec_path_out, path_cap, "%s", strip_base_dir(final_path, bd));
                     } else {
@@ -663,46 +743,72 @@ int recording_apply_dp_action(rec_mgr_t *mgr, uint8_t rec_action,
                 if (rec_path_out && b_path[0] && path_cap > 0)
                     snprintf(rec_path_out, path_cap, "%s", strip_base_dir(b_path, bd));
             }
-        } else if (a_path[0]) {
-            /* 单 leg：只有 mono WAV —— M1 有视频轨则 wav+h264 → mp4 */
-            if (video_path[0]) {
+        } else if (a_path[0] || b_path[0]) {
+            /* 单 leg：只有一条 mono WAV —— M1+ 有视频轨则 wav+h264 → mp4
+             * （双腿 mono 合并时已走上面 mix 路径）
+             * 修复 Bug 1: 覆盖只有 B 腿音频存在的 case（之前只处理 a_path[0]）
+             * 修复 Bug 2: 视频腿对齐音频腿 —— 有音频的那条腿的 h264 优先 */
+            const char *audio = a_path[0] ? a_path : b_path;
+            /* 视频腿对齐：优先选 audio 同腿的 h264；没有则退回另一条腿 */
+            const char *h264_same = a_path[0]
+                ? (video_paths[0][0] ? video_paths[0] : NULL)
+                : (video_paths[1][0] ? video_paths[1] : NULL);
+            const char *h264_other = a_path[0]
+                ? (video_paths[1][0] ? video_paths[1] : NULL)
+                : (video_paths[0][0] ? video_paths[0] : NULL);
+
+            if (video_paths[0][0] || video_paths[1][0]) {
                 char final_path[REC_PATH_MAX];
-                snprintf(final_path, sizeof(final_path), "%s", a_path);
+                snprintf(final_path, sizeof(final_path), "%s", audio);
                 char *dot = strrchr(final_path, '.');
                 if (dot) snprintf(dot, sizeof(final_path) - (dot - final_path), ".mp4");
-                if (ffmpeg_convert_av(a_path, video_path, final_path) == NSBC_OK) {
+                /* h264_a 放同腿视频，h264_b 放另一条（可能为 NULL）—— ffmpeg_convert_av
+                 * 单视频分支优先 h264_a；双视频时走 PIP 融合 */
+                int rc_av = ffmpeg_convert_av(audio, h264_same, h264_other, final_path);
+                if (rc_av == NSBC_OK) {
                     llog(LOG_INFO, "rec", "recording AV-MUX mono callid=%s → mp4", callid);
-                    unlink(a_path);
-                    unlink(video_path);
+                    unlink(audio);
+                    if (video_paths[0][0]) unlink(video_paths[0]);
+                    if (video_paths[1][0]) unlink(video_paths[1]);
                     if (rec_path_out && path_cap > 0)
                         snprintf(rec_path_out, path_cap, "%s", strip_base_dir(final_path, bd));
                 } else {
                     llog(LOG_WARN, "rec",
                          "recording AV-MUX mono failed callid=%s — keeping WAV+H264", callid);
                     if (rec_path_out && path_cap > 0)
-                        snprintf(rec_path_out, path_cap, "%s", strip_base_dir(a_path, bd));
+                        snprintf(rec_path_out, path_cap, "%s", strip_base_dir(audio, bd));
                 }
             } else if (live_fmt != REC_FMT_WAV_PCM) {
                 const char *target_ext = rec_fmt_ext(live_fmt);
                 char final_path[REC_PATH_MAX];
-                snprintf(final_path, sizeof(final_path), "%s", a_path);
+                snprintf(final_path, sizeof(final_path), "%s", audio);
                 char *dot = strrchr(final_path, '.');
                 if (dot) snprintf(dot, sizeof(final_path) - (dot - final_path), ".%s", target_ext);
 
-                if (ffmpeg_convert(a_path, final_path, live_fmt) == NSBC_OK) {
+                if (ffmpeg_convert(audio, final_path, live_fmt) == NSBC_OK) {
                     llog(LOG_INFO, "rec", "recording CONVERT mono callid=%s → .%s", callid, target_ext);
-                    unlink(a_path);
+                    unlink(audio);
                     if (rec_path_out && path_cap > 0)
                         snprintf(rec_path_out, path_cap, "%s", strip_base_dir(final_path, bd));
                 } else {
                     llog(LOG_WARN, "rec", "recording CONVERT mono failed callid=%s — keeping WAV", callid);
                     if (rec_path_out && path_cap > 0)
-                        snprintf(rec_path_out, path_cap, "%s", strip_base_dir(a_path, bd));
+                        snprintf(rec_path_out, path_cap, "%s", strip_base_dir(audio, bd));
                 }
             } else {
                 if (rec_path_out && path_cap > 0)
-                    snprintf(rec_path_out, path_cap, "%s", strip_base_dir(a_path, bd));
+                    snprintf(rec_path_out, path_cap, "%s", strip_base_dir(audio, bd));
             }
+        }
+
+        /* ★ 路径链诊断日志 —— 帮助定位 Web 侧 404 */
+        if (rec_path_out && path_cap > 0 && rec_path_out[0]) {
+            llog(LOG_INFO, "rec",
+                 "rec_path_chain: bd='%s' a='%s' b='%s' → strip='%s'",
+                 bd,
+                 a_path[0] ? a_path : "-",
+                 b_path[0] ? b_path : "-",
+                 rec_path_out);
         }
 
         return rc_all;

@@ -179,8 +179,7 @@ fn api_router<C: CoreApi + Clone + 'static>(st: Arc<AppState<C>>) -> Router {
         .merge(routes::metrics::router())
         .merge(routes::cdrs::router())
         .merge(routes::security::router())
-        .merge(routes::recordings::router())
-        .merge(routes::recordings::public_file_router(st.clone()))
+        .merge(routes::recordings::router())       // ← 列表接口（需要鉴权）
         .nest("/billing", routes::billing::router())
         .merge(routes::transcode::router())
         .merge(routes::tenants::router())
@@ -239,6 +238,7 @@ fn app_router<C: CoreApi + Clone + 'static>(state: Arc<AppState<C>>) -> Router {
     let app = Router::new()
         .nest("/api/v1", api_router(state.clone()))
         .nest("/ext/v1", ext_router(state.clone()))
+        .merge(routes::recordings::public_file_router(state.clone()))  // ← 顶层直挂 /recordings/*，不走 /api/v1 前缀
         .route("/health", axum::routing::get(routes::system::health))
         .merge(static_files::router());
 
@@ -570,13 +570,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    let recording_root = std::path::PathBuf::from(&cfg.recording.path);
+    // Ensure recording_root dir exists — nsbcd may not have created it yet when nsbc-web starts first.
+    if !recording_root.exists() {
+        if let Err(e) = std::fs::create_dir_all(&recording_root) {
+            tracing::warn!(path = %recording_root.display(), err = %e, "create recording_root failed");
+        } else {
+            tracing::info!(path = %recording_root.display(), "created recording_root");
+        }
+    }
+    tracing::info!(
+        "recording_root = {} (exists={})",
+        recording_root.display(),
+        recording_root.exists()
+    );
+
     let state = Arc::new(AppState {
         core,
         auth,
         db,
         api_major: API_MAJOR,
         bind,
-        recording_root: std::path::PathBuf::from(&cfg.recording.path),
+        recording_root: recording_root.clone(),
         require_loopback_auth: cfg.web.ext.require_loopback_auth,
         data_pushed: Arc::new(AtomicBool::new(false)),
         calls_tx: tokio::sync::broadcast::channel(256).0,

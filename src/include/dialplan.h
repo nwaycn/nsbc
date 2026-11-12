@@ -82,6 +82,9 @@ typedef struct dp_rule {
     /* §18 可选录音路径模板，空串=系统默认 yyyymmdd/callid_mix_seq.wav
      * 变量替换：{caller} {callee} {callid} {date} {time} {mix} */
     char rec_path_template[128];
+    /* §19 规则级录音格式：空串=全局默认（recording.format YAML），
+     * 有效值：wav / mp3 / opus / mp4 — 非法值忽略回退全局 */
+    char rec_fmt[16];
     /* REQ-DP-SIP-001：SIP 头重写（统一容器，从 action_json 解析） */
     sip_hdr_rewrite_t hdr_rw;
     /* REQ-DP-APP-001：Application 链（JSON 字段 "app_chain"）。
@@ -149,6 +152,7 @@ typedef struct {
     char target[64];     /* 目的地：分机/业务号/中继组（变量替换后的最终值） */
     uint8_t rec_action;  /* 由命中规则透传：0=none, 1=start, 2=stop */
     char rec_path_template[128]; /* §18 路径模板透传，空=系统默认 */
+    char rec_fmt[16]; /* §19 录音格式透传，空=全局默认 */
     sip_hdr_rewrite_t hdr_rw; /* REQ-DP-SIP-001：SIP 头重写（命中规则全量透传） */
 
     /* Advisor 2026-10-12n: 正则捕获组（pm_match_groups 输出）

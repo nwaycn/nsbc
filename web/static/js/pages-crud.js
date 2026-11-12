@@ -254,6 +254,12 @@ app.component('dialplan-rules', {
                 <span v-else class="text-slate-400 text-xs">{{ t('Default') }}</span>
               </template>
             </el-table-column>
+            <el-table-column prop="rec_fmt" label="录音格式" width="110" align="center">
+              <template #default="{ row }">
+                <el-tag v-if="row.rec_fmt" :type="row.rec_fmt === 'mp4' ? 'danger' : 'info'" effect="plain" size="small" round>{{ row.rec_fmt }}</el-tag>
+                <span v-else class="text-slate-400 text-xs">全局</span>
+              </template>
+            </el-table-column>
             <el-table-column prop="prio" label="Priority" width="80" align="center"></el-table-column>
             <el-table-column prop="src_ip_cidr" label="IP 准入 CIDR" min-width="180">
               <template #default="{ row }">
@@ -304,6 +310,12 @@ app.component('dialplan-rules', {
               <template #default="{ row }">
                 <code v-if="row.rec_path_template" class="text-xs text-emerald-600">{{ row.rec_path_template }}</code>
                 <span v-else class="text-slate-400 text-xs">{{ t('Default') }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="rec_fmt" label="录音格式" width="110" align="center">
+              <template #default="{ row }">
+                <el-tag v-if="row.rec_fmt" :type="row.rec_fmt === 'mp4' ? 'danger' : 'info'" effect="plain" size="small" round>{{ row.rec_fmt }}</el-tag>
+                <span v-else class="text-slate-400 text-xs">全局</span>
               </template>
             </el-table-column>
             <el-table-column prop="prio" label="Priority" width="80" align="center"></el-table-column>
@@ -435,15 +447,32 @@ app.component('dialplan-rules', {
             </el-form-item>
             <el-form-item label="Media模式（本规则路由时）">
               <el-select v-model="form.media_mode" style="width:100%">
-                <el-option :value="0" label="Never"></el-option>
-                <el-option :value="1" label="mixed"></el-option>
-                <el-option :value="2" label="separate"></el-option>
+                <el-option :value="0" label="Auto — 自动决策"></el-option>
+                <el-option :value="1" label="Bypass — 媒体直连绕过 nsbc"></el-option>
+                <el-option :value="2" label="Relay — nsbc 锚定媒体（H.264 视频录制必需）"></el-option>
               </el-select>
               <div class="text-xs text-slate-400 mt-1">
-                WebRTC 通话会被强制 relay 加密终结，bypass 对此类通话无效。
+                WebRTC 通话自动走 SRTP_RELAY；BYPASS 模式媒体不经 nsbc 锚定，<b>不支持视频录制</b>。
               </div>
             </el-form-item>
           </div>
+          <el-form-item label="录音格式（本规则独立配置）">
+            <el-select v-model="form.rec_fmt" style="width:100%" clearable placeholder="跟随全局 recording.format">
+              <el-option label="（空）跟随全局默认" value=""></el-option>
+              <el-option-group label="音频格式">
+                <el-option value="wav"  label="wav · 原生 PCM 无依赖，体积最大"></el-option>
+                <el-option value="mp3"  label="mp3 · 通用播放器兼容 128kbps"></el-option>
+                <el-option value="opus" label="opus · 省空间（约 wav 1/10）"></el-option>
+              </el-option-group>
+              <el-option-group label="音视频合成">
+                <el-option value="mp4"  label="mp4 · AAC 音频 + H.264 视频浏览器直放"></el-option>
+              </el-option-group>
+            </el-select>
+            <div class="text-xs text-slate-400 mt-1">
+              优先级：本规则配置 <b>></b> 系统 <code>recording.format</code> <b>></b> wav 兜底。
+              mp4 格式自动将 A/B 腿语音 + 视频合成到同一个 mp4 文件。
+            </div>
+          </el-form-item>
           <el-form-item label="录音路径模板（空=系统Default）">
             <el-input v-model="form.rec_path_template"
                       placeholder="如 YYYY-MM-DD/{caller}-{callee}-{callid}.wav"
@@ -670,6 +699,7 @@ app.component('dialplan-rules', {
         rec_action: 0,
         media_mode: 0,
         rec_path_template: '',
+        rec_fmt: '',
         /* IMS 三态强制覆盖：0=inherit 1=force on 2=force off */
         force_prack: 0,
         force_precondition: 0,

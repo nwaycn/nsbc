@@ -92,14 +92,16 @@ async fn list_recordings<C: CoreApi + Clone + 'static>(
 // Public file download (no RBAC)
 // ============================================================
 
-/// Recordings file download — mounted inside protected RBAC layer (L0+).
-/// Unauthenticated requests return 401.
-pub fn public_file_router<C>(_state: Arc<AppState<C>>) -> Router<Arc<AppState<C>>>
+/// Recordings file download — **public, no auth required**.
+/// Mounted at top-level router (NOT inside protected RBAC layer), so browsers
+/// can hit `/recordings/*path` directly without a Bearer token.
+pub fn public_file_router<C>(state: Arc<AppState<C>>) -> Router
 where
     C: CoreApi + Clone + 'static,
 {
     Router::new()
         .route("/recordings/*path", get(download_recording::<C>))
+        .with_state(state)
 }
 
 /// Allowed recording file extensions only (whitelist, prevent arbitrary file download).
@@ -119,13 +121,22 @@ async fn download_recording<C: CoreApi + Clone + 'static>(
     if !root.exists() || !root.is_dir() {
         return (
             StatusCode::NOT_FOUND,
+            [
+                (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                (header::CONTENT_DISPOSITION,
+                 "inline; filename=\"error.txt\""),
+            ],
             format!("recording root not found: {}", root.display()),
         )
             .into_response();
     }
     let root_canon = match root.canonicalize() {
         Ok(p) => p,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "recording root resolve failed").into_response(),
+        Err(_) => return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            "recording root resolve failed",
+        ).into_response(),
     };
 
     // 1) Whitelist extension check
@@ -135,7 +146,11 @@ async fn download_recording<C: CoreApi + Clone + 'static>(
         .map(|e| ALLOWED_EXTS.contains(&e.to_ascii_lowercase().as_str()))
         .unwrap_or(false);
     if !ext_ok {
-        return (StatusCode::FORBIDDEN, "forbidden extension").into_response();
+        return (
+            StatusCode::FORBIDDEN,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            "forbidden extension",
+        ).into_response();
     }
 
     // 2) Directory-traversal defense: strip all ".." and "."
@@ -145,7 +160,11 @@ async fn download_recording<C: CoreApi + Clone + 'static>(
         .collect::<Vec<_>>()
         .join("/");
     if safe_rel.is_empty() {
-        return (StatusCode::BAD_REQUEST, "empty path").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            "empty path",
+        ).into_response();
     }
 
     // Insurance layer: older nsbcd versions wrote CDR rec_path with a base_dir prefix
@@ -178,21 +197,56 @@ async fn download_recording<C: CoreApi + Clone + 'static>(
 
     // 3) After canonicalization the path must still be within root
     tracing::info!(
-        "recordings req: safe_rel={}, full={}, root={}",
-        safe_rel, full.display(), root.display()
+        "recording req: rel='{}' safe_rel='{}' root='{}' full='{}' full_exists={}",
+        rel, safe_rel, root.display(), full.display(), full.exists()
     );
+
+    // Existence pre-check — canonicalize() fails on non-existent paths,
+    // but we want a clear error with the safe_rel path (not full which may contain
+    // internal symlinks).
+    if !full.exists() {
+        let msg = format!(
+            "file not found on disk: {}/{} (root={})",
+            root.display(), safe_rel, root_canon.display()
+        );
+        tracing::warn!(%msg, "recording download 404");
+        return (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            msg,
+        ).into_response();
+    }
+
     let canon = match full.canonicalize() {
         Ok(p) => p,
-        Err(_) => return (StatusCode::NOT_FOUND, format!("file not found: {}", full.display())).into_response(),
+        Err(e) => {
+            tracing::warn!(err = %e, path = %full.display(), "canonicalize failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                format!("resolve failed: {}", full.display()),
+            ).into_response();
+        }
     };
     if !canon.starts_with(&root_canon) {
-        return (StatusCode::FORBIDDEN, "path traversal blocked").into_response();
+        return (
+            StatusCode::FORBIDDEN,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            "path traversal blocked",
+        ).into_response();
     }
 
     // 4) Read file + Content-Type
     let data = match tokio::fs::read(&canon).await {
         Ok(d) => d,
-        Err(_) => return (StatusCode::NOT_FOUND, "not found").into_response(),
+        Err(e) => {
+            tracing::warn!(err = %e, path = %canon.display(), "read recording failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                format!("read failed: {}", canon.display()),
+            ).into_response();
+        }
     };
 
     let ctype = match canon.extension().and_then(|e| e.to_str()) {

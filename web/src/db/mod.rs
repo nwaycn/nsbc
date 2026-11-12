@@ -2997,6 +2997,7 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
                 target        TEXT    NOT NULL,
                 rec_action    INTEGER NOT NULL DEFAULT 0,  /* 0=none 1=start 2=stop, passed through by C-side dp_execute */
                 rec_path_template TEXT NOT NULL DEFAULT '',  /* optional recording path template, empty = system default yyyymmdd/callid_mix_seq.wav */
+                rec_fmt       TEXT    NOT NULL DEFAULT '',   /* §19 规则级录音格式：''=全局默认 wav/mp3/opus/mp4 */
                 /* IMS force-override 三态字段：0=inherit 1=force on 2=force off */
                 force_prack        INTEGER NOT NULL DEFAULT 0,
                 force_precondition INTEGER NOT NULL DEFAULT 0,
@@ -3028,6 +3029,7 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
                 target        TEXT    NOT NULL,
                 rec_action    INTEGER NOT NULL DEFAULT 0,
                 rec_path_template TEXT NOT NULL DEFAULT '',
+                rec_fmt       TEXT    NOT NULL DEFAULT '',   /* §19 规则级录音格式：''=全局默认 wav/mp3/opus/mp4 */
                 /* IMS force-override 三态字段：0=inherit 1=force on 2=force off */
                 force_prack        INTEGER NOT NULL DEFAULT 0,
                 force_precondition INTEGER NOT NULL DEFAULT 0,
@@ -3059,6 +3061,7 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
                 target        VARCHAR(256) NOT NULL,
                 rec_action    INT          NOT NULL DEFAULT 0,
                 rec_path_template VARCHAR(256) NOT NULL DEFAULT '',
+                rec_fmt       VARCHAR(16)  NOT NULL DEFAULT '',   /* §19 规则级录音格式：''=全局默认 wav/mp3/opus/mp4 */
                 /* IMS force-override 三态字段：0=inherit 1=force on 2=force off */
                 force_prack        TINYINT NOT NULL DEFAULT 0,
                 force_precondition TINYINT NOT NULL DEFAULT 0,
@@ -6085,6 +6088,7 @@ pub struct DialplanRule {
     pub target:         String,
     pub rec_action:     i64,  /* 0=none 1=start 2=stop — C side dp_execute carries independently per rule */
     pub rec_path_template: String,  /* optional path template, empty=default yyyymmdd/callid_mix_seq.wav */
+    pub rec_fmt:        String,  /* §19 规则级录音格式：''=全局默认 wav/mp3/opus/mp4 */
     /* IMS force-override 三态字段：0=inherit 1=force on 2=force off */
     pub force_prack:       i64,
     pub force_precondition: i64,
@@ -6124,6 +6128,8 @@ pub struct DialplanRuleCreate {
     pub rec_action:     i64,  /* 0=none 1=start 2=stop */
     #[serde(default)]
     pub rec_path_template: String,  /* optional path template, empty=system default */
+    #[serde(default)]
+    pub rec_fmt:        String,  /* §19 规则级录音格式：''=全局默认 */
     /* IMS force-override 三态字段，default 0 = inherit */
     #[serde(default)]
     pub force_prack:       i64,
@@ -6159,6 +6165,7 @@ pub struct DialplanRuleUpdate {
     pub target:         Option<String>,
     pub rec_action:     Option<i64>,  /* 0=none 1=start 2=stop */
     pub rec_path_template: Option<String>,  /* optional path template */
+    pub rec_fmt:        Option<String>,  /* §19 规则级录音格式：''=全局默认 */
     /* IMS force-override 三态字段 */
     pub force_prack:       Option<i64>,
     pub force_precondition: Option<i64>,
@@ -6975,15 +6982,15 @@ impl Db {
         sqlx::query_as::<_, DialplanRule>(
             "INSERT INTO dialplan_rules
                 (tenant_id, name, layer, profile_name, src_ip_cidr, match_expr, caller_match,
-                 prio, strip, target, rec_action, rec_path_template,
+                 prio, strip, target, rec_action, rec_path_template, rec_fmt,
                  force_prack, force_precondition, force_timer, force_gruu,
                  action_json, app_chain, enabled, description)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
              RETURNING *"
         )
         .bind(c.tenant_id).bind(&c.name).bind(&c.layer).bind(&c.profile_name).bind(&c.src_ip_cidr)
         .bind(&c.match_expr).bind(&c.caller_match)
-        .bind(c.prio).bind(c.strip).bind(&c.target).bind(c.rec_action).bind(&c.rec_path_template)
+        .bind(c.prio).bind(c.strip).bind(&c.target).bind(c.rec_action).bind(&c.rec_path_template).bind(&c.rec_fmt)
         .bind(c.force_prack).bind(c.force_precondition).bind(c.force_timer).bind(c.force_gruu)
         .bind(&act).bind(&ac)
         .bind(c.enabled as i64).bind(&c.description)
@@ -7028,6 +7035,7 @@ impl Db {
         set_sr!("target", u.target.clone());
         set_ir!("rec_action", u.rec_action);  /* §16 new: recording control per rule independently */
         set_sr!("rec_path_template", u.rec_path_template.clone());  /* §18 new: optional path template */
+        set_sr!("rec_fmt", u.rec_fmt.clone());  /* §19 规则级录音格式 */
         /* IMS force-override 三态字段 */
         set_ir!("force_prack", u.force_prack);
         set_ir!("force_precondition", u.force_precondition);

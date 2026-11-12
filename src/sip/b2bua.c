@@ -700,7 +700,7 @@ static void call_destroy(b2b_call_t *c)
         char destroy_rec_path[CDR_REC_MAX] = {0};
         recording_apply_dp_action(co->cfg.rec_mgr, 2,
                                   c->leg[0].callid, "call_destroy",
-                                  NULL,
+                                  NULL, NULL,
                                   call_destroy_caller[0] ? call_destroy_caller : NULL,
                                   call_destroy_callee[0] ? call_destroy_callee : NULL,
                                   destroy_rec_path, sizeof(destroy_rec_path));

@@ -52,10 +52,11 @@ extern dp_ctx_t *sig_dp_ctx(void);
 int recording_apply_dp_action(rec_mgr_t *mgr, uint8_t rec_action,
                               const char *callid, const char *reason,
                               const char *rec_path_template,
+                              const char *rec_fmt,
                               const char *caller, const char *callee,
                               char *rec_path_out, size_t path_cap) {
     (void)mgr; (void)rec_action; (void)callid; (void)reason;
-    (void)rec_path_template; (void)caller; (void)callee;
+    (void)rec_path_template; (void)rec_fmt; (void)caller; (void)callee;
     (void)rec_path_out; (void)path_cap; return 0;
 }
 int recording_feed_frame(const char *callid, int leg, const media_frame_t *frm) {
@@ -633,6 +634,14 @@ static int dp_json_parse_one(cJSON *obj, dp_rule_t *r, uint32_t rid,
     j = cJSON_GetObjectItem(obj, "rec_path_template");
     if (j && cJSON_IsString(j) && j->valuestring[0])
         snprintf(r->rec_path_template, sizeof(r->rec_path_template), "%s", j->valuestring);
+
+    /* §19 规则级录音格式：''=全局默认 wav/mp3/opus/mp4 */
+    j = cJSON_GetObjectItem(obj, "rec_fmt");
+    if (j && cJSON_IsString(j) && j->valuestring[0]) {
+        const char *f = j->valuestring;
+        if (!strcmp(f, "wav") || !strcmp(f, "mp3") || !strcmp(f, "opus") || !strcmp(f, "mp4"))
+            snprintf(r->rec_fmt, sizeof(r->rec_fmt), "%s", f);
+    }
 
     /* ====== §15 新增：profile_name（强制分区键）+ src_ip_cidr（规则级 IP 准入）======
      * 默认值保证旧 reload JSON（没有这两个 key）自动继承：

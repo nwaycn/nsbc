@@ -402,6 +402,7 @@ int dp_execute(const dp_ctx_t *ctx, const dp_call_t *call, dp_result_t *res)
         res->force_timer        = r->force_timer;
         res->force_gruu         = r->force_gruu;
         snprintf(res->rec_path_template, sizeof(res->rec_path_template), "%s", r->rec_path_template);
+        snprintf(res->rec_fmt, sizeof(res->rec_fmt), "%s", r->rec_fmt);
         if (clip_sub[0])
             snprintf(res->clip, sizeof(res->clip), "%s", clip_sub);
         /* FreeSWITCH 风格精细化主叫覆盖：origination_caller_id_number/name 也做变量替换 */

@@ -619,6 +619,7 @@ static int resolve_cb(b2b_call_t *call, const char *ruri, size_t ruri_len,
         recording_apply_dp_action(s->ctx->rec_mgr, dres.rec_action,
                                   call->leg[0].callid, "dialplan",
                                   dres.rec_path_template,
+                                  dres.rec_fmt,
                                   dcall.caller, dcall.called,
                                   NULL, 0);
         /* REQ-REC-006：start 成功后反查两个分腿 sess → 存 call->rec[0] 和 call->rec[1]
@@ -1333,7 +1334,7 @@ static void sig_on_end_cb(void *call_key, void *ud)
         if (cid && cid[0]) {
             recording_apply_dp_action((rec_mgr_t *)s->ctx->rec_mgr, 2,
                                       cid, "hangup",
-                                      NULL, NULL, NULL,
+                                      NULL, NULL, NULL, NULL,
                                       rec_path, sizeof(rec_path));
             /* 录音终态路径存进 call 对象（first-wins：call_destroy 的兜底
              * stop 在 on_end 之前先跑，通常已填过，这里只做补位），
