@@ -695,9 +695,9 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
                             uint8_t pli_buf[64];
                             size_t pli_len = 0;
                             /* ★ Sender SSRC 不能填 0 —— Chrome 会忽略 Sender SSRC=0 的 PLI。
-                             * 用固定魔法值 0x4E534243 ("NSBC") 作为 nsbcd 作为 SFU 的 RTCP SSRC。
-                             * Media SSRC = pkt.ssrc（Chrome 发的媒体 SSRC）。 */
-                            if (video_build_pli(pkt.ssrc, 0x4E534243, pli_buf, sizeof(pli_buf), &pli_len) == NSBC_OK) {
+                             * 用固定魔法值 0x4E534243 ("NSBC") 作为 nsbcd 作为 SFU 的 RTCP SSRC。 */
+                            const uint32_t pli_src_ssrc = 0x4E534243;
+                            if (video_build_pli(pkt.ssrc, pli_src_ssrc, pli_buf, sizeof(pli_buf), &pli_len) == NSBC_OK) {
                                 uint8_t pli_send[64];
                                 size_t pli_send_len = pli_len;
                                 memcpy(pli_send, pli_buf, pli_len);
@@ -711,8 +711,8 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
                                     ssize_t pret = sendto(r->fd_rtp[side], pli_send, pli_send_len, MSG_NOSIGNAL,
                                                           (const struct sockaddr *)&dst->ss, dst->len);
                                     llog(LOG_INFO, "relay",
-                                         "★ PLI_SENT side=%d media_ssrc=0x%08x send_len=%zu ret=%zd",
-                                         side, pkt.ssrc, pli_send_len, pret);
+                                         "★ PLI_SENT side=%d src_ssrc=0x%08x media_ssrc=0x%08x send_len=%zu ret=%zd",
+                                         side, pli_src_ssrc, pkt.ssrc, pli_send_len, pret);
                                 }
                             }
                         }
