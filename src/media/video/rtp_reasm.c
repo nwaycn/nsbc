@@ -33,6 +33,14 @@ struct vid_reasm {
 
 /* ---------- 内部 append helpers（返回 0=OK, -1=溢出） ---------- */
 
+/* 帧边界标记 NAL：原始 RTP payload 已带这些类型 → 不需要重组器再注入 AUD。
+ * type=6 SEI, type=7 SPS, type=8 PPS, type=9 AUD, type=12 EOB,
+ * type=13 Prefix(SVC), type=14 Suffix(SVC) */
+static inline int is_boundary_nal(uint8_t t)
+{
+    return t == 6 || t == 7 || t == 8 || t == 9 || t == 12 || t == 13 || t == 14;
+}
+
 static int raw_append(vid_reasm_t *r, const uint8_t *p, size_t n)
 {
     if (r->len + n > r->cap) return -1;
@@ -46,13 +54,11 @@ static int raw_append(vid_reasm_t *r, const uint8_t *p, size_t n)
 static int annexb_append(vid_reasm_t *r, const uint8_t *nal, size_t n)
 {
     static const uint8_t sc[4] = { 0, 0, 0, 1 };
-    /* ★ AUD 预注入：裸流 demux 帧边界歧义根因 —— WebRTC SVC 编码输出只有
-     *   初始 IDR，后续依赖 RTCP PLI 请求才发新关键帧。Chrome 在 SVC 模式下
-     *   每帧带 Prefix NAL (type=14)，但 ffmpeg demux Annex-B 裸流时帧边界
-     *   判定不稳定，帧间无标记会导致粘帧/拆帧 → 解码器花屏。
-     *   AUD (type=9) 是 H.264 标准的帧边界显式标记，告诉 demux "这就是
-     *   一个 access unit 的开始"。只在帧首 NAL (len==0) 时注入。 */
-    if (r->len == 0) {
+    /* ★ AUD 条件注入：仅当帧首 NAL 本身不是帧边界标记时才补 AUD。
+     * Chrome SVC 原生 RTP payload 已带 AUD/EOB/Prefix 等边界标记，
+     * 若重组器再无条件注入一份 → 每帧 2× AUD → ffmpeg demux 帧边界混乱 → 花屏。
+     * 取证实锤：935 帧侧车有 1873 个 AUD，正是此因。 */
+    if (r->len == 0 && !is_boundary_nal(nal[0] & 0x1F)) {
         static const uint8_t aud[5] = { 0, 0, 0, 1, 9 };
         if (r->cap < sizeof(aud) + 4 + n) return -1;
         if (raw_append(r, aud, sizeof(aud)) != 0) return -1;
@@ -186,6 +192,11 @@ void vid_reasm_feed(vid_reasm_t *r, const uint8_t *payload, size_t len,
 
     const uint8_t nal_type = payload[0] & 0x1F;
 
+    /* type=12 EOB —— Chrome SVC 专用 End of Bitstream 标记，不属于 access unit 内容。
+     * 取证侧车有 4 个 EOB 混在帧数据里，落盘会打断 ffmpeg demux 帧边界。 */
+    if (nal_type == 12)
+        return;
+
     /* FU-A 未结束（S 见 E 未到）却来了其他 NAL 类型 —— 上个 NAL 被截断，丢整帧 */
     if (r->in_fu && nal_type != 28) {
         frame_drop(r);
@@ -226,15 +237,15 @@ void vid_reasm_feed(vid_reasm_t *r, const uint8_t *payload, size_t len,
                 frame_drop(r);
                 return;
             }
-            /* ★ AUD 预注入（帧首 FU-A：同 annexb_append 逻辑） */
-            if (r->len == 0) {
+            /* ★ 先重构 NAL header 再判断是否需要 AUD（同 annexb_append 条件注入逻辑） */
+            const uint8_t nal_hdr = (uint8_t)((payload[0] & 0xE0) | (fu_hdr & 0x1F));
+            if (r->len == 0 && !is_boundary_nal(nal_hdr & 0x1F)) {
                 static const uint8_t aud[5] = { 0, 0, 0, 1, 9 };
                 if (raw_append(r, aud, sizeof(aud)) != 0) {
                     frame_drop(r);
                     return;
                 }
             }
-            const uint8_t nal_hdr = (uint8_t)((payload[0] & 0xE0) | (fu_hdr & 0x1F));
             static const uint8_t sc[4] = { 0, 0, 0, 1 };
             if (raw_append(r, sc, 4) != 0 || raw_append(r, &nal_hdr, 1) != 0) {
                 frame_drop(r);
