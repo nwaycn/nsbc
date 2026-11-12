@@ -1175,13 +1175,15 @@ reg_auth_ok:
         /* === FS max-registrations-per-extension=N：per-AoR binding 数上限 ===
          * 在 loc_upsert 之前查当前 AoR 有效 binding 数。
          * multiple_registrations=false 已在上面清空，所以上限检查只对允许多注册的场景生效。
-         * 达到上限时返回 403 + Warning（RFC 3261 §21.4.3）。
          *
-         * ★ BUG-FIX: dup 判断只看 contact 字符串 → WebRTC 场景每次断线重连
-         *   都生成新的随机 contact（sip:rand1@rand2.invalid;transport=ws），
-         *   永远不 dup → 累积多条 → 最终触发 max 上限。
+         * ★ 2026-11-11: 达到上限时的行为从"403 拒绝"改为"踢掉最旧 binding"：
+         *   单设备场景 (max=1) 下，WebRTC 断线重连会生成新的随机 contact 和新 Call-ID，
+         *   永远不会 dup → 累积到 max 后被 403 拒绝 → 用户无法重注册。
+         *   新行为：找到 expire_ms 最小的那条（最近要过期的 / 最旧的），loc_remove 掉，
+         *   然后继续 upsert 新 binding。相当于 FIFO 的设备替换语义。
          *
-         *   现在 dup 判断 = contact 完全相同 OR 同一个 Call-ID（同一终端的刷新）。 */
+         *   dup 判断保持不变：contact 完全相同 OR 同一个 Call-ID（同一终端刷新）。
+         *   dup 直接 loc_upsert 覆盖，不踢别人。 */
         if (r->cfg.max_registrations_per_ext > 0 && r->cfg.multiple_registrations != 0) {
             loc_binding_t probe[32];
             int cur = loc_query(r->cfg.db, b.aor, probe, 32, now);
@@ -1189,19 +1191,42 @@ reg_auth_ok:
                 int dup = 0;
                 for (int i = 0; i < cur; ++i) {
                     if (strcmp(probe[i].contact, b.contact) == 0) { dup = 1; break; }
-                    /* 同一个 Call-ID → 同一终端刷新（覆盖旧 binding） */
                     if (b.callid[0] && strcmp(probe[i].callid, b.callid) == 0) { dup = 1; break; }
                 }
                 if (!dup) {
-                    char extra[128];
-                    snprintf(extra, sizeof(extra),
-                             "Warning: 399 <%s>;cause=\"registration-limit-reached\";count=%d;max=%d\r\n",
-                             b.aor, cur, r->cfg.max_registrations_per_ext);
-                    llog(LOG_WARN, "reg",
-                         "max_registrations_per_ext: aor=%s cur=%d >= max=%d → 403 reject contact=%s",
-                         b.aor, cur, r->cfg.max_registrations_per_ext, b.contact);
-                    respond(r, proto, src, m, 403, extra, NULL, 0, txn);
-                    _rc = NSBC_OK; goto reg_out;
+                    /* ★ 踢掉 expire_ms 最小的那条（最近要过期的 / 最旧的 binding） */
+                    int oldest = 0;
+                    for (int i = 1; i < cur; ++i) {
+                        if (probe[i].expire_ms < probe[oldest].expire_ms) oldest = i;
+                    }
+                    llog(LOG_INFO, "reg",
+                         "max_registrations_per_ext: aor=%s cur=%d >= max=%d → evict oldest contact=%s expire_ms=%lu → allow new contact=%s",
+                         b.aor, cur, r->cfg.max_registrations_per_ext,
+                         probe[oldest].contact,
+                         (unsigned long)probe[oldest].expire_ms,
+                         b.contact);
+                    int removed = loc_remove(r->cfg.db, b.aor, probe[oldest].contact);
+                    if (removed <= 0) {
+                        /* 极端竞争：被 sweep 清走了 → 回到 cur 检查再试一次 dup → 仍没有 → 403 */
+                        cur = loc_query(r->cfg.db, b.aor, probe, 32, now);
+                        dup = 0;
+                        for (int i = 0; i < cur; ++i) {
+                            if (strcmp(probe[i].contact, b.contact) == 0) { dup = 1; break; }
+                            if (b.callid[0] && strcmp(probe[i].callid, b.callid) == 0) { dup = 1; break; }
+                        }
+                        if (!dup && cur >= r->cfg.max_registrations_per_ext) {
+                            char extra[128];
+                            snprintf(extra, sizeof(extra),
+                                     "Warning: 399 <%s>;cause=\"registration-limit-reached\";count=%d;max=%d\r\n",
+                                     b.aor, cur, r->cfg.max_registrations_per_ext);
+                            llog(LOG_WARN, "reg",
+                                 "max_registrations_per_ext: evict race lost → 403 reject aor=%s cur=%d max=%d contact=%s",
+                                 b.aor, cur, r->cfg.max_registrations_per_ext, b.contact);
+                            respond(r, proto, src, m, 403, extra, NULL, 0, txn);
+                            _rc = NSBC_OK; goto reg_out;
+                        }
+                    }
+                    /* 踢成功（或 race 后 cur < max）— 继续往下 loc_upsert 新 contact */
                 }
             }
         }
