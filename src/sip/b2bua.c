@@ -2301,9 +2301,12 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
     }
 
     llog(LOG_INFO, "b2b",
-         "cli_tu: ev=%d cid=%s s0=%d s1=%d",
+         "cli_tu: ev=%d cid=%s s0=%d s1=%d hangup_by=%d t=%p L0_out=%p L1_out=%p L0_inv=%p L1_inv=%p",
          ev, c->leg[0].callid,
-         c->leg[0].state, c->leg[1].state);
+         c->leg[0].state, c->leg[1].state, c->hangup_by,
+         (void *)t,
+         (void *)c->leg[0].out_txn, (void *)c->leg[1].out_txn,
+         (void *)c->leg[0].inv_txn, (void *)c->leg[1].inv_txn);
 
     /* Session Timer: refresh_cb 发出的 re-INVITE 收到 2xx → reset + arm 下次
      * 此块无 t==inv_txn 守卫，因为 A-leg/B-leg re-INVITE 都用独立 txn。
