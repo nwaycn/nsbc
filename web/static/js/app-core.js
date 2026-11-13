@@ -439,7 +439,7 @@ const DialplanActionEditor = {
         <div class="text-[11px] text-gray-500 font-semibold pt-2">{{ t('─ From Header (low → high priority) ─') }}</div>
         <div class="struct-row">
           <span class="struct-label w-40 shrink-0">{{ t('sip_from_display Display') }}</span>
-          <input v-model="action.sip_from_display" :placeholder="t('e.g. &quot;Sales Team&quot;')">
+          <input v-model="action.sip_from_display" :placeholder="t('e.g. “Sales Team”')">
           <span class="hint">{{ t('component') }}</span>
         </div>
         <div class="struct-row">
@@ -1282,7 +1282,7 @@ function crudTable(entity, path, columns, formSchema, asyncLoaders = null) {
                     </el-button>
                   </div>
                   <el-input v-if="rawMode[f.key]" v-model="form[f.key]" type="textarea" :rows="6"
-                    :placeholder="t('Valid JSON, e.g. {&quot;clip&quot;:&quot;44&quot;}')" resize="none"></el-input>
+                    :placeholder="t('Valid JSON, e.g. {&apos;clip&apos;:&apos;44&apos;}')" resize="none"></el-input>
                   <trunk-codec-editor v-else-if="f.editor === 'trunk-codec'" v-model="form[f.key]"></trunk-codec-editor>
                   <dp-action-editor   v-else-if="f.editor === 'dp-action'"   v-model="form[f.key]"></dp-action-editor>
                   <time-range-editor  v-else-if="f.editor === 'time-ranges'"  v-model="form[f.key]"></time-range-editor>
