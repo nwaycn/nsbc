@@ -17,6 +17,7 @@ import org.webrtc.IceCandidate
 import org.webrtc.IceServer
 import org.webrtc.MediaConstraints
 import org.webrtc.MediaStream
+import org.webrtc.MediaStreamTrack
 import org.webrtc.PeerConnection
 import org.webrtc.PeerConnectionFactory
 import org.webrtc.RtpReceiver
@@ -368,18 +369,20 @@ class WebRtcMediaEngine(private val appContext: Context) : MediaEngine {
         val f = factory ?: return
         val cfg = config ?: return
 
-        // 音频：每通呼叫显式 addTransceiver 保证 Unified Plan 方向可控
+        // 音频：呼入时复用远端 offer 已创建的 transceiver，呼出时才新建
         if (audioTrack == null) {
             val src = f.createAudioSource(MediaConstraints())
             audioSource = src
             audioTrack = f.createAudioTrack("audio0", src)
         }
-        pc.addTransceiver("audio",
-            RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.SEND_RECV)
-        )
-        // 绑定本地音轨到新建 transceiver 的 sender
+        val audioTx = findTransceiver(pc, MediaStreamTrack.MediaType.MEDIA_TYPE_AUDIO)
+            ?: pc.addTransceiver(
+                "audio",
+                RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.SEND_RECV)
+            )
         runCatching {
-            pc.transceivers.lastOrNull()?.sender?.setTrack(audioTrack, false)
+            audioTx.sender.setTrack(audioTrack, false)
+            audioTx.direction = RtpTransceiver.RtpTransceiverDirection.SEND_RECV
         }
         audioTrack?.setEnabled(micEnabled)
 
@@ -390,11 +393,14 @@ class WebRtcMediaEngine(private val appContext: Context) : MediaEngine {
 
         // 视频：轨道创建一次复用，采集随通话/开关动态启停
         val track = ensureVideoTrack() ?: return
-        pc.addTransceiver("video",
-            RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.SEND_RECV)
-        )
+        val videoTx = findTransceiver(pc, MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO)
+            ?: pc.addTransceiver(
+                "video",
+                RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.SEND_RECV)
+            )
         runCatching {
-            pc.transceivers.lastOrNull()?.sender?.setTrack(track, false)
+            videoTx.sender.setTrack(track, false)
+            videoTx.direction = RtpTransceiver.RtpTransceiverDirection.SEND_RECV
         }
         track.setEnabled(cameraEnabled)
         if (cameraEnabled) startCaptureIfNeeded()
@@ -404,6 +410,10 @@ class WebRtcMediaEngine(private val appContext: Context) : MediaEngine {
             track.addSink(it)
         }
     }
+
+    /** 按媒体类型查找已存在的 transceiver（呼入时由远端 offer 创建）。 */
+    private fun findTransceiver(pc: PeerConnection, type: MediaStreamTrack.MediaType): RtpTransceiver? =
+        pc.transceivers.firstOrNull { it.mediaType == type }
 
     /** 创建（或复用）摄像头采集链路与视频轨；失败返回 null 并降级为音频。 */
     private fun ensureVideoTrack(): VideoTrack? {
@@ -509,7 +519,7 @@ class WebRtcMediaEngine(private val appContext: Context) : MediaEngine {
      */
     private fun filterOfferSdp(sdp: String): String {
         var out = sdp
-        // 定位 m=video section，改 H.264 fmtp
+        // 降级 H.264 profile 为 baseline，并强制 packetization-mode=1
         out = out.replace(H264_FMTP_REGEX) { match ->
             val line = match.value
             val replaced = line.replace(
@@ -547,9 +557,9 @@ class WebRtcMediaEngine(private val appContext: Context) : MediaEngine {
     companion object {
         private const val MEDIA_STREAM_ID = "nsbc"
 
-        // 匹配 m=video section 内的 H.264 fmtp 行（profile-level-id 非 baseline 需降级）
+        // 匹配含 profile-level-id 的 H.264 fmtp 行（参数顺序不固定，不能要求紧跟 PT）
         private val H264_FMTP_REGEX =
-            Regex("""a=fmtp:\d+ profile-level-id=[0-9a-fA-F]{6}($|[^\r\n]*)""")
+            Regex("""a=fmtp:\d+[^\r\n]*profile-level-id=[0-9a-fA-F]{6}[^\r\n]*""")
         // 匹配 opus fmtp 行（通常 pt=111，但不固定 pt 号）
         private val OPUS_FMTP_REGEX =
             Regex("""a=fmtp:111[^\r\n]*""")
