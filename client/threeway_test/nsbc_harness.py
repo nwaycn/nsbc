@@ -26,7 +26,7 @@ import socket
 import ssl
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 
@@ -367,7 +367,7 @@ class NsbcSipClient:
         msg += f'From: "{self.username}" <{self.sip_uri}>;tag={from_tag}\r\n'
         msg += f"To: <{call.remote_uri}>;tag={to_tag}\r\n"
         msg += f"Call-ID: {call.call_id}\r\n"
-        msg += f"CSeq: {call.local_cseq or 2} BYE\r\n"
+        msg += f"CSeq: {call.local_cseq} BYE\r\n"
         msg += f"Supported: replaces, outbound\r\n"
         msg += f"Session-ID: {self.session_id}\r\n"
         msg += f"User-Agent: {self.user_agent}\r\n"
@@ -735,8 +735,6 @@ class NsbcSipClient:
         call = self._current_call
         bye = self._build_bye(call)
         self.on_log("INFO", f"BYE → {call.call_id[:8]}")
-        # 为 CallInfo 增加 local_cseq 方便下次 BYE 正确填 CSeq
-        self._current_call.local_cseq = 2
         await self._send(bye)
         await asyncio.sleep(0.5)
 
@@ -800,7 +798,3 @@ class NsbcSipClient:
             )
         sdp += "\r\n"
         return sdp
-
-
-# 给 CallInfo 加上 local_cseq 字段（方便 BYE 用）
-CallInfo.local_cseq: int = field(default=2)  # type: ignore[attr-defined]
