@@ -1138,32 +1138,39 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
              * cfg.rec_feed_fn 是 signaling 创建时设的录音主槽；rec_hooks 是
              * 模块 dlopen 后追加的 hook。锁内拷贝 fn+ud 到栈、解锁后执行 ——
              * Phase 0: 锁内执行外部 hook 会嵌套 recording.c 的 sess.lock（之前 P0-2 锁内套锁）。*/
-            if (pkt.payload && pkt.payload_len &&
-                __atomic_load_n(&r->m->rec_hooks, __ATOMIC_ACQUIRE)) {
-                mb_rec_hook_t *local[MB_REC_HOOK_MAX];
-                int nh = 0;
-                pthread_mutex_lock(&r->m->rec_hook_lock);
-                for (mb_rec_hook_t *h =
-                         __atomic_load_n(&r->m->rec_hooks, __ATOMIC_RELAXED);
-                     h && nh < MB_REC_HOOK_MAX; h = h->next) {
-                    ++h->refs;
-                    local[nh++] = h;
-                }
-                pthread_mutex_unlock(&r->m->rec_hook_lock);
-                /* 锁外遍历执行 hook —— 各自内部锁互不嵌套 */
-                ++rec_hook_dispatch_depth;
-                for (int hi = 0; hi < nh; ++hi)
-                    local[hi]->fn(local[hi]->ud, r->node ? r->node->call : NULL,
-                                  pkt.payload, pkt.payload_len, side, (int)pkt.pt);
-                --rec_hook_dispatch_depth;
-                if (nh > 0) {
+            {
+                void *hooks_head = __atomic_load_n(&r->m->rec_hooks, __ATOMIC_ACQUIRE);
+                static __thread int rh_cnt = 0;
+                if (rh_cnt++ < 5)
+                    llog(LOG_INFO, "relay", "★REC_HOOK_CHECK m=%p hooks=%p side=%d pt=%u len=%zu payload=%p",
+                         (void *)r->m, hooks_head, side, (unsigned)pkt.pt, pkt.payload_len, pkt.payload);
+                if (pkt.payload && pkt.payload_len && hooks_head) {
+                    mb_rec_hook_t *local[MB_REC_HOOK_MAX];
+                    int nh = 0;
                     pthread_mutex_lock(&r->m->rec_hook_lock);
-                    for (int hi = 0; hi < nh; ++hi)
-                        --local[hi]->refs;
-                    pthread_cond_broadcast(&r->m->rec_hook_cond);
+                    for (mb_rec_hook_t *h =
+                             __atomic_load_n(&r->m->rec_hooks, __ATOMIC_RELAXED);
+                         h && nh < MB_REC_HOOK_MAX; h = h->next) {
+                        ++h->refs;
+                        local[nh++] = h;
+                    }
                     pthread_mutex_unlock(&r->m->rec_hook_lock);
+                    /* 锁外遍历执行 hook —— 各自内部锁互不嵌套 */
+                    ++rec_hook_dispatch_depth;
+                    for (int hi = 0; hi < nh; ++hi)
+                        local[hi]->fn(local[hi]->ud, r->node ? r->node->call : NULL,
+                                      pkt.payload, pkt.payload_len, side, (int)pkt.pt);
+                    --rec_hook_dispatch_depth;
+                    if (nh > 0) {
+                        pthread_mutex_lock(&r->m->rec_hook_lock);
+                        for (int hi = 0; hi < nh; ++hi)
+                            --local[hi]->refs;
+                        pthread_cond_broadcast(&r->m->rec_hook_cond);
+                        pthread_mutex_unlock(&r->m->rec_hook_lock);
+                    }
                 }
             }
+            /* ← 关 line 1141 REC_HOOK_CHECK 外层块 */
             /* 出向 SSRC 重写（固定头偏移 8，4 字节网络序）
              * 之前 Bug：只改 p[3] 一个字节，导致 SSRC 变成 orig[0..2] | (new & 0xFF)。
              *
@@ -1361,6 +1368,14 @@ static void relay_cb(int fd, uint32_t ev, void *arg)
 {
     (void)ev;
     rtp_relay_t *r = arg;
+    /* ★DEBUG 2026-11-13: relay_cb 是否被 reactor 回调？ */
+    {
+        static int hits = 0;
+        if (hits++ < 10 || hits % 1000 == 0)
+            fprintf(stderr, "[RELAY_CB] fd=%d ev=0x%x r=%p rtp=[%d,%d] rtcp=[%d,%d]\n",
+                    fd, (unsigned)ev, (void*)r,
+                    r->fd_rtp[0], r->fd_rtp[1], r->fd_rtcp[0], r->fd_rtcp[1]);
+    }
     /* REQ-DTLS-001：STUN/DTLS/SRTP demux 全在 relay_recv_one 内部
      * （peek 分型：STUN 应答、DTLS 喂握手、SRTP 解密后 relay）——
      * 此处不做状态分流，避免 BIO_dgram 与 relay 层抢读同 fd。 */
@@ -2567,15 +2582,24 @@ static int relay_batch_arm_fn(void *arg)
     reactor_t *target = r->home_reactor;
     if (!target) return NSBC_INVAL;
 
+    /* ★DEBUG 2026-11-13: 诊断 reactor_add 是否真的执行 + 返回值 */
+    llog(LOG_NOTICE, "media",
+         "★relay_batch_arm_fn ENTER r=%p target=%p home_reactor=%p armed=%d "
+         "fd_rtp[0]=%d fd_rtp[1]=%d fd_rtcp[0]=%d fd_rtcp[1]=%d",
+         (void *)r, (void *)target, (void *)r->home_reactor, r->armed,
+         r->fd_rtp[0], r->fd_rtp[1], r->fd_rtcp[0], r->fd_rtcp[1]);
+
     int rc;
     int ok_count = 0;
     int ok_fds[4] = { -1, -1, -1, -1 };  /* 记录哪些 fd 注册成功用于回滚 */
 
     rc = reactor_add(target, r->fd_rtp[0], EPOLLIN, relay_cb, r);
+    llog(LOG_NOTICE, "media", "★reactor_add rtp[0]=%d rc=%d", r->fd_rtp[0], rc);
     if (rc != NSBC_OK) goto rollback;
     ok_fds[ok_count++] = r->fd_rtp[0];
 
     rc = reactor_add(target, r->fd_rtp[1], EPOLLIN, relay_cb, r);
+    llog(LOG_NOTICE, "media", "★reactor_add rtp[1]=%d rc=%d", r->fd_rtp[1], rc);
     if (rc != NSBC_OK) goto rollback;
     ok_fds[ok_count++] = r->fd_rtp[1];
 
@@ -3053,9 +3077,15 @@ int bridge_offer_hook(void *call, const char *in, size_t inlen,
                      e->relay->fd_rtp[side], side);
             }
         }
-        /* ★ 降级条件更严格：只有双侧都不需要 DTLS（both_plain）或**该建的那侧**
-         * 全失败才降级。mixed_ws 下一侧 DTLS 成功就够了。 */
-        if (!any_dtls_ok) {
+        /* ★ 降级条件：只有**需要 DTLS 的那侧**真的建失败才降级。
+         *   both_plain（need_dtls=[0,0]）→ 明文 RELAY，**不降级**！
+         *   mixed_ws 下一侧 DTLS 成功就够了。
+         *
+         * ★ 2026-11-13 修复：之前 !any_dtls_ok 把 both_plain 也降级了，
+         *   导致 sipp↔sipp 全明文场景永远走 BYPASS → relay 不 arm →
+         *   rec_feed_hook 不触发 → recording bytes=0。 */
+        const int need_any_dtls = need_dtls_on_side[0] || need_dtls_on_side[1];
+        if (!any_dtls_ok && need_any_dtls) {
             llog(LOG_WARN, "media",
                  "DTLS-SRTP 无可用终结器 — 降级 BYPASS 让两端直连 "
                  "(need_dtls=[%d,%d])",
@@ -4358,6 +4388,17 @@ int rtp_relay_fd(const rtp_relay_t *r, int side)
 {
     if (!r || side < 0 || side > 1) return -1;
     return r->fd_rtp[side];
+}
+
+uint16_t rtp_relay_port(const rtp_relay_t *r, int side)
+{
+    if (!r || side < 0 || side > 1) return 0;
+    return r->rtp_port[side];
+}
+
+const char *bridge_local_ip(const bridge_mgr_t *m)
+{
+    return (m && m->cfg.local_ip) ? m->cfg.local_ip : NULL;
 }
 
 int rtp_relay_latched(const rtp_relay_t *r, int side)

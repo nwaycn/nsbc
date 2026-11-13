@@ -213,6 +213,20 @@ struct b2b_call {
     uint64_t early_183_ms;
     uint64_t early_end_ms;
     uint32_t early_bytes;
+    /* ====== REQ-DP-APP-001 Early Media（ringback/playback 正确时序） ======
+     * app_ringback/app_playback 在 dp_execute（resolve_cb 阶段）执行时
+     * relay 尚未建立（offer_hook 要到 send_invite_b 才建 relay），且 A 腿
+     * 没收到 183+SDP 根本不知道往哪收 RTP。正确时序：
+     *   1) app 层只登记意图（b2b_request_early_media 置 em_pending）
+     *   2) new_invite 在 send_invite_b 完成（relay ready + A 侧 peer 已
+     *      从 SDP 解析）后执行 b2b_early_media_start：
+     *      respond_a(183, SDP answer) → pb_start 向 A 腿放音
+     *   3) B 腿 200 OK → LEG_CONFIRMED 路径已有 pb_stop_if_playing 停止
+     * 若调用时 A 腿已 EARLY/CONFIRMED（in-dialog 场景），request 接口
+     * 内部直接 pb_start（relay 已存在）。 */
+    uint8_t em_pending;   /* 1=待启动 early media（relay ready 后执行） */
+    uint8_t em_loop;      /* 放音循环：ringback=1（接通自动停），playback=0 */
+    char em_wav[256];     /* 放音 WAV 路径 */
     char b_key[128];
     int key_held;
     char rt_name[32];
@@ -568,6 +582,16 @@ int b2b_valid_callid(const char *s, size_t len);
  * CALL_STATE_EARLY + pre_answer_sent 标志）。media_bridge 可提前介入。
  * 成功后后续的 playback / media 操作可在未接通状态执行。 */
 int b2b_pre_answer_call(b2b_call_t *call);
+
+/* ---- REQ-DP-APP-001 Early Media 请求（app_ringback / app_playback 用） ----
+ * 在 dp_execute（resolve_cb 阶段，relay 尚未建立）调用，只登记意图：
+ * 置 em_pending/em_wav/em_loop，由 new_invite 在 send_invite_b 完成
+ * （offer_hook 已建 relay）后统一执行 183+SDP+pb_start。
+ * 幂等：重复请求覆盖 wav/loop。
+ * 若 A 腿已 EARLY/CONFIRMED（in-dialog / originate 尾随场景，relay 已
+ * 存在）→ 跳过标记直接 pb_start 立即放音。
+ * 返回 NSBC_OK（已登记或已启动）/ NSBC_NOENT（call 已 dead）/ NSBC_INVAL。 */
+int b2b_request_early_media(b2b_call_t *call, const char *wav, int loop);
 
 /* ---- Call-Destroy 多槽 Hook（REQ-MEDIA-SEC-004 扩展）----
  *

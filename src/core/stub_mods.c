@@ -756,6 +756,9 @@ static int dp_json_parse_one(cJSON *obj, dp_rule_t *r, uint32_t rid,
      * dp_table_free 会释放 app_chain（见 dialplan.c） */
     {
         cJSON *alt = cJSON_GetObjectItem(obj, "app_chain");
+        llog(LOG_INFO, "dp_json", "  ★ app_chain parse: obj has 'app_chain'=%p is_array=%d size=%d",
+             (void *)alt, alt ? cJSON_IsArray(alt) : 0,
+             alt && cJSON_IsArray(alt) ? cJSON_GetArraySize(alt) : 0);
         if (alt && cJSON_IsArray(alt) && cJSON_GetArraySize(alt) > 0) {
             int nn = cJSON_GetArraySize(alt);
             dp_app_action_t *chain =
@@ -776,12 +779,36 @@ static int dp_json_parse_one(cJSON *obj, dp_rule_t *r, uint32_t rid,
                                  sizeof(chain[valid].data), "%s", data->valuestring);
                     ++valid;
                 }
+                llog(LOG_INFO, "dp_json", "  ★ app_chain valid=%d (nn=%d)", valid, nn);
                 if (valid > 0) {
                     dp_rule_set_app_chain(r, chain, (size_t)valid);
+
+                    /* ★ REQ-DP-APP-001：放音类 app 需要 SBC 锚定媒体
+                     * （183+SDP answer 由 SBC 合成、RTP 经 relay 注入 A 腿）。
+                     * bypass 模式下 relay 不建立、A 腿收不到 183 → 放音必然
+                     * 失败。规则级强制 relay：auto(0)/bypass(1) 一律提升为 2，
+                     * media_bridge offer_hook 的 rule→force RELAY 路径生效。 */
+                    for (int k = 0; k < valid; ++k) {
+                        const char *a = chain[k].app;
+                        if (!strcmp(a, "ringback") || !strcmp(a, "playback") ||
+                            !strcmp(a, "endless_playback") ||
+                            !strcmp(a, "post_playback")) {
+                            if (r->media_mode != 2) {
+                                llog(LOG_INFO, "dp_json",
+                                     "  ★ rule id=%u: app '%s' requires media anchor "
+                                     "→ media_mode %u→2 (relay)",
+                                     r->id, a, (unsigned)r->media_mode);
+                                r->media_mode = 2;
+                            }
+                            break;
+                        }
+                    }
                 } else {
                     free(chain);                          /* 全无效 → 不挂链 */
                 }
             }
+        } else {
+            llog(LOG_INFO, "dp_json", "  ★ app_chain SKIP (alt=%p)", (void *)alt);
         }
     }
 

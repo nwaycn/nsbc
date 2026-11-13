@@ -242,6 +242,11 @@ int reactor_add(reactor_t *r, int fd, uint32_t events, reactor_cb_fn cb,
 {
     if (!r || !cb || fd == r->wake_fd)
         return NSBC_INVAL;
+
+#ifdef NSBC_DEBUG_REACTOR_SLOTS
+    fprintf(stderr, "reactor_add ENTER r=%p epfd=%d fd=%d events=%u wake_fd=%d\n",
+            (void *)r, r->epfd, fd, (unsigned)events, r->wake_fd);
+#endif
 #ifdef NSBC_REACTOR_OWNER_CHECK
     if (!pthread_equal(pthread_self(), r->owner)) {
         fprintf(stderr,
@@ -256,10 +261,17 @@ int reactor_add(reactor_t *r, int fd, uint32_t events, reactor_cb_fn cb,
     memset(&ev, 0, sizeof(ev));
     ev.events = events;
     ev.data.fd = fd;
-    if (epoll_ctl(r->epfd, EPOLL_CTL_ADD, fd, &ev) < 0)
+    if (epoll_ctl(r->epfd, EPOLL_CTL_ADD, fd, &ev) < 0) {
+        fprintf(stderr, "reactor_add: epoll_ctl(ADD) FAILED epfd=%d fd=%d errno=%d(%s)\n",
+                r->epfd, fd, errno, strerror(errno));
         return NSBC_ERR;
+    }
     r->slots[fd].cb = cb;
     r->slots[fd].arg = arg;
+#ifdef NSBC_DEBUG_REACTOR_SLOTS
+    fprintf(stderr, "reactor_add OK epfd=%d fd=%d slots[%d].cb=%p\n",
+            r->epfd, fd, fd, (void *)r->slots[fd].cb);
+#endif
     return NSBC_OK;
 }
 
@@ -294,6 +306,16 @@ int reactor_del(reactor_t *r, int fd)
         return NSBC_PERM_DENIED;
     }
 #endif
+
+    /* ★ 防御性幂等：如果 slots[fd].cb 已经是 NULL，说明要么没注册过要么已经被删过了。
+     * 跳过 epoll_ctl DEL（会 ENOENT），直接返回 OK。
+     * 典型场景：obs 的 EPOLLHUP 和 EPOLLIN 同 batch 触发，HUP 先 dispatch 调 reactor_del，
+     * 同 batch 后续 EPOLLIN dispatch 到同一 fd 时 callback 又调 reactor_del → 第二次幂等跳过。 */
+    if (fd < r->slots_cap && r->slots[fd].cb == NULL) {
+        fprintf(stderr, "[reactor] del fd=%d ALREADY NULL cb — idempotent skip\n", fd);
+        return NSBC_OK;
+    }
+
     /* ★ slots 清理必须在 epoll_ctl 之前 —— 即使 EPOLL_CTL_DEL 失败
      * (fd 未被监控、epfd 关闭等边界情况)，也要先置 cb/arg=NULL，
      * 防止 reactor_wait dispatch 残留事件到已释放的 arg。 */
@@ -310,10 +332,8 @@ int reactor_del(reactor_t *r, int fd)
 #endif
     }
     if (epoll_ctl(r->epfd, EPOLL_CTL_DEL, fd, NULL) < 0) {
-#ifdef NSBC_DEBUG_REACTOR_SLOTS
-        fprintf(stderr, "[reactor] del fd=%d epoll_ctl DEL FAILED errno=%d (slots already cleared)\n",
-                fd, errno);
-#endif
+        fprintf(stderr, "[reactor] del fd=%d epoll_ctl DEL FAILED errno=%d(%s) (slots already cleared)\n",
+                fd, errno, strerror(errno));
         return NSBC_ERR;
     }
 #ifdef NSBC_DEBUG_REACTOR_SLOTS

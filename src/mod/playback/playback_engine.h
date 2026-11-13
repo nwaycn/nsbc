@@ -46,6 +46,12 @@ void pb_engine_stop(void);
 int pb_start(void *call_key, const char *wav_path, int side, int loop,
              pb_ctx_t **out);
 
+/* 按 A 腿 INVITE offer 协商出的 RTP payload type 播放（early media 用）：
+ *   pt — 0=PCMU / 8=PCMA（G.711，P0 仅这两种；opus/G.729 待 codec 引擎 P1）
+ * 其余语义同 pb_start；不支持的 pt 返回 NSBC_NOTSUP。 */
+int pb_start_ex(void *call_key, const char *wav_path, int side, int loop,
+                 int pt, pb_ctx_t **out);
+
 /* 管道符拼接模式：chain 数 N 个 wav 文件按顺序依次播放
  * （每个 EOF 自动 start 下一个，最后一个 EOF 自动 stop）。 */
 int pb_start_chain(void *call_key, const char **wav_list, int n,

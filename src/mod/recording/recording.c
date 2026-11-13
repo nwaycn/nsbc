@@ -426,8 +426,12 @@ static void recording_rec_feed(void *ud, void *call_key, const void *payload,
     b2b_call_t *c = (b2b_call_t *)call_key;
     if (!c || !payload || len == 0) return;
     if (leg < 0 || leg > 1) return;
-    /* 直接从 call 上 atomic 取 sess —— 无锁查表 */
+    /* ★ DIAG: 每次进来都打一条（前 3 次 + 每 500 次），看 sess 有没有 */
+    static __thread int di_cnt = 0;
     rec_sess_t *sess = (rec_sess_t *)__atomic_load_n((void **)&c->rec[leg], __ATOMIC_ACQUIRE);
+    if (di_cnt++ < 3 || di_cnt % 500 == 0)
+        llog(LOG_INFO, "rec", "rec_feed ENTER call=%p leg=%d pt=%u len=%zu sess=%p",
+             (void *)c, leg, (unsigned)pt, len, (void *)sess);
     if (!sess) return;
     rec_feed_raw(sess, leg, payload, len, pt);
 }
@@ -955,6 +959,7 @@ int recording_feed_frame(const char *callid, int leg, const media_frame_t *frm)
 
 static int recording_init(struct nsbc_ctx *ctx)
 {
+    llog(LOG_ERR, "rec", "★★★ recording_init ENTER ctx=%p (DEBUG FOR REC FEED HOOK) ★★★", (void *)ctx);
     if (ctx == NULL) return NSBC_INVAL;
 
     rec_mgr_cfg_t mc = { 0 };

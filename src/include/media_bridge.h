@@ -203,8 +203,15 @@ int bridge_active_count(bridge_mgr_t *m);
 int bridge_lookup_relay(bridge_mgr_t *m, void *call_key,
                         rtp_relay_t **out_relay, nsbc_sa_t out_peer[2]);
 
+/* REQ-DP-APP-001：bridge 绑定/SDP 重写用的 local IP（offer_hook 同源。
+ * b2bua 合成 183 answer SDP 时 profile 未配 external_rtp_ip 的 fallback）。 */
+const char *bridge_local_ip(const bridge_mgr_t *m);
+
 /* relay 内部 fd 访问（media 层内部用，opaque 类型查询） */
 int rtp_relay_fd(const rtp_relay_t *r, int side);
+/* REQ-DP-APP-001：relay 指定侧本地 RTP 端口（b2bua 合成 183 Session Progress
+ * 的 SDP answer 时填 m=audio 端口用；side 0=A 腿侧，1=B 腿侧） */
+uint16_t rtp_relay_port(const rtp_relay_t *r, int side);
 /* relay 某侧是否已 latch 到真实 peer（1=已 latch，0=未 latch） */
 int rtp_relay_latched(const rtp_relay_t *r, int side);
 /* relay 某侧已 latch 的 peer 地址（未 latch 返回空 nsbc_sa_t） */

@@ -30,6 +30,31 @@ mod bool_i64 {
     }
 }
 
+/// 把 DB 里存的 JSON 文本（String）在 serde 序列化/反序列化时还原成
+/// 真正的 `serde_json::Value` 节点。这样推给 C 端的 JSON 里 `app_chain`
+/// 字段就是裸数组 `[{...}]`，而不是带转义的字符串 `"[{...}]"`。
+mod json_text_as_value {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    pub fn serialize<S: Serializer>(v: &String, s: S) -> Result<S::Ok, S::Error> {
+        // 空字符串或 "null" / "[]" → 序列化成空数组
+        let trimmed = v.trim();
+        if trimmed.is_empty() || trimmed == "null" {
+            return serde_json::Value::Array(vec![]).serialize(s);
+        }
+        match serde_json::from_str::<serde_json::Value>(trimmed) {
+            Ok(val) => val.serialize(s),
+            Err(_) => {
+                // 兜底：解析失败就当普通字符串序列化（不 panic）
+                s.serialize_str(v)
+            }
+        }
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+        let val = serde_json::Value::deserialize(d)?;
+        Ok(val.to_string())
+    }
+}
+
 
 fn scheme(dsn: &str) -> &str {
     if let Some((s, _)) = dsn.split_once("://") { s }
@@ -6094,8 +6119,12 @@ pub struct DialplanRule {
     pub force_precondition: i64,
     pub force_timer:       i64,
     pub force_gruu:        i64,
+    #[serde(with = "json_text_as_value")]
     pub action_json:    String,
-    /* REQ-DP-APP-001: Application chain JSON array — pushed to C side dp_json_parse_one on reload */
+    /* REQ-DP-APP-001: Application chain JSON array — pushed to C side dp_json_parse_one on reload.
+     * DB 存 JSON 文本（TEXT 列），但 serde 序列化时要还原成真正的 JSON array/object 节点，
+     * 不能把 String 原样序列化成带引号的字符串（会让 C 端 cJSON_IsArray 返回 false）。 */
+    #[serde(with = "json_text_as_value")]
     pub app_chain:      String,
     #[serde(serialize_with = "bool_i64::serialize")]
     pub enabled:        i64,

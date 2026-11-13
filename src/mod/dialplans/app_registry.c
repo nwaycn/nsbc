@@ -375,17 +375,27 @@ static app_rc_t app_answer(app_ctx_t *c, const char *data, void *ud)
     return APP_RC_FAILED;
 }
 
-/* ---- 2. bridge（REQ-DP-APP-001，P1 实装，P0 占位 NOTSUP）---- */
+/* ---- 2. bridge（REQ-DP-APP-001，P1 实装，resolve_cb 自动发起 B 腿 ----
+ *
+ * ★ 2026-11-13 修复：app_bridge 原来是 NOTSUP 占位（永远返回 FAILED）。
+ *   bridge 的实际工作由 resolve_cb → handle_new_invite 自动完成：
+ *     resolve_cb 内部 dp_execute（执行 app_chain）→ 同步返回路由 dst/out_ruri/out_to
+ *     → handle_new_invite 拿到路由 → b2b_originate 发 B 腿 INVITE。
+ *   所以 app_bridge 只是个意图标记（"至此该 bridge 了"），resolve_cb 在它之后
+ *   自动走路由流程。这里改成 APP_RC_OK no-op，不再 FAILED。
+ *
+ * data 白名单做格式校验，校验通过即返回 OK（不阻塞 chain）。 */
 static app_rc_t app_bridge(app_ctx_t *c, const char *data, void *ud)
 {
     (void)ud;
     if (!cv_call_alive(c)) return APP_RC_FAILED;
-    /* data 白名单：sofia/gateway/<gw>/<ext> 或 user/<ext> 或 sip:<uri>
-     * P0 只做格式校验 */
     const char *d = data ? data : "";
     size_t dl = strlen(d);
     if (dl == 0 || dl > 256) return APP_RC_FAILED;
-    return APP_RC_FAILED;  /* NOTSUP → APP_RC_FAILED（执行器走下一 prio） */
+    /* 格式校验通过 → OK。resolve_cb 在 dp_execute 返回后自动走 b2b_originate */
+    llog(LOG_INFO, "app", "app_bridge OK call=%p target='%s' (B 腿将由 resolve_cb 自动发起)",
+         c->call_key, d);
+    return APP_RC_OK;
 }
 
 /* ---- §6 pre_answer（Early Media 原语）----
@@ -408,7 +418,12 @@ static app_rc_t app_pre_answer(app_ctx_t *c, const char *data, void *ud)
 /* ---- 3. playback（P1 实装，接 pb_engine）----
  * data：WAV 文件路径，支持管道符拼接 "a.wav|b.wav|c.wav"
  * leg 参数：默认向当前执行腿（通常 A 腿）放音；可指定 both。
- * loop：0=播完 EOF 自动 stop，1=循环（MoH） */
+ * loop：0=播完 EOF 自动 stop，1=循环（MoH）
+ *
+ * ★ REQ-DP-APP-001 时序：app_chain 在 resolve_cb 同步执行，此刻 relay
+ * 尚未建立（offer_hook 要到 send_invite_b 才建），A 腿也没收到 183+SDP。
+ * 单文件走 b2b_request_early_media 登记意图，由 new_invite 在 relay ready
+ * 后统一执行 183+SDP+pb_start；若 A 腿已 EARLY/CONFIRMED 则直接放音。 */
 static app_rc_t app_playback(app_ctx_t *c, const char *data, void *ud)
 {
     (void)ud;
@@ -418,10 +433,7 @@ static app_rc_t app_playback(app_ctx_t *c, const char *data, void *ud)
     /* 停掉可能在播的（同一个 call_key 只能有一个 pb_ctx） */
     pb_stop_if_playing(c->call_key);
 
-    int side = c->leg;  /* 默认当前 leg */
-    int loop = 0;
-
-    /* 管道符拼接 → 拆成数组调 pb_start_chain */
+    /* 管道符拼接（in-dialog 队列/MoH 语义，relay 已存在场景）→ 拆数组直接放 */
     if (strchr(data, '|')) {
         char buf[512];
         strncpy(buf, data, sizeof(buf) - 1);
@@ -434,13 +446,20 @@ static app_rc_t app_playback(app_ctx_t *c, const char *data, void *ud)
             p = strchr(p, '|');
             if (p) { *p = '\0'; p++; }
         }
-        int rc = pb_start_chain(c->call_key, list, n, side, NULL);
+        int rc = pb_start_chain(c->call_key, list, n, c->leg, NULL);
         return rc == NSBC_OK ? APP_RC_OK : APP_RC_FAILED;
     }
 
-    /* 单文件 */
-    int rc = pb_start(c->call_key, data, side, loop, NULL);
-    return rc == NSBC_OK ? APP_RC_OK : APP_RC_FAILED;
+    /* 单文件：pre-answer 阶段登记 early media（183+SDP 先行），
+     * in-dialog 阶段（A 腿已 EARLY/CONFIRMED）接口内部直接 pb_start */
+    int rc = b2b_request_early_media((b2b_call_t *)c->call_key, data,
+                                     /*loop=*/0);
+    if (rc != NSBC_OK) {
+        llog(LOG_WARN, "app", "playback early_media rc=%d (call=%p wav=%s)",
+             rc, c->call_key, data);
+        return APP_RC_FAILED;
+    }
+    return APP_RC_OK;
 }
 
 /* ---- post_playback（接通后放音，与 playback 语义相同但意图不同）----
@@ -453,15 +472,22 @@ static app_rc_t app_post_playback(app_ctx_t *c, const char *data, void *ud)
     return app_playback(c, data, ud);
 }
 
-/* ---- endless_playback（P1 循环播放，uuid_break 可打断）---- */
+/* ---- endless_playback（P1 循环播放，uuid_break 可打断）----
+ * ★ REQ-DP-APP-001：同 playback 走 early media 登记时序（loop=1）。 */
 static app_rc_t app_endless_playback(app_ctx_t *c, const char *data, void *ud)
 {
     (void)ud;
     if (!cv_call_alive(c)) return APP_RC_FAILED;
     if (!data || data[0] == '\0' || strlen(data) > 256) return APP_RC_FAILED;
     pb_stop_if_playing(c->call_key);
-    int rc = pb_start(c->call_key, data, c->leg, /*loop=*/1, NULL);
-    return rc == NSBC_OK ? APP_RC_OK : APP_RC_FAILED;
+    int rc = b2b_request_early_media((b2b_call_t *)c->call_key, data,
+                                     /*loop=*/1);
+    if (rc != NSBC_OK) {
+        llog(LOG_WARN, "app", "endless_playback early_media rc=%d (call=%p wav=%s)",
+             rc, c->call_key, data);
+        return APP_RC_FAILED;
+    }
+    return APP_RC_OK;
 }
 
 /* ---- ringback（回铃音：接通自动停的循环放音）----
@@ -478,9 +504,17 @@ static app_rc_t app_endless_playback(app_ctx_t *c, const char *data, void *ud)
  *   [{"app":"ringback","data":"/var/sounds/ringback.wav"},
  *    {"app":"bridge","data":"user/1000"}]
  *
- * b2bua.c 三个 LEG_CONFIRMED 点（B 腿 200 OK / A 腿 originate 200 OK /
- * A 腿 ACK）都调 pb_stop_if_playing(c) —— 对 playback 不影响（chain 里
- * playback 通常在 answer 前已播完，且接通时停掉残留放音也是正确语义）。 */
+ * ★ REQ-DP-APP-001 时序修正（2026-11-13）：
+ *   dp_execute 在 resolve_cb 同步执行，此刻 relay 尚未建立（offer_hook
+ *   要到 send_invite_b 才建），A 腿也没收到 183+SDP —— 直接 pb_start
+ *   的话 A 根本不知道往哪收 RTP。正确 SIP Early Media 时序：
+ *     1) 本 app 只登记意图（b2b_request_early_media）
+ *     2) new_invite 在 send_invite_b 完成后（relay ready）：
+ *        183 Session Progress + SDP answer（A 侧 relay 地址）→ pb_start
+ *     3) B 腿 200 OK → LEG_CONFIRMED 的 pb_stop_if_playing 停放音转桥接
+ *     4) B 腿 1xx 带 SDP 不透传（A 已有我们的 answer）
+ *   ringback 是辅助功能：early_media 登记失败不阻塞 chain（non-fatal）。
+ * b2bua.c LEG_CONFIRMED 停放音见 app_ringback 旧注释（仍有效）。 */
 static app_rc_t app_ringback(app_ctx_t *c, const char *data, void *ud)
 {
     (void)ud;
@@ -490,10 +524,13 @@ static app_rc_t app_ringback(app_ctx_t *c, const char *data, void *ud)
     /* 同一 call_key 只能有一个 pb_ctx：先停再放 */
     pb_stop_if_playing(c->call_key);
 
-    /* 非阻塞：循环放音，chain 立即继续执行下一 app（bridge/transfer）。
-     * 接通停止由 b2bua.c LEG_CONFIRMED 路径的 pb_stop_if_playing 完成。 */
-    int rc = pb_start(c->call_key, data, c->leg, /*loop=*/1, NULL);
-    return rc == NSBC_OK ? APP_RC_OK : APP_RC_FAILED;
+    int rc = b2b_request_early_media((b2b_call_t *)c->call_key, data,
+                                     /*loop=*/1);
+    if (rc != NSBC_OK) {
+        llog(LOG_WARN, "app",
+             "ringback early_media rc=%d (non-fatal, continuing)", rc);
+    }
+    return APP_RC_OK; /* 辅助功能，失败不阻塞 chain */
 }
 
 /* ---- §8 uuid_break（双模：Dialplan app + ESL api）----
