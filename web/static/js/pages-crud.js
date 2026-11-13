@@ -669,19 +669,35 @@ app.component('dialplan-rules', {
         });
       }
     }
-    // 从 action_json 里安全地取出顶层字段（dst_override 等），不存在返回DefaultValue
-    function actGet(action_json, key, def) {
-      try {
-        const o = JSON.parse(action_json || '{}');
-        return o[key] ?? def;
-      } catch { return def; }
+    // 统一 action_json 为 object —— 后端 json_text_as_value 把 DB 里的
+    // JSON 文本序列化成真正的 object 返回；但 form 内部 v-model 传的是
+    // JSON 字符串。兼容两种形态避免字段回退默认值（media_mode 变 auto、
+    // ringback 丢失等）。
+    function toJsonObj(v) {
+      if (v == null || v === '') return {};
+      if (typeof v === 'object') return v;       // 后端返回的是 object
+      if (typeof v === 'string') {
+        try { return JSON.parse(v); } catch { return {}; }
+      }
+      return {};
     }
-    // 把顶层字段安全地 merge 进 action_json（保留其他字段）
+    // 从 action_json 里安全地取出顶层字段，不存在返回DefaultValue
+    function actGet(action_json, key, def) {
+      const o = toJsonObj(action_json);
+      return o[key] ?? def;
+    }
+    // 把顶层字段安全地 merge 进 action_json（保留未知字段如 ringback）
     function actSet(action_json, patches) {
-      let o = {};
-      try { o = JSON.parse(action_json || '{}'); } catch { o = {}; }
+      const o = toJsonObj(action_json);
       Object.assign(o, patches);
       return JSON.stringify(o);
+    }
+    // 把 value 统一成 JSON 字符串（保存 payload 用）
+    function toJsonStr(v) {
+      if (v == null) return '';
+      if (typeof v === 'string') return v;
+      if (typeof v === 'object') return JSON.stringify(v);
+      return String(v);
     }
 
     function openCreate() {
@@ -721,9 +737,11 @@ app.component('dialplan-rules', {
       // 从 action_json 里把顶层快捷字段剥出来
       f.dst_override = actGet(row.action_json, 'dst_override', '');
       f.media_mode = Number(actGet(row.action_json, 'media_mode', 0));
-      // app_chain 回显：row.app_chain 是 JSON 字符串（后端 serde 序列化）
-      if (!f.app_chain || typeof f.app_chain !== 'string' || !f.app_chain.trim().startsWith('['))
-        f.app_chain = '[]';
+      // app_chain 回显：后端 json_text_as_value 序列化成真正数组，
+      // form 内部 v-model 期望字符串，统一成 JSON string
+      f.app_chain = toJsonStr(row.app_chain || '[]');
+      // action_json 也统一成字符串 —— 供 DialplanActionEditor v-model 使用
+      f.action_json = toJsonStr(row.action_json || '{}');
       form.value = f;
       rawMode.action_json = false;
       rawMode.app_chain = false;

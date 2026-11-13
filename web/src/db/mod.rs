@@ -33,25 +33,37 @@ mod bool_i64 {
 /// 把 DB 里存的 JSON 文本（String）在 serde 序列化/反序列化时还原成
 /// 真正的 `serde_json::Value` 节点。这样推给 C 端的 JSON 里 `app_chain`
 /// 字段就是裸数组 `[{...}]`，而不是带转义的字符串 `"[{...}]"`。
+///
+/// 双向契约：
+///  serialize (DB → 前端): String → parse 成 Value → 序列化成真正 JSON object/array
+///  deserialize (前端 → DB):
+///    - 前端发 JSON string "{"a":1}" → serde 解成 Value::String → 再 parse 取裸 JSON text
+///    - 前端发 JSON object {"a":1} → Value::Object → 直接 to_string 存 DB
 mod json_text_as_value {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     pub fn serialize<S: Serializer>(v: &String, s: S) -> Result<S::Ok, S::Error> {
-        // 空字符串或 "null" / "[]" → 序列化成空数组
         let trimmed = v.trim();
         if trimmed.is_empty() || trimmed == "null" {
             return serde_json::Value::Array(vec![]).serialize(s);
         }
         match serde_json::from_str::<serde_json::Value>(trimmed) {
             Ok(val) => val.serialize(s),
-            Err(_) => {
-                // 兜底：解析失败就当普通字符串序列化（不 panic）
-                s.serialize_str(v)
-            }
+            Err(_) => s.serialize_str(v),
         }
     }
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
         let val = serde_json::Value::deserialize(d)?;
-        Ok(val.to_string())
+        match val {
+            // 前端发 JSON 字符串 "{"a":1}" → 再 parse 一次取裸 JSON text
+            serde_json::Value::String(s) => {
+                match serde_json::from_str::<serde_json::Value>(&s) {
+                    Ok(v) => Ok(v.to_string()),
+                    Err(_) => Ok(s),
+                }
+            }
+            // 前端直接发 JSON object/array/number → 直接 to_string（就是合法 JSON）
+            other => Ok(other.to_string()),
+        }
     }
 }
 
@@ -4075,18 +4087,17 @@ sqlx::query(acct_ddl).execute(pool).await?;
     }
 
     // Default extensions seed: only seed when extensions table is EMPTY
-    // (prevents re-seeding after DELETE). Seed full range 10000-99999 (90000 extensions).
-    // Used for large-scale register stress testing and production defaults.
+    // (prevents re-seeding after DELETE). Seed small office range 1000-1019 (20 extensions).
     let ext_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM extensions")
         .fetch_one(pool).await.unwrap_or(0);
     if ext_count > 0 {
         info!("extensions table already has {ext_count} rows — skipping default seed");
     } else {
-        info!("extensions table is empty — seeding full range 10000-99999 (90000 extensions)");
+        info!("extensions table is empty — seeding range 1000-1019 (20 extensions)");
     }
     let default_realm = "nsbc.local";
     let default_pass  = "876876";
-    let seed_range: Vec<u32> = if ext_count == 0 { (10000..100000).collect() } else { Vec::new() };
+    let seed_range: Vec<u32> = if ext_count == 0 { (1000..1020).collect() } else { Vec::new() };
     for n in seed_range {
         let ext = format!("{n}");
         let clip = format!("{n}");

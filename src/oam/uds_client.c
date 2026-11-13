@@ -347,6 +347,41 @@ static void send_hello(void)
     pthread_mutex_unlock(&g.cmd_lock);
 }
 
+/* CMD 通道发 HEARTBEAT —— 无 payload，纯 ping。
+ * Rust 侧对 FT_HEARTBEAT 只回 ACK，**不触发** push_all（HELLO 才触发）。
+ * 区别：
+ *   - HELLO:   "我刚连上，请推全量配置" → push_all
+ *   - HEARTBEAT: "我还活着" → 仅回 ACK
+ *
+ * send HEARTBEAT 的目的：
+ *   Web 重启后 data_cmd.sock inode 变化 → 旧 fd connect 到旧 inode →
+ *   poll 永远等不到新 socket 数据。本函数每 3s 发一次，Rust 侧收到
+ *   就记录 peer path（CORE_PEER_CMD_PATH），后续 reload_via_uds 就能 sendto 新 socket。
+ *   如果 Rust 侧也没活 → 连续 6s 无回包 → force reconnect → open 新 inode。 */
+static void send_heartbeat(void)
+{
+    uint8_t frame[NSBC_FRAME_HDR_LEN + 1];  /* 最小：12B 头 + 1B 空 payload */
+    /* 手工拼 FT_HEARTBEAT 空帧（uds_encode_frame 要求 payload_len > 0，给 1 字节 0） */
+    frame[0] = NSBC_FRAME_MAGIC;
+    frame[1] = FT_HEARTBEAT;
+    uint32_t total = NSBC_FRAME_HDR_LEN + 1;
+    frame[2] = (uint8_t)((total >> 24) & 0xff);
+    frame[3] = (uint8_t)((total >> 16) & 0xff);
+    frame[4] = (uint8_t)((total >> 8) & 0xff);
+    frame[5] = (uint8_t)(total & 0xff);
+    frame[6] = frame[7] = frame[8] = frame[9] = 0;  /* ticket=0 */
+    frame[10] = 0;  /* flags */
+    frame[11] = 0;  /* rsvd */
+    frame[12] = 0;  /* 空 payload */
+    pthread_mutex_lock(&g.cmd_lock);
+    if (g.fd_cmd >= 0 && dgram_send_locked(g.fd_cmd, frame, sizeof(frame)) != 0) {
+        pthread_mutex_lock(&g.conn_lock);
+        mark_broken_locked();
+        pthread_mutex_unlock(&g.conn_lock);
+    }
+    pthread_mutex_unlock(&g.cmd_lock);
+}
+
 /* ========================================================================
  * 收帧分发（仅后台线程，datagram 天然完整帧 —— 无需重组）
  * ======================================================================*/
@@ -960,12 +995,26 @@ static void *shard_consumer_thread(void *arg)
 /* ========================================================================
  * CMD poll 线程（独立，只管 CMD/HELLO/HEARTBEAT 的收和回）
  * 旧 uds_client_thread 拆出来的 CMD 通道循环
+ *
+ * ★ Web 重启后 C 侧重连机制：
+ *   nsbc-web 重启会 unlink + 重新 bind data_cmd.sock（inode 变化）。
+ *   C 侧旧 fd_cmd 指向旧 inode，poll(POLLIN) 永远等不到新 inode 数据。
+ *   本线程每 5s 主动 send_hello，若连续 2 次超时未收到任何帧 →
+ *   mark_broken → reconnect → open 新 inode → send HELLO → Rust 侧
+ *   recv_from 拿到 peer 路径 → 更新 CORE_PEER_CMD_PATH → 恢复。
  * ======================================================================*/
+
+#define CMD_POLL_TIMEOUT_MS       500    /* poll 单轮超时 */
+#define CMD_HEARTBEAT_INTERVAL_MS 3000   /* 两次 HELLO 间隔：3s */
+#define CMD_FORCE_RECONNECT_MS    6000   /* 6s 无任何帧 → 强制重连 */
 
 static void *cmd_poll_thread(void *ud)
 {
     (void)ud;
     g.backoff_ms = UDS_RECONNECT_BASE_MS;
+
+    uint64_t last_hb_ms = 0;     /* 上次发 HELLO 时间 */
+    int      missed_rx = 0;      /* 连续几轮没收到任何帧 */
 
     for (;;) {
         if (g.stop_flag) break;
@@ -986,9 +1035,11 @@ static void *cmd_poll_thread(void *ud)
                 continue;
             }
             g.backoff_ms = UDS_RECONNECT_BASE_MS;
+            missed_rx = 0;
             llog(LOG_NOTICE, "uds", "connected to %s + %s, sending hello",
                  g.path_push, g.path_cmd);
             send_hello();
+            last_hb_ms = nsbc_now_ms();
         }
 
         /* poll: fd_cmd (POLLIN) + wake_cmd (POLLIN)
@@ -1001,16 +1052,18 @@ static void *cmd_poll_thread(void *ud)
         pfd[nfds].events = POLLIN;
         nfds++;
 
-        int pr = poll(pfd, nfds, 500);
+        int pr = poll(pfd, nfds, CMD_POLL_TIMEOUT_MS);
         if (g.stop_flag) break;
         if (pr < 0) {
             if (errno == EINTR) continue;
             pthread_mutex_lock(&g.conn_lock);
             mark_broken_locked();
             pthread_mutex_unlock(&g.conn_lock);
+            missed_rx = 0;
             continue;
         }
 
+        int got_frame = 0;
         /* fd_cmd 可读 —— 收 RSP / HELLO_ACK / HEARTBEAT */
         if (fdc >= 0 && (pfd[0].revents & (POLLIN | POLLHUP | POLLERR))) {
             if (recv_cmd_once() != 0) {
@@ -1018,14 +1071,46 @@ static void *cmd_poll_thread(void *ud)
                 mark_broken_locked();
                 pthread_mutex_unlock(&g.conn_lock);
                 llog(LOG_INFO, "uds", "datagram path reset by peer, reconnecting");
+                missed_rx = 0;
                 continue;
             }
+            got_frame = 1;
         }
         /* wake pipe —— stop 或其它 */
         if (pfd[nfds-1].revents & POLLIN) {
             char buf[64];
             while (read(g.wake_cmd_rd, buf, sizeof(buf)) > 0)
                 ;
+        }
+
+        /* ---- Heartbeat: 每 3s 主动 send HEARTBEAT 验证链路 ----
+         * ★ 必须是 HEARTBEAT 不是 HELLO：
+         *   - HELLO 会触发 Rust 侧 push_all（14 kinds 全量 reload）
+         *   - HEARTBEAT Rust 侧只回 ACK，不触发任何 reload
+         *   Web 重启后 data_cmd.sock inode 变化 → 旧 fd connect 到旧 inode →
+         *   poll 永远等不到新 socket 数据。本逻辑连续 CMD_FORCE_RECONNECT_MS
+         *   没收到帧 → mark_broken → reopen → connect 新 inode → HELLO 能到。 */
+        uint64_t now = nsbc_now_ms();
+        if (got_frame) {
+            missed_rx = 0;
+        } else {
+            missed_rx++;
+            /* 超过 3s 没收到 → 发 HEARTBEAT ping */
+            if (now - last_hb_ms >= CMD_HEARTBEAT_INTERVAL_MS) {
+                send_heartbeat();
+                last_hb_ms = now;
+                /* 累计超过 6s 无任何帧 → 强制重连（旧 fd 指向旧 inode） */
+                if (missed_rx * CMD_POLL_TIMEOUT_MS > CMD_FORCE_RECONNECT_MS) {
+                    llog(LOG_WARN, "uds",
+                         "no cmd frame for %dms (last_recv=%llu), forcing reconnect",
+                         missed_rx * CMD_POLL_TIMEOUT_MS,
+                         (unsigned long long)g.last_recv_ms);
+                    pthread_mutex_lock(&g.conn_lock);
+                    mark_broken_locked();
+                    pthread_mutex_unlock(&g.conn_lock);
+                    missed_rx = 0;
+                }
+            }
         }
     }
 

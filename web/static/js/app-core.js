@@ -556,41 +556,62 @@ const DialplanActionEditor = {
     });
     let _s = false;
     const preview = computed(() => JSON.stringify(action));
+
+    // 兼容：后端 json_text_as_value 可能把 DB 里的 JSON 文本序列化成
+    // 真正的 object 返回（不是字符串）；而 v-model 传递时又是字符串。
+    // 统一成 object，避免 JSON.parse(object) 抛异常导致回显丢失所有字段。
+    function asObj(v) {
+      if (v == null || v === '') return {};
+      if (typeof v === 'object') return v;
+      if (typeof v === 'string') { try { return JSON.parse(v); } catch { return {}; } }
+      return {};
+    }
+
     function syncFrom() {
       _s = true;
-      try {
-        const v = JSON.parse(props.modelValue || '{}');
-        // 号码变换
-        action.dst_override = v.dst_override ?? '';
-        action.clip = v.clip ?? '';
-        action.perm = Number(v.perm ?? 0);
-        action.immediate = !!v.immediate;
-        // From 头
-        action.sip_invite_from = v.sip_invite_from ?? '';
-        action.sip_invite_from_uri = v.sip_invite_from_uri ?? '';
-        action.sip_from_uri = v.sip_from_uri ?? '';
-        action.sip_from_display = v.sip_from_display ?? '';
-        action.sip_invite_from_params = v.sip_invite_from_params ?? '';
-        // FS 精细化Caller
-        action.origination_caller_id_number = v.origination_caller_id_number ?? '';
-        action.origination_caller_id_name = v.origination_caller_id_name ?? '';
-        // To / R-URI / Contact
-        action.sip_invite_to_uri = v.sip_invite_to_uri ?? '';
-        action.sip_invite_to_params = v.sip_invite_to_params ?? '';
-        action.sip_invite_req_uri = v.sip_invite_req_uri ?? '';
-        action.sip_invite_tel_params = v.sip_invite_tel_params ?? '';
-        action.sip_invite_contact_params = v.sip_invite_contact_params ?? '';
-        // Domain
-        action.sip_invite_domain = v.sip_invite_domain ?? '';
-        // Extra
-        action.sip_invite_params = v.sip_invite_params ?? '';
-        action.sip_invite_pid_params = v.sip_invite_pid_params ?? '';
-        // legacy
-        action.clip_from = v.clip_from ?? '';
-      } catch {}
+      const v = asObj(props.modelValue);
+      // 号码变换
+      action.dst_override = v.dst_override ?? '';
+      action.clip = v.clip ?? '';
+      action.perm = Number(v.perm ?? 0);
+      action.immediate = !!v.immediate;
+      // From 头
+      action.sip_invite_from = v.sip_invite_from ?? '';
+      action.sip_invite_from_uri = v.sip_invite_from_uri ?? '';
+      action.sip_from_uri = v.sip_from_uri ?? '';
+      action.sip_from_display = v.sip_from_display ?? '';
+      action.sip_invite_from_params = v.sip_invite_from_params ?? '';
+      // FS 精细化Caller
+      action.origination_caller_id_number = v.origination_caller_id_number ?? '';
+      action.origination_caller_id_name = v.origination_caller_id_name ?? '';
+      // To / R-URI / Contact
+      action.sip_invite_to_uri = v.sip_invite_to_uri ?? '';
+      action.sip_invite_to_params = v.sip_invite_to_params ?? '';
+      action.sip_invite_req_uri = v.sip_invite_req_uri ?? '';
+      action.sip_invite_tel_params = v.sip_invite_tel_params ?? '';
+      action.sip_invite_contact_params = v.sip_invite_contact_params ?? '';
+      // Domain
+      action.sip_invite_domain = v.sip_invite_domain ?? '';
+      // Extra
+      action.sip_invite_params = v.sip_invite_params ?? '';
+      action.sip_invite_pid_params = v.sip_invite_pid_params ?? '';
+      // legacy
+      action.clip_from = v.clip_from ?? '';
       _s = false;
     }
-    function syncTo()  { if (_s) return; emit('update:modelValue', JSON.stringify(action)); }
+    // syncTo: 先 parse 当前 JSON，把已知字段覆盖进去（undefined 不覆盖），
+    // 保留 ringback / media_mode 等未知字段 —— 避免用户在 Raw JSON 里加的东西
+    // 被结构化编辑器覆盖掉。
+    function syncTo() {
+      if (_s) return;
+      const merged = asObj(props.modelValue);   // 先拿旧值（含未知字段如 ringback）
+      for (const k of Object.keys(action)) {
+        const v = action[k];
+        // undefined 不覆盖；布尔值 false、数字 0、空字符串 '' 都要覆盖（用户明确设过）
+        if (v !== undefined) merged[k] = v;
+      }
+      emit('update:modelValue', JSON.stringify(merged));
+    }
     watch(() => props.modelValue, syncFrom);
     watch(action, syncTo, { deep: true });
     syncFrom();
@@ -772,17 +793,23 @@ const AppChainEditor = {
     const preview = computed(() => JSON.stringify(chain.value));
 
     let _s = false;
+    // 兼容：后端 json_text_as_value 可能把 app_chain 序列化成真正的 array
+    // 返回；v-model 传递时又是 JSON 字符串。统一成 array。
+    function asArr(v) {
+      if (v == null || v === '') return [];
+      if (Array.isArray(v)) return v;
+      if (typeof v === 'string') {
+        try { const x = JSON.parse(v); return Array.isArray(x) ? x : []; }
+        catch { return []; }
+      }
+      return [];
+    }
     function syncFrom() {
       _s = true;
-      try {
-        const v = JSON.parse(props.modelValue || '[]');
-        if (Array.isArray(v))
-          chain.value = v
-            .filter(x => x && typeof x.app === 'string' && x.app.length > 0)
-            .map(x => ({ app: x.app, data: x.data || '' }));
-        else
-          chain.value = [];
-      } catch { chain.value = []; }
+      const v = asArr(props.modelValue);
+      chain.value = v
+        .filter(x => x && typeof x.app === 'string' && x.app.length > 0)
+        .map(x => ({ app: x.app, data: x.data || '' }));
       _s = false;
     }
     function syncTo() {
