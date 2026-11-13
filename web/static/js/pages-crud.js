@@ -560,6 +560,35 @@ app.component('dialplan-rules', {
               <code class="bg-slate-100 px-1 rounded ml-1">sleep</code> 返回 PENDING 时 timer_wheel 挂起，到点后自动继续。
             </div>
           </el-form-item>
+          <!-- ★ 完整 Rule JSON 双向同步预览/编辑框 -->
+          <el-divider content-position="left">
+            <i class="fas fa-code mr-1 text-indigo-500"></i>
+            Full Rule JSON（双向同步 · 直接改这里也能更新上方条目）
+          </el-divider>
+          <el-form-item label="">
+            <div class="w-full">
+              <div class="flex justify-between items-center mb-1">
+                <span class="text-xs text-slate-500">
+                  结构化条目 ↔ 完整 JSON 实时同步 · 保存时也会校验 JSON 合法性
+                </span>
+                <div class="flex gap-1">
+                  <el-button link size="small" @click="ruleJsonSyncFromForm" type="primary" v-if="!ruleJsonUserEdited">
+                    ↻ 从条目同步
+                  </el-button>
+                  <el-button link size="small" @click="ruleJsonFormat">格式化</el-button>
+                  <el-button link size="small" @click="ruleJsonCopy">复制</el-button>
+                </div>
+              </div>
+              <el-input v-model="ruleJson" type="textarea" :rows="12"
+                placeholder='{"name":"...","profile_name":"internal","match_expr":"^1000$",...}' resize="none"
+                @input="ruleJsonOnInput" @blur="ruleJsonOnBlur">
+              </el-input>
+              <div class="text-xs mt-1" :class="ruleJsonValid ? 'text-green-600' : 'text-red-500'">
+                <span v-if="ruleJsonValid">✓ JSON 合法</span>
+                <span v-else>✗ JSON 不合法：{{ ruleJsonError }}</span>
+              </div>
+            </div>
+          </el-form-item>
         </el-form>
         <template #footer>
           <el-button @click="showModal = false">{{ t('Cancel') }}</el-button>
@@ -582,6 +611,111 @@ app.component('dialplan-rules', {
     const form = ref({});
     const saving = ref(false);
     const rawMode = Vue.reactive({ action_json: false, app_chain: false });
+    // ★ 完整 Rule JSON 双向同步
+    const ruleJson = ref('');
+    const ruleJsonValid = ref(true);
+    const ruleJsonError = ref('');
+    const ruleJsonUserEdited = ref(false); // 用户手动改过 JSON（blur 时反向解析回条目）
+    let ruleJsonTimer = null;
+    const ruleJsonFromForm = () => {
+      const f = form.value;
+      const obj = {
+        name: f.name || '',
+        profile_name: f.profile_name || 'internal',
+        src_ip_cidr: f.src_ip_cidr || '0.0.0.0/0',
+        match_expr: f.match_expr || '',
+        caller_match: f.caller_match || '',
+        prio: f.prio ?? 1,
+        strip: f.strip ?? 0,
+        target: f.target || '',
+        rec_action: f.rec_action ?? 0,
+        rec_path_template: f.rec_path_template || '',
+        rec_fmt: f.rec_fmt || '',
+        force_prack: f.force_prack ?? 0,
+        force_precondition: f.force_precondition ?? 0,
+        force_timer: f.force_timer ?? 0,
+        force_gruu: f.force_gruu ?? 0,
+        action_json: toJsonObj(f.action_json || '{}'),
+        app_chain: (() => {
+          try { return typeof f.app_chain === 'string' ? JSON.parse(f.app_chain || '[]') : f.app_chain; }
+          catch { return []; }
+        })(),
+        enabled: f.enabled !== false,
+        description: f.description || '',
+      };
+      try {
+        ruleJson.value = JSON.stringify(obj, null, 2);
+        ruleJsonValid.value = true;
+        ruleJsonError.value = '';
+      } catch (e) { /* ignore */ }
+    };
+    function ruleJsonOnInput() {
+      ruleJsonUserEdited.value = true;
+      // 延迟 400ms 自动校验
+      if (ruleJsonTimer) clearTimeout(ruleJsonTimer);
+      ruleJsonTimer = setTimeout(() => {
+        try {
+          JSON.parse(ruleJson.value);
+          ruleJsonValid.value = true;
+          ruleJsonError.value = '';
+        } catch (e) {
+          ruleJsonValid.value = false;
+          ruleJsonError.value = e.message;
+        }
+      }, 400);
+    }
+    function ruleJsonOnBlur() {
+      if (!ruleJsonUserEdited.value) return;
+      // 用户停止编辑后：JSON 合法 → 反向解析回 form 条目
+      let obj;
+      try { obj = JSON.parse(ruleJson.value); }
+      catch { ruleJsonValid.value = false; return; }
+      ruleJsonValid.value = true;
+      ruleJsonError.value = '';
+      // 反向 merge 回 form（只覆盖 JSON 里有的字段）
+      const f = form.value;
+      if (obj.name !== undefined) f.name = obj.name;
+      if (obj.profile_name !== undefined) f.profile_name = obj.profile_name;
+      if (obj.src_ip_cidr !== undefined) f.src_ip_cidr = obj.src_ip_cidr;
+      if (obj.match_expr !== undefined) f.match_expr = obj.match_expr;
+      if (obj.caller_match !== undefined) f.caller_match = obj.caller_match;
+      if (obj.prio !== undefined) f.prio = Number(obj.prio);
+      if (obj.strip !== undefined) f.strip = Number(obj.strip);
+      if (obj.target !== undefined) f.target = obj.target;
+      if (obj.rec_action !== undefined) f.rec_action = Number(obj.rec_action);
+      if (obj.rec_path_template !== undefined) f.rec_path_template = obj.rec_path_template;
+      if (obj.rec_fmt !== undefined) f.rec_fmt = obj.rec_fmt;
+      if (obj.force_prack !== undefined) f.force_prack = Number(obj.force_prack);
+      if (obj.force_precondition !== undefined) f.force_precondition = Number(obj.force_precondition);
+      if (obj.force_timer !== undefined) f.force_timer = Number(obj.force_timer);
+      if (obj.force_gruu !== undefined) f.force_gruu = Number(obj.force_gruu);
+      if (obj.action_json !== undefined) f.action_json = typeof obj.action_json === 'string'
+        ? obj.action_json : JSON.stringify(obj.action_json);
+      if (obj.app_chain !== undefined) f.app_chain = typeof obj.app_chain === 'string'
+        ? obj.app_chain : JSON.stringify(obj.app_chain);
+      if (obj.enabled !== undefined) f.enabled = !!obj.enabled;
+      if (obj.description !== undefined) f.description = obj.description;
+      // 同步一下 form → JSON 避免循环不一致
+      ruleJsonUserEdited.value = false;
+      ruleJsonFromForm();
+      ruleJsonUserEdited.value = true; // 保持"用户正在编辑"的UI状态，直到用户点保存或切换
+    }
+    function ruleJsonSyncFromForm() {
+      ruleJsonUserEdited.value = false;
+      ruleJsonFromForm();
+    }
+    function ruleJsonFormat() {
+      let obj; try { obj = JSON.parse(ruleJson.value); }
+      catch { ElementPlus.ElMessage({ message: 'JSON 不合法，无法格式化', type: 'error' }); return; }
+      ruleJson.value = JSON.stringify(obj, null, 2);
+    }
+    function ruleJsonCopy() {
+      navigator.clipboard?.writeText(ruleJson.value).then(() =>
+        ElementPlus.ElMessage({ message: '已复制到剪贴板', type: 'success' })
+      ).catch(() =>
+        ElementPlus.ElMessage({ message: '复制失败（请手动 Ctrl+C）', type: 'warning' })
+      );
+    }
     // 正则验证Status
     const matchValid = ref(null);    // null=未验证, true=合法, false=非法
     const matchError = ref('');
@@ -729,8 +863,11 @@ app.component('dialplan-rules', {
       };
       rawMode.action_json = false;
       rawMode.app_chain = false;
+      ruleJsonUserEdited.value = false;
       editingId.value = null;
       showModal.value = true;
+      // 初始化 ruleJson（等 Vue tick 完 form 已赋值）
+      Vue.nextTick(() => ruleJsonFromForm());
     }
     function openEdit(row) {
       const f = { ...row };
@@ -745,8 +882,10 @@ app.component('dialplan-rules', {
       form.value = f;
       rawMode.action_json = false;
       rawMode.app_chain = false;
+      ruleJsonUserEdited.value = false;
       editingId.value = row.id;
       showModal.value = true;
+      Vue.nextTick(() => ruleJsonFromForm());
     }
     /* profile 切换时智能填Default CIDR（internal→RFC1918 防盗打，external→0.0.0.0/0 外部Gateway） */
     function onProfileChange() {
@@ -795,15 +934,30 @@ app.component('dialplan-rules', {
     async function save() {
       saving.value = true;
       try {
-        // 把顶层快捷字段 merge 进 action_json（C 侧从这里解析 dst_override 等）
-        // 注意：strip 已独立存 DB 列，同步到 C 侧作为 JSON 顶层字段，不用塞 action_json
-        const payload = { ...form.value };
-        payload.action_json = actSet(payload.action_json, {
-          dst_override: payload.dst_override || '',
-          media_mode: payload.media_mode ?? 0,
-        });
-        delete payload.dst_override; // 后端表没有这列，去掉
-        delete payload.media_mode;   // 同上
+        // ★ 如果用户直接编辑了 JSON 并且合法 → 优先用 JSON 作为 payload
+        let payload;
+        if (ruleJsonUserEdited.value && ruleJsonValid.value) {
+          let obj; try { obj = JSON.parse(ruleJson.value); }
+          catch { obj = null; }
+          if (obj && typeof obj === 'object') {
+            // 确保 action_json / app_chain 是字符串（后端 DB 列是 TEXT）
+            if (obj.action_json !== undefined && typeof obj.action_json !== 'string')
+              obj.action_json = JSON.stringify(obj.action_json);
+            if (obj.app_chain !== undefined && typeof obj.app_chain !== 'string')
+              obj.app_chain = JSON.stringify(obj.app_chain);
+            payload = obj;
+          }
+        }
+        if (!payload) {
+          // 回退：用 form 结构化字段（走原来的 merge 逻辑）
+          payload = { ...form.value };
+          payload.action_json = actSet(payload.action_json, {
+            dst_override: payload.dst_override || '',
+            media_mode: payload.media_mode ?? 0,
+          });
+          delete payload.dst_override;
+          delete payload.media_mode;
+        }
         if (editingId.value) await API.put(API_PATH + '/' + editingId.value, payload);
         else await API.post(API_PATH, payload);
         showModal.value = false;
@@ -823,6 +977,8 @@ app.component('dialplan-rules', {
              trunkOptions, gatewayOptions, trunkApiOk, tenantOptions,
              filteredItems, filteredTotal, pagedItems,
              matchValid, matchError, matchTestNum, matchTestResult, validateMatchExpr,
+             ruleJson, ruleJsonValid, ruleJsonError, ruleJsonUserEdited,
+             ruleJsonOnInput, ruleJsonOnBlur, ruleJsonSyncFromForm, ruleJsonFormat, ruleJsonCopy,
              load, reloadRules, openCreate, openEdit, onProfileChange, save, del };
   },
 });

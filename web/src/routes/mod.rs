@@ -21,6 +21,7 @@ pub mod registrations;
 pub mod route_groups;
 pub mod security;
 pub mod sip_profiles;
+pub mod sounds;
 pub mod system;
 pub mod tenants;
 pub mod time_groups;
@@ -55,6 +56,7 @@ mod tests {
             api_major: API_MAJOR,
             bind: SocketAddr::from(([127, 0, 0, 1], 0)),
             recording_root: std::path::PathBuf::from("/tmp/nsbc-test-recordings"),
+            sounds_root: std::path::PathBuf::from("/tmp/nsbc-test-sounds"),
             require_loopback_auth: false,  /* F-10 修复：测试中 loopback peer 免鉴权 */
             data_pushed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             calls_tx: tokio::sync::broadcast::channel(256).0,

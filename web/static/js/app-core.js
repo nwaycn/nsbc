@@ -696,6 +696,29 @@ const AppChainEditor = {
                 <el-option label="mp4  · 音视频合成浏览器直放"  value="mp4" />
               </el-select>
             </div>
+            <!-- ★ 声音相关 app: data 输入框 + 已有文件下拉 + 上传按钮 -->
+            <div v-else-if="isSoundApp(item.app)" class="flex items-center gap-2">
+              <el-input v-model="item.data" size="small" style="flex:1"
+                        :placeholder="dataPlaceholder(item.app)" clearable>
+                <template #append>
+                  <el-select v-model="item.data" size="small" style="width:180px"
+                    filterable clearable placeholder="选已有文件"
+                    @change="v => onSoundPicked(item, v)">
+                    <el-option label="— 上传后自动填路径 —" disabled value=""></el-option>
+                    <el-option v-for="s in sounds" :key="s.name" :value="s.name">
+                      <span>{{ s.name }}</span>
+                      <span class="text-xs text-slate-400 ml-2">{{ fmtSize(s.size) }}</span>
+                    </el-option>
+                  </el-select>
+                </template>
+              </el-input>
+              <el-upload :show-file-list="false" :before-upload="f => onSoundUpload(f, item)"
+                accept=".wav,.mp3,.opus,.gsm">
+                <el-button size="small" type="primary" plain>
+                  <i class="fa-solid fa-upload mr-1"></i>上传
+                </el-button>
+              </el-upload>
+            </div>
             <!-- 其他 app: 通用 data 输入框 -->
             <el-input v-else-if="needsData(item.app)" v-model="item.data" size="small"
                       :placeholder="dataPlaceholder(item.app)" clearable></el-input>
@@ -767,6 +790,7 @@ const AppChainEditor = {
 
     function appHint(name)  { return APP_DESCS[name] || ''; }
     function needsData(name){ return ['playback','ringback','post_playback','endless_playback','sleep','transfer','conference','set','gentones','play_and_get_digits','read'].includes(name); }
+    function isSoundApp(name){ return ['playback','ringback','post_playback','endless_playback','play_and_get_digits'].includes(name); }
     function dataPlaceholder(name) {
       const H = {
         playback:             'welcome.wav or /path/to/file.wav',
@@ -848,9 +872,56 @@ const AppChainEditor = {
     watch(chain, syncTo, { deep: true });
     syncFrom();
 
+    // ★ Sound files 相关（REQ-DP-UPLOAD）
+    const sounds = ref([]);
+    async function fetchSounds() {
+      try {
+        const r = await API.get('/sounds');
+        sounds.value = r.files || [];
+      } catch { sounds.value = []; }
+    }
+    function fmtSize(b) {
+      if (b < 1024) return b + ' B';
+      if (b < 1024*1024) return (b/1024).toFixed(1) + ' KB';
+      return (b/1024/1024).toFixed(2) + ' MB';
+    }
+    function onSoundPicked(item, name) {
+      if (name) item.data = name;
+    }
+    async function onSoundUpload(file, item) {
+      // 构造 multipart form
+      const fd = new FormData();
+      fd.append('file', file, file.name);
+      try {
+        const r = await fetch('/api/v1/sounds/upload', {
+          method: 'POST', body: fd,
+          headers: {
+            // 保留 Authorization（后端路由可能需要鉴权）
+            ...(localStorage.getItem('nsbc_token') ?
+              { Authorization: 'Bearer ' + localStorage.getItem('nsbc_token') } : {}),
+          },
+        });
+        if (!r.ok) {
+          const err = await r.json().catch(() => ({}));
+          throw new Error(err.detail || r.statusText);
+        }
+        const res = await r.json();
+        // 优先用 C 侧默认解析的路径（/var/sounds/xxx.wav），
+        // 如果用户已经填了路径前缀（如 /var/sounds/），只填文件名即可
+        item.data = res.name; // 只填文件名，C 侧会 sounds_dir + filename
+        await fetchSounds(); // 刷新列表
+        ElementPlus.ElMessage({ message: `已上传 ${res.name}`, type: 'success', duration: 2000 });
+      } catch (e) {
+        ElementPlus.ElMessage({ message: '上传失败：' + e.message, type: 'error', duration: 4000 });
+      }
+      return false; // 阻止 el-upload 默认行为（我们手动 fetch）
+    }
+    fetchSounds();
+
     return { chain, nextApp, appGroups, addApp, removeAt, moveUp, moveDown,
-             appHint, needsData, dataPlaceholder, preview,
-             recordField, recordSet };
+             appHint, needsData, isSoundApp, dataPlaceholder, preview,
+             recordField, recordSet,
+             sounds, fmtSize, onSoundPicked, onSoundUpload };
   },
 };
 
