@@ -889,32 +889,25 @@ const AppChainEditor = {
       if (name) item.data = name;
     }
     async function onSoundUpload(file, item) {
-      // 构造 multipart form
-      const fd = new FormData();
-      fd.append('file', file, file.name);
+      // PUT /sounds/:name — 文件名在 path，body 直接是文件字节
+      const url = '/api/v1/sounds/' + encodeURIComponent(file.name);
+      const headers = {};
+      const token = localStorage.getItem('nsbc_token');
+      if (token) headers['Authorization'] = 'Bearer ' + token;
       try {
-        const r = await fetch('/api/v1/sounds/upload', {
-          method: 'POST', body: fd,
-          headers: {
-            // 保留 Authorization（后端路由可能需要鉴权）
-            ...(localStorage.getItem('nsbc_token') ?
-              { Authorization: 'Bearer ' + localStorage.getItem('nsbc_token') } : {}),
-          },
-        });
+        const r = await fetch(url, { method: 'PUT', body: file, headers });
         if (!r.ok) {
           const err = await r.json().catch(() => ({}));
-          throw new Error(err.detail || r.statusText);
+          throw new Error(err.detail || err.error?.message || r.statusText);
         }
         const res = await r.json();
-        // 优先用 C 侧默认解析的路径（/var/sounds/xxx.wav），
-        // 如果用户已经填了路径前缀（如 /var/sounds/），只填文件名即可
-        item.data = res.name; // 只填文件名，C 侧会 sounds_dir + filename
-        await fetchSounds(); // 刷新列表
+        item.data = res.name;
+        await fetchSounds();
         ElementPlus.ElMessage({ message: `已上传 ${res.name}`, type: 'success', duration: 2000 });
       } catch (e) {
         ElementPlus.ElMessage({ message: '上传失败：' + e.message, type: 'error', duration: 4000 });
       }
-      return false; // 阻止 el-upload 默认行为（我们手动 fetch）
+      return false;
     }
     fetchSounds();
 
