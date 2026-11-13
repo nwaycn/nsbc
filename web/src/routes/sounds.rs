@@ -2,8 +2,8 @@
 //!
 //! Four endpoints:
 //!   GET    /sounds           — list .wav files in sounds_root
-//!   POST   /sounds/upload    — multipart upload (.wav only, size limit)
-//!   DELETE /sounds/:name     — delete a wav file
+//!   POST   /sounds/upload    — multipart upload (.wav/.mp3/.opus/.gsm, 16 MB max)
+//!   DELETE /sounds/:name     — delete a sound file
 //!   GET    /sounds/:name     — download (in-browser audio preview)
 
 use std::path::{Path, PathBuf};
@@ -74,11 +74,11 @@ async fn list<C: Clone + Send + Sync + 'static>(
     }
 
     let mut rd = std::fs::read_dir(root).map_err(|e| {
-        ApiError::Internal(format!("read_dir sounds_root: {e}"))
+        ApiError::Db(format!("read_dir sounds_root: {e}"))
     })?;
 
     while let Some(entry) = rd.next().transpose().map_err(|e| {
-        ApiError::Internal(format!("read_dir entry: {e}"))
+        ApiError::Db(format!("read_dir entry: {e}"))
     })? {
         let path = entry.path();
         if !path.is_file() { continue; }
@@ -89,7 +89,7 @@ async fn list<C: Clone + Send + Sync + 'static>(
             Ok(m) => m,
             Err(_) => continue,
         };
-        let mtime = meta
+        let mtime: u64 = meta
             .modified()
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -116,7 +116,7 @@ async fn upload<C: Clone + Send + Sync + 'static>(
     let root = st.sounds_root.clone();
     if !root.exists() {
         std::fs::create_dir_all(&root).map_err(|e| {
-            ApiError::Internal(format!("create sounds_root: {e}"))
+            ApiError::Db(format!("create sounds_root: {e}"))
         })?;
     }
 
@@ -126,12 +126,10 @@ async fn upload<C: Clone + Send + Sync + 'static>(
     while let Some(field) = multipart.next_field().await.map_err(|e| {
         ApiError::BadRequest(format!("multipart error: {e}"))
     })? {
-        // Use original filename from Content-Disposition
         let orig_name = field.file_name().unwrap_or("upload.wav").to_string();
         let is_sound = is_allowed_ext(&orig_name);
         let field_name = field.name().unwrap_or("file").to_string();
 
-        // Only "file" field with allowed ext → save; ignore others silently
         if field_name != "file" || !is_sound {
             if field_name == "file" && !is_sound {
                 return Err(ApiError::BadRequest(format!(
@@ -144,22 +142,19 @@ async fn upload<C: Clone + Send + Sync + 'static>(
             continue;
         }
 
-        // Sanitize name — keep only basename, strip path
         let safe_name = Path::new(&orig_name)
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("upload.wav")
             .to_string();
 
-        // Validate final path stays inside root
         let dest = safe_join(&root, &safe_name).ok_or_else(|| {
             ApiError::BadRequest(format!("invalid filename: {safe_name}"))
         })?;
 
-        // Stream bytes into temp file, enforce size limit
         use tokio::io::AsyncWriteExt;
         let mut file = tokio::fs::File::create(&dest).await.map_err(|e| {
-            ApiError::Internal(format!("create {}: {e}", dest.display()))
+            ApiError::Db(format!("create {}: {e}", dest.display()))
         })?;
 
         while let Some(chunk) = field.chunk().await.map_err(|e| {
@@ -167,7 +162,6 @@ async fn upload<C: Clone + Send + Sync + 'static>(
         })? {
             total_bytes += chunk.len();
             if total_bytes > MAX_UPLOAD_BYTES {
-                // Clean up partial file
                 let _ = tokio::fs::remove_file(&dest).await;
                 return Err(ApiError::BadRequest(format!(
                     "file too large (limit {} MB)",
@@ -175,7 +169,7 @@ async fn upload<C: Clone + Send + Sync + 'static>(
                 )));
             }
             file.write_all(&chunk).await.map_err(|e| {
-                ApiError::Internal(format!("write chunk: {e}"))
+                ApiError::Db(format!("write chunk: {e}"))
             })?;
         }
         file.flush().await.ok();
@@ -214,7 +208,7 @@ async fn delete_one<C: Clone + Send + Sync + 'static>(
         return Err(ApiError::NotFound(format!("sound file not found: {name}")));
     }
     std::fs::remove_file(&target).map_err(|e| {
-        ApiError::Internal(format!("remove {}: {e}", target.display()))
+        ApiError::Db(format!("remove {}: {e}", target.display()))
     })?;
     tracing::info!(path = %target.display(), "sound deleted");
     Ok(StatusCode::NO_CONTENT)
@@ -242,7 +236,7 @@ async fn download<C: Clone + Send + Sync + 'static>(
     };
 
     let bytes = std::fs::read(&target).map_err(|e| {
-        ApiError::Internal(format!("read {}: {e}", target.display()))
+        ApiError::Db(format!("read {}: {e}", target.display()))
     })?;
 
     Ok((
