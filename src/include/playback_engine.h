@@ -40,17 +40,20 @@ void pb_engine_stop(void);
  *   wav_path — WAV 文件路径（S16LE 单声道，player_load_wav 自动识别）；
  *              支持管道符拼接："welcome.wav|digits/${x}.wav|serve.wav"
  *   side     — 0=A, 1=B, PB_SIDE_BOTH(-1)=双腿
- *   loop     — 0=播一次 EOF 自动 stop，1=循环（MoH 模式）
+ *   loop     — 0=播一次 EOF 自动 stop，1=循环（MoH/ringback 模式）
  * 返回 NSBC_OK / NSBC_NOENT（找不到呼叫）/ NSBC_NOMEM / NSBC_ERR。
- * 成功后返回播放句柄 out（可选）。 */
+ * 成功后返回播放句柄 out（可选）。
+ * ★ legacy 接口：stop_on_answer 默认 0（不受 B 腿接通影响）。 */
 int pb_start(void *call_key, const char *wav_path, int side, int loop,
              pb_ctx_t **out);
 
 /* 按 A 腿 INVITE offer 协商出的 RTP payload type 播放（early media 用）：
  *   pt — 0=PCMU / 8=PCMA（G.711，P0 仅这两种；opus/G.729 待 codec 引擎 P1）
+ *   stop_on_answer — 1=B 腿 LEG_CONFIRMED 时 pb_stop_by_flag 自动停
+ *                   （ringback 行为），0=不受接通影响（playback 工号提示音）
  * 其余语义同 pb_start；不支持的 pt 返回 NSBC_NOTSUP。 */
 int pb_start_ex(void *call_key, const char *wav_path, int side, int loop,
-                 int pt, pb_ctx_t **out);
+                 int pt, int stop_on_answer, pb_ctx_t **out);
 
 /* 管道符拼接模式：chain 数 N 个 wav 文件按顺序依次播放
  * （每个 EOF 自动 start 下一个，最后一个 EOF 自动 stop）。 */
@@ -61,8 +64,16 @@ int pb_start_chain(void *call_key, const char **wav_list, int n,
  * ESL/API uuid_break 调这个。 */
 int pb_stop(void *call_key);
 
-/* 当前播放会话：若 call_key 在播则停掉并返回 1；否则返回 0 */
+/* 当前播放会话：若 call_key 在播则停掉并返回 1；否则返回 0
+ * （停止所有 ctx，不论 stop_on_answer 标记——call_destroy / uuid_break 用）。 */
 int pb_stop_if_playing(void *call_key);
+
+/* ★ 只停止指定 flag 值的播放上下文。
+ * flag=1 → 停掉 stop_on_answer=1 的 ctx（ringback 等接通自动停的）
+ * flag=0 → 停掉 stop_on_answer=0 的 ctx（playback 等）
+ * B 腿 LEG_CONFIRMED 时 call_pb_stop_on_answer(c) 内部调 pb_stop_by_flag(c, 1)
+ * 只停 ringback，不影响正在播的工号提示音。 */
+int pb_stop_by_flag(void *call_key, int stop_on_answer);
 
 /* 查询指定 call_key 是否在播（返回 1/0），可选填 side + eof + loop */
 int pb_status(void *call_key, int *side_out, int *loop_out);

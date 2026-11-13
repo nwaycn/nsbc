@@ -2395,8 +2395,9 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                     a->answer_len = m->body.len;
                 }
                 a->state = LEG_CONFIRMED;
-                /* ★ ringback：originate A 腿接通 → 停残留放音 */
-                pb_stop_if_playing(c);
+                /* ★ ringback：originate A 腿接通 → 只停 stop_on_answer=1 的
+                 * (ringback)，playback/endless_playback 继续 */
+                pb_stop_by_flag(c, 1);
                 send_ack_leg(c, 0);
                 call_unlock(c);
                 return;
@@ -2609,11 +2610,11 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                 c->leg[1].state = LEG_CONFIRMED;
 
                 /* ★ ringback：B 腿接通瞬间停掉 A 腿回铃音放音。
-                 * playback 场景不受影响（chain 里 playback 在 answer 前已
-                 * EOF 自然结束；残留放音在接通时切断也是正确语义）。
-                 * pb_stop_if_playing 内部 call_key 查 pb 表，不碰 b2bua
-                 * call lock，持锁调用无死锁风险。 */
-                pb_stop_if_playing(c);
+                 * ★ stop_on_answer=1 只停 ringback，不影响 playback/endless_playback
+                 *   (工号提示音等 answer 后放的内容会继续播完 EOF)。
+                 * pb_stop_by_flag 内部 call_key 查 pb 表 + 匹配 flag，不碰
+                 * b2bua call lock，持锁调用无死锁风险。 */
+                pb_stop_by_flag(c, 1);
 
                 /* 存 Bob 200 OK 的 Session-Expires 到 B leg（P0 透传 + P1 协商都需要） */
                 {
@@ -6358,8 +6359,9 @@ void b2b_on_rx(void *ud, sip_tr_proto_t proto, const nsbc_sa_t *src,
                                      c->leg[0].callid);
                             }
                             c->leg[0].state = LEG_CONFIRMED;
-                            /* ★ ringback：A 腿 ACK 双腿 CONFIRMED → 停残留放音（幂等兜底） */
-                            pb_stop_if_playing(c);
+                            /* ★ ringback：A 腿 ACK 双腿 CONFIRMED → 只停 stop_on_answer=1 的
+                             * (ringback)，playback 继续。幂等兜底路径。 */
+                            pb_stop_by_flag(c, 1);
                             /* CDR ANSWER 幂等 */
                             if (c->answer_ms == 0) {
                                 c->answer_ms = now_ms();
@@ -7742,7 +7744,8 @@ int b2b_pre_answer_call(b2b_call_t *call)
  *   B 腿 1xx 带 SDP → 不透传（A 已有我们的 answer，RFC 3264 单 answer）
  * ==================================================================*/
 
-int b2b_request_early_media(b2b_call_t *call, const char *wav, int loop)
+int b2b_request_early_media(b2b_call_t *call, const char *wav, int loop,
+                            int stop_on_answer)
 {
     if (!call || !wav || !wav[0]) return NSBC_INVAL;
     b2b_call_t *c = call;
@@ -7763,20 +7766,22 @@ int b2b_request_early_media(b2b_call_t *call, const char *wav, int loop)
         if (pt < 0) pt = 0;
         call_unlock(c);
         pb_stop_if_playing(c);
-        int rc = pb_start_ex(c, wav, 0 /* side 0 = A 腿 */, loop ? 1 : 0, pt, NULL);
+        int rc = pb_start_ex(c, wav, 0 /* side 0 = A 腿 */, loop ? 1 : 0,
+                             pt, stop_on_answer ? 1 : 0, NULL);
         llog(LOG_INFO, "b2b",
-             "early_media: in-dialog direct pb_start call=%p rc=%d pt=%d wav=%s loop=%d",
-             (void *)c, rc, pt, wav, loop ? 1 : 0);
+             "early_media: in-dialog direct pb_start call=%p rc=%d pt=%d wav=%s loop=%d stop_on_answer=%d",
+             (void *)c, rc, pt, wav, loop ? 1 : 0, stop_on_answer ? 1 : 0);
         return rc;
     }
     /* pre-answer 阶段：只登记，等 new_invite 尾部 relay ready 后统一执行 */
     snprintf(c->em_wav, sizeof(c->em_wav), "%s", wav);
     c->em_loop = loop ? 1 : 0;
+    c->em_stop_on_answer = stop_on_answer ? 1 : 0;
     c->em_pending = 1;
     call_unlock(c);
     llog(LOG_INFO, "b2b",
-         "early_media: REQUEST call=%p wav=%s loop=%d (pending until relay ready)",
-         (void *)c, wav, loop ? 1 : 0);
+         "early_media: REQUEST call=%p wav=%s loop=%d stop_on_answer=%d (pending until relay ready)",
+         (void *)c, wav, loop ? 1 : 0, stop_on_answer ? 1 : 0);
     return NSBC_OK;
 }
 
@@ -7953,6 +7958,7 @@ static void b2b_early_media_start(b2b_call_t *c)
      *   inv_txn 兜底且 to-tag/Via received;rport/Content-Type 完整处理。 */
     char wav[256];
     int loop;
+    int stop_on_answer;
     int started = 0;
     call_lock(c);
     if (!c->dead && c->leg[0].inv_txn &&
@@ -7974,16 +7980,18 @@ static void b2b_early_media_start(b2b_call_t *c)
     }
     snprintf(wav, sizeof(wav), "%s", c->em_wav);
     loop = c->em_loop;
+    stop_on_answer = c->em_stop_on_answer;
     call_unlock(c);
 
     /* ④ 放音（锁外：pb_start_ex 内部 tw_add + player 打开，不允许持 call 锁）
      * pt 用 ②b 协商结果：A offer 顺序第一个 G.711（0/8），pb 同码编码 */
     if (!started) return;
     pb_stop_if_playing(c);
-    int rc = pb_start_ex(c, wav, 0 /* side 0 = A 腿 */, loop, play_pt, NULL);
+    int rc = pb_start_ex(c, wav, 0 /* side 0 = A 腿 */, loop, play_pt,
+                         stop_on_answer ? 1 : 0, NULL);
     if (rc == NSBC_OK)
-        llog(LOG_INFO, "b2b", "early_media: pb_start OK call=%p pt=%d wav=%s",
-             (void *)c, play_pt, wav);
+        llog(LOG_INFO, "b2b", "early_media: pb_start OK call=%p pt=%d wav=%s loop=%d stop_on_answer=%d",
+             (void *)c, play_pt, wav, loop, stop_on_answer ? 1 : 0);
     else
         llog(LOG_WARN, "b2b", "early_media: pb_start rc=%d call=%p pt=%d wav=%s",
              rc, (void *)c, play_pt, wav);

@@ -45,6 +45,9 @@ typedef struct pb_ctx {
     int side;                 /* 0=A, 1=B, -1=both */
     int loop;                 /* 0=once, 1=loop */
     uint8_t pt;               /* RTP payload type：0=PCMU, 8=PCMA */
+    int stop_on_answer;       /* 1=B 腿 LEG_CONFIRMED 时 pb_stop_by_flag(c,1) 停
+                                 * (ringback 行为)，
+                                 * 0=不受接通影响 (playback / endless_playback / MoH) */
     tw_node_t tn;             /* 时间轮节点 */
     snd_src_t *snd;           /* 音频文件解码 + 重采样 → 8k/mono/S16LE 统一输出 */
     rtp_relay_t *relay;       /* relay 指针（弱引用，bridge 自己管理生命周期） */
@@ -251,13 +254,13 @@ static void pb_timer_cb(uint64_t now_ms, void *arg)
 int pb_start(void *call_key, const char *wav_path, int side, int loop,
              pb_ctx_t **out)
 {
-    /* 兼容入口：默认 PCMU（旧调用方——OAM playback 命令 / in-dialog MoH；
-     * early media 路径用 pb_start_ex 传协商 PT） */
-    return pb_start_ex(call_key, wav_path, side, loop, PB_RTP_PT, out);
+    /* 兼容入口：默认 PCMU + stop_on_answer=0（旧调用方——OAM playback 命令 /
+     * in-dialog MoH；early media 路径用 pb_start_ex 传协商 PT 和明确 flag） */
+    return pb_start_ex(call_key, wav_path, side, loop, PB_RTP_PT, 0, out);
 }
 
 int pb_start_ex(void *call_key, const char *wav_path, int side, int loop,
-                 int pt, pb_ctx_t **out)
+                 int pt, int stop_on_answer, pb_ctx_t **out)
 {
     if (!g_pb_started || !call_key || !wav_path)
         return NSBC_INVAL;
@@ -301,6 +304,7 @@ int pb_start_ex(void *call_key, const char *wav_path, int side, int loop,
     pb->side = side;
     pb->loop = loop;
     pb->pt = (uint8_t)pt;
+    pb->stop_on_answer = stop_on_answer ? 1 : 0;
     pb->snd = snd;
     pb->relay = relay;
     pb->peer[0] = peer[0];
@@ -400,6 +404,45 @@ int pb_stop_if_playing(void *call_key)
 {
     if (!call_key) return 0;
     return pb_stop(call_key) == NSBC_OK ? 1 : 0;
+}
+
+/* ---------- pb_stop_by_flag ----------
+ *
+ * ★ 只停止 stop_on_answer == flag 值的播放上下文。
+ * B 腿 LEG_CONFIRMED 时传 flag=1 → 只停 ringback，不影响正在播的
+ * 工号提示音 / MoH / endless_playback。
+ *
+ * 实现：扫描 g_pb_list 找 call_key 匹配 + stop_on_answer==flag 的 ctx，
+ * 按 pb_stop 标准流程停（摘链 + 删时间轮 + 关 snd_file）。 */
+int pb_stop_by_flag(void *call_key, int stop_on_answer)
+{
+    if (!call_key) return 0;
+    nsbc_ctx_t *ctx = nsbc_get_ctx();
+    if (!ctx) return 0;
+
+    int stopped = 0;
+    pthread_mutex_lock(&g_pb_lock);
+    pb_ctx_t **pp = &g_pb_list;
+    while (*pp) {
+        pb_ctx_t *pb = *pp;
+        if (pb->call_key == call_key && pb->stop_on_answer == (stop_on_answer ? 1 : 0)) {
+            *pp = pb->next; /* 从链表摘除 */
+            pb->active = 0;
+            tw_del(ctx->tw, &pb->tn);
+            if (pb->snd) { snd_file_close(pb->snd); pb->snd = NULL; }
+            llog(LOG_INFO, "pb", "pb_stop_by_flag stop call=%p flag=%d wav=%s",
+                 call_key, stop_on_answer, pb->wav_path);
+            free(pb);
+            stopped++;
+            /* 注意：摘链后继续扫——同一个 call_key 理论上只有一个 ctx，
+             * 但 pb_start_ex 之前 pb_stop_if_playing 会先停旧的，
+             * 这里保险起见不 break */
+        } else {
+            pp = &pb->next;
+        }
+    }
+    pthread_mutex_unlock(&g_pb_lock);
+    return stopped;
 }
 
 /* pb_start_chain：管道符拼接。P0 简化实现——内部只播第一个，

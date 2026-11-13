@@ -375,26 +375,27 @@ static app_rc_t app_answer(app_ctx_t *c, const char *data, void *ud)
     return APP_RC_FAILED;
 }
 
-/* ---- 2. bridge（REQ-DP-APP-001，P1 实装，resolve_cb 自动发起 B 腿 ----
+/* ---- 2. bridge（⚠️ DEPRECATED — 路由由 rule.target 字段决定）----
  *
- * ★ 2026-11-13 修复：app_bridge 原来是 NOTSUP 占位（永远返回 FAILED）。
- *   bridge 的实际工作由 resolve_cb → handle_new_invite 自动完成：
- *     resolve_cb 内部 dp_execute（执行 app_chain）→ 同步返回路由 dst/out_ruri/out_to
- *     → handle_new_invite 拿到路由 → b2b_originate 发 B 腿 INVITE。
- *   所以 app_bridge 只是个意图标记（"至此该 bridge 了"），resolve_cb 在它之后
- *   自动走路由流程。这里改成 APP_RC_OK no-op，不再 FAILED。
- *
- * data 白名单做格式校验，校验通过即返回 OK（不阻塞 chain）。 */
+ * ★ 2026-11-15 精简：bridge 在 app_chain 里是纯 no-op。完整路由流程：
+ *     resolve_cb(dp_execute) 内部：
+ *       ① 拨号规则匹配 → res->target = extension:1000 / gateway:trunk / ...
+ *       ② dp_execute_app_chain（执行 app_chain，bridge 在这里是意图标记）
+ *       ③ resolve_cb 用 res->target 走路由 → loc_query(ext) / rt_select(trunk)
+ *       ④ handle_new_invite 拿到路由结果 → send_invite_b 发 B 腿 INVITE
+ *   bridge.data 完全不被使用，target 字段是唯一路由入口。
+ *   保留注册只为向后兼容（旧配置 reload 时 bridge app 不会 FAILED 阻塞 chain）。
+ *   前端已从 appGroups 下拉中移除 bridge，用户不再能选到。 */
 static app_rc_t app_bridge(app_ctx_t *c, const char *data, void *ud)
 {
-    (void)ud;
+    (void)ud; (void)data;
     if (!cv_call_alive(c)) return APP_RC_FAILED;
-    const char *d = data ? data : "";
-    size_t dl = strlen(d);
-    if (dl == 0 || dl > 256) return APP_RC_FAILED;
-    /* 格式校验通过 → OK。resolve_cb 在 dp_execute 返回后自动走 b2b_originate */
-    llog(LOG_INFO, "app", "app_bridge OK call=%p target='%s' (B 腿将由 resolve_cb 自动发起)",
-         c->call_key, d);
+    /* DEPRECATED：bridge 是纯 no-op，data 完全不被使用。
+     * 路由由 rule.target 字段决定，resolve_cb 在 dp_execute 返回后
+     * 自动拿 dres.target → loc_query/rt_select → send_invite_b。
+     * 放宽校验接受空 data，旧配置 reload 不会 FAILED 阻塞 chain。 */
+    llog(LOG_INFO, "app", "app_bridge (DEPRECATED no-op) call=%p — routing handled by rule.target",
+         c->call_key);
     return APP_RC_OK;
 }
 
@@ -451,9 +452,10 @@ static app_rc_t app_playback(app_ctx_t *c, const char *data, void *ud)
     }
 
     /* 单文件：pre-answer 阶段登记 early media（183+SDP 先行），
-     * in-dialog 阶段（A 腿已 EARLY/CONFIRMED）接口内部直接 pb_start */
+     * in-dialog 阶段（A 腿已 EARLY/CONFIRMED）接口内部直接 pb_start
+     * ★ stop_on_answer=0：playback 是提示音（工号等），B 腿接通不应打断 */
     int rc = b2b_request_early_media((b2b_call_t *)c->call_key, data,
-                                     /*loop=*/0);
+                                     /*loop=*/0, /*stop_on_answer=*/0);
     if (rc != NSBC_OK) {
         llog(LOG_WARN, "app", "playback early_media rc=%d (call=%p wav=%s)",
              rc, c->call_key, data);
@@ -481,7 +483,7 @@ static app_rc_t app_endless_playback(app_ctx_t *c, const char *data, void *ud)
     if (!data || data[0] == '\0' || strlen(data) > 256) return APP_RC_FAILED;
     pb_stop_if_playing(c->call_key);
     int rc = b2b_request_early_media((b2b_call_t *)c->call_key, data,
-                                     /*loop=*/1);
+                                     /*loop=*/1, /*stop_on_answer=*/0);
     if (rc != NSBC_OK) {
         llog(LOG_WARN, "app", "endless_playback early_media rc=%d (call=%p wav=%s)",
              rc, c->call_key, data);
@@ -525,7 +527,7 @@ static app_rc_t app_ringback(app_ctx_t *c, const char *data, void *ud)
     pb_stop_if_playing(c->call_key);
 
     int rc = b2b_request_early_media((b2b_call_t *)c->call_key, data,
-                                     /*loop=*/1);
+                                     /*loop=*/1, /*stop_on_answer=*/1);
     if (rc != NSBC_OK) {
         llog(LOG_WARN, "app",
              "ringback early_media rc=%d (non-fatal, continuing)", rc);
@@ -853,7 +855,7 @@ static app_rc_t app_echo(app_ctx_t *c, const char *data, void *ud)
 static const app_desc_t builtin_apps[] = {
     { "answer",             "应答来电（发送 200 OK）",                          app_answer,             NULL },
     { "pre_answer",         "Early Media 预应答（发 183，不发 200 OK）",         app_pre_answer,         NULL },
-    { "bridge",             "桥接当前通话到另一端点 sofia/gateway/<gw>/<ext>", app_bridge,            NULL },
+    { "bridge",             "⚠️ DEPRECATED: routing handled by rule target (no-op)", app_bridge,   NULL },
     { "playback",           "播放单个音频文件（支持 a.wav|b.wav 管道符拼接）", app_playback,          NULL },
     { "post_playback",      "接通后放音（语义同 playback，阶段区分用）",        app_post_playback,     NULL },
     { "record",             "录制当前通话音频",                                 app_record,            NULL },

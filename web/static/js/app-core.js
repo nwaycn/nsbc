@@ -724,13 +724,17 @@ const AppChainEditor = {
     const { ref, computed, watch } = Vue;
     const { Plus, ArrowUp, ArrowDown, Delete } = ElementPlusIconsVue || {};
 
-    /* C 侧 app_registry.c builtin_apps[] Register的 17 个内建 apps（必须对齐） */
+    /* C 侧 app_registry.c builtin_apps[] Register的 16 个内建 apps（必须对齐）
+     * ★ bridge 已废弃（deprecated）：路由完全由 dialplan rule.target 字段决定，
+     *   resolve_cb 里直接走 target → locate ext/trunk，bridge 在 app_chain 里是纯 no-op。
+     *   APP_DESCS 里保留 bridge 条是为了兼容已存在的 Raw JSON 配置能正常显示描述，
+     *   但 appGroups 不提供 bridge 作为选项，前端下拉里选不到。 */
     const APP_DESCS = {
       answer:              'Answer inbound (send 200 OK)',
       pre_answer:          'Early media pre-answer (183, no 200 OK)',
-      bridge:              'Bridge to sofia/gateway/<gw>/<ext>',
+      bridge:              '⚠️ DEPRECATED — routing handled by rule Target field (no-op)',
       playback:            'Play a single audio file (plays to completion)',
-      ringback:            'Ringback tone: loops while routing, auto-stops when B-leg answers (put BEFORE bridge/transfer)',
+      ringback:            'Ringback tone: loops while routing, auto-stops when B-leg answers',
       post_playback:       'Play after answer (phase marker)',
       record:              '录音：下拉选 start/stop + 格式（mp4 含视频合成）',
       transfer:            'Transfer current call (REFER or 302)',
@@ -746,12 +750,13 @@ const AppChainEditor = {
       read:                'Collect DTMF digits',
     };
 
-    /* 按执行阶段Group（引导用户构建合理顺序） */
+    /* 按执行阶段Group（引导用户构建合理顺序）
+     * ★ 精简：bridge 已废弃，不在可选列表中。路由 = rule.target 字段。 */
     const appGroups = computed(() => [
       { label: t('— Early Media / Answer Phase —'), apps: ['pre_answer', 'ringback', 'playback', 'post_playback', 'sleep', 'answer', 'endless_playback', 'read', 'play_and_get_digits'] },
-      { label: t('— Routing / Bridge Phase —'),        apps: ['bridge', 'transfer', 'att_xfer', 'conference', 'park'] },
-      { label: t('— Variables / Control —'),            apps: ['set', 'uuid_break', 'gentones'] },
-      { label: t('— Media / Recording —'),            apps: ['record'] },
+      { label: t('— Routing / Transfer Phase —'),   apps: ['transfer', 'att_xfer', 'conference', 'park'] },
+      { label: t('— Variables / Control —'),        apps: ['set', 'uuid_break', 'gentones'] },
+      { label: t('— Media / Recording —'),          apps: ['record'] },
     ].map(g => ({
       label: g.label,
       apps: g.apps.map(n => ({ name: n, desc: APP_DESCS[n] || '' })),
@@ -761,7 +766,7 @@ const AppChainEditor = {
     const chain = ref([]);
 
     function appHint(name)  { return APP_DESCS[name] || ''; }
-    function needsData(name){ return ['playback','ringback','post_playback','endless_playback','sleep','bridge','transfer','conference','set','gentones','play_and_get_digits','read'].includes(name); }
+    function needsData(name){ return ['playback','ringback','post_playback','endless_playback','sleep','transfer','conference','set','gentones','play_and_get_digits','read'].includes(name); }
     function dataPlaceholder(name) {
       const H = {
         playback:             'welcome.wav or /path/to/file.wav',
@@ -769,7 +774,6 @@ const AppChainEditor = {
         post_playback:        'announce.wav',
         endless_playback:     'hold_music.wav',
         sleep:                '1500 (ms)',
-        bridge:               'sofia/gateway/my_trunk/8613800138000',
         transfer:             'sip:support@other.com',
         conference:           'my_room@default',
         set:                  'var_name=value',
