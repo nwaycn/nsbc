@@ -20,12 +20,13 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::coreclient::CoreApi;
 use crate::error::ApiError;
 use crate::AppState;
 
 pub fn router<C>() -> Router<Arc<AppState<C>>>
 where
-    C: Clone + Send + Sync + 'static,
+    C: CoreApi + Clone + Send + Sync + 'static,
 {
     Router::new()
         .route("/sounds", get(list::<C>))
@@ -59,7 +60,7 @@ fn safe_join(root: &Path, name: &str) -> Option<PathBuf> {
 }
 
 /// GET /sounds — list files
-async fn list<C: Clone + Send + Sync + 'static>(
+async fn list<C: CoreApi + Clone + Send + Sync + 'static>(
     State(st): State<Arc<AppState<C>>>,
 ) -> Result<impl IntoResponse, ApiError> {
     let root = &st.sounds_root;
@@ -104,7 +105,7 @@ async fn list<C: Clone + Send + Sync + 'static>(
 ///
 /// No multipart dep: caller sends the file body directly.
 /// Path param :name becomes the filename (must have allowed extension).
-async fn upload<C: Clone + Send + Sync + 'static>(
+async fn upload<C: CoreApi + Clone + Send + Sync + 'static>(
     State(st): State<Arc<AppState<C>>>,
     AxumPath(name): AxumPath<String>,
     body: Bytes,
@@ -150,7 +151,7 @@ async fn upload<C: Clone + Send + Sync + 'static>(
 }
 
 /// DELETE /sounds/:name
-async fn delete_one<C: Clone + Send + Sync + 'static>(
+async fn delete_one<C: CoreApi + Clone + Send + Sync + 'static>(
     State(st): State<Arc<AppState<C>>>,
     AxumPath(name): AxumPath<String>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -169,7 +170,7 @@ async fn delete_one<C: Clone + Send + Sync + 'static>(
 }
 
 /// GET /sounds/:name — download / audio preview
-async fn download<C: Clone + Send + Sync + 'static>(
+async fn download<C: CoreApi + Clone + Send + Sync + 'static>(
     State(st): State<Arc<AppState<C>>>,
     AxumPath(name): AxumPath<String>,
 ) -> Result<Response, ApiError> {
