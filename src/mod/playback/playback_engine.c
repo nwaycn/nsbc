@@ -10,7 +10,7 @@
  */
 
 #include "playback_engine.h"
-#include "player.h"
+#include "snd_file.h"
 #include "media_bridge.h"
 #include "g711.h"
 #include "app_ctx.h"
@@ -35,35 +35,34 @@ static inline void rtp_write_u32(uint8_t *p, uint32_t v)
 /* ---------- pb_ctx：每个播放会话 ---------- */
 
 #define PB_MAX_PARALLEL 256
-#define PB_RTP_PT 0 /* PCMU（pb_start 旧签名的默认值） */
-#define PB_PULL_FRAMES 80 /* 10ms @ 8kHz → 80 samples */
-#define PB_PULL_INTERVAL_MS 20 /* 20ms 定时器间隔（比 10ms pull 慢一倍，
-                                * 节省 CPU；播放音高略高，正常范围） */
+#define PB_RTP_PT 8 /* PCMU（pb_start 旧签名的默认值） */
+#define PB_MAX_FRAMES 800 /* 100ms @ 8kHz → 适配 timer_wheel 100ms 粒度
+                            * （tw_add 被 round 到 tick_ms 整数倍，
+                            *  PB_PULL_INTERVAL_MS=20 实际 ≈ 100ms 触发一次） */
 
 typedef struct pb_ctx {
     void *call_key;
     int side;                 /* 0=A, 1=B, -1=both */
     int loop;                 /* 0=once, 1=loop */
-    uint8_t pt;               /* RTP payload type：0=PCMU, 8=PCMA（按 A 腿
-                               * INVITE offer 协商，b2b 层传入；G.711 同为
-                               * 8kHz/20ms 帧，PB_PULL_FRAMES 通用） */
+    uint8_t pt;               /* RTP payload type：0=PCMU, 8=PCMA */
     tw_node_t tn;             /* 时间轮节点 */
-    player_t pl;              /* PCM 播放器 */
-    pcm_src_t *src;           /* WAV 音源引用 */
+    snd_src_t *snd;           /* 音频文件解码 + 重采样 → 8k/mono/S16LE 统一输出 */
     rtp_relay_t *relay;       /* relay 指针（弱引用，bridge 自己管理生命周期） */
     nsbc_sa_t peer[2];        /* 两侧 peer 地址 */
     uint32_t ssrc;            /* 随机 SSRC */
     uint16_t seq;             /* RTP seq */
-    uint32_t ts;              /* RTP timestamp（8000 per second → 每次 +80） */
+    uint32_t ts;              /* RTP timestamp（8000 per second） */
     volatile int active;      /* 1=在播，0=待清理 */
     uint64_t lazy_start_ms;   /* lazy start 计时起点（relay 还没创建时等待） */
+    uint64_t last_tick_ms;    /* ★ 上次 timer_cb 时刻，用于动态计算 pull 量 */
+    int total_pulled;         /* ★ 累计 pull 帧数（诊断用） */
+    int total_sent;           /* ★ 累计 sendto 次数（诊断用） */
     char wav_path[256];
     struct pb_ctx *next;
 } pb_ctx_t;
 
 static pthread_mutex_t g_pb_lock = PTHREAD_MUTEX_INITIALIZER;
 static pb_ctx_t *g_pb_list = NULL;
-static player_reg_t g_pb_reg;
 static int g_pb_started = 0;
 static uint64_t g_pb_total = 0;
 
@@ -72,9 +71,8 @@ static uint64_t g_pb_total = 0;
 int pb_engine_start(void)
 {
     if (g_pb_started) return NSBC_OK;
-    player_reg_init(&g_pb_reg);
     g_pb_started = 1;
-    llog(LOG_INFO, "pb", "playback engine started (G.711 PCMU/PCMA 8kHz)");
+    llog(LOG_INFO, "pb", "playback engine started (snd_file + G.711 encode)");
     return NSBC_OK;
 }
 
@@ -86,18 +84,30 @@ void pb_engine_stop(void)
         pb_ctx_t *nx = p->next;
         p->active = 0;
         tw_del(nsbc_get_ctx()->tw, &p->tn);
-        player_put(p->src);
+        if (p->snd) { snd_file_close(p->snd); p->snd = NULL; }
         free(p);
         p = nx;
     }
     g_pb_list = NULL;
     pthread_mutex_unlock(&g_pb_lock);
-    player_reg_fini(&g_pb_reg);
     g_pb_started = 0;
     llog(LOG_INFO, "pb", "playback engine stopped");
 }
 
 /* ---------- 定时器回调：pull PCM → 编码 → sendto ---------- */
+
+#define PB_FRAMES_PER_MS 8
+
+/* ★ 标准 RTP ptime = 20ms → 160 样本 @ 8kHz。
+ * timer_wheel tick_ms=100ms（main.c:684），tw_add 会把 expire_ms
+ * 向上取整到下一个 tick 边界（timer_wheel.c:98），所以 timer_cb 实际
+ * 每 100ms 触发一次。正确做法：每次 tick 拉满 100ms 数据（800 帧），
+ * 但拆成 5 个标准 RTP 包发送（每包 20ms/160 帧），保证 RTP timestamp
+ * 连续，MicroSIP jitter buffer 能正确恢复音频节奏。 */
+#define PB_RTP_PTIME_MS 20
+#define PB_RTP_FRAMES_PER_PACKET 160 /* 20ms × 8kHz */
+#define PB_TICK_MS 100                /* timer_wheel tick_ms */
+#define PB_PACKETS_PER_TICK 5         /* 100 / 20 = 5 个 RTP 包/次 tick */
 
 static void pb_timer_cb(uint64_t now_ms, void *arg)
 {
@@ -107,14 +117,13 @@ static void pb_timer_cb(uint64_t now_ms, void *arg)
     nsbc_ctx_t *ctx = nsbc_get_ctx();
     if (!ctx || !ctx->tw) return;
 
-    /* lazy start: relay 不存在时尝试 lookup（ringback 在 bridge 之前执行，
-     * relay 还没创建；等 bridge_confirm 后 relay_arm 完成就能找到了） */
+    /* lazy start：relay 还没创建时继续等 */
     if (!pb->relay) {
         if (!pb->lazy_start_ms) pb->lazy_start_ms = now_ms;
         if (now_ms - pb->lazy_start_ms > 5000) {
-            llog(LOG_WARN, "pb", "lazy start TIMEOUT call=%p side=%d", pb->call_key, pb->side);
+            llog(LOG_WARN, "pb", "lazy start TIMEOUT call=%p", pb->call_key);
             pb->active = 0;
-            player_put(pb->src);
+            if (pb->snd) { snd_file_close(pb->snd); pb->snd = NULL; }
             return;
         }
         rtp_relay_t *relay = NULL;
@@ -126,87 +135,115 @@ static void pb_timer_cb(uint64_t now_ms, void *arg)
             pb->lazy_start_ms = 0;
             llog(LOG_INFO, "pb", "lazy start READY call=%p relay=%p", pb->call_key, (void *)relay);
         } else {
-            tw_add(ctx->tw, &pb->tn, now_ms + PB_PULL_INTERVAL_MS,
-                   pb_timer_cb, pb);
+            tw_add(ctx->tw, &pb->tn, now_ms + 1, pb_timer_cb, pb);
             return;
         }
     }
 
-    /* pull PCM */
-    int16_t pcm_frames[PB_PULL_FRAMES];
-    int pulled = player_pull(&pb->pl, pcm_frames, PB_PULL_FRAMES);
-    if (pulled <= 0) {
-        /* EOF */
-        if (pb->loop) {
-            pb->pl.pos = 0; /* 回到开头 */
-            pulled = player_pull(&pb->pl, pcm_frames, PB_PULL_FRAMES);
+    /* peer latch refresh（每 tick 都查一次） */
+    {
+        int need_refresh = 0;
+        if (pb->side >= 0) {
+            if (pb->peer[pb->side].len == 0) need_refresh = 1;
+        } else {
+            if (pb->peer[0].len == 0 || pb->peer[1].len == 0) need_refresh = 1;
         }
-        if (pulled <= 0) {
-            /* 结束 */
-            llog(LOG_INFO, "pb", "EOF reached call=%p side=%d", pb->call_key, pb->side);
-            if (ctx->esl_event_fire) {
-                ctx->esl_event_fire("PLAYBACK_STOP", pb->wav_path, strlen(pb->wav_path));
+        if (need_refresh) {
+            rtp_relay_t *relay2 = NULL;
+            nsbc_sa_t peer2[2] = {{0}};
+            if (bridge_lookup_relay((bridge_mgr_t *)ctx->bridge, pb->call_key, &relay2, peer2) == NSBC_OK && relay2) {
+                int old_len0 = pb->peer[0].len;
+                int old_len1 = pb->peer[1].len;
+                pb->relay = relay2;
+                pb->peer[0] = peer2[0];
+                pb->peer[1] = peer2[1];
+                if (old_len0 == 0 && pb->peer[0].len > 0)
+                    llog(LOG_INFO, "pb", "peer[0] LATCHED call=%p len=%d", pb->call_key, pb->peer[0].len);
+                if (old_len1 == 0 && pb->peer[1].len > 0)
+                    llog(LOG_INFO, "pb", "peer[1] LATCHED call=%p len=%d", pb->call_key, pb->peer[1].len);
             }
-            pb_stop(pb->call_key);
-            return;
         }
     }
 
-    /* G.711 编码（按协商 PT：0=PCMU / 8=PCMA，共享 g711.c 查表实现） */
-    uint8_t payload[PB_PULL_FRAMES];
-    size_t enc = (pb->pt == 8)
-        ? g711_alaw_encode(pcm_frames, (size_t)pulled, payload)
-        : g711_ulaw_encode(pcm_frames, (size_t)pulled, payload);
-    if (enc == 0) {
-        llog(LOG_WARN, "pb", "g711 encode failed call=%p pt=%u", pb->call_key,
-             pb->pt);
-        tw_add(ctx->tw, &pb->tn, now_ms + PB_PULL_INTERVAL_MS,
-               pb_timer_cb, pb);
+    /* ★ 每 tick 拉满 100ms 数据，拆成 5 个 20ms RTP 包 */
+    const int total_frames = PB_RTP_FRAMES_PER_PACKET * PB_PACKETS_PER_TICK; /* 160×5 = 800 */
+    int16_t pcm_buf[PB_MAX_FRAMES];
+    int pulled = snd_file_pull(pb->snd, pcm_buf, total_frames, pb->loop);
+    pb->total_pulled += pulled;
+    if (pulled <= 0) {
+        llog(LOG_INFO, "pb", "EOF call=%p", pb->call_key);
+        pb_stop(pb->call_key);
         return;
     }
 
-    /* RTP 封装：12B header + payload */
-    uint8_t rtp_frame[12 + PB_PULL_FRAMES];
-    memset(rtp_frame, 0, sizeof(rtp_frame));
-    rtp_frame[0] = 0x80; /* V=2, P=0, X=0, CC=0 */
-    rtp_frame[1] = pb->pt; /* PT=0 PCMU / 8 PCMA（协商值），M=0 */
-    rtp_write_u16(&rtp_frame[2], pb->seq++);
-    rtp_write_u32(&rtp_frame[4], pb->ts);
-    pb->ts += pulled;
-    rtp_write_u32(&rtp_frame[8], pb->ssrc);
-    memcpy(&rtp_frame[12], payload, enc);
-    int rtp_len = 12 + (int)enc;
-
-    /* sendto — side 指定的腿 或 both */
-    int sides[2] = {pb->side, pb->side};
-    int nside;
-    if (pb->side >= 0) {
-        sides[0] = pb->side;
-        nside = 1;
-    } else {
-        sides[0] = 0; sides[1] = 1;
-        nside = 2;
+    /* peer / fd 检查 */
+    int side = pb->side >= 0 ? pb->side : 0;
+    if (pb->peer[side].len == 0) {
+        tw_add(ctx->tw, &pb->tn, now_ms + 1, pb_timer_cb, pb);
+        return;
     }
-    for (int i = 0; i < nside; i++) {
-        int side = sides[i];
-        if (pb->peer[side].len == 0) continue; /* 无 peer 地址（latch 未完成） */
-        int fd = rtp_relay_fd(pb->relay, side);
-        if (fd < 0) continue;
-        ssize_t sret = sendto(fd, rtp_frame, rtp_len,
-                              MSG_NOSIGNAL,
+    int fd = rtp_relay_fd(pb->relay, side);
+    if (fd < 0) {
+        tw_add(ctx->tw, &pb->tn, now_ms + 1, pb_timer_cb, pb);
+        return;
+    }
+
+    /* ★ 诊断：前 3 tick 打印链路状态 */
+    if (pb->total_sent < 3) {
+        llog(LOG_INFO, "pb", "tick call=%p pulled=%d total_pulled=%d peer[%d].len=%d fd=%d",
+             pb->call_key, pulled, pb->total_pulled, side, pb->peer[side].len, fd);
+    }
+
+    /* 拆包发送：每次 160 帧（20ms） */
+    int remaining = pulled;
+    int offset = 0;
+    int pkts = 0;
+    while (remaining > 0) {
+        int pkt_frames = remaining >= PB_RTP_FRAMES_PER_PACKET ? PB_RTP_FRAMES_PER_PACKET : remaining;
+        uint8_t payload[PB_RTP_FRAMES_PER_PACKET];
+        size_t enc = (pb->pt == 8)
+            ? g711_alaw_encode(pcm_buf + offset, pkt_frames, payload)
+            : g711_ulaw_encode(pcm_buf + offset, pkt_frames, payload);
+        if (enc == 0) break;
+
+        uint8_t rtp_frame[12 + PB_RTP_FRAMES_PER_PACKET];
+        memset(rtp_frame, 0, sizeof(rtp_frame));
+        rtp_frame[0] = 0x80;
+        rtp_frame[1] = pb->pt;
+        rtp_write_u16(&rtp_frame[2], pb->seq++);
+        rtp_write_u32(&rtp_frame[4], pb->ts);
+        pb->ts += pkt_frames;
+        rtp_write_u32(&rtp_frame[8], pb->ssrc);
+        memcpy(&rtp_frame[12], payload, enc);
+        int rtp_len = 12 + (int)enc;
+
+        ssize_t sret = sendto(fd, rtp_frame, rtp_len, MSG_NOSIGNAL,
                               (const struct sockaddr *)&pb->peer[side].ss,
                               pb->peer[side].len);
+        pb->total_sent++;
+        pkts++;
+
         if (sret != rtp_len) {
-            llog(LOG_WARN, "pb", "sendto FAIL side=%d ret=%zd expected=%d errno=%d",
+            llog(LOG_WARN, "pb", "sendto FAIL side=%d ret=%zd expect=%d errno=%d",
                  side, sret, rtp_len, errno);
+            if (errno == ENOTSOCK || errno == EBADF) {
+                llog(LOG_WARN, "pb", "fd invalid self-stop call=%p", pb->call_key);
+                pb->active = 0;
+                return;
+            }
         }
+
+        offset += pkt_frames;
+        remaining -= pkt_frames;
     }
 
-    /* 下一轮（tw_add 第三参是绝对 expire_ms——必须 now+间隔，传相对值
-     * 会落在过去被 timer_wheel.c:94 静默拒绝，timer 永不 tick） */
+    if (pb->total_sent <= 5 || pb->total_sent % 100 == 0) {
+        llog(LOG_INFO, "pb", "sendto OK tick call=%p pkts=%d total=%d ts=%lu",
+             pb->call_key, pkts, pb->total_sent, (unsigned long)pb->ts);
+    }
+
     if (!pb->active) return;
-    tw_add(ctx->tw, &pb->tn, now_ms + PB_PULL_INTERVAL_MS,
-           pb_timer_cb, pb);
+    tw_add(ctx->tw, &pb->tn, now_ms + 1, pb_timer_cb, pb);
 }
 
 /* ---------- pb_start ---------- */
@@ -235,17 +272,17 @@ int pb_start_ex(void *call_key, const char *wav_path, int side, int loop,
     if (!ctx || !ctx->tw || !ctx->bridge)
         return NSBC_ERR;
 
-    /* 1. load wav */
-    char alias[64];
-    snprintf(alias, sizeof(alias), "pb_%p_%s", call_key, strrchr(wav_path, '/') ?
-             strrchr(wav_path, '/') + 1 : wav_path);
-    int rc = player_load_wav(&g_pb_reg, wav_path, alias);
+    /* 1. 开音频文件（snd_file 负责：格式探测 + 重采样 + 声道合并 →
+     * 统一 8k/mono/S16LE 输出；零依赖 PCM WAV backend 已覆盖 alice.wav 等） */
+    snd_src_t *snd = NULL;
+    int backend = 0;
+    int rc = snd_file_open(wav_path, &snd, 0 /* auto fallback */, &backend);
     if (rc != NSBC_OK) {
-        llog(LOG_WARN, "pb", "load_wav FAIL path=%s rc=%d", wav_path, rc);
+        llog(LOG_WARN, "pb", "snd_file_open FAIL path=%s rc=%d", wav_path, rc);
         return NSBC_ERR;
     }
-    pcm_src_t *src = player_get(&g_pb_reg, alias);
-    if (!src) return NSBC_ERR;
+    llog(LOG_INFO, "pb", "snd_file_open OK path=%s backend=%d orig_rate=%d ch=%d",
+         wav_path, backend, snd_file_rate(snd), snd_file_channels(snd));
 
     /* 2. lookup relay + peer（lazy start —— relay 可能还没创建，
      * ringback 在 bridge 之前执行时 relay 还不存在） */
@@ -255,17 +292,16 @@ int pb_start_ex(void *call_key, const char *wav_path, int side, int loop,
     if (rc != NSBC_OK || !relay) {
         llog(LOG_INFO, "pb", "lookup_relay pending call=%p (lazy start, will retry)", call_key);
         relay = NULL;
-        /* peer 保持全零，pb_timer_cb lazy retry 时会一起获取 */
     }
 
     /* 3. create pb_ctx */
     pb_ctx_t *pb = calloc(1, sizeof(*pb));
-    if (!pb) { player_put(src); return NSBC_NOMEM; }
+    if (!pb) { snd_file_close(snd); return NSBC_NOMEM; }
     pb->call_key = call_key;
     pb->side = side;
     pb->loop = loop;
     pb->pt = (uint8_t)pt;
-    pb->src = src;
+    pb->snd = snd;
     pb->relay = relay;
     pb->peer[0] = peer[0];
     pb->peer[1] = peer[1];
@@ -274,7 +310,6 @@ int pb_start_ex(void *call_key, const char *wav_path, int side, int loop,
     pb->ts = 0;
     pb->active = 1;
     snprintf(pb->wav_path, sizeof(pb->wav_path), "%s", wav_path);
-    player_open(&pb->pl, src, loop);
 
     /* 4. 存全局列表 */
     pthread_mutex_lock(&g_pb_lock);
@@ -288,7 +323,13 @@ int pb_start_ex(void *call_key, const char *wav_path, int side, int loop,
      * 等于"过去时刻"被静默拒绝，pb_timer_cb 从未执行（lll.pcap 实证：
      * 服务器 0 帧 RTP 外发）。必须 now+1。 */
     tw_node_init(&pb->tn);
-    tw_add(ctx->tw, &pb->tn, nsbc_now_ms() + 1, pb_timer_cb, pb);
+    {
+        uint64_t expire = nsbc_now_ms() + 1;
+        int rc = tw_add(ctx->tw, &pb->tn, expire, pb_timer_cb, pb);
+        llog(LOG_INFO, "pb", "tw_add expire=%lu now=%lu rc=%d",
+             (unsigned long)expire,
+             (unsigned long)nsbc_now_ms(), rc);
+    }
 
     llog(LOG_INFO, "pb", "START call=%p side=%d loop=%d pt=%u wav=%s",
          call_key, side, loop, pb->pt, wav_path);
@@ -326,9 +367,9 @@ int pb_stop(void *call_key)
     pb->active = 0;
     pthread_mutex_unlock(&g_pb_lock);
 
-    /* 停时间轮 */
+    /* 停时间轮 + 关 snd_file */
     tw_del(ctx->tw, &pb->tn);
-    player_put(pb->src);
+    if (pb->snd) { snd_file_close(pb->snd); pb->snd = NULL; }
 
     llog(LOG_INFO, "pb", "STOP call=%p side=%d", call_key, pb->side);
 

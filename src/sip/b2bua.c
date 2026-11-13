@@ -627,6 +627,10 @@ static void call_destroy(b2b_call_t *c)
     c->dead = 1;
     llog(LOG_INFO, "b2b", "call_destroy BEGIN callid=%s a_state=%d b_state=%d a_final=%d",
          c->leg[0].callid, c->leg[0].state, c->leg[1].state, c->a_final);
+    /* ★ Bugfix 2026-11-13：early_media ringback 在 CANCEL/487 时没有停 pb
+     * bridge_release_call 释放 relay fd 后 pb timer 还在跑 → ENOTSOCK 刷屏
+     * 放在 dead=1 之后、任何 bridge 操作之前，保证 timer 先停再放 fd */
+    pb_stop_if_playing(c);
     /* SIP Profile active_calls 对称递减（handle_new_invite 归属时 +1 配对）。
      * ★ 注意：不能在这里置 c->prof=NULL —— 后面 g_end_hooks / on_end / b2b_emit_cdr(END)
      * 都要读 c->prof->name 发事件。真正的 NULL 赋值在 mem_obj_release 之前。 */
