@@ -716,6 +716,22 @@ app.component('dialplan-rules', {
         ElementPlus.ElMessage({ message: '复制失败（请手动 Ctrl+C）', type: 'warning' })
       );
     }
+    // ★ 表单字段变化 → 自动同步 JSON（但用户手动编辑 JSON 期间暂停，避免覆盖）
+    const syncFields = [
+      'name','profile_name','src_ip_cidr','match_expr','caller_match',
+      'prio','strip','target','rec_action','rec_path_template','rec_fmt',
+      'force_prack','force_precondition','force_timer','force_gruu',
+      'action_json','app_chain','enabled','description',
+    ];
+    Vue.watch(
+      () => syncFields.map(k => form.value[k]),
+      () => {
+        if (!showModal.value) return;          // 弹窗关闭时不触发
+        if (ruleJsonUserEdited.value) return;  // 用户在手动编辑 JSON → 不覆盖
+        ruleJsonFromForm();
+      },
+      { deep: true }
+    );
     // 正则验证Status
     const matchValid = ref(null);    // null=未验证, true=合法, false=非法
     const matchError = ref('');
