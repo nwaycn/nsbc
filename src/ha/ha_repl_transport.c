@@ -76,12 +76,18 @@ struct ha_repl_trans {
     /* === P1.5 NOSPC 主动 FULL ===
      * SPSC send_q 满（业务线程 repl_publish 返回 NOSPC）时累加计数器，
      * transport 线程 poll 时检测到 nospc_cnt≥TRANS_NOSPC_MAX → 自动 FULL push
-     * （等价于业务侧 NOSPC 后"转全量快照"的温和降级，transport 线程内做不阻塞业务） */
+     * （等价于业务侧 NOSPC 后"转全量快照"的温和降级，transport 线程内做不阻塞业务）
+     * ★ 全部 __atomic：repl_ops_send 业务线程写 nospc_cnt/last_nospc_time_ms，
+     *   ha_repl_trans_thread 读三者 + 写 nospc_cnt/full_on_nospc_pending ——
+     *   跨线程共享必须原子，否则 32-bit 平台 uint64_t torn write、x86 store reorder
+     *   都会导致漏/重触发。
+     * ★ 和 gap 跟踪不同：same_gap_cnt/full_resync_inflight 只在 transport 线程内
+     *   读写（repl_ops_on_gap 回调在同一线程），不需要 atomic。 */
 #define TRANS_NOSPC_MAX       16    /* 连续 16 次 NOSPC 触发 FULL push */
 #define TRANS_NOSPC_WINDOW_MS 5000  /* 5s 内的 NOSPC 才累计，超时清零 */
-    int      nospc_cnt;
-    uint64_t last_nospc_time_ms;
-    int      full_on_nospc_pending;  /* 防重复触发 FULL */
+    int      nospc_cnt;                /* ★ atomic: 业务线程写 ++；transport 读写 */
+    uint64_t last_nospc_time_ms;        /* ★ atomic: 业务线程写；transport 读 */
+    int      full_on_nospc_pending;    /* ★ atomic: transport 线程内部读写，但 atomic 保证可见性 */
 };
 
 /* === HaReplV1 帧编解码 === */
@@ -139,14 +145,25 @@ static int repl_ops_send(void *ud, const repl_rec_t *r)
              (unsigned long long)head, (unsigned long long)tail,
              (unsigned long long)r->seq);
         /* ★ P1.5 NOSPC 主动 FULL: 业务线程遇到 NOSPC 时累加计数器，
-         * transport 线程 poll 时检测超限自动发 FULL push（不阻塞业务） */
-        uint64_t now = (uint64_t)time(NULL) * 1000;  /* 粗 ms 精度足够 */
-        if (now - t->last_nospc_time_ms > TRANS_NOSPC_WINDOW_MS) {
-            t->nospc_cnt = 1;
-        } else {
-            t->nospc_cnt++;
+         * transport 线程 poll 时检测超限自动发 FULL push（不阻塞业务）
+         * ★ R1 fix: __atomic 写 — 跨线程可见
+         * ★ R3 fix: CLOCK_MONOTONIC — 避免系统时间跳变；和 gap 跟踪一致 */
+        {
+            struct timespec ts_ns;
+            clock_gettime(CLOCK_MONOTONIC, &ts_ns);
+            uint64_t now = (uint64_t)ts_ns.tv_sec * 1000 +
+                           (uint64_t)ts_ns.tv_nsec / 1000000;
+            uint64_t last = __atomic_load_n(&t->last_nospc_time_ms,
+                                            __ATOMIC_ACQUIRE);
+            int cnt = __atomic_load_n(&t->nospc_cnt, __ATOMIC_ACQUIRE);
+            if (last == 0 || now - last > TRANS_NOSPC_WINDOW_MS) {
+                cnt = 1;
+            } else {
+                cnt++;
+            }
+            __atomic_store_n(&t->nospc_cnt, cnt, __ATOMIC_RELEASE);
+            __atomic_store_n(&t->last_nospc_time_ms, now, __ATOMIC_RELEASE);
         }
-        t->last_nospc_time_ms = now;
         return NSBC_NOSPC;
     }
     uint64_t slot = head % REPL_RING_CAP;
@@ -430,16 +447,39 @@ static void *ha_repl_trans_thread(void *arg)
         /* 收发：peer_fd >= 0 时才有数据通路 */
         if (t->peer_fd >= 0) {
             /* ★ P1.5 NOSPC 主动 FULL: 业务线程累计 NOSPC ≥ 阈值 → transport 线程发 FULL push
-             * （NOSPC 意味着 SPSC send_q 满，备端 ACK 落后严重；FULL push 是比 gap 重传更彻底的恢复） */
-            if (t->is_active && !t->full_on_nospc_pending &&
-                t->nospc_cnt >= TRANS_NOSPC_MAX) {
-                llog(LOG_WARN, "ha-repl",
-                     "NOSPC FULL: %d NOSPC in window → ACTIVE auto FULL push",
-                     t->nospc_cnt);
-                t->full_on_nospc_pending = 1;
-                t->nospc_cnt = 0;
-                transport_send_full_snapshot(t);
-                t->full_on_nospc_pending = 0;
+             * （NOSPC 意味着 SPSC send_q 满，备端 ACK 落后严重；FULL push 是比 gap 重传更彻底的恢复）
+             * ★ R1 fix: 全部 __atomic 跨线程可见
+             * ★ R2 fix: 触发前先检查窗口是否过期 —— 安静期残留值不能误触发
+             *   场景：T=0s 连爆 16 次 → cnt=16，然后 STANDBY 追上来安静了 10s，
+             *   poll 跑到时旧 cnt 还在 → 必须先清过期残留值再判断阈值 */
+            {
+                int cnt = __atomic_load_n(&t->nospc_cnt, __ATOMIC_ACQUIRE);
+                if (cnt > 0) {
+                    struct timespec ts_th;
+                    clock_gettime(CLOCK_MONOTONIC, &ts_th);
+                    uint64_t now_t = (uint64_t)ts_th.tv_sec * 1000 +
+                                     (uint64_t)ts_th.tv_nsec / 1000000;
+                    uint64_t last_t = __atomic_load_n(&t->last_nospc_time_ms,
+                                                      __ATOMIC_ACQUIRE);
+                    if (last_t && now_t - last_t > TRANS_NOSPC_WINDOW_MS) {
+                        /* 窗口过期 → 残留值清零，本轮不再触发 */
+                        __atomic_store_n(&t->nospc_cnt, 0, __ATOMIC_RELEASE);
+                        cnt = 0;
+                    }
+                }
+                if (t->is_active &&
+                    !__atomic_load_n(&t->full_on_nospc_pending, __ATOMIC_ACQUIRE) &&
+                    cnt >= TRANS_NOSPC_MAX) {
+                    llog(LOG_WARN, "ha-repl",
+                         "NOSPC FULL: %d NOSPC in window → ACTIVE auto FULL push",
+                         cnt);
+                    __atomic_store_n(&t->full_on_nospc_pending, 1, __ATOMIC_RELEASE);
+                    __atomic_store_n(&t->nospc_cnt, 0, __ATOMIC_RELEASE);
+                    transport_send_full_snapshot(t);
+                    __atomic_store_n(&t->full_on_nospc_pending, 0, __ATOMIC_RELEASE);
+                    /* ★ 不清 nospc_cnt — FULL push 期间业务线程可能又加了几次，
+                     * pending 解除后下一轮 poll 继续判断累计（R4 fix） */
+                }
             }
 
             struct pollfd pfds[2];
