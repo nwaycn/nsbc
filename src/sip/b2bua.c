@@ -5031,13 +5031,12 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
     /* REGISTER 多槽链：遍历所有注册模块直到某个返回非 0
      * （security 可返回 PERM_DENIED → 403 静默丢弃；registrar 返回 OK → 已处理） */
     if (m->method == SIP_M_REGISTER) {
-        /* HA 门控：备机不受理注册（防 AoR 双写/主备状态漂移），静默丢弃 */
-        if (ha_role() != HA_ROLE_ACTIVE) {
-            static unsigned drop_reg_n = 0;
-            llog(LOG_WARN, "b2b",
-                 "HA standby: drop REGISTER (dropped=%u)", drop_reg_n++);
-            return;
-        }
+        /* ★ 修复：HA 门控不再 drop REGISTER（2026-11-14）
+         * 之前：STANDBY 静默丢弃所有 REGISTER → 备机 loc_db 永远空
+         *       → failover 后 INVITE 找不到路由 → MicroSIP 5 分钟后 "错误网关"
+         * 现在：ACTIVE 和 STANDBY 都接 REGISTER 写入本地 loc_db（内存），
+         *       但 reg_push（DB/事件推送）只由 ACTIVE 执行 → 备机 DB 不双写，
+         *       failover 时新 ACTIVE 直接用已有注册数据接 INVITE。 */
         extern sip_tr_proto_t g_ws_bridge_proto; /* signaling.c */
         const nsbc_sa_t *rp = txn_peer(t);
         sip_tr_proto_t reg_proto =

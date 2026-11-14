@@ -7,12 +7,13 @@
 #include <errno.h>
 #include <limits.h>
 #include <pthread.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/eventfd.h>
 #include <time.h>
 #include <unistd.h>
+
+#include "log.h"
 
 typedef struct {
     reactor_cb_fn cb;
@@ -59,8 +60,7 @@ static void reactor_wake(reactor_t *r)
         n = write(r->wake_fd, &one, sizeof(one));
     } while (n < 0 && errno == EINTR);
     if (n < 0 && errno != EAGAIN)
-        fprintf(stderr, "reactor: wake eventfd write failed errno=%d\n",
-                errno);
+        llog(LOG_WARN, "reactor", "wake eventfd write failed errno=%d", errno);
 }
 
 static void reactor_drain_wake_fd(reactor_t *r)
@@ -76,8 +76,7 @@ static void reactor_drain_wake_fd(reactor_t *r)
             return;
         if (n == 0)
             return;
-        fprintf(stderr, "reactor: wake eventfd read failed errno=%d\n",
-                errno);
+        llog(LOG_WARN, "reactor", "wake eventfd read failed errno=%d", errno);
         return;
     }
 }
@@ -104,8 +103,8 @@ static unsigned reactor_run_tasks(reactor_t *r, unsigned budget)
         task->done = 1;
         int signal_rc = pthread_cond_signal(&task->done_cond);
         if (signal_rc != 0) {
-            fprintf(stderr, "reactor: command completion signal failed rc=%d\n",
-                    signal_rc);
+            llog(LOG_CRIT, "reactor", "command completion signal failed rc=%d",
+                 signal_rc);
             abort();
         }
         pthread_mutex_unlock(&task->lock);
@@ -184,12 +183,13 @@ int reactor_destroy(reactor_t *r)
      * 但 reactor owner 是 main 线程（预创建时设定）。生产构建关闭此检查。
      * wait_active=0 + 无 pending commands 保证安全。 */
     if (!pthread_equal(pthread_self(), r->owner)) {
-        fprintf(stderr, "reactor: destroy must run on the owner thread (debug check)\n");
+        llog(LOG_WARN, "reactor",
+             "destroy must run on owner thread (debug check)");
         return NSBC_PERM_DENIED;
     }
 #endif
     if (r->wait_active) {
-        fprintf(stderr, "reactor: destroy refused while reactor_wait is active\n");
+        llog(LOG_WARN, "reactor", "destroy refused while reactor_wait is active");
         return NSBC_BUSY;
     }
     if (r->task_queue_initialized) {
@@ -198,8 +198,8 @@ int reactor_destroy(reactor_t *r)
         uint32_t pending = r->task_count;
         if (pending != 0) {
             pthread_mutex_unlock(&r->task_lock);
-            fprintf(stderr, "reactor: destroy refused with %u queued commands\n",
-                    pending);
+            llog(LOG_WARN, "reactor",
+                 "destroy refused with %u queued commands", pending);
             return NSBC_BUSY;
         }
         pthread_mutex_unlock(&r->task_lock);
@@ -244,13 +244,14 @@ int reactor_add(reactor_t *r, int fd, uint32_t events, reactor_cb_fn cb,
         return NSBC_INVAL;
 
 #ifdef NSBC_DEBUG_REACTOR_SLOTS
-    fprintf(stderr, "reactor_add ENTER r=%p epfd=%d fd=%d events=%u wake_fd=%d\n",
-            (void *)r, r->epfd, fd, (unsigned)events, r->wake_fd);
+    llog(LOG_DEBUG, "reactor",
+         "reactor_add ENTER r=%p epfd=%d fd=%d events=%u wake_fd=%d",
+         (void *)r, r->epfd, fd, (unsigned)events, r->wake_fd);
 #endif
 #ifdef NSBC_REACTOR_OWNER_CHECK
     if (!pthread_equal(pthread_self(), r->owner)) {
-        fprintf(stderr,
-                "reactor: add must run on owner thread (debug check)\n");
+        llog(LOG_WARN, "reactor",
+             "add must run on owner thread (debug check)");
         return NSBC_PERM_DENIED;
     }
 #endif
@@ -262,15 +263,17 @@ int reactor_add(reactor_t *r, int fd, uint32_t events, reactor_cb_fn cb,
     ev.events = events;
     ev.data.fd = fd;
     if (epoll_ctl(r->epfd, EPOLL_CTL_ADD, fd, &ev) < 0) {
-        fprintf(stderr, "reactor_add: epoll_ctl(ADD) FAILED epfd=%d fd=%d errno=%d(%s)\n",
-                r->epfd, fd, errno, strerror(errno));
+        llog(LOG_ERR, "reactor",
+             "reactor_add: epoll_ctl(ADD) FAILED epfd=%d fd=%d errno=%d(%s)",
+             r->epfd, fd, errno, strerror(errno));
         return NSBC_ERR;
     }
     r->slots[fd].cb = cb;
     r->slots[fd].arg = arg;
 #ifdef NSBC_DEBUG_REACTOR_SLOTS
-    fprintf(stderr, "reactor_add OK epfd=%d fd=%d slots[%d].cb=%p\n",
-            r->epfd, fd, fd, (void *)r->slots[fd].cb);
+    llog(LOG_DEBUG, "reactor",
+         "reactor_add OK epfd=%d fd=%d slots[%d].cb=%p",
+         r->epfd, fd, fd, (void *)r->slots[fd].cb);
 #endif
     return NSBC_OK;
 }
@@ -290,19 +293,20 @@ int reactor_mod(reactor_t *r, int fd, uint32_t events)
 int reactor_del(reactor_t *r, int fd)
 {
 #ifdef NSBC_DEBUG_REACTOR_SLOTS
-    fprintf(stderr, "[reactor] del ENTER r=%p fd=%d wake_fd=%d slots_cap=%zu\n",
-            (void*)r, fd, r ? r->wake_fd : -1, r ? r->slots_cap : 0);
+    llog(LOG_DEBUG, "reactor",
+         "del ENTER r=%p fd=%d wake_fd=%d slots_cap=%zu",
+         (void*)r, fd, r ? r->wake_fd : -1, r ? r->slots_cap : 0);
 #endif
     if (!r || fd < 0 || fd == r->wake_fd) {
 #ifdef NSBC_DEBUG_REACTOR_SLOTS
-        fprintf(stderr, "[reactor] del REJECTED r=%p fd=%d (INVAL)\n", (void*)r, fd);
+        llog(LOG_DEBUG, "reactor", "del REJECTED r=%p fd=%d (INVAL)", (void*)r, fd);
 #endif
         return NSBC_INVAL;
     }
 #ifdef NSBC_REACTOR_OWNER_CHECK
     if (!pthread_equal(pthread_self(), r->owner)) {
-        fprintf(stderr,
-                "reactor: del must run on owner thread (debug check)\n");
+        llog(LOG_WARN, "reactor",
+             "del must run on owner thread (debug check)");
         return NSBC_PERM_DENIED;
     }
 #endif
@@ -312,7 +316,8 @@ int reactor_del(reactor_t *r, int fd)
      * 典型场景：obs 的 EPOLLHUP 和 EPOLLIN 同 batch 触发，HUP 先 dispatch 调 reactor_del，
      * 同 batch 后续 EPOLLIN dispatch 到同一 fd 时 callback 又调 reactor_del → 第二次幂等跳过。 */
     if (fd < r->slots_cap && r->slots[fd].cb == NULL) {
-        fprintf(stderr, "[reactor] del fd=%d ALREADY NULL cb — idempotent skip\n", fd);
+        llog(LOG_DEBUG, "reactor",
+             "del fd=%d ALREADY NULL cb (idempotent skip)", fd);
         return NSBC_OK;
     }
 
@@ -323,21 +328,23 @@ int reactor_del(reactor_t *r, int fd)
         r->slots[fd].cb = NULL;
         r->slots[fd].arg = NULL;
 #ifdef NSBC_DEBUG_REACTOR_SLOTS
-        fprintf(stderr, "[reactor] del fd=%d slots[fd] cleared (cb=NULL)\n", fd);
+        llog(LOG_DEBUG, "reactor", "del fd=%d slots cleared (cb=NULL)", fd);
 #endif
     } else {
 #ifdef NSBC_DEBUG_REACTOR_SLOTS
-        fprintf(stderr, "[reactor] del fd=%d SKIP slots clear (fd >= slots_cap=%zu)\n",
-                fd, r->slots_cap);
+        llog(LOG_DEBUG, "reactor",
+             "del fd=%d SKIP slots clear (fd >= slots_cap=%zu)",
+             fd, r->slots_cap);
 #endif
     }
     if (epoll_ctl(r->epfd, EPOLL_CTL_DEL, fd, NULL) < 0) {
-        fprintf(stderr, "[reactor] del fd=%d epoll_ctl DEL FAILED errno=%d(%s) (slots already cleared)\n",
-                fd, errno, strerror(errno));
+        llog(LOG_ERR, "reactor",
+             "del fd=%d epoll_ctl DEL FAILED errno=%d(%s) (slots already cleared)",
+             fd, errno, strerror(errno));
         return NSBC_ERR;
     }
 #ifdef NSBC_DEBUG_REACTOR_SLOTS
-    fprintf(stderr, "[reactor] del fd=%d OK (epoll DEL + slots cleared)\n", fd);
+    llog(LOG_DEBUG, "reactor", "del fd=%d OK (epoll DEL + slots cleared)", fd);
 #endif
     return NSBC_OK;
 }
@@ -396,7 +403,7 @@ int reactor_call(reactor_t *r, reactor_task_fn fn, void *arg)
     while (!task.done) {
         int wait_rc = pthread_cond_wait(&task.done_cond, &task.lock);
         if (wait_rc != 0) {
-            fprintf(stderr, "reactor: command wait failed rc=%d\n", wait_rc);
+            llog(LOG_CRIT, "reactor", "command wait failed rc=%d", wait_rc);
             abort();
         }
     }
@@ -500,19 +507,16 @@ int reactor_wait(reactor_t *r, int timeout_ms)
         if (fd >= r->slots_cap || !r->slots[fd].cb) {
 #ifdef NSBC_DEBUG_REACTOR_SLOTS
             if (fd < r->slots_cap)
-                fprintf(stderr, "[reactor] i=%d fd=%d SKIP (slots[fd].cb=%p arg=%p)\n",
-                        i, fd, (void*)r->slots[fd].cb, r->slots[fd].arg);
+                llog(LOG_DEBUG, "reactor",
+                     "i=%d fd=%d SKIP (slots[fd].cb=%p arg=%p)",
+                     i, fd, (void*)r->slots[fd].cb, r->slots[fd].arg);
             else
-                fprintf(stderr, "[reactor] i=%d fd=%d SKIP (fd >= slots_cap=%zu)\n",
-                        i, fd, r->slots_cap);
+                llog(LOG_DEBUG, "reactor",
+                     "i=%d fd=%d SKIP (fd >= slots_cap=%zu)",
+                     i, fd, r->slots_cap);
 #endif
             continue;
         }
-#ifdef NSBC_DEBUG_REACTOR_SLOTS
-        fprintf(stderr, "[reactor] i=%d fd=%d ev=0x%x cb=%p arg=%p → dispatch\n",
-                i, fd, (unsigned)r->events[i].events,
-                (void*)r->slots[fd].cb, r->slots[fd].arg);
-#endif
         /* ★ 同一 epoll batch 内同一 fd 可能出现在多个 events 位置
          *   （EPOLLIN/EPOLLHUP 分别被 LT 模式捕获）。callback 可能 free(arg) →
          *   同 batch 后续 dispatch 访问已释放内存 → UAF。
@@ -521,10 +525,6 @@ int reactor_wait(reactor_t *r, int timeout_ms)
         reactor_cb_fn cb = r->slots[fd].cb;
         void *arg = r->slots[fd].arg;
         cb(fd, r->events[i].events, arg);
-#ifdef NSBC_DEBUG_REACTOR_SLOTS
-        fprintf(stderr, "[reactor] i=%d fd=%d dispatch RETURNED (slots[fd].cb=%p)\n",
-                i, fd, (void*)r->slots[fd].cb);
-#endif
     }
     if (reactor_stopping(r))
         (void)reactor_run_tasks(r, UINT_MAX);
@@ -537,8 +537,9 @@ int reactor_wait(reactor_t *r, int timeout_ms)
         if (elapsed_ms > 500) {
             static uint32_t wd_n = 0;
             if (wd_n++ % 10 == 0)
-                fprintf(stderr, "reactor_warn: slow batch %lu ms n=%d (wd_n=%u)\n",
-                        (unsigned long)elapsed_ms, n, wd_n);
+                llog(LOG_WARN, "reactor",
+                     "slow batch %lu ms n=%d (wd_n=%u)",
+                     (unsigned long)elapsed_ms, n, wd_n);
         }
     }
     r->wait_active = 0;

@@ -168,7 +168,13 @@ loc_rc_t loc_upsert(loc_db_t *db, const loc_binding_t *b, uint64_t now_ms)
         }
         if (!strcmp(p->b.contact, b->contact) ||
             (b->instance[0] && p->b.instance[0] &&
-             !strcmp(p->b.instance, b->instance))) {
+             !strcmp(p->b.instance, b->instance)) ||
+            /* instance 为空时的软判定（WS 重连最常见场景）：
+             * UA 不带 +sip.instance 时，WS 断线重连会生成新 contact + 新 callid
+             * → 以上三个条件全 miss。同 IP + 同 transport 基本锁定同一终端。 */
+            (!b->instance[0] && p->b.received_ip[0] && b->received_ip[0] &&
+             !strcmp(p->b.received_ip, b->received_ip) &&
+             p->b.transport_proto == b->transport_proto)) {
             match = p;
             break;
         }

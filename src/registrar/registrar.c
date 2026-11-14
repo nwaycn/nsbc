@@ -3,6 +3,7 @@
 #endif
 #include "registrar.h"
 #include "b2bua.h"      /* b2b_guard_notify — 认证失败上报 security 封禁 */
+#include "ha.h"         /* ha_role() — STANDBY 跳过 reg_push（loc_db 照常写，DB 事件不双写） */
 #include "metric_reg.h"
 #include "sip_build.h"
 #include "sip_profile.h"
@@ -253,6 +254,80 @@ static void copy_addr(char *dst, size_t cap, const sip_hdr_t *h)
     dst[n] = '\0';
 }
 
+/* 从 aor 里提取 user 部分（@ 前面的短号/分机号）—— grep 'user=1006'
+ * 就能把同一个分机的注册链 + 通话链（b2bua new_invite/cdr）全部聚合。
+ * 典型：aor="1006@nsbc.local" → out="1006"；aor="1006" → out="1006"。 */
+static inline void _aor_user(const char *aor, char *out, size_t out_sz)
+{
+    if (!out || out_sz == 0) return;
+    out[0] = '\0';
+    if (!aor || !aor[0]) return;
+    const char *at = strchr(aor, '@');
+    size_t ulen = at ? (size_t)(at - aor) : strlen(aor);
+    if (ulen >= out_sz) ulen = out_sz - 1;
+    memcpy(out, aor, ulen);
+    out[ulen] = '\0';
+}
+
+/* === 统一 dup 判定（与 loc_upsert 对齐）===
+ * 判断新 REGISTER 的 binding b 是否与现有 probe[i] 是"同一终端刷新"
+ * 而不是新设备接入——是 dup 就不该 evict 老的，让 loc_upsert 自然覆盖。
+ *
+ * 四条判定（按可靠性从高到低）：
+ *   ① Contact 字符串完全相同（UA 用同一端口刷新的常规路径）
+ *   ② +sip.instance 相同（RFC 5627 终端唯一标识——WS 重连后 contact/callid 全变，
+ *      但 SIP.js/FreeSWITCH 等成熟 UA 都会在 Contact 里带 +sip.instance="<urn:uuid:...>"，
+ *      这个 UUID 跨 WS 重建稳定不变，是"同一浏览器/软电话"的最准指纹）
+ *   ③ Call-ID 相同（同一 Call-ID 的 REGISTER 刷新）
+ *   ④ instance 为空时（老 UA 不带 +sip.instance）用 received_ip + transport 兜底
+ *      —— 同一 IP + 同一 transport（WS/WSS/UDP）大概率同一终端断线重连
+ *
+ * ★ 为什么这条放在 loc_upsert 之前？
+ *   因为 max_registrations_per_ext evict 逻辑在 L1191 先于 loc_upsert 执行，
+ *   如果 dup 判定不覆盖 instance，WS 重连后的"新 contact + 新 callid"会被当成新设备
+ *   → 触发 evict 踢掉老的，然后 loc_upsert 才发现 instance 相同但已经晚了。
+ *   两层 dup 判定必须对齐。 */
+static inline int is_dup_binding(const loc_binding_t *probe,
+                                 const loc_binding_t *b)
+{
+    /* ① Contact 相同：最经典 dup */
+    if (strcmp(probe->contact, b->contact) == 0) {
+        char _u[64]; _aor_user(probe->aor, _u, sizeof(_u));
+        llog(LOG_INFO, "reg",
+             "DUP-HIT[①contact] user=%s aor=%s contact=%.80s",
+             _u, probe->aor, probe->contact);
+        return 1;
+    }
+    /* ② instance 相同：WS 重连最稳的 dup 指纹 */
+    if (b->instance[0] && probe->instance[0] &&
+        strcmp(probe->instance, b->instance) == 0) {
+        char _u[64]; _aor_user(probe->aor, _u, sizeof(_u));
+        llog(LOG_INFO, "reg",
+             "DUP-HIT[②instance] user=%s aor=%s instance=%.60s",
+             _u, probe->aor, b->instance);
+        return 1;
+    }
+    /* ③ Call-ID 相同：同 Call-ID 的 REGISTER 刷新 */
+    if (b->callid[0] && strcmp(probe->callid, b->callid) == 0) {
+        char _u[64]; _aor_user(probe->aor, _u, sizeof(_u));
+        llog(LOG_INFO, "reg",
+             "DUP-HIT[③callid] user=%s aor=%s callid=%.60s",
+             _u, probe->aor, b->callid);
+        return 1;
+    }
+    /* ④ instance 为空时的软判定：同 IP + 同 transport → 大概率断线重连 */
+    if (!b->instance[0] && probe->received_ip[0] && b->received_ip[0] &&
+        strcmp(probe->received_ip, b->received_ip) == 0 &&
+        probe->transport_proto == b->transport_proto) {
+        char _u[64]; _aor_user(probe->aor, _u, sizeof(_u));
+        llog(LOG_INFO, "reg",
+             "DUP-HIT[④ip+transport] user=%s aor=%s ip=%s proto=%d (no instance, soft match)",
+             _u, probe->aor, b->received_ip, b->transport_proto);
+        return 1;
+    }
+    return 0;
+}
+
 /* === NAT 检测辅助（REQ-NAT-001）===
  * RFC1918 + CGNAT + 回环 + Link-Local 私网判断。
  * IPv4 only（SIP 99% 场景），IPv6 私网暂不处理（nsbc 当前 IPv6 支持有限）。 */
@@ -497,6 +572,19 @@ static void respond(reg_core_t *r, sip_tr_proto_t proto, const nsbc_sa_t *dst,
         sa_to_str(dst, src_ip, sizeof(src_ip), &src_port);
         sip_via_patch_received_rport(out, &len, sizeof(out), src_ip, src_port);
     }
+    /* ★ 诊断（2026-11-14 "错误的网关"排查）：完整响应字节 dump。
+     * 之前只打了流程节点日志，但客户端真正收到的是什么字节没验证过——
+     * 服务端视角"200 OK 已发"不等于"客户端能解析"。此 dump 能直接暴露：
+     * 头部畸形 / 截断 / Service-Route 等客户端可能不认的内容。 */
+    {
+        char _rip[INET6_ADDRSTRLEN] = "-";
+        uint16_t _rport = 0;
+        if (dst) sa_to_str(dst, _rip, sizeof(_rip), &_rport);
+        llog(LOG_INFO, "reg",
+             "REG-RESP status=%d dst=%s:%u len=%zu\n%.*s",
+             status, _rip, (unsigned)_rport, len,
+             (int)(len > 600 ? 600 : len), out);
+    }
     /* 优先走 txn 层：自动缓存响应 + 吸收同 branch 重传 */
     if (txn) {
         txn_ref(txn);  /* ★ 防竞态：protect txn_send_response 期间 txn 不被释放 */
@@ -517,6 +605,12 @@ static void respond(reg_core_t *r, sip_tr_proto_t proto, const nsbc_sa_t *dst,
 void reg_push(const loc_binding_t *b, long expires_sec)
 {
     if (!b) return;
+    /* ★ STANDBY 跳过 DB/事件推送（但 loc_upsert 在之前已完成，内存 loc_db 有数据）
+     * 防双机同时 upsert 同一个 UA 到 Rust side registrations 表（幂等但无意义）。
+     * failover 后新 ACTIVE 节点的 loc_db 已有注册数据，INVITE 可立即路由。 */
+    if (ha_role() != HA_ROLE_ACTIVE)
+        return;
+
     /* 从 AOR 提取 user 部分（去掉 sip: 和 @domain） */
     const char *aor = b->aor;
     const char *user = aor;
@@ -694,6 +788,79 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
     } else {
         snprintf(reg_realm, sizeof(reg_realm), "nsbc.local");
     }
+    /* ===== 诊断入口：完整 REGISTER 请求上下文 =====
+     * 打在 realm 确定后（还没进 auth）—— 这是整个注册链的"第一帧"。
+     * 后续 AUTH/200/evict/upsert 日志都用同一个 call_id 关联。
+     * ★ 同时提取 aor 的 user 部分（短号/分机号）—— grep 'user=1006' 就能聚合
+     *   整个注册+通话链（b2bua 的 new_invite/cdr 也打 caller/callee，天然对齐）。 */
+    sip_hdr_t *_cid0 = sip_hdr_get(m, SIP_H_CALL_ID);
+    sip_hdr_t *_ua0  = sip_hdr_get(m, SIP_H_USER_AGENT);
+    char _cid_str[LOC_CALLID_MAX] = "";
+    char _ua_str[128] = "";
+    if (_cid0 && _cid0->value.len > 0)
+        snprintf(_cid_str, sizeof(_cid_str), "%.*s",
+                 (int)(_cid0->value.len < sizeof(_cid_str) - 1
+                           ? _cid0->value.len
+                           : sizeof(_cid_str) - 1),
+                 _cid0->value.p);
+    if (_ua0 && _ua0->value.len > 0)
+        snprintf(_ua_str, sizeof(_ua_str), "%.*s",
+                 (int)(_ua0->value.len < sizeof(_ua_str) - 1
+                           ? _ua0->value.len
+                           : sizeof(_ua_str) - 1),
+                 _ua0->value.p);
+    /* 从 aor 里提取 user 部分（@ 前面） —— 1006@nsbc.local → user=1006 */
+    char _reg_user[64] = "";
+    {
+        const char *_at = strchr(aor, '@');
+        size_t _ulen = _at ? (size_t)(_at - aor) : strlen(aor);
+        if (_ulen >= sizeof(_reg_user)) _ulen = sizeof(_reg_user) - 1;
+        memcpy(_reg_user, aor, _ulen);
+        _reg_user[_ulen] = '\0';
+    }
+    {
+        const char *_role_s =
+            ha_role() == HA_ROLE_ACTIVE ? "ACTIVE" : "STANDBY";
+        /* ★ 关键增强：CSeq / Expires 头 / Contact 原始值 / Route —— 用于识别
+         * 注销请求（expires=0 或 Contact:*）和客户端路由行为（是否回带了
+         * 我们 200 OK 里 Service-Route 的值） */
+        char _cseq_str[48] = "", _exp_str[32] = "", _ct_str[96] = "";
+        char _rt_str[72] = "";
+        sip_hdr_t *_h;
+        if ((_h = sip_hdr_get(m, SIP_H_CSEQ)) && _h->value.len > 0)
+            snprintf(_cseq_str, sizeof(_cseq_str), "%.*s",
+                     (int)(_h->value.len < sizeof(_cseq_str) - 1
+                               ? _h->value.len : sizeof(_cseq_str) - 1),
+                     _h->value.p);
+        if ((_h = sip_hdr_get(m, SIP_H_EXPIRES)) && _h->value.len > 0)
+            snprintf(_exp_str, sizeof(_exp_str), "%.*s",
+                     (int)(_h->value.len < sizeof(_exp_str) - 1
+                               ? _h->value.len : sizeof(_exp_str) - 1),
+                     _h->value.p);
+        if ((_h = sip_hdr_get(m, SIP_H_CONTACT)) && _h->value.len > 0)
+            snprintf(_ct_str, sizeof(_ct_str), "%.*s",
+                     (int)(_h->value.len < sizeof(_ct_str) - 1
+                               ? _h->value.len : sizeof(_ct_str) - 1),
+                     _h->value.p);
+        if ((_h = sip_hdr_get(m, SIP_H_ROUTE)) && _h->value.len > 0)
+            snprintf(_rt_str, sizeof(_rt_str), "%.*s",
+                     (int)(_h->value.len < sizeof(_rt_str) - 1
+                               ? _h->value.len : sizeof(_rt_str) - 1),
+                     _h->value.p);
+        llog(LOG_INFO, "reg",
+             "REGISTER-IN user=%s aor=%s realm=%s src=%s proto=%d ha_role=%s "
+             "force_ok=%d call_id=%s ua=%s\n"
+             "  cseq=[%s] expires_hdr=[%s] contact=[%s] route=[%s]",
+             _reg_user, aor, reg_realm, src_ip, proto, _role_s,
+             r->cfg.force_register_ok,
+             _cid_str[0] ? _cid_str : "(none)",
+             _ua_str[0] ? _ua_str : "(none)",
+             _cseq_str[0] ? _cseq_str : "(none)",
+             _exp_str[0] ? _exp_str : "(none)",
+             _ct_str[0] ? _ct_str : "(none)",
+             _rt_str[0] ? _rt_str : "(none)");
+    }
+
     llog(LOG_DEBUG, "reg",
          "REGISTER aor=%s realm=%s (to_host=%s cfg.realm=%s)",
          aor, reg_realm,
@@ -792,12 +959,12 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
         if (!auth) {
             static __thread uint64_t bare_ms = 0;
             uint64_t now = nsbc_now_ms();
-            if (now - bare_ms > 3000) {   /* 每 3 秒聚合一条 */
-                llog(LOG_DEBUG, "reg",
+            if (now - bare_ms > 3000) {   /* 每 3 秒聚合一条 — INFO 级默认可见 */
+                char _u[64]; _aor_user(aor, _u, sizeof(_u));
+                llog(LOG_INFO, "reg",
                      "REGISTER → 401 challenge (RFC 3261 handshake, no auth hdr) "
-                     "aor=%s src_ip=%s realm=%s\n"
-                     "  WWW-Authenticate: %s",
-                     aor, src_ip, reg_realm, ch);
+                     "user=%s aor=%s src_ip=%s realm=%s → WWW-Authenticate sent",
+                     _u, aor, src_ip, reg_realm);
                 bare_ms = now;
             }
         } else {
@@ -850,7 +1017,9 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
         _rc = NSBC_OK; goto reg_out;
     }
 reg_auth_ok:
-    llog(LOG_DEBUG, "reg", "REGISTER auth OK → processing loc_add...");
+    llog(LOG_INFO, "reg",
+         "REGISTER-AUTH-OK user=%s aor=%s src=%s force_ok=%d",
+         _reg_user, aor, src_ip, auth_ok_override ? 1 : 0);
     b2b_guard_notify(src_ip, B2B_GUARD_AUTH_OK); /* auth OK：通知 security 清零 fail/ratelimit 计数 */
 
     /* ---- RFC 3327 §6.2：Path 头回显 ----
@@ -886,17 +1055,18 @@ reg_auth_ok:
     }
 
     /* ---- RFC 3608：Service-Route 生成 + 入站回显 ----
-     * 我们作为 registrar/CSCF 生成 Service-Route 告诉 UE 后续
-     * INVITE/SUBSCRIBE 等请求应该用什么 Route 头来到达我们。
-     * UE 拿到后自动把 Service-Route 值拷贝到后续请求的 Route 头。
-     * 格式："Service-Route: <sip:{tenant_realm};lr>\r\n"
-     *   - lr = loose router（RFC 3608 §4.4 强制）
-     * 同时请求里如果已经带了 Service-Route（outreg 上游注入），也原样回显。 */
+     * ★ 2026-11-14 修复：此前无条件发 <sip:{realm};lr>，realm（如
+     *   nsbc.local）是公网客户端无法解析的内部域名。遵循 RFC 3608 的
+     *   UA（pjsip 等）会把它拷进路由集 → 后续请求发送失败 → pjsip 报
+     *   502 Bad Gateway（MicroSIP 中文显示"错误的网关"）。
+     *   现改为配置驱动：registrar.service_route_host 为空则完全不发。
+     *   同时请求里如果已经带了 Service-Route（outreg 上游注入），原样回显。 */
     char generated_service_route[256]; generated_service_route[0] = '\0';
     {
-        /* 1. 先生成本地 Service-Route（registrar 角色） */
-        snprintf(generated_service_route, sizeof(generated_service_route),
-                 "<sip:%s;lr>", reg_realm);
+        /* 仅当显式配置了可路由主机名时才生成（registrar 角色） */
+        if (r->cfg.service_route_host[0])
+            snprintf(generated_service_route, sizeof(generated_service_route),
+                     "<sip:%s;lr>", r->cfg.service_route_host);
     }
 
     /* 合成 REGISTER 200 OK 公共 extra 前缀：Service-Route 在前，Path 在后，
@@ -954,6 +1124,10 @@ reg_auth_ok:
         ch0 = &contact_tmp; /* 用处理后的副本 */
     }
     if (ch0 && sip_hdr_parse_addr(ch0) == NSBC_OK && ch0->u.addr.star) {
+        char _u[64]; _aor_user(aor, _u, sizeof(_u));
+        llog(LOG_INFO, "reg",
+             "REGISTER-LOGOUT user=%s aor=%s (Contact:* Expires:0 → loc_remove all)",
+             _u, aor);
         loc_remove(r->cfg.db, aor, "*");
         /* 注销响应也带 Service-Route + Path（RFC 3608/3327 覆盖所有 REGISTER 200 OK） */
         if (hdr_prefix[0]) {
@@ -970,6 +1144,11 @@ reg_auth_ok:
 
     /* 逐 Contact 处理 */
     int nc = 0;
+    /* 被移除的 Contact 回显链（RFC 3261 §10.3.5：注销 200 OK 必须带
+     * Contact: <uri>;expires=0，不能是裸 200 OK） */
+    char removed_ct[1024]; removed_ct[0] = '\0';
+    size_t removed_used = 0;
+    int removed_n = 0;
     for (sip_hdr_t *h = ch0; h; h = sip_hdr_next(m, h)) {
         llog(LOG_DEBUG, "reg", "loc_add loop: h=%p type=%d", (void*)h, h->type);
         if (h->type != SIP_H_CONTACT)
@@ -1021,6 +1200,20 @@ reg_auth_ok:
             snprintf(dummy.contact, sizeof(dummy.contact), "%s", ctext);
             loc_remove(r->cfg.db, aor, ctext);
             reg_push(&dummy, 0);   /* write-through: 注销快照（NAT 字段留空） */
+            /* ★ RFC 3261 §10.3.5/§10.2.4：200 OK 必须回显被移除的 Contact
+             *   （带 expires=0）。2026-11-14 之前这里直接 continue，导致
+             *   注销响应是"裸 200 OK"（无 Contact 无 Expires）——UA 无法
+             *   从响应判定注册状态，pjsua 等栈按"注册被移除"处理并可能
+             *   走异常分支（MicroSIP "错误的网关"）。 */
+            {
+                int w = snprintf(removed_ct + removed_used,
+                                 sizeof(removed_ct) - removed_used,
+                                 "Contact: %s;expires=0\r\n", ctext);
+                if (w > 0 && (size_t)w < sizeof(removed_ct) - removed_used) {
+                    removed_used += (size_t)w;
+                    ++removed_n;
+                }
+            }
             continue;
         }
         loc_binding_t b;
@@ -1190,8 +1383,7 @@ reg_auth_ok:
             if (cur >= r->cfg.max_registrations_per_ext) {
                 int dup = 0;
                 for (int i = 0; i < cur; ++i) {
-                    if (strcmp(probe[i].contact, b.contact) == 0) { dup = 1; break; }
-                    if (b.callid[0] && strcmp(probe[i].callid, b.callid) == 0) { dup = 1; break; }
+                    if (is_dup_binding(&probe[i], &b)) { dup = 1; break; }
                 }
                 if (!dup) {
                     /* ★ 踢掉 expire_ms 最小的那条（最近要过期的 / 最旧的 binding） */
@@ -1200,8 +1392,9 @@ reg_auth_ok:
                         if (probe[i].expire_ms < probe[oldest].expire_ms) oldest = i;
                     }
                     llog(LOG_INFO, "reg",
-                         "max_registrations_per_ext: aor=%s cur=%d >= max=%d → evict oldest contact=%s expire_ms=%lu → allow new contact=%s",
-                         b.aor, cur, r->cfg.max_registrations_per_ext,
+                         "max_registrations_per_ext: user=%s aor=%s cur=%d >= max=%d "
+                         "→ evict oldest contact=%.80s expire_ms=%lu → allow new contact=%.80s",
+                         _reg_user, b.aor, cur, r->cfg.max_registrations_per_ext,
                          probe[oldest].contact,
                          (unsigned long)probe[oldest].expire_ms,
                          b.contact);
@@ -1211,8 +1404,7 @@ reg_auth_ok:
                         cur = loc_query(r->cfg.db, b.aor, probe, 32, now);
                         dup = 0;
                         for (int i = 0; i < cur; ++i) {
-                            if (strcmp(probe[i].contact, b.contact) == 0) { dup = 1; break; }
-                            if (b.callid[0] && strcmp(probe[i].callid, b.callid) == 0) { dup = 1; break; }
+                            if (is_dup_binding(&probe[i], &b)) { dup = 1; break; }
                         }
                         if (!dup && cur >= r->cfg.max_registrations_per_ext) {
                             char extra[128];
@@ -1231,7 +1423,34 @@ reg_auth_ok:
             }
         }
 
+        llog(LOG_INFO, "reg",
+             "loc_upsert-CALL user=%s aor=%s contact=%.80s expires_server=%ld "
+             "nat=%d instance=%.60s callid=%.60s src_ip=%s transport=%d",
+             _reg_user, b.aor, b.contact, exp, b.nat_detected,
+             b.instance[0] ? b.instance : "(none)",
+             b.callid[0]   ? b.callid   : "(none)",
+             b.received_ip[0] ? b.received_ip : src_ip,
+             b.transport_proto);
+
         loc_rc_t rc = loc_upsert(r->cfg.db, &b, now);
+        const char *rc_name =
+            rc == LOC_OK ? "OK" :
+            rc == LOC_FULL ? "FULL" :
+            rc == LOC_STALE_CSEQ ? "STALE_CSEQ" : "OTHER";
+        /* 正常 LOC_OK 走 INFO；FULL/STALE_CSEQ/EXPIRED 是注册被拒绝的信号 → WARN */
+        if (rc == LOC_OK) {
+            llog(LOG_INFO, "reg",
+                 "loc_upsert-RETURN user=%s rc=OK aor=%s contact=%.80s",
+                 _reg_user, b.aor, b.contact);
+        } else {
+            llog(LOG_WARN, "reg",
+                 "loc_upsert-RETURN user=%s rc=%d(%s) aor=%s contact=%.80s "
+                 "callid=%.60s cseq=%u expire_ms=%lu now=%lu",
+                 _reg_user,
+                 (int)rc, rc_name, b.aor, b.contact,
+                 b.callid[0] ? b.callid : "(none)",
+                 b.cseq, (unsigned long)b.expire_ms, (unsigned long)now);
+        }
         if (rc == LOC_FULL) {
             char extra[64];
             snprintf(extra, sizeof(extra), "Retry-After: %d\r\n",
@@ -1283,6 +1502,11 @@ reg_auth_ok:
         int w = snprintf(extra + used, sizeof(extra) - used,
                          "Expires: %ld\r\n", max_e);
         if (w > 0) used += (size_t)w;
+    } else if (removed_n > 0) {
+        /* 纯注销（当前无存活绑定，本次移除了 Contact）→ 顶层 Expires: 0 */
+        int w = snprintf(extra + used, sizeof(extra) - used,
+                         "Expires: 0\r\n");
+        if (w > 0) used += (size_t)w;
     }
     for (int i = 0; i < n; ++i) {
         long e = (long)((list[i].expire_ms - now) / 1000);
@@ -1299,7 +1523,23 @@ reg_auth_ok:
             break;
         used += (size_t)w;
     }
+    /* 追加被移除的 Contact 回显（RFC 3261 §10.3.5：expires=0） */
+    if (removed_n > 0 && removed_used > 0 &&
+        used + removed_used < sizeof(extra)) {
+        memcpy(extra + used, removed_ct, removed_used + 1);
+        used += removed_used;
+    }
     respond(r, proto, src, m, 200, extra[0] ? extra : NULL, NULL, 0, txn);
+
+    /* ===== 诊断：200 OK 最终返回汇总 ===== */
+    {
+        const char *_role_s =
+            ha_role() == HA_ROLE_ACTIVE ? "ACTIVE" : "STANDBY";
+        llog(LOG_INFO, "reg",
+             "REGISTER-200 user=%s aor=%s contacts_in_aor=%d expires_top=%ld "
+             "role=%s nc_this_register=%d",
+             _reg_user, aor, n, max_e, _role_s, nc);
+    }
     _rc = NSBC_OK; goto reg_out;
 
     /* ================================================================
