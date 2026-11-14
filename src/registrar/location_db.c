@@ -261,6 +261,19 @@ int loc_remove(loc_db_t *db, const char *aor, const char *contact)
     return removed;
 }
 
+void loc_db_clear_all(loc_db_t *db)
+{
+    if (!db) return;
+    for (int si = 0; si < LOC_SHARDS; si++) {
+        loc_shard_t *sh = &db->sh[si];
+        pthread_mutex_lock(&sh->lock);
+        for (int bi = 0; bi < LOC_AOR_BUCKETS; bi++)
+            sh->aors[bi] = NULL;
+        sh->n = 0;
+        pthread_mutex_unlock(&sh->lock);
+    }
+}
+
 int loc_query(loc_db_t *db, const char *aor, loc_binding_t *out, int max,
               uint64_t now_ms)
 {

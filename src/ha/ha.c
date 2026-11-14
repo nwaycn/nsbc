@@ -58,6 +58,9 @@ typedef struct {
     int loop_lag_ms;     /* 心跳线程调度滞后：系统压力粗粒度代理 */
 } ha_t;
 
+/* 前向声明（文件底部定义，Hitless Upgrade 部分先调用） */
+static uint64_t mono_ms(void);
+
 static ha_t *g_ha;
 static ha_repl_trans_t *g_repl_trans;
 static ha_bfd_t *g_bfd;
@@ -208,26 +211,187 @@ uint64_t ha_repl_last_ack(void)
     return ha_repl_trans_last_ack(g_repl_trans);
 }
 
-/* === HA P1 Hitless Upgrade 冻结 stub（骨架实现：纯 atomic flag）===
- * 正式接线时 b2bua.c INVITE 门控会读 ha_is_frozen()，为 1 时主机也拒绝新呼。 */
+/* === HA P1 Drain 活跃对话订阅链 ===
+ * Hitless Upgrade DRAIN 阶段轮询 — 所有业务模块 drain count 都为 0 才能 yield */
+#define HA_DRAIN_MAX 4
+typedef struct {
+    ha_drain_count_fn cb;
+    void *ud;
+} ha_drain_sub_t;
+
+static ha_drain_sub_t g_drain_subs[HA_DRAIN_MAX];
+static int g_drain_sub_count;
+
+int ha_drain_subscribe(ha_drain_count_fn cb, void *ud)
+{
+    if (!cb) return NSBC_INVAL;
+    for (int i = 0; i < g_drain_sub_count; i++)
+        if (g_drain_subs[i].cb == cb && g_drain_subs[i].ud == ud)
+            return NSBC_OK;   /* 幂等 */
+    if (g_drain_sub_count >= HA_DRAIN_MAX) {
+        llog(LOG_WARN, "ha", "drain subscriber FULL (max=%d)", HA_DRAIN_MAX);
+        return NSBC_NOSPC;
+    }
+    g_drain_subs[g_drain_sub_count].cb = cb;
+    g_drain_subs[g_drain_sub_count].ud = ud;
+    g_drain_sub_count++;
+    llog(LOG_INFO, "ha", "drain subscriber #%d cb=%p ud=%p",
+         g_drain_sub_count, (void *)cb, ud);
+    return NSBC_OK;
+}
+
+int64_t ha_drain_proxy(void)
+{
+    if (g_drain_sub_count == 0) return 0;   /* 无订阅 → 安全退化，立即 yield */
+    int64_t max_cnt = 0;
+    for (int i = 0; i < g_drain_sub_count; i++) {
+        int64_t c = g_drain_subs[i].cb(g_drain_subs[i].ud);
+        if (c > max_cnt) max_cnt = c;
+    }
+    return max_cnt;
+}
+
+/* === HA P1 Hitless Upgrade ===
+ * 完整时序: FREEZE → DRAIN (等 in-dialog BYE) → FULL push → YIELD → 进程退出
+ *
+ * 降级安全网:
+ *   ① 非 ACTIVE 触发 upgrade → 直接返回（STANDBY 不占 VIP，已经是备）
+ *   ② transport 未就绪 → 跳过 FULL push，直接 freeze → yield（丢状态但能切）
+ *   ③ drain 超时 → 强制 yield（不等 BYE）
+ *   ④ yield 后 keepalived track_process nsbcd → 摘 VIP → 新进程从 STANDBY 变 ACTIVE
+ */
 static int g_frozen;
+static uint64_t g_frozen_until_ms;   /* auto-unfreeze 时间戳（mono_ms），0=永不自动 */
+static int g_hitless_yield_requested;  /* 1 = 请求 heartbeat 线程把 ACTIVE 降 STANDBY */
+static int g_hitless_in_progress;       /* 防 upgrade 重入 */
 
 void ha_freeze_input(int freeze_ms)
 {
     __atomic_store_n(&g_frozen, 1, __ATOMIC_RELEASE);
-    llog(LOG_NOTICE, "ha", "hitless freeze input freeze_ms=%d", freeze_ms);
-    (void)freeze_ms; /* P1 skeleton: auto-unfreeze 定时器由 shm_seg publish path 触发 */
+    uint64_t until = 0;
+    if (freeze_ms > 0) {
+        until = mono_ms() + (uint64_t)freeze_ms;
+        __atomic_store_n(&g_frozen_until_ms, until, __ATOMIC_RELEASE);
+    }
+    llog(LOG_NOTICE, "ha", "hitless freeze input freeze_ms=%d auto_until=%llu",
+         freeze_ms, (unsigned long long)until);
 }
 
 void ha_unfreeze_input(void)
 {
     __atomic_store_n(&g_frozen, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_frozen_until_ms, 0ULL, __ATOMIC_RELEASE);
     llog(LOG_NOTICE, "ha", "hitless unfreeze input");
 }
 
 int ha_is_frozen(void)
 {
+    /* auto-unfreeze: 时间到了自动清 flag — 防止 upgrade 流程中断后永远 frozen */
+    uint64_t until = __atomic_load_n(&g_frozen_until_ms, __ATOMIC_ACQUIRE);
+    if (until > 0 && mono_ms() >= until) {
+        __atomic_store_n(&g_frozen, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_frozen_until_ms, 0ULL, __ATOMIC_RELEASE);
+        llog(LOG_WARN, "ha", "hitless auto-unfreeze (timeout)");
+        return 0;
+    }
     return __atomic_load_n(&g_frozen, __ATOMIC_ACQUIRE);
+}
+
+/* === 公共 API: Hitless Upgrade ===
+ * 调用方: OAM CLI "nsbctl hitless_upgrade" / 外部 HTTP API
+ * 流程: FREEZE → DRAIN (等 in-dialog BYE) → FULL push → YIELD → 返回
+ * 返回值: NSBC_OK=已触发；NSBC_NOENT=非 ACTIVE；NSBC_NOSPC=重入
+ * 注意: 本函数在调用方线程执行（可能是 API/CLI 线程），transport FULL push 是同步阻塞
+ *   （但只几 ms — ring 有界，send 用 poll 非阻塞）。heartbeat 线程会在下个仲裁周期
+ *   看到 g_hitless_yield_requested → role ACTIVE→STANDBY */
+int ha_hitless_upgrade(int force)
+{
+    (void)force;
+    if (__atomic_test_and_set(&g_hitless_in_progress, __ATOMIC_ACQ_REL)) {
+        llog(LOG_WARN, "ha", "hitless upgrade already in progress");
+        return NSBC_NOSPC;
+    }
+
+    if (ha_role() != HA_ROLE_ACTIVE) {
+        llog(LOG_INFO, "ha", "hitless: not ACTIVE (role=%d), skip", ha_role());
+        __atomic_clear(&g_hitless_in_progress, __ATOMIC_RELEASE);
+        return NSBC_NOENT;
+    }
+
+    llog(LOG_WARN, "ha", "=== Hitless Upgrade BEGIN ===");
+
+    /* Step 1: FREEZE input — b2bua INVITE gate 拒绝新呼 */
+    ha_freeze_input(0);  /* 0 = 永不自动（yield 后由新进程 unfreeze） */
+    llog(LOG_NOTICE, "ha", "hitless: FREEZE done — new INVITE rejected");
+
+    /* Step 2: DRAIN — 等 in-dialog BYE 让活跃对话降到 0
+     * 超时 30s（降级安全网：超时后继续 FULL push + yield 不阻塞升级）
+     * 订阅链由 b2bua init 时注册（返回 active 计数）
+     * 无订阅 → 安全退化（proxy 返回 0），立即进入 FULL push */
+#define HITLESS_DRAIN_TIMEOUT_MS 30000
+#define HITLESS_DRAIN_POLL_MS    200
+    {
+        int64_t drain_start = mono_ms();
+        int64_t last_cnt = -1;
+        while (1) {
+            int64_t cnt = ha_drain_proxy();
+            if (cnt != last_cnt) {
+                llog(LOG_INFO, "ha", "hitless DRAIN: active_calls=%lld", (long long)cnt);
+                last_cnt = cnt;
+            }
+            if (cnt == 0) {
+                llog(LOG_NOTICE, "ha",
+                     "hitless DRAIN: all calls BYE'd (took %lldms)",
+                     (long long)(mono_ms() - drain_start));
+                break;
+            }
+            if (mono_ms() - drain_start > HITLESS_DRAIN_TIMEOUT_MS) {
+                llog(LOG_WARN, "ha",
+                     "hitless DRAIN TIMEOUT after %dms — force yield (active=%lld)",
+                     HITLESS_DRAIN_TIMEOUT_MS, (long long)cnt);
+                break;
+            }
+            struct timespec ts = {0, HITLESS_DRAIN_POLL_MS * 1000 * 1000};
+            nanosleep(&ts, NULL);
+        }
+    }
+
+    /* Step 3: FULL push — 把完整快照推给 STANDBY（不等 FULL_REQ） */
+    if (g_repl_trans) {
+        int rc = ha_repl_trans_force_full_push(g_repl_trans);
+        if (rc == NSBC_OK) {
+            llog(LOG_NOTICE, "ha", "hitless: FULL push OK");
+        } else if (rc == NSBC_NOENT) {
+            /* STANDBY 没连上 transport — 跳过 FULL，继续 yield
+             * 降级: STANDBY loc_db 只有之前热备的数据，failover 后可能丢 in-flight
+             * Hitless 目标不完美但能切 — keepalived track_process 会摘 VIP */
+            llog(LOG_WARN, "ha", "hitless: STANDBY transport not connected — skip FULL push (degrade)");
+        } else {
+            llog(LOG_WARN, "ha", "hitless: FULL push skipped rc=%d", rc);
+        }
+    }
+
+    /* Step 3: request yield — heartbeat 线程看到后 role ACTIVE→STANDBY */
+    __atomic_store_n(&g_hitless_yield_requested, 1, __ATOMIC_RELEASE);
+    llog(LOG_NOTICE, "ha", "hitless: yield requested → heartbeat thread will switch role");
+
+    /* Step 4: 等 heartbeat 线程切换（最多 1.5s，仲裁周期 250ms × 6） */
+    uint64_t deadline = mono_ms() + 1500;
+    while (mono_ms() < deadline) {
+        if (ha_role() == HA_ROLE_STANDBY) break;
+        struct timespec ts = {0, 50 * 1000 * 1000};  /* 50ms */
+        nanosleep(&ts, NULL);
+    }
+
+    /* Step 5: 收尾 */
+    if (ha_role() == HA_ROLE_STANDBY) {
+        llog(LOG_NOTICE, "ha", "=== Hitless Upgrade DONE (now STANDBY) ===");
+    } else {
+        llog(LOG_WARN, "ha", "=== Hitless Upgrade TIMEOUT (still ACTIVE after 1.5s) ===");
+    }
+    __atomic_store_n(&g_hitless_yield_requested, 0, __ATOMIC_RELEASE);
+    __atomic_clear(&g_hitless_in_progress, __ATOMIC_RELEASE);
+    return NSBC_OK;
 }
 
 static uint64_t mono_ms(void)
@@ -456,6 +620,16 @@ static void *ha_main(void *arg)
             }
         } else {
             h->unhealthy_run = 0;
+        }
+
+        /* === Hitless Upgrade 强制 yield ===
+         * 由 ha_hitless_upgrade() 置 g_hitless_yield_requested=1
+         * 仲裁周期内看到后立即 want=STANDBY（不等健康门防抖） */
+        if (want == HA_ROLE_ACTIVE &&
+            __atomic_load_n(&g_hitless_yield_requested, __ATOMIC_ACQUIRE)) {
+            want = HA_ROLE_STANDBY;
+            llog(LOG_WARN, "ha",
+                 "Hitless Upgrade yield request → role ACTIVE→STANDBY");
         }
 
         if (want != h->role) {

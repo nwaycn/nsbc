@@ -3534,6 +3534,39 @@ void bridge_release_call(bridge_mgr_t *m, void *call)
     llog(LOG_INFO, "media", "bridge_release_call: call=%p NOT FOUND in shard", call);
 }
 
+/* ★ HA P1: 反向绑定 — 给定新 call_key 挂入 bridge_mgr shard。
+ * 和 bridge_release_call 对称：同 ptr_shard → 同 shard 锁 → 同 cnode 生命周期。
+ * rebuild 侧负责 rtp_relay_start + set_peer 把 relay 内部状态建好再调此函数。 */
+int bridge_register_call(bridge_mgr_t *m, void *call_key,
+                         rtp_relay_t *relay, mb_mode_t mode)
+{
+    if (!m || !call_key || !relay) return NSBC_INVAL;
+
+    br_shard_t *s = &m->sh[ptr_shard(call_key)];
+    pthread_mutex_lock(&s->lock);
+
+    /* 幂等: 已存在就跳过。FULL resync 重发同一 dialog 多次时这里会 hit */
+    cnode_t *dup = entry_find(m, call_key);
+    if (dup) {
+        pthread_mutex_unlock(&s->lock);
+        return NSBC_AGAIN;
+    }
+
+    cnode_t *ne = malloc(sizeof(*ne));
+    if (!ne) { pthread_mutex_unlock(&s->lock); return NSBC_NOMEM; }
+    memset(ne, 0, sizeof(*ne));
+    ne->call  = call_key;
+    ne->relay = relay;
+    ne->mode  = mode;
+    ne->next  = s->head;
+    s->head   = ne;
+
+    pthread_mutex_unlock(&s->lock);
+    llog(LOG_INFO, "media", "HA rebuild: bridge_register_call call=%p relay=%p mode=%d",
+         call_key, (void *)relay, mode);
+    return NSBC_OK;
+}
+
 /* ======================================================================
  * REQ-AI-001：RTP payload 注入（给 ai_dialog / hold / 未来 broadcast 用）
  * 桥接层只做：找 relay → 选 dst（latch 优先 peer fallback）→ 构造 RTP 头 → sendto

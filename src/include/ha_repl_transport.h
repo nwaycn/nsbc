@@ -27,7 +27,15 @@ extern "C" {
 /* HaReplV1 帧头 16 字节（网络字节序） */
 #define HA_REPL_FRAME_MAGIC     0x4852u  /* "HR" */
 #define HA_REPL_FRAME_VER       1u
-#define HA_REPL_FRAME_ACK_TYPE  0xFFu   /* 备端 ACK 帧 type */
+#define HA_REPL_FRAME_ACK_TYPE  0xFFu   /* 备端 ACK 帧 type (payload_len=applied_seq) */
+#define HA_REPL_FRAME_GAP_REQ_TYPE 0xFEu  /* 备端请求主端重发缺口 */
+#define HA_REPL_FRAME_FULL_REQ_TYPE 0xFDu /* 备端请求主端推全量快照 */
+
+/* GAP_REQ payload：两个 uint64_t (gap_start 期望 seq, gap_end 收到的 seq) */
+typedef struct {
+    uint64_t gap_start;   /* 期望但缺失的起始 seq */
+    uint64_t gap_end;     /* 实际收到的 seq（中间 gap_start..gap_end-1 缺失） */
+} ha_repl_gap_req_t;
 
 typedef struct {
     uint16_t magic;
@@ -79,6 +87,12 @@ void ha_repl_trans_notify_role(ha_repl_trans_t *t, ha_role_t role);
 
 /* ACK 水位（OAM 只读） */
 uint64_t ha_repl_trans_last_ack(ha_repl_trans_t *t);
+
+/* Hitless Upgrade：ACTIVE 主动触发 FULL push（不等 STANDBY 发 FULL_REQ）
+ * 用于 ACTIVE 要让位前把完整状态快照先推给 STANDBY，确保切换零丢状态。
+ * 非 ACTIVE 或 transport 未就绪 → 返回 NSBC_NOENT。
+ * 内部异步执行（transport 线程），本函数立即返回。 */
+int ha_repl_trans_force_full_push(ha_repl_trans_t *t);
 
 #ifdef __cplusplus
 }

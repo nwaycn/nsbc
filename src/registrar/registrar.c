@@ -497,6 +497,16 @@ static int reg_repl_apply(void *ud, const repl_rec_t *rec)
 {
     reg_core_t *r = ud;
     if (!r || !rec) return NSBC_INVAL;
+
+    /* === REPL_FULL_CLEAR (type=REPL_FULL, len=0): FULL resync 起始 ===
+     * 主端 FULL push 第一帧 — 清 loc_db 内存；然后后续 REPL_REG 帧逐条装
+     * 只清内存 — 不调 reg_push（防双写 DB） */
+    if (rec->type == REPL_FULL && rec->len == 0) {
+        loc_db_clear_all(r->cfg.db);
+        llog(LOG_NOTICE, "reg", "HA FULL resync: loc_db cleared");
+        return NSBC_OK;
+    }
+
     if (rec->type != REPL_REG)
         return NSBC_OK;   /* 不是 REPL_REG，跳过（b2bua 负责 REPL_DIALOG） */
     if (rec->len < sizeof(loc_binding_t))

@@ -64,6 +64,24 @@ void ha_freeze_input(int freeze_ms);
 void ha_unfreeze_input(void);
 int  ha_is_frozen(void);
 
+/* === HA P1 Hitless Upgrade 公共入口 ===
+ * 调用方: OAM CLI / HTTP API 触发升级
+ * 流程: FREEZE → DRAIN (等 in-dialog BYE) → FULL push → YIELD ACTIVE→STANDBY → 返回
+ * force: 预留，当前忽略
+ * 返回: NSBC_OK=已触发；NSBC_NOENT=非 ACTIVE；NSBC_NOSPC=重入 */
+int ha_hitless_upgrade(int force);
+
+/* === HA P1 Drain 活跃对话查询订阅（Hitless Upgrade DRAIN 阶段用）===
+ * drain 阶段：FREEZE 后拒绝新呼，等 in-dialog BYE 让 active_count 降到 0 再 yield。
+ * 业务模块（b2bua）在 init 时注册 — 返回当前活跃对话数（0=空，可以 yield）。
+ * 返回值: 0=注册成功；<0=已满（MAX_DRAIN_SUBSCRIBERS=4） */
+typedef int64_t (*ha_drain_count_fn)(void *ud);
+int ha_drain_subscribe(ha_drain_count_fn cb, void *ud);
+
+/* DRAIN proxy — 遍历订阅链取最小活跃数（多个业务模块取 max）。
+ * 返回 max 活跃数；无订阅时返回 0（安全退化，立即 yield）。 */
+int64_t ha_drain_proxy(void);
+
 /* HA P1 只读 OAM（repl connected / ack 水位） */
 int      ha_repl_connected(void);
 uint64_t ha_repl_last_ack(void);

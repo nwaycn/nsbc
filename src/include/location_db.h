@@ -82,6 +82,10 @@ loc_rc_t loc_upsert(loc_db_t *db, const loc_binding_t *b, uint64_t now_ms);
 /* 删单个 contact（contact=NULL 或 "*"：整 AoR 注销）。返回删除条数 */
 int loc_remove(loc_db_t *db, const char *aor, const char *contact);
 
+/* FULL resync 起始：清空整个 loc_db 内存。
+ * slab 不 free（重用），只 shard 链表置 NULL、n=0。 */
+void loc_db_clear_all(loc_db_t *db);
+
 /* 查询有效绑定（按 q 降序）；返回复制条数 */
 int loc_query(loc_db_t *db, const char *aor, loc_binding_t *out, int max,
               uint64_t now_ms);

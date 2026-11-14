@@ -150,6 +150,17 @@ int bridge_answer_hook(void *call_key, const char *in, size_t inlen,
 /* 呼叫结束释放（挂 b2b terminate；P0 由 media confirm 回调反注册兜底） */
 void bridge_release_call(bridge_mgr_t *m, void *call_key);
 
+/* ★ HA P1: STANDBY → ACTIVE failover 时重建 call_key→relay 绑定。
+ * call_key 是新的 b2b_call_t*（rebuild 侧 mem_slab_alloc 来的，
+ * 和 ACTIVE 侧原 call_key 不同 — bridge_mgr 内部表要认新 key）。
+ * relay 是调用方（b2b rebuild）刚 rtp_relay_start + set_peer 好的。
+ * mode 通常是 MB_SIMPLE_RELAY / MB_TRANSCODE / MB_SRTP_RELAY。
+ *
+ * 幂等: 已存在就跳过（返回 NSBC_AGAIN）。
+ * 只挂 shard 链表，不触发 reactor/转发线程（relay 内部状态已由调用方建好）。 */
+int bridge_register_call(bridge_mgr_t *m, void *call_key,
+                         rtp_relay_t *relay, mb_mode_t mode);
+
 /* 两侧 SDP 齐备后的最终模式确认（挂 b2b media 回调）：
  * 已建 relay 实例不降级 bypass（媒体面已锚定）；决策为 transcode 时把
  * 模式落账供诊断（执行引擎 P1，本函数不改变转发路径）。 */

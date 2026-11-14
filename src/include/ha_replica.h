@@ -62,6 +62,9 @@ void repl_set_ops(ha_repl_t *r,
                   int (*on_gap)(void *ud, uint64_t expect, uint64_t got),
                   void *ud);
 
+/* FULL resync 期间：跳过 gap 判定，接受任意 seq（避免 CLEAR 帧 seq 跳变触发 false gap） */
+void repl_set_accept_any_seq(ha_repl_t *r, int v);
+
 /* 主端：发布变更（填 seq/入环/回调 send）。返回发布 seq，<0 错误码。
  * 环满（备端长期 ACK 落后）返回 NOSPC——调用方转全量/告警，不阻塞。 */
 int64_t repl_publish(ha_repl_t *r, repl_type_t type, uint16_t ver,
@@ -78,7 +81,13 @@ void repl_resync_done(ha_repl_t *r, uint64_t snapshot_seq);
 /* OAM 只读水位 */
 uint64_t repl_published_seq(ha_repl_t *r);
 uint64_t repl_applied_seq(ha_repl_t *r);
+uint64_t repl_ack_seq(ha_repl_t *r);
 uint64_t repl_gap_count(ha_repl_t *r);
+
+/* ACTIVE 重发：按 seq 从 ring 取出对应 repl_rec_t。
+ * 返回 NULL 表示 seq 不在 ring 范围（已被 ack 淘汰 / 未 publish）。
+ * 主端 on_gap 收到备端 GAP_REQ 时用此函数重发 gap_start..gap_end */
+const repl_rec_t *repl_at(ha_repl_t *r, uint64_t seq);
 
 const char *repl_type_name(repl_type_t t);
 

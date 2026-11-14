@@ -526,6 +526,19 @@ static int b2b_repl_apply(void *ud, const repl_rec_t *rec)
 {
     b2b_core_t *co = ud;
     if (!co || !rec) return NSBC_INVAL;
+
+    /* === REPL_FULL_CLEAR (type=REPL_FULL, len=0): FULL resync 起始 ===
+     * 主端 FULL push 第一帧 — 清 ha_dlg_buf 内存；然后后续 REPL_DIALOG 帧逐条装
+     * co 内部当前 shard hash 不动 — ha_dlg_buf 只用于 failover rebuild 起点 */
+    if (rec->type == REPL_FULL && rec->len == 0) {
+        pthread_mutex_lock(&co->ha_dlg_lock);
+        co->ha_dlg_head = 0;
+        memset(co->ha_dlg_buf, 0, sizeof(co->ha_dlg_buf));
+        pthread_mutex_unlock(&co->ha_dlg_lock);
+        llog(LOG_NOTICE, "b2b", "HA FULL resync: ha_dlg_buf cleared");
+        return NSBC_OK;
+    }
+
     if (rec->type != REPL_DIALOG && rec->type != REPL_FULL)
         return NSBC_OK;   /* 不是 dialog/full — 跳过 */
     /* round-robin 存快照 — repl_rec_t 自身 payload[REPL_PAYLOAD_MAX] 已含完整数据 */
@@ -548,69 +561,181 @@ static int b2b_repl_apply(void *ud, const repl_rec_t *rec)
  * 线程安全：role_switch_proxy 在 ha 心跳线程调用 — co 内部 shard 锁 + slab 内部锁
  * 保证 tbl_link 和 mem_slab_alloc_direct 安全。ha_dlg_lock 保护 buf 遍历。 */
 
-/* CONFIRMED payload 扁平布局（对应 publish 时的 repl_dialog_v1_t） */
+/* CONFIRMED payload 扁平布局（v3，对应 publish 的 repl_dialog_v3_t）
+ * profile + relay + codec 完整字段 — rebuild 能重建对话 + 媒体 anchor */
 typedef struct {
-    uint8_t  action;      /* 0=CONFIRMED, 1=END */
-    char callid_a[128];
-    char callid_b[128];
+    uint8_t  action;
+    uint8_t  media_done;
+    uint8_t  hangup_by;
+    uint8_t  hold_legs;
+    char callid_a[80];
+    char callid_b[80];
+    char loc_tag_a[32];
+    char rem_tag_a[32];
+    char loc_tag_b[32];
+    char rem_tag_b[32];
     char aor[256];
+    char prof_name[128];
+    char orig_to[128];
+    char clip[48];
+    char dst_number[48];
     uint32_t cseq_a;
     uint32_t cseq_b;
+    uint64_t start_ms;
     uint8_t  leg0_state;
     uint8_t  leg1_state;
+    uint8_t  a_final;
+    /* ★ v3: media anchor */
+    uint16_t a_rtp, a_rtcp;
+    uint16_t b_rtp, b_rtcp;
+    uint8_t  relay_latched_a;
+    uint8_t  relay_latched_b;
+    uint8_t  relay_mode;
+    char peer_a_ip[INET6_ADDRSTRLEN];
+    char peer_b_ip[INET6_ADDRSTRLEN];
+    uint16_t peer_a_port;
+    uint16_t peer_b_port;
+    uint8_t  codec_pt_a;
+    uint8_t  codec_pt_b;
+    uint16_t codec_cr_a;
+    uint16_t codec_cr_b;
+    uint32_t ssrc_a;
+    uint32_t ssrc_b;
 } b2b_repl_dlg_confirm_t;
 
 static int b2b_repl_rebuild_from_buf(b2b_core_t *co)
 {
     if (!co) return NSBC_INVAL;
-    int rebuilt = 0;
+    int rebuilt = 0, dup = 0, rebuilt_relay = 0;
 
-    /* 拿 ha_dlg_lock 保护 buf 遍历（transport recv 线程 apply 也写这个 buf） */
     pthread_mutex_lock(&co->ha_dlg_lock);
     uint64_t buf_head_at_rebuild = co->ha_dlg_head;
 
-    /* round-robin buf 是循环覆盖：直接遍历所有 HA_REPL_DIALOG_BUF_MAX 槽
-     * （0..255），每个槽要么是有效 REPL_DIALOG 条目，要么是旧数据/空槽。
-     * 由 repl_rec_t.type/len 过滤无效条目。 */
     for (int slot = 0; slot < HA_REPL_DIALOG_BUF_MAX; slot++) {
         const repl_rec_t *rec = &co->ha_dlg_buf[slot];
         if (rec->type != REPL_DIALOG) continue;
         if (rec->len < sizeof(b2b_repl_dlg_confirm_t)) continue;
 
         const uint8_t *p = (const uint8_t *)rec->payload;
-        if (p[0] != 0) continue;  /* action != CONFIRMED → 跳过（END 或非法） */
+        if (p[0] != 0) continue;   /* action=1 END 跳过 */
 
         const b2b_repl_dlg_confirm_t *dlg = (const b2b_repl_dlg_confirm_t *)p;
-        if (dlg->callid_a[0] == '\0' || dlg->callid_b[0] == '\0') continue;
+        if (dlg->callid_a[0] == '\0') continue;
 
-        /* mem_slab 分配 call — slab 内部自带锁，安全 */
+        /* 去重: tbl_find 按 callid_a / callid_b 先查 — 防止 FULL push 重发
+         * 同一 dialog 被重复挂链（孤儿 link 后续 BYE 找不到 anchor） */
+        b2b_call_t *existing = NULL;
+        existing = tbl_find(co, dlg->callid_a, strlen(dlg->callid_a), NULL);
+        if (!existing && dlg->callid_b[0])
+            existing = tbl_find(co, dlg->callid_b, strlen(dlg->callid_b), NULL);
+        if (existing) { dup++; continue; }
+
         b2b_call_t *c = mem_slab_alloc_direct(co->slab);
         if (c == NULL) {
-            llog(LOG_WARN, "b2b", "HA rebuild: slab alloc failed callid_a=%s",
-                 dlg->callid_a);
+            llog(LOG_WARN, "b2b", "HA rebuild: slab alloc failed callid_a=%s", dlg->callid_a);
             continue;
         }
         memset(c, 0, sizeof(*c));
         pthread_mutex_init(&c->lock, NULL);
-        c->active = 1;
 
-        /* leg[0] = 主叫侧 (callid_a), leg[1] = 被叫侧 (callid_b) */
+        /* leg[0] 主叫侧 */
         snprintf(c->leg[0].callid, sizeof(c->leg[0].callid), "%s", dlg->callid_a);
-        snprintf(c->leg[1].callid, sizeof(c->leg[1].callid), "%s", dlg->callid_b);
+        snprintf(c->leg[0].loc_tag, sizeof(c->leg[0].loc_tag), "%s", dlg->loc_tag_a);
+        snprintf(c->leg[0].rem_tag, sizeof(c->leg[0].rem_tag), "%s", dlg->rem_tag_a);
+        c->leg[0].cseq = (int32_t)dlg->cseq_a;
         c->leg[0].state = (leg_state_t)dlg->leg0_state;
+
+        /* leg[1] 被叫侧 */
+        snprintf(c->leg[1].callid, sizeof(c->leg[1].callid), "%s", dlg->callid_b);
+        snprintf(c->leg[1].loc_tag, sizeof(c->leg[1].loc_tag), "%s", dlg->loc_tag_b);
+        snprintf(c->leg[1].rem_tag, sizeof(c->leg[1].rem_tag), "%s", dlg->rem_tag_b);
+        c->leg[1].cseq = (int32_t)dlg->cseq_b;
         c->leg[1].state = (leg_state_t)dlg->leg1_state;
 
+        /* call 顶层 flag — in-dialog BYE/re-INVITE 续接路径依赖这些值 */
+        c->active     = 1;   /* 关键: b2b_active_count 计数依赖 active==1 */
+        c->dead       = 0;   /* 让 b2b_on_bye/reinvite 进正常分支 */
+        c->media_done = dlg->media_done;
+        c->hangup_by  = dlg->hangup_by;
+        c->hold_legs  = dlg->hold_legs;
+        c->a_final    = dlg->a_final;
+        c->start_ms   = dlg->start_ms;
+
+        snprintf(c->orig_to,   sizeof(c->orig_to),   "%s", dlg->orig_to);
+        snprintf(c->clip,      sizeof(c->clip),      "%s", dlg->clip);
+        snprintf(c->dst_number,sizeof(c->dst_number),"%s", dlg->dst_number);
+
+        /* ★ v3: profile 查找 — STANDBY profile module 也预加载了同一批 profile，
+         * 按名字能查到 → prof 字段有效；查不到则 prof=NULL 降级 */
+        if (dlg->prof_name[0]) {
+            c->prof = sip_profile_find(dlg->prof_name);
+            if (!c->prof && dlg->aor[0])
+                c->prof = sip_profile_find(dlg->aor);  /* fallback */
+        }
+
+        /* ★ v3: relay 完整重建 — ACTIVE 侧 bridge_lookup_relay 打平的 ports+peer+mode
+         * STANDBY→ACTIVE 时 RTPPROXY 进程仍在跑（同一个 nsbcd 进程里），
+         * 可以直接 rtp_relay_start + set_peer_a/b + bridge_register_call 完整重建 */
+        if (dlg->a_rtp && dlg->b_rtp) {
+            nsbc_ctx_t *ha_ctx = nsbc_get_ctx();
+            bridge_mgr_t *bm = ha_ctx ? (bridge_mgr_t *)ha_ctx->bridge : NULL;
+            if (bm) {
+                relay_ports_t rp; memset(&rp, 0, sizeof(rp));
+                rp.a_rtp = dlg->a_rtp; rp.b_rtp = dlg->b_rtp;
+                /* a_rtcp 固定 = a_rtp + 1；b_rtcp 同理（RTP 标准约定） */
+                rp.a_rtcp = (uint16_t)(rp.a_rtp + 1);
+                rp.b_rtcp = (uint16_t)(rp.b_rtp + 1);
+
+                rtp_relay_t *rl = NULL;
+                if (rtp_relay_start(bm, &rl, &rp, 0, 0) == NSBC_OK && rl) {
+                    /* peer A + peer B — 按 payload 里的 IP + port 重建 */
+                    nsbc_sa_t peer_a; memset(&peer_a, 0, sizeof(peer_a));
+                    nsbc_sa_t peer_b; memset(&peer_b, 0, sizeof(peer_b));
+                    if (dlg->peer_a_ip[0]) {
+                        struct sockaddr_in *sin = (struct sockaddr_in *)&peer_a;
+                        sin->sin_family = AF_INET;
+                        sin->sin_port   = htons(dlg->peer_a_port);
+                        inet_pton(AF_INET, dlg->peer_a_ip, &sin->sin_addr);
+                        rtp_relay_set_peer_a(rl, &peer_a);
+                    }
+                    if (dlg->peer_b_ip[0]) {
+                        struct sockaddr_in *sin = (struct sockaddr_in *)&peer_b;
+                        sin->sin_family = AF_INET;
+                        sin->sin_port   = htons(dlg->peer_b_port);
+                        inet_pton(AF_INET, dlg->peer_b_ip, &sin->sin_addr);
+                        rtp_relay_set_peer_b(rl, &peer_b);
+                    }
+
+                    mb_mode_t mode = MB_RELAY;
+                    if (dlg->relay_mode && dlg->relay_mode <= MB_SRTP_RELAY)
+                        mode = (mb_mode_t)dlg->relay_mode;
+                    int rc = bridge_register_call(bm, c, rl, mode);
+                    if (rc != NSBC_OK && rc != NSBC_AGAIN) {
+                        llog(LOG_WARN, "b2b",
+                             "HA rebuild: bridge_register_call failed rc=%d callid=%s",
+                             rc, dlg->callid_a);
+                    } else {
+                        rebuilt_relay++;
+                    }
+                } else {
+                    llog(LOG_WARN, "b2b",
+                         "HA rebuild: rtp_relay_start failed callid=%s a_rtp=%d b_rtp=%d",
+                         dlg->callid_a, dlg->a_rtp, dlg->b_rtp);
+                }
+            }
+        }
+
         /* 挂进 shard hash — tbl_link 内部自己拿 shard->lock */
-        tbl_link(co, c, 0);
-        tbl_link(co, c, 1);
+        tbl_link(co, c, 0);  /* callid_a shard */
+        tbl_link(co, c, 1);  /* callid_b shard */
 
         rebuilt++;
     }
     pthread_mutex_unlock(&co->ha_dlg_lock);
 
     llog(LOG_NOTICE, "b2b",
-         "HA rebuild_from_buf: rebuilt=%d buf_head=%llu",
-         rebuilt, (unsigned long long)buf_head_at_rebuild);
+         "HA rebuild_from_buf: rebuilt=%d dup=%d rebuilt_relay=%d buf_head=%llu",
+         rebuilt, dup, rebuilt_relay, (unsigned long long)buf_head_at_rebuild);
     return NSBC_OK;
 }
 
@@ -623,6 +748,26 @@ static void b2b_repl_on_role_switch(void *ud, ha_role_t role)
         b2b_repl_rebuild_from_buf(co);
     }
     /* role=STANDBY 时不做 — 新 ACTIVE 切过来时 ha_dlg_buf 已经在 STANDBY 侧写好了 */
+}
+
+/* === HA P1: Hitless Upgrade DRAIN — 返回活跃对话数 ===
+ * 遍历 call_shard，统计 active=1 的 call_t。
+ * 线程安全：每 shard 自己的 lock 保护链表，加锁遍历安全。 */
+int64_t b2b_active_count(b2b_core_t *co)
+{
+    if (!co) return 0;
+    int64_t cnt = 0;
+    for (int si = 0; si < B2B_CALL_SHARDS; si++) {
+        pthread_mutex_lock(&co->sh[si].lock);
+        call_link_t *l = co->sh[si].head;
+        while (l) {
+            b2b_call_t *c = l->call;
+            if (c && c->active) cnt++;
+            l = l->next;
+        }
+        pthread_mutex_unlock(&co->sh[si].lock);
+    }
+    return cnt;
 }
 
 int b2b_core_create(const b2b_cfg_t *cfg, b2b_core_t **out)
@@ -709,6 +854,14 @@ int b2b_core_create(const b2b_cfg_t *cfg, b2b_core_t **out)
     pthread_mutex_init(&co->ha_dlg_lock, NULL);
     ha_repl_subscribe_apply(b2b_repl_apply, co);
     ha_repl_subscribe_role_switch(b2b_repl_on_role_switch, co);
+
+    /* === HA P1 Hitless Upgrade DRAIN 订阅 ===
+     * ha_hitless_upgrade FREEZE 后轮询此回调 — 返回当前活跃对话数
+     * drain 阶段等它降到 0 再 FULL push + yield */
+    {
+        extern int64_t b2b_active_count(b2b_core_t *co);
+        ha_drain_subscribe((ha_drain_count_fn)b2b_active_count, co);
+    }
 
     *out = co;
     return NSBC_OK;
@@ -2766,30 +2919,108 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                 c->leg[1].state = LEG_CONFIRMED;
 
                 /* === HA P1: ACTIVE → REPL_DIALOG publish（INVITE 建立对话锚点） ===
-                 * b2b_call_t 是 opaque struct（定义在本文件内部），选关键字段打平传输。
-                 * payload 第 1 字节 action=0 (DIALOG_CONFIRMED)；action=1 是 END */
+                 * v3 payload：在 v2 call 状态机基础上，追加 profile 查找名 + relay 端口
+                 * + peer 地址 + codec 协商 — rebuild 时能完整重建对话 + 媒体 anchor */
                 {
                     typedef struct {
                         uint8_t  action;      /* 0=CONFIRMED, 1=END */
-                        char callid_a[128];   /* leg[0].callid 主叫侧 */
-                        char callid_b[128];   /* leg[1].callid 被叫侧 */
-                        char aor[256];        /* prof->name（tenant） */
+                        uint8_t  media_done;
+                        uint8_t  hangup_by;
+                        uint8_t  hold_legs;
+                        char callid_a[80];
+                        char callid_b[80];
+                        char loc_tag_a[32];
+                        char rem_tag_a[32];
+                        char loc_tag_b[32];
+                        char rem_tag_b[32];
+                        char aor[256];
+                        char prof_name[128];  /* ★ v3: profile module 按名查用 */
+                        char orig_to[128];
+                        char clip[48];
+                        char dst_number[48];
                         uint32_t cseq_a;
                         uint32_t cseq_b;
-                        uint8_t  leg0_state;  /* LEG_CONFIRMED=3 等枚举值 */
+                        uint64_t start_ms;
+                        uint8_t  leg0_state;
                         uint8_t  leg1_state;
-                    } repl_dialog_v1_t;
-                    repl_dialog_v1_t dlg; memset(&dlg, 0, sizeof(dlg));
-                    dlg.action = 0;  /* REPL_DIALOG_ACTION_CONFIRMED */
+                        uint8_t  a_final;
+                        /* ★ v3: media anchor — relay 端口 + 对端地址 + codec 协商 */
+                        uint16_t a_rtp, a_rtcp;   /* relay 朝 A 侧 */
+                        uint16_t b_rtp, b_rtcp;   /* relay 朝 B 侧 */
+                        uint8_t  relay_latched_a; /* peer A 是否已 latch */
+                        uint8_t  relay_latched_b; /* peer B 是否已 latch */
+                        uint8_t  relay_mode;      /* mb_mode_t: RELAY/BYPASS/SRTP */
+                        char peer_a_ip[INET6_ADDRSTRLEN];
+                        char peer_b_ip[INET6_ADDRSTRLEN];
+                        uint16_t peer_a_port;
+                        uint16_t peer_b_port;
+                        uint8_t  codec_pt_a;      /* payload type (PCMU=0, G722=9...) */
+                        uint8_t  codec_pt_b;
+                        uint16_t codec_cr_a;      /* clock rate (8000=PCMU, 16000=G722) */
+                        uint16_t codec_cr_b;
+                        uint32_t ssrc_a;
+                        uint32_t ssrc_b;
+                    } repl_dialog_v3_t;
+                    repl_dialog_v3_t dlg; memset(&dlg, 0, sizeof(dlg));
+                    dlg.action = 0;
+                    dlg.media_done = (uint8_t)c->media_done;
+                    dlg.hold_legs = c->hold_legs;
                     snprintf(dlg.callid_a, sizeof(dlg.callid_a), "%s", c->leg[0].callid);
                     snprintf(dlg.callid_b, sizeof(dlg.callid_b), "%s", c->leg[1].callid);
-                    if (c->prof)
-                        snprintf(dlg.aor, sizeof(dlg.aor), "%s", c->prof->name);
-                    dlg.cseq_a = c->leg[0].cseq;
-                    dlg.cseq_b = c->leg[1].cseq;
-                    dlg.leg0_state = (uint8_t)c->leg[0].state;
-                    dlg.leg1_state = (uint8_t)c->leg[1].state;
-                    int64_t rc = ha_repl_publish(REPL_DIALOG, 2, &dlg, sizeof(dlg));
+                    snprintf(dlg.loc_tag_a, sizeof(dlg.loc_tag_a), "%s", c->leg[0].loc_tag);
+                    snprintf(dlg.rem_tag_a, sizeof(dlg.rem_tag_a), "%s", c->leg[0].rem_tag);
+                    snprintf(dlg.loc_tag_b, sizeof(dlg.loc_tag_b), "%s", c->leg[1].loc_tag);
+                    snprintf(dlg.rem_tag_b, sizeof(dlg.rem_tag_b), "%s", c->leg[1].rem_tag);
+                    if (c->prof) {
+                        snprintf(dlg.aor,      sizeof(dlg.aor),      "%s", c->prof->name);
+                        snprintf(dlg.prof_name,sizeof(dlg.prof_name),"%s", c->prof->name);
+                    }
+                    snprintf(dlg.orig_to,    sizeof(dlg.orig_to),    "%s", c->orig_to);
+                    snprintf(dlg.clip,       sizeof(dlg.clip),       "%s", c->clip);
+                    snprintf(dlg.dst_number, sizeof(dlg.dst_number), "%s", c->dst_number);
+                    dlg.cseq_a    = (uint32_t)c->leg[0].cseq;
+                    dlg.cseq_b    = (uint32_t)c->leg[1].cseq;
+                    dlg.start_ms  = c->start_ms;
+                    dlg.leg0_state= (uint8_t)c->leg[0].state;
+                    dlg.leg1_state= (uint8_t)c->leg[1].state;
+                    dlg.a_final   = (uint8_t)c->a_final;
+
+                    /* ★ v3: relay info — bridge_mgr 按 call_key (b2b_call_t*) 查 */
+                    {
+                        nsbc_ctx_t *ha_ctx = nsbc_get_ctx();
+                        bridge_mgr_t *bm = ha_ctx ? (bridge_mgr_t *)ha_ctx->bridge : NULL;
+                        if (bm) {
+                            rtp_relay_t *rl = NULL;
+                            nsbc_sa_t p2[2];
+                            if (bridge_lookup_relay(bm, c, &rl, p2) == NSBC_OK && rl) {
+                                dlg.a_rtp = rtp_relay_port(rl, 0);
+                                dlg.b_rtp = rtp_relay_port(rl, 1);
+                                dlg.relay_latched_a = (uint8_t)rtp_relay_latched(rl, 0);
+                                dlg.relay_latched_b = (uint8_t)rtp_relay_latched(rl, 1);
+                                /* peer 地址打平 */
+                                if (p2[0].ss.ss_family) {
+                                    char ip[INET6_ADDRSTRLEN];
+                                    if (inet_ntop(p2[0].ss.ss_family,
+                                                  (const void *)&p2[0].ss,
+                                                  ip, sizeof(ip))) {
+                                        snprintf(dlg.peer_a_ip, sizeof(dlg.peer_a_ip), "%s", ip);
+                                    }
+                                    dlg.peer_a_port = nsbc_sa_port(&p2[0]);
+                                }
+                                if (p2[1].ss.ss_family) {
+                                    char ip[INET6_ADDRSTRLEN];
+                                    if (inet_ntop(p2[1].ss.ss_family,
+                                                  (const void *)&p2[1].ss,
+                                                  ip, sizeof(ip))) {
+                                        snprintf(dlg.peer_b_ip, sizeof(dlg.peer_b_ip), "%s", ip);
+                                    }
+                                    dlg.peer_b_port = nsbc_sa_port(&p2[1]);
+                                }
+                            }
+                        }
+                    }
+
+                    int64_t rc = ha_repl_publish(REPL_DIALOG, 3, &dlg, sizeof(dlg));
                     if (rc < 0 && rc != NSBC_NOSPC)
                         llog(LOG_WARN, "b2b",
                              "repl_publish DIALOG-CONFIRMED failed rc=%lld callid=%s",

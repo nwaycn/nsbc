@@ -30,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #define TRANS_POLL_MS          100
@@ -60,6 +61,17 @@ struct ha_repl_trans {
     int backoff_ms;      /* STANDBY connect 指数退避 */
 
     int have_peer;
+
+    /* === P1 FULL resync 兜底：gap 跟踪 ===
+     * 同一个 [gap_start, gap_end) 对连续重复 GAP_MAX 次 → 发 FULL_REQ
+     * 避免单次 UDP 抖动误触发全量快照 */
+#define TRANS_GAP_MAX      3
+#define TRANS_GAP_WINDOW_MS 1000
+    uint64_t last_gap_start;
+    uint64_t last_gap_end;
+    int      same_gap_cnt;
+    uint64_t last_gap_time_ms;
+    int      full_resync_inflight;  /* 防 FULL_REQ 重复发 */
 };
 
 /* === HaReplV1 帧编解码 === */
@@ -124,13 +136,174 @@ static int repl_ops_send(void *ud, const repl_rec_t *r)
     return NSBC_OK;
 }
 
+/* 前向声明（repl_ops_on_gap 里先调用） */
+static int transport_send_full_req(ha_repl_trans_t *t);
+
 static int repl_ops_on_gap(void *ud, uint64_t expect, uint64_t got)
 {
-    /* P1 skeleton: gap 重传通过 GAP_REQ 帧触发主端重发；当前骨架日志即可 */
-    llog(LOG_INFO, "ha-repl", "repl gap expect=%llu got=%llu → request resync",
-         (unsigned long long)expect, (unsigned long long)got);
-    (void)ud;
+    /* P1: STANDBY 发现缺口 → 构造 GAP_REQ 帧 → 发回 ACTIVE 请求重发
+     * expect = 期望 seq (applied_seq+1), got = 实际收到 seq (跳了)
+     * ACTIVE 收到后重发 expect..got-1 (或 ring 里还有的部分) */
+    ha_repl_trans_t *t = (ha_repl_trans_t *)ud;
+    if (!t || t->peer_fd < 0) return NSBC_INVAL;
+
+    /* === gap 重复计数 + FULL resync 兜底 === */
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+    if (expect == t->last_gap_start && got == t->last_gap_end &&
+        (now - t->last_gap_time_ms) < TRANS_GAP_WINDOW_MS) {
+        t->same_gap_cnt++;
+    } else {
+        t->same_gap_cnt = 1;
+    }
+    t->last_gap_start = expect;
+    t->last_gap_end = got;
+    t->last_gap_time_ms = now;
+
+    /* FULL resync 兜底：同一个 gap 连续 GAP_MAX 次 → 直接发 FULL_REQ
+     * 说明 ring 里 seq 已被 ack 淘汰 / 根本没 publish，重发 gap 没用了 */
+    if (t->same_gap_cnt >= TRANS_GAP_MAX && !t->full_resync_inflight) {
+        llog(LOG_WARN, "ha-repl",
+             "gap [%llu..%llu) repeated %d× → send FULL_REQ resync",
+             (unsigned long long)expect, (unsigned long long)got,
+             t->same_gap_cnt);
+        t->full_resync_inflight = 1;
+        (void)transport_send_full_req(t);
+        return NSBC_OK;
+    }
+
+    llog(LOG_WARN, "ha-repl", "gap detected expect=%llu got=%llu → send GAP_REQ (cnt=%d)",
+         (unsigned long long)expect, (unsigned long long)got, t->same_gap_cnt);
+
+    ha_repl_frame_hdr_t h; memset(&h, 0, sizeof(h));
+    ha_repl_gap_req_t payload;
+    payload.gap_start = expect;
+    payload.gap_end   = got;
+    /* HaReplV1 帧头 */
+    h.magic       = htons(HA_REPL_FRAME_MAGIC);
+    h.ver         = htons(HA_REPL_FRAME_VER);
+    h.type        = HA_REPL_FRAME_GAP_REQ_TYPE;
+    h.payload_len = htonl((uint32_t)sizeof(payload));
+
+    char frame[sizeof(h) + sizeof(payload)];
+    memcpy(frame, &h, sizeof(h));
+    memcpy(frame + sizeof(h), &payload, sizeof(payload));
+    (void)send(t->peer_fd, frame, sizeof(frame), MSG_NOSIGNAL);
     return NSBC_OK;
+}
+
+/* === ACTIVE 重发缺口 ===
+ * ring 里捞 gap_start..gap_end-1（闭开区间），逐条 frame_encode + send */
+static void transport_resend_gap(ha_repl_trans_t *t,
+                                 uint64_t gap_start, uint64_t gap_end)
+{
+    if (!t || !t->repl) return;
+    if (gap_start == 0 || gap_end <= gap_start) return;
+
+    llog(LOG_WARN, "ha-repl",
+         "ACTIVE resend gap [%llu..%llu)",
+         (unsigned long long)gap_start, (unsigned long long)gap_end);
+
+    int sent = 0;
+    for (uint64_t seq = gap_start; seq < gap_end; seq++) {
+        const repl_rec_t *r = repl_at(t->repl, seq);
+        if (!r) {
+            /* seq 不在 ring 范围（已被 ack 淘汰 / 没 publish）— 跳过 */
+            continue;
+        }
+        char frame[sizeof(ha_repl_frame_hdr_t) + REPL_PAYLOAD_MAX];
+        int n = frame_encode(r, frame, sizeof(frame));
+        if (n < 0) continue;
+        (void)send(t->peer_fd, frame, n, MSG_NOSIGNAL);
+        sent++;
+    }
+    llog(LOG_NOTICE, "ha-repl",
+         "ACTIVE gap resend done: sent=%d requested [%llu..%llu)",
+         sent, (unsigned long long)gap_start, (unsigned long long)gap_end);
+}
+
+/* === STANDBY → ACTIVE FULL_REQ 帧（无 payload，头 type=FULL_REQ） === */
+static int transport_send_full_req(ha_repl_trans_t *t)
+{
+    ha_repl_frame_hdr_t h; memset(&h, 0, sizeof(h));
+    h.magic = htons(HA_REPL_FRAME_MAGIC);
+    h.ver   = htons(HA_REPL_FRAME_VER);
+    h.type  = HA_REPL_FRAME_FULL_REQ_TYPE;
+    h.payload_len = 0;
+    (void)send(t->peer_fd, &h, sizeof(h), MSG_NOSIGNAL);
+    return NSBC_OK;
+}
+
+/* === ACTIVE FULL push：先发 REPL_FULL_CLEAR，再发 ring 全部条目 ===
+ * CLEAR 帧 payload_len=0 表示全清命令；后续帧 type=原 type、seq 继续 */
+static void transport_send_full_snapshot(ha_repl_trans_t *t)
+{
+    if (!t || !t->repl || t->peer_fd < 0) return;
+
+    uint64_t snap_seq = repl_published_seq(t->repl);
+
+    llog(LOG_WARN, "ha-repl",
+         "ACTIVE FULL push start: snap_seq=%llu ring_used=%d",
+         (unsigned long long)snap_seq, (int)(snap_seq - repl_applied_seq(t->repl)));
+
+    /* 帧 1：REPL_FULL_CLEAR（type=REPL_FULL=3, payload_len=0, seq=pub_seq+1 或 pub_seq）
+     * seq 用 pub_seq+1 给 CLEAR 一个唯一标记；备端 apply 不看 type 顺序
+     * 只看 type=REPL_FULL 且 len==0 就清 — 幂等 */
+    {
+        ha_repl_frame_hdr_t h; memset(&h, 0, sizeof(h));
+        h.magic       = htons(HA_REPL_FRAME_MAGIC);
+        h.ver         = htons(HA_REPL_FRAME_VER);
+        h.seq         = htobe64(snap_seq + 1);  /* CLEAR 给一个独占 seq */
+        h.type        = REPL_FULL;
+        h.payload_len = 0;
+        (void)send(t->peer_fd, &h, sizeof(h), MSG_NOSIGNAL);
+    }
+
+    /* 帧 2..N：ring 所有条目从 ack_seq 之后逐条重发 */
+    int sent = 0;
+    uint64_t ring_min = repl_ack_seq(t->repl);
+    if (ring_min == 0 && repl_published_seq(t->repl) > 0) {
+        /* 初始状态 ack_seq 未置 — 从头重发可能被 ring 覆盖淘汰了，
+         * 从 pub_seq - REPL_RING_CAP 取 max(ack_seq+1, pub_seq - CAP) */
+        uint64_t from = snap_seq > REPL_RING_CAP
+                        ? snap_seq - REPL_RING_CAP + 1
+                        : 1;
+        if (from <= ring_min) from = ring_min + 1;
+        for (uint64_t seq = from; seq <= snap_seq; seq++) {
+            const repl_rec_t *r = repl_at(t->repl, seq);
+            if (!r) continue;
+            char frame[sizeof(ha_repl_frame_hdr_t) + REPL_PAYLOAD_MAX];
+            int n = frame_encode(r, frame, sizeof(frame));
+            if (n < 0) continue;
+            (void)send(t->peer_fd, frame, n, MSG_NOSIGNAL);
+            sent++;
+        }
+    } else {
+        for (uint64_t seq = ring_min + 1; seq <= snap_seq; seq++) {
+            const repl_rec_t *r = repl_at(t->repl, seq);
+            if (!r) continue;
+            char frame[sizeof(ha_repl_frame_hdr_t) + REPL_PAYLOAD_MAX];
+            int n = frame_encode(r, frame, sizeof(frame));
+            if (n < 0) continue;
+            (void)send(t->peer_fd, frame, n, MSG_NOSIGNAL);
+            sent++;
+        }
+    }
+
+    /* 最后一发 ACK 帧（payload_len=snap_seq）告诉备端可以对齐 applied_seq */
+    {
+        ha_repl_frame_hdr_t ah; memset(&ah, 0, sizeof(ah));
+        ah.magic = htons(HA_REPL_FRAME_MAGIC);
+        ah.ver   = htons(HA_REPL_FRAME_VER);
+        ah.type  = HA_REPL_FRAME_ACK_TYPE;
+        ah.payload_len = htonl((uint32_t)snap_seq); /* 跨协议约定：FULL push 结束信号 */
+        (void)send(t->peer_fd, &ah, sizeof(ah), MSG_NOSIGNAL);
+    }
+
+    llog(LOG_NOTICE, "ha-repl",
+         "ACTIVE FULL push done: sent=%d snap_seq=%llu",
+         sent, (unsigned long long)snap_seq);
 }
 
 /* === TCP 辅助 === */
@@ -291,6 +464,26 @@ static void *ha_repl_trans_thread(void *arg)
                             if (ack > hdr.seq) ack = hdr.seq;
                             repl_ack(t->repl, ack);
                             t->last_ack_seq = ack;
+                        } else if (hdr.type == HA_REPL_FRAME_GAP_REQ_TYPE) {
+                            /* GAP_REQ 帧：备端请求主端重发 gap_start..gap_end-1 */
+                            if ((size_t)r >= sizeof(hdr) + sizeof(ha_repl_gap_req_t)) {
+                                ha_repl_gap_req_t gap;
+                                memcpy(&gap, rbuf + sizeof(hdr), sizeof(gap));
+                                if (t->is_active) {
+                                    transport_resend_gap(t, gap.gap_start, gap.gap_end);
+                                } else {
+                                    llog(LOG_DEBUG, "ha-repl",
+                                         "STANDBY got GAP_REQ — ignore (not active)");
+                                }
+                            }
+                        } else if (hdr.type == HA_REPL_FRAME_FULL_REQ_TYPE) {
+                            /* FULL_REQ 帧：备端请求主端推全量快照（gap 连续超限兜底） */
+                            if (t->is_active) {
+                                transport_send_full_snapshot(t);
+                            } else {
+                                llog(LOG_DEBUG, "ha-repl",
+                                     "STANDBY got FULL_REQ — ignore (not active)");
+                            }
                         } else {
                             repl_rec_t rec;
                             memset(&rec, 0, sizeof(rec));
@@ -300,7 +493,40 @@ static void *ha_repl_trans_thread(void *arg)
                             rec.len = (uint16_t)hdr.payload_len;
                             if (rec.len > 0 && (size_t)r >= sizeof(hdr) + rec.len)
                                 memcpy(rec.payload, rbuf + sizeof(hdr), rec.len);
+
+                            /* === FULL resync 边界识别 ===
+                             * STANDBY 收到 REPL_FULL_CLEAR 帧 (type=REPL_FULL, len=0)
+                             * → 开启 accept_any_seq（跳过 gap check）
+                             * ACTIVE 侧：不需要 — 不 ingest */
+                            if (rec.type == REPL_FULL && rec.len == 0 && t->repl) {
+                                repl_set_accept_any_seq(t->repl, 1);
+                                llog(LOG_NOTICE, "ha-repl",
+                                     "STANDBY REPL_FULL_CLEAR: accept_any_seq=1");
+                            }
+
                             (void)repl_ingest(t->repl, &rec);
+
+                            /* === FULL resync 结束 ===
+                             * 主端 FULL push 最后 ACK 帧 payload_len=snap_seq 但被当 REPL 帧跳过了。
+                             * 识别方式：FULL push 后会有 ACK 帧，收到 ACK 帧且 accept_any_seq=1 → 关闭 + resync_done */
+                            if (t->repl) {
+                                if (t->full_resync_inflight && hdr.type == HA_REPL_FRAME_ACK_TYPE) {
+                                    repl_set_accept_any_seq(t->repl, 0);
+                                    repl_resync_done(t->repl, hdr.payload_len);
+                                    t->full_resync_inflight = 0;
+                                    /* gap 跟踪清零 — 下一轮正常重传/GAP_REQ */
+                                    t->same_gap_cnt = 0;
+                                    t->last_gap_start = 0;
+                                    t->last_gap_end = 0;
+                                    llog(LOG_NOTICE, "ha-repl",
+                                         "FULL resync done: snap_seq=%llu",
+                                         (unsigned long long)hdr.payload_len);
+                                } else if (!t->is_active && rec.type == REPL_FULL && rec.len == 0) {
+                                    /* CLEAR 帧置位 FULL inflight — 等最后 ACK 帧收尾 */
+                                    t->full_resync_inflight = 1;
+                                }
+                            }
+
                             /* 每收一帧发 ACK —— 简化 P1 骨架 */
                             char ackbuf[sizeof(ha_repl_frame_hdr_t)];
                             ha_repl_frame_hdr_t ah;
@@ -454,6 +680,15 @@ int ha_repl_trans_connected(ha_repl_trans_t *t)
 uint64_t ha_repl_trans_last_ack(ha_repl_trans_t *t)
 {
     return t ? t->last_ack_seq : 0;
+}
+
+int ha_repl_trans_force_full_push(ha_repl_trans_t *t)
+{
+    if (!t || !t->repl || !t->is_active) return NSBC_NOENT;
+    if (t->peer_fd < 0) return NSBC_NOENT;  /* 未连上 STANDBY — FULL push 没用 */
+    llog(LOG_WARN, "ha-repl", "Hitless Upgrade: ACTIVE force FULL push");
+    transport_send_full_snapshot(t);
+    return NSBC_OK;
 }
 
 void ha_repl_trans_notify_role(ha_repl_trans_t *t, ha_role_t role)
