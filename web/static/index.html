@@ -6,8 +6,10 @@
   <title>NSBC Management Console</title>
   <!-- ===== Tailwind theme 重映射 (Linear + Vercel 混合风) ===== -->
   <script>
-    tailwind = tailwind || {};
-    tailwind.config = {
+    // Use window.tailwind explicitly — bare reference throws ReferenceError
+    // in strict mode when tailwindcss.js hasn't set the global yet.
+    window.tailwind = window.tailwind || {};
+    window.tailwind.config = {
       theme: {
         extend: {
           colors: {
