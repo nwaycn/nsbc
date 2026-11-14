@@ -124,10 +124,41 @@ async fn list<C: CoreApi + Clone + Send + Sync + 'static>(
     })))
 }
 
+/// Generate a collision-free name: stem + "_" + 6-hex suffix + extension.
+/// Suffix is derived from SystemTime nanos (lowest 24 bits). Retries up to 50
+/// times if there's still a collision (practically impossible under normal
+/// load). No new deps needed.
+fn unique_name_if_exists(root: &Path, name: &str) -> String {
+    let candidate = root.join(name);
+    if !candidate.exists() {
+        return name.to_string();
+    }
+    let orig = Path::new(name);
+    let stem  = orig.file_stem().and_then(|s| s.to_str()).unwrap_or("sound");
+    let ext   = orig.extension().and_then(|s| s.to_str()).unwrap_or("wav");
+    for _ in 0..50 {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let suffix = format!("{:06x}", t & 0xFFFFFF);
+        let new_name = format!("{stem}_{suffix}.{ext}");
+        if !root.join(&new_name).exists() {
+            return new_name;
+        }
+        std::thread::yield_now();
+    }
+    // Ultimate fallback — append random counter
+    format!("{stem}_{}_{ext}", "ZZZZZZ")
+}
+
 /// PUT /sounds/:name — upload (body = raw file bytes)
 ///
 /// No multipart dep: caller sends the file body directly.
-/// Path param :name becomes the filename (must have allowed extension).
+/// If a file with the same name already exists, the server automatically
+/// generates a collision-free unique name (`stem_<6hex>.ext`) and returns
+/// it to the caller. This lets multiple dialplan rules have their own copy
+/// of "greeting.wav" without stomping each other.
 async fn upload<C: CoreApi + Clone + Send + Sync + 'static>(
     State(st): State<Arc<AppState<C>>>,
     AxumPath(name): AxumPath<String>,
@@ -160,8 +191,15 @@ async fn upload<C: CoreApi + Clone + Send + Sync + 'static>(
         })?;
     }
 
-    let dest = safe_join(&root, &name).map_err(|reason| {
-        tracing::warn!(name = %name, reason = %reason, "safe_join failed");
+    // Auto-rename on collision — multiple rules uploading "greeting.wav"
+    // each gets its own unique copy instead of overwriting the previous one.
+    let final_name = unique_name_if_exists(&root, &name);
+    if final_name != name {
+        tracing::info!(orig = %name, assigned = %final_name, "sounds/upload renamed to avoid collision");
+    }
+
+    let dest = safe_join(&root, &final_name).map_err(|reason| {
+        tracing::warn!(name = %final_name, reason = %reason, "safe_join failed");
         ApiError::BadRequest(reason)
     })?;
 
@@ -174,7 +212,7 @@ async fn upload<C: CoreApi + Clone + Send + Sync + 'static>(
     tracing::info!(path = %dest.display(), size, "sound uploaded OK");
 
     Ok(Json(json!({
-        "name": name,
+        "name": final_name,
         "path": dest.display().to_string(),
         "size": size,
     })))
