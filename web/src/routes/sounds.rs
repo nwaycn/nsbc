@@ -53,10 +53,24 @@ fn safe_join(root: &Path, name: &str) -> Option<PathBuf> {
         return None;
     }
     let candidate = root.join(name);
-    let canon = candidate.canonicalize().ok()?;
+    // NOTE: only canonicalize root itself — candidate may not yet exist
+    // (upload path), and Path::canonicalize() errors on missing files.
     let root_canon = root.canonicalize().ok()?;
-    if !canon.starts_with(&root_canon) { return None; }
-    Some(canon)
+    // For existing-path ops (list/delete/download) canon candidate;
+    // for upload we can't — so just check textual containment is enough
+    // because we already stripped separators and ".." above.
+    if candidate.exists() {
+        let canon = candidate.canonicalize().ok()?;
+        if !canon.starts_with(&root_canon) { return None; }
+        Some(canon)
+    } else {
+        // File does not exist yet (upload) — check that its parent
+        // canonicalizes to something inside root.
+        let parent = candidate.parent()?;
+        let parent_canon = parent.canonicalize().ok()?;
+        if !parent_canon.starts_with(&root_canon) { return None; }
+        Some(candidate)
+    }
 }
 
 /// GET /sounds — list files
