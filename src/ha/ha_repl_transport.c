@@ -72,6 +72,16 @@ struct ha_repl_trans {
     int      same_gap_cnt;
     uint64_t last_gap_time_ms;
     int      full_resync_inflight;  /* 防 FULL_REQ 重复发 */
+
+    /* === P1.5 NOSPC 主动 FULL ===
+     * SPSC send_q 满（业务线程 repl_publish 返回 NOSPC）时累加计数器，
+     * transport 线程 poll 时检测到 nospc_cnt≥TRANS_NOSPC_MAX → 自动 FULL push
+     * （等价于业务侧 NOSPC 后"转全量快照"的温和降级，transport 线程内做不阻塞业务） */
+#define TRANS_NOSPC_MAX       16    /* 连续 16 次 NOSPC 触发 FULL push */
+#define TRANS_NOSPC_WINDOW_MS 5000  /* 5s 内的 NOSPC 才累计，超时清零 */
+    int      nospc_cnt;
+    uint64_t last_nospc_time_ms;
+    int      full_on_nospc_pending;  /* 防重复触发 FULL */
 };
 
 /* === HaReplV1 帧编解码 === */
@@ -128,6 +138,15 @@ static int repl_ops_send(void *ud, const repl_rec_t *r)
              "transport SPSC ring FULL head=%llu tail=%llu seq=%llu → NOSPC",
              (unsigned long long)head, (unsigned long long)tail,
              (unsigned long long)r->seq);
+        /* ★ P1.5 NOSPC 主动 FULL: 业务线程遇到 NOSPC 时累加计数器，
+         * transport 线程 poll 时检测超限自动发 FULL push（不阻塞业务） */
+        uint64_t now = (uint64_t)time(NULL) * 1000;  /* 粗 ms 精度足够 */
+        if (now - t->last_nospc_time_ms > TRANS_NOSPC_WINDOW_MS) {
+            t->nospc_cnt = 1;
+        } else {
+            t->nospc_cnt++;
+        }
+        t->last_nospc_time_ms = now;
         return NSBC_NOSPC;
     }
     uint64_t slot = head % REPL_RING_CAP;
@@ -410,6 +429,19 @@ static void *ha_repl_trans_thread(void *arg)
 
         /* 收发：peer_fd >= 0 时才有数据通路 */
         if (t->peer_fd >= 0) {
+            /* ★ P1.5 NOSPC 主动 FULL: 业务线程累计 NOSPC ≥ 阈值 → transport 线程发 FULL push
+             * （NOSPC 意味着 SPSC send_q 满，备端 ACK 落后严重；FULL push 是比 gap 重传更彻底的恢复） */
+            if (t->is_active && !t->full_on_nospc_pending &&
+                t->nospc_cnt >= TRANS_NOSPC_MAX) {
+                llog(LOG_WARN, "ha-repl",
+                     "NOSPC FULL: %d NOSPC in window → ACTIVE auto FULL push",
+                     t->nospc_cnt);
+                t->full_on_nospc_pending = 1;
+                t->nospc_cnt = 0;
+                transport_send_full_snapshot(t);
+                t->full_on_nospc_pending = 0;
+            }
+
             struct pollfd pfds[2];
             int np = 0;
             pfds[np].fd = t->peer_fd;

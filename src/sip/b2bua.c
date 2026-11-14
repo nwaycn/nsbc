@@ -20,6 +20,7 @@
 #include "log.h"
 #include "media_bug.h"
 #include "media_bridge.h"   /* REQ-ORIGINATE-003 &echo: bridge_lookup_relay + rtp_relay_set_echo */
+#include "media_codec.h"    /* codec_registry_find_name — codec 名称 → PT/CR 映射 */
 #include "playback_engine.h"  /* ringback app：LEG_CONFIRMED 接通点自动停放音 */
 #include "metric_reg.h"
 #include "nsbc_id.h"
@@ -3020,7 +3021,40 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                         }
                     }
 
-                    int64_t rc = ha_repl_publish(REPL_DIALOG, 3, &dlg, sizeof(dlg));
+                    /* ★ v4: codec PT/CR + SSRC — 从 bridge_call_view 拿实际重写后的 SSRC，
+                     * 从 codec_registry_find_name 拿协商 codec 的 PT 和 clock_rate。
+                     * relay 本身不做 codec 协商/转码（P1），但 payload 带 codec 信息后
+                     * STANDBY 侧日志可读，且未来精细重建（PT 固定/CR 影响 ts 步进）能复用。 */
+                    {
+                        nsbc_ctx_t *ha_ctx = nsbc_get_ctx();
+                        bridge_mgr_t *bm = ha_ctx ? (bridge_mgr_t *)ha_ctx->bridge : NULL;
+                        if (bm) {
+                            mb_view_t mv; memset(&mv, 0, sizeof(mv));
+                            if (bridge_call_view(bm, c, &mv) == NSBC_OK) {
+                                if (mv.have_ssrc_out[0]) dlg.ssrc_a = mv.ssrc_out[0];
+                                if (mv.have_ssrc_out[1]) dlg.ssrc_b = mv.ssrc_out[1];
+                            }
+                        }
+                        /* codec PT/CR — 按 c->codec_a/b 名称查 registry */
+                        if (c->codec_a[0]) {
+                            const codec_ops_t *ops = codec_registry_find_name(
+                                c->codec_a, strlen(c->codec_a));
+                            if (ops && ops->default_pt >= 0) {
+                                dlg.codec_pt_a  = (uint8_t)ops->default_pt;
+                                dlg.codec_cr_a  = (uint16_t)ops->clock_rate;
+                            }
+                        }
+                        if (c->codec_b[0]) {
+                            const codec_ops_t *ops = codec_registry_find_name(
+                                c->codec_b, strlen(c->codec_b));
+                            if (ops && ops->default_pt >= 0) {
+                                dlg.codec_pt_b  = (uint8_t)ops->default_pt;
+                                dlg.codec_cr_b  = (uint16_t)ops->clock_rate;
+                            }
+                        }
+                    }
+
+                    int64_t rc = ha_repl_publish(REPL_DIALOG, 4, &dlg, sizeof(dlg));
                     if (rc < 0 && rc != NSBC_NOSPC)
                         llog(LOG_WARN, "b2b",
                              "repl_publish DIALOG-CONFIRMED failed rc=%lld callid=%s",
