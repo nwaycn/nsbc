@@ -48,28 +48,37 @@ fn is_allowed_ext(name: &str) -> bool {
     ALLOWED_EXT.iter().any(|e| lower.ends_with(&format!(".{e}")))
 }
 
-fn safe_join(root: &Path, name: &str) -> Option<PathBuf> {
-    if name.contains('/') || name.contains('\\') || name.contains("..") {
-        return None;
+fn safe_join(root: &Path, name: &str) -> Result<PathBuf, String> {
+    if name.is_empty() {
+        return Err("empty filename".into());
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Err(format!("path separator in filename '{name}'"));
+    }
+    if name.contains("..") {
+        return Err(format!("'..' in filename '{name}'"));
     }
     let candidate = root.join(name);
-    // NOTE: only canonicalize root itself — candidate may not yet exist
-    // (upload path), and Path::canonicalize() errors on missing files.
-    let root_canon = root.canonicalize().ok()?;
-    // For existing-path ops (list/delete/download) canon candidate;
-    // for upload we can't — so just check textual containment is enough
-    // because we already stripped separators and ".." above.
+    let root_canon = root.canonicalize()
+        .map_err(|e| format!("canonicalize root {}: {e}", root.display()))?;
+
     if candidate.exists() {
-        let canon = candidate.canonicalize().ok()?;
-        if !canon.starts_with(&root_canon) { return None; }
-        Some(canon)
+        let canon = candidate.canonicalize()
+            .map_err(|e| format!("canonicalize {}: {e}", candidate.display()))?;
+        if !canon.starts_with(&root_canon) {
+            return Err(format!("path escapes root: {}", candidate.display()));
+        }
+        Ok(canon)
     } else {
-        // File does not exist yet (upload) — check that its parent
-        // canonicalizes to something inside root.
-        let parent = candidate.parent()?;
-        let parent_canon = parent.canonicalize().ok()?;
-        if !parent_canon.starts_with(&root_canon) { return None; }
-        Some(candidate)
+        // Upload path — file does not exist yet. Verify parent is inside root.
+        let parent = candidate.parent()
+            .ok_or_else(|| format!("no parent for {}", candidate.display()))?;
+        let parent_canon = parent.canonicalize()
+            .map_err(|e| format!("canonicalize parent {}: {e}", parent.display()))?;
+        if !parent_canon.starts_with(&root_canon) {
+            return Err(format!("parent escapes root: {}", parent.display()));
+        }
+        Ok(candidate)
     }
 }
 
@@ -124,7 +133,10 @@ async fn upload<C: CoreApi + Clone + Send + Sync + 'static>(
     AxumPath(name): AxumPath<String>,
     body: Bytes,
 ) -> Result<impl IntoResponse, ApiError> {
+    tracing::info!(name = %name, size = body.len(), "sounds/upload hit");
+
     if !is_allowed_ext(&name) {
+        tracing::warn!(name = %name, "sounds/upload rejected: bad extension");
         return Err(ApiError::BadRequest(format!(
             "invalid file extension '.{}' — allowed: {}",
             Path::new(&name).extension().and_then(|e| e.to_str()).unwrap_or("?"),
@@ -140,22 +152,26 @@ async fn upload<C: CoreApi + Clone + Send + Sync + 'static>(
     }
 
     let root = st.sounds_root.clone();
+    tracing::info!(root = %root.display(), "sounds root");
     if !root.exists() {
+        tracing::info!(path = %root.display(), "creating sounds_root");
         std::fs::create_dir_all(&root).map_err(|e| {
             ApiError::Db(format!("create sounds_root: {e}"))
         })?;
     }
 
-    let dest = safe_join(&root, &name).ok_or_else(|| {
-        ApiError::BadRequest(format!("invalid filename: {name}"))
+    let dest = safe_join(&root, &name).map_err(|reason| {
+        tracing::warn!(name = %name, reason = %reason, "safe_join failed");
+        ApiError::BadRequest(reason)
     })?;
 
+    tracing::info!(path = %dest.display(), "writing upload");
     tokio::fs::write(&dest, &body).await.map_err(|e| {
         ApiError::Db(format!("write {}: {e}", dest.display()))
     })?;
 
     let size = body.len();
-    tracing::info!(path = %dest.display(), size, "sound uploaded");
+    tracing::info!(path = %dest.display(), size, "sound uploaded OK");
 
     Ok(Json(json!({
         "name": name,
@@ -170,9 +186,7 @@ async fn delete_one<C: CoreApi + Clone + Send + Sync + 'static>(
     AxumPath(name): AxumPath<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let root = &st.sounds_root;
-    let target = safe_join(root, &name).ok_or_else(|| {
-        ApiError::BadRequest(format!("invalid filename: {name}"))
-    })?;
+    let target = safe_join(root, &name).map_err(|r| ApiError::BadRequest(r))?;
     if !target.exists() {
         return Err(ApiError::NotFound(format!("sound file not found: {name}")));
     }
@@ -189,9 +203,7 @@ async fn download<C: CoreApi + Clone + Send + Sync + 'static>(
     AxumPath(name): AxumPath<String>,
 ) -> Result<Response, ApiError> {
     let root = &st.sounds_root;
-    let target = safe_join(root, &name).ok_or_else(|| {
-        ApiError::BadRequest(format!("invalid filename: {name}"))
-    })?;
+    let target = safe_join(root, &name).map_err(|r| ApiError::BadRequest(r))?;
     if !target.exists() {
         return Err(ApiError::NotFound(format!("sound file not found: {name}")));
     }
