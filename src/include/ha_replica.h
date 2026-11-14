@@ -54,6 +54,14 @@ typedef struct ha_repl ha_repl_t;
 int  repl_create(const repl_ops_t *ops, int is_active, ha_repl_t **out);
 void repl_destroy(ha_repl_t *r);
 
+/* 运行时覆盖 apply / on_gap（业务模块在 init 时注入 loc_upsert / dialog 重建函数）。
+ * send 和 ud 由 transport 创建时注入，运行时不覆写。
+ * transport 线程 recv 路径在读 apply 时本函数应已返回（init 时序保证），无 race。 */
+void repl_set_ops(ha_repl_t *r,
+                  int (*apply)(void *ud, const repl_rec_t *r),
+                  int (*on_gap)(void *ud, uint64_t expect, uint64_t got),
+                  void *ud);
+
 /* 主端：发布变更（填 seq/入环/回调 send）。返回发布 seq，<0 错误码。
  * 环满（备端长期 ACK 落后）返回 NOSPC——调用方转全量/告警，不阻塞。 */
 int64_t repl_publish(ha_repl_t *r, repl_type_t type, uint16_t ver,

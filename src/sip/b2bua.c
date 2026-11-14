@@ -15,7 +15,8 @@
 #include "dialplan.h"        /* dp_execute — 拨号规则预匹配（防扫号器） */
 #include "endpoint_registry.h"  /* Phase 5 XL: INVITE 入站 endpoint_registry 分发 */
 #include "event_bus.h"          /* 白皮书 §10.3: SESSION_CREATE/ANSWER/END 事件触发 */
-#include "ha.h"                 /* REQ-HA-001: 主备角色门控（ha_role，主二进制内符号） */
+#include "ha.h"                 /* REQ-HA-001: 主备角色门控（ha_role，主二进制内符号）
+                                 * HA P1: ha_repl_publish() — 主→备对话状态复制接线点 */
 #include "log.h"
 #include "media_bug.h"
 #include "media_bridge.h"   /* REQ-ORIGINATE-003 &echo: bridge_lookup_relay + rtp_relay_set_echo */
@@ -168,6 +169,15 @@ struct b2b_core {
         uint32_t count;
         char key[128];
     } pk[B2B_PERKEY_N];
+
+    /* === HA P1: STANDBY 对话锚点环形缓冲 ===
+     * REPL_DIALOG apply 时 round-robin 存入最新 N 条对话快照。
+     * 无 hash：骨架期只做"failover 时遍历重建"起点用，成本低。
+     * 后续 P1.5 替换成真正的 callid→dialog hash 表。 */
+#define HA_REPL_DIALOG_BUF_MAX 256
+    pthread_mutex_t ha_dlg_lock;
+    uint64_t        ha_dlg_head;   /* round-robin 写入位置 */
+    repl_rec_t      ha_dlg_buf[HA_REPL_DIALOG_BUF_MAX];  /* 直接存 repl_rec_t 拷贝 */
 };
 
 /* ------------------------------------------------------------------ */
@@ -504,6 +514,117 @@ static int r_calls(char *b, size_t cap, void *ud)
                     (unsigned long long)b2b_failed_calls(c));
 }
 
+/* === HA P1: STANDBY REPL_DIALOG / REPL_FULL apply 回调 ===
+ * transport recv 线程调 — proxy 分发到各订阅者。
+ * 处理：
+ *   - REPL_DIALOG: round-robin 存入 co->ha_dlg_buf（256 槽）
+ *     骨架期只做 failover 重建起点；后续 P1.5 替换成真正 callid→dialog hash
+ *   - REPL_REG: 跳过（registrar 负责）
+ *   - REPL_FULL: 跳过（骨架期）
+ * 返回 NSBC_OK = 接受（ingest 推进 applied_seq）；非 OK → 计入 warn 但不跳序 */
+static int b2b_repl_apply(void *ud, const repl_rec_t *rec)
+{
+    b2b_core_t *co = ud;
+    if (!co || !rec) return NSBC_INVAL;
+    if (rec->type != REPL_DIALOG && rec->type != REPL_FULL)
+        return NSBC_OK;   /* 不是 dialog/full — 跳过 */
+    /* round-robin 存快照 — repl_rec_t 自身 payload[REPL_PAYLOAD_MAX] 已含完整数据 */
+    pthread_mutex_lock(&co->ha_dlg_lock);
+    uint64_t slot = co->ha_dlg_head % HA_REPL_DIALOG_BUF_MAX;
+    memcpy(&co->ha_dlg_buf[slot], rec, sizeof(*rec));
+    co->ha_dlg_head++;
+    pthread_mutex_unlock(&co->ha_dlg_lock);
+    return NSBC_OK;
+}
+
+/* === HA P1: STANDBY → ACTIVE failover 时对话锚点重建 ===
+ * ha_dlg_buf 是 round-robin 循环覆盖 — 遍历最近写入的 HA_REPL_DIALOG_BUF_MAX 条
+ * REPL_DIALOG，action=0（CONFIRMED）的重建 b2b_call_t 挂进 call_shard hash。
+ * action=1（END）跳过：对话已结束，failover 无需在 ACTIVE 侧再挂。
+ * payload 解析（CONFIRMED action=0）：
+ *   payload[0] = action, [1..128] = callid_a, [129..256] = callid_b,
+ *   + state 字段（callid_a@offset 1, callid_b@offset 129）
+ *
+ * 线程安全：role_switch_proxy 在 ha 心跳线程调用 — co 内部 shard 锁 + slab 内部锁
+ * 保证 tbl_link 和 mem_slab_alloc_direct 安全。ha_dlg_lock 保护 buf 遍历。 */
+
+/* CONFIRMED payload 扁平布局（对应 publish 时的 repl_dialog_v1_t） */
+typedef struct {
+    uint8_t  action;      /* 0=CONFIRMED, 1=END */
+    char callid_a[128];
+    char callid_b[128];
+    char aor[256];
+    uint32_t cseq_a;
+    uint32_t cseq_b;
+    uint8_t  leg0_state;
+    uint8_t  leg1_state;
+} b2b_repl_dlg_confirm_t;
+
+static int b2b_repl_rebuild_from_buf(b2b_core_t *co)
+{
+    if (!co) return NSBC_INVAL;
+    int rebuilt = 0;
+
+    /* 拿 ha_dlg_lock 保护 buf 遍历（transport recv 线程 apply 也写这个 buf） */
+    pthread_mutex_lock(&co->ha_dlg_lock);
+    uint64_t buf_head_at_rebuild = co->ha_dlg_head;
+
+    /* round-robin buf 是循环覆盖：直接遍历所有 HA_REPL_DIALOG_BUF_MAX 槽
+     * （0..255），每个槽要么是有效 REPL_DIALOG 条目，要么是旧数据/空槽。
+     * 由 repl_rec_t.type/len 过滤无效条目。 */
+    for (int slot = 0; slot < HA_REPL_DIALOG_BUF_MAX; slot++) {
+        const repl_rec_t *rec = &co->ha_dlg_buf[slot];
+        if (rec->type != REPL_DIALOG) continue;
+        if (rec->len < sizeof(b2b_repl_dlg_confirm_t)) continue;
+
+        const uint8_t *p = (const uint8_t *)rec->payload;
+        if (p[0] != 0) continue;  /* action != CONFIRMED → 跳过（END 或非法） */
+
+        const b2b_repl_dlg_confirm_t *dlg = (const b2b_repl_dlg_confirm_t *)p;
+        if (dlg->callid_a[0] == '\0' || dlg->callid_b[0] == '\0') continue;
+
+        /* mem_slab 分配 call — slab 内部自带锁，安全 */
+        b2b_call_t *c = mem_slab_alloc_direct(co->slab);
+        if (c == NULL) {
+            llog(LOG_WARN, "b2b", "HA rebuild: slab alloc failed callid_a=%s",
+                 dlg->callid_a);
+            continue;
+        }
+        memset(c, 0, sizeof(*c));
+        pthread_mutex_init(&c->lock, NULL);
+        c->active = 1;
+
+        /* leg[0] = 主叫侧 (callid_a), leg[1] = 被叫侧 (callid_b) */
+        snprintf(c->leg[0].callid, sizeof(c->leg[0].callid), "%s", dlg->callid_a);
+        snprintf(c->leg[1].callid, sizeof(c->leg[1].callid), "%s", dlg->callid_b);
+        c->leg[0].state = (leg_state_t)dlg->leg0_state;
+        c->leg[1].state = (leg_state_t)dlg->leg1_state;
+
+        /* 挂进 shard hash — tbl_link 内部自己拿 shard->lock */
+        tbl_link(co, c, 0);
+        tbl_link(co, c, 1);
+
+        rebuilt++;
+    }
+    pthread_mutex_unlock(&co->ha_dlg_lock);
+
+    llog(LOG_NOTICE, "b2b",
+         "HA rebuild_from_buf: rebuilt=%d buf_head=%llu",
+         rebuilt, (unsigned long long)buf_head_at_rebuild);
+    return NSBC_OK;
+}
+
+static void b2b_repl_on_role_switch(void *ud, ha_role_t role)
+{
+    b2b_core_t *co = ud;
+    if (!co) return;
+    if (role == HA_ROLE_ACTIVE) {
+        llog(LOG_NOTICE, "b2b", "HA role→ACTIVE: trigger dialog rebuild");
+        b2b_repl_rebuild_from_buf(co);
+    }
+    /* role=STANDBY 时不做 — 新 ACTIVE 切过来时 ha_dlg_buf 已经在 STANDBY 侧写好了 */
+}
+
 int b2b_core_create(const b2b_cfg_t *cfg, b2b_core_t **out)
 {
     b2b_core_t *co = calloc(1, sizeof(*co));
@@ -581,6 +702,14 @@ int b2b_core_create(const b2b_cfg_t *cfg, b2b_core_t **out)
     sess_timer_cfg_default(&co->cfg.sess_timer_cfg);
     co->cfg.sess_timer_enabled = 1; /* 开启 P1 完整模式：协商 + 定时刷新/超时 */
     metric_source_register("nsbc_calls", "call counters", r_calls, co);
+
+    /* === HA P1: dialog 锚点 apply 订阅 ===
+     * 用 ha_dlg_lock + ha_dlg_buf round-robin 存 REPL_DIALOG 快照。
+     * 订阅时序：b2b_core_create 在 transport 线程启动前完成，无 race。 */
+    pthread_mutex_init(&co->ha_dlg_lock, NULL);
+    ha_repl_subscribe_apply(b2b_repl_apply, co);
+    ha_repl_subscribe_role_switch(b2b_repl_on_role_switch, co);
+
     *out = co;
     return NSBC_OK;
 }
@@ -625,6 +754,33 @@ static void call_destroy(b2b_call_t *c)
     if (c->dead)
         return;
     c->dead = 1;
+
+    /* === HA P1: ACTIVE → REPL_DIALOG publish（对话终结锚点） ===
+     * STANDBY 收到后可重建对话终止状态（failover 时不会重复接收 BYE）
+     * payload 第 1 字节 action=1 (DIALOG_END)；action=0 是 CONFIRMED */
+    {
+        typedef struct {
+            uint8_t  action;      /* 0=CONFIRMED, 1=END */
+            char callid_a[128];
+            char callid_b[128];
+            uint8_t  leg0_state;  /* TERMINATED */
+            uint8_t  leg1_state;
+            uint8_t  a_final;
+            uint8_t  reserved[4];
+        } repl_dialog_end_v1_t;
+        repl_dialog_end_v1_t dlg; memset(&dlg, 0, sizeof(dlg));
+        dlg.action = 1;  /* REPL_DIALOG_ACTION_END */
+        snprintf(dlg.callid_a, sizeof(dlg.callid_a), "%s", c->leg[0].callid);
+        snprintf(dlg.callid_b, sizeof(dlg.callid_b), "%s", c->leg[1].callid);
+        dlg.leg0_state = (uint8_t)c->leg[0].state;
+        dlg.leg1_state = (uint8_t)c->leg[1].state;
+        dlg.a_final    = (uint8_t)c->a_final;
+        int64_t rc = ha_repl_publish(REPL_DIALOG, 2, &dlg, sizeof(dlg));
+        if (rc < 0 && rc != NSBC_NOSPC)
+            llog(LOG_DEBUG, "b2b",
+                 "repl_publish DIALOG-END failed rc=%lld callid=%s",
+                 (long long)rc, dlg.callid_a);
+    }
     llog(LOG_INFO, "b2b", "call_destroy BEGIN callid=%s a_state=%d b_state=%d a_final=%d",
          c->leg[0].callid, c->leg[0].state, c->leg[1].state, c->a_final);
     /* ★ Bugfix 2026-11-13：early_media ringback 在 CANCEL/487 时没有停 pb
@@ -2609,6 +2765,37 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                 }
                 c->leg[1].state = LEG_CONFIRMED;
 
+                /* === HA P1: ACTIVE → REPL_DIALOG publish（INVITE 建立对话锚点） ===
+                 * b2b_call_t 是 opaque struct（定义在本文件内部），选关键字段打平传输。
+                 * payload 第 1 字节 action=0 (DIALOG_CONFIRMED)；action=1 是 END */
+                {
+                    typedef struct {
+                        uint8_t  action;      /* 0=CONFIRMED, 1=END */
+                        char callid_a[128];   /* leg[0].callid 主叫侧 */
+                        char callid_b[128];   /* leg[1].callid 被叫侧 */
+                        char aor[256];        /* prof->name（tenant） */
+                        uint32_t cseq_a;
+                        uint32_t cseq_b;
+                        uint8_t  leg0_state;  /* LEG_CONFIRMED=3 等枚举值 */
+                        uint8_t  leg1_state;
+                    } repl_dialog_v1_t;
+                    repl_dialog_v1_t dlg; memset(&dlg, 0, sizeof(dlg));
+                    dlg.action = 0;  /* REPL_DIALOG_ACTION_CONFIRMED */
+                    snprintf(dlg.callid_a, sizeof(dlg.callid_a), "%s", c->leg[0].callid);
+                    snprintf(dlg.callid_b, sizeof(dlg.callid_b), "%s", c->leg[1].callid);
+                    if (c->prof)
+                        snprintf(dlg.aor, sizeof(dlg.aor), "%s", c->prof->name);
+                    dlg.cseq_a = c->leg[0].cseq;
+                    dlg.cseq_b = c->leg[1].cseq;
+                    dlg.leg0_state = (uint8_t)c->leg[0].state;
+                    dlg.leg1_state = (uint8_t)c->leg[1].state;
+                    int64_t rc = ha_repl_publish(REPL_DIALOG, 2, &dlg, sizeof(dlg));
+                    if (rc < 0 && rc != NSBC_NOSPC)
+                        llog(LOG_WARN, "b2b",
+                             "repl_publish DIALOG-CONFIRMED failed rc=%lld callid=%s",
+                             (long long)rc, dlg.callid_a);
+                }
+
                 /* ★ ringback：B 腿接通瞬间停掉 A 腿回铃音放音。
                  * ★ stop_on_answer=1 只停 ringback，不影响 playback/endless_playback
                  *   (工号提示音等 answer 后放的内容会继续播完 EOF)。
@@ -3984,6 +4171,18 @@ void handle_new_invite(b2b_core_t *co, sip_txn_t *t,
         if (drop_invite_n++ % 50 == 0)
             llog(LOG_WARN, "b2b",
                  "HA standby: drop new INVITE (dropped=%u)", drop_invite_n);
+        return;
+    }
+
+    /* === HA P1 Hitless Upgrade 冻结门控 ===
+     * ha_freeze_input() 后主机也拒绝新 INVITE —— 让老进程 drain 在途对话
+     * 再 detach，keepalived 收敛窗口内备机接呼。应急呼叫 SOS 同样放行。 */
+    if (ha_role() == HA_ROLE_ACTIVE && ha_is_frozen() && !is_emergency) {
+        static unsigned frozen_drop_n = 0;
+        if (frozen_drop_n++ % 50 == 0)
+            llog(LOG_WARN, "b2b",
+                 "HA frozen (hitless upgrade): drop new INVITE (dropped=%u)",
+                 frozen_drop_n);
         return;
     }
 

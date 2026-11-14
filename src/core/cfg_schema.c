@@ -209,6 +209,25 @@ static const cfg_desc_t k_core[] = {
     {"ha.peer", CGT_STR, CGF_RESTART, "", NULL, 0, 0},
     {"ha.heartbeat_ms", CGT_INT, CGF_HOT, "500", NULL, 50, 10000},
     {"ha.failover_ms", CGT_INT, CGF_HOT, "3000", NULL, 100, 60000},
+    {"ha.priority", CGT_INT, CGF_HOT, "100", NULL, 1, 65535},
+    /* ---- HA P1 状态复制 ---- */
+    {"ha.replica.enabled", CGT_BOOL, CGF_RESTART, "false", NULL, 0, 0},
+    {"ha.replica.port", CGT_INT, CGF_RESTART, "5071", NULL, 1024, 65535},
+    {"ha.replica.ring_cap", CGT_INT, CGF_RESTART, "8192", NULL, 1024, 65536},
+    {"ha.replica.payload_max", CGT_INT, CGF_RESTART, "4096", NULL, 512, 65536},
+    {"ha.replica.lag_warn", CGT_INT, CGF_HOT, "10000", NULL, 0, 1000000},
+    {"ha.replica.full_resync_interval", CGT_INT, CGF_HOT, "0", NULL, 0, 86400},
+    /* ---- HA P1 BFD 亚秒探测 ---- */
+    {"ha.bfd.enabled", CGT_BOOL, CGF_RESTART, "false", NULL, 0, 0},
+    {"ha.bfd.local_discriminator", CGT_INT, CGF_RESTART, "1", NULL, 1, 16777215},
+    {"ha.bfd.desired_min_tx_interval", CGT_INT, CGF_HOT, "200", NULL, 50, 5000},
+    {"ha.bfd.required_min_rx_interval", CGT_INT, CGF_HOT, "200", NULL, 50, 5000},
+    {"ha.bfd.detect_multiplier", CGT_INT, CGF_HOT, "3", NULL, 1, 10},
+    /* ---- HA P1 Hitless Upgrade ---- */
+    {"ha.hitless.enabled", CGT_BOOL, CGF_RESTART, "false", NULL, 0, 0},
+    {"ha.hitless.shm_prefix", CGT_STR, CGF_RESTART, "nsbc_ha_", NULL, 0, 0},
+    {"ha.hitless.freeze_ms", CGT_INT, CGF_HOT, "1000", NULL, 100, 60000},
+    {"ha.hitless.upgrade_timeout_ms", CGT_INT, CGF_HOT, "10000", NULL, 1000, 300000},
 
     /* ---- 计费（REQ-PBX-BILL-001，默认关闭；Phase 1.6 资金闭环完成后生产环境开启） ----
      * billing.enabled=false → C 侧跳过 CDR hook 注册 + INVITE pre-auth 检查 +

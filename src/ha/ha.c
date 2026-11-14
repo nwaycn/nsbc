@@ -19,7 +19,9 @@
 #include "app_ctx.h"
 #include "cfg.h"
 #include "ha.h"
+#include "ha_bfd.h"
 #include "ha_health.h"
+#include "ha_repl_transport.h"
 #include "log.h"
 #include "module.h"
 #include "net_sock.h"
@@ -57,6 +59,8 @@ typedef struct {
 } ha_t;
 
 static ha_t *g_ha;
+static ha_repl_trans_t *g_repl_trans;
+static ha_bfd_t *g_bfd;
 
 ha_role_t ha_role(void)
 {
@@ -64,6 +68,166 @@ ha_role_t ha_role(void)
     if (!h)
         return HA_ROLE_ACTIVE; /* 未启用 HA：单机恒 ACTIVE */
     return (ha_role_t)__atomic_load_n(&h->role, __ATOMIC_ACQUIRE);
+}
+
+/* === HA P1 状态复制 wrapper ===
+ * 业务线程（registrar/b2bua）调用 —— 传输层 ops.send 内部已 SPSC 入队，
+ * 零阻塞。role 守卫 + transport 未就绪 → 静默跳过（不影响业务主路径）。 */
+int64_t ha_repl_publish(repl_type_t type, uint16_t ver,
+                        const void *payload, uint16_t len)
+{
+    /* role 守卫：只有 ACTIVE 才 publish（STANDBY 不生成话务/注册，防双写） */
+    if (ha_role() != HA_ROLE_ACTIVE)
+        return 0;
+    if (!g_repl_trans)
+        return 0; /* transport 未就绪（disabled / degraded / 单机） */
+    ha_repl_t *r = ha_repl_trans_repl(g_repl_trans);
+    if (!r)
+        return 0;
+    int64_t rc = repl_publish(r, type, ver, payload, len);
+    if (rc == NSBC_NOSPC) {
+        /* 环形缓冲满（备端 ACK 长期落后） —— 业务侧应该转全量/告警，
+         * 这里只 WARN 日志，业务线程继续跑（P0-1 不阻塞热路径） */
+        llog(LOG_WARN, "ha-repl",
+             "repl_publish NOSPC type=%d ver=%d → business should trigger FULL",
+             (int)type, (int)ver);
+    }
+    return rc;
+}
+
+/* === HA P1 备端 apply 订阅链 ===
+ * 线程安全：订阅/遍历 不在并发路径
+ *   subscribe_apply: 业务模块 init 时调（此时 transport 线程尚未 recv）
+ *   apply_proxy:     transport recv 线程调
+ * init 时序保证 subscribe 发生在 proxy 第一次被调之前。 */
+
+#define HA_REPL_APPLY_MAX 4
+typedef struct {
+    int  (*apply)(void *ud, const repl_rec_t *rec);
+    void *ud;
+} ha_repl_sub_t;
+
+static ha_repl_sub_t g_repl_subs[HA_REPL_APPLY_MAX];
+static int g_repl_sub_count;
+
+int ha_repl_subscribe_apply(int (*apply)(void *ud, const repl_rec_t *rec),
+                            void *ud)
+{
+    if (!apply) return NSBC_INVAL;
+    /* 幂等：相同 apply+ud 不重复注册 */
+    for (int i = 0; i < g_repl_sub_count; i++)
+        if (g_repl_subs[i].apply == apply && g_repl_subs[i].ud == ud)
+            return NSBC_OK;
+    if (g_repl_sub_count >= HA_REPL_APPLY_MAX) {
+        llog(LOG_WARN, "ha-repl",
+             "apply subscriber FULL (max=%d) apply=%p", HA_REPL_APPLY_MAX, (void *)apply);
+        return NSBC_NOSPC;
+    }
+    g_repl_subs[g_repl_sub_count].apply = apply;
+    g_repl_subs[g_repl_sub_count].ud     = ud;
+    g_repl_sub_count++;
+    llog(LOG_NOTICE, "ha-repl",
+         "apply subscriber #%d apply=%p ud=%p",
+         g_repl_sub_count, (void *)apply, ud);
+    return NSBC_OK;
+}
+
+int ha_repl_apply_proxy(void *ud, const repl_rec_t *rec)
+{
+    (void)ud;   /* proxy 层不感知具体业务模块 ud —— 各订阅者自带 ud */
+    if (!rec) return NSBC_INVAL;
+    if (g_repl_sub_count == 0) return NSBC_OK;  /* 无订阅者：骨架期 STANDBY 不重建 */
+    int first_err = NSBC_OK;
+    for (int i = 0; i < g_repl_sub_count; i++) {
+        int rc = g_repl_subs[i].apply(g_repl_subs[i].ud, rec);
+        if (rc != NSBC_OK && first_err == NSBC_OK) {
+            first_err = rc;
+            llog(LOG_WARN, "ha-repl",
+                 "apply_proxy sub[%d] rc=%d type=%d seq=%llu",
+                 i, rc, (int)rec->type, (unsigned long long)rec->seq);
+        }
+    }
+    return first_err;
+}
+
+/* === HA P1 角色切换回调订阅链 ===
+ * 心跳线程 role transition 时调 proxy — 通知 b2bua 等业务模块重建内存状态
+ * （特别是 STANDBY→ACTIVE failover 时 b2bua 需要重建对话锚点）。
+ *
+ * 线程安全：subscribe 只在业务 init 时调；role_switch_proxy 在心跳线程（ha_main）调。
+ * init 时序保证 subscribe 先于任何 role_switch。数组遍历无锁。 */
+
+#define HA_ROLE_MAX 4
+typedef struct {
+    ha_role_switch_fn cb;
+    void *ud;
+} ha_role_sub_t;
+
+static ha_role_sub_t g_role_subs[HA_ROLE_MAX];
+static int g_role_sub_count;
+
+int ha_repl_subscribe_role_switch(ha_role_switch_fn cb, void *ud)
+{
+    if (!cb) return NSBC_INVAL;
+    /* 幂等：相同 cb+ud 不重复注册 */
+    for (int i = 0; i < g_role_sub_count; i++)
+        if (g_role_subs[i].cb == cb && g_role_subs[i].ud == ud)
+            return NSBC_OK;
+    if (g_role_sub_count >= HA_ROLE_MAX) {
+        llog(LOG_WARN, "ha-repl",
+             "role subscriber FULL (max=%d) cb=%p", HA_ROLE_MAX, (void *)cb);
+        return NSBC_NOSPC;
+    }
+    g_role_subs[g_role_sub_count].cb = cb;
+    g_role_subs[g_role_sub_count].ud = ud;
+    g_role_sub_count++;
+    llog(LOG_NOTICE, "ha-repl",
+         "role subscriber #%d cb=%p ud=%p",
+         g_role_sub_count, (void *)cb, ud);
+    return NSBC_OK;
+}
+
+void ha_repl_role_switch_proxy(ha_role_t new_role)
+{
+    if (g_role_sub_count == 0) return;
+    for (int i = 0; i < g_role_sub_count; i++) {
+        llog(LOG_INFO, "ha-repl",
+             "role_switch_proxy sub[%d] → %s",
+             i, new_role == HA_ROLE_ACTIVE ? "ACTIVE" : "STANDBY");
+        g_role_subs[i].cb(g_role_subs[i].ud, new_role);
+    }
+}
+
+int ha_repl_connected(void)
+{
+    return ha_repl_trans_connected(g_repl_trans);
+}
+
+uint64_t ha_repl_last_ack(void)
+{
+    return ha_repl_trans_last_ack(g_repl_trans);
+}
+
+/* === HA P1 Hitless Upgrade 冻结 stub（骨架实现：纯 atomic flag）===
+ * 正式接线时 b2bua.c INVITE 门控会读 ha_is_frozen()，为 1 时主机也拒绝新呼。 */
+static int g_frozen;
+
+void ha_freeze_input(int freeze_ms)
+{
+    __atomic_store_n(&g_frozen, 1, __ATOMIC_RELEASE);
+    llog(LOG_NOTICE, "ha", "hitless freeze input freeze_ms=%d", freeze_ms);
+    (void)freeze_ms; /* P1 skeleton: auto-unfreeze 定时器由 shm_seg publish path 触发 */
+}
+
+void ha_unfreeze_input(void)
+{
+    __atomic_store_n(&g_frozen, 0, __ATOMIC_RELEASE);
+    llog(LOG_NOTICE, "ha", "hitless unfreeze input");
+}
+
+int ha_is_frozen(void)
+{
+    return __atomic_load_n(&g_frozen, __ATOMIC_ACQUIRE);
 }
 
 static uint64_t mono_ms(void)
@@ -147,7 +311,23 @@ static void sample_local_health(ha_t *h)
     s.rss_mb = proc_rss_mb();
     s.evloop_lag_ms = h->loop_lag_ms; /* ha 线程周期超期：调度压力代理 */
     s.overload_reject_rate_pct = 0;   /* OAM 过载拒绝率 P1 接入 */
-    s.repl_lag = 0;                   /* 状态复制 P1 上线后接入 */
+
+    /* === HA P1: 状态复制水位差 ===
+     * ACTIVE: repl_lag = published_seq - last_ack_seq（主端看备端落尾）
+     * STANDBY: repl_lag = repl_apply_proxy 推进的 applied_seq vs 主端发的 published_seq
+     *          简化：用 transport last_ack 本身（备端只负责 apply，没有 published）
+     *          所以备端 lag=0 合理 — repl lag 只在 ACTIVE 有意义 */
+    if (g_repl_trans) {
+        ha_repl_t *r = ha_repl_trans_repl(g_repl_trans);
+        if (r) {
+            uint64_t pub = repl_published_seq(r);
+            uint64_t ack = ha_repl_trans_last_ack(g_repl_trans);
+            /* published_seq 和 ack_seq 都是单调增的 64-bit：
+             * ACTIVE publish 后 published_seq 立刻++；STANDBY apply 后 repl_ack() 推 ack
+             * 如果 pub < ack（wrap 或备端更超前）→ lag=0 */
+            s.repl_lag = (pub > ack) ? (pub - ack) : 0;
+        }
+    }
 
     h->last_sample_ms = now;
     h->last_ticks = ticks;
@@ -297,6 +477,12 @@ static void *ha_main(void *arg)
                                                         : "peer seen");
             log_audit("ha", want == HA_ROLE_ACTIVE ? "failover" : "standby",
                       "HA role transition");
+            /* === HA P1 状态复制：角色切换通知 transport 重连方向 === */
+            ha_repl_trans_notify_role(g_repl_trans, want);
+            /* === HA P1 角色切换多路通知 — 业务模块重建内存状态 ===
+             * b2bua: STANDBY→ACTIVE 时遍历 ha_dlg_buf 重建对话锚点
+             * registrar: 预留（可选重建 loc_db 过期注销） */
+            ha_repl_role_switch_proxy(want);
         }
         usleep((useconds_t)h->hb_ms * 1000 / 4);
     }
@@ -408,6 +594,66 @@ static int ha_init(struct nsbc_ctx *ctx)
          "heartbeat enabled peer=%s hb=%ums failover=%ums prio=%d node=%s",
          h->have_peer ? peer : "-", h->hb_ms, h->failover_ms, h->my_prio,
          h->node_id);
+
+    /* === HA P1 状态复制传输层 ===
+     * 默认 ha.replica.enabled=false → transport 自己返回 NSBC_NOENT，不浪费资源。
+     * 显式开启 + have_peer → 尝试创建。
+     * 失败降级：transport 内部已兜底（listen/socket 失败→返回 NSBC_OK 让调用方继续）
+     * 本层不再额外降级，保持心跳仲裁正常运行。 */
+    {
+        int rep_en = 0;
+        cfg_get_bool(ctx->cfg, "ha.replica.enabled", &rep_en, NULL);
+        if (rep_en && h->have_peer) {
+            long rep_port = 5071;
+            long ring_cap = 8192;
+            long payload_max = 4096;
+            cfg_get_int(ctx->cfg, "ha.replica.port", &rep_port, NULL);
+            cfg_get_int(ctx->cfg, "ha.replica.ring_cap", &ring_cap, NULL);
+            cfg_get_int(ctx->cfg, "ha.replica.payload_max", &payload_max, NULL);
+            ha_repl_trans_cfg_t tcfg;
+            memset(&tcfg, 0, sizeof(tcfg));
+            tcfg.enabled = 1;
+            tcfg.port = (uint16_t)rep_port;
+            tcfg.ring_cap = (uint32_t)ring_cap;
+            tcfg.payload_max = (uint32_t)payload_max;
+            tcfg.is_active = 0;   /* 角色稍后通知；init 时 role 尚未仲裁 */
+            tcfg.have_peer = 1;
+            tcfg.peer_addr = h->peer;
+            int rc = ha_repl_trans_create(&tcfg, &g_repl_trans);
+            if (rc == NSBC_OK && g_repl_trans) {
+                /* transport 初始化后立即通知当前 role（避免首次仲裁前角色=STANDBY） */
+                ha_repl_trans_notify_role(g_repl_trans, HA_ROLE_STANDBY);
+            }
+        }
+    }
+
+    /* === HA P1 BFD 亚秒探测（与 UDP 5070 心跳互补）===
+     * 默认 ha.bfd.enabled=false → 跳过。显式开启 + have_peer → 创建独立 BFD Control socket。
+     * ha_bfd 线程每收到 Control 调 ha_hc_peer_probe()，ha_health 仲裁层统一判定。 */
+    {
+        int bfd_en = 0;
+        cfg_get_bool(ctx->cfg, "ha.bfd.enabled", &bfd_en, NULL);
+        if (bfd_en && h->have_peer) {
+            long local_disc = 1;
+            long tx_ms = 200, rx_ms = 200, mult = 3;
+            cfg_get_int(ctx->cfg, "ha.bfd.local_discriminator", &local_disc, NULL);
+            cfg_get_int(ctx->cfg, "ha.bfd.desired_min_tx_interval", &tx_ms, NULL);
+            cfg_get_int(ctx->cfg, "ha.bfd.required_min_rx_interval", &rx_ms, NULL);
+            cfg_get_int(ctx->cfg, "ha.bfd.detect_multiplier", &mult, NULL);
+            ha_bfd_cfg_t bcfg;
+            memset(&bcfg, 0, sizeof(bcfg));
+            bcfg.enabled = 1;
+            bcfg.local_discriminator = (uint32_t)local_disc;
+            bcfg.desired_min_tx_interval = (uint32_t)tx_ms;
+            bcfg.required_min_rx_interval = (uint32_t)rx_ms;
+            bcfg.detect_multiplier = (uint8_t)mult;
+            bcfg.have_peer = 1;
+            bcfg.peer_addr = h->peer;
+            bcfg.hc = h->hc;     /* BFD 线程通过 ha_hc_peer_probe 更新健康门探测结果 */
+            ha_bfd_create(&bcfg, &g_bfd);
+        }
+    }
+
     return NSBC_OK;
 }
 
@@ -422,6 +668,17 @@ static void ha_fini(struct nsbc_ctx *ctx)
     close(h->fd);
     if (h->hc)
         ha_hc_destroy(h->hc);
+    /* === HA P1 状态复制传输层 ===
+     * 心跳线程已停（pthread_join 已返回），此时 destroy transport 安全 */
+    if (g_repl_trans) {
+        ha_repl_trans_destroy(g_repl_trans);
+        g_repl_trans = NULL;
+    }
+    /* === HA P1 BFD === */
+    if (g_bfd) {
+        ha_bfd_destroy(g_bfd);
+        g_bfd = NULL;
+    }
     g_ha = NULL;
     free(h);
 }

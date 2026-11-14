@@ -40,6 +40,17 @@ void repl_destroy(ha_repl_t *r)
     free(r);
 }
 
+void repl_set_ops(ha_repl_t *r,
+                  int (*apply)(void *ud, const repl_rec_t *rec),
+                  int (*on_gap)(void *ud, uint64_t expect, uint64_t got),
+                  void *ud)
+{
+    if (r == NULL) return;
+    if (apply)  r->ops.apply  = apply;
+    if (on_gap) r->ops.on_gap = on_gap;
+    if (ud)     r->ops.ud     = ud;
+}
+
 int64_t repl_publish(ha_repl_t *r, repl_type_t type, uint16_t ver,
                      const void *payload, uint16_t len)
 {

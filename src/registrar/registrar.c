@@ -3,7 +3,8 @@
 #endif
 #include "registrar.h"
 #include "b2bua.h"      /* b2b_guard_notify — 认证失败上报 security 封禁 */
-#include "ha.h"         /* ha_role() — STANDBY 跳过 reg_push（loc_db 照常写，DB 事件不双写） */
+#include "ha.h"         /* ha_role() — STANDBY 跳过 reg_push（loc_db 照常写，DB 事件不双写）
+                         * HA P1: ha_repl_publish() — 主→备状态复制接线点 */
 #include "metric_reg.h"
 #include "sip_build.h"
 #include "sip_profile.h"
@@ -293,7 +294,7 @@ static inline int is_dup_binding(const loc_binding_t *probe,
     /* ① Contact 相同：最经典 dup */
     if (strcmp(probe->contact, b->contact) == 0) {
         char _u[64]; _aor_user(probe->aor, _u, sizeof(_u));
-        llog(LOG_INFO, "reg",
+        llog(LOG_DEBUG, "reg",
              "DUP-HIT[①contact] user=%s aor=%s contact=%.80s",
              _u, probe->aor, probe->contact);
         return 1;
@@ -302,7 +303,7 @@ static inline int is_dup_binding(const loc_binding_t *probe,
     if (b->instance[0] && probe->instance[0] &&
         strcmp(probe->instance, b->instance) == 0) {
         char _u[64]; _aor_user(probe->aor, _u, sizeof(_u));
-        llog(LOG_INFO, "reg",
+        llog(LOG_DEBUG, "reg",
              "DUP-HIT[②instance] user=%s aor=%s instance=%.60s",
              _u, probe->aor, b->instance);
         return 1;
@@ -310,7 +311,7 @@ static inline int is_dup_binding(const loc_binding_t *probe,
     /* ③ Call-ID 相同：同 Call-ID 的 REGISTER 刷新 */
     if (b->callid[0] && strcmp(probe->callid, b->callid) == 0) {
         char _u[64]; _aor_user(probe->aor, _u, sizeof(_u));
-        llog(LOG_INFO, "reg",
+        llog(LOG_DEBUG, "reg",
              "DUP-HIT[③callid] user=%s aor=%s callid=%.60s",
              _u, probe->aor, b->callid);
         return 1;
@@ -320,7 +321,7 @@ static inline int is_dup_binding(const loc_binding_t *probe,
         strcmp(probe->received_ip, b->received_ip) == 0 &&
         probe->transport_proto == b->transport_proto) {
         char _u[64]; _aor_user(probe->aor, _u, sizeof(_u));
-        llog(LOG_INFO, "reg",
+        llog(LOG_DEBUG, "reg",
              "DUP-HIT[④ip+transport] user=%s aor=%s ip=%s proto=%d (no instance, soft match)",
              _u, probe->aor, b->received_ip, b->transport_proto);
         return 1;
@@ -485,6 +486,34 @@ static int r_reg(char *b, size_t cap, void *ud)
                     (unsigned long long)(r ? reg_throttled(r) : 0));
 }
 
+/* === HA P1: STANDBY REPL_REG apply 回调 ===
+ * transport recv 线程调 — proxy 分发到各订阅者。
+ * 处理：type=REPL_REG + payload 是 loc_binding_t（ACTIVE publish 时 memcpy 整包）
+ *       expire_ms > 0 → loc_upsert（内存 upsert）
+ *       expire_ms == 0 → loc_remove（注销）
+ * 只重建 loc_db 内存 —— 绝对不调 reg_push（防双写 DB）
+ * 返回 NSBC_OK = 接受（ingest 推进 applied_seq）；非 OK → 计入 warn 但不跳序 */
+static int reg_repl_apply(void *ud, const repl_rec_t *rec)
+{
+    reg_core_t *r = ud;
+    if (!r || !rec) return NSBC_INVAL;
+    if (rec->type != REPL_REG)
+        return NSBC_OK;   /* 不是 REPL_REG，跳过（b2bua 负责 REPL_DIALOG） */
+    if (rec->len < sizeof(loc_binding_t))
+        return NSBC_PROTO;   /* payload 格式不匹配 */
+    const loc_binding_t *b = (const loc_binding_t *)rec->payload;
+    if (b->aor[0] == '\0') return NSBC_PROTO;
+    uint64_t now = nsbc_now_ms();
+    if (b->expire_ms == 0 || b->expire_ms <= now) {
+        /* 注销 — expire_ms=0 表示主动 remove；<=now 表示过期 */
+        loc_remove(r->cfg.db, b->aor, b->contact[0] ? b->contact : NULL);
+    } else {
+        /* 注册/刷新 — 只写内存，不调 reg_push（防双写） */
+        (void)loc_upsert(r->cfg.db, b, now);
+    }
+    return NSBC_OK;
+}
+
 int reg_core_create(const reg_cfg_t *cfg, reg_core_t **out)
 {
     reg_core_t *r = calloc(1, sizeof(*r));
@@ -521,6 +550,13 @@ int reg_core_create(const reg_cfg_t *cfg, reg_core_t **out)
     for (int i = 0; i < TB_AOR_N; ++i)
         pthread_mutex_init(&r->aor[i].lock, NULL);
     metric_source_register("nsbc_reg", "registration counters", r_reg, r);
+
+    /* === HA P1: 注册 REPL_REG apply 回调（STANDBY 侧内存重建）===
+     * 只重建 loc_db 内存 —— **绝对不调 reg_push**（防双写 DB）
+     * role 守卫：apply 回调里不检查 role（proxy 分发前 transport 已 role 仲裁）
+     * subscribe 时序：reg_core_create 先于 ha_repl_transport 线程启动，无 race */
+    ha_repl_subscribe_apply(reg_repl_apply, r);
+
     *out = r;
     return NSBC_OK;
 }
@@ -580,10 +616,11 @@ static void respond(reg_core_t *r, sip_tr_proto_t proto, const nsbc_sa_t *dst,
         char _rip[INET6_ADDRSTRLEN] = "-";
         uint16_t _rport = 0;
         if (dst) sa_to_str(dst, _rip, sizeof(_rip), &_rport);
-        llog(LOG_INFO, "reg",
-             "REG-RESP status=%d dst=%s:%u len=%zu\n%.*s",
-             status, _rip, (unsigned)_rport, len,
-             (int)(len > 600 ? 600 : len), out);
+        llog(LOG_DEBUG, "reg",
+             "REG-RESP status=%d dst=%s:%u len=%zu",
+             status, _rip, (unsigned)_rport, len);
+        /* 字节全量 dump 只在 DEBUG 全开时才有意义（诊断服务端发了什么字节）。
+         * INFO 级只打印元信息；需要看完整响应体时手动开 DEBUG。 */
     }
     /* 优先走 txn 层：自动缓存响应 + 吸收同 branch 重传 */
     if (txn) {
@@ -847,18 +884,13 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
                      (int)(_h->value.len < sizeof(_rt_str) - 1
                                ? _h->value.len : sizeof(_rt_str) - 1),
                      _h->value.p);
-        llog(LOG_INFO, "reg",
+        llog(LOG_DEBUG, "reg",
              "REGISTER-IN user=%s aor=%s realm=%s src=%s proto=%d ha_role=%s "
-             "force_ok=%d call_id=%s ua=%s\n"
-             "  cseq=[%s] expires_hdr=[%s] contact=[%s] route=[%s]",
+             "force_ok=%d call_id=%s ua=%s",
              _reg_user, aor, reg_realm, src_ip, proto, _role_s,
              r->cfg.force_register_ok,
              _cid_str[0] ? _cid_str : "(none)",
-             _ua_str[0] ? _ua_str : "(none)",
-             _cseq_str[0] ? _cseq_str : "(none)",
-             _exp_str[0] ? _exp_str : "(none)",
-             _ct_str[0] ? _ct_str : "(none)",
-             _rt_str[0] ? _rt_str : "(none)");
+             _ua_str[0] ? _ua_str : "(none)");
     }
 
     llog(LOG_DEBUG, "reg",
@@ -959,11 +991,11 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
         if (!auth) {
             static __thread uint64_t bare_ms = 0;
             uint64_t now = nsbc_now_ms();
-            if (now - bare_ms > 3000) {   /* 每 3 秒聚合一条 — INFO 级默认可见 */
+            if (now - bare_ms > 3000) {   /* 每 3 秒聚合一条 — DEBUG 级（正常握手非异常） */
                 char _u[64]; _aor_user(aor, _u, sizeof(_u));
-                llog(LOG_INFO, "reg",
+                llog(LOG_DEBUG, "reg",
                      "REGISTER → 401 challenge (RFC 3261 handshake, no auth hdr) "
-                     "user=%s aor=%s src_ip=%s realm=%s → WWW-Authenticate sent",
+                     "user=%s aor=%s src_ip=%s realm=%s",
                      _u, aor, src_ip, reg_realm);
                 bare_ms = now;
             }
@@ -1017,7 +1049,7 @@ int reg_on_register(sip_tr_proto_t proto, const nsbc_sa_t *src,
         _rc = NSBC_OK; goto reg_out;
     }
 reg_auth_ok:
-    llog(LOG_INFO, "reg",
+    llog(LOG_DEBUG, "reg",
          "REGISTER-AUTH-OK user=%s aor=%s src=%s force_ok=%d",
          _reg_user, aor, src_ip, auth_ok_override ? 1 : 0);
     b2b_guard_notify(src_ip, B2B_GUARD_AUTH_OK); /* auth OK：通知 security 清零 fail/ratelimit 计数 */
@@ -1125,7 +1157,7 @@ reg_auth_ok:
     }
     if (ch0 && sip_hdr_parse_addr(ch0) == NSBC_OK && ch0->u.addr.star) {
         char _u[64]; _aor_user(aor, _u, sizeof(_u));
-        llog(LOG_INFO, "reg",
+        llog(LOG_DEBUG, "reg",
              "REGISTER-LOGOUT user=%s aor=%s (Contact:* Expires:0 → loc_remove all)",
              _u, aor);
         loc_remove(r->cfg.db, aor, "*");
@@ -1200,6 +1232,16 @@ reg_auth_ok:
             snprintf(dummy.contact, sizeof(dummy.contact), "%s", ctext);
             loc_remove(r->cfg.db, aor, ctext);
             reg_push(&dummy, 0);   /* write-through: 注销快照（NAT 字段留空） */
+
+            /* === HA P1: ACTIVE → REPL_REG action=REMOVE ===
+             * loc_binding_t.expire_ms 为 0 时 STANDBY apply 侧应视为注销 */
+            {
+                int64_t rc = ha_repl_publish(REPL_REG, 1, &dummy, sizeof(dummy));
+                if (rc < 0 && rc != NSBC_NOSPC)
+                    llog(LOG_WARN, "reg",
+                         "repl_publish REG-REMOVE failed rc=%lld aor=%s",
+                         (long long)rc, dummy.aor);
+            }
             /* ★ RFC 3261 §10.3.5/§10.2.4：200 OK 必须回显被移除的 Contact
              *   （带 expires=0）。2026-11-14 之前这里直接 continue，导致
              *   注销响应是"裸 200 OK"（无 Contact 无 Expires）——UA 无法
@@ -1338,7 +1380,7 @@ reg_auth_ok:
                     strncpy(last_aor, b.aor, sizeof(last_aor) - 1);
                     strncpy(last_pub, b.public_contact, sizeof(last_pub) - 1);
                     last_log_ms = now_ms;
-                    llog(LOG_INFO, "reg",
+                    llog(LOG_DEBUG, "reg",
                          "NAT detected contact=%s → public_contact=%s src=%s via_recv=%s",
                          b.contact, b.public_contact, src_ip, via_recv);
                 } else {
@@ -1423,7 +1465,7 @@ reg_auth_ok:
             }
         }
 
-        llog(LOG_INFO, "reg",
+        llog(LOG_DEBUG, "reg",
              "loc_upsert-CALL user=%s aor=%s contact=%.80s expires_server=%ld "
              "nat=%d instance=%.60s callid=%.60s src_ip=%s transport=%d",
              _reg_user, b.aor, b.contact, exp, b.nat_detected,
@@ -1437,9 +1479,9 @@ reg_auth_ok:
             rc == LOC_OK ? "OK" :
             rc == LOC_FULL ? "FULL" :
             rc == LOC_STALE_CSEQ ? "STALE_CSEQ" : "OTHER";
-        /* 正常 LOC_OK 走 INFO；FULL/STALE_CSEQ/EXPIRED 是注册被拒绝的信号 → WARN */
+        /* 正常 LOC_OK 走 DEBUG（常规路径不吵）；FULL/STALE_CSEQ 是注册被拒信号 → WARN */
         if (rc == LOC_OK) {
-            llog(LOG_INFO, "reg",
+            llog(LOG_DEBUG, "reg",
                  "loc_upsert-RETURN user=%s rc=OK aor=%s contact=%.80s",
                  _reg_user, b.aor, b.contact);
         } else {
@@ -1466,6 +1508,18 @@ reg_auth_ok:
             continue;  /* 跳过这个 Contact，不 reg_push（data store 不被污染） */
         }
         reg_push(&b, exp);  /* write-through: 注册成功（含 NAT 元数据） */
+
+        /* === HA P1: ACTIVE → REPL_REG publish ===
+         * loc_binding_t 是扁平无指针结构（所有固定数组），可直接 memcpy 为载荷。
+         * payload_ver=1 —— 载荷结构版本，后续演进 bump 版本号 */
+        {
+            int64_t rc = ha_repl_publish(REPL_REG, 1, &b, sizeof(b));
+            if (rc < 0 && rc != NSBC_NOSPC)
+                llog(LOG_WARN, "reg",
+                     "repl_publish REG failed rc=%lld aor=%s contact=%s",
+                     (long long)rc, b.aor, b.contact);
+        }
+
         ++nc;
     }
     if (!nc && !ch0) {
