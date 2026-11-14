@@ -5148,7 +5148,7 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                     sip_hdr_t *_cid = sip_hdr_get(m, SIP_H_CALL_ID);
                     const char *_cids = (_cid && _cid->value.p) ? _cid->value.p : "-";
                     llog(LOG_INFO, "b2b",
-                         "Phase 5 XL: INVITE dispatched to endpoint '%s' rc=%d callid=%s",
+                         "Phase 5 XL: INVITE dispatched to endpoint '%s' rc=%d callid=%.64s",
                          ep->name, rc, _cids);
                 }
                 return;

@@ -1611,6 +1611,43 @@ window.nsbcHangup = async function(callId) {
   }
 };
 
+// ===== Playback 全局函数（chain 管道符拼接支持）=====
+
+window.nsbcPlayback = async function(callId, wav, side, loop) {
+  if (!callId || !wav) return;
+  try {
+    await API.post('/calls/' + encodeURIComponent(callId) + '/playback', {
+      wav: wav,
+      side: (side !== undefined && side !== null) ? side : -1,
+      loop: (loop !== undefined && loop !== null) ? loop : 0
+    });
+    alert('Playback started: ' + wav);
+  } catch (e) {
+    alert('Playback failed: ' + (e.message || e));
+  }
+};
+
+window.nsbcPlaybackStop = async function(callId) {
+  if (!callId) return;
+  try {
+    await API.post('/calls/' + encodeURIComponent(callId) + '/playback-stop', {});
+    alert('Playback stopped');
+  } catch (e) {
+    alert('Playback stop failed: ' + (e.message || e));
+  }
+};
+
+window.nsbcPlaybackStatus = async function(callId) {
+  if (!callId) return null;
+  try {
+    const r = await API.get('/calls/' + encodeURIComponent(callId) + '/playback-status');
+    return r.data || r;
+  } catch (e) {
+    console.warn('Playback status failed:', e.message || e);
+    return null;
+  }
+};
+
 // ===== SESSION 实时推送消费者（SSE，nsbc-esl-web §8#1）=====
 // 双路径设计（符合项目「订阅推送 + 拉取」约束）：本消费者把服务端 /calls/stream
 // 的 SESSION 事件转成本地 nsbc-refresh 事件即时Refresh livePanel；若 SSE 不可用，

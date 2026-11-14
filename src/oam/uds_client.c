@@ -515,33 +515,68 @@ static void uds_handle_core_cmd(uint32_t ticket, const char *line, size_t len)
         return;
     }
 
-    /* 切分命令行：argv[0]=命令名，argv[1]=剩余全部（大 JSON payload 不按空格切） */
-    /* 找第一个空格 */
-    const char *sp = memchr(line, ' ', len);
-    char argv0[CMD_NAME_MAX] = {0};
-    const char *argv1 = "";
-    size_t argv1_len = 0;
+    /* 切分命令行：区分"payload 型"（.reload / config.set / config.validate）
+     * 和"普通命令型"（uuid_kill / uuid_hold / uuid_transfer ...）：
+     *   - payload 型：只切第一个空格，argv[1] 后面整段（JSON）
+     *   - 普通命令：全空格切分，每个 token 独立 argv[]
+     * 安全策略：cmd_name 只存命令名（不含任何参数），先查 cmd_registered 再决定如何切。 */
 
-    if (sp) {
-        size_t name_len = (size_t)(sp - line);
-        if (name_len >= sizeof(argv0)) name_len = sizeof(argv0) - 1;
-        memcpy(argv0, line, name_len);
-        argv0[name_len] = '\0';
-        argv1 = sp + 1;
-        argv1_len = len - (size_t)(sp + 1 - line);
-    } else {
-        /* 无参数命令 */
-        size_t name_len = len < sizeof(argv0) - 1 ? len : sizeof(argv0) - 1;
-        memcpy(argv0, line, name_len);
-        argv0[name_len] = '\0';
+    /* Step 1: 先拿纯命令名（到第一个空格为止） */
+    const char *sp0 = memchr(line, ' ', len);
+    char cmd_name[CMD_NAME_MAX] = {0};
+    size_t name_len = sp0 ? (size_t)(sp0 - line) : len;
+    if (name_len >= sizeof(cmd_name)) name_len = sizeof(cmd_name) - 1;
+    memcpy(cmd_name, line, name_len);
+    cmd_name[name_len] = '\0';
+
+    if (!cmd_name[0]) return;
+
+    /* Step 2: 先查命令是否存在（用纯命令名） */
+    if (!cmd_registered(reg, cmd_name)) {
+        llog(LOG_WARN, "uds", "unknown CMD_REQ command: %s", cmd_name);
+        return;
     }
 
-    if (!argv0[0]) return;
+    /* Step 3: 判断是否 payload 型命令 */
+    int is_payload = 0;
+    size_t nn = strlen(cmd_name);
+    if (nn >= 7 && strcmp(cmd_name + nn - 7, ".reload") == 0) is_payload = 1;
+    if (strcmp(cmd_name, "config.set") == 0 ||
+        strcmp(cmd_name, "config.validate") == 0) is_payload = 1;
 
-    /* 检查命令是否已注册 */
-    if (!cmd_registered(reg, argv0)) {
-        llog(LOG_WARN, "uds", "unknown CMD_REQ command: %s", argv0);
+    /* Step 4: 全量切分到动态 buffer（extensions.reload 可达 12.6MB，
+     * 栈上 1024 根本不够！旧版是 malloc(argv1_len+1)，这里保持动态分配） */
+    char *work = (char *)malloc(len + 1);
+    if (!work) {
+        llog(LOG_WARN, "uds", "CMD_REQ: malloc work failed");
         return;
+    }
+    memcpy(work, line, len);
+    work[len] = '\0';
+
+    char *argv[16] = {0};
+    int argc = 0;
+    char *p = work;
+
+    if (is_payload) {
+        /* 只切第一个空格：argv[0]=命令名，argv[1]=payload 整段 */
+        char *wsp = strchr(work, ' ');
+        argv[argc++] = p;           /* argv[0] 指向命令名 */
+        if (wsp) {
+            *wsp = '\0';            /* 在 work[] 里就地改写 */
+            argv[argc++] = wsp + 1;
+        }
+    } else {
+        /* 全空格切分，最多 15 个参数（argv[0] + argv[1..15]） */
+        while (p && argc < 16) {
+            /* 跳过前导空格 */
+            while (*p == ' ') p++;
+            if (!*p) break;
+            argv[argc++] = p;
+            /* 找下一个空格 */
+            p = strchr(p, ' ');
+            if (p) { *p = '\0'; p++; }
+        }
     }
 
     /* 构造 ctx + io buffer，执行命令 */
@@ -554,26 +589,13 @@ static void uds_handle_core_cmd(uint32_t ticket, const char *line, size_t len)
         .io_ud = &io,
     };
 
-    /* Rust 端 periodic push 每 60s 推全量命令（N 条/次），NOTICE 级会刷屏。
-     * 高频 CMD_REQ 详情降 DEBUG；CMD_REQ 本身的成功/失败由各 cmd handler 自打。 */
-    llog(LOG_DEBUG, "uds-cmd", "CMD_REQ argv0='%s' argv1_len=%zu ticket=%u",
-         argv0, argv1_len, ticket);
+    llog(LOG_DEBUG, "uds-cmd",
+         "CMD_REQ argv0='%s' argc=%d is_payload=%d ticket=%u",
+         argv[0] ? argv[0] : "-", argc, is_payload, ticket);
 
-    /* 把 argv1 拷贝到临时 buffer（cmd_execute 可能原地修改 argv[1]） */
-    char *argv1_copy = NULL;
-    if (argv1_len > 0) {
-        argv1_copy = (char *)malloc(argv1_len + 1);
-        if (!argv1_copy) goto cleanup;
-        memcpy(argv1_copy, argv1, argv1_len);
-        argv1_copy[argv1_len] = '\0';
-    }
-
-    char *argv[2] = { argv0, argv1_copy };
-    int argc = argv1_copy ? 2 : 1;
     int rc = cmd_execute(reg, &ctx, argc, argv);
     (void)rc;
 
-cleanup:
     /* 把命令结果作为 FT_CMD_RSP 发回 Rust 端
      * conn_lock 保护 fd_cmd 不被 reconnect 并发重建，
      * cmd_lock 保护 send 分片（uds_send_fragmented_locked 假设调用者持锁）。 */
@@ -590,8 +612,8 @@ cleanup:
             pthread_mutex_unlock(&g.cmd_lock);
         }
     }
-    free(argv1_copy);
     free(io.buf);
+    free(work);
 }
 
 /* 校验 magic + total_len + flags，然后按 frame_type 分发。

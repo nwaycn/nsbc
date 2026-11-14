@@ -39,6 +39,7 @@ static inline void rtp_write_u32(uint8_t *p, uint32_t v)
 #define PB_MAX_FRAMES 800 /* 100ms @ 8kHz → 适配 timer_wheel 100ms 粒度
                             * （tw_add 被 round 到 tick_ms 整数倍，
                             *  PB_PULL_INTERVAL_MS=20 实际 ≈ 100ms 触发一次） */
+#define PB_CHAIN_MAX 8   /* 多文件 chain 上限 —— 工号播报场景足够 */
 
 typedef struct pb_ctx {
     void *call_key;
@@ -62,6 +63,13 @@ typedef struct pb_ctx {
     int total_sent;           /* ★ 累计 sendto 次数（诊断用） */
     char wav_path[256];
     struct pb_ctx *next;
+
+    /* ---- chain 多文件串联 ----
+     * pb_start_chain 时填；中间文件播完 EOF 自动 start 下一个；
+     * 最后一个 EOF 自动 pb_stop。 */
+    int chain_count;                        /* chain 文件总数（>=1） */
+    int chain_idx;                          /* 当前正在播的文件在 chain_wavs[] 里的下标 */
+    char *chain_wavs[PB_CHAIN_MAX];         /* strdup 进来的路径，pb_stop 时逐个 free */
 } pb_ctx_t;
 
 static pthread_mutex_t g_pb_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -174,7 +182,29 @@ static void pb_timer_cb(uint64_t now_ms, void *arg)
     int pulled = snd_file_pull(pb->snd, pcm_buf, total_frames, pb->loop);
     pb->total_pulled += pulled;
     if (pulled <= 0) {
-        llog(LOG_INFO, "pb", "EOF call=%p", pb->call_key);
+        /* EOF —— chain 中间文件自动 start 下一个，最后一个才停 */
+        if (pb->chain_count > 1 && pb->chain_idx < pb->chain_count - 1) {
+            const char *next_wav = pb->chain_wavs[pb->chain_idx + 1];
+            llog(LOG_INFO, "pb", "chain EOF idx=%d → start idx=%d path=%s",
+                 pb->chain_idx, pb->chain_idx + 1, next_wav ? next_wav : "?");
+            /* 关当前 snd，开下一个（snd_file_open 是 4 参数，
+             * 返回 int，snd_src_t* 通过 out 出参拿到） */
+            snd_file_close(pb->snd); pb->snd = NULL;
+            snd_src_t *next_snd = NULL;
+            int rc2 = snd_file_open(next_wav, &next_snd, 0 /* auto fallback */, NULL);
+            if (rc2 != NSBC_OK || !next_snd) {
+                llog(LOG_WARN, "pb", "chain next file open failed rc=%d path=%s — stopping",
+                     rc2, next_wav ? next_wav : "null");
+                pb_stop(pb->call_key);
+                return;
+            }
+            pb->snd = next_snd;
+            pb->chain_idx++;
+            /* 保持同一 ctx，继续 timer_cb 下一个 tick 拉数据 */
+            return;
+        }
+        llog(LOG_INFO, "pb", "EOF call=%p chain_idx=%d/%d → pb_stop",
+             pb->call_key, pb->chain_idx, pb->chain_count);
         pb_stop(pb->call_key);
         return;
     }
@@ -371,9 +401,12 @@ int pb_stop(void *call_key)
     pb->active = 0;
     pthread_mutex_unlock(&g_pb_lock);
 
-    /* 停时间轮 + 关 snd_file */
+    /* 停时间轮 + 关 snd_file + free chain 路径 */
     tw_del(ctx->tw, &pb->tn);
     if (pb->snd) { snd_file_close(pb->snd); pb->snd = NULL; }
+    for (int i = 0; i < PB_CHAIN_MAX; ++i) {
+        if (pb->chain_wavs[i]) { free(pb->chain_wavs[i]); pb->chain_wavs[i] = NULL; }
+    }
 
     llog(LOG_INFO, "pb", "STOP call=%p side=%d", call_key, pb->side);
 
@@ -445,27 +478,38 @@ int pb_stop_by_flag(void *call_key, int stop_on_answer)
     return stopped;
 }
 
-/* pb_start_chain：管道符拼接。P0 简化实现——内部只播第一个，
- * 后续文件由调用方（Dialplan 执行器）按顺序依次调 pb_start。
- * P1 扩展：把 chain 存在 pb_ctx_t 里，EOF 时自动 start 下一个。 */
+/* pb_start_chain：多文件串联播放（P1 真 chain 版）。
+ *
+ * 内部就是一个 pb_ctx_t，chain_wavs[] 保存所有路径，chain_idx 标记当前下标。
+ * pb_timer_cb EOF 时自动 close 当前 snd → snd_file_open 下一个 wav → chain_idx++。
+ * 最后一个 EOF 才 pb_stop 并 free chain_wavs[]。
+ * chain 模式下 loop 被忽略（每个文件只播一次，这是工号播报的语义）。 */
 int pb_start_chain(void *call_key, const char **wav_list, int n,
                   int side, pb_ctx_t **out)
 {
     if (!call_key || !wav_list || n <= 0) return NSBC_INVAL;
-    if (n == 1) return pb_start(call_key, wav_list[0], side, 0, out);
-    /* P0 简化：先停可能在播的，依次调 pb_start（后续 EOF 自动 stop）。
-     * 这符合 Dialplan app_chain 语义——每个 playback app 独立执行。 */
+    if (n > PB_CHAIN_MAX) n = PB_CHAIN_MAX; /* 硬上限截断 */
+
+    /* 先停可能在播的（幂等） */
     pb_stop_if_playing(call_key);
-    int rc = NSBC_OK;
-    for (int i = 0; i < n; ++i) {
-        rc = pb_start(call_key, wav_list[i], side, 0,
-                      (i == n - 1) ? out : NULL);
-        if (rc != NSBC_OK) break;
-        /* 注意：pb_start 内部挂时间轮，当前 pb_timer_cb 只推一个文件。
-         * 多文件串联需要扩展 pb_ctx_t 存 chain + next_idx，EOF 时 start 下一个。
-         * P0 先按 Dialplan app_chain 模式走——每个文件一个 playback app 调用。 */
-    }
-    return rc;
+
+    /* 播第一个 —— pb_start 内部建完整 pb_ctx 并挂到 g_pb_list，
+     * snd_file_open + 挂时间轮 timer_cb 都自动做好 */
+    pb_ctx_t *pb = NULL;
+    int rc = pb_start(call_key, wav_list[0], side, 0 /* chain 中间不 loop */, &pb);
+    if (rc != NSBC_OK || !pb) return rc;
+
+    /* 填 chain 字段 —— timer_cb EOF 时自动链切 */
+    pb->chain_count = n;
+    pb->chain_idx = 0;
+    for (int i = 0; i < PB_CHAIN_MAX; ++i) pb->chain_wavs[i] = NULL;
+    pb->chain_wavs[0] = strdup(wav_list[0]);
+    for (int i = 1; i < n; ++i) pb->chain_wavs[i] = strdup(wav_list[i]);
+
+    llog(LOG_INFO, "pb", "START chain call=%p n=%d wav0=%s",
+         call_key, n, wav_list[0]);
+    if (out) *out = pb;
+    return NSBC_OK;
 }
 
 /* ---------- pb_active_count / pb_total_players ---------- */

@@ -262,7 +262,13 @@ app.component('channels-live', livePanel(t('Live channels'), 'fa-solid fa-phone-
     actionCol: (row) => {
       const callId = row.a_call_id || row.b_call_id || '';
       if (!callId) return '';
-      return `<button onclick="nsbcHangup('${callId}')" class="px-2 py-1 text-xs text-red-600 border border-red-300 rounded hover:bg-red-50 hover:text-red-800"><i class="fa-solid fa-phone-slash"></i> ${t('Hang up')}</button>`;
+      const esc = callId.replace(/'/g, "\\'");
+      return [
+        `<button onclick="nsbcHangup('${esc}')" class="px-2 py-1 text-xs text-red-600 border border-red-300 rounded hover:bg-red-50 hover:text-red-800"><i class="fa-solid fa-phone-slash"></i> ${t('Hang up')}</button>`,
+        `<button onclick="(async ()=>{const w=prompt('${t('WAV path or chain (| sep)')}','welcome.wav');if(!w)return;await nsbcPlayback('${esc}',w,-1,0)})()" class="px-2 py-1 text-xs text-green-600 border border-green-300 rounded hover:bg-green-50 hover:text-green-800"><i class="fa-solid fa-play"></i> Play</button>`,
+        `<button onclick="nsbcPlaybackStop('${esc}')" class="px-2 py-1 text-xs text-amber-600 border border-amber-300 rounded hover:bg-amber-50 hover:text-amber-800"><i class="fa-solid fa-stop"></i> Stop</button>`,
+        `<button onclick="(async ()=>{const s=await nsbcPlaybackStatus('${esc}');if(s)alert('active='+s.active+' side='+s.side+' loop='+s.loop);else alert('not playing')})()" class="px-2 py-1 text-xs text-slate-600 border border-slate-300 rounded hover:bg-slate-50 hover:text-slate-800"><i class="fa-solid fa-circle-info"></i> Status</button>`,
+      ].join(' ');
     },
   }));
 

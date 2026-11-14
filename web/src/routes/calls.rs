@@ -55,6 +55,9 @@ where
         .route("/calls/:id/broadcast", post(broadcast::<C>))
         .route("/calls/:id/vad-start", post(vad_start::<C>))
         .route("/calls/:id/vad-stop", post(vad_stop::<C>))
+        .route("/calls/:id/playback", post(playback::<C>))
+        .route("/calls/:id/playback-stop", post(playback_stop::<C>))
+        .route("/calls/:id/playback-status", get(playback_status::<C>))
         .route("/calls/:id/transfer", post(transfer::<C>))
         .route("/calls/:id/record", post(record::<C>))
         .route("/calls/:id/send-dtmf", post(send_dtmf::<C>))
@@ -318,6 +321,101 @@ async fn vad_stop<C: CoreApi + Clone + 'static>(
     }
     st.core.call_action(&id, "vad_stop", &[]).await?;
     Ok(action_response(&id))
+}
+
+// ===== playback chain 路由 =====
+
+/// POST /calls/{id}/playback — uuid_playback <wav|chain> [side=-1] [loop=0]
+#[derive(Debug, Deserialize)]
+struct PlaybackBody {
+    /// WAV 路径或管道符拼接 chain: "9.wav|5.wav|2.wav|agent.wav"
+    wav: String,
+    /// -1=both(默认) 0=A 1=B
+    side: Option<i32>,
+    /// 0=播一次 EOF 停(默认) 1=循环 (chain 模式忽略)
+    /// 字段名用 looping（loop 是 Rust 保留字），JSON key 仍叫 "loop"
+    #[serde(rename = "loop")]
+    looping: Option<i32>,
+}
+
+fn valid_playback_wav(w: &str) -> bool {
+    !w.is_empty() && w.len() <= 1024
+}
+
+async fn playback<C: CoreApi + Clone + 'static>(
+    State(st): State<Arc<AppState<C>>>,
+    Path(id): Path<String>,
+    Json(body): Json<PlaybackBody>,
+) -> ApiResult<Json<ActionResponse>> {
+    if !valid_call_id(&id) {
+        return Err(ApiError::BadRequest("invalid call id".into()));
+    }
+    if !valid_playback_wav(&body.wav) {
+        return Err(ApiError::BadRequest("invalid wav (1..1024 chars)".into()));
+    }
+    let side = body.side.unwrap_or(-1);
+    if side != -1 && side != 0 && side != 1 {
+        return Err(ApiError::BadRequest("side must be -1|0|1".into()));
+    }
+    let lp = body.looping.unwrap_or(0);
+    if lp != 0 && lp != 1 {
+        return Err(ApiError::BadRequest("loop must be 0|1".into()));
+    }
+    st.core.call_action(
+        &id, "playback",
+        &[&body.wav, &side.to_string(), &lp.to_string()],
+    ).await?;
+    Ok(action_response(&id))
+}
+
+/// POST /calls/{id}/playback-stop — uuid_playback_stop (幂等)
+async fn playback_stop<C: CoreApi + Clone + 'static>(
+    State(st): State<Arc<AppState<C>>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<ActionResponse>> {
+    if !valid_call_id(&id) {
+        return Err(ApiError::BadRequest("invalid call id".into()));
+    }
+    st.core.call_action(&id, "playback_stop", &[]).await?;
+    Ok(action_response(&id))
+}
+
+/// GET /calls/{id}/playback-status — uuid_playback_status (L1 只读)
+#[derive(Debug, serde::Serialize)]
+struct PlaybackStatus {
+    active: bool,
+    side: Option<i32>,
+    #[serde(rename = "loop")]
+    looping: Option<i32>,
+}
+
+/// 解析 core 输出："OK playback active=1 side=-1 loop=0 call=xxx"
+fn parse_playback_status(output: &str) -> PlaybackStatus {
+    let mut active = false;
+    let mut side: Option<i32> = None;
+    let mut looping: Option<i32> = None;
+
+    for tok in output.split_whitespace() {
+        if let Some(v) = tok.strip_prefix("active=") {
+            active = v.parse::<i32>().map(|x| x == 1).unwrap_or(false);
+        } else if let Some(v) = tok.strip_prefix("side=") {
+            side = v.parse::<i32>().ok();
+        } else if let Some(v) = tok.strip_prefix("loop=") {
+            looping = v.parse::<i32>().ok();
+        }
+    }
+    PlaybackStatus { active, side, looping }
+}
+
+async fn playback_status<C: CoreApi + Clone + 'static>(
+    State(st): State<Arc<AppState<C>>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<PlaybackStatus>> {
+    if !valid_call_id(&id) {
+        return Err(ApiError::BadRequest("invalid call id".into()));
+    }
+    let raw = st.core.exec_cmd(&format!("uuid_playback_status {}", id)).await?;
+    Ok(Json(parse_playback_status(&raw)))
 }
 
 /// POST /calls/{id}/transfer — uuid_transfer dest.

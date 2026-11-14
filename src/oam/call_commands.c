@@ -27,6 +27,7 @@
 #include "media_bug.h"
 #include "hep_sink.h"
 #include "vad_engine.h"
+#include "playback_engine.h"
 #include "nsbc_common.h"
 #include "obs_sub.h"       /* obs_sub_global + obs_sub_add — siptrace on 自动订阅当前连接 */
 #include "sip_transport.h"
@@ -438,6 +439,155 @@ static int cmd_uuid_break(cmd_ctx_t *c, int argc, char **argv, void *ud)
                             strlen("{\"reason\":\"uuid_break\"}"));
     }
     return rc;
+}
+
+/* ==================================================================
+ * uuid_playback <call-id> <wav|chain> [side=-1] [loop=0]（L2）
+ *
+ * wav 支持管道符拼接："9.wav|5.wav|2.wav|7.wav|agent.wav"
+ *   → pb_start_chain EOF 自动串播；单文件等价 pb_start。
+ * side: -1=both(默认), 0=A, 1=B
+ * loop: 0=播一次 EOF 停(默认), 1=循环（chain 模式忽略 loop）
+ * ==================================================================*/
+
+#define PB_CHAIN_MAX_OAM 8
+
+static int cmd_uuid_playback(cmd_ctx_t *c, int argc, char **argv, void *ud)
+{
+    if (!c || !c->io_printf) return NSBC_INVAL;
+    char *callid = NULL;
+    if (!pick_callid(c, argv, argc, &callid)) return NSBC_INVAL;
+    if (argc < 3 || !argv[2] || argv[2][0] == '\0') {
+        c->io_printf(c->io_ud, "ERR missing wav path (chain: a.wav|b.wav|c.wav)\n");
+        return NSBC_INVAL;
+    }
+
+    int side = PB_SIDE_BOTH; /* -1 */
+    int loop = 0;
+    if (argc >= 4 && argv[3][0] != '\0') {
+        side = atoi(argv[3]);
+        if (side != -1 && side != 0 && side != 1) {
+            c->io_printf(c->io_ud, "ERR side must be -1|0|1\n");
+            return NSBC_INVAL;
+        }
+    }
+    if (argc >= 5 && argv[4][0] != '\0') {
+        loop = atoi(argv[4]);
+        if (loop != 0 && loop != 1) {
+            c->io_printf(c->io_ud, "ERR loop must be 0|1\n");
+            return NSBC_INVAL;
+        }
+    }
+
+    b2b_core_t *b = b2b_from_ctx(ctx_from_ud(ud));
+    if (!b) { c->io_printf(c->io_ud, "ERR b2b not available\n"); return NSBC_ERR; }
+    b2b_call_t *call = b2b_find_callid(b, callid, strlen(callid));
+    if (!call) { c->io_printf(c->io_ud, "ERR notfound\n"); return NSBC_NOENT; }
+
+    /* 解析管道符 chain —— 原地切分需要可写副本 */
+    const char *chain = argv[2];
+    size_t cl = strlen(chain);
+    char *chain_copy = (char *)malloc(cl + 1);
+    if (!chain_copy) { c->io_printf(c->io_ud, "ERR nomem\n"); return NSBC_NOMEM; }
+    memcpy(chain_copy, chain, cl + 1);
+
+    const char *wav_list[PB_CHAIN_MAX_OAM] = {0};
+    int n = 0;
+    char *p = chain_copy;
+    while (*p && n < PB_CHAIN_MAX_OAM) {
+        wav_list[n++] = p;
+        char *pipe = strchr(p, '|');
+        if (pipe) { *pipe = '\0'; p = pipe + 1; }
+        else break;
+    }
+
+    pb_ctx_t *pb = NULL;
+    int rc;
+    if (n == 1) {
+        /* 单文件 → pb_start（支持 loop 语义） */
+        rc = pb_start(call, wav_list[0], side, loop, &pb);
+    } else {
+        /* 多文件 chain → pb_start_chain（chain 忽略 loop，内部 EOF 自动切下一个） */
+        rc = pb_start_chain(call, wav_list, n, side, &pb);
+    }
+
+    free(chain_copy);
+
+    if (rc == NSBC_OK) {
+        c->io_printf(c->io_ud, "OK playback n=%d side=%d %s\n", n, side, callid);
+        log_audit("oam", "uuid-playback",
+                  "call-id=%s n=%d side=%d loop=%d result=ok",
+                  callid, n, side, loop);
+        return NSBC_OK;
+    } else if (rc == NSBC_NOENT) {
+        c->io_printf(c->io_ud, "ERR call not found\n");
+    } else if (rc == NSBC_NOTSUP) {
+        c->io_printf(c->io_ud, "ERR not-supported\n");
+    } else {
+        c->io_printf(c->io_ud, "ERR playback failed rc=%d\n", rc);
+    }
+    log_audit("oam", "uuid-playback",
+              "call-id=%s n=%d side=%d result=err rc=%d",
+              callid, n, side, rc);
+    return rc;
+}
+
+/* ==================================================================
+ * uuid_playback_stop <call-id>（L2）—— 强制停止播放（幂等）
+ * ==================================================================*/
+
+static int cmd_uuid_playback_stop(cmd_ctx_t *c, int argc, char **argv, void *ud)
+{
+    if (!c || !c->io_printf) return NSBC_INVAL;
+    char *callid = NULL;
+    if (!pick_callid(c, argv, argc, &callid)) return NSBC_INVAL;
+
+    b2b_core_t *b = b2b_from_ctx(ctx_from_ud(ud));
+    if (!b) { c->io_printf(c->io_ud, "ERR b2b not available\n"); return NSBC_ERR; }
+    b2b_call_t *call = b2b_find_callid(b, callid, strlen(callid));
+    if (!call) { c->io_printf(c->io_ud, "ERR notfound\n"); return NSBC_NOENT; }
+
+    int rc = pb_stop(call);
+    if (rc == NSBC_OK) {
+        c->io_printf(c->io_ud, "OK playback stopped %s\n", callid);
+        log_audit("oam", "uuid-playback-stop", "call-id=%s result=ok", callid);
+        return NSBC_OK;
+    } else if (rc == NSBC_NOENT) {
+        /* 没在播也算成功（幂等） */
+        c->io_printf(c->io_ud, "OK no-active-playback %s\n", callid);
+        return NSBC_OK;
+    }
+    c->io_printf(c->io_ud, "ERR playback stop failed rc=%d\n", rc);
+    return rc;
+}
+
+/* ==================================================================
+ * uuid_playback_status <call-id>（L1 只读）—— active/side/loop
+ * ==================================================================*/
+
+static int cmd_uuid_playback_status(cmd_ctx_t *c, int argc, char **argv, void *ud)
+{
+    (void)ud;
+    if (!c || !c->io_printf) return NSBC_INVAL;
+    char *callid = NULL;
+    if (!pick_callid(c, argv, argc, &callid)) return NSBC_INVAL;
+
+    b2b_core_t *b = b2b_from_ctx(ctx_from_ud(ud));
+    if (!b) { c->io_printf(c->io_ud, "ERR b2b not available\n"); return NSBC_ERR; }
+    b2b_call_t *call = b2b_find_callid(b, callid, strlen(callid));
+    if (!call) { c->io_printf(c->io_ud, "ERR notfound\n"); return NSBC_NOENT; }
+
+    int side = 0, loop = 0;
+    int active = pb_status(call, &side, &loop);
+    if (active) {
+        c->io_printf(c->io_ud,
+                     "OK playback active=1 side=%d loop=%d call=%s\n",
+                     side, loop, callid);
+    } else {
+        c->io_printf(c->io_ud,
+                     "OK playback active=0 call=%s\n", callid);
+    }
+    return NSBC_OK;
 }
 
 /* ==================================================================
@@ -1706,6 +1856,12 @@ void call_commands_register(cmd_reg_t *reg, nsbc_ctx_t *ctx)
           "b2b", CMD_L2_ADMIN, cmd_uuid_broadcast, ctx },
         { "uuid_break",    "打断当前媒体流（L2）",
           "b2b", CMD_L2_ADMIN, cmd_uuid_break, ctx },
+        { "uuid_playback", "启动播放（支持 chain 管道符）<id> <wav|a.wav|b.wav> [side=-1] [loop=0]（L2）",
+          "b2b", CMD_L2_ADMIN, cmd_uuid_playback, ctx },
+        { "uuid_playback_stop", "强制停止播放 <id>（L2，幂等）",
+          "b2b", CMD_L2_ADMIN, cmd_uuid_playback_stop, ctx },
+        { "uuid_playback_status","查询播放状态 active/side/loop <id>（L1 只读）",
+          "b2b", CMD_L1_MONITOR, cmd_uuid_playback_status, ctx },
         { "uuid_record",   "start|stop 录制（L2）",
           "b2b", CMD_L2_ADMIN, cmd_uuid_record, ctx },
         { "uuid_answer",   "200 OK 应答（L2）",
