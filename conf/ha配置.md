@@ -384,17 +384,18 @@ HA 暂无独立 CLI 命令。可通过 `nsbcli status` 查看当前角色（需�
 | Hitless Upgrade | ha.h 公共 API | ✅ | ✅ **6 步完整流程**（FREEZE→DRAIN→FULL push→yield_requested→heartbeat role flip→返回）+ auto-unfreeze 超时 + drain_by_in-dialog BYE 30s 降级 + **FULL resync 状态对齐** |
 | Dialog Rebuild | b2bua.c（STANDBY→ACTIVE） | ✅ | ✅ **v3 payload 完整重建**：call state machine（leg tag/cseq/state/a_final）+ profile 查找（sip_profile_find）+ **media anchor relay 重建**（bridge_register_call + rtp_relay_start + set_peer_a/b）+ 去重（tbl_find） |
 
-### 10.2 已知降级点（明确不做或后续 P1.5）
+### 10.2 已知降级点（明确不做或后续 P2）
 
 | 项 | 降级 | 原因 |
 |----|------|------|
 | **REPL_FULL_CDR_FLUSH** | 未实现 | 当前只对 loc_db + dialog 做 FULL；CDR flush 走独立 DB 路径，不在内存复制覆盖范围 |
 | **BFD Echo 模式**（D bit=1） | 未实现 | UDP 心跳 250ms + BFD Control 200ms×3=600ms 已够秒级探测，Echo 不增加价值 |
-| **STANDBY REPL_DIALOG apply 的 SDP codec/SSRC** | payload 打 0，重建侧不重建 | SDP 体积大（~1KB/条）+ codec 协商结果可从 SDP answer 解析后打平 — 这是 v3→v4 可以加的 |
 | **relay transcode session 重建** | rebuild 时 fallback MB_RELAY | relay_mode 在 payload 里打平，但 transcode session 内部状态（codec filter graph）无法序列化；降级为 MB_RELAY 能续通但不转码 |
-| **NOSPC 主动 FULL** | NOSPC 只 WARN，不主动发 FULL | 触发 FULL 还是靠 on_gap same_gap_cnt≥3（更温和降级链，业务侧零侵入） |
-| **rebuild 后 codec v4 payload** | 当前 payload_ver=3，codec 字段全 0 | v4 在 publish 时从 ACTIVE 侧 SDP answer 解析 codec PT/CR/SSRC 打平，rebuild 侧按版本号分支解析 |
 | **跨进程 SHM（shm_seg.h）** | Hitless Upgrade 走 **replica FULL push** 状态对齐，不依赖 SHM | SHM 是跨进程方案（老进程 publish → 新进程 attach）；我们用的是**进程内** role flip + STANDBY→ACTIVE rebuild_from_buf — 更简单、更安全、无 SHM 陈旧风险 |
+
+> ✅ **已实现**（原 P1.5 降级点已落地）：
+> - **NOSPC 主动 FULL**：transport 线程 poll 检测连续 NOSPC ≥ 16（5s 窗口）→ 自动 `transport_send_full_snapshot`。业务线程只做 counter 累加，不阻塞。
+> - **payload v4 codec/SSRC**：publish 侧从 `bridge_call_view.ssrc_out[2]` 拿 relay 重写后的 SSRC，从 `codec_registry_find_name` 拿 PT + clock_rate，payload_ver 从 3 升到 4。rebuild 侧 payload 结构体形状不变，自动吃。
 
 ### 10.3 ha_replica 核心设计不变
 
@@ -504,7 +505,7 @@ typedef struct {
 | 触发源 | 条件 | 降级 |
 |--------|------|------|
 | **GAP_REQ 重传失败**（已实现） | STANDBY on_gap same_gap_cnt≥3 → 发 FULL_REQ | 最温和（STANDBY 主动请求，ACTIVE 被动响应） |
-| **NOSPC**（未实现，降级链 P1.5） | ACTIVE 环形缓冲满（repl_publish 返回 NOSPC） | 当前只 WARN |
+| **NOSPC**（✅ 已实现） | ACTIVE 业务线程连续 NOSPC ≥ 16（5s 窗口）→ transport 线程自动 FULL push | 比 gap 重传更彻底的降级（备端 ACK 严重落后时触发） |
 | **OAM API**（已实现） | `ha_hitless_upgrade()` Step 3 主动调 `ha_repl_trans_force_full_push()` | Hitless Upgrade 强制状态对齐 |
 | **周期对齐**（未实现，P1.5） | `ha.replica.full_resync_interval` 配置（默认 0=关闭） | 定期周期性兜底 |
 
@@ -522,16 +523,16 @@ ACTIVE → STANDBY:
 
 **降级链**：ring 空（无 publish 过）→ FULL push 只发 CLEAR + 尾 ACK → STANDBY 只清内存 → 正常流水恢复。
 
-### 12.5 接线点（✅ 已落地，payload v3）
+### 12.5 接线点（✅ 已落地，payload v4）
 
 | 模块 | 事件 | payload_ver | 调用时机 |
 |------|------|------------|----------|
 | [registrar.c](../../src/registrar/registrar.c) | REGISTER 200 OK（新增/刷新绑定） | 1（扁平 `loc_binding_t`） | `reg_push(&b, exp)` 成功后（ACTIVE guard + `ha_repl_publish(REPL_REG, 1, &b, sizeof(b))`） |
 | [registrar.c](../../src/registrar/registrar.c) | REGISTER 4xx/expire=0（注销） | 1 | `reg_push(&dummy, 0)` → `ha_repl_publish(REPL_REG, 1, &dummy, sizeof(dummy))`（expire_ms=0 应用侧视作注销） |
-| [b2bua.c](../../src/sip/b2bua.c) | LEG_CONFIRMED（对话锚点创建） | **3** | `c->leg[1].state = LEG_CONFIRMED` 后 publish 完整 REPL_DIALOG |
-| [b2bua.c](../../src/sip/b2bua.c) | `call_destroy`（对话终结） | **3** | `ha_repl_publish(REPL_DIALOG, action=1)` — rebuild 侧跳过 END |
+| [b2bua.c](../../src/sip/b2bua.c) | LEG_CONFIRMED（对话锚点创建） | **4** | `c->leg[1].state = LEG_CONFIRMED` 后 publish 完整 REPL_DIALOG |
+| [b2bua.c](../../src/sip/b2bua.c) | `call_destroy`（对话终结） | **4** | `ha_repl_publish(REPL_DIALOG, action=1)` — rebuild 侧跳过 END |
 
-**REPL_DIALOG payload v3 完整字段（b2bua.c publish 侧）**：
+**REPL_DIALOG payload v4 完整字段（b2bua.c publish 侧）**：
 
 ```c
 typedef struct {
@@ -554,16 +555,24 @@ typedef struct {
     uint64_t start_ms;
     uint8_t  leg0_state, leg1_state;
     uint8_t  a_final;
-    /* ★ v3: media anchor */
+    /* ★ v3: media anchor — relay + peer */
     uint16_t a_rtp, b_rtp;            /* relay ports: bridge_lookup_relay → rtp_relay_port */
     uint16_t a_rtcp, b_rtcp;          /* a_rtp+1, b_rtp+1 */
     uint8_t  relay_latched_a, relay_latched_b;
     uint8_t  relay_mode;              /* 0=BYPASS / 1=RELAY / 2=TRANSCODE / 3=SRTP_RELAY */
     char peer_a_ip[64], peer_b_ip[64]; /* inet_ntop 打平 */
     uint16_t peer_a_port, peer_b_port;
-    /* codec / SSRC 暂打 0 — v4 补 */
-} repl_dialog_v3_t;
+    /* ★ v4: codec + SSRC — 之前 v3 全打 0，v4 填充有效 */
+    uint8_t  codec_pt_a, codec_pt_b;   /* payload type: PCMU=0, PCMA=8, G722=9, ... */
+    uint16_t codec_cr_a, codec_cr_b;   /* clock rate: 8000=PCMU/G722, 48000=Opus */
+    uint32_t ssrc_a, ssrc_b;           /* relay 重写后发往对侧的 SSRC */
+} repl_dialog_v4_t;
 ```
+
+**v4 codec/SSRC 填充来源**：
+- **SSRC**：`bridge_call_view(bm, c, &mv)` → `mv.ssrc_out[0/1]`（relay 重写后的真实出向 SSRC）
+- **codec PT/CR**：`codec_registry_find_name(c->codec_a/b, strlen(name))` → `ops->default_pt` + `ops->clock_rate`
+- **降级路径**：bridge_call_view 失败 / codec_registry_find_name 返回 NULL → 对应字段保持 0（和 v3 行为一致，rebuild 侧 relay 自己会重新协商）
 
 **角色守卫**：所有接线点统一判断 `ha_role() == HA_ROLE_ACTIVE` 再 publish（ha.h `ha_repl_publish` 内部带 role guard + transport NULL 检查）。
 
