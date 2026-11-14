@@ -889,18 +889,22 @@ const AppChainEditor = {
       if (name) item.data = name;
     }
     async function onSoundUpload(file, item) {
-      // PUT /sounds/:name — 文件名在 path，body 直接是文件字节
       const url = '/api/v1/sounds/' + encodeURIComponent(file.name);
-      const headers = {};
+      const headers = { 'x-nsbc-api-version': '1' };
       const token = localStorage.getItem('nsbc_token');
       if (token) headers['Authorization'] = 'Bearer ' + token;
       try {
+        console.log('[sounds] PUT', url, 'size=', file.size);
         const r = await fetch(url, { method: 'PUT', body: file, headers });
+        console.log('[sounds] status:', r.status);
+        const text = await r.text();
+        console.log('[sounds] body:', text);
         if (!r.ok) {
-          const err = await r.json().catch(() => ({}));
-          throw new Error(err.detail || err.error?.message || r.statusText);
+          let msg = text;
+          try { msg = JSON.parse(text).error?.message || JSON.parse(text).detail || text; } catch {}
+          throw new Error(msg || r.statusText);
         }
-        const res = await r.json();
+        const res = JSON.parse(text);
         item.data = res.name;
         await fetchSounds();
         ElementPlus.ElMessage({ message: `已上传 ${res.name}`, type: 'success', duration: 2000 });
