@@ -86,6 +86,14 @@ int64_t ha_drain_proxy(void);
 int      ha_repl_connected(void);
 uint64_t ha_repl_last_ack(void);
 
+/* === HA P2 OAM CLI：ha.status ===
+ * 填充 buf 返回人类可读的多行状态文本；bsz 足够装下（建议 ≥ 4096）。
+ * 内容：role / peer / hb / failover / prio / frozen / health /
+ *       replica connected + lag / BFD state / hitless 状态。
+ * 返回值：实际写入字节数（snprintf 口径），负数=buf 不够或内部错。
+ * 设计为单函数一次性吐 —— 命令处理侧只管 printf，OAM 不暴露 struct 细节。 */
+int ha_status(char *buf, size_t bsz);
+
 #ifdef __cplusplus
 }
 #endif

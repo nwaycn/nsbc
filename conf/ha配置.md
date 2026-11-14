@@ -8,14 +8,15 @@ NSBC 的 HA 模块采用 **双机主备（Active-Standby）** 模式。核心职
 
 | 职责 | 完成情况 |
 |------|----------|
-| UDP 心跳 + 仲裁角色（P0） | ✅ 已实现 |
-| 健康门控（CPU/调度滞后/RSS） | ✅ 已实现（粗骨架） |
-| REGISTER 共享（备机 loc_db 热备） | ✅ 已实现 |
-| INVITE 门控（备机拒绝新呼） | ✅ 已实现 |
+| UDP 心跳 + 仲裁角色（P0） | ✅ 已实现（仲裁周期 `heartbeat_ms/4`，默认 125ms） |
+| 健康门控（CPU/调度滞后/RSS） | ✅ 已实现（CPU/RSS/evlag/peer_probe/repl_lag 全采样，RSS 默认关闭） |
+| REGISTER 共享（备机 loc_db 热备） | ✅ 已实现（双机受理，reg_push 只 ACTIVE） |
+| INVITE 门控（备机拒绝新呼 + SOS 双保险） | ✅ 已实现 |
 | 外呼门控（备机不 originate） | ✅ 已实现 |
-| **状态复制**（注册/对话/CDR 主→备推送） | 🟡 `ha_replica` 骨架已完成（seq/ring/gap/ingest 全路径），传输层 + registrar/b2bua 接线点未接 |
-| **BFD**（秒级探测） | 🟡 ha_health.h 预留 `peer_probe`/`peer_rtt_ms` 接口，UDP 心跳周期 250ms 已能秒级收敛，正式 RFC 5880 BFD 留 P1 |
-| **Hitless Upgrade**（无感滚动升级） | 🟡 `shm_seg.h` 共享内存段 + epoch/CRC 校验已实现，滚动升级切换流程待装配 |
+| **状态复制**（注册/对话 主→备 TCP 推送） | ✅ 已实现（replica.c + transport.c + registrar/b2bua 接线点全接；NOSPC 主动 FULL + GAP_REQ→FULL_REQ 重传链 + v4 payload codec/SSRC） |
+| **Dialog Rebuild**（STANDBY→ACTIVE 对话锚点重建） | ✅ 已实现（payload v4 + bridge_register_call + rtp_relay_set_peer + 去重 tbl_find） |
+| **BFD**（RFC 5881 亚秒探测） | ✅ 已实现（独立 socket + AdminDown→Down→Init→Up 状态机 + ha_hc_peer_probe 联动；暂不做 Echo） |
+| **Hitless Upgrade**（无感滚动升级） | ✅ 已实现（FREEZE→DRAIN 30s→FULL push→yield→role flip，replica FULL push 方案，**不走 SHM**） |
 
 VIP 漂移（对外暴露的单服务 IP）由外部 **keepalived / HAProxy / SLB** 执行，本进程只出角色状态 + 信令门控。
 
@@ -47,7 +48,7 @@ VIP 漂移（对外暴露的单服务 IP）由外部 **keepalived / HAProxy / SL
 
 ## 3. 仲裁规则（ha.c）
 
-每 250ms 一个仲裁周期：
+每 `heartbeat_ms / 4` 一个仲裁周期（默认 500/4 = **125ms**）。代码见 [ha.c L661](../../src/ha/ha.c)：`usleep(hb_ms * 1000 / 4)`
 
 | 场景 | 判定条件 | 结果 |
 |------|----------|------|
@@ -151,28 +152,152 @@ ha:
     upgrade_timeout_ms: 10000    # 默认 10s
 ```
 
+### 5.1 快速启用三步法（最简生产配置）
+
+面向目标：**双机主备 + keepalived VIP 漂移**。只改最关键的几个值，其他全部走默认。
+
+**Step 1 — nsbc.yaml（两台各改 4–5 行）**
+
+> 💡 **最简原则**：`heartbeat_ms` / `failover_ms` / `bfd.*` / `hitless.*` **不用写** — 默认值对 99% 的生产环境够用。
+
+**node-a（主节点，10.0.0.80）**：
+
+```yaml
+ha:
+  enabled: true
+  peer: "10.0.0.81:5070"   # ← 填对端 IP:端口
+  priority: 100             # ← 显式主高备低，避免 hostname 不确定性
+  # replica:               # ← 想要状态复制（对话不丢）就把这三行解开
+  #   enabled: true
+```
+
+**node-b（备节点，10.0.0.81）**：
+
+```yaml
+ha:
+  enabled: true
+  peer: "10.0.0.80:5070"   # ← 互指对方
+  priority: 90              # ← 低，备节点
+  # replica:
+  #   enabled: true
+```
+
+#### 💫 进阶：P2-9 零配置 discover 模式
+
+两台机器在**同一二层子网**上时，**完全不写 `peer:` 行**，让自动 discover 搞定。
+
+两台配置**完全相同**（priority 差一点还是要有）：
+
+```yaml
+# 两台机器上的 nsbc.yaml 完全一样（除了 priority 可以相同或差一点）
+ha:
+  enabled: true
+  priority: 100    # 两台都 100 也没关系 — hostname tie-break 自动分主备
+  # 没有 peer: 行 — discover 自动找对端
+```
+
+启动时两台同时起：
+
+```bash
+# 两台机器上同时
+systemctl start nsbcd
+```
+
+discover 过程（[ha.c L890-1039](../../src/ha/ha.c)）：
+
+1. ha_init 发现 `ha.peer` 未配置 → 启动 discover 窗口
+2. 发 `NSBC-DISCOVER/1 hostname prio port` 广播到 `255.255.255.255:5070`
+3. select 等 3 秒 → 收到对端 DISCOVER-ACK 就存 peer
+4. 对端也在 discover 窗口 → 两边互相发现，peer 双向填好，心跳线程正常跑
+5. 对端已启动但 discover 窗口已关 → 心跳线程被动收 DISCOVER 包自动回 ACK（[ha.c L744-770](../../src/ha/ha.c)）
+
+**成功日志**：`NOTICE ha: P2-9 broadcast discover: found peer 10.0.0.81 prio=90 node=node-b`
+
+**⚠️ discover 模式前置条件**：
+- 两台在**同一二层子网**（或 router 开了 udp helper）
+- 防火墙**允许 broadcast 包穿过** 5070/UDP（`firewall-cmd --permanent --add-port=5070/udp`）
+- 两台 nsbcd **启动间隔 ≤ 3s**（对端 discover 窗口还开着时）
+
+**Step 2 — 防火墙开端口（两台都要）**
+
+```bash
+# SIP 信令 + RTP 媒体
+firewall-cmd --permanent --add-port=5060/udp
+# HA 心跳（UDP 5070）
+firewall-cmd --permanent --add-port=5070/udp
+# 状态复制（TCP 5071，仅 replica.enabled=true 时需要）
+firewall-cmd --permanent --add-port=5071/tcp
+firewall-cmd --reload
+```
+
+**Step 3 — keepalived（可选但强烈推荐）**
+
+只需要两份几乎一样的 keepalived.conf（唯一区别是 `priority` 值）。两台机器各装一份 keepalived，VIP 自动漂移：
+
+```nginx
+# keepalived.conf（两台通用结构，仅 MASTER/BACKUP + priority 不同）
+global_defs { router_id NSBC_HA }
+vrrp_instance VI_1 {
+    state MASTER              # 节点 A 写 MASTER；节点 B 写 BACKUP
+    interface eth0            # 改成你的物理网卡名
+    virtual_router_id 51
+    priority 150              # 节点 A 写 150；节点 B 写 140（差 10 即可）
+    advert_int 1
+    authentication { auth_type PASS auth_pass nsbc_ha }
+    virtual_ipaddress { 139.226.66.211/24 }  # ← 改成你的 VIP
+    track_process { nsbcd }   # ← nsbcd 挂了自动摘 VIP
+}
+```
+
+**启动顺序无所谓** — 同时启动 → 心跳互通 → priority 大的自动 ACTIVE；priority 相同则 hostname 字典序 tie-break。
+
+**30 秒验证 checklist**：
+
+```bash
+# ① HA 启动日志 — 两台都应该有（注意 peer=对端）
+grep 'heartbeat enabled' /var/log/nsbcd.log
+# NOTICE ha: heartbeat enabled peer=10.0.0.81:5070 hb=500ms failover=3000ms prio=100 node=node-a
+
+# ② 角色收敛 — 主节点应看到 STANDBY→ACTIVE 切换
+grep 'role' /var/log/nsbcd.log | tail -5
+# node-a: NOTICE ha: role STANDBY -> ACTIVE (peer alive, me prio=100 ...)
+# node-b: 无 role 切换日志（保持 STANDBY）
+
+# ③ 状态复制（如果 replica.enabled=true） — 主节点注册 UA 后，备节点 loc_db 也应有
+grep 'REGISTER-200' /var/log/nsbcd.log
+```
+
+**failover 测试**：在主节点 `kill nsbcd` → 3 秒后备节点 `role STANDBY -> ACTIVE` → keepalived VIP 自动漂备机 → UA INVITE 继续可达。
+
 ### 配置变更生效方式
 
-| 配置项 | 生效方式 | schema 标记 |
-|--------|----------|-------------|
-| `ha.enabled` | **重启 nsbcd** | CGF_RESTART |
-| `ha.peer` | **重启 nsbcd** | CGF_RESTART |
-| `ha.heartbeat_ms` | 热加载（`control reload`） | CGF_HOT |
-| `ha.failover_ms` | 热加载（`control reload`） | CGF_HOT |
-| `ha.priority` | 热加载（`control reload`） | CGF_HOT |
-| `ha.replica.enabled` | **重启 nsbcd**（传输层 TCP connect/listen 需重建） | CGF_RESTART |
-| `ha.replica.port` | **重启 nsbcd** | CGF_RESTART |
-| `ha.replica.ring_cap` | **重启 nsbcd**（环形缓冲静态分配） | CGF_RESTART |
-| `ha.replica.lag_warn` | 热加载 | CGF_HOT（未注册 schema，走默认） |
-| `ha.replica.full_resync_interval` | 热加载 | CGF_HOT |
-| `ha.bfd.enabled` | **重启 nsbcd**（BFD Control socket 需创建） | CGF_RESTART |
-| `ha.bfd.desired_min_tx_interval` | 热加载 | CGF_HOT |
-| `ha.bfd.detect_multiplier` | 热加载 | CGF_HOT |
-| `ha.hitless.enabled` | **重启 nsbcd**（shm 段创建/attach 路径分叉） | CGF_RESTART |
-| `ha.hitless.freeze_ms` | 热加载 | CGF_HOT |
-| 健康门参数 | 热加载 | 未注册 schema（走默认） |
+schema 来源：[cfg_schema.c L208-230](../../src/core/cfg_schema.c) — **全部 ha.* / ha.replica.* / ha.bfd.* / ha.hitless.* 配置项均已注册**，无遗漏。
 
-> ⚠️ `ha.priority` / `ha.replica.*` / `ha.bfd.*` / `ha.hitless.*` 的 schema 尚未全部在 `cfg_schema.c` 注册。已注册的热加载项（heartbeat_ms / failover_ms / priority）可 `control reload` 生效；未注册的走代码默认值，建议启动前写好。
+| 配置项 | 生效方式 | schema 标记 | 备注 |
+|--------|----------|-------------|------|
+| `ha.enabled` | **重启 nsbcd** | CGF_RESTART | |
+| `ha.peer` | **重启 nsbcd** | CGF_RESTART | 解析失败降级 solo-active |
+| `ha.heartbeat_ms` | 热加载（`control reload`） | CGF_HOT | 范围 [50, 10000]，默认 500 |
+| `ha.failover_ms` | 热加载 | CGF_HOT | 范围 [100, 60000]，默认 3000 |
+| `ha.priority` | 热加载 | CGF_HOT | 范围 [1, 65535]，默认 100 |
+| `ha.replica.enabled` | **重启 nsbcd**（transport TCP connect/listen 需重建） | CGF_RESTART | |
+| `ha.replica.port` | **重启 nsbcd** | CGF_RESTART | 默认 5071 |
+| `ha.replica.ring_cap` | **重启 nsbcd**（环形缓冲静态分配） | CGF_RESTART | 默认 8192 |
+| `ha.replica.payload_max` | **重启 nsbcd** | CGF_RESTART | 默认 4096 |
+| `ha.replica.lag_warn` | 热加载 | CGF_HOT | 默认 10000 条 |
+| `ha.replica.full_resync_interval` | 热加载 | CGF_HOT | 默认 0（关闭周期对齐）；⚠️ **P1.5 功能未实现**（配置已注册但 transport 无 timer 触发） |
+| `ha.bfd.enabled` | **重启 nsbcd**（BFD Control socket 需创建） | CGF_RESTART | |
+| `ha.bfd.local_discriminator` | **重启 nsbcd** | CGF_RESTART | 范围 [1, 16777215] |
+| `ha.bfd.desired_min_tx_interval` | 热加载 | CGF_HOT | 默认 200 |
+| `ha.bfd.required_min_rx_interval` | 热加载 | CGF_HOT | 默认 200 |
+| `ha.bfd.detect_multiplier` | 热加载 | CGF_HOT | 默认 3 |
+| `ha.hitless.enabled` | **重启 nsbcd** | CGF_RESTART | ⚠️ **当前未使用** — `ha_hitless_upgrade()` 无开关守卫，任何 ACTIVE 都能直接触发；配置项保留为未来预留 |
+| `ha.hitless.shm_prefix` | **重启 nsbcd** | CGF_RESTART | ⚠️ **当前未使用** — Hitless 已改用 replica FULL push 方案，不走 SHM |
+| `ha.hitless.freeze_ms` | 热加载 | CGF_HOT | 默认 1000 |
+| `ha.hitless.upgrade_timeout_ms` | 热加载 | CGF_HOT | 默认 10000 |
+| 健康门参数（evlag/cpu 阈值） | 硬编码 | — | 见 ha_health.c 默认值；暂未开放配置化 |
+
+> 💡 **关键陷阱**：启用 `ha.replica.enabled=true` 必须同时 `ha.enabled=true` + 配置有效 `ha.peer`，否则 ha_init 里 transport 会跳过创建（见 [ha.c L778-780](../../src/ha/ha.c)）。
 
 ## 6. 信令门控一览表
 
@@ -351,10 +476,50 @@ grep 'REGISTER-200 user=1006' /var/log/nsbcd.log
 | `bfd session down` | BFD 会话 Down 超时（P1） | WARN |
 | `hitless freeze` | 主进程冻结输入，等待滚动升级 | NOTICE |
 | `hitless SHM stale` | 新进程 attach 的 SHM epoch 过旧，降级从零启动 | WARN |
+| **role_transition audit** | role 切换独立审计通道（不进普通日志环），含 old/new/peer/reason/prio/node | audit |
+| **HA_REPL_LAG_HIGH obs_event** | ACTIVE 端 lag 首次跨 lag_warn 阈值 → OBS_EVENT 推送 | WARN |
+| **HA_REPL_LAG_NORMAL obs_event** | lag 回落到阈值内 → OBS_EVENT 推送 | INFO |
 
-### 9.2 OAM / CLI
+### 9.2 OAM / CLI（✅ 2026-11-14 新增 P2 命令）
 
-HA 暂无独立 CLI 命令。可通过 `nsbcli status` 查看当前角色（需扩展）。
+通过 `cmd_registry` 注册，`nsbc_cli` / ESL / HTTP API 三种通道都能调。OBS 命令用空格分隔（`ha status`），EOL 以 `\n` 结尾。
+
+| 命令 | 权限 | 说明 |
+|------|------|------|
+| `ha status` | L1 monitor | **综合状态一屏看**：role/peer/hb/failover/priority/hostname/frozen + 健康门（state + peer_visible + rtt_ms）+ replica（connected + published/applied/lag/gap）+ BFD（enabled + rtt_via_health）+ Hitless Upgrade（in_progress + yield_requested） |
+| `ha status-frozen` | L1 monitor | Hitless Upgrade FREEZE 状态（`yes/no`） |
+| `ha hitless_upgrade [force]` | L2 admin | 触发滚动升级（ACTIVE→STANDBY）。默认需要 `ha.hitless.enabled=true`；加 `force` 绕过配置守卫（运维紧急场景） |
+
+示例输出：
+
+```
+nsbc> ha status
+=== HA Status ===
+role:           ACTIVE
+peer:           present
+heartbeat_ms:   500  (arbiter tick: 125ms)
+failover_ms:    1100
+priority:       100
+hostname:       node-a
+peer_prio:      90
+frozen:         no
+health:         healthy
+  peer_visible: yes  rtt_ms: 3
+--- Replica ---
+connected:      yes
+published_seq:  12489
+applied_seq:    12489
+lag:            0
+gap_count:      0
+--- BFD ---
+enabled:        yes
+peer_rtt_ms:    3 (via health gate)
+--- Hitless Upgrade ---
+upgrade_in_prog: no
+yield_requested: no
+```
+
+> 🔧 注册日志：`NOTICE ha: registered 3 ha commands` — 启动时看到这句就表示命令已就绪。
 
 ### 9.3 健康门指标（ha_hc_t）
 
@@ -382,22 +547,26 @@ HA 暂无独立 CLI 命令。可通过 `nsbcli status` 查看当前角色（需�
 | 状态复制 | ha_replica.h / ha_replica.c | ✅ 完整骨架 | ✅ **TCP 传输层已接**（ha_repl_transport.c）；**registrar.c 接线点已接**（REG/UNREG）；**b2bua.c 接线点已接**（CONFIRMED/END） |
 | BFD 亚秒探测 | ha_bfd.h / ha_bfd.c（独立 pthread） | ✅ RFC 5881 状态机 | ✅ **BFD Control socket + AdminDown→Down→Init→Up 状态机 + ha_hc_peer_probe 联动**；暂不实现 Echo（D bit=0） |
 | Hitless Upgrade | ha.h 公共 API | ✅ | ✅ **6 步完整流程**（FREEZE→DRAIN→FULL push→yield_requested→heartbeat role flip→返回）+ auto-unfreeze 超时 + drain_by_in-dialog BYE 30s 降级 + **FULL resync 状态对齐** |
-| Dialog Rebuild | b2bua.c（STANDBY→ACTIVE） | ✅ | ✅ **v3 payload 完整重建**：call state machine（leg tag/cseq/state/a_final）+ profile 查找（sip_profile_find）+ **media anchor relay 重建**（bridge_register_call + rtp_relay_start + set_peer_a/b）+ 去重（tbl_find） |
+| Dialog Rebuild | b2bua.c（STANDBY→ACTIVE） | ✅ | ✅ **v4 payload 完整重建**：call state machine（leg tag/cseq/state/a_final）+ profile 查找（sip_profile_find）+ **media anchor relay 重建**（bridge_register_call + rtp_relay_start + rtp_relay_set_peer_a/b）+ codec/SSRC 回填 + 去重（tbl_find） |
 
 ### 10.2 已知降级点（明确不做或后续 P2）
 
 | 项 | 降级 | 原因 |
 |----|------|------|
 | **REPL_FULL_CDR_FLUSH** | 未实现 | 当前只对 loc_db + dialog 做 FULL；CDR flush 走独立 DB 路径，不在内存复制覆盖范围 |
-| **BFD Echo 模式**（D bit=1） | 未实现 | UDP 心跳 250ms + BFD Control 200ms×3=600ms 已够秒级探测，Echo 不增加价值 |
+| **BFD Echo 模式**（D bit=1） | 未实现 | UDP 心跳 500ms（发送）+ BFD Control 200ms×3=600ms 已够秒级探测，Echo 不增加价值 |
 | **relay transcode session 重建** | rebuild 时 fallback MB_RELAY | relay_mode 在 payload 里打平，但 transcode session 内部状态（codec filter graph）无法序列化；降级为 MB_RELAY 能续通但不转码 |
 | **跨进程 SHM（shm_seg.h）** | Hitless Upgrade 走 **replica FULL push** 状态对齐，不依赖 SHM | SHM 是跨进程方案（老进程 publish → 新进程 attach）；我们用的是**进程内** role flip + STANDBY→ACTIVE rebuild_from_buf — 更简单、更安全、无 SHM 陈旧风险 |
 
-> ✅ **已实现**（原 P1.5 降级点已落地）：
-> - **NOSPC 主动 FULL**：transport 线程 poll 检测连续 NOSPC ≥ 16（5s 窗口）→ 自动 `transport_send_full_snapshot`。业务线程只做 counter 累加，不阻塞。
-> - **payload v4 codec/SSRC**：publish 侧从 `bridge_call_view.ssrc_out[2]` 拿 relay 重写后的 SSRC，从 `codec_registry_find_name` 拿 PT + clock_rate，payload_ver 从 3 升到 4。rebuild 侧 payload 结构体形状不变，自动吃。
+> ⚠️ **P1.5 未实现（配置已注册，但代码暂无 timer 驱动）**：
+> - **`ha.replica.full_resync_interval` 周期触发** — 配置已在 `cfg_schema.c` 注册为 CGF_HOT，transport 代码无周期 timer 轮询，需在 ha_repl_transport.c 的 transport 线程主循环里加一个周期性 FULL push 触发（每 full_resync_interval 秒对齐一次）
 
-### 10.3 ha_replica 核心设计不变
+### 10.3 已实现的 P1.5 增强
+
+- **NOSPC 主动 FULL**：transport 线程 poll 检测连续 NOSPC ≥ 16（5s 窗口）→ 自动 `transport_send_full_snapshot`。业务线程只做 counter 累加，不阻塞。
+- **payload v4 codec/SSRC**：publish 侧从 `bridge_call_view.ssrc_out[2]` 拿 relay 重写后的 SSRC，从 `codec_registry_find_name` 拿 PT + clock_rate，payload_ver 已从 3 升到 4。rebuild 侧 payload 结构体形状不变，自动吃。
+
+### 10.4 ha_replica 核心设计不变
 
 - **主→备单推**，64 位单调 seq + 备端 ACK 水位
 - 环形缓冲 8192 条，满了返回 NOSPC → WARN，不阻塞呼叫线程
@@ -625,7 +794,7 @@ ha_dlg_buf[256] (round-robin, 由 transport recv 线程 REPL_DIALOG apply 填充
 
 ## 13. BFD 亚秒探测（P1 / ha_health.h）
 
-当前 UDP 心跳每 250ms 一个仲裁周期（heartbeat_ms=500 / 4），已经能在 failover_ms（默认 3000ms）窗口内收敛故障。BFD（RFC 5880）是更轻量的亚秒级探测协议，作为心跳的 **辅助/替代** 路径，在以下场景价值最大：
+当前 UDP 心跳线程每 `heartbeat_ms / 4`（默认 125ms）执行一次仲裁循环，心跳包发送间隔为 heartbeat_ms（默认 500ms），已经能在 failover_ms（默认 3000ms）窗口内收敛故障。BFD（RFC 5880）是更轻量的亚秒级探测协议，作为心跳的 **辅助/替代** 路径，在以下场景价值最大：
 
 | 场景 | UDP 心跳表现 | BFD 优势 |
 |------|-------------|----------|
@@ -844,6 +1013,45 @@ systemctl start nsbcd    # 原 ACTIVE 机器新进程启动
 | **媒体 anchor** | bridge_register_call 重建 relay（同进程内 RTPPROXY 仍在） | relay 句柄无法跨进程传递（SHM 存不了 socket fd）— 媒体必然断 |
 
 > **结论**：对 NSBC 单进程 nsbcd 架构，本方案是**更合理的选择**。SHM 方案适合**多进程架构**（老进程只做 ACTIVE，新进程是全新的 nsbcd 实例），但当前 nsbcd 是单进程 reactor 模型 — 进程内 role flip 就够了，不需要跨进程共享。
+
+---
+
+## 15. 改进建议（TODO 清单）
+
+基于代码审计发现的"配置与实现不完全对齐"、"部分已注册配置未生效"等问题，以下是可落地的改进建议，按优先级排序：
+
+### 15.1 P0 — 配置与实现对齐（死配置清理）
+
+| # | 改进 | 现状 | 建议改动 | 影响文件 |
+|---|------|------|----------|----------|
+| ① | **`ha.hitless.enabled` 实际守卫** | cfg_schema 已注册但 `ha_hitless_upgrade()` 无检查 — 任何 ACTIVE 都能直接触发 | ha_hitless_upgrade 入口加 `if (!cfg_get_bool("ha.hitless.enabled")) return NSBC_NOENT;` | ha.c |
+| ② | **`ha.hitless.shm_prefix` 清理或重定义** | Hitless 已改用 replica FULL push 方案，不走 SHM — 这个配置项是死代码 | 要么从 cfg_schema 删除（**推荐**，减少用户困惑），要么重定义为 Hitless 操作的日志前缀 | cfg_schema.c |
+| ③ | **`ha.replica.full_resync_interval` 周期触发** | 配置已注册（cfg_schema CGF_HOT），但 ha_repl_transport.c 的 transport 线程主循环无 timer 驱动 | 在 transport 线程里加一个秒级 ticker，每 `full_resync_interval` 秒主动调 `transport_send_full_snapshot` | ha_repl_transport.c |
+
+### 15.2 P1 — 让配置更简单
+
+| # | 改进 | 效果 | 建议实现 |
+|---|------|------|----------|
+| ④ | **健康门参数配置化** | ha_health.c 的 CPU/RSS/evlag 阈值（warn/fail）目前硬编码，生产环境无法调优 | cfg_schema 注册 `ha.health.evlag_warn_ms` / `ha.health.evlag_fail_ms` / `ha.health.cpu_warn_pct` / `ha.health.cpu_fail_pct`；ha_health_init 读 cfg 覆盖默认 |
+| ⑤ | **`replica.enabled` 默认联动 `ha.enabled`** | 当前必须手动写 `replica.enabled: true` 才开复制。HA 既然启用，状态复制应该默认也开（除非用户显式关） | ha_init 里：如果 `ha.enabled=true && replica.enabled` 未显式配置（用 cfg_schema 的 "not-set" 检查），默认置 true |
+| ⑥ | **BFD 与 failover_ms 自动联动** | 文档 L700 明确警告"开了 BFD 但 failover_ms 没调小等于白开" | ha_init 检测 `ha.bfd.enabled=true` 时自动将 failover_ms 调为 `bfd_interval × bfd_multiplier + 500`（留 UDP 心跳兜底余量），但只在用户未显式配置 failover_ms 时才覆盖 |
+
+### 15.3 P2 — CLI / 运维体验
+
+| # | 改进 | 状态 | 说明 |
+|---|------|------|------|
+| ⑦ | **`ha status` / `ha status-frozen` / `ha hitless_upgrade` 命令** | ✅ **已落地（2026-11-14 P2）** | ha.c 新增 `ha_status()` API + `cmd_register` 注册 3 条命令。见 9.2 节 |
+| ⑧ | **CLI 配置生成器（`tools/ha_init.py`）** | ✅ **已落地（2026-11-14 P2-8）** | 纯 Python 工具，零 nsbcd 依赖。见下文 |
+| ⑨ | **UDP broadcast 自动发现 peer** | ✅ **已落地（2026-11-14 P2-9）** | 见下文 |
+
+### 15.4 P3 — 监控增强
+
+| # | 改进 | 状态 | 说明 |
+|---|------|------|------|
+| ⑩ | **role 切换 log_audit 完整上下文** | ✅ **已落地（2026-11-14 P3）** | 独立 audit 通道（不进普通日志环），含 old/new/peer/reason/me_prio/me_node/peer_prio/peer_node。reason 区分 `peer_down_failover` / `peer_alive_yield` / `hitless_upgrade_yield` / `tiebreak` — 事后审计/Prometheus 可直接消费 |
+| ⑪ | **repl lag OBS 事件推送** | ✅ **已落地（2026-11-14 P3）** | ACTIVE + replica 已连 + lag_warn>0 → 心跳线程每秒采样。状态机防 spam：`HA_REPL_LAG_HIGH` 仅 lag 首次跨阈值时推一次，`HA_REPL_LAG_NORMAL` 首次回落时推一次。事件进 OBS_EVENT 环形缓冲，Prometheus/Grafana/Webhook 可接 |
+
+> 💡 **实施优先级**：①②③（死配置对齐）> ④⑤⑥（配置简化）> ⑦⑧（CLI 体验）> ⑨⑩⑪（远期）。
 
 ---
 

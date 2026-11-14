@@ -18,6 +18,7 @@
 #endif
 #include "app_ctx.h"
 #include "cfg.h"
+#include "cmd_registry.h"   /* P2 命令注册 */
 #include "ha.h"
 #include "ha_bfd.h"
 #include "ha_health.h"
@@ -25,6 +26,7 @@
 #include "log.h"
 #include "module.h"
 #include "net_sock.h"
+#include "obs.h"             /* obs_control_get_cmd_reg() */
 
 #include <errno.h>
 #include <pthread.h>
@@ -33,6 +35,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/select.h>
+#include <arpa/inet.h>
 
 typedef struct {
     nsbc_ctx_t *ctx;
@@ -56,10 +60,21 @@ typedef struct {
     long last_ticks;     /* /proc/self/stat utime+stime */
     uint64_t last_iter_ms;
     int loop_lag_ms;     /* 心跳线程调度滞后：系统压力粗粒度代理 */
+
+    /* === P3 repl lag 报警状态机 ===
+     * ACTIVE 才推（STANDBY lag 自然为 0）。obs_event 不 spam：
+     * 只有 lag 跨阈值时才推一次（high→normal、normal→high），
+     * 持续 high 期间每秒采样只累加不推送。 */
+    uint64_t lag_warn;       /* 从 cfg 读 ha.replica.lag_warn */
+    int lag_high_seen;       /* 0=当前 normal，1=当前 high */
 } ha_t;
 
 /* 前向声明（文件底部定义，Hitless Upgrade 部分先调用） */
 static uint64_t mono_ms(void);
+
+/* Hitless Upgrade 原子变量 — ha_status() 先于 Hitless 段定义，前向声明 */
+static int g_hitless_in_progress;
+static int g_hitless_yield_requested;
 
 static ha_t *g_ha;
 static ha_repl_trans_t *g_repl_trans;
@@ -211,6 +226,142 @@ uint64_t ha_repl_last_ack(void)
     return ha_repl_trans_last_ack(g_repl_trans);
 }
 
+/* === HA P2 OAM CLI: ha.status ===
+ * 单函数一次性吐多行状态文本；命令处理侧只负责 io_printf。
+ * 不暴露 g_ha / g_repl_trans / g_bfd 内部结构给外部 —— OAM 不需要知道细节。 */
+int ha_status(char *buf, size_t bsz)
+{
+    if (!buf || bsz == 0) return -1;
+    int off = 0;
+#define APP(...) do { \
+        if ((size_t)off < bsz) \
+            off += snprintf(buf + off, bsz - off, __VA_ARGS__); \
+    } while (0)
+
+    ha_role_t role = ha_role();
+    APP("=== HA Status ===\n");
+    APP("role:           %s\n", role == HA_ROLE_ACTIVE ? "ACTIVE" : "STANDBY");
+
+    if (g_ha) {
+        APP("peer:           %s\n",
+            g_ha->have_peer ? "present" : "(none / solo-mode)");
+        APP("heartbeat_ms:   %u  (arbiter tick: %ums)\n",
+            g_ha->hb_ms, g_ha->hb_ms / 4);
+        APP("failover_ms:    %u\n", g_ha->failover_ms);
+        APP("priority:       %d\n", g_ha->my_prio);
+        APP("hostname:       %s\n", g_ha->node_id[0] ? g_ha->node_id : "-");
+        APP("peer_prio:      %d\n", g_ha->peer_prio);
+        APP("frozen:         %s\n", ha_is_frozen() ? "yes" : "no");
+
+        /* 健康门 */
+        if (g_ha->hc) {
+            ha_hc_state_t hst = ha_hc_local(g_ha->hc);
+            APP("health:         %s\n", ha_hc_state_name(hst));
+            APP("  peer_visible: %s  rtt_ms: %d\n",
+                ha_hc_peer_visible(g_ha->hc) ? "yes" : "no",
+                ha_hc_peer_rtt_ms(g_ha->hc));
+        } else {
+            APP("health:         (disabled)\n");
+        }
+    } else {
+        APP("(ha not enabled — solo-active)\n");
+    }
+
+    /* 状态复制 */
+    APP("--- Replica ---\n");
+    if (g_repl_trans) {
+        int c = ha_repl_trans_connected(g_repl_trans);
+        APP("connected:      %s\n", c ? "yes" : "no");
+        ha_repl_t *r = ha_repl_trans_repl(g_repl_trans);
+        if (r) {
+            uint64_t pub = repl_published_seq(r);
+            uint64_t ack = repl_applied_seq(r);
+            uint64_t gap = repl_gap_count(r);
+            APP("published_seq:  %llu\n", (unsigned long long)pub);
+            APP("applied_seq:    %llu\n", (unsigned long long)ack);
+            APP("lag:            %llu\n", (unsigned long long)(pub - ack));
+            APP("gap_count:      %llu\n", (unsigned long long)gap);
+        }
+    } else {
+        APP("(replica not enabled)\n");
+    }
+
+    /* BFD */
+    APP("--- BFD ---\n");
+    if (g_bfd) {
+        APP("enabled:        yes\n");
+        if (g_ha && g_ha->hc)
+            APP("peer_rtt_ms:    %d (via health gate)\n",
+                ha_hc_peer_rtt_ms(g_ha->hc));
+    } else {
+        APP("(not enabled)\n");
+    }
+
+    /* Hitless Upgrade 状态 */
+    APP("--- Hitless Upgrade ---\n");
+    APP("upgrade_in_prog: %s\n",
+        __atomic_load_n(&g_hitless_in_progress, __ATOMIC_RELAXED) ? "yes" : "no");
+    APP("yield_requested: %s\n",
+        __atomic_load_n(&g_hitless_yield_requested, __ATOMIC_RELAXED) ? "yes" : "no");
+#undef APP
+    return off;
+}
+
+/* ==================================================================
+ * P2 cmd_registry 命令处理函数
+ * ==================================================================*/
+
+/* ha status — L1 只读 */
+static int cmd_ha_status(cmd_ctx_t *c, int argc, char **argv, void *ud)
+{
+    (void)argc; (void)argv; (void)ud;
+    if (!c || !c->io_printf) return NSBC_INVAL;
+    char out[4096];
+    int n = ha_status(out, sizeof(out));
+    if (n < 0) {
+        c->io_printf(c->io_ud, "ERR ha_status failed\n");
+        return NSBC_INVAL;
+    }
+    c->io_printf(c->io_ud, "%s", out);
+    return NSBC_OK;
+}
+
+/* ha hitless_upgrade [force] — L2 写操作（触发滚动升级） */
+static int cmd_ha_hitless_upgrade(cmd_ctx_t *c, int argc, char **argv, void *ud)
+{
+    (void)ud;
+    if (!c || !c->io_printf) return NSBC_INVAL;
+    int force = 0;
+    if (argc >= 2 && strcmp(argv[1], "force") == 0)
+        force = 1;
+    log_audit("ha", "hitless_upgrade",
+              "authed_level=%d force=%d uid=%p",
+              c->authed_level, force, c->uid);
+    int rc = ha_hitless_upgrade(force);
+    if (rc == NSBC_OK) {
+        c->io_printf(c->io_ud, "OK hitless upgrade triggered\n");
+    } else if (rc == NSBC_NOENT) {
+        c->io_printf(c->io_ud, "ERR not ACTIVE — only ACTIVE node can trigger\n");
+    } else if (rc == NSBC_NOSPC) {
+        c->io_printf(c->io_ud, "ERR already in progress\n");
+    } else if (rc == NSBC_PERM_DENIED) {
+        c->io_printf(c->io_ud, "ERR ha.hitless.enabled=false — set enabled:true or pass 'force'\n");
+    } else {
+        c->io_printf(c->io_ud, "ERR failed rc=%d\n", rc);
+    }
+    return rc;
+}
+
+/* ha status-frozen — L1 只读（检查 FREEZE 状态） */
+static int cmd_ha_freeze_status(cmd_ctx_t *c, int argc, char **argv, void *ud)
+{
+    (void)argc; (void)argv; (void)ud;
+    if (!c || !c->io_printf) return NSBC_INVAL;
+    c->io_printf(c->io_ud, "frozen: %s\n",
+                 ha_is_frozen() ? "yes (new INVITE rejected)" : "no");
+    return NSBC_OK;
+}
+
 /* === HA P1 Drain 活跃对话订阅链 ===
  * Hitless Upgrade DRAIN 阶段轮询 — 所有业务模块 drain count 都为 0 才能 yield */
 #define HA_DRAIN_MAX 4
@@ -262,8 +413,7 @@ int64_t ha_drain_proxy(void)
  */
 static int g_frozen;
 static uint64_t g_frozen_until_ms;   /* auto-unfreeze 时间戳（mono_ms），0=永不自动 */
-static int g_hitless_yield_requested;  /* 1 = 请求 heartbeat 线程把 ACTIVE 降 STANDBY */
-static int g_hitless_in_progress;       /* 防 upgrade 重入 */
+/* g_hitless_yield_requested / g_hitless_in_progress 已在文件顶部前向声明 */
 
 void ha_freeze_input(int freeze_ms)
 {
@@ -316,6 +466,25 @@ int ha_hitless_upgrade(int force)
         llog(LOG_INFO, "ha", "hitless: not ACTIVE (role=%d), skip", ha_role());
         __atomic_clear(&g_hitless_in_progress, __ATOMIC_RELEASE);
         return NSBC_NOENT;
+    }
+
+    /* === P0 守卫: hitless.enabled 未显式开启 → 拒绝（force=1 跳过） === */
+    {
+        int hitless_en = 0;
+        if (g_ha && g_ha->ctx && g_ha->ctx->cfg) {
+            cfg_get_bool(g_ha->ctx->cfg, "ha.hitless.enabled", &hitless_en, NULL);
+        }
+        if (!hitless_en && !force) {
+            llog(LOG_WARN, "ha",
+                 "hitless upgrade disabled (ha.hitless.enabled=false; "
+                 "set enabled:true or pass force=1 to override)");
+            __atomic_clear(&g_hitless_in_progress, __ATOMIC_RELEASE);
+            return NSBC_PERM_DENIED;
+        }
+        if (!hitless_en && force) {
+            llog(LOG_WARN, "ha",
+                 "hitless.enabled=false but force=1 — proceeding anyway");
+        }
     }
 
     llog(LOG_WARN, "ha", "=== Hitless Upgrade BEGIN ===");
@@ -575,11 +744,77 @@ static void *ha_main(void *arg)
             }
         }
 
+        /* === P2-9 被动 DISCOVER 处理 ===
+         * 没配 peer 的节点在心跳线程里收到 DISCOVER 包 → 存 peer + 回 ACK。
+         * 这样 discover 窗口没赶上的节点（比如一端 discover timeout 后另
+         * 一端才启动）也能发现对方。只接受 DISCOVER 包 — 普通心跳包在没配
+         * peer 时继续走上面的 `!h->have_peer` 宽松分支（got_hb=1）。 */
+        if (!h->have_peer && r > 0 &&
+            strncmp(in, "NSBC-DISCOVER/1", 16) == 0) {
+            in[r] = '\0';
+            char ack[24], pnode[64];
+            int pprio = 0, pport = 0;
+            if (sscanf(in, "%23s %63s %d %d", ack, pnode, &pprio, &pport) >= 3) {
+                memcpy(&h->peer, &src, sizeof(src));
+                h->peer_prio = pprio;
+                snprintf(h->peer_node, sizeof(h->peer_node), "%s", pnode);
+                h->have_peer = 1;
+                /* 回 DISCOVER-ACK — 对方 discover 窗口正在等这个 */
+                char apkt[256];
+                int an = snprintf(apkt, sizeof(apkt),
+                                  "NSBC-DISCOVER-ACK/1 %s %d %d\n",
+                                  h->node_id, h->my_prio, 5070);
+                sendto(h->fd, apkt, an, MSG_NOSIGNAL,
+                       (struct sockaddr *)&src.ss, src.len);
+                llog(LOG_NOTICE, "ha",
+                     "P2-9 passive discover: got DISCOVER from peer %s prio=%d node=%s",
+                     pnode, pprio, pnode);
+            }
+        }
+
         /* 健康检查接线：对端探测（连续 3 次空手 → 不可见）+ 1s 本地采样 */
         if (h->hc) {
             ha_hc_peer_probe(h->hc, got_hb, got_hb ? 0 : -1);
             if (mono_ms() - h->last_sample_ms >= 1000)
                 sample_local_health(h);
+        }
+
+        /* === P3 repl lag 报警（跨阈值单次推送，防 spam） ===
+         * ACTIVE + lag_warn > 0 + replica 已连 → 每秒采样一次。
+         * 状态机：lag > warn → push HA_REPL_LAG_HIGH（仅首次）
+         *        lag ≤ warn → push HA_REPL_LAG_NORMAL（仅首次回落） */
+        if (h->lag_warn > 0 && ha_role() == HA_ROLE_ACTIVE) {
+            ha_repl_t *r = g_repl_trans ? ha_repl_trans_repl(g_repl_trans) : NULL;
+            if (r && ha_repl_trans_connected(g_repl_trans)) {
+                uint64_t pub = repl_published_seq(r);
+                uint64_t ack = ha_repl_trans_last_ack(g_repl_trans);
+                uint64_t lag = (pub > ack) ? (pub - ack) : 0;
+                int cur_high = (lag > h->lag_warn) ? 1 : 0;
+                if (cur_high != h->lag_high_seen) {
+                    h->lag_high_seen = cur_high;
+                    if (cur_high) {
+                        llog(LOG_WARN, "ha-repl",
+                             "P3 repl lag HIGH: lag=%llu > warn=%llu",
+                             (unsigned long long)lag,
+                             (unsigned long long)h->lag_warn);
+                        obs_event(4 /*WARN*/, "HA_REPL_LAG_HIGH",
+                                  "lag=%llu warn=%llu pub=%llu ack=%llu",
+                                  (unsigned long long)lag,
+                                  (unsigned long long)h->lag_warn,
+                                  (unsigned long long)pub,
+                                  (unsigned long long)ack);
+                    } else {
+                        llog(LOG_NOTICE, "ha-repl",
+                             "P3 repl lag NORMAL: lag=%llu <= warn=%llu",
+                             (unsigned long long)lag,
+                             (unsigned long long)h->lag_warn);
+                        obs_event(6 /*INFO*/, "HA_REPL_LAG_NORMAL",
+                                  "lag=%llu warn=%llu",
+                                  (unsigned long long)lag,
+                                  (unsigned long long)h->lag_warn);
+                    }
+                }
+            }
         }
 
         /* ---- 仲裁 ----
@@ -649,8 +884,28 @@ static void *ha_main(void *arg)
                                  "role transition (%s)",
                                  want == HA_ROLE_ACTIVE ? "peer lost"
                                                         : "peer seen");
-            log_audit("ha", want == HA_ROLE_ACTIVE ? "failover" : "standby",
-                      "HA role transition");
+            /* === P3-10 log_audit：完整上下文留痕 ===
+             * 比 NOTICE 日志更结构化，独立 audit 通道不进普通日志环 ——
+             * 事后审计、Prometheus/ELK 接入都依赖这条。 */
+            {
+                const char *reason = "unknown";
+                if (old == HA_ROLE_ACTIVE && want == HA_ROLE_STANDBY) {
+                    reason = peer_alive ? "peer_alive_yield" : "hitless_yield";
+                    if (__atomic_load_n(&g_hitless_yield_requested, __ATOMIC_RELAXED))
+                        reason = "hitless_upgrade_yield";
+                } else if (old == HA_ROLE_STANDBY && want == HA_ROLE_ACTIVE) {
+                    reason = peer_alive ? "tiebreak" : "peer_down_failover";
+                }
+                log_audit("ha", "role_transition",
+                          "old=%s new=%s peer=%s reason=%s "
+                          "me_prio=%d me_node=%s peer_prio=%d peer_node=%s",
+                          old == HA_ROLE_ACTIVE ? "ACTIVE" : "STANDBY",
+                          want == HA_ROLE_ACTIVE ? "ACTIVE" : "STANDBY",
+                          peer_alive ? "alive" : "down/absent",
+                          reason,
+                          h->my_prio, h->node_id,
+                          h->peer_prio, h->peer_node);
+            }
             /* === HA P1 状态复制：角色切换通知 transport 重连方向 === */
             ha_repl_trans_notify_role(g_repl_trans, want);
             /* === HA P1 角色切换多路通知 — 业务模块重建内存状态 ===
@@ -661,6 +916,157 @@ static void *ha_main(void *arg)
         usleep((useconds_t)h->hb_ms * 1000 / 4);
     }
     return NULL;
+}
+
+/* ==================================================================
+ * P2-9 UDP broadcast 自动发现 peer
+ * ==================================================================
+ *
+ * 在 ha_init 线程里执行（心跳线程还没 start，不干扰）。
+ *
+ * 协议:
+ *   DISCOVER:  "NSBC-DISCOVER/1 <hostname> <prio> <port>\n" → 255.255.255.255:hb_port
+ *   DISCOVER-ACK: "NSBC-DISCOVER-ACK/1 <hostname> <prio> <port>\n" → 回给发现者
+ *
+ * 实现:
+ *   - 设 SO_BROADCAST，发一次 DISCOVER 包
+ *   - select 等 3 秒等对端 DISCOVER-ACK 回复
+ *   - 收到就填 h->peer + have_peer=1 + peer_prio/peer_node + 回一个 ACK
+ *   - timeout → have_peer 保持 0，心跳线程照跑，仲裁层自然 solo-active
+ *
+ * 零侵入: discover 失败完全不影响现有逻辑 — 心跳线程照跑，
+ * 只是永远收不到对端心跳 → 仲裁层自然降级 solo-active。 */
+
+static void ha_broadcast_discover(ha_t *h)
+{
+    /* SO_BROADCAST 允许发 UDP 广播包 */
+    int broadcast = 1;
+    if (setsockopt(h->fd, SOL_SOCKET, SO_BROADCAST,
+                   &broadcast, sizeof(broadcast)) < 0) {
+        llog(LOG_WARN, "ha", "P2-9 discover: SO_BROADCAST opt errno=%d — skip", errno);
+        return;
+    }
+
+    /* 构造 broadcast 目标地址（255.255.255.255:ha_port） */
+    struct sockaddr_in ba;
+    memset(&ba, 0, sizeof(ba));
+    ba.sin_family = AF_INET;
+    ba.sin_port = htons(5070);   /* 固定端口，心跳线程后续会解析 ha.heartbeat_ms */
+    if (inet_pton(AF_INET, "255.255.255.255",
+                 &ba.sin_addr) <= 0) {
+        llog(LOG_WARN, "ha", "P2-9 discover: inet_pton broadcast failed");
+        return;
+    }
+
+    /* 发 DISCOVER 广播包 */
+    char pkt[256];
+    int n = snprintf(pkt, sizeof(pkt),
+                     "NSBC-DISCOVER/1 %s %d %d\n",
+                     h->node_id, h->my_prio, 5070);
+    ssize_t sent = sendto(h->fd, pkt, (size_t)n, MSG_NOSIGNAL,
+                          (struct sockaddr *)&ba, sizeof(ba));
+    if (sent < 0) {
+        llog(LOG_WARN, "ha", "P2-9 discover: sendto broadcast errno=%d", errno);
+        return;
+    }
+    llog(LOG_INFO, "ha", "P2-9 broadcast discover sent — waiting up to 3s");
+
+    /* select 等对端 DISCOVER-ACK 回复 — 3 秒窗口 */
+    fd_set rfds;
+    struct timeval tv;
+    int tried_self = 0;   /* 是否已跳过自己的回声一次 */
+
+    for (;;) {
+        FD_ZERO(&rfds);
+        FD_SET(h->fd, &rfds);
+        tv.tv_sec = 3;
+        tv.tv_usec = 0;
+        int rc = select(h->fd + 1, &rfds, NULL, NULL, &tv);
+        if (rc <= 0) {
+            if (rc == 0)
+                llog(LOG_INFO, "ha",
+                     "P2-9 broadcast discover: timeout (3s), no peer found");
+            else
+                llog(LOG_WARN, "ha",
+                     "P2-9 discover: select errno=%d", errno);
+            return;   /* timeout 或 error — 降级 solo-active */
+        }
+
+        /* recvfrom — 可能是对端 DISCOVER-ACK，也可能是广播回声（自己的 DISCOVER） */
+        char in[256];
+        nsbc_sa_t src;
+        socklen_t sl = sizeof(src.ss);
+        ssize_t r = recvfrom(h->fd, in, sizeof(in) - 1, 0,
+                             (struct sockaddr *)&src.ss, &sl);
+        src.len = sl;
+        if (r <= 0) continue;
+        in[r] = '\0';
+
+        /* 解析 DISCOVER-ACK — 对端在它的 discover 窗口收到 DISCOVER 后回的 */
+        char ack[24], pnode[64];
+        int pprio = 0, pport = 0;
+        int matched = sscanf(in, "%23s %63s %d %d", ack, pnode, &pprio, &pport);
+        if (matched < 4 || strncmp(ack, "NSBC-DISCOVER-ACK", 18) != 0) {
+            /* 不是 ACK — 可能是老版本 nsbcd 发的普通心跳包（兼容旧对端） */
+            if (strncmp(ack, "NSBC-HB/1", 9) == 0) {
+                /* 普通心跳里也带 hostname + prio — 当成 discover 结果 */
+                int pseq, psrole;
+                char phost[64] = "";
+                matched = sscanf(in, "%23s %d %d %d %63s",
+                                 ack, &pseq, &psrole, &pprio, phost);
+                if (matched >= 5) {
+                    snprintf(pnode, sizeof(pnode), "%s", phost);
+                    goto accept_peer;
+                }
+            }
+            /* 也可能是自己 DISCOVER 广播包被 loopback 回来 */
+            if (strcmp(ack, "NSBC-DISCOVER/1") == 0 && !tried_self) {
+                tried_self = 1;
+                llog(LOG_INFO, "ha",
+                     "P2-9 discover: got own broadcast echo, wait more...");
+                continue;
+            }
+            llog(LOG_WARN, "ha",
+                 "P2-9 discover: unexpected reply '%100s'", in);
+            return;
+        }
+
+    accept_peer:
+        /* 跳过自己的 DISCOVER-ACK（两端同时 discover，有可能自己也回了一份） */
+        if (strcmp(pnode, h->node_id) == 0 && pprio == h->my_prio) {
+            if (!tried_self) {
+                tried_self = 1;
+                continue;
+            }
+            return;   /* 两次都是自己 — 真的没有其他 peer */
+        }
+
+        /* 存 peer — 用 src.recvfrom 地址（对端 bind 了 5070，端口正确） */
+        memcpy(&h->peer, &src, sizeof(src));
+        h->peer_prio = pprio;
+        snprintf(h->peer_node, sizeof(h->peer_node), "%s", pnode);
+        h->have_peer = 1;
+
+        /* 也回一个 ACK — 对方那边可能也在 discover 窗口等我的回复
+         * （避免对方 discover 超时） */
+        char ack_pkt[256];
+        int an = snprintf(ack_pkt, sizeof(ack_pkt),
+                          "NSBC-DISCOVER-ACK/1 %s %d %d\n",
+                          h->node_id, h->my_prio, 5070);
+        sendto(h->fd, ack_pkt, an, MSG_NOSIGNAL,
+               (struct sockaddr *)&src.ss, src.len);
+
+        {
+            char ip[INET_ADDRSTRLEN] = "?";
+            struct sockaddr_in *sin = (struct sockaddr_in *)&src.ss;
+            inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip));
+            llog(LOG_NOTICE, "ha",
+                 "P2-9 broadcast discover: found peer %s prio=%d node=%s "
+                 "(ha.peer was not set)",
+                 ip, pprio, pnode);
+        }
+        return;
+    }
 }
 
 static int ha_init(struct nsbc_ctx *ctx)
@@ -695,8 +1101,36 @@ static int ha_init(struct nsbc_ctx *ctx)
     h->node_id[sizeof(h->node_id) - 1] = '\0';
     h->peer_prio = 100; /* 对端旧格式/未收到心跳时的默认 */
 
-    if (ha_hc_create(NULL, &h->hc) != NSBC_OK)
-        h->hc = NULL; /* 健康门降级关闭，不影响心跳仲裁 */
+    /* === HA P1-4 健康门参数配置化 ===
+     * ha_hc_create 支持传 cfg，用户覆盖的阈值填入；未覆盖的 ≤0 值走
+     * ha_health.c apply_defaults（evlag 200/1000, cpu 80/95, rss 0=关）。
+     * 之前一直传 NULL → 全部硬编码，现在真正读 cfg。 */
+    {
+        ha_hc_cfg_t hcc;
+        memset(&hcc, 0, sizeof(hcc));
+        long v = 0;
+        cfg_get_int(ctx->cfg, "ha.health.evlag_warn_ms", &v, NULL);
+        if (v > 0) hcc.evlag_warn_ms = (int)v;
+        cfg_get_int(ctx->cfg, "ha.health.evlag_fail_ms", &v, NULL);
+        if (v > 0) hcc.evlag_fail_ms = (int)v;
+        cfg_get_int(ctx->cfg, "ha.health.cpu_warn_pct", &v, NULL);
+        if (v > 0) hcc.cpu_warn_pct = (int)v;
+        cfg_get_int(ctx->cfg, "ha.health.cpu_fail_pct", &v, NULL);
+        if (v > 0) hcc.cpu_fail_pct = (int)v;
+        cfg_get_int(ctx->cfg, "ha.health.rss_warn_mb", &v, NULL);
+        if (v > 0) hcc.rss_warn_mb = (int)v;
+        /* repl_lag_warn 已在 ha.replica.lag_warn 配置（replica transport 用） */
+        if (ha_hc_create(&hcc, &h->hc) != NSBC_OK)
+            h->hc = NULL; /* 健康门降级关闭，不影响心跳仲裁 */
+        else if (h->hc) {
+            llog(LOG_INFO, "ha",
+                 "health gate cfg: cpu=%d/%d%% evlag=%d/%dms rss=%dMB repl_lag=%llu",
+                 hcc.cpu_warn_pct, hcc.cpu_fail_pct,
+                 hcc.evlag_warn_ms, hcc.evlag_fail_ms,
+                 hcc.rss_warn_mb,
+                 (unsigned long long)hcc.repl_lag_warn);
+        }
+    }
 
     h->role = HA_ROLE_STANDBY;
 
@@ -716,6 +1150,19 @@ static int ha_init(struct nsbc_ctx *ctx)
     long local_port = 5070;
     const char *peer = NULL;
     cfg_get_str(ctx->cfg, "ha.peer", &peer, NULL);
+
+    /* === P2-9 UDP broadcast 自动发现 peer ===
+     * 只有 ha.peer 未显式配置 + ha.enabled=true 才跑 discover。
+     * 复用心跳 fd，SO_BROADCAST 开了发，select 等对端心跳回复。
+     * 收到 → 自动填 h->peer + have_peer=1 + peer_prio/peer_node；
+     * 超时没收到 → 继续下面的显式 peer 解析（如果用户没填就 have_peer=0 solo-active）。
+     *
+     * 零侵入设计: discover 失败完全不影响现有逻辑 — 心跳线程照跑，
+     * 只是永远收不到对端心跳 → 仲裁层自然降级 solo-active。 */
+    if (!peer || !*peer) {
+        ha_broadcast_discover(h);
+    }
+
     if (peer && *peer) {
         char host[128];
         snprintf(host, sizeof(host), "%s", peer);
@@ -773,23 +1220,42 @@ static int ha_init(struct nsbc_ctx *ctx)
      * 默认 ha.replica.enabled=false → transport 自己返回 NSBC_NOENT，不浪费资源。
      * 显式开启 + have_peer → 尝试创建。
      * 失败降级：transport 内部已兜底（listen/socket 失败→返回 NSBC_OK 让调用方继续）
-     * 本层不再额外降级，保持心跳仲裁正常运行。 */
+     * 本层不再额外降级，保持心跳仲裁正常运行。
+     *
+     * P1-⑤ 自动联动：如果 ha.enabled=true + have_peer 但 replica.enabled 未显式配置
+     * （cfg layer == CFG_L_DEFAULT），自动置 true —— HA 启了复制就默认也开，
+     * 避免用户"启了 HA 但忘了开 replica 导致 failover 丢对话"的坑。 */
     {
         int rep_en = 0;
-        cfg_get_bool(ctx->cfg, "ha.replica.enabled", &rep_en, NULL);
+        cfg_layer_t rep_layer;
+        cfg_get_bool(ctx->cfg, "ha.replica.enabled", &rep_en, &rep_layer);
+        if (h->have_peer && rep_layer == CFG_L_DEFAULT && !rep_en) {
+            rep_en = 1;
+            llog(LOG_INFO, "ha",
+                 "P1-5 auto-enable: ha.replica.enabled defaulted to true "
+                 "(ha.enabled=true + have_peer, user not set)");
+        }
         if (rep_en && h->have_peer) {
             long rep_port = 5071;
             long ring_cap = 8192;
             long payload_max = 4096;
+            long lag_warn = 10000;
+            long full_resync_interval = 0;
             cfg_get_int(ctx->cfg, "ha.replica.port", &rep_port, NULL);
             cfg_get_int(ctx->cfg, "ha.replica.ring_cap", &ring_cap, NULL);
             cfg_get_int(ctx->cfg, "ha.replica.payload_max", &payload_max, NULL);
+            cfg_get_int(ctx->cfg, "ha.replica.lag_warn", &lag_warn, NULL);
+            h->lag_warn = (uint64_t)(lag_warn > 0 ? lag_warn : 0); /* P3 OBS lag 报警阈值 */
+            cfg_get_int(ctx->cfg, "ha.replica.full_resync_interval", &full_resync_interval, NULL);
+            if (full_resync_interval < 0) full_resync_interval = 0;
             ha_repl_trans_cfg_t tcfg;
             memset(&tcfg, 0, sizeof(tcfg));
             tcfg.enabled = 1;
             tcfg.port = (uint16_t)rep_port;
             tcfg.ring_cap = (uint32_t)ring_cap;
             tcfg.payload_max = (uint32_t)payload_max;
+            tcfg.lag_warn = (uint64_t)lag_warn;
+            tcfg.full_resync_interval = (uint32_t)full_resync_interval;
             tcfg.is_active = 0;   /* 角色稍后通知；init 时 role 尚未仲裁 */
             tcfg.have_peer = 1;
             tcfg.peer_addr = h->peer;
@@ -803,8 +1269,16 @@ static int ha_init(struct nsbc_ctx *ctx)
 
     /* === HA P1 BFD 亚秒探测（与 UDP 5070 心跳互补）===
      * 默认 ha.bfd.enabled=false → 跳过。显式开启 + have_peer → 创建独立 BFD Control socket。
-     * ha_bfd 线程每收到 Control 调 ha_hc_peer_probe()，ha_health 仲裁层统一判定。 */
+     * ha_bfd 线程每收到 Control 调 ha_hc_peer_probe()，ha_health 仲裁层统一判定。
+     *
+     * P1-⑥ 自动联动：启用 BFD 但用户没显式配 failover_ms 时，自动调为
+     *   bfd_window(=max(tx,rx)*detect_multiplier) + 500ms 兜底余量。
+     *   否则 BFD 能在 600ms 判对端 Down 但 ha.c 仲裁层还要等 3s failover_ms ——
+     *   BFD 白开。只在 failover_ms 是 schema 默认值时才覆盖（尊重用户显式配置）。 */
     {
+        cfg_layer_t fo_layer;
+        cfg_get_int(ctx->cfg, "ha.failover_ms", NULL, &fo_layer); /* 只拿 layer */
+
         int bfd_en = 0;
         cfg_get_bool(ctx->cfg, "ha.bfd.enabled", &bfd_en, NULL);
         if (bfd_en && h->have_peer) {
@@ -814,6 +1288,23 @@ static int ha_init(struct nsbc_ctx *ctx)
             cfg_get_int(ctx->cfg, "ha.bfd.desired_min_tx_interval", &tx_ms, NULL);
             cfg_get_int(ctx->cfg, "ha.bfd.required_min_rx_interval", &rx_ms, NULL);
             cfg_get_int(ctx->cfg, "ha.bfd.detect_multiplier", &mult, NULL);
+
+            /* P1-⑥ 自动调 failover_ms（仅当用户没显式配） */
+            if (fo_layer == CFG_L_DEFAULT) {
+                long bfd_win = (tx_ms > rx_ms ? tx_ms : rx_ms) * mult;
+                long new_fo = bfd_win + 500;   /* +500ms UDP 心跳兜底 */
+                if (new_fo < 100) new_fo = 100;
+                if ((uint32_t)new_fo != h->failover_ms) {
+                    llog(LOG_INFO, "ha",
+                         "P1-6 auto-tune failover_ms: %ums → %ums "
+                         "(BFD window=%lums + 500ms UDP safety; "
+                         "user did not set ha.failover_ms)",
+                         h->failover_ms, (uint32_t)new_fo,
+                         (long)bfd_win);
+                    h->failover_ms = (uint32_t)new_fo;
+                }
+            }
+
             ha_bfd_cfg_t bcfg;
             memset(&bcfg, 0, sizeof(bcfg));
             bcfg.enabled = 1;
@@ -825,6 +1316,28 @@ static int ha_init(struct nsbc_ctx *ctx)
             bcfg.peer_addr = h->peer;
             bcfg.hc = h->hc;     /* BFD 线程通过 ha_hc_peer_probe 更新健康门探测结果 */
             ha_bfd_create(&bcfg, &g_bfd);
+        }
+    }
+
+    /* === P2 命令注册（MOD_L_FINAL 在 OAM L_NET_READY 之后，cmd_reg 已存在） === */
+    {
+        cmd_reg_t *reg = obs_control_get_cmd_reg();
+        if (reg) {
+            cmd_desc_t descs[] = {
+                { "ha status",  "HA 综合状态（role/peer/replica/BFD/健康门/冻结）",
+                  "ha", CMD_L1_MONITOR, cmd_ha_status, NULL },
+                { "ha hitless_upgrade", "触发 Hitless Upgrade 滚动升级（ACTIVE→STANDBY，需 ha.hitless.enabled=true；加 'force' 绕过）",
+                  "ha", CMD_L2_ADMIN, cmd_ha_hitless_upgrade, NULL },
+                { "ha status-frozen", "HA FREEZE 状态（Hitless Upgrade 期间新呼是否被拒）",
+                  "ha", CMD_L1_MONITOR, cmd_ha_freeze_status, NULL },
+            };
+            for (size_t i = 0; i < sizeof(descs)/sizeof(descs[0]); ++i) {
+                int rc = cmd_register(reg, &descs[i]);
+                if (rc != NSBC_OK)
+                    llog(LOG_WARN, "ha", "cmd '%s' register rc=%d", descs[i].name, rc);
+            }
+            llog(LOG_NOTICE, "ha", "registered %zu ha commands",
+                 sizeof(descs)/sizeof(descs[0]));
         }
     }
 

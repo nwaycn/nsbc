@@ -88,6 +88,12 @@ struct ha_repl_trans {
     int      nospc_cnt;                /* ★ atomic: 业务线程写 ++；transport 读写 */
     uint64_t last_nospc_time_ms;        /* ★ atomic: 业务线程写；transport 读 */
     int      full_on_nospc_pending;    /* ★ atomic: transport 线程内部读写，但 atomic 保证可见性 */
+
+    /* === P1.6 周期性全量快照对齐 ===
+     * ha.replica.full_resync_interval 秒一次 FULL push —— 防长期运行
+     * NOSPC / gap 重传漏帧累积的缺口；0=关闭（默认） */
+    uint32_t full_resync_interval_sec;
+    uint64_t last_full_resync_ms;  /* 上次 FULL push 的 mono_ms（周期计算用） */
 };
 
 /* === HaReplV1 帧编解码 === */
@@ -482,6 +488,26 @@ static void *ha_repl_trans_thread(void *arg)
                 }
             }
 
+            /* === P1.6 周期性全量快照对齐 ===
+             * ACTIVE + connected + interval > 0 → 每 interval 秒调一次 FULL push，
+             * 防长期运行 gap/NOSPC 漏帧累积的缺口；和 NOSPC FULL 互斥（pending 跳过） */
+            if (t->is_active && t->full_resync_interval_sec > 0 &&
+                !__atomic_load_n(&t->full_on_nospc_pending, __ATOMIC_ACQUIRE)) {
+                struct timespec ts_c;
+                clock_gettime(CLOCK_MONOTONIC, &ts_c);
+                uint64_t now_ms = (uint64_t)ts_c.tv_sec * 1000 +
+                                  (uint64_t)ts_c.tv_nsec / 1000000;
+                if (t->last_full_resync_ms == 0 ||
+                    now_ms - t->last_full_resync_ms >=
+                        (uint64_t)t->full_resync_interval_sec * 1000) {
+                    llog(LOG_NOTICE, "ha-repl",
+                         "periodic FULL resync (interval=%us)",
+                         t->full_resync_interval_sec);
+                    transport_send_full_snapshot(t);
+                    t->last_full_resync_ms = now_ms;
+                }
+            }
+
             struct pollfd pfds[2];
             int np = 0;
             pfds[np].fd = t->peer_fd;
@@ -667,6 +693,8 @@ int ha_repl_trans_create(const ha_repl_trans_cfg_t *cfg, ha_repl_trans_t **out)
     t->backoff_ms = 100;
     t->last_sent_seq = 0;
     t->last_ack_seq = 0;
+    t->full_resync_interval_sec = cfg->full_resync_interval;
+    t->last_full_resync_ms = 0;
     __atomic_store_n(&t->send_head, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&t->send_tail, 0, __ATOMIC_RELEASE);
 

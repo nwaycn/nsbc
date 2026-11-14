@@ -223,11 +223,22 @@ static const cfg_desc_t k_core[] = {
     {"ha.bfd.desired_min_tx_interval", CGT_INT, CGF_HOT, "200", NULL, 50, 5000},
     {"ha.bfd.required_min_rx_interval", CGT_INT, CGF_HOT, "200", NULL, 50, 5000},
     {"ha.bfd.detect_multiplier", CGT_INT, CGF_HOT, "3", NULL, 1, 10},
-    /* ---- HA P1 Hitless Upgrade ---- */
+    /* ---- HA P1 Hitless Upgrade ----
+     * 不走 SHM（已改用 replica FULL push + STANDBY rebuild_from_buf 方案）
+     * ha.hitless.shm_prefix 已于 2026-11-14 删除（P0-2 死配置清理） */
     {"ha.hitless.enabled", CGT_BOOL, CGF_RESTART, "false", NULL, 0, 0},
-    {"ha.hitless.shm_prefix", CGT_STR, CGF_RESTART, "nsbc_ha_", NULL, 0, 0},
     {"ha.hitless.freeze_ms", CGT_INT, CGF_HOT, "1000", NULL, 100, 60000},
     {"ha.hitless.upgrade_timeout_ms", CGT_INT, CGF_HOT, "10000", NULL, 1000, 300000},
+
+    /* ---- HA 健康门参数（原硬编码于 ha_health.c，2026-11-14 配置化 P1-4） ----
+     * 用户只配想覆盖的阈值，不配走 ha_health.c apply_defaults：
+     *   evlag 200/1000, cpu 80/95, rss 0=不判。全部 CGF_RESTART —
+     *   健康门仲裁阈值在运行中热切换可能产生误判定，建议重启生效。 */
+    {"ha.health.evlag_warn_ms", CGT_INT, CGF_RESTART, "200", NULL, 50, 5000},
+    {"ha.health.evlag_fail_ms", CGT_INT, CGF_RESTART, "1000", NULL, 100, 10000},
+    {"ha.health.cpu_warn_pct",  CGT_INT, CGF_RESTART, "80",   NULL, 30, 99},
+    {"ha.health.cpu_fail_pct",  CGT_INT, CGF_RESTART, "95",   NULL, 50, 99},
+    {"ha.health.rss_warn_mb",   CGT_INT, CGF_RESTART, "0",    NULL, 0, 65536},
 
     /* ---- 计费（REQ-PBX-BILL-001，默认关闭；Phase 1.6 资金闭环完成后生产环境开启） ----
      * billing.enabled=false → C 侧跳过 CDR hook 注册 + INVITE pre-auth 检查 +
