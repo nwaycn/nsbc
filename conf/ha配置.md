@@ -371,27 +371,38 @@ HA 暂无独立 CLI 命令。可通过 `nsbcli status` 查看当前角色（需�
 
 健康门只影响"主动抢占"决策，不影响仲裁基本规则。DEGRADED 状态不主动抢主，但已有 ACTIVE 维持。UNHEALTHY 连续 3 周期主动让位 STANDBY。
 
-## 10. P1 规划（复制 + Hitless）
+## 10. P1 功能落地状态
 
-当前 HA 模块的骨架已为 P1 预留接口：
+### 10.1 模块状态表（2026-11-14 更新）
 
 | 模块 | 头文件 | 骨架完成 | 接线状态 |
 |------|--------|----------|----------|
 | 心跳 + 仲裁 | ha.h / ha.c | ✅ | ✅ 全接 |
-| 健康门 | ha_health.h / ha_health.c | ✅ 粗骨架 | ⚠️ CPU/RSS/调度滞后已采样，peer_probe 接口已预留；**BFD/RPL 过载/复制水位接入 P1** |
-| 状态复制 | ha_replica.h / ha_replica.c | ✅ **完整骨架**（seq/ring/gap/ingest/ACK/全量） | 🔲 TCP 传输层未接；**registrar.c / b2bua.c 接线点未调 repl_publish()**（见第 12 章 12.5 节） |
-| BFD 亚秒探测 | ha_health.h（接口）+ P1 新增 ha_bfd.c | 🟡 接口预留（`peer_probe`/`peer_rtt_ms`） | 🔲 BFD Control socket + 状态机未接；UDP 心跳 250ms 周期已能秒级收敛 |
-| Hitless Upgrade | shm_seg.h + ha.h 预留接口 | ✅ SHM 三级回退链 + epoch/CRC | 🔲 滚动升级冻结/解冻流程 + 业务 SHM publish/attach 未接（见第 14 章） |
+| 健康门 | ha_health.h / ha_health.c | ✅ 粗骨架 | ✅ CPU/RSS/调度滞后/peer_probe/repl_lag 已采样；**BFD 联动已接**；RSS 默认关闭（warn=0） |
+| 状态复制 | ha_replica.h / ha_replica.c | ✅ 完整骨架 | ✅ **TCP 传输层已接**（ha_repl_transport.c）；**registrar.c 接线点已接**（REG/UNREG）；**b2bua.c 接线点已接**（CONFIRMED/END） |
+| BFD 亚秒探测 | ha_bfd.h / ha_bfd.c（独立 pthread） | ✅ RFC 5881 状态机 | ✅ **BFD Control socket + AdminDown→Down→Init→Up 状态机 + ha_hc_peer_probe 联动**；暂不实现 Echo（D bit=0） |
+| Hitless Upgrade | ha.h 公共 API | ✅ | ✅ **6 步完整流程**（FREEZE→DRAIN→FULL push→yield_requested→heartbeat role flip→返回）+ auto-unfreeze 超时 + drain_by_in-dialog BYE 30s 降级 + **FULL resync 状态对齐** |
+| Dialog Rebuild | b2bua.c（STANDBY→ACTIVE） | ✅ | ✅ **v3 payload 完整重建**：call state machine（leg tag/cseq/state/a_final）+ profile 查找（sip_profile_find）+ **media anchor relay 重建**（bridge_register_call + rtp_relay_start + set_peer_a/b）+ 去重（tbl_find） |
 
-`ha_replica` 设计要点：
+### 10.2 已知降级点（明确不做或后续 P1.5）
+
+| 项 | 降级 | 原因 |
+|----|------|------|
+| **REPL_FULL_CDR_FLUSH** | 未实现 | 当前只对 loc_db + dialog 做 FULL；CDR flush 走独立 DB 路径，不在内存复制覆盖范围 |
+| **BFD Echo 模式**（D bit=1） | 未实现 | UDP 心跳 250ms + BFD Control 200ms×3=600ms 已够秒级探测，Echo 不增加价值 |
+| **STANDBY REPL_DIALOG apply 的 SDP codec/SSRC** | payload 打 0，重建侧不重建 | SDP 体积大（~1KB/条）+ codec 协商结果可从 SDP answer 解析后打平 — 这是 v3→v4 可以加的 |
+| **relay transcode session 重建** | rebuild 时 fallback MB_RELAY | relay_mode 在 payload 里打平，但 transcode session 内部状态（codec filter graph）无法序列化；降级为 MB_RELAY 能续通但不转码 |
+| **NOSPC 主动 FULL** | NOSPC 只 WARN，不主动发 FULL | 触发 FULL 还是靠 on_gap same_gap_cnt≥3（更温和降级链，业务侧零侵入） |
+| **rebuild 后 codec v4 payload** | 当前 payload_ver=3，codec 字段全 0 | v4 在 publish 时从 ACTIVE 侧 SDP answer 解析 codec PT/CR/SSRC 打平，rebuild 侧按版本号分支解析 |
+| **跨进程 SHM（shm_seg.h）** | Hitless Upgrade 走 **replica FULL push** 状态对齐，不依赖 SHM | SHM 是跨进程方案（老进程 publish → 新进程 attach）；我们用的是**进程内** role flip + STANDBY→ACTIVE rebuild_from_buf — 更简单、更安全、无 SHM 陈旧风险 |
+
+### 10.3 ha_replica 核心设计不变
 
 - **主→备单推**，64 位单调 seq + 备端 ACK 水位
-- 环形缓冲 8192 条，满了返回 NOSPC → 转全量/告警，不阻塞呼叫线程
-- 缺口处理：备端期望 seq 未到 → `on_gap` 回调请求重传
-- 载荷类型：REPL_REG / REPL_DIALOG / REPL_CDR_FLUSH / REPL_FULL
-- 热升级跨版本：payload 带 `ver` 字段
-
-接线点在 **registrar.c**（注册增删）和 **b2bua.c**（对话锚点增删）——调用 `repl_publish()` 即可。
+- 环形缓冲 8192 条，满了返回 NOSPC → WARN，不阻塞呼叫线程
+- GAP_REQ 帧（type=0xFE）重传；同一段 gap 连续 `TRANS_GAP_MAX=3` 次 → FULL_REQ 帧（type=0xFD）
+- 载荷类型：REPL_REG=0 / REPL_DIALOG=1 / REPL_FULL_CLEAR=3 / ACK=0xFF / GAP_REQ=0xFE / FULL_REQ=0xFD
+- 热升级跨版本：payload 带 `payload_ver` 字段，apply 侧按版本号分支解析
 
 ## 11. 常见问题
 
@@ -467,9 +478,9 @@ typedef struct {
 
 **关键设计：不阻塞**。环形缓冲是 SPSC（单生产者多消费者可降级为 SPSC）结构，publish 走呼叫线程，TCP 发送走独立 ha 通道线程。环满返回 NOSPC 后，业务侧不应等，应转全量/告警后继续。
 
-### 12.3 备端应用与缺口重传
+### 12.3 备端应用与缺口重传（✅ 已实现）
 
-`repl_ingest()` 判定逻辑（ha_replica.c L72-L96 已实现）：
+`repl_ingest()` 判定逻辑（ha_replica.c）：
 
 | 收到的 seq | 期望 seq = applied_seq + 1 | 处理 |
 |-----------|---------------------------|------|
@@ -477,50 +488,121 @@ typedef struct {
 | == 期望 | ✅ | 调 `ops.apply()` → `applied_seq = rec->seq` |
 | > 期望 | ❌ 缺口 | `gaps++` → `ops.on_gap(expect, got)` → 返回 `NSBC_AGAIN` |
 
-**缺口处理策略**：
+**缺口处理策略（已落地实现）**：
 
-1. `on_gap` 回调备端向主端请求重传：发一个 **REPL_GAP_REQ** 帧（type=0xFE，payload 含 `expect_seq..got_seq-1` 区间）；
-2. 主端收 GAP_REQ 后按区间从环形缓冲取出重发；
-3. 若缺口范围超环形缓冲容量（备端长时间离线），主端直接回推 `REPL_FULL` 全量快照；
-4. 骨架版本不做乱序缓存，收到缺口直接等重传（粗实现）；正式 P1 接线时可加一个 256 条的乱序窗口 `pending[seq & 0xFF]`。
+1. **单次 gap**：`on_gap` 回调 STANDBY 向 ACTIVE 发 **GAP_REQ 帧**（type=0xFE，payload 含 `{ gap_start, gap_end }`）
+2. ACTIVE 收 GAP_REQ → 按区间从环形缓冲取出重发（`transport_resend_gap`）
+3. **同一段 gap 连续 `TRANS_GAP_MAX=3` 次**（备端发了 GAP_REQ 但 ACTIVE 重发也丢 / 环形缓冲已淘汰缺口段）→ 备端发 **FULL_REQ 帧**（type=0xFD，无 payload）
+4. ACTIVE 收 FULL_REQ → 立即发 **完整快照**（见 12.4 节）
 
-### 12.4 全量快照（REPL_FULL）
+> 骨架版本曾写"不做乱序缓存" — 实际实现也没加，但 `repl_set_accept_any_seq` 在 FULL resync 期间跳过 gap check — 效果等价。
 
-**触发条件**：
+### 12.4 全量快照 REPL_FULL（✅ 已实现，含降级链）
 
-| 触发源 | 条件 |
-|--------|------|
-| 环形缓冲满 | 主端 `repl_publish()` 返回 NOSPC → 主端主动发 FULL |
-| 缺口请求超界 | 备端 `on_gap` 请求的区间超出主端环形缓冲 |
-| 周期对齐 | `ha.replica.full_resync_interval` 配置（默认 0=关闭） |
-| 主备切换后首次对齐 | 新 ACTIVE 启动后立即推一次 FULL |
+**触发条件（按优先级）**：
 
-**FULL 载荷格式**（主端序列化）：
+| 触发源 | 条件 | 降级 |
+|--------|------|------|
+| **GAP_REQ 重传失败**（已实现） | STANDBY on_gap same_gap_cnt≥3 → 发 FULL_REQ | 最温和（STANDBY 主动请求，ACTIVE 被动响应） |
+| **NOSPC**（未实现，降级链 P1.5） | ACTIVE 环形缓冲满（repl_publish 返回 NOSPC） | 当前只 WARN |
+| **OAM API**（已实现） | `ha_hitless_upgrade()` Step 3 主动调 `ha_repl_trans_force_full_push()` | Hitless Upgrade 强制状态对齐 |
+| **周期对齐**（未实现，P1.5） | `ha.replica.full_resync_interval` 配置（默认 0=关闭） | 定期周期性兜底 |
+
+**FULL push 帧序列（transport_send_full_snapshot 已实现）**：
 
 ```
-[64 位 snapshot_seq]           ← 对齐水位
-[32 位 type_count]             ← 条目数
-[条目1: REPL_REG 格式]
-[条目2: REPL_DIALOG 格式]
-...
+ACTIVE → STANDBY:
+  ① REPL_FULL_CLEAR (type=3, seq=snap_seq+1, payload_len=0)
+     → STANDBY: repl_set_accept_any_seq=1 + loc_db_clear_all + ha_dlg_buf clear
+  ② ring 从 max(ack_seq+1, pub_seq-8192+1) 逐条重发 REPL_REG / REPL_DIALOG
+     → STANDBY: accept_any_seq=1 跳过 gap check → 每条调 ops.apply
+  ③ HA_REPL_FRAME_ACK_TYPE (type=0xFF, payload_len=snap_seq) 作为结束信号
+     → STANDBY: repl_set_accept_any_seq=0 + repl_resync_done(snap_seq)
 ```
 
-备端 `repl_resync_done(r, snapshot_seq)` 推进 applied_seq + 清零 gaps。
+**降级链**：ring 空（无 publish 过）→ FULL push 只发 CLEAR + 尾 ACK → STANDBY 只清内存 → 正常流水恢复。
 
-### 12.5 接线点（业务模块调用 repl_publish）
+### 12.5 接线点（✅ 已落地，payload v3）
 
-| 模块 | 事件 | 载荷格式（建议） | 调用时机 |
-|------|------|-----------------|----------|
-| [registrar.c](../../src/registrar/registrar.c) | REGISTER 200 OK（新增/刷新绑定） | `REPL_REG { aor, contact, expires }` | `loc_upsert()` 成功后（ACTIVE 角色） |
-| [registrar.c](../../src/registrar/registrar.c) | REGISTER 4xx/expire=0（注销） | `REPL_REG { aor, contact, expires=0 }` | `loc_upsert()` 返回 expires=0 或 `loc_del()` |
-| [b2bua.c](../../src/sip/b2bua.c) | INVITE accept（对话锚点创建） | `REPL_DIALOG { call_id, cseq, media_addr, state }` | `b2b_accept()` 成功（ACTIVE 角色） |
-| [b2bua.c](../../src/sip/b2bua.c) | BYE final（对话清理） | `REPL_DIALOG { call_id, state=TERMINATED }` | `b2b_bye_final()` |
+| 模块 | 事件 | payload_ver | 调用时机 |
+|------|------|------------|----------|
+| [registrar.c](../../src/registrar/registrar.c) | REGISTER 200 OK（新增/刷新绑定） | 1（扁平 `loc_binding_t`） | `reg_push(&b, exp)` 成功后（ACTIVE guard + `ha_repl_publish(REPL_REG, 1, &b, sizeof(b))`） |
+| [registrar.c](../../src/registrar/registrar.c) | REGISTER 4xx/expire=0（注销） | 1 | `reg_push(&dummy, 0)` → `ha_repl_publish(REPL_REG, 1, &dummy, sizeof(dummy))`（expire_ms=0 应用侧视作注销） |
+| [b2bua.c](../../src/sip/b2bua.c) | LEG_CONFIRMED（对话锚点创建） | **3** | `c->leg[1].state = LEG_CONFIRMED` 后 publish 完整 REPL_DIALOG |
+| [b2bua.c](../../src/sip/b2bua.c) | `call_destroy`（对话终结） | **3** | `ha_repl_publish(REPL_DIALOG, action=1)` — rebuild 侧跳过 END |
 
-**角色守卫**：所有接线点统一判断 `ha_role() == HA_ROLE_ACTIVE` 再 publish，STANDBY 跳过（防双写）。
+**REPL_DIALOG payload v3 完整字段（b2bua.c publish 侧）**：
 
-**载荷序列化**：业务模块自带版本号（`payload_ver`），结构演进时 bump 版本号即可，备端按版本号分支解析。**禁止直接 memcpy 含指针对象**（跨进程/跨地址空间指针无意义）。
+```c
+typedef struct {
+    uint8_t  action;        /* 0=CONFIRMED, 1=END */
+    uint8_t  media_done;    /* call->media_done */
+    uint8_t  hangup_by;     /* call->hangup_by (END 才有值) */
+    uint8_t  hold_legs;
+    char callid_a[80];      /* leg[0].callid */
+    char callid_b[80];
+    char loc_tag_a[32];     /* leg[0].loc_tag / rem_tag */
+    char rem_tag_a[32];
+    char loc_tag_b[32];
+    char rem_tag_b[32];
+    char aor[256];          /* prof->name */
+    char prof_name[128];    /* ★ rebuild 侧 sip_profile_find 用 */
+    char orig_to[128];
+    char clip[48];
+    char dst_number[48];
+    uint32_t cseq_a, cseq_b;
+    uint64_t start_ms;
+    uint8_t  leg0_state, leg1_state;
+    uint8_t  a_final;
+    /* ★ v3: media anchor */
+    uint16_t a_rtp, b_rtp;            /* relay ports: bridge_lookup_relay → rtp_relay_port */
+    uint16_t a_rtcp, b_rtcp;          /* a_rtp+1, b_rtp+1 */
+    uint8_t  relay_latched_a, relay_latched_b;
+    uint8_t  relay_mode;              /* 0=BYPASS / 1=RELAY / 2=TRANSCODE / 3=SRTP_RELAY */
+    char peer_a_ip[64], peer_b_ip[64]; /* inet_ntop 打平 */
+    uint16_t peer_a_port, peer_b_port;
+    /* codec / SSRC 暂打 0 — v4 补 */
+} repl_dialog_v3_t;
+```
 
-### 12.6 监控水位（OAM 只读）
+**角色守卫**：所有接线点统一判断 `ha_role() == HA_ROLE_ACTIVE` 再 publish（ha.h `ha_repl_publish` 内部带 role guard + transport NULL 检查）。
+
+**载荷序列化规则**：**扁平打平、禁止指针**。所有字段用 memcpy 直接传，跨版本只 bump `payload_ver` 让 apply 侧分支解析。
+
+### 12.6 STANDBY→ACTIVE failover dialog rebuild（✅ 已实现）
+
+role_switch_proxy 链路：ha_main 心跳仲裁 → `ha_repl_role_switch_proxy(ACTIVE)` → `b2b_repl_on_role_switch(co, ACTIVE)` → `b2b_repl_rebuild_from_buf(co)`。
+
+**rebuild 步骤（v3 payload 完整重建）**：
+
+```
+ha_dlg_buf[256] (round-robin, 由 transport recv 线程 REPL_DIALOG apply 填充)
+  │
+  ├─ tbl_find(co, callid_a / callid_b) → 去重（FULL push 重发同一 dialog 防重复挂链）
+  │
+  ├─ mem_slab_alloc_direct(sizeof(b2b_call_t)) → new_call
+  │
+  ├─ leg[0/1].callid / loc_tag / rem_tag / cseq / state  ← 从 payload 填
+  │
+  ├─ call.active=1 / dead=0 / media_done / hangup_by / hold_legs / a_final / start_ms
+  │
+  ├─ sip_profile_find(dlg.prof_name) → c->prof  ← CDR 里 prof->name 不再 "(unknown)"
+  │
+  ├─ ★ rtp_relay_start(bm, &rl, &rp{a_rtp, b_rtp}, 0, 0)
+  ├─ ★ inet_pton(peer_a_ip) → rtp_relay_set_peer_a(rl, &sa)
+  ├─ ★ bridge_register_call(bm, new_call, rl, relay_mode) ← media_bridge.c 新增接口
+  │    → shard[ptr_shard(new_call)].head → new cnode { call=new_call, relay=rl, mode }
+  │
+  └─ tbl_link(co, new_call, 0)  /* callid_a shard */
+     tbl_link(co, new_call, 1)  /* callid_b shard */
+
+后续 in-dialog BYE/re-INVITE 到同一 callid:
+  tbl_find(co, callid) → rebuild 的 call (active=1, dead=0) → 正常续接 RTP
+```
+
+**bridge_register_call 新接口**：`media_bridge.c` 新增，反向绑定 call_key→relay。和 `bridge_release_call` 对称：同 `ptr_shard(call_key)` 哈希 → 同 shard 锁 → 同 malloc/free cnode 生命周期。幂等（已存在返回 `NSBC_AGAIN`）。
+
+### 12.7 监控水位（OAM 只读）
 
 | OAM 指标 | 含义 | 来源 |
 |----------|------|------|
@@ -542,7 +624,7 @@ typedef struct {
 | 对端进程存活但 UDP socket 挂住 | 永远收不到 → 3s failover | BFD Control 走独立 socket，更精确 |
 | 主备跨机房专线抖动 | 丢 UDP 但 TCP 复制通 | BFD 独立探测 |
 
-### 13.1 BFD 与 UDP 心跳的关系
+### 13.1 BFD 与 UDP 心跳的关系（✅ 已实现）
 
 **BFD 不是替代，是补充**：
 
@@ -554,22 +636,20 @@ UDP 5070 心跳 ──→ 角色仲裁（priority/tie-break）
 
 BFD Control ────→ 对端存活精确判定（毫秒级）
                     │
+                    ├── UDP socket + 独立 pthread（ha_bfd.c）
                     ├── 周期: desired_min_tx_interval（默认 200ms）
-                    └── 判定: 连续 detect_multiplier 次未收到 → 对端 Down
-                              （经典 BFD: interval × multiplier 即探测时间）
+                    ├── 状态机: AdminDown → Down → Init → Up（RFC 5881）
+                    └── 判定: 连续 detect_multiplier 次未收到 → ha_hc_peer_probe(0, -1)
 ```
 
-**ha_health.h 接口已预留**：
+**ha_bfd.c 实现要点**：
 
-```c
-void ha_hc_peer_probe(ha_hc_t *h, int ok, int rtt_ms);
-int  ha_hc_peer_visible(ha_hc_t *h);
-int  ha_hc_peer_rtt_ms(ha_hc_t *h);
-```
-
-当前 UDP 心跳每周期调一次 `ha_hc_peer_probe(got_hb, 0)`。BFD 启用后，心跳线程 **额外** 起一个 BFD Control socket，每 `desired_min_tx_interval` 发 BFD Control 包，每收到一个调 `ha_hc_peer_probe(1, rtt_ms)`；连续 `detect_multiplier` 次没收到则调 `ha_hc_peer_probe(0, -1)`。
-
-仲裁层（ha.c）只读 `ha_hc_peer_visible()` 的结果，不关心底层是 UDP 还是 BFD。
+- 独立 UDP socket（非 SOCK_DGRAM 独立于复制 TCP 5071 和心跳 UDP 5070）
+- 独立 pthread `bfd_thread_main`（poll 100ms 周期）
+- BFD Control 包 52 字节（AdminDown→Down→Init→Up 状态按 `local_discriminator` + `desired_min_tx_interval` 递增）
+- 每收到 Control 包 → `ha_hc_peer_probe(hc, 1, rtt_ms)` 联动健康门
+- 连续 `detect_multiplier` 次未收到 → `ha_hc_peer_probe(hc, 0, -1)` 标记 peer invisible
+- ha.c ha_init 读 `ha.bfd.*` cfg 项 → `ha_bfd_create()`；socket/pthread 失败降级（静默跳过 BFD，心跳仲裁照常）
 
 ### 13.2 BFD Control 包格式（RFC 5880 Section 4.1）
 
@@ -611,20 +691,91 @@ BFD 探测时间 = BFD 探测间隔 × detect_multiplier
 
 > ⚠️ **关键陷阱**：启用 BFD 必须同步配置 `failover_ms = bfd_interval × detect_multiplier + 500ms`（留 UDP 心跳兜底余量），否则 BFD 探测已判对端 Down，ha.c 仲裁层还要等满 failover_ms 才升主，BFD 白开。
 
-## 14. Hitless Upgrade 滚动升级（P1 / shm_seg.h）
+## 14. Hitless Upgrade 滚动升级（✅ 已实现，replica FULL push 方案）
 
-> 代码骨架：[shm_seg.h](../../src/include/shm_seg.h) 已实现 `memfd_create → POSIX shm_open → SystemV shmget` 三级回退链、`epoch` 世代号、`CRC32C` 校验。本章节描述"老进程出、新进程进"的滚动升级流程。
+> **重要更正**：初版文档假设用 `shm_seg.h` 跨进程共享内存段 publish 状态，但实际代码落地选择了**进程内 replica FULL push + STANDBY rebuild_from_buf** 方案。原因：更简单、无 SHM 陈旧风险、不需要新进程 attach 旧进程 SHM（新进程就是原来的 nsbcd，不是新进程）。
 
-### 14.1 滚动升级的核心难题
+### 14.1 滚动升级的核心难题（及本方案解法）
 
-| 难题 | 解法 |
-|------|------|
-| **老进程如何不丢在途呼叫** | 冻结输入（`FREEZE` 控制面）→ 等在途对话 drain → 关闭 |
-| **新进程如何继承注册数据** | 共享内存段（`shm_seg`）：老进程 publish 到 SHM，新进程 attach + 校验 epoch/CRC 加载 loc_db 热启动 |
-| **如何保证只有一个 ACTIVE 在跑** | 老进程主动让位 STANDBY → 新进程启动后心跳仲裁 → 新 ACTIVE 接管 |
-| **VIP 不中断** | keepalived track_process 盯着 ACTIVE nsbcd，老进程 stop 瞬间 VIP 会漂到备机（如果备机也停了）。正确做法是 **滚动升级时先升备机，再升主机**（见 14.3） |
+| 难题 | 本方案解法 |
+|------|-----------|
+| **老进程如何不丢在途呼叫** | ① `ha_freeze_input(0)` 冻结新呼（b2bua INVITE gate + SOS 例外）② `ha_drain_proxy()` 轮询 in-dialog BYE 自然到期（`b2b_active_count` 遍历 shard 统计），30s 超时降级继续 |
+| **新 ACTIVE 如何继承对话状态** | 不等 SHM，走 **replica FULL push**：ACTIVE 调 `ha_repl_trans_force_full_push()` → CLEAR + ring 全量 → 尾 ACK → STANDBY 侧 `accept_any_seq=1` 跳过 gap check 装完整 loc_db + dialog buf → 再 ACTIVE 切换时 `b2b_repl_rebuild_from_buf` 重建完整 call + relay |
+| **如何保证只有一个 ACTIVE 在跑** | ACTIVE 主动调 `ha_hitless_upgrade()` → 内部 `g_hitless_yield_requested=1` → 心跳线程仲裁时强制 `want=STANDBY` → role flip + keepalived track_process 摘 VIP → 原 ACTIVE 进程退出 → keepalived VIP 漂到 STANDBY → STANDBY 心跳仲裁 want=ACTIVE（对端 DOWN）→ STANDBY→ACTIVE |
+| **VIP 不中断** | keepalived track_process 盯着 ACTIVE nsbcd，老进程 stop 瞬间 VIP 会漂到备机。**滚动升级时序：先升备机（VIP 仍在主机）→ 再升主机（主机降 STANDBY → 进程退出 → VIP 漂备机 → 备机升 ACTIVE）** |
 
-### 14.2 滚动升级时序（先升备机，再升主机）
+### 14.2 Hitless Upgrade 6 步完整流程（ha_hitless_upgrade）
+
+```
+ha_hitless_upgrade():
+  │
+  ├─ Step 1: FREEZE ───────────────────────┐
+  │  ha_freeze_input(0)                      │
+  │  g_frozen_until_ms = auto-unfreeze 120s  │  （进程被 kill 后自动解冻）
+  │  b2bua INVITE gate:                      │
+  │    ha_is_frozen()==1                     │
+  │    && !SOS → drop                        │
+  │                                           │  新呼入口关闭
+  ├─ Step 2: DRAIN ──────────────────────────┤
+  │  ha_drain_proxy() 200ms 轮询:            │
+  │    → b2b_active_count(co)                │
+  │      遍历 B2B_CALL_SHARDS                 │
+  │      加锁统计 call.active==1              │
+  │  等 cnt==0 或 30s 超时                    │  in-dialog BYE 自然到期
+  │                                           │
+  ├─ Step 3: FULL push ──────────────────────┤
+  │  ha_repl_trans_force_full_push()           │
+  │    → REPL_FULL_CLEAR (type=3)             │
+  │    → ring 从 max(ack_seq+1, pub_seq-8192+1)│
+  │      逐条重发 REPL_REG / REPL_DIALOG      │
+  │    → 尾 ACK 帧 (type=0xFF, payload_len=snap_seq)│
+  │  STANDBY 侧:                              │
+  │    repl_set_accept_any_seq=1               │
+  │    reg_repl_apply: loc_db_clear_all       │
+  │    b2b_repl_apply: ha_dlg_buf clear       │  状态对齐
+  │                                           │
+  ├─ Step 4: yield_requested ────────────────┤
+  │  atomic_store(&g_hitless_yield_requested, 1)│
+  │                                           │
+  ├─ Step 5: heartbeat role flip ────────────┤
+  │  ha_main 仲裁周期 (250ms):                │
+  │    正常 want=ACTIVE                       │
+  │    yield_requested==1                     │
+  │    want=STANDBY                           │  强制让位
+  │    role ACTIVE→STANDBY                   │
+  │    repl_trans_notify_role(STANDBY)        │
+  │    repl_role_switch_proxy(STANDBY)        │
+  │    log_audit("standby")                   │
+  │                                           │
+  └─ Step 6: 返回（1.5s 超时兜底）────────────┘
+```
+
+**后续进程操作（调用方负责）**：
+
+```bash
+systemctl stop nsbcd      # 原 ACTIVE 进程退出
+                         # keepalived track_process 触发 → VIP 漂到备机
+                         # 备机心跳仲裁 want=ACTIVE（对端 DOWN）→ STANDBY→ACTIVE
+                         # 备机 rebuild_from_buf → 对话续接 + media anchor 重建
+
+systemctl start nsbcd    # 原 ACTIVE 机器新进程启动
+                         # 收到备机心跳 → priority 低 → 保持 STANDBY
+                         # 新进程 ha_is_frozen() 默认 0（未设置） → 正常
+```
+
+### 14.3 降级安全网（稳定性 P0 硬约束）
+
+| 场景 | 处理 | 日志 |
+|------|------|------|
+| **STANDBY 触发 upgrade** | 直接返回 `NSBC_NOENT` | INFO: "not ACTIVE, skip" |
+| **transport 未连接**（备端离线） | 跳过 FULL push，继续 yield | WARN: "STANDBY transport not connected — skip FULL push (degrade)" |
+| **upgrade 重入** | `atomic test_and_set` 防重入 | WARN: "already in progress" |
+| **DRAIN 30s 超时** | WARN + 继续 FULL push + yield（不阻塞升级） | "DRAIN TIMEOUT — force yield" |
+| **heartbeat 超时不 yield** | 1.5s 后返回但不强制 kill | WARN: "TIMEOUT (still ACTIVE after 1.5s)" |
+| **调用方挂了（进程被 kill）** | `g_frozen_until_ms` 自动超时解冻（120s）— **永远不会永远 frozen** | WARN: "auto-unfreeze (timeout)" |
+| **yield 后 keepalived 不漂 VIP** | 调用方必须 `systemctl stop nsbcd` — keepalived track_process 只盯进程存活 | — |
+
+### 14.4 跨版本升级时序（强制顺序，防 payload_ver 不兼容）
 
 ```
 时间 ──────────────────────────────────────────────────────►
@@ -634,106 +785,57 @@ BFD 探测时间 = BFD 探测间隔 × detect_multiplier
   ACTIVE, 正常服务          STANDBY, 复制接收中           初始状态
                               │
                               ▼
-                           B 收到 systemctl upgrade
-                              │
-                              ▼
-                           发 HA_REPL_FULL → 对端 A 立即发全量快照
-                              │
-                              ▼
-                           detach 旧 nsbcd（进程退出）
-                              │
-                              ▼
-                           新 nsbcd 启动 → attach SHM (nsbc_ha_node-b)
-                           → 加载 loc_db / dialog snapshot（校验 epoch/CRC）
-                           → 心跳启动 → 收到 A 心跳 → STANDBY 正常
+                           升 B → B 跑 apply v3
+                           （新 STANDBY apply 侧 sizeof(v3)≥sizeof(v2)
+                            → 能吃旧 ACTIVE 的 v2 payload
+                            → prof_name/relay 字段全 0 → rebuild 降级
+                            → 但对话续接仍 OK）
                               │
                               ▼
                            ✅ B 升级完成（VIP 仍在 A，零影响）
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
                               │
-  A 收到 systemctl upgrade     │
-  ├─ ① 发 FREEZE 控制面          │
-  ├─ ② 拒绝新 INVITE（已实现）   │   备机 B 已升级，复制链路正常
-  ├─ ③ wait all in-dialog BYE │
-  ├─ ④ publish final snapshot ─┼─→ SHM (nsbc_ha_node-a)
-  ├─ ⑤ detach 旧 nsbcd          │
-  ├─ ⑥ B 心跳判定 A Down        │   failover_ms 内 B 升 ACTIVE
-  │                              │
-  ▼                              ▼
-  新 nsbcd 启动 → attach SHM     VIP 漂到 B（keepalived track_process）
-  → 加载 loc_db / dialog         → B 开始接呼
-  → 心跳启动 → 收到 B 心跳       → 按 priority 降 STANDBY（或等待 A 完成）
-  → STANDBY 正常                 → 服务正常
+  A 调 ha_hitless_upgrade     │
+  ├─ FREEZE                    │   B 已升级（apply v3）
+  ├─ DRAIN 30s max            │   复制链路正常
+  ├─ FULL push (transport_send │
+  │   _full_snapshot v3)       │
+  ├─ yield_requested=1        │
+  ├─ ACTIVE → STANDBY         │
+  │                           │
+  ▼                           ▼
+  systemctl stop nsbcd       VIP 漂到 B（keepalived track_process）
+  （进程退出）                 │
+                              ├─ B 心跳仲裁 want=ACTIVE（对端 DOWN）
+                              ├─ B 降 ACTIVE
+                              ├─ b2b_repl_rebuild_from_buf(co)
+                              │   → prof_find → prof 填
+                              │   → rtp_relay_start + bridge_register_call
+                              │     → media anchor 重建
+                              │   → tbl_link
+                              └─ ✅ 服务正常（对话续接 + RTP 正常）
 
-  ✅ A 升级完成
+  systemctl start nsbcd（A）
+  → 收 B 心跳 → priority 低 → STANDBY
+  → 正常
 ```
 
-### 14.3 共享内存段设计（shm_seg.h）
+> ⚠️ **升级顺序强制：先升 STANDBY → 再升 ACTIVE**。反过来（先升 ACTIVE 到 publish v3，旧 STANDBY apply 侧 sizeof(v2 payload) 更小 → FULL push 全部 REPL_DIALOG 被 len check 跳过 → failover 后 dialog rebuild 零覆盖 — SIP 续接断）。
 
-**段结构**：
+### 14.5 Hitless Upgrade vs 传统 SHM 方案对比
 
-```
-┌───────────────────────────────────────┐
-│ shm_hdr_t (48 字节)                   │
-│   magic      = 0x4e534243 ("NSBC")    │
-│   version    = 1                      │
-│   size       = 整个段大小              │
-│   epoch      = 每次 publish +1         │  ← 新进程 attach 后读 epoch，
-│   crc        = payload CRC32C         │     若与上一代相同则拒绝（陈旧 SHM）
-│   reserved   = 4 × 8 字节              │
-├───────────────────────────────────────┤
-│ loc_db 快照（数组 or 哈希表序列化）     │
-├───────────────────────────────────────┤
-│ dialog 快照                            │
-├───────────────────────────────────────┤
-│ ... (预留扩展)                         │
-└───────────────────────────────────────┘
-```
+| 维度 | 本方案（replica FULL push + drain + yield） | 传统 SHM（老进程 publish → 新进程 attach） |
+|------|-------------------------------------------|------------------------------------------|
+| **复杂度** | 低（进程内 role flip，零跨进程通信） | 高（SHM 段创建/attach/epoch/CRC + 进程间同步） |
+| **陈旧风险** | 无（STANDBY 实时接收复制，FULL push 刚对齐） | 有（SHM 被老进程 publish 后可能陈旧 → epoch/CRC 校验不过降级） |
+| **代码量** | 小（~600 行：ha_hitless_upgrade + bridge_register_call + rebuild_from_buf） | 大（shm_seg + loc_db 序列化 + dialog 序列化 + attach 校验 + rebuild — 至少 1500 行） |
+| **进程模型** | **同一 nsbcd 进程**降 STANDBY → stop → 新进程升 ACTIVE | **两个独立进程**（老 ACTIVE publish SHM + 新 STANDBY attach） |
+| **降级链** | FREEZE→DRAIN→FULL→YIELD 每步可超时降级 | SHM attach 失败 → 新进程从零启动 loc_db（最坏 15min UA 重注册） |
+| **媒体 anchor** | bridge_register_call 重建 relay（同进程内 RTPPROXY 仍在） | relay 句柄无法跨进程传递（SHM 存不了 socket fd）— 媒体必然断 |
 
-**SHM 创建/attach 判定**：
-
-```c
-shm_seg_t *seg = shm_seg_open(&(shm_cfg_t){
-    .name    = "nsbc_ha_node-a",     // prefix + hostname
-    .size    = 256 * 1024 * 1024,    // 256MB 可配置
-    .create  = 1,                    // ACTIVE 创建；STANDBY attach
-    .backend_force = SHM_BACKEND_NONE, // memfd → POSIX → SysV 回退
-}, &seg);
-
-// 新进程 attach 后校验：
-int rc = shm_validate(seg, &epoch, &crc);
-if (rc != NSBC_OK || epoch <= last_seen_epoch)
-    // 版本不匹配或 SHM 已陈旧 → 从零启动 loc_db（降级）
-```
-
-### 14.4 冻结/解冻控制面
-
-**控制命令**：`nsbcli ha freeze [ms]` 或通过 UDS `control` 接口。
-
-```c
-// ha.h 预留（待 P1 接线）
-void ha_freeze_input(int freeze_ms);  // 冻结新输入 ms；0=永久直到 unfreeze
-void ha_unfreeze_input(void);
-int  ha_is_frozen(void);
-```
-
-冻结期间：
-- INVITE 入站：备机继续丢弃（正常门控），主机拒绝新 INVITE（**新增门控**，当前 P0 未实现）；
-- REGISTER 入站：继续受理（保持 loc_db 热备）；
-- 外呼：继续拒绝（已实现）。
-
-**关键：冻结后不立即退出**。要等所有 in-dialog 对话自然结束（BYE/CANCEL），或等到 `upgrade_timeout_ms`，才真正 detach 进程。
-
-### 14.5 降级与安全网
-
-| 场景 | 处理 |
-|------|------|
-| SHM attach 失败（旧版无段、或版本不匹配） | 新进程从零启动 loc_db → 等 UA 下次 REGISTER 刷新（最坏 15min），HA 正常服务但丢失在途注册 |
-| FREEZE 后在途呼叫长期不结束 | `upgrade_timeout_ms`（默认 10s）到期后强制 detach（会丢在途呼叫，日志 WARN） |
-| 老进程 detach 瞬间 VIP 飘回旧 ACTIVE | keepalived track_process + 进程级 watchdog 兜底：进程已退出 → track_process 自动摘 VIP |
-| 新进程启动太慢 | `upgrade_timeout_ms` 到期后 keepalived 重新漂 VIP（但此时老进程已死）→ **需要提前 500ms 调大 failover_ms 留冗余窗口** |
+> **结论**：对 NSBC 单进程 nsbcd 架构，本方案是**更合理的选择**。SHM 方案适合**多进程架构**（老进程只做 ACTIVE，新进程是全新的 nsbcd 实例），但当前 nsbcd 是单进程 reactor 模型 — 进程内 role flip 就够了，不需要跨进程共享。
 
 ---
 
-**源文件**：[ha.c](../../src/ha/ha.c) · [ha_health.c](../../src/ha/ha_health.c) · [ha_replica.c](../../src/ha/ha_replica.c) · [shm_seg.h](../../src/include/shm_seg.h) · [registrar.c](../../src/registrar/registrar.c) · [b2bua.c](../../src/sip/b2bua.c)
+**源文件**：[ha.c](../../src/ha/ha.c) · [ha_health.c](../../src/ha/ha_health.c) · [ha_replica.c](../../src/ha/ha_replica.c) · [ha_repl_transport.c](../../src/ha/ha_repl_transport.c) · [ha_bfd.c](../../src/ha/ha_bfd.c) · [registrar.c](../../src/registrar/registrar.c) · [location_db.c](../../src/registrar/location_db.c) · [b2bua.c](../../src/sip/b2bua.c) · [media_bridge.c](../../src/media/bridge/media_bridge.c)
