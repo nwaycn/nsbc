@@ -187,7 +187,7 @@ fn api_router<C: CoreApi + Clone + 'static>(st: Arc<AppState<C>>) -> Router {
         .merge(routes::security::router())
         .merge(routes::recordings::router())
         .merge(routes::sounds::router())          // ← 声音文件管理（REQ-DP-UPLOAD）
-        .nest("/billing", routes::billing::router())
+        .merge(routes::billing::router())
         .merge(routes::transcode::router())
         .merge(routes::tenants::router())
         .merge(routes::auth::protected_router())
