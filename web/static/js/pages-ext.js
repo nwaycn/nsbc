@@ -303,83 +303,232 @@ app.component('ext-webhooks', {
 });
 
 // =============================================================================
-// 外部 API 使用说明页 —— 所有数据从后端 GET /api/v1/ext-docs 动态拉取
-// endpoints / scopes / cmds 都从 nsbc-web 实际注册的路由和 nsbcd core 取
+// 外部 API 使用说明页 + 高可用配置指南
+// —— 外部 API 数据从后端 GET /api/v1/ext-docs 动态拉取
+// —— HA 配置内容来自 conf/ha配置.md（Active-Standby 双机主备模型）
 // =============================================================================
 
 app.component('ext-api-guide', {
   template: `
-    <div class="p-4 max-w-5xl">
-      <h2 class="text-xl font-bold mb-4">📡 外部 API 使用指南
+    <div class="p-4 max-w-6xl">
+      <h2 class="text-xl font-bold mb-4">📡 外部 API & 高可用配置指南
         <el-tag size="small" class="ml-2" v-if="docs">v{{ docs.web_version }}</el-tag>
       </h2>
 
-      <el-alert type="success" :closable="false" show-icon style="margin-bottom:20px">
-        外部系统（呼叫中心 / CRM / AI Agent）接入 NSBC 只需要一个 API Key —— 不需要部署
-        Python 客户端、不需要 UDS 访问、不需要 Web UI 登录。所有端点元数据由后端
-        <code>GET /ext/v1/docs</code> 动态提供（本页数据来自 <code>GET /api/v1/ext-docs</code>）。
-      </el-alert>
+      <el-tabs v-model="activeTab" type="border-card">
+        <!-- ==================== Tab 1: 外部 API ==================== -->
+        <el-tab-pane label="🔐 外部 API 使用指南" name="api">
+          <div class="bg-gray-50 border rounded-lg p-4 mb-4">
+            <el-alert type="success" :closable="false" show-icon>
+              外部系统（呼叫中心 / CRM / AI Agent）接入 NSBC 只需一个 API Key —— 不需要部署 Python 客户端、不需要 UDS 访问。
+              所有端点元数据由后端 <code>GET /ext/v1/docs</code> 动态提供。
+            </el-alert>
+          </div>
 
-      <h3 class="font-bold mt-4 mb-2">🔐 认证方式</h3>
-      <div class="bg-gray-100 p-3 rounded font-mono text-sm mb-4">
-        Authorization: Bearer nsbc_live_&lt;64hex&gt;
-      </div>
+          <h3 class="font-bold mt-4 mb-2">🔐 认证方式</h3>
+          <div class="bg-gray-900 text-green-400 p-3 rounded font-mono text-sm mb-4">
+            Authorization: Bearer nsbc_live_&lt;64hex&gt;
+          </div>
 
-      <h3 class="font-bold mt-4 mb-2">📋 Scope 分级</h3>
-      <el-table :data="docs?.scopes || []" size="small" stripe style="margin-bottom:20px">
-        <el-table-column prop="scope" label="Scope" width="120"/>
-        <el-table-column prop="can" label="能做什么"/>
-        <el-table-column prop="example" label="适用场景" width="260"/>
-      </el-table>
+          <h3 class="font-bold mt-4 mb-2">📋 Scope 分级</h3>
+          <el-table :data="docs?.scopes || []" size="small" stripe style="margin-bottom:20px">
+            <el-table-column prop="scope" label="Scope" width="120"/>
+            <el-table-column prop="can" label="能做什么"/>
+            <el-table-column prop="example" label="适用场景" width="260"/>
+          </el-table>
 
-      <h3 class="font-bold mt-4 mb-2">🔗 端点列表
-        <el-tag size="small" type="info" class="ml-2">{{ (docs?.endpoints || []).length }} 个端点</el-tag>
-      </h3>
-      <el-table :data="docs?.endpoints || []" size="small" stripe v-loading="loading">
-        <el-table-column prop="method" label="方法" width="80">
-          <template #default="{row}">
-            <el-tag :type="row.method==='GET'?'success':'warning'" size="small">{{ row.method }}</el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column prop="path" label="路径" width="220"/>
-        <el-table-column prop="min_scope" label="最小 Scope" width="120">
-          <template #default="{row}">
-            <el-tag :type="row.min_scope==='readonly'?'info':row.min_scope==='readwrite'?'primary':'danger'" size="small">{{ row.min_scope }}</el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column prop="desc" label="说明"/>
-      </el-table>
+          <h3 class="font-bold mt-4 mb-2">🔗 端点列表
+            <el-tag size="small" type="info" class="ml-2">{{ (docs?.endpoints || []).length }} 个端点</el-tag>
+          </h3>
+          <el-table :data="docs?.endpoints || []" size="small" stripe v-loading="loading">
+            <el-table-column prop="method" label="方法" width="80">
+              <template #default="{row}">
+                <el-tag :type="row.method==='GET'?'success':'warning'" size="small">{{ row.method }}</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column prop="path" label="路径" width="220"/>
+            <el-table-column prop="min_scope" label="最小 Scope" width="120">
+              <template #default="{row}">
+                <el-tag :type="row.min_scope==='readonly'?'info':row.min_scope==='readwrite'?'primary':'danger'" size="small">{{ row.min_scope }}</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column prop="desc" label="说明"/>
+          </el-table>
 
-      <h3 class="font-bold mt-4 mb-2">🛠 nsbcd 命令注册表
-        <el-tag size="small" type="warning" class="ml-2">{{ docs?.cmd_count || 0 }} 条（动态从 core 取）</el-tag>
-      </h3>
-      <el-alert type="info" :closable="false" show-icon style="margin-bottom:12px">
-        这些命令全部可以通过 <code>POST /ext/v1/cmd</code> 透明代理执行。
-        命令名前缀 <code>[2]</code> 表示 L2 admin 级（二次授权），<code>[1]</code> 表示 L1 monitor 级。
-      </el-alert>
-      <el-input v-model="cmdFilter" placeholder="🔍 搜索命令名或帮助文本..." clearable style="margin-bottom:10px"/>
-      <el-table :data="filteredCmds" size="small" stripe height="360">
-        <el-table-column label="级别" width="70">
-          <template #default="{row}">
-            <el-tag :type="row.level===2?'danger':'info'" size="small">L{{ row.level }}</el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column prop="name" label="命令名" width="180">
-          <template #default="{row}"><code>{{ row.name }}</code></template>
-        </el-table-column>
-        <el-table-column prop="help" label="帮助"/>
-      </el-table>
+          <h3 class="font-bold mt-4 mb-2">🛠 nsbcd 命令注册表
+            <el-tag size="small" type="warning" class="ml-2">{{ docs?.cmd_count || 0 }} 条</el-tag>
+          </h3>
+          <el-alert type="info" :closable="false" show-icon style="margin-bottom:12px">
+            这些命令全部可以通过 <code>POST /ext/v1/cmd</code> 透明代理执行。
+            <span class="ml-2">命令名前缀 <code>[2]</code> 表示 L2 admin 级，<code>[1]</code> 表示 L1 monitor 级。</span>
+          </el-alert>
+          <el-input v-model="cmdFilter" placeholder="🔍 搜索命令名或帮助文本..." clearable style="margin-bottom:10px"/>
+          <el-table :data="filteredCmds" size="small" stripe height="360">
+            <el-table-column label="级别" width="70">
+              <template #default="{row}">
+                <el-tag :type="row.level===2?'danger':'info'" size="small">L{{ row.level }}</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column prop="name" label="命令名" width="180">
+              <template #default="{row}"><code>{{ row.name }}</code></template>
+            </el-table-column>
+            <el-table-column prop="help" label="帮助"/>
+          </el-table>
 
-      <h3 class="font-bold mt-4 mb-2">💡 接入流程</h3>
-      <ol class="list-decimal pl-5 space-y-1">
-        <li>在左侧菜单「外部 API → API Key 管理」创建一个 Key（选 scope，写标签）</li>
-        <li>⚠️ 弹窗里只显示一次 Key 原文 —— 立即复制到密码管理器</li>
-        <li>用这个 Key 作为 Bearer Token 调 /ext/v1/* 接口（<code>curl -k -X POST https://YOUR_HOST/ext/v1/docs -H "Authorization: Bearer &lt;KEY&gt;"</code> 先看完整端点列表）</li>
-        <li>如果需要事件推送，在「外部 API → Webhook 回调管理」注册你的回调 URL</li>
-      </ol>
+          <h3 class="font-bold mt-4 mb-2">💡 接入流程</h3>
+          <ol class="list-decimal pl-5 space-y-1">
+            <li>在 Web UI「外部 API → API Key 管理」创建一个 Key（选 scope，写标签）</li>
+            <li>⚠️ 弹窗里只显示一次 Key 原文 —— 立即复制到密码管理器</li>
+            <li>用这个 Key 作为 Bearer Token 调 <code>/ext/v1/*</code> 接口</li>
+            <li>需要事件推送？在「外部 API → Webhook 回调管理」注册回调 URL</li>
+          </ol>
 
-      <h3 class="font-bold mt-4 mb-2">📥 示例（curl）</h3>
-      <pre class="bg-gray-900 text-green-400 p-3 rounded text-xs overflow-x-auto">{{ curlExample }}</pre>
+          <h3 class="font-bold mt-4 mb-2">📥 curl 示例</h3>
+          <pre class="bg-gray-900 text-green-400 p-3 rounded text-xs overflow-x-auto">{{ curlExample }}</pre>
+        </el-tab-pane>
+
+        <!-- ==================== Tab 2: 高可用配置 ==================== -->
+        <el-tab-pane label="🏗 高可用 HA 配置指南" name="ha">
+          <div class="bg-gray-50 border rounded-lg p-4 mb-4">
+            <el-alert type="warning" :closable="false" show-icon>
+              <b>双机主备（Active-Standby）模式</b> —— VIP 漂移由外部 keepalived / HAProxy 执行，本进程只出角色状态 + 信令门控。
+              完整细节见项目文档 <code>conf/ha配置.md</code>。
+            </el-alert>
+          </div>
+
+          <!-- 架构图 -->
+          <h3 class="font-bold mt-4 mb-2">📐 架构图</h3>
+          <div class="bg-gray-900 text-gray-200 p-4 rounded font-mono text-xs leading-relaxed overflow-x-auto whitespace-pre">
+{{ archDiagram }}
+          </div>
+
+          <!-- 快速启用三步法 -->
+          <h3 class="font-bold mt-6 mb-2">⚡ 快速启用三步法</h3>
+
+          <div class="bg-white border rounded-lg p-4 mb-3">
+            <div class="font-bold text-blue-600 mb-2">Step 1 — nsbc.yaml（两台各改 4–5 行）</div>
+            <div class="text-xs text-gray-500 mb-2">最简原则：<code>heartbeat_ms</code> / <code>failover_ms</code> 不用写 — 默认值够用。</div>
+            <pre class="bg-gray-900 text-green-400 p-3 rounded text-xs overflow-x-auto">
+# node-a (主节点 10.0.0.80)
+ha:
+  enabled: true
+  peer: "10.0.0.81:5070"
+  priority: 100          # 主高备低，避免 hostname 不确定性
+
+# node-b (备节点 10.0.0.81)
+ha:
+  enabled: true
+  peer: "10.0.0.80:5070"  # 互指对方
+  priority: 90
+            </pre>
+          </div>
+
+          <div class="bg-white border rounded-lg p-4 mb-3">
+            <div class="font-bold text-blue-600 mb-2">Step 2 — 防火墙开端口（两台都要）</div>
+            <pre class="bg-gray-900 text-green-400 p-3 rounded text-xs overflow-x-auto">
+firewall-cmd --permanent --add-port=5060/udp   # SIP
+firewall-cmd --permanent --add-port=5070/udp   # HA 心跳
+firewall-cmd --permanent --add-port=5071/tcp   # 状态复制（replica.enabled=true 时才需要）
+firewall-cmd --reload
+            </pre>
+          </div>
+
+          <div class="bg-white border rounded-lg p-4 mb-3">
+            <div class="font-bold text-blue-600 mb-2">Step 3 — keepalived VIP 漂移（可选但强烈推荐）</div>
+            <pre class="bg-gray-900 text-green-400 p-3 rounded text-xs overflow-x-auto">
+# node-a (MASTER) / node-b (BACKUP) — 唯一区别是 state + priority
+global_defs { router_id NSBC_HA }
+vrrp_instance VI_1 {
+    state MASTER          # node-b 写 BACKUP
+    interface eth0
+    virtual_router_id 51
+    priority 150          # node-b 写 140
+    advert_int 1
+    authentication { auth_type PASS auth_pass nsbc_ha }
+    virtual_ipaddress { 139.226.66.211/24 }
+    track_process { nsbcd }   # nsbcd 挂了自动摘 VIP
+}
+            </pre>
+          </div>
+
+          <!-- P2-9 discover 模式 -->
+          <div class="bg-amber-50 border border-amber-200 rounded-lg p-4 mb-3">
+            <div class="font-bold text-amber-700 mb-2">💫 P2-9 零配置 discover 模式</div>
+            <div class="text-sm text-gray-700">
+              两台机器在<b>同一二层子网</b>上时，<b>完全不写 peer 行</b>，HA 模块会通过 UDP broadcast
+              <code>255.255.255.255:5070</code> 自动互相发现。启动间隔 ≤ 3 秒即可。
+            </div>
+            <div class="text-xs text-gray-500 mt-2">前置条件：防火墙允许 broadcast 包穿过 5070/UDP。</div>
+          </div>
+
+          <!-- 仲裁规则 -->
+          <h3 class="font-bold mt-6 mb-2">⚖️ 仲裁规则</h3>
+          <el-table :data="arbRules" size="small" stripe>
+            <el-table-column prop="scene" label="场景" width="200"/>
+            <el-table-column prop="cond" label="判定条件"/>
+            <el-table-column prop="result" label="结果" width="180"/>
+          </el-table>
+
+          <!-- 信令门控 -->
+          <h3 class="font-bold mt-6 mb-2">🚦 信令门控一览表</h3>
+          <el-table :data="signalGate" size="small" stripe>
+            <el-table-column prop="path" label="路径" width="160"/>
+            <el-table-column label="ACTIVE" width="100">
+              <template #default="{row}"><el-tag type="success" size="small">✅ {{ row.active }}</el-tag></template>
+            </el-table-column>
+            <el-table-column label="STANDBY" width="140">
+              <template #default="{row}"><el-tag :type="row.standbyOk?'success':'danger'" size="small">{{ row.standbyOk?'✅ ✅ 但跳过 reg_push':'❌ '+row.standby }}</el-tag></template>
+            </el-table-column>
+          </el-table>
+
+          <!-- 配置项详解 -->
+          <h3 class="font-bold mt-6 mb-2">⚙️ 配置项详解（全部在 nsbc.yaml 的 ha: 段）</h3>
+          <pre class="bg-gray-900 text-gray-200 p-3 rounded text-xs overflow-x-auto">{{ haConfigDump }}</pre>
+
+          <!-- 配置变更生效方式 -->
+          <h3 class="font-bold mt-6 mb-2">🔄 配置变更生效方式</h3>
+          <el-table :data="configEffect" size="small" stripe max-height="360">
+            <el-table-column prop="key" label="配置项" width="260"/>
+            <el-table-column prop="effect" label="生效方式" width="120">
+              <template #default="{row}">
+                <el-tag :type="row.effect.includes('重启')?'warning':'success'" size="small">{{ row.effect }}</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column prop="note" label="备注"/>
+          </el-table>
+
+          <!-- 故障降级 -->
+          <h3 class="font-bold mt-6 mb-2">🛟 故障降级策略</h3>
+          <div class="bg-red-50 border border-red-200 rounded-lg p-4">
+            <div class="text-sm text-gray-700 mb-2">HA 模块自身故障<b>绝不拖死整机</b> —— 所有故障点都降级为 <code>solo-active</code>（本机无条件 ACTIVE）：</div>
+            <ul class="text-sm text-gray-600 space-y-1 pl-5 list-disc">
+              <li>socket / bind / pthread_create 失败 → WARN 日志 + 跳过 HA 初始化</li>
+              <li>ha.peer DNS 解析失败 → 单机 ACTIVE</li>
+              <li>健康门创建失败 → 静默关闭健康门，心跳仲裁照常</li>
+            </ul>
+          </div>
+
+          <!-- OAM CLI -->
+          <h3 class="font-bold mt-6 mb-2">🛠 OAM CLI 命令</h3>
+          <el-table :data="haCommands" size="small" stripe>
+            <el-table-column prop="cmd" label="命令" width="200">
+              <template #default="{row}"><code>{{ row.cmd }}</code></template>
+            </el-table-column>
+            <el-table-column prop="perm" label="权限" width="80"/>
+            <el-table-column prop="desc" label="说明"/>
+          </el-table>
+
+          <!-- 验证清单 -->
+          <h3 class="font-bold mt-6 mb-2">✅ 部署验证清单（30 秒）</h3>
+          <ol class="list-decimal pl-5 space-y-1 text-sm">
+            <li><b>心跳互通</b>：<code>grep 'heartbeat enabled' /var/log/nsbcd.log</code> — 两台都应有 peer=对端</li>
+            <li><b>角色收敛</b>：<code>grep 'role' /var/log/nsbcd.log | tail -5</code> — 主节点 STANDBY→ACTIVE，备节点保持 STANDBY</li>
+            <li><b>注册热备</b>：UA 在 VIP 上 REGISTER 后，两台 grep REGISTER-200 都能看到</li>
+            <li><b>Failover 测试</b>：kill 主节点 nsbcd → 3 秒后备节点升 ACTIVE → keepalived VIP 漂移</li>
+            <li><b>恢复测试</b>：主节点重启 → priority 高 → 自动切回 ACTIVE</li>
+          </ol>
+        </el-tab-pane>
+      </el-tabs>
     </div>
   `,
 
@@ -388,6 +537,92 @@ app.component('ext-api-guide', {
       loading: false,
       docs: null,
       cmdFilter: '',
+      activeTab: 'api',
+
+      // ---- HA 配置指南数据 ----
+      archDiagram: `
+
+  ┌─────────────────────────────────────────────────────────┐
+  │                    外部 keepalived                       │
+  │         VIP 139.226.66.211 漂移 → ACTIVE 节点            │
+  └──────────────┬───────────────────────────┬─────────────┘
+                 │  SIP UDP 5060             │
+     ┌───────────▼──────────┐        ┌────────▼─────────────┐
+     │   nsbcd (ACTIVE)     │  UDP   │   nsbcd (STANDBY)    │
+     │                      │ 5070   │                      │
+     │  • INVITE ✅ 接呼     │◄────► │  • INVITE ❌ 丢弃     │
+     │  • REGISTER ✅ 受理   │心跳    │  • REGISTER ✅ 受理   │
+     │  • 外呼 ✅ 允许        │       │  • 外呼 ❌ 拒绝       │
+     │  • reg_push ✅ DB写入 │       │  • reg_push ❌ 跳过   │
+     │  • replica TCP 推送   │──────► │  • loc_db ✅ 热备     │
+     └──────────────────────┘ 5071   └───────────────────────┘
+      `.trim(),
+
+      arbRules: [
+        { scene: '单机 (ha.enabled=false)', cond: '无对端配置', result: 'ACTIVE（solo-active）' },
+        { scene: '对端不可见', cond: '启动后等满 failover_ms 未收到心跳', result: 'ACTIVE（failover 接管）' },
+        { scene: '正常主备', cond: '对端活着', result: 'priority 大的 ACTIVE' },
+        { scene: 'Priority 相等', cond: '对端活着 + priority 相同', result: 'hostname 字典序 tie-break' },
+        { scene: '健康门让位', cond: '本机 UNHEALTHY 连续 3 周期', result: '主动降 STANDBY' },
+      ],
+
+      signalGate: [
+        { path: 'REGISTER 受理', active: '✅', standbyOk: true, standby: '✅ loc_db 写内存' },
+        { path: 'reg_push (DB/事件)', active: '✅', standbyOk: false, standby: '❌ 跳过防双写' },
+        { path: 'INVITE 新呼', active: '✅', standbyOk: false, standby: '❌ 503 兜底（SOS 例外）' },
+        { path: 'INVITE in-dialog', active: '✅', standbyOk: true, standby: '✅ 接 BYE/re-INVITE' },
+        { path: '外呼 originate', active: '✅', standbyOk: false, standby: '❌ 拒绝' },
+      ],
+
+      haConfigDump: `ha:
+  enabled: false                 # 默认 false = 单机模式
+  peer: "10.0.0.81:5070"         # 对端心跳地址；空则启用 broadcast discover
+  heartbeat_ms: 500              # 心跳间隔，实际仲裁周期 = heartbeat_ms / 4 = 125ms
+  failover_ms: 3000              # failover 窗口，对端连续不可见超此时长才升主
+  priority: 100                  # 仲裁优先级，大者 ACTIVE；相同则 hostname tie-break
+
+  # === 状态复制（replica.enabled=true 需同时 ha.enabled=true + peer 有效）===
+  replica:
+    enabled: false               # 主→备注册/对话 TCP 推送总开关
+    port: 5071                   # 复制 TCP 监听端口
+    ring_cap: 8192               # 环形缓冲容量（条）
+    lag_warn: 10000              # 备端 applied_seq 落后 pub_seq 超过此值 → DEGRADED
+
+  # === BFD 亚秒探测（RFC 5881）===
+  bfd:
+    enabled: false               # 启用后建议同步调小 failover_ms
+    local_discriminator: 1       # 双方不同
+    desired_min_tx_interval: 200 # BFD 控制面发包间隔
+    detect_multiplier: 3         # interval × 3 = failover 时间
+
+  # === Hitless Upgrade 滚动升级 ===
+  hitless:
+    enabled: false               # FREEZE→DRAIN→FULL push→yield 无感切换
+    freeze_ms: 1000              # 老进程 stop 前冻结输入等待新进程 ready
+    upgrade_timeout_ms: 10000    # 新进程超时未上线则放弃滚动
+      `.trim(),
+
+      configEffect: [
+        { key: 'ha.enabled', effect: '重启', note: 'CGF_RESTART' },
+        { key: 'ha.peer', effect: '重启', note: '解析失败降级 solo-active' },
+        { key: 'ha.heartbeat_ms', effect: '热加载', note: '范围 [50, 10000]，默认 500' },
+        { key: 'ha.failover_ms', effect: '热加载', note: '范围 [100, 60000]，默认 3000' },
+        { key: 'ha.priority', effect: '热加载', note: '范围 [1, 65535]，默认 100' },
+        { key: 'ha.replica.enabled', effect: '重启', note: 'transport TCP connect/listen 需重建' },
+        { key: 'ha.replica.port', effect: '重启', note: '默认 5071' },
+        { key: 'ha.replica.ring_cap', effect: '重启', note: '环形缓冲静态分配' },
+        { key: 'ha.replica.lag_warn', effect: '热加载', note: '默认 10000' },
+        { key: 'ha.bfd.enabled', effect: '重启', note: 'BFD Control socket 需创建' },
+        { key: 'ha.bfd.desired_min_tx_interval', effect: '热加载', note: '默认 200' },
+        { key: 'ha.bfd.detect_multiplier', effect: '热加载', note: '默认 3' },
+        { key: 'ha.hitless.enabled', effect: '重启', note: '' },
+      ],
+
+      haCommands: [
+        { cmd: 'ha status', perm: 'L1', desc: '综合状态一屏看：role/peer/hb/failover/priority/健康门/replica/BFD/Hitless' },
+        { cmd: 'ha status-frozen', perm: 'L1', desc: 'Hitless Upgrade FREEZE 状态 (yes/no)' },
+        { cmd: 'ha hitless_upgrade [force]', perm: 'L2', desc: '触发滚动升级（ACTIVE→STANDBY）；force 绕过配置守卫' },
+      ],
     };
   },
 
@@ -402,7 +637,7 @@ app.component('ext-api-guide', {
       );
     },
     curlExample() {
-      return `# 1) 先拉完整端点文档（拿到 API Key 后第一步）
+      return `# 1) 先拉完整端点文档
 curl -k https://YOUR_HOST/ext/v1/docs \\
   -H "Authorization: Bearer nsbc_live_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
@@ -412,16 +647,15 @@ curl -k -X POST https://YOUR_HOST/ext/v1/originate \\
   -H "Content-Type: application/json" \\
   -d '{"call_url": "user/1000 &echo"}'
 
-# 3) ★ 透明代理 —— 任意 nsbc_cli 命令直送 core（最强大的能力）
+# 3) ★ 透明代理 —— 任意 nsbc_cli 命令直送 core
 curl -k -X POST https://YOUR_HOST/ext/v1/cmd \\
   -H "Authorization: Bearer nsbc_live_xxx" \\
   -H "Content-Type: application/json" \\
-  -d '{"cmd": "help"}'        # 完整命令列表
+  -d '{"cmd": "ha status"}'        # HA 综合状态
   #-d '{"cmd": "show channels"}'   # 活动呼叫
-  #-d '{"cmd": "status"}'          # 系统状态
-  #-d '{"cmd": "originate user/1000 &echo"}'  # 透明代理外呼
+  #-d '{"cmd": "help"}'            # 完整命令列表
 
-# 4) 订阅实时事件流（会一直挂着，每个事件一行 JSON）
+# 4) 订阅实时事件流（SSE，会一直挂着）
 curl -k -N https://YOUR_HOST/ext/v1/events/stream \\
   -H "Authorization: Bearer nsbc_live_xxx"`;
     }

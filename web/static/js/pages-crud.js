@@ -1086,24 +1086,80 @@ app.component('ivr-menus', crudTable(
   ],
 ));
 
-// --- 高可用组 ---
+// --- 高可用组（双机主备 Active-Standby）---
+// 字段 1:1 对齐 conf/ha配置.md yaml 配置模型
 app.component('ha-groups', crudTable(
   { label: '高可用组', icon: 'fa-solid fa-server' },
   '/ha-groups',
   [
-    { key: 'name', label: t('Name'), type: 'text' },
-    { key: 'enabled', label: t('Status'), type: 'bool' },
-    { key: 'quorum', label: '法定人数', type: 'text' },
-    { key: 'state', label: t('CurrentStatus'), type: 'text' },
+    { key: 'name', label: '组名', type: 'text' },
+    { key: 'enabled', label: '启用', type: 'bool' },
+    { key: 'peer', label: '对端地址', type: 'text' },
+    { key: 'priority', label: '优先级', type: 'text' },
+    { key: 'state', label: '当前角色', type: 'text' },
   ],
   [
-    { key: 'name', label: t('Name'), type: 'text' },
-    { key: 'enabled', label: t('Enable'), type: 'bool', default: true },
-    { key: 'node_list_json', label: '节点列表', type: 'json', editor: 'ha-node-list',
-      default: '[{"node_id":"node-1","host":"10.0.0.25","port":8080,"role":"slave"}]' },
-    { key: 'quorum', label: '法定人数', type: 'number', default: 2 },
-    { key: 'election_timeout', label: '选主超时 (ms)', type: 'number', default: 5000 },
-    { key: 'description', label: t('Notes'), type: 'textarea' },
+    { key: 'name', label: '组名', type: 'text', default: '' },
+    { key: 'enabled', label: '启用 HA', type: 'bool', default: false,
+      help: 'HA 模块总开关；关掉后 nsbcd 运行在 solo-active 模式' },
+
+    // ---- 核心仲裁 ----
+    { key: 'peer', label: '对端地址 (peer)', type: 'text', default: '',
+      help: '对端 nsbcd 的心跳地址 IP:端口（如 10.0.0.81:5070）；留空则启用 UDP broadcast 自动 discover' },
+    { key: 'heartbeat_ms', label: '心跳间隔 (ms)', type: 'number', default: 500,
+      help: '默认 500ms；仲裁周期 = heartbeat_ms / 4 = 125ms；范围 [50, 10000]' },
+    { key: 'failover_ms', label: 'Failover 窗口 (ms)', type: 'number', default: 3000,
+      help: '对端连续不可见超此时长才升主；建议 heartbeat_ms × 6；范围 [100, 60000]' },
+    { key: 'priority', label: '仲裁优先级', type: 'number', default: 100,
+      help: '大者 ACTIVE；双方相同则 hostname 字典序 tie-break；主高备低避免不确定性' },
+
+    // ---- 健康门阈值（可覆盖默认）----
+    { key: 'evlag_warn_ms', label: '调度滞后告警 (ms)', type: 'number', default: 200,
+      help: '事件循环滞后告警阈值；默认 200' },
+    { key: 'evlag_fail_ms', label: '调度滞后失败 (ms)', type: 'number', default: 1000,
+      help: '超过此值 → 健康门 UNHEALTHY → 让位 STANDBY' },
+    { key: 'cpu_warn_pct', label: 'CPU 告警 (%)', type: 'number', default: 80,
+      help: 'CPU 使用率告警阈值；默认 80' },
+    { key: 'cpu_fail_pct', label: 'CPU 失败 (%)', type: 'number', default: 95,
+      help: 'CPU 使用率 ≥ 此值 → 健康门 UNHEALTHY → 让位 STANDBY' },
+
+    // ---- 状态复制 (replica) ----
+    { key: 'replica_enabled', label: '启用状态复制 (replica)', type: 'bool', default: false,
+      help: '主→备注册/对话 TCP 推送总开关；启用需同时填 peer' },
+    { key: 'replica_port', label: '复制 TCP 端口', type: 'number', default: 5071,
+      help: '主端监听，备端连接；与 UDP 心跳 5070 分离' },
+    { key: 'replica_ring_cap', label: '环形缓冲容量 (条)', type: 'number', default: 8192,
+      help: '备端 ACK 落后满环 → 主端返回 NOSPC → 触发全量快照' },
+    { key: 'replica_payload_max', label: '单条最大载荷 (字节)', type: 'number', default: 4096,
+      help: '超过此值的单条 REPL_REG/REPL_DIALOG 会被分片或转 FULL' },
+    { key: 'replica_lag_warn', label: '复制水位差告警 (条)', type: 'number', default: 10000,
+      help: '备端 applied_seq 落后主端 pub_seq 超过此值 → 健康门 DEGRADED' },
+    { key: 'replica_full_resync_interval', label: '全量快照周期 (秒)', type: 'number', default: 0,
+      help: '0=关闭；生产建议 3600（每小时全量一次对齐防缺口累积）' },
+
+    // ---- BFD 亚秒探测 ----
+    { key: 'bfd_enabled', label: '启用 BFD 亚秒探测', type: 'bool', default: false,
+      help: 'RFC 5881；启用后心跳线程额外发 BFD Control 包；建议同步调小 failover_ms' },
+    { key: 'bfd_local_disc', label: 'Local Discriminator', type: 'number', default: 1,
+      help: '1–2^24-1，双方必须不同' },
+    { key: 'bfd_tx_interval', label: '发包间隔 (ms)', type: 'number', default: 200,
+      help: 'desired_min_tx_interval；建议 100–500' },
+    { key: 'bfd_rx_interval', label: '期望对端发包间隔 (ms)', type: 'number', default: 200,
+      help: 'required_min_rx_interval' },
+    { key: 'bfd_detect_mult', label: '检测倍数', type: 'number', default: 3,
+      help: 'detect_multiplier；经典口径 interval × 3 = failover 时间' },
+
+    // ---- Hitless Upgrade ----
+    { key: 'hitless_enabled', label: '启用滚动升级', type: 'bool', default: false,
+      help: 'FREEZE→DRAIN→FULL push→yield 无感切换；不走 SHM 共享内存' },
+    { key: 'hitless_shm_prefix', label: 'SHM 段名前缀', type: 'text', default: 'nsbc_ha_',
+      help: '实际段名 = prefix + hostname；多节点互不干扰' },
+    { key: 'hitless_freeze_ms', label: 'Freeze 窗口 (ms)', type: 'number', default: 1000,
+      help: '老进程 stop 前冻结输入等待新进程 ready' },
+    { key: 'hitless_timeout_ms', label: '升级超时 (ms)', type: 'number', default: 10000,
+      help: '新进程在 freeze 内未上线则放弃滚动，回退重启老进程' },
+
+    { key: 'description', label: '备注', type: 'textarea', default: '' },
   ],
 ));
 

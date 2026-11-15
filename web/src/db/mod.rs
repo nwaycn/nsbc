@@ -3181,48 +3181,109 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
                  ON dialplan_rules(profile_name, prio)")
         .execute(pool).await.ok();
 
-    // ================ ha_groups (high-availability groups) ================
+    // ================ ha_groups (high-availability groups — 双机主备 Active-Standby) ================
+    // 字段对齐 conf/ha配置.md 中的 yaml 配置模型
     let ha_ddl = match backend {
         "sqlite" => r#"
             CREATE TABLE IF NOT EXISTS ha_groups (
-                id                INTEGER PRIMARY KEY AUTOINCREMENT,
-                name              TEXT    NOT NULL UNIQUE,
-                enabled           INTEGER NOT NULL DEFAULT 1,
-                node_list_json    TEXT    NOT NULL DEFAULT '[]',
-                quorum            INTEGER NOT NULL DEFAULT 2,
-                election_timeout  INTEGER NOT NULL DEFAULT 5000,
-                state             TEXT    NOT NULL DEFAULT 'initializing',
-                description       TEXT    NOT NULL DEFAULT '',
-                created_at        TEXT    NOT NULL DEFAULT (datetime('now')),
-                updated_at        TEXT    NOT NULL DEFAULT (datetime('now'))
+                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                name                    TEXT    NOT NULL UNIQUE,
+                enabled                 INTEGER NOT NULL DEFAULT 0,
+                peer                    TEXT    NOT NULL DEFAULT '',
+                heartbeat_ms            INTEGER NOT NULL DEFAULT 500,
+                failover_ms             INTEGER NOT NULL DEFAULT 3000,
+                priority                INTEGER NOT NULL DEFAULT 100,
+                evlag_warn_ms           INTEGER NOT NULL DEFAULT 200,
+                evlag_fail_ms           INTEGER NOT NULL DEFAULT 1000,
+                cpu_warn_pct            INTEGER NOT NULL DEFAULT 80,
+                cpu_fail_pct            INTEGER NOT NULL DEFAULT 95,
+                replica_enabled         INTEGER NOT NULL DEFAULT 0,
+                replica_port            INTEGER NOT NULL DEFAULT 5071,
+                replica_ring_cap        INTEGER NOT NULL DEFAULT 8192,
+                replica_payload_max     INTEGER NOT NULL DEFAULT 4096,
+                replica_lag_warn        INTEGER NOT NULL DEFAULT 10000,
+                replica_full_resync_interval INTEGER NOT NULL DEFAULT 0,
+                bfd_enabled             INTEGER NOT NULL DEFAULT 0,
+                bfd_local_disc          INTEGER NOT NULL DEFAULT 1,
+                bfd_tx_interval         INTEGER NOT NULL DEFAULT 200,
+                bfd_rx_interval         INTEGER NOT NULL DEFAULT 200,
+                bfd_detect_mult         INTEGER NOT NULL DEFAULT 3,
+                hitless_enabled         INTEGER NOT NULL DEFAULT 0,
+                hitless_shm_prefix      TEXT    NOT NULL DEFAULT 'nsbc_ha_',
+                hitless_freeze_ms       INTEGER NOT NULL DEFAULT 1000,
+                hitless_timeout_ms      INTEGER NOT NULL DEFAULT 10000,
+                state                   TEXT    NOT NULL DEFAULT 'standby',
+                description             TEXT    NOT NULL DEFAULT '',
+                created_at              TEXT    NOT NULL DEFAULT (datetime('now')),
+                updated_at              TEXT    NOT NULL DEFAULT (datetime('now'))
             )
         "#,
         "postgres" => r#"
             CREATE TABLE IF NOT EXISTS ha_groups (
-                id                BIGSERIAL PRIMARY KEY,
-                name              TEXT    NOT NULL UNIQUE,
-                enabled           INTEGER NOT NULL DEFAULT 1,
-                node_list_json    TEXT   NOT NULL DEFAULT '[]',
-                quorum            INTEGER NOT NULL DEFAULT 2,
-                election_timeout  INTEGER NOT NULL DEFAULT 5000,
-                state             TEXT    NOT NULL DEFAULT 'initializing',
-                description       TEXT    NOT NULL DEFAULT '',
-                created_at        TEXT NOT NULL DEFAULT (to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD') || 'T' || to_char(NOW() AT TIME ZONE 'UTC', 'HH24:MI:SS.MS') || 'Z'),
-                updated_at        TEXT NOT NULL DEFAULT (to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD') || 'T' || to_char(NOW() AT TIME ZONE 'UTC', 'HH24:MI:SS.MS') || 'Z')
+                id                      BIGSERIAL PRIMARY KEY,
+                name                    TEXT    NOT NULL UNIQUE,
+                enabled                 INTEGER NOT NULL DEFAULT 0,
+                peer                    TEXT    NOT NULL DEFAULT '',
+                heartbeat_ms            INTEGER NOT NULL DEFAULT 500,
+                failover_ms             INTEGER NOT NULL DEFAULT 3000,
+                priority                INTEGER NOT NULL DEFAULT 100,
+                evlag_warn_ms           INTEGER NOT NULL DEFAULT 200,
+                evlag_fail_ms           INTEGER NOT NULL DEFAULT 1000,
+                cpu_warn_pct            INTEGER NOT NULL DEFAULT 80,
+                cpu_fail_pct            INTEGER NOT NULL DEFAULT 95,
+                replica_enabled         INTEGER NOT NULL DEFAULT 0,
+                replica_port            INTEGER NOT NULL DEFAULT 5071,
+                replica_ring_cap        INTEGER NOT NULL DEFAULT 8192,
+                replica_payload_max     INTEGER NOT NULL DEFAULT 4096,
+                replica_lag_warn        INTEGER NOT NULL DEFAULT 10000,
+                replica_full_resync_interval INTEGER NOT NULL DEFAULT 0,
+                bfd_enabled             INTEGER NOT NULL DEFAULT 0,
+                bfd_local_disc          INTEGER NOT NULL DEFAULT 1,
+                bfd_tx_interval         INTEGER NOT NULL DEFAULT 200,
+                bfd_rx_interval         INTEGER NOT NULL DEFAULT 200,
+                bfd_detect_mult         INTEGER NOT NULL DEFAULT 3,
+                hitless_enabled         INTEGER NOT NULL DEFAULT 0,
+                hitless_shm_prefix      TEXT    NOT NULL DEFAULT 'nsbc_ha_',
+                hitless_freeze_ms       INTEGER NOT NULL DEFAULT 1000,
+                hitless_timeout_ms      INTEGER NOT NULL DEFAULT 10000,
+                state                   TEXT    NOT NULL DEFAULT 'standby',
+                description             TEXT    NOT NULL DEFAULT '',
+                created_at              TEXT NOT NULL DEFAULT (to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD') || 'T' || to_char(NOW() AT TIME ZONE 'UTC', 'HH24:MI:SS.MS') || 'Z'),
+                updated_at              TEXT NOT NULL DEFAULT (to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD') || 'T' || to_char(NOW() AT TIME ZONE 'UTC', 'HH24:MI:SS.MS') || 'Z')
             )
         "#,
         _ => r#"
             CREATE TABLE IF NOT EXISTS ha_groups (
-                id                BIGINT AUTO_INCREMENT PRIMARY KEY,
-                name              VARCHAR(128) NOT NULL,
-                enabled           TINYINT(1)   NOT NULL DEFAULT 1,
-                node_list_json    JSON         NOT NULL,
-                quorum            INT          NOT NULL DEFAULT 2,
-                election_timeout  INT          NOT NULL DEFAULT 5000,
-                state             VARCHAR(32)  NOT NULL DEFAULT 'initializing',
-                description       VARCHAR(512) NOT NULL DEFAULT '',
-                created_at        DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-                updated_at        DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+                id                      BIGINT AUTO_INCREMENT PRIMARY KEY,
+                name                    VARCHAR(128) NOT NULL,
+                enabled                 TINYINT(1)   NOT NULL DEFAULT 0,
+                peer                    VARCHAR(128) NOT NULL DEFAULT '',
+                heartbeat_ms            INT          NOT NULL DEFAULT 500,
+                failover_ms             INT          NOT NULL DEFAULT 3000,
+                priority                INT          NOT NULL DEFAULT 100,
+                evlag_warn_ms           INT          NOT NULL DEFAULT 200,
+                evlag_fail_ms           INT          NOT NULL DEFAULT 1000,
+                cpu_warn_pct            INT          NOT NULL DEFAULT 80,
+                cpu_fail_pct            INT          NOT NULL DEFAULT 95,
+                replica_enabled         TINYINT(1)   NOT NULL DEFAULT 0,
+                replica_port            INT          NOT NULL DEFAULT 5071,
+                replica_ring_cap        INT          NOT NULL DEFAULT 8192,
+                replica_payload_max     INT          NOT NULL DEFAULT 4096,
+                replica_lag_warn        INT          NOT NULL DEFAULT 10000,
+                replica_full_resync_interval INT   NOT NULL DEFAULT 0,
+                bfd_enabled             TINYINT(1)   NOT NULL DEFAULT 0,
+                bfd_local_disc          INT          NOT NULL DEFAULT 1,
+                bfd_tx_interval         INT          NOT NULL DEFAULT 200,
+                bfd_rx_interval         INT          NOT NULL DEFAULT 200,
+                bfd_detect_mult         INT          NOT NULL DEFAULT 3,
+                hitless_enabled         TINYINT(1)   NOT NULL DEFAULT 0,
+                hitless_shm_prefix      VARCHAR(64)  NOT NULL DEFAULT 'nsbc_ha_',
+                hitless_freeze_ms       INT          NOT NULL DEFAULT 1000,
+                hitless_timeout_ms      INT          NOT NULL DEFAULT 10000,
+                state                   VARCHAR(32)  NOT NULL DEFAULT 'standby',
+                description             VARCHAR(512) NOT NULL DEFAULT '',
+                created_at              DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+                updated_at              DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
                 UNIQUE KEY uq_ha_name (name)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         "#,
@@ -6234,36 +6295,99 @@ fn default_ext() -> String { "ext".to_string() }
 /* §15 RFC1918 intranet subnets default IP admission (toll fraud prevention) */
 fn default_rfc1918() -> String { RFC1918_CIDR_DEFAULT.to_string() }
 
-// ---------- ha_groups CRUD ----------
+// ---------- ha_groups CRUD (对齐 conf/ha配置.md 双机主备 Active-Standby 模型) ----------
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct HaGroup {
-    pub id:              i64,
-    pub name:            String,
+    pub id:                     i64,
+    pub name:                   String,
     #[serde(serialize_with = "bool_i64::serialize")]
-    pub enabled:         i64,
-    pub node_list_json:  String,
-    pub quorum:          i64,
-    pub election_timeout: i64,
-    pub state:           String,
-    pub description:     String,
-    pub created_at:      String,
-    pub updated_at:      String,
+    pub enabled:                i64,
+    pub peer:                   String,
+    pub heartbeat_ms:           i64,
+    pub failover_ms:            i64,
+    pub priority:               i64,
+    pub evlag_warn_ms:          i64,
+    pub evlag_fail_ms:          i64,
+    pub cpu_warn_pct:           i64,
+    pub cpu_fail_pct:           i64,
+    #[serde(serialize_with = "bool_i64::serialize")]
+    pub replica_enabled:        i64,
+    pub replica_port:           i64,
+    pub replica_ring_cap:       i64,
+    pub replica_payload_max:    i64,
+    pub replica_lag_warn:       i64,
+    pub replica_full_resync_interval: i64,
+    #[serde(serialize_with = "bool_i64::serialize")]
+    pub bfd_enabled:            i64,
+    pub bfd_local_disc:         i64,
+    pub bfd_tx_interval:        i64,
+    pub bfd_rx_interval:        i64,
+    pub bfd_detect_mult:        i64,
+    #[serde(serialize_with = "bool_i64::serialize")]
+    pub hitless_enabled:        i64,
+    pub hitless_shm_prefix:     String,
+    pub hitless_freeze_ms:      i64,
+    pub hitless_timeout_ms:     i64,
+    pub state:                  String,
+    pub description:            String,
+    pub created_at:             String,
+    pub updated_at:             String,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HaGroupCreate {
     pub name:             String,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub enabled:          bool,
-    #[serde(default = "default_empty_json")]
-    pub node_list_json:   String,
-    #[serde(default = "default_2")]
-    pub quorum:           i64,
-    #[serde(default = "default_5000")]
-    pub election_timeout: i64,
-    #[serde(default = "default_initializing")]
+    #[serde(default)]
+    pub peer:             String,
+    #[serde(default = "default_500")]
+    pub heartbeat_ms:     i64,
+    #[serde(default = "default_3000")]
+    pub failover_ms:      i64,
+    #[serde(default = "default_100")]
+    pub priority:         i64,
+    #[serde(default = "default_evlag_warn")]
+    pub evlag_warn_ms:    i64,
+    #[serde(default = "default_evlag_fail")]
+    pub evlag_fail_ms:    i64,
+    #[serde(default = "default_cpu_warn")]
+    pub cpu_warn_pct:     i64,
+    #[serde(default = "default_cpu_fail")]
+    pub cpu_fail_pct:     i64,
+    #[serde(default)]
+    pub replica_enabled:  bool,
+    #[serde(default = "default_5071")]
+    pub replica_port:     i64,
+    #[serde(default = "default_8192")]
+    pub replica_ring_cap: i64,
+    #[serde(default = "default_payload_max")]
+    pub replica_payload_max: i64,
+    #[serde(default = "default_10000")]
+    pub replica_lag_warn: i64,
+    #[serde(default)]
+    pub replica_full_resync_interval: i64,
+    #[serde(default)]
+    pub bfd_enabled:      bool,
+    #[serde(default = "default_ha_disc")]
+    pub bfd_local_disc:   i64,
+    #[serde(default = "default_ha_tx")]
+    pub bfd_tx_interval:  i64,
+    #[serde(default = "default_ha_rx")]
+    pub bfd_rx_interval:  i64,
+    #[serde(default = "default_ha_mult")]
+    pub bfd_detect_mult:  i64,
+    #[serde(default)]
+    pub hitless_enabled:  bool,
+    #[serde(default = "default_shm_prefix")]
+    pub hitless_shm_prefix: String,
+    #[serde(default = "default_ha_freeze")]
+    pub hitless_freeze_ms:   i64,
+    #[serde(default = "default_ha_timeout")]
+    pub hitless_timeout_ms:  i64,
+    #[serde(default = "default_standby")]
     pub state:            String,
     #[serde(default)]
     pub description:      String,
@@ -6272,17 +6396,54 @@ pub struct HaGroupCreate {
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HaGroupUpdate {
-    pub enabled:          Option<bool>,
-    pub node_list_json:   Option<String>,
-    pub quorum:           Option<i64>,
-    pub election_timeout: Option<i64>,
-    pub state:            Option<String>,
-    pub description:      Option<String>,
+    pub enabled:           Option<bool>,
+    pub peer:              Option<String>,
+    pub heartbeat_ms:      Option<i64>,
+    pub failover_ms:       Option<i64>,
+    pub priority:          Option<i64>,
+    pub evlag_warn_ms:     Option<i64>,
+    pub evlag_fail_ms:     Option<i64>,
+    pub cpu_warn_pct:      Option<i64>,
+    pub cpu_fail_pct:      Option<i64>,
+    pub replica_enabled:   Option<bool>,
+    pub replica_port:      Option<i64>,
+    pub replica_ring_cap:  Option<i64>,
+    pub replica_payload_max: Option<i64>,
+    pub replica_lag_warn:  Option<i64>,
+    pub replica_full_resync_interval: Option<i64>,
+    pub bfd_enabled:       Option<bool>,
+    pub bfd_local_disc:    Option<i64>,
+    pub bfd_tx_interval:   Option<i64>,
+    pub bfd_rx_interval:   Option<i64>,
+    pub bfd_detect_mult:   Option<i64>,
+    pub hitless_enabled:   Option<bool>,
+    pub hitless_shm_prefix: Option<String>,
+    pub hitless_freeze_ms:    Option<i64>,
+    pub hitless_timeout_ms:   Option<i64>,
+    pub state:             Option<String>,
+    pub description:       Option<String>,
 }
 
-fn default_2() -> i64 { 2 }
-fn default_5000() -> i64 { 5000 }
-fn default_initializing() -> String { "initializing".to_string() }
+fn default_evlag_warn() -> i64 { 200 }
+fn default_evlag_fail() -> i64 { 1000 }
+fn default_cpu_warn() -> i64 { 80 }
+fn default_cpu_fail() -> i64 { 95 }
+fn default_payload_max() -> i64 { 4096 }
+fn default_ha_rx() -> i64 { 200 }
+fn default_shm_prefix() -> String { "nsbc_ha_".to_string() }
+
+fn default_500() -> i64 { 500 }
+fn default_3000() -> i64 { 3000 }
+fn default_100() -> i64 { 100 }
+fn default_5071() -> i64 { 5071 }
+fn default_8192() -> i64 { 8192 }
+fn default_10000() -> i64 { 10000 }
+fn default_ha_disc() -> i64 { 1 }
+fn default_ha_tx() -> i64 { 200 }
+fn default_ha_mult() -> i64 { 3 }
+fn default_ha_freeze() -> i64 { 1000 }
+fn default_ha_timeout() -> i64 { 10000 }
+fn default_standby() -> String { "standby".to_string() }
 
 // ---------- time_groups CRUD ----------
 
@@ -7186,17 +7347,25 @@ impl Db {
         let pool = self.pool().ok_or(sqlx::Error::Configuration("NSBC_DB_DSN not set".into()))?;
         let backend = self.backend();
         let is_mysql = backend == "mysql";
-        let nodes = if c.node_list_json.is_empty() { "[]".to_string() } else { c.node_list_json };
         let raw_sql = "INSERT INTO ha_groups
-                (name, enabled, node_list_json, quorum, election_timeout, state, description)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+                (name, enabled, peer, heartbeat_ms, failover_ms, priority,
+                 evlag_warn_ms, evlag_fail_ms, cpu_warn_pct, cpu_fail_pct,
+                 replica_enabled, replica_port, replica_ring_cap, replica_payload_max, replica_lag_warn, replica_full_resync_interval,
+                 bfd_enabled, bfd_local_disc, bfd_tx_interval, bfd_rx_interval, bfd_detect_mult,
+                 hitless_enabled, hitless_shm_prefix, hitless_freeze_ms, hitless_timeout_ms,
+                 state, description)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
              RETURNING *";
         if is_mysql {
             let plain_sql = strip_returning(raw_sql);
             let sql = fix_ph(&plain_sql, backend);
             let res = sqlx::query(&sql)
-                .bind(&c.name).bind(c.enabled as i64).bind(&nodes)
-                .bind(c.quorum).bind(c.election_timeout)
+                .bind(&c.name).bind(c.enabled as i64).bind(&c.peer)
+                .bind(c.heartbeat_ms).bind(c.failover_ms).bind(c.priority)
+                .bind(c.evlag_warn_ms).bind(c.evlag_fail_ms).bind(c.cpu_warn_pct).bind(c.cpu_fail_pct)
+                .bind(c.replica_enabled as i64).bind(c.replica_port).bind(c.replica_ring_cap).bind(c.replica_payload_max).bind(c.replica_lag_warn).bind(c.replica_full_resync_interval)
+                .bind(c.bfd_enabled as i64).bind(c.bfd_local_disc).bind(c.bfd_tx_interval).bind(c.bfd_rx_interval).bind(c.bfd_detect_mult)
+                .bind(c.hitless_enabled as i64).bind(&c.hitless_shm_prefix).bind(c.hitless_freeze_ms).bind(c.hitless_timeout_ms)
                 .bind(&c.state).bind(&c.description)
                 .execute(pool).await?;
             let id = res.last_insert_id();
@@ -7205,8 +7374,12 @@ impl Db {
         }
         let sql = fix_ph(raw_sql, backend);
         sqlx::query_as::<_, HaGroup>(&sql)
-        .bind(&c.name).bind(c.enabled as i64).bind(&nodes)
-        .bind(c.quorum).bind(c.election_timeout)
+        .bind(&c.name).bind(c.enabled as i64).bind(&c.peer)
+        .bind(c.heartbeat_ms).bind(c.failover_ms).bind(c.priority)
+        .bind(c.evlag_warn_ms).bind(c.evlag_fail_ms).bind(c.cpu_warn_pct).bind(c.cpu_fail_pct)
+        .bind(c.replica_enabled as i64).bind(c.replica_port).bind(c.replica_ring_cap).bind(c.replica_payload_max).bind(c.replica_lag_warn).bind(c.replica_full_resync_interval)
+        .bind(c.bfd_enabled as i64).bind(c.bfd_local_disc).bind(c.bfd_tx_interval).bind(c.bfd_rx_interval).bind(c.bfd_detect_mult)
+        .bind(c.hitless_enabled as i64).bind(&c.hitless_shm_prefix).bind(c.hitless_freeze_ms).bind(c.hitless_timeout_ms)
         .bind(&c.state).bind(&c.description)
         .fetch_one(pool).await
     }
@@ -7236,9 +7409,29 @@ impl Db {
         }
 
         set_br!("enabled", u.enabled);
-        set_sr!("node_list_json", u.node_list_json.clone());
-        set_ir!("quorum", u.quorum);
-        set_ir!("election_timeout", u.election_timeout);
+        set_sr!("peer", u.peer.clone());
+        set_ir!("heartbeat_ms", u.heartbeat_ms);
+        set_ir!("failover_ms", u.failover_ms);
+        set_ir!("priority", u.priority);
+        set_ir!("evlag_warn_ms", u.evlag_warn_ms);
+        set_ir!("evlag_fail_ms", u.evlag_fail_ms);
+        set_ir!("cpu_warn_pct", u.cpu_warn_pct);
+        set_ir!("cpu_fail_pct", u.cpu_fail_pct);
+        set_br!("replica_enabled", u.replica_enabled);
+        set_ir!("replica_port", u.replica_port);
+        set_ir!("replica_ring_cap", u.replica_ring_cap);
+        set_ir!("replica_payload_max", u.replica_payload_max);
+        set_ir!("replica_lag_warn", u.replica_lag_warn);
+        set_ir!("replica_full_resync_interval", u.replica_full_resync_interval);
+        set_br!("bfd_enabled", u.bfd_enabled);
+        set_ir!("bfd_local_disc", u.bfd_local_disc);
+        set_ir!("bfd_tx_interval", u.bfd_tx_interval);
+        set_ir!("bfd_rx_interval", u.bfd_rx_interval);
+        set_ir!("bfd_detect_mult", u.bfd_detect_mult);
+        set_br!("hitless_enabled", u.hitless_enabled);
+        set_sr!("hitless_shm_prefix", u.hitless_shm_prefix.clone());
+        set_ir!("hitless_freeze_ms", u.hitless_freeze_ms);
+        set_ir!("hitless_timeout_ms", u.hitless_timeout_ms);
         set_sr!("state", u.state.clone());
         set_sr!("description", u.description.clone());
 
