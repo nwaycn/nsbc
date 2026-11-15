@@ -1215,9 +1215,22 @@ static int respond_txn(b2b_core_t *co, sip_txn_t *t, int status,
         goto out;
     }
     char out[SIP_MAX_MSG];
-    /* 取本侧 to-tag：服务端事务对应的腿 */
+    /* 取本侧 UAS local tag：从 txn_ud 拿 b2b_call_t，匹配 srv_txn 找到 leg.loc_tag
+     * 时序保证（INVITE 入口 L4859 dlg_uas_new → L4861 loc_tag → L4865 txn_set_ud）：
+     * 所有 respond_txn 调用时 loc_tag 已生成。
+     * ★ 之前硬编码 tag=NULL + sip_build_response From/To 写反 → bridge_url leg1
+     * 的 200 OK From 带了 INVITE From tag，SIP.js 存为 rem_tag → rem_tag==loc_tag。 */
     const char *tag = NULL;
-    (void)co;
+    (void)co;  /* 保留签名兼容，tag 从 txn_ud 推导，无需 co */
+    b2b_call_t *c = (b2b_call_t *)txn_ud(t);
+    if (c) {
+        for (int i = 0; i < 2; i++) {
+            if (c->leg[i].srv_txn == t && c->leg[i].loc_tag[0]) {
+                tag = c->leg[i].loc_tag;
+                break;
+            }
+        }
+    }
     int n = sip_build_response(out, sizeof(out), &req, status, NULL, tag,
                                contact, extra, body, bodylen);
     if (n < 0) {
