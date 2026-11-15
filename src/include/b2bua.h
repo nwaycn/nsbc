@@ -170,6 +170,10 @@ struct b2b_call {
     int hangup_by;
     uint32_t dump_mark;
     tw_node_t noanswer_node;
+    /* REQ-ORIGINATE-005：originate 呼出通话时长上限 timer。
+     * 仅 originate 创建的 call 会 arm 这个节点（co->cfg.originate_caller_timeout_ms > 0）。
+     * call_destroy catch-all 里 disarm。 */
+    tw_node_t call_limit_node;
     uint64_t start_ms;
     uint64_t answer_ms;
     int redirect_count;
@@ -269,6 +273,10 @@ struct b2b_call {
     /* REQ-ORIGINATE-001：per-call noanswer timer override（毫秒）。
      * >0 覆盖 co->cfg.ring_noanswer_ms；<=0 走全局（memset 默认 0 不影响入站 INVITE）。 */
     int noanswer_ms_override;
+    /* REQ-ORIGINATE-005：originate 创建的 call 标志。
+     * 0=入站 INVITE 创建（Session Timer 控制通话时长）；
+     * 1=b2b_originate 创建（走 co->cfg.originate_caller_timeout_ms 控制）。 */
+    uint8_t originate_created;
     /* REQ-ORIGINATE-003 待补：originate 尾随 app（&park/&hangup/&echo）。
      * 取值 B2B_APP_*；B2B_APP_NONE 表示普通外呼（无后置动作）。 */
     int post_app;
@@ -391,6 +399,10 @@ typedef struct {
      * cdr_emit / media_view —— 都从 cfg 单槽改成了 b2bua.c 全局 hook 链 */
     /* PBX 基础 */
     uint32_t ring_noanswer_ms;
+    /* REQ-ORIGINATE-005：originate 呼出后的最长通话时长（毫秒）。
+     * 默认 0 = 不限制；>0 则 originate 的双腿都 answer 后 arm 一个 timer，
+     * 到期自动 b2b_terminate(c, 486)。入站 INVITE 不受此值影响。 */
+    uint32_t originate_caller_timeout_ms;
     int auto_redirect_302;
     int max_redirects;
     /* 并发硬限制 */

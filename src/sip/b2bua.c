@@ -114,6 +114,7 @@ static pthread_mutex_t g_mv_hook_lock = PTHREAD_MUTEX_INITIALIZER;
 /* b2b_leg_t / call_link_t / struct b2b_call 已在 b2bua.h 完整定义 */
 
 static void disarm_noanswer_timer(b2b_call_t *c); /* 前置声明 */
+static void disarm_call_limit_timer(b2b_call_t *c);
 static void b2b_emit_cdr(b2b_call_t *c, cdr_phase_t phase);
 
 /* nsbc_sa_t → 纯 IP 字符串（无端口；nsbc_sa_fmt 带 ":port" 不能喂 CIDR 匹配）。
@@ -496,6 +497,7 @@ static void call_ctor(void *obj, void *ud)
     b2b_call_t *c = obj;
     pthread_mutex_init(&c->lock, NULL);
     tw_node_init(&c->noanswer_node);
+    tw_node_init(&c->call_limit_node);
     c->prof = NULL;
     c->out_prof = NULL;
 }
@@ -1030,6 +1032,7 @@ static void call_destroy(b2b_call_t *c)
         __sync_fetch_and_sub(&c->prof->active_calls, 1u);
     }
     disarm_noanswer_timer(c); /* catch-all：所有终止路径最终走到这里 */
+    disarm_call_limit_timer(c); /* REQ-ORIGINATE-005：通话时长上限 timer */
     /* Session Timer: disarm all timer nodes */
     if (c->core->cfg.tw) {
         tw_del(c->core->cfg.tw, &c->leg[0].refresh_node);
@@ -2249,6 +2252,7 @@ static void maybe_start_media(b2b_call_t *c)
         co->cfg.media(c, c->leg[0].offer, c->leg[0].offer_len,
                       c->leg[1].answer, c->leg[1].answer_len,
                       co->cfg.media_ud);
+        arm_call_limit_timer(c); /* REQ-ORIGINATE-005：originate 创建的 call 自动 arm */
         return;
     }
 
@@ -2259,6 +2263,7 @@ static void maybe_start_media(b2b_call_t *c)
                       c->leg[1].answer, c->leg[1].answer_len,
                       co->cfg.media_ud);
         llog(LOG_INFO, "media", "maybe_start_media: originate mode confirmed");
+        arm_call_limit_timer(c); /* REQ-ORIGINATE-005 */
     }
 }
 
@@ -2537,6 +2542,54 @@ static void disarm_noanswer_timer(b2b_call_t *c)
     if (!co->cfg.tw)
         return;
     tw_del(co->cfg.tw, &c->noanswer_node);
+}
+
+/* REQ-ORIGINATE-005：originate 呼出通话时长上限 — arm/disarm/expire 三函数。
+ * 仅对 originate 创建的 call 生效：cfg.originate_caller_timeout_ms > 0 才 arm。
+ * 入站 INVITE 不走此逻辑（cfg 为 0 + call 没主动 arm）。 */
+static void arm_call_limit_timer(b2b_call_t *c)
+{
+    b2b_core_t *co = c->core;
+    if (!co->cfg.tw)
+        return;
+    if (!c->originate_created)
+        return; /* 仅 originate 创建的 call 走此路径 */
+    if (c->dead || c->a_final)
+        return;
+    uint32_t ms = co->cfg.originate_caller_timeout_ms;
+    if (ms == 0)
+        return;
+    tw_del(co->cfg.tw, &c->call_limit_node);
+    tw_add(co->cfg.tw, &c->call_limit_node,
+           now_ms() + ms,
+           call_limit_expire_cb, c);
+    llog(LOG_NOTICE, "b2b", "call_limit armed callid=%s timeout_ms=%u",
+         c->leg[0].callid, ms);
+}
+
+static void disarm_call_limit_timer(b2b_call_t *c)
+{
+    b2b_core_t *co = c->core;
+    if (!co->cfg.tw)
+        return;
+    tw_del(co->cfg.tw, &c->call_limit_node);
+}
+
+static void call_limit_expire_cb(uint64_t cb_now, void *arg)
+{
+    b2b_call_t *c = (b2b_call_t *)arg;
+    b2b_core_t *co = c->core;
+    (void)cb_now;
+    call_lock(c);
+    if (c->dead) { call_unlock(c); return; }
+    if (!c->leg[0].st.active && !c->leg[1].st.active) { call_unlock(c); return; }
+    uint64_t dur_ms = c->answer_ms ? (now_ms() - c->answer_ms) : 0;
+    llog(LOG_WARN, "b2b",
+         "call_limit EXPIRED callid=%s dur_ms=%llu → terminate cause=486",
+         c->leg[0].callid, (unsigned long long)dur_ms);
+    disarm_call_limit_timer(c);
+    call_unlock(c);
+    b2b_terminate(c, 486);
 }
 
 /* ==================================================================== */
@@ -3240,13 +3293,20 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                             tw_add(co->cfg.tw, &al->expire_node, nm + (uint64_t)na.interval_s * 1000u + SESS_TIMER_GRACE_MS, sess_timer_expire_cb, c);
                         }
                     }
-                    /* B-leg arm（从 Bob 200 OK） */
+                    /* B-leg arm（从 Bob 200 OK）
+                     * ★ 必须用 cfg 上限裁剪 —— Bob 200 OK 里的 Session-Expires 可能超过
+                     *   B2BUA 同意的上限（典型：WebRTC UA 自报 6000s），不裁剪会导致
+                     *   B2BUA arm 一个 100 分钟级的 expire timer → 100min 后 EXPIRED 断话。
+                     *   A-leg 协商已在 sess_timer_uas_negotiate 里做了 max_se_s 裁剪，
+                     *   B-leg arm 也要保持对称。 */
                     sip_hdr_t *bose = sip_hdr_get(m, SIP_H_SESSION_EXPIRES);
                     if (bose) {
                         nb.interval_s = atoi(bose->value.p);
                         nb.refresher = SIP_REF_NONE;
                         const char *rp = strstr(bose->value.p, "refresher=");
                         if (rp) { rp += 10; if (!strncmp(rp, "uac", 3)) nb.refresher = SIP_REF_UAC; else if (!strncmp(rp, "uas", 3)) nb.refresher = SIP_REF_UAS; }
+                        if (nb.interval_s > co->cfg.sess_timer_cfg.max_se_s)
+                            nb.interval_s = co->cfg.sess_timer_cfg.max_se_s;
                         if (nb.interval_s >= co->cfg.sess_timer_cfg.min_se_s) {
                             /* B-leg: B2BUA=UAC → 仅当 refresher=uac 时 B2BUA 是刷新方 */
                             if (nb.refresher == SIP_REF_UAC) {
@@ -7144,6 +7204,7 @@ int b2b_originate(b2b_core_t *co, const b2b_orig_t *o, b2b_call_t **out)
     }
     memset(c, 0, sizeof(*c));
     c->core = co;
+    c->originate_created = 1; /* REQ-ORIGINATE-005：标记 originate 创建的 call */
     sip_upd_guard_init(&c->leg[0].guard);
     sip_upd_guard_init(&c->leg[1].guard);
 

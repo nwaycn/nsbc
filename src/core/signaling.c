@@ -1822,6 +1822,10 @@ static int sig_start(struct nsbc_ctx *ctx)
     long rna_s = 60;
     cfg_get_int(cfg, "sip.ring_noanswer_timeout_s", &rna_s, NULL);
     bc.ring_noanswer_ms = (uint32_t)rna_s * 1000u;
+    /* REQ-ORIGINATE-005：originate 呼出通话时长上限（秒→ms；默认 0=不限） */
+    long oct_s = 0;
+    cfg_get_int(cfg, "sip.originate_caller_timeout_s", &oct_s, NULL);
+    bc.originate_caller_timeout_ms = (uint32_t)((oct_s > 0) ? oct_s * 1000u : 0);
     /* REQ-SIP-DIV-001 P0：302/380 自动重定向 */
     int ar = 1;
     cfg_get_bool(cfg, "sip.auto_redirect_302", &ar, NULL);
