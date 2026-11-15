@@ -367,6 +367,68 @@ const char *nsbc_srtp_cipher_name(nsbc_srtp_cipher_t c)
     return "unknown";
 }
 
+/* ★ HA P3-3: failover rebuild 需要恢复 SRTP session
+ *
+ * material getter — publish 侧从 ACTIVE srtp session 拿 inbound/outbound
+ * key material + cipher + keylen，写进 replica payload。
+ * rebuild 侧直接用这些重建 srtp session（不用重新 DTLS exporter）。
+ *
+ * roc getter/setter — libsrtp replay window 默认 64，备节点 rebuild 时
+ * 把 send_ctx ROC 跳到 ACTIVE 侧最后发的值，避免 UA replay 丢包。
+ *
+ * ⚠️ 这些 API 必须由**持 srtp session 的线程**调用 — relay 线程持互斥
+ * 访问保护（内部 libsrtp 结构非线程安全）。 */
+
+int nsbc_srtp_session_get_material(nsbc_srtp_sess_t *s,
+                                   nsbc_srtp_material_t *outbound,
+                                   nsbc_srtp_material_t *inbound,
+                                   nsbc_srtp_cipher_t *cipher_out)
+{
+    if (!s) return NSBC_INVAL;
+    if (outbound)  *outbound  = s->outbound;
+    if (inbound)   *inbound   = s->inbound;
+    if (cipher_out) *cipher_out = s->policy.cipher;
+    return NSBC_OK;
+}
+
+/* libsrtp2 内部 ROC 字段：srtp_t 里有 roc (uint64_t)，但对外不暴露。
+ * 我们 access 内部 struct — 同版本 libsrtp2 字段稳定（roc 在 srtp.h 里是 public field）。 */
+#ifdef NSBC_WITH_SRTP
+#  include <srtp.h>  /* 重新 include 拿 srtp_t struct 定义（roc 是 public 字段） */
+#endif
+
+int nsbc_srtp_session_get_roc(nsbc_srtp_sess_t *s,
+                              uint64_t *out_send_roc,
+                              uint64_t *out_recv_roc)
+{
+    if (!s) return NSBC_INVAL;
+#ifdef NSBC_WITH_SRTP
+    if (out_send_roc)
+        *out_send_roc = s->send_ctx.roc;
+    if (out_recv_roc)
+        *out_recv_roc = s->recv_ctx.roc;
+    return NSBC_OK;
+#else
+    return NSBC_NOTSUP;
+#endif
+}
+
+int nsbc_srtp_session_set_roc(nsbc_srtp_sess_t *s,
+                              uint64_t send_roc,
+                              uint64_t recv_roc)
+{
+    if (!s) return NSBC_INVAL;
+#ifdef NSBC_WITH_SRTP
+    if (send_roc > 0)
+        s->send_ctx.roc = send_roc;
+    if (recv_roc > 0)
+        s->recv_ctx.roc = recv_roc;
+    return NSBC_OK;
+#else
+    return NSBC_NOTSUP;
+#endif
+}
+
 /*
     Author:       李浩 (Li Hao)
     Company:      上海宁卫信息技术有限公司 (Shanghai Nway Co., Ltd.)

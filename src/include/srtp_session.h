@@ -67,6 +67,24 @@ int  nsbc_srtp_unprotect_rtcp(nsbc_srtp_sess_t *s, uint8_t *buf, size_t *len);
 int  nsbc_srtp_kdr_valid(uint64_t kdr);
 const char *nsbc_srtp_cipher_name(nsbc_srtp_cipher_t c);
 
+/* ★ HA P3-3: failover rebuild 恢复 SRTP session
+ *
+ * material getter — publish 侧从 ACTIVE srtp session 拿 inbound/outbound
+ * key material + cipher + keylen，写进 replica payload。
+ * rebuild 侧直接用这些重建 srtp session（不用重新 DTLS exporter）。 */
+int  nsbc_srtp_session_get_material(nsbc_srtp_sess_t *s,
+                                    nsbc_srtp_material_t *outbound,
+                                    nsbc_srtp_material_t *inbound,
+                                    nsbc_srtp_cipher_t *cipher_out);
+
+/* ROC getter/setter — libsrtp replay window 默认 64。备节点 rebuild 时
+ * 把 send_ctx ROC 跳到 ACTIVE 侧最后发的值，避免 UA replay 丢包。
+ * ⚠️ 必须由持有 srtp session 的线程调用（libsrtp 非线程安全）。 */
+int  nsbc_srtp_session_get_roc(nsbc_srtp_sess_t *s,
+                               uint64_t *out_send_roc, uint64_t *out_recv_roc);
+int  nsbc_srtp_session_set_roc(nsbc_srtp_sess_t *s,
+                               uint64_t send_roc, uint64_t recv_roc);
+
 #ifdef __cplusplus
 }
 #endif

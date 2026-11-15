@@ -600,8 +600,34 @@ typedef struct {
     uint8_t  codec_pt_b;
     uint16_t codec_cr_a;
     uint16_t codec_cr_b;
-    uint32_t ssrc_a;
-    uint32_t ssrc_b;
+    /* ★ v4: payload v4 codec+SSRC — publish 从 bridge_call_view 打平 out SSRC
+     * ★ v5: payload v5 再加 in SSRC — 让 rebuild 时能预填 relay smap，
+     *       UA 侧不感知 SSRC 漂移。兼容 v4 ACTIVE → v5 STANDBY 同编译 */
+    uint32_t ssrc_a;          /* v4 out[0]: 发往 B 的 SSRC（relay 重写后） */
+    uint32_t ssrc_b;          /* v4 out[1]: 发往 A 的 SSRC */
+    uint32_t ssrc_in_a;       /* v5 in[0]: UA-A 发给 nsbc 的 SSRC（入向学习主源） */
+    uint32_t ssrc_in_b;       /* v5 in[1]: UA-B 发给 nsbc 的 SSRC */
+
+    /* ★ v6: SRTP session material — P3-3 failover 恢复 SRTP。
+     * 两侧各自独立：side=0 朝 A（我们发给 A 的 SRTP 用 outbound_a 加密，
+     * 我们收到 A 的 SRTP 用 inbound_a 解密）；side=1 朝 B 同理。
+     *
+     * material 全 0（keylen==0）→ 该侧明文降级（bypass 或旧版 payload）。
+     * ROC（Roll-Over Counter）也带过来 — 备节点 rebuild 时把 srtp session
+     * 的 send_ctx ROC 跳到 ACTIVE 侧最后发的值，避免 UA replay 丢包
+     * （libsrtp replay window 默认 64）。 */
+    uint8_t  srtp_cipher_a;           /* nsbc_srtp_cipher_t */
+    uint8_t  srtp_keylen_a;           /* 0=无 SRTP（明文侧） */
+    uint8_t  srtp_out_a[SRTP_KEY_MAX]; /* outbound 发给 A 的 SRTP material */
+    uint8_t  srtp_in_a[SRTP_KEY_MAX];  /* inbound 从 A 收的 SRTP material */
+    uint8_t  srtp_cipher_b;
+    uint8_t  srtp_keylen_b;
+    uint8_t  srtp_out_b[SRTP_KEY_MAX];
+    uint8_t  srtp_in_b[SRTP_KEY_MAX];
+    uint64_t srtp_roc_send_a;         /* send_ctx.roc 朝 A */
+    uint64_t srtp_roc_recv_a;         /* recv_ctx.roc 从 A */
+    uint64_t srtp_roc_send_b;
+    uint64_t srtp_roc_recv_b;
 } b2b_repl_dlg_confirm_t;
 
 static int b2b_repl_rebuild_from_buf(b2b_core_t *co)
@@ -705,6 +731,68 @@ static int b2b_repl_rebuild_from_buf(b2b_core_t *co)
                         sin->sin_port   = htons(dlg->peer_b_port);
                         inet_pton(AF_INET, dlg->peer_b_ip, &sin->sin_addr);
                         rtp_relay_set_peer_b(rl, &peer_b);
+                    }
+
+                    /* ★ v5: 预填 SSRC 重写映射 — 让 UA 侧不感知 failover
+                     * 导致的 SSRC 漂移。必须在 bridge_register_call（会 arm relay）
+                     * 之前调用，否则 relay thread 并发读写 smap。
+                     *
+                     * side=0 朝 A：in=UA-A 发给 nsbc 的 SSRC，out=nsbc 发给 UA-B 的 SSRC
+                     * side=1 朝 B：in=UA-B 发给 nsbc 的 SSRC，out=nsbc 发给 UA-A 的 SSRC */
+                    if (dlg->ssrc_in_a && dlg->ssrc_a)
+                        rtp_relay_preset_ssrc(rl, 0, dlg->ssrc_in_a, dlg->ssrc_a);
+                    if (dlg->ssrc_in_b && dlg->ssrc_b)
+                        rtp_relay_preset_ssrc(rl, 1, dlg->ssrc_in_b, dlg->ssrc_b);
+
+                    /* ★ v6: SRTP session rebuild — HA P3-3 failover SRTP restore
+                     *
+                     * ACTIVE 侧在 DTLS handshake 后创建 srtp session，inbound/outbound
+                     * material 存进 srtp_sess opaque struct 内部。publish 侧通过
+                     * nsbc_srtp_session_get_material 拿到 → 进 replica payload。
+                     * rebuild 侧直接用 material 重建 srtp session（不用重跑 DTLS exporter）。
+                     *
+                     * keylen==0 → 该侧明文（bypass / SIP 侧未开 SRTP），跳过重建。
+                     * ROC 跳到 ACTIVE 侧最后发的值 — 防 libsrtp replay window 丢包。
+                     *
+                     * ⚠️ 必须在 bridge_register_call 之前 — register 内部 arm relay，
+                     * arm 后 relay thread 跑 protect/unprotect 需要 srtp session 已挂好。 */
+                    for (int s = 0; s < 2; s++) {
+                        uint8_t  cipher = (s == 0) ? dlg->srtp_cipher_a : dlg->srtp_cipher_b;
+                        uint8_t  keylen = (s == 0) ? dlg->srtp_keylen_a : dlg->srtp_keylen_b;
+                        uint64_t send_roc = (s == 0) ? dlg->srtp_roc_send_a : dlg->srtp_roc_send_b;
+                        uint64_t recv_roc = (s == 0) ? dlg->srtp_roc_recv_a : dlg->srtp_roc_recv_b;
+                        if (keylen == 0) continue;  /* 明文侧，跳过 */
+
+                        nsbc_srtp_material_t mat_out = {0}, mat_in = {0};
+                        if (s == 0) {
+                            mat_out.keylen = mat_in.keylen = keylen;
+                            memcpy(mat_out.key, dlg->srtp_out_a, SRTP_KEY_MAX);
+                            memcpy(mat_in.key,  dlg->srtp_in_a,  SRTP_KEY_MAX);
+                        } else {
+                            mat_out.keylen = mat_in.keylen = keylen;
+                            memcpy(mat_out.key, dlg->srtp_out_b, SRTP_KEY_MAX);
+                            memcpy(mat_in.key,  dlg->srtp_in_b,  SRTP_KEY_MAX);
+                        }
+                        nsbc_srtp_policy_t pol = {
+                            .cipher = (nsbc_srtp_cipher_t)cipher,
+                            .key_lifetime = 0,  /* 0=default 4GB */
+                        };
+                        /* ★ 参数顺序：policy, inbound, outbound — 看 srtp_session.h */
+                        nsbc_srtp_sess_t *sr = nsbc_srtp_session_create(&pol, &mat_in, &mat_out);
+                        if (!sr) {
+                            llog(LOG_WARN, "b2b",
+                                 "HA rebuild: srtp[%d] create failed cipher=%d callid=%s — SRTP 降级明文",
+                                 s, cipher, dlg->callid);
+                            continue;
+                        }
+                        /* ROC 跳到 ACTIVE 侧最后发的值 — libsrtp replay window 默认 64，
+                         * 只要备节点不落后超过 64 个包 UA 侧不会 replay 丢包 */
+                        nsbc_srtp_session_set_roc(sr, send_roc, recv_roc);
+                        r->srtp[s] = sr;
+                        llog(LOG_INFO, "b2b",
+                             "HA rebuild: srtp[%d] restored cipher=%s send_roc=%llu recv_roc=%llu",
+                             s, nsbc_srtp_cipher_name((nsbc_srtp_cipher_t)cipher),
+                             (unsigned long long)send_roc, (unsigned long long)recv_roc);
                     }
 
                     mb_mode_t mode = MB_RELAY;
@@ -3033,6 +3121,33 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                             if (bridge_call_view(bm, c, &mv) == NSBC_OK) {
                                 if (mv.have_ssrc_out[0]) dlg.ssrc_a = mv.ssrc_out[0];
                                 if (mv.have_ssrc_out[1]) dlg.ssrc_b = mv.ssrc_out[1];
+                                /* ★ v5: 入向 SSRC — rebuild 时用来预填 relay smap，
+                                 * UA 侧不感知 failover 导致的 SSRC 漂移 */
+                                if (mv.have_ssrc_in[0])  dlg.ssrc_in_a = mv.ssrc_in[0];
+                                if (mv.have_ssrc_in[1])  dlg.ssrc_in_b = mv.ssrc_in[1];
+
+                                /* ★ v6: SRTP material + ROC — HA P3-3 failover SRTP restore
+                                 * side=0 朝 A: cipher[0]/keylen[0]/out[0]/in[0]/roc_send[0]/roc_recv[0]
+                                 * side=1 朝 B: cipher[1]/keylen[1]/out[1]/in[1]/roc_send[1]/roc_recv[1]
+                                 *
+                                 * keylen==0 → 该侧明文（bypass 或 SIP 侧没开 SRTP），rebuild 侧跳过
+                                 * material 副本进 replica payload（同 subnet 可信），走进程内 TCP */
+                                dlg.srtp_cipher_a  = mv.srtp_cipher[0];
+                                dlg.srtp_keylen_a  = mv.srtp_keylen[0];
+                                if (mv.srtp_keylen[0] > 0) {
+                                    memcpy(dlg.srtp_out_a, mv.srtp_out[0], SRTP_KEY_MAX);
+                                    memcpy(dlg.srtp_in_a,  mv.srtp_in[0],  SRTP_KEY_MAX);
+                                    dlg.srtp_roc_send_a = mv.srtp_roc_send[0];
+                                    dlg.srtp_roc_recv_a = mv.srtp_roc_recv[0];
+                                }
+                                dlg.srtp_cipher_b  = mv.srtp_cipher[1];
+                                dlg.srtp_keylen_b  = mv.srtp_keylen[1];
+                                if (mv.srtp_keylen[1] > 0) {
+                                    memcpy(dlg.srtp_out_b, mv.srtp_out[1], SRTP_KEY_MAX);
+                                    memcpy(dlg.srtp_in_b,  mv.srtp_in[1],  SRTP_KEY_MAX);
+                                    dlg.srtp_roc_send_b = mv.srtp_roc_send[1];
+                                    dlg.srtp_roc_recv_b = mv.srtp_roc_recv[1];
+                                }
                             }
                         }
                         /* codec PT/CR — 按 c->codec_a/b 名称查 registry */

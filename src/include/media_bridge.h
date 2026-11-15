@@ -131,6 +131,13 @@ void rtp_relay_stop(rtp_relay_t *r);
 void rtp_relay_set_peer_a(rtp_relay_t *r, const nsbc_sa_t *sa);
 void rtp_relay_set_peer_b(rtp_relay_t *r, const nsbc_sa_t *sa);
 
+/* ★ HA P3-2: failover rebuild 预填 SSRC 重写映射。
+ * 让 STANDBY→ACTIVE 新建的 relay 对同一路 UA 发同样的 out SSRC —
+ * UA 侧不感知 failover 导致的 SSRC 漂移，RTP session 不 drop。
+ * 必须在 rtp_relay_arm 之前调用（rebuild 恰好满足）。 */
+void rtp_relay_preset_ssrc(rtp_relay_t *r, int side,
+                           uint32_t in_ssrc, uint32_t out_ssrc);
+
 /* OBS：转发/丢弃计数 */
 uint64_t rtp_relay_pkts(const rtp_relay_t *r);
 uint64_t rtp_relay_drops(const rtp_relay_t *r);
@@ -191,6 +198,18 @@ typedef struct {
     int      have_cname[2];
     uint64_t ssrc_inject_drops[2];   /* ≈ ssrc_unauthorized（白名单外陌生 SSRC） */
     uint64_t ssrc_collision_drops[2];
+
+    /* ★ HA P3-3: SRTP failover restore — 每侧独立
+     * 常量值 64 必须与 SRTP_KEY_MAX (srtp_session.h) 一致 — 用于在
+     * bridge_call_view 中从 rtp_relay_t 拷贝 srtp material 副本进
+     * mb_view_t，publish 侧直接 memcpy 到 replica payload。 */
+#define MB_SRTP_MATERIAL_MAX 64
+    uint8_t  srtp_cipher[2];       /* nsbc_srtp_cipher_t */
+    uint8_t  srtp_keylen[2];       /* 0=明文侧 */
+    uint8_t  srtp_out[2][MB_SRTP_MATERIAL_MAX]; /* outbound material */
+    uint8_t  srtp_in[2][MB_SRTP_MATERIAL_MAX];  /* inbound material */
+    uint64_t srtp_roc_send[2];     /* send_ctx.roc */
+    uint64_t srtp_roc_recv[2];     /* recv_ctx.roc */
 } mb_view_t;
 int bridge_call_view(bridge_mgr_t *m, void *call_key, mb_view_t *v);
 

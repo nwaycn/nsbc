@@ -1,4 +1,4 @@
-/*
+﻿/*
  * NSBC media bridge — RTP relay, DTLS-SRTP, SDP rewrite, transcoding orchestration.
  * Copyright 2024-2026 李浩 (Li Hao), 上海宁卫信息技术有限公司
  * Contact: 1354608370@qq.com
@@ -18,6 +18,13 @@
 #include "ivr.h"          /* ivr_on_dtmf — relay_recv_one 消费 DTMF */
 #include "sip_common.h"   /* sip_ci_eq */
 #include "media_bug.h"
+#include "srtp_session.h" /* ★ HA P3-3: nsbc_srtp_session_get_material / get_roc */
+
+/* ★ media_bridge.h 里 MB_SRTP_MATERIAL_MAX 和 srtp_session.h 里 SRTP_KEY_MAX
+ * 必须一致 — 前者是 bridge_call_view 里的本地常量（避免头文件污染），
+ * 后者是 nsbc_srtp_material_t.key[] 数组大小。这里做编译期断言防漂移。 */
+_Static_assert(MB_SRTP_MATERIAL_MAX == SRTP_KEY_MAX,
+               "MB_SRTP_MATERIAL_MAX must equal SRTP_KEY_MAX");
 #include "media_codec.h"   /* codec registry + transcode engine */
 #include "rtp_reasm.h"     /* M1: H.264 RTP 重组器（视频录制前置） */
 #include "media_video.h"   /* P0: video_build_pli — RTCP PLI 关键帧请求 */
@@ -2762,6 +2769,29 @@ void rtp_relay_set_peer_b(rtp_relay_t *r, const nsbc_sa_t *sa)
     __atomic_store_n(&r->d_latched[1], 1, __ATOMIC_RELEASE);
 }
 
+/* ★ HA P3-2: failover rebuild 预填 SSRC 重写映射
+ * 让 STANDBY→ACTIVE 新建的 relay 对同一路 UA 发同样的 out SSRC —
+ * UA 侧（软电话/WebRTC）不感知 SSRC 漂移，RTP session 不 drop。
+ *
+ * 预填只占 map[side].e[0] 一个槽（hint 指它），后续自动学习的新 SSRC
+ * 会占 e[1..15]，不冲突。
+ *
+ * ⚠️ 必须在 rtp_relay_arm 之前调用 — 否则 relay thread 并发读写 smap。 */
+void rtp_relay_preset_ssrc(rtp_relay_t *r, int side,
+                           uint32_t in_ssrc, uint32_t out_ssrc)
+{
+    if (!r || side < 0 || side > 1 || !in_ssrc || !out_ssrc) return;
+    smap_t *m = &r->map[side];
+    m->e[0].used = 1;
+    m->e[0].in   = in_ssrc;
+    m->e[0].out  = out_ssrc;
+    m->hint = 0;
+    /* OAM view 也反映预填值 — UA-A 发来的 SSRC 是 in_ssrc；
+     * relay 发往对侧的是 out_ssrc */
+    __atomic_store_n(&r->d_in_ssrc[side],  in_ssrc,  __ATOMIC_RELEASE);
+    __atomic_store_n(&r->d_out_ssrc[side], out_ssrc, __ATOMIC_RELEASE);
+}
+
 uint64_t rtp_relay_pkts(const rtp_relay_t *r)
 {
     return r ? r->pkts : 0;
@@ -4318,6 +4348,29 @@ int bridge_call_view(bridge_mgr_t *m, void *call, mb_view_t *v)
             v->rtp_expected[i] = te;
             v->rtp_lost[i]     = tl;
         }
+        /* ★ HA P3-3: SRTP material + ROC — 每侧独立。
+         * relay->srtp[i] = 该侧 DTLS-SRTP 会话（WebRTC 侧可能有，SIP 侧通常 NULL 明文）。
+         * get_material 只 memcpy struct 字段 — 桥层持 shard 锁 + material 只读安全；
+         * get_roc 读 libsrtp send_ctx.roc / recv_ctx.roc（uint64_t 内部字段）。 */
+        {
+            nsbc_srtp_sess_t *sr = r->srtp[i];
+            if (sr) {
+                nsbc_srtp_material_t m_out = {0}, m_in = {0};
+                nsbc_srtp_cipher_t cipher = 0;
+                if (nsbc_srtp_session_get_material(sr, &m_out, &m_in, &cipher) == NSBC_OK) {
+                    v->srtp_cipher[i] = (uint8_t)cipher;
+                    v->srtp_keylen[i] = (uint8_t)m_out.keylen;
+                    if (m_out.keylen > 0)
+                        memcpy(v->srtp_out[i], m_out.key, SRTP_KEY_MAX);
+                    if (m_in.keylen > 0)
+                        memcpy(v->srtp_in[i], m_in.key, SRTP_KEY_MAX);
+                }
+                uint64_t send_roc = 0, recv_roc = 0;
+                nsbc_srtp_session_get_roc(sr, &send_roc, &recv_roc);
+                v->srtp_roc_send[i] = send_roc;
+                v->srtp_roc_recv[i] = recv_roc;
+            }
+        }  /* close HA P3-3 SRTP anonymous block */
         /* REQ-MEDIA-SEC-003⑤ P0：CNAME 绑定 + 安全计数。
          * d_have_cname 序列计数器：0=未写，≥1=写完且值为 len+1。
          * char 数组非原子，OAM 低频读 double-check 防 torn read（媒体线程
