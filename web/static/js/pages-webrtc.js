@@ -244,7 +244,7 @@ app.component('webrtc-page', {
 
     _attachPC(pc) {
       if (!pc) return;
-      if (!this.remoteStream) this.remoteStream = new MediaStream();
+      if (!this.remoteStream) this.remoteStream = Vue.markRaw(new MediaStream());
 
       pc.ontrack = (e) => {
         if (!this.remoteStream.getTrackById(e.track.id)) this.remoteStream.addTrack(e.track);
@@ -299,7 +299,7 @@ app.component('webrtc-page', {
 
     _setupLocalPreview(pc) {
       if (!pc) return;
-      if (!this.localStream) this.localStream = new MediaStream();
+      if (!this.localStream) this.localStream = Vue.markRaw(new MediaStream());
       pc.getSenders().forEach(s => {
         if (s.track && !this.localStream.getTrackById(s.track.id)) {
           this.localStream.addTrack(s.track);
@@ -319,7 +319,7 @@ app.component('webrtc-page', {
 
       try {
         const socket = new JsSIP.WebSocketInterface(this.wssServer);
-        this.ua = new JsSIP.UA({
+        this.ua = Vue.markRaw(new JsSIP.UA({
           sockets: [socket],
           uri: `sip:${this.username}@${this.realm}`,
           password: this.password,
@@ -328,7 +328,7 @@ app.component('webrtc-page', {
           pcConfig: PC_CONFIG,
           connection_recovery_min_interval: 2,
           connection_recovery_max_interval: 30,
-        });
+        }));
 
         this.ua.on('connecting',   () => this.pushSipLog(`🔌 JsSIP connecting...`));
         this.ua.on('connected',    () => { this.pushSipLog(`🔌 JsSIP connected`); this.ua.register(); });
@@ -378,7 +378,7 @@ app.component('webrtc-page', {
 
           if (e.originator === 'remote') {
             self.pushSipLog(`<span class="text-yellow-400">📞 INCOMING</span> from ${from}`);
-            self.pendingSession = session;
+            self.pendingSession = Vue.markRaw(session);
             self.incomingCall = true;
             self.incomingFrom = from;
             self.startRing();
@@ -393,7 +393,7 @@ app.component('webrtc-page', {
           } else {
             self.pushSipLog(`📤 OUTGOING to ${from}`);
             // ★ Outgoing call也要存 session，Ringing阶段能Hang up
-            self.pendingSession = session;
+            self.pendingSession = Vue.markRaw(session);
             self._bindSession(session, false);
           }
         });
@@ -416,7 +416,7 @@ app.component('webrtc-page', {
       session.on('confirmed', () => {
         this.stopRing();
         this.pushSipLog(`<span class="text-green-400">✅ CONFIRMED</span>`);
-        this.session = session;
+        this.session = Vue.markRaw(session);
         this.pendingSession = null;
         this.incomingCall = false;
         this.inCall = true;
@@ -464,7 +464,7 @@ app.component('webrtc-page', {
       try {
         // ★ 先 getUserMedia + ensureVideoReady（和 nsbc-phone.js 一样）
         if (!this.localStream) {
-          this.localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+          this.localStream = Vue.markRaw(await navigator.mediaDevices.getUserMedia({ audio: true, video: true }));
           await ensureVideoReady(this.localStream);
           const lv = this.$refs.localVideo;
           if (lv) { lv.srcObject = this.localStream; tryPlayWithGesture(lv); }
@@ -496,7 +496,7 @@ app.component('webrtc-page', {
 
       try {
         if (!this.localStream) {
-          this.localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+          this.localStream = Vue.markRaw(await navigator.mediaDevices.getUserMedia({ audio: true, video: true }));
           await ensureVideoReady(this.localStream);
           const lv = this.$refs.localVideo;
           if (lv) { lv.srcObject = this.localStream; tryPlayWithGesture(lv); }
