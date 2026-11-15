@@ -649,7 +649,7 @@ function bindSessionNonPC(session, isCallee, skipPeerConn) {
 
 // ============ Register ============
 async function doRegister() {
-  if (!window.JsSIP) { alert('JsSIP 未加载！请检查 jssip-3.10.0.min.js'); return; }
+  if (!window.JsSIP) { ElMessage.error('JsSIP 未加载！请检查 jssip-3.10.0.min.js'); return; }
   const rs = $('regStatus'); if (rs) { rs.textContent = 'Connect中...'; rs.className = 'status'; }
   const br = $('btnReg'); if (br) br.disabled = true;
 

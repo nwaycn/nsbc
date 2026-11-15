@@ -314,7 +314,7 @@ app.component('webrtc-page', {
 
     // ======== Register ========
     async doRegister() {
-      if (!window.JsSIP) { alert('JsSIP 未加载！检查 index.html script src'); return; }
+      if (!window.JsSIP) { ElMessage.error('JsSIP 未加载！检查 index.html script src'); return; }
       this.regStatus = t('Connect中...'); this.regClass = 'text-yellow-600';
 
       try {

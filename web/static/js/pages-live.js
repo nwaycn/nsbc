@@ -265,9 +265,9 @@ app.component('channels-live', livePanel(t('Live channels'), 'fa-solid fa-phone-
       const esc = callId.replace(/'/g, "\\'");
       return [
         `<button onclick="nsbcHangup('${esc}')" class="px-2 py-1 text-xs text-red-600 border border-red-300 rounded hover:bg-red-50 hover:text-red-800"><i class="fa-solid fa-phone-slash"></i> ${t('Hang up')}</button>`,
-        `<button onclick="(async ()=>{const w=prompt('${t('WAV path or chain (| sep)')}','welcome.wav');if(!w)return;await nsbcPlayback('${esc}',w,-1,0)})()" class="px-2 py-1 text-xs text-green-600 border border-green-300 rounded hover:bg-green-50 hover:text-green-800"><i class="fa-solid fa-play"></i> Play</button>`,
+        `<button onclick="(async ()=>{try{const w=(await window.ElMessageBox.prompt('${t('WAV path or chain (| sep)')}','',{inputValue:'welcome.wav'}))?.value;if(!w)return;await nsbcPlayback('${esc}',w,-1,0)}catch(e){}})()" class="px-2 py-1 text-xs text-green-600 border border-green-300 rounded hover:bg-green-50 hover:text-green-800"><i class="fa-solid fa-play"></i> Play</button>`,
         `<button onclick="nsbcPlaybackStop('${esc}')" class="px-2 py-1 text-xs text-amber-600 border border-amber-300 rounded hover:bg-amber-50 hover:text-amber-800"><i class="fa-solid fa-stop"></i> Stop</button>`,
-        `<button onclick="(async ()=>{const s=await nsbcPlaybackStatus('${esc}');if(s)alert('active='+s.active+' side='+s.side+' loop='+s.loop);else alert('not playing')})()" class="px-2 py-1 text-xs text-slate-600 border border-slate-300 rounded hover:bg-slate-50 hover:text-slate-800"><i class="fa-solid fa-circle-info"></i> Status</button>`,
+        `<button onclick="(async ()=>{const s=await nsbcPlaybackStatus('${esc}');if(s)window.ElMessage.success('active='+s.active+' side='+s.side+' loop='+s.loop);else window.ElMessage.info('not playing')})()" class="px-2 py-1 text-xs text-slate-600 border border-slate-300 rounded hover:bg-slate-50 hover:text-slate-800"><i class="fa-solid fa-circle-info"></i> Status</button>`,
       ].join(' ');
     },
   }));
@@ -362,7 +362,7 @@ app.component('cdrs-live', {
       <div v-else-if="!rows.length" class="text-center text-gray-400 py-12">{{ t('No CDRs yet') }}</div>
 
       <!-- 表格 -->
-      <table v-else class="w-full text-sm border-collapse">
+      <table v-else class="live-table w-full text-sm border-collapse">
         <thead><tr class="bg-gray-50 border-b">
           <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Caller') }}</th>
           <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Callee') }}</th>
@@ -645,7 +645,7 @@ app.component('registrations-live', {
       <div v-else-if="!rows.length" class="text-center text-gray-400 py-12">
         {{ searchKeyword ? t('No matching registrations') : t('No registrations yet') }}
       </div>
-      <table v-else class="w-full text-sm border-collapse">
+      <table v-else class="live-table w-full text-sm border-collapse">
         <thead><tr class="bg-gray-50 border-b">
           <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Extension') }}</th>
           <th class="px-3 py-2 text-left font-medium text-gray-600">AoR</th>
@@ -874,7 +874,7 @@ app.component('transcode-live', {
       <div v-else-if="!filteredRows.length" class="text-center text-gray-400 py-12">
         {{ searchKeyword ? t('No matching sessions') : t('无活跃Media sessions') }}
       </div>
-      <table v-else class="w-full text-sm border-collapse">
+      <table v-else class="live-table w-full text-sm border-collapse">
         <thead><tr class="bg-gray-50 border-b">
           <th class="px-3 py-2 text-left font-medium text-gray-600">#</th>
           <th class="px-3 py-2 text-left font-medium text-gray-600">Call Key</th>
@@ -1049,7 +1049,7 @@ app.component('billing-page', {
           <div>{{ resvKeyword ? t('No matching reservations') : '暂无活跃通话 Reservation' }}</div>
           <div class="text-xs mt-1">发起通话后，L4 tick 会显示每个通话的实时预占</div>
         </div>
-        <table v-else class="w-full text-sm border-collapse">
+        <table v-else class="live-table w-full text-sm border-collapse">
           <thead><tr class="bg-gray-50 border-b">
             <th class="px-3 py-2 text-left font-medium text-gray-600">ID</th>
             <th class="px-3 py-2 text-left font-medium text-gray-600">Call-ID</th>

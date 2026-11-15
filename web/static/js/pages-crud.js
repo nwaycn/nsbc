@@ -978,14 +978,14 @@ app.component('dialplan-rules', {
         else await API.post(API_PATH, payload);
         showModal.value = false;
         await load();
-      } catch (e) { alert('Save失败: ' + e.message); }
+      } catch (e) { ElMessage.error('Save失败: ' + e.message); }
       finally { saving.value = false; }
     }
     async function del(id) {
       try {
         await API.delete(API_PATH + '/' + id);
         await load();
-      } catch (e) { alert('Delete失败: ' + e.message); }
+      } catch (e) { ElMessage.error('Delete失败: ' + e.message); }
     }
 
     onMounted(() => { load(); fetchTrunkOptions(); fetchGatewayOptions(); fetchTenants(); });

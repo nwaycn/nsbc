@@ -4,10 +4,19 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>NSBC Management Console</title>
-  <!-- ===== Tailwind theme 重映射 (Linear + Vercel 混合风) ===== -->
+  <!-- 内联 favicon — 消除浏览器默认 /favicon.ico 请求 -->
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='20' fill='%235E6AD2'/%3E%3Ctext x='50' y='68' font-family='Arial' font-size='60' font-weight='bold' fill='white' text-anchor='middle'%3EN%3C/text%3E%3C/svg%3E">
+  <!-- ===== Tailwind + Play CDN 零Node预编译 ===== -->
+  <!--
+    策略：localStorage 缓存层优先（命中 → 直接注入 CSS 跳过 Play CDN）
+         未命中则 Play CDN 跑，MutationObserver 静默 3s + 加载 ≥8s 后存缓存
+         BUILD_TS 手动失效（改了 class/config 就更新）
+  -->
+  <script>window.__NSBC_TW_BUILD_TS__ = '20261115-002';</script>
+  <script>(function(){try{var c=JSON.parse(localStorage.getItem('nsbc-tw-cache-v1')||'null');if(c&&c.ts===window.__NSBC_TW_BUILD_TS__&&c.css&&c.css.length>5000){var s=document.createElement('style');s.id='__nsbc_tw_cache__';s.textContent=c.css;document.head.appendChild(s);window.__nsbc_tw_cached__=true;}}catch(e){}})();</script>
+  <!-- 主题初始化 — Vue 渲染前设 data-theme 防暗色首屏闪烁 -->
+  <script>try{if(localStorage.getItem('nsbc_theme')==='dark')document.documentElement.dataset.theme='dark';}catch(e){}</script>
   <script>
-    // Use window.tailwind explicitly — bare reference throws ReferenceError
-    // in strict mode when tailwindcss.js hasn't set the global yet.
     window.tailwind = window.tailwind || {};
     window.tailwind.config = {
       theme: {
@@ -115,7 +124,8 @@
       }
     };
   </script>
-  <script src="vendor/tailwindcss.js"></script>
+  <!-- Play CDN：始终加载（缓存命中时静默跑），onload 后等渲染稳定再存缓存 -->
+  <script>(function(){var s=document.createElement('script');s.src='vendor/tailwindcss.js';s.onload=function(){var startTime=Date.now(),silentTimer=null,minWaitMs=8000,silentMs=3000;function saveCache(){var ss=document.head.querySelectorAll('style');for(var i=0;i<ss.length;i++){var st=ss[i];if(!st.id&&!st.textContent.startsWith('/*')&&st.textContent.length>5000){try{localStorage.setItem('nsbc-tw-cache-v1',JSON.stringify({ts:window.__NSBC_TW_BUILD_TS__,css:st.textContent}));}catch(e){}break;}}}function onMutation(){if(silentTimer)clearTimeout(silentTimer);if(Date.now()-startTime>minWaitMs)silentTimer=setTimeout(saveCache,silentMs);}try{var ob=new MutationObserver(onMutation);ob.observe(document.body,{childList:true,subtree:true});}catch(e){}setTimeout(saveCache,15000);};document.head.appendChild(s);})();</script>
   <link rel="stylesheet" href="vendor/fontawesome.css">
   <link rel="stylesheet" href="vendor/element-plus.css">
   <script src="vendor/vue.global.prod.js"></script>
@@ -243,7 +253,7 @@
 
     /* Element Plus Input */
     .el-input__wrapper { border-radius: 8px; box-shadow: 0 0 0 1px rgba(0,0,0,0.08) inset !important; transition: box-shadow 0.15s; }
-    .el-input__wrapper.is-focus { box-shadow: 0 0 0 2px rgba(94,106,210,0.25), 0 0 0 1px #5E6AD2 inset !important; }
+    .el-input__wrapper.is-focus { box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent), 0 0 0 1px var(--accent) inset !important; }
 
     /* Element Plus Tag */
     .el-tag { border-radius: 6px; font-weight: 500; }
@@ -262,8 +272,8 @@
     }
     .field-input:focus {
       outline: none;
-      border-color: #5E6AD2;
-      box-shadow: 0 0 0 2px rgba(94,106,210,0.2);
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 20%, transparent);
     }
 
     .struct-editor { border: 1px solid rgba(0,0,0,0.08); border-radius: 10px; background: #FAFAFA; overflow: hidden; }
@@ -275,10 +285,10 @@
       font-size: 13px; background: #fff;
     }
     .struct-row input:focus, .struct-row select:focus {
-      outline: none; border-color: #5E6AD2; box-shadow: 0 0 0 2px rgba(94,106,210,0.2);
+      outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 20%, transparent);
     }
     .struct-row textarea { padding: 4px 8px; border: 1px solid rgba(0,0,0,0.08); border-left: none; border-radius: 0 6px 6px 0; font-size: 13px; background: #fff; resize: none; }
-    .struct-row textarea:focus { outline: none; border-color: #5E6AD2; box-shadow: 0 0 0 2px rgba(94,106,210,0.2); }
+    .struct-row textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 20%, transparent); }
 
     .struct-label {
       display: inline-block; font-size: 11px; font-weight: 600; color: var(--ink-2);
@@ -286,12 +296,12 @@
       padding: 2px 8px; white-space: nowrap; line-height: 1.4;
     }
     .struct-row .hint { color: var(--ink-4); font-size: 11px; margin-left: 4px; flex-shrink: 0; }
-    .struct-add { padding: 8px 12px; font-size: 12px; color: #5E6AD2; cursor: pointer; transition: background 0.15s; }
-    .struct-add:hover { background: rgba(94,106,210,0.08); }
+    .struct-add { padding: 8px 12px; font-size: 12px; color: var(--accent); cursor: pointer; transition: background 0.15s; }
+    .struct-add:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
     .struct-del { color: #E5484D; cursor: pointer; }
     .struct-del:hover { color: #D13D42; }
     .toggle-raw { font-size: 12px; color: var(--ink-3); cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
-    .toggle-raw:hover { color: #5E6AD2; }
+    .toggle-raw:hover { color: var(--accent); }
 
     .codec-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; padding: 8px 12px; }
     .codec-grid label {
@@ -299,7 +309,7 @@
       background: #fff; border: 1px solid rgba(0,0,0,0.06); border-radius: 8px; padding: 4px 8px;
       transition: border-color 0.15s;
     }
-    .codec-grid label:hover { border-color: #5E6AD2; }
+    .codec-grid label:hover { border-color: var(--accent); }
 
     /* ===== 侧边栏 Linear 深色风 ===== */
     .sidebar-dark { background: #0F0F10; color: #8A8F98; }
@@ -310,8 +320,8 @@
     }
     .sidebar-dark .nav-item:hover { color: #E6E6E6; background: rgba(255,255,255,0.04); }
     .sidebar-dark .nav-item.active {
-      color: #fff; background: #5E6AD2;
-      box-shadow: 0 1px 3px rgba(94,106,210,0.3);
+      color: #fff; background: var(--accent);
+      box-shadow: 0 1px 3px color-mix(in srgb, var(--accent) 30%, transparent);
     }
 
     /* ===== 卡片样式 — 无厚重阴影 ===== */
@@ -331,7 +341,59 @@
     ::-webkit-scrollbar-thumb:hover { background: rgba(0,0,0,0.2); }
 
     /* ===== 选中文字颜色 ===== */
-    ::selection { background: #5E6AD2; color: #fff; }
+    ::selection { background: var(--accent); color: #fff; }
+
+    /* ===== live-table — 与 el-table 统一视觉风格 ===== */
+    .live-table { border-radius: 8px; overflow: hidden; font-size: 13px; background: var(--el-table-bg-color); }
+    .live-table thead th {
+      font-weight: 600; color: var(--ink-3); font-size: 12px; text-transform: uppercase; letter-spacing: 0.02em;
+      background: var(--el-table-header-bg-color); padding: 8px 12px; text-align: left;
+    }
+    .live-table tbody td { padding: 8px 12px; border-bottom: 1px solid var(--el-table-border-color); line-height: 1.5; }
+    .live-table tbody tr:hover td { background: var(--el-table-row-hover-bg-color); }
+
+    /* ===== 暗色模式覆写 ===== */
+    [data-theme=dark] {
+      --bg:             #0F0F10;
+      --bg-soft:        #171717;
+      --bg-muted:       #1F1F1F;
+      --ink:            #F5F5F5;
+      --ink-2:          #E5E5E5;
+      --ink-3:          #A3A3A3;
+      --ink-4:          #525252;
+      --border:         rgba(255,255,255,0.08);
+      --border-strong:  rgba(255,255,255,0.18);
+      --el-text-color-primary:   #F5F5F5;
+      --el-text-color-regular:   #E5E5E5;
+      --el-text-color-secondary: #A3A3A3;
+      --el-text-color-placeholder: #525252;
+      --el-border-color:           rgba(255,255,255,0.08);
+      --el-border-color-light:     rgba(255,255,255,0.06);
+      --el-fill-color:           #171717;
+      --el-fill-color-light:     #1F1F1F;
+      --el-bg-color:             #171717;
+      --el-bg-color-page:        #0F0F10;
+      --el-table-border-color:   rgba(255,255,255,0.06);
+      --el-table-header-bg-color: #171717;
+      --el-table-row-hover-bg-color: #1F1F1F;
+      --el-table-bg-color:       #171717;
+      --el-table-tr-bg-color:    #171717;
+    }
+    [data-theme=dark] main,
+    [data-theme=dark] .bg-white { background: var(--bg) !important; }
+    [data-theme=dark] .struct-editor { background: var(--bg-soft); border-color: var(--border); }
+    [data-theme=dark] .struct-header { background: var(--bg-muted); border-bottom-color: var(--border); }
+    [data-theme=dark] .struct-row { background: var(--bg-soft); border-bottom-color: var(--border); }
+    [data-theme=dark] .struct-row input,
+    [data-theme=dark] .struct-row select,
+    [data-theme=dark] .struct-row textarea { background: var(--bg); border-color: var(--border); color: var(--ink); }
+    [data-theme=dark] .struct-label { background: var(--bg-muted); border-color: var(--border); color: var(--ink-3); }
+    [data-theme=dark] .codec-grid label { background: var(--bg-soft); border-color: var(--border); }
+    [data-theme=dark] .field-input { background: var(--bg); border-color: var(--border); color: var(--ink); }
+    [data-theme=dark] .el-input__wrapper { box-shadow: 0 0 0 1px var(--border) inset !important; }
+    [data-theme=dark] .table-row:hover { background: var(--bg-muted); }
+    [data-theme=dark] ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); }
+    [data-theme=dark] ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.25); }
   </style>
 </head>
 <body class="bg-white text-slate-900">
@@ -448,6 +510,10 @@
             <button @click="setLang('en')" :class="getLang() === 'en' ? 'text-blue-400 font-semibold' : 'text-white/30 hover:text-white/70'" class="transition-colors">EN</button>
             <span class="text-white/15">|</span>
             <button @click="setLang('zh')" :class="getLang() === 'zh' ? 'text-blue-400 font-semibold' : 'text-white/30 hover:text-white/70'" class="transition-colors">中文</button>
+            <span class="text-white/15">|</span>
+            <button @click="toggleTheme" :title="isDark ? 'Light mode' : 'Dark mode'" class="text-white/30 hover:text-white/70 transition-colors">
+              <i :class="isDark ? 'fa-solid fa-sun' : 'fa-solid fa-moon'"></i>
+            </button>
           </span>
         </div>
       </div>
@@ -518,19 +584,19 @@
 </div>
 
 <!-- 应用核心（API、编辑器、工厂、App 创建） -->
-<script src="js/app-core.js?v=20261031d"></script>
+<script src="js/app-core.js?v=20261115b"></script>
 <!-- CRUD 实体页面（extensions/gateways/trunks 等） -->
-<script src="js/pages-crud.js?v=20261023d"></script>
+<script src="js/pages-crud.js?v=20261115a"></script>
 <!-- 实时监控面板（realtime/channels/cdrs 等） -->
-<script src="js/pages-live.js?v=20261023d"></script>
+<script src="js/pages-live.js?v=20261115a"></script>
 <script src="js/pages-security.js?v=20261023d"></script>
 <!-- 外部 API 平台: API Key / Webhook 管理 + 使用指南 (REQ-EXT-API-001) -->
 <script src="js/pages-ext.js?v=20261024a"></script>
 <!-- JsSIP 3.10.0 UMD — WebRTC 共享电话层（addTrack patch + SDP 工具 + Hold/DTMF） -->
 <script src="js/jssip-3.10.0.min.js"></script>
-<script src="js/nsbc-phone.js?v=20261018b"></script>
+<script src="js/nsbc-phone.js?v=20261115a"></script>
 <!-- WebRTC 真实互通页面（Vue 组件 + JsSIP UA + WSS + STUN） -->
-<script src="js/pages-webrtc.js?v=20261023d"></script>
+<script src="js/pages-webrtc.js?v=20261115a"></script>
 <!-- Config hot-editor (standalone component) -->
 <script src="js/pages-config.js?v=20261023d"></script>
 

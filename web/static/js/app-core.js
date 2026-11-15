@@ -11,6 +11,18 @@
 /* global Vue, ElementPlus, ElementPlusIconsVue */
 
 const { createApp, ref, reactive, computed, onMounted, onBeforeUnmount, watch } = Vue;
+const { ElMessage, ElMessageBox } = ElementPlus;
+// 挂到 window 供 pages-live.js 等 HTML onclick 模板使用
+window.ElMessage = ElMessage;
+window.ElMessageBox = ElMessageBox;
+
+// ===== 暗色模式 — Linear 风标配 =====
+window.isDark = localStorage.getItem('nsbc_theme') === 'dark';
+window.toggleTheme = function () {
+  var next = window.isDark ? 'light' : 'dark';
+  localStorage.setItem('nsbc_theme', next);
+  location.reload();
+};
 
 // ===== API wrapper =====
 const API = {
@@ -979,6 +991,10 @@ const app = createApp({
     const clientIp = ref('---');
     const route = ref(location.hash.replace('#', '') || '/realtime');
 
+    // ===== 暗色模式 — 从 window 全局引一份到 setup scope，让模板能引用 =====
+    const isDark = window.isDark;
+    const toggleTheme = window.toggleTheme;
+
     // ===== 多Tenant全局Status =====
     const tenantId = ref(parseInt(localStorage.getItem('nsbc_tenant_id') || '1', 10) || 1);
     const tenantOptions = ref([]);  // [{value, label}]
@@ -1001,7 +1017,7 @@ const app = createApp({
         const r = await API.get('/tenants?limit=500&offset=0');
         tenantOptions.value = (r.items || []).map(t => ({
           value: t.id,
-          label: t.tenant_name + (t.enabled ? '' : t(' (Disable)')),
+          label: t.tenant_name + (t.enabled ? '' : ' (Disable)'),
         }));
       } catch (e) { tenantOptions.value = []; }
       finally { tenantLoading.value = false; }
@@ -1154,7 +1170,8 @@ const app = createApp({
 
     return { auth, loginForm, captchaSvg, clientIp, route, menuItems, login, logout, refreshCaptcha,
              tenantId, tenantOptions, tenantLoading, changeTenant, fetchTenants,
-             showPwdDialog, pwdLoading, pwdFormRef, pwdForm, pwdRules, submitChangePassword };
+             showPwdDialog, pwdLoading, pwdFormRef, pwdForm, pwdRules, submitChangePassword,
+             isDark, toggleTheme };
   },
 });
 
@@ -1279,7 +1296,7 @@ function crudTable(entity, path, columns, formSchema, asyncLoaders = null) {
                     </el-button>
                   </div>
                   <el-input v-if="rawMode[f.key]" v-model="form[f.key]" type="textarea" :rows="6"
-                    :placeholder="t('Valid JSON, e.g. {&apos;clip&apos;:&apos;44&apos;}')" resize="none"></el-input>
+                    :placeholder="t('Valid JSON, e.g. {&quot;clip&quot;:&quot;44&quot;}')" resize="none"></el-input>
                   <trunk-codec-editor v-else-if="f.editor === 'trunk-codec'" v-model="form[f.key]"></trunk-codec-editor>
                   <dp-action-editor   v-else-if="f.editor === 'dp-action'"   v-model="form[f.key]"></dp-action-editor>
                   <time-range-editor  v-else-if="f.editor === 'time-ranges'"  v-model="form[f.key]"></time-range-editor>
@@ -1383,7 +1400,7 @@ function crudTable(entity, path, columns, formSchema, asyncLoaders = null) {
           for (const f of formSchema) {
             if (f.type === 'json') {
               try { const v = form[f.key] || 'null'; if (v !== 'null') JSON.parse(v); }
-              catch { alert(f.label + ' is not valid JSON'); saving.value = false; return; }
+              catch { ElMessage.error(f.label + ' is not valid JSON'); saving.value = false; return; }
             }
           }
           const body = {};
@@ -1397,13 +1414,14 @@ function crudTable(entity, path, columns, formSchema, asyncLoaders = null) {
           if (editingId.value) await API.put(path + '/' + editingId.value, body);
           else await API.post(path, body);
           showModal.value = false; await load();
-        } catch (e) { alert('Save failed: ' + e.message); }
+        } catch (e) { ElMessage.error('Save failed: ' + e.message); }
         finally { saving.value = false; }
       }
       async function del(id) {
-        if (!confirm(t('Confirm delete ID=') + id + '?')) return;
+        try { await ElMessageBox.confirm(t('Confirm delete ID=') + id + '?', t('Confirm'), { type: 'warning' }); }
+        catch { return; }
         try { await API.delete(path + '/' + id); await load(); }
-        catch (e) { alert('Delete failed: ' + e.message); }
+        catch (e) { ElMessage.error('Delete failed: ' + e.message); }
       }
 
       onMounted(() => {
@@ -1460,7 +1478,7 @@ function livePanel(title, icon, columns, apiPath, opts = {}) {
           {{ searchKeyword ? t('No matching records') : 'No data' }}
         </div>
         <div v-else class="overflow-x-auto border rounded">
-        <table class="w-full text-sm border-collapse min-w-[1400px]">
+        <table class="live-table w-full text-sm border-collapse min-w-[1400px]">
           <thead>
             <tr class="bg-gray-50 border-b">
               <th v-for="c in columns" :key="c.key" class="px-3 py-2 text-left font-medium text-gray-600 whitespace-nowrap">{{ c.label }}</th>
@@ -1600,18 +1618,16 @@ function livePanel(title, icon, columns, apiPath, opts = {}) {
 // ===== 全局Hang up函数（livePanel actionCol 用 v-html + onclick 调） =====
 window.nsbcHangup = async function(callId) {
   if (!callId) return;
-  if (!confirm(t('Confirm hang up call ') + callId + '?')) return;
+  try { await ElMessageBox.confirm(t('Confirm hang up call ') + callId + '?', t('Confirm'), { type: 'warning' }); }
+  catch { return; }
   try {
     await API.post('/calls/' + encodeURIComponent(callId) + '/hangup', {});
-    // 触发所有 livePanel Refresh
     document.dispatchEvent(new CustomEvent('nsbc-refresh'));
-    alert('Hang up command sent');
+    ElMessage.success('Hang up command sent');
   } catch (e) {
-    alert('Hang up failed: ' + (e.message || e));
+    ElMessage.error('Hang up failed: ' + (e.message || e));
   }
 };
-
-// ===== Playback 全局函数（chain 管道符拼接支持）=====
 
 window.nsbcPlayback = async function(callId, wav, side, loop) {
   if (!callId || !wav) return;
@@ -1621,9 +1637,9 @@ window.nsbcPlayback = async function(callId, wav, side, loop) {
       side: (side !== undefined && side !== null) ? side : -1,
       loop: (loop !== undefined && loop !== null) ? loop : 0
     });
-    alert('Playback started: ' + wav);
+    ElMessage.success('Playback started: ' + wav);
   } catch (e) {
-    alert('Playback failed: ' + (e.message || e));
+    ElMessage.error('Playback failed: ' + (e.message || e));
   }
 };
 
@@ -1631,9 +1647,9 @@ window.nsbcPlaybackStop = async function(callId) {
   if (!callId) return;
   try {
     await API.post('/calls/' + encodeURIComponent(callId) + '/playback-stop', {});
-    alert('Playback stopped');
+    ElMessage.success('Playback stopped');
   } catch (e) {
-    alert('Playback stop failed: ' + (e.message || e));
+    ElMessage.error('Playback stop failed: ' + (e.message || e));
   }
 };
 
