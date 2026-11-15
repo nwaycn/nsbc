@@ -1132,7 +1132,7 @@ app.component('billing-page', {
     // === billing.enabled 读写 ===
     async function loadEnabled() {
       try {
-        const data = await API.get('/billing/enabled');
+        const data = await API.get('/enabled');
         billingEnabled.value = !!data.enabled;
         enabledLoadError.value = null;
       } catch (e) {
@@ -1147,7 +1147,7 @@ app.component('billing-page', {
       switchBusy.value = true;
       switchMsg.value = '';
       try {
-        const data = await API.put('/billing/enabled', { enabled: want });
+        const data = await API.put('/enabled', { enabled: want });
         billingEnabled.value = want;
         switchMsg.value = want
           ? `✓ 计费已启用（热切换生效中，tick 3s 内开始跑）`
@@ -1168,7 +1168,7 @@ app.component('billing-page', {
       resvInflight = true;
       if (silent !== true) { resvLoading.value = true; resvError.value = null; }
       try {
-        const data = await API.get('/billing/reservations/core');
+        const data = await API.get('/reservations/core');
         resvRows.value = data.reservations || [];
         resvTotal.value = data.total || resvRows.value.length;
       } catch (e) {
