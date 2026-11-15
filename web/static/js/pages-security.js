@@ -24,14 +24,55 @@ app.component('security-center', {
               size="small" style="width:240px" clearable
               @keyup.enter="reload" @clear="reload"></el-input>
             <div class="flex items-center gap-2">
+              <el-button size="small" type="primary" :disabled="!missingFwIps.length"
+                @click="fwSyncMissing" :title="'Push ' + missingFwIps.length + ' core-banned IP(s) to nftables'">
+                <i class="fa-solid fa-fire"></i> Sync Missing to FW ({{ missingFwIps.length }})
+              </el-button>
               <el-button size="small" type="primary" @click="reload">
                 <i class="fa-solid fa-magnifying-glass"></i> Search
               </el-button>
-              <el-button size="small" @click="load">
-                <i class="fa-solid fa-rotate"></i> Refresh
+              <el-button size="small" @click="fullReload">
+                <i class="fa-solid fa-rotate"></i> Refresh All
               </el-button>
             </div>
           </div>
+
+          <!-- Manual ban form (ops shortcut, skips fail2ban threshold) -->
+          <el-card shadow="never" class="border mb-3">
+            <div class="flex items-center justify-between mb-2">
+              <div class="flex items-center gap-2 font-semibold text-sm">
+                <i class="fa-solid fa-user-pen text-red-500"></i>
+                Manual Ban - ops shortcut (skips fail2ban threshold)
+              </div>
+              <el-tooltip placement="top" effect="dark"
+                content="Two layers: core ban table (process-level immediate) + nftables kernel DROP. Use Unban in list to clear both.">
+                <i class="fa-solid fa-circle-question text-gray-400 cursor-help"></i>
+              </el-tooltip>
+            </div>
+            <div class="flex items-end gap-2">
+              <div class="flex-1">
+                <label class="text-xs text-gray-500 block mb-1">IP Address</label>
+                <el-input v-model="banIp" size="small" placeholder="e.g. 45.61.144.127" clearable />
+              </div>
+              <div style="width:160px">
+                <label class="text-xs text-gray-500 block mb-1">Duration</label>
+                <el-select v-model="banDurKey" size="small" style="width:100%">
+                  <el-option label="5 min (300s)" value="300"></el-option>
+                  <el-option label="30 min (1800s)" value="1800"></el-option>
+                  <el-option label="1 hour (3600s)" value="3600"></el-option>
+                  <el-option label="2 hours (7200s)" value="7200"></el-option>
+                  <el-option label="6 hours (21600s)" value="21600"></el-option>
+                  <el-option label="1 day (86400s)" value="86400"></el-option>
+                </el-select>
+              </div>
+              <div>
+                <el-button size="small" type="danger" :loading="banSending"
+                  :disabled="!banIp" @click="manualBan">
+                  <i class="fa-solid fa-ban"></i> Ban Now
+                </el-button>
+              </div>
+            </div>
+          </el-card>
 
           <el-alert type="info" :closable="false" class="mb-3"
             title="Auto-ban when same IP hits REGISTER auth failure threshold within the counting window；Ban期间其 REGISTER/INVITE 均静默丢弃。Observing = count below threshold; auto-unban when remaining reaches zero. Click Unban to clear immediately. Restarting nsbcd also clears the table." />
@@ -70,15 +111,81 @@ app.component('security-center', {
             <el-table-column label="Last Activity" width="110" align="center">
               <template #default="{ row }">{{ row.act_ago_s }}s ago</template>
             </el-table-column>
-            <el-table-column label="Action" width="90" align="center">
+            <el-table-column label="Core Ban" width="90" align="center">
               <template #default="{ row }">
-                <el-popconfirm :title="'Unban ' + row.ip + '？(clear all counts & ban status)'"
-                  confirm-button-text="Unban" cancel-button-text="Cancel"
-                  @confirm="unban(row.ip)">
-                  <template #reference>
-                    <el-button size="small" type="danger" plain>Unban</el-button>
-                  </template>
-                </el-popconfirm>
+                <el-tag v-if="row.state === 'ban'" type="danger" size="small">
+                  <i class="fa-solid fa-lock"></i> Core
+                </el-tag>
+                <el-tag v-else type="warning" size="small">Observe</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="nftables FW" width="110" align="center">
+              <template #default="{ row }">
+                <template v-if="row.state !== 'ban'">
+                  <span class="text-gray-300">-</span>
+                </template>
+                <template v-else-if="fwIps.includes(row.ip)">
+                  <el-tag type="success" size="small" effect="light">
+                    <i class="fa-solid fa-shield-halved"></i> Synced
+                  </el-tag>
+                </template>
+                <template v-else>
+                  <el-tag type="warning" size="small" effect="light">
+                    <i class="fa-solid fa-triangle-exclamation"></i> Missing
+                  </el-tag>
+                </template>
+              </template>
+            </el-table-column>
+            <el-table-column label="Action" min-width="260" align="center">
+              <template #default="{ row }">
+                <!-- ============ Observing 行：还没 ban ============ -->
+                <template v-if="row.state !== 'ban'">
+                  <el-button size="small" type="danger" plain
+                    @click="manualBanFor(row.ip)">
+                    <i class="fa-solid fa-ban"></i> Ban Now
+                  </el-button>
+                  <el-button size="small" type="warning" plain
+                    @click="fwAddFor(row.ip)">
+                    <i class="fa-solid fa-shield-halved"></i> FW Only
+                  </el-button>
+                  <el-popconfirm v-if="row.fails > 0"
+                    :title="'Clear fail counts for ' + row.ip + '?'"
+                    confirm-button-text="Clear" cancel-button-text="Cancel"
+                    @confirm="clearCounts(row.ip)">
+                    <template #reference>
+                      <el-button size="small" plain>
+                        <i class="fa-solid fa-eraser"></i> Clear
+                      </el-button>
+                    </template>
+                  </el-popconfirm>
+                </template>
+
+                <!-- ============ Banned 行 ============ -->
+                <template v-else>
+                  <el-popconfirm :title="unbanTitle(row)"
+                    confirm-button-text="Unban" cancel-button-text="Cancel"
+                    @confirm="unban(row.ip)">
+                    <template #reference>
+                      <el-button size="small" type="danger" plain>
+                        <i class="fa-solid fa-user-xmark"></i> Unban
+                      </el-button>
+                    </template>
+                  </el-popconfirm>
+
+                  <!-- 已同步 nft：可以单独从内核层移除 -->
+                  <el-button v-if="fwIps.includes(row.ip)"
+                    size="small" type="warning" plain
+                    @click="fwDelFor(row.ip)">
+                    <i class="fa-solid fa-shield"></i> Remove FW
+                  </el-button>
+
+                  <!-- 还没同步 nft：一键推过去 -->
+                  <el-button v-else
+                    size="small" type="primary" plain
+                    @click="fwAddFor(row.ip)">
+                    <i class="fa-solid fa-fire"></i> Push FW
+                  </el-button>
+                </template>
               </template>
             </el-table-column>
           </el-table>
@@ -379,6 +486,70 @@ app.component('security-center', {
           </div>
         </el-tab-pane>
 
+        <!-- Tab 4: Firewall (nftables kernel DROP) -->
+        <el-tab-pane label="Firewall (nftables)" name="fw">
+          <div class="flex items-center justify-between mb-3">
+            <div class="text-sm text-gray-500">
+              nftables table <span class="font-mono">inet nsbc_ban</span> -
+              kernel DROP at NIC. Auto-sync every 60s from core ban list.
+            </div>
+            <div class="flex items-center gap-2">
+              <el-button size="small" @click="loadFw">
+                <i class="fa-solid fa-rotate"></i> Refresh
+              </el-button>
+              <el-button size="small" type="primary" :loading="fwSyncing"
+                @click="fwSync">
+                <i class="fa-solid fa-arrows-rotate"></i> Sync From Core
+              </el-button>
+            </div>
+          </div>
+
+          <div v-if="fwLoading" class="text-gray-400 py-8 text-center">Loading...</div>
+          <div v-else-if="fwError" class="text-red-500 py-8 text-center">Error: {{ fwError }}</div>
+          <div v-else-if="!fwIps || !fwIps.length" class="text-gray-400 py-8 text-center">
+            nftables ban set is empty
+          </div>
+          <el-table v-else :data="fwIps" size="small" border>
+            <el-table-column label="IP Address" min-width="180">
+              <template #default="{ row }">
+                <span class="font-mono">{{ row }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="Action" width="120" align="center">
+              <template #default="{ row }">
+                <el-button size="small" type="danger" plain
+                  @click="fwDel(row)">Remove</el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+
+          <div v-if="missingFwIps && missingFwIps.length" class="mt-3 text-xs text-yellow-600">
+            <i class="fa-solid fa-triangle-exclamation"></i>
+            {{ missingFwIps.length }} core-banned IP(s) missing from nftables - click "Sync From Core".
+          </div>
+
+          <!-- manually add to nftables only (pre-block before auto-ban threshold) -->
+          <el-card shadow="never" class="border mt-4">
+            <div class="flex items-center gap-2 font-semibold text-sm mb-2">
+              <i class="fa-solid fa-circle-plus text-blue-500"></i>
+              Add to nftables only (pre-block, skips core)
+            </div>
+            <div class="flex items-end gap-2">
+              <div class="flex-1">
+                <el-input v-model="fwAddIp" size="small" placeholder="e.g. 1.2.3.4" clearable />
+              </div>
+              <el-button size="small" type="primary" :loading="fwAdding"
+                :disabled="!fwAddIp" @click="fwAdd">
+                <i class="fa-solid fa-plus"></i> Add
+              </el-button>
+            </div>
+            <div class="text-xs text-yellow-600 mt-2">
+              This does NOT create a core ban entry - will NOT survive auto-sync (60s).
+              Use "Ban Now" in Tab 1 to block at both layers.
+            </div>
+          </el-card>
+        </el-tab-pane>
+
       </el-tabs>
     </div>
   `,
@@ -404,24 +575,51 @@ app.component('security-center', {
         const params = new URLSearchParams({ limit: banLimit.value, offset: (banPage.value - 1) * banLimit.value });
         const q = (query.value || '').trim();
         if (q) params.set('query', q);
-        const data = await API.get('/security/bans?' + params.toString());
-        rows.value = data.data || [];
-        banTotal.value = data.total || rows.value.length;
+        // Parallel: core ban list + nftables fw set
+        const [banData, fwData] = await Promise.all([
+          API.get('/security/bans?' + params.toString()).catch(() => ({ data: [], total: 0 })),
+          API.get('/security/firewall').catch(() => ({ ips: [] })),
+        ]);
+        rows.value = banData.data || [];
+        banTotal.value = banData.total || rows.value.length;
+        fwIps.value = fwData.ips || [];
       } catch (e) {
         error.value = e.message;
       }
       loading.value = false;
     }
+    function fullReload() { banPage.value = 1; load(); loadFw(); }
     function reload() { banPage.value = 1; load(); }
 
     async function unban(ip) {
       try {
         await API.delete('/security/bans/' + encodeURIComponent(ip));
-        ElementPlus.ElMessage.success('Unbanned ' + ip);
+        ElementPlus.ElMessage.success('Unbanned ' + ip + ' (core + nftables)');
         load();
       } catch (e) {
         ElementPlus.ElMessage.error('Unban failed: ' + e.message);
       }
+    }
+
+    // ---------- Tab 1: Manual Ban ----------
+    const banIp = ref('');
+    const banDurKey = ref('3600');
+    const banSending = ref(false);
+
+    async function manualBan() {
+      const ip = (banIp.value || '').trim();
+      if (!ip) return;
+      banSending.value = true;
+      try {
+        await API.post('/security/bans', { ip, duration_s: Number(banDurKey.value) });
+        ElementPlus.ElMessage.success('Banned ' + ip + ' (core + nftables synced)');
+        banIp.value = '';
+        load();
+        loadFw();
+      } catch (e) {
+        ElementPlus.ElMessage.error('Ban failed: ' + e.message);
+      }
+      banSending.value = false;
     }
 
     // ============ Tab 2: Fence Rules ============
@@ -578,16 +776,121 @@ app.component('security-center', {
       cfgSaving.value = false;
     }
 
+    // ============ Tab 4: Firewall (nftables) ============
+    // ============ FW state shared by Tab 1 and Tab 4 ============
+    const fwIps = ref([]);             // nftables set as flat IP list
+    const fwLoading = ref(false), fwError = ref(null);
+    const fwSyncing = ref(false), fwAdding = ref(false), fwAddIp = ref('');
+
+    // Tab 1 里 state=ban 但 nft set 里找不到的 IP
+    const missingFwIps = computed(() =>
+      rows.value.filter(r => r.state === 'ban' && !fwIps.value.includes(r.ip))
+                .map(r => r.ip)
+    );
+
+    // Unban popconfirm 动态标题：如果 nft 层已同步，提示也清 kernel drop
+    function unbanTitle(row) {
+      const synced = fwIps.value.includes(row.ip);
+      if (synced)
+        return 'Unban ' + row.ip + ' ?\nClear core ban + remove nftables kernel DROP';
+      return 'Unban ' + row.ip + ' ?\nClear core ban (not yet in nftables anyway)';
+    }
+
+    // Observing 行的 "Ban Now" 快捷按钮
+    async function manualBanFor(ip) {
+      banIp.value = ip;
+      banDurKey.value = '3600';
+      await manualBan();
+    }
+
+    // ---- per-row FW 快捷按钮（不进 core ban 表） ----
+    async function fwAddFor(ip) {
+      try {
+        await API.post('/security/firewall/add', { ip });
+        ElementPlus.ElMessage.success('Pushed ' + ip + ' to nftables');
+        await loadFw();
+      } catch (e) { ElementPlus.ElMessage.error('Push failed: ' + e.message); }
+    }
+    async function fwDelFor(ip) {
+      try {
+        await API.post('/security/firewall/del', { ip });
+        ElementPlus.ElMessage.success('Removed ' + ip + ' from nftables');
+        await loadFw();
+      } catch (e) { ElementPlus.ElMessage.error('Remove failed: ' + e.message); }
+    }
+
+    // 清 fail2ban 计数（Observing 行：删 entry 同时清 fails）
+    async function clearCounts(ip) {
+      // 与 unban 同逻辑：DELETE /security/bans/{ip} 删整个 entry
+      await unban(ip);
+    }
+
+    // 一键差集 sync（把 core 里所有 banned IP 推到 nftables）
+    async function fwSyncMissing() {
+      fwSyncing.value = true;
+      try {
+        const data = await API.post('/security/firewall/sync', {});
+        ElementPlus.ElMessage.success('Synced: v4=' + data.pushed_v4 + ' v6=' + data.pushed_v6);
+        fwIps.value = await API.get('/security/firewall').then(d => d.ips || []);
+      } catch (e) { ElementPlus.ElMessage.error('Sync failed: ' + e.message); }
+      fwSyncing.value = false;
+    }
+
+    async function loadFw() {
+      fwLoading.value = true; fwError.value = null;
+      try {
+        const data = await API.get('/security/firewall');
+        fwIps.value = data.ips || [];
+      } catch (e) { fwError.value = e.message; }
+      fwLoading.value = false;
+    }
+
+    async function fwSync() {
+      fwSyncing.value = true;
+      try {
+        const data = await API.post('/security/firewall/sync', {});
+        ElementPlus.ElMessage.success('Synced: v4=' + data.pushed_v4 + ' v6=' + data.pushed_v6);
+        await loadFw();
+      } catch (e) { ElementPlus.ElMessage.error('Sync failed: ' + e.message); }
+      fwSyncing.value = false;
+    }
+
+    async function fwAdd() {
+      const ip = (fwAddIp.value || '').trim();
+      if (!ip) return;
+      fwAdding.value = true;
+      try {
+        await API.post('/security/firewall/add', { ip });
+        ElementPlus.ElMessage.success('Added ' + ip + ' to nftables');
+        fwAddIp.value = '';
+        await loadFw();
+      } catch (e) { ElementPlus.ElMessage.error('Add failed: ' + e.message); }
+      fwAdding.value = false;
+    }
+
+    async function fwDel(ip) {
+      try {
+        await API.post('/security/firewall/del', { ip });
+        ElementPlus.ElMessage.success('Removed ' + ip + ' from nftables');
+        await loadFw();
+      } catch (e) { ElementPlus.ElMessage.error('Remove failed: ' + e.message); }
+    }
+
     onMounted(() => { load(); loadBl(); loadCfg(); timer = setInterval(load, 10000); });
     onBeforeUnmount(() => clearInterval(timer));
     return {
       tab, rows, loading, error, query, fmtDur, reload, load, unban,
       banPage, banLimit, banTotal,
+      banIp, banDurKey, banSending, manualBan, manualBanFor, unbanTitle, fullReload,
+      fwAddFor, fwDelFor, clearCounts,
+      missingFwIps, fwSyncMissing, fwSyncing,
       blRows, blLoading, blError, blKind, blType, blKeyword, blPage, blLimit, blTotal, loadBl,
       dlgVisible, saving, form, openAdd, saveBl, toggleBl, removeBl,
       valueLabel, valuePlaceholder,
       cfg, cfgLoading, cfgError, cfgSaving,
       methodList, isMethodSet, toggleMethod, loadCfg, saveCfg,
+      fwIps, fwLoading, fwError, fwAdding, fwAddIp,
+      loadFw, fwAdd, fwDel, fwSync,
     };
   },
 });

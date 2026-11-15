@@ -22,6 +22,7 @@ mod coreclient;
 mod tls;
 mod db;
 mod error;
+mod fw;
 mod middleware;
 mod poller;
 mod ai_agent;
@@ -624,6 +625,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // CDR background poller: fetch core-side cdr.recent every 15s → write DB.
     poller::spawn(state.clone(), 15, 100);
+
+    // nftables auto-ban synchronizer: every 60s pull security.ban.list → push
+    // all still-banned IPs into nftables table `inet nsbc_ban`, dropping packets
+    // at NIC level so reactor threads / slab pools are not even woken up by flood.
+    // Fail-open: if nft binary missing on host, task logs once then retries silently;
+    // dynamic ban still works inside nsbc — firewall sync is a hardening layer.
+    fw::spawn(state.clone(), 60);
 
     // AI Agent barge-in background task (REQ-AI-BARGEIN-001 P0):
     // Subscribe to VAD_EVENT pushed by C core's vad_engine; auto-mute AI side when user speaks.

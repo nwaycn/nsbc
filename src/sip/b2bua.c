@@ -20,6 +20,7 @@
 #include "log.h"
 #include "media_bug.h"
 #include "media_bridge.h"   /* REQ-ORIGINATE-003 &echo: bridge_lookup_relay + rtp_relay_set_echo */
+#include "srtp_session.h"   /* ★ HA P3-3: nsbc_srtp_session_create / get_material */
 #include "media_codec.h"    /* codec_registry_find_name — codec 名称 → PT/CR 映射 */
 #include "playback_engine.h"  /* ringback app：LEG_CONFIRMED 接通点自动停放音 */
 #include "metric_reg.h"
@@ -759,8 +760,6 @@ static int b2b_repl_rebuild_from_buf(b2b_core_t *co)
                     for (int s = 0; s < 2; s++) {
                         uint8_t  cipher = (s == 0) ? dlg->srtp_cipher_a : dlg->srtp_cipher_b;
                         uint8_t  keylen = (s == 0) ? dlg->srtp_keylen_a : dlg->srtp_keylen_b;
-                        uint64_t send_roc = (s == 0) ? dlg->srtp_roc_send_a : dlg->srtp_roc_send_b;
-                        uint64_t recv_roc = (s == 0) ? dlg->srtp_roc_recv_a : dlg->srtp_roc_recv_b;
                         if (keylen == 0) continue;  /* 明文侧，跳过 */
 
                         nsbc_srtp_material_t mat_out = {0}, mat_in = {0};
@@ -775,24 +774,19 @@ static int b2b_repl_rebuild_from_buf(b2b_core_t *co)
                         }
                         nsbc_srtp_policy_t pol = {
                             .cipher = (nsbc_srtp_cipher_t)cipher,
-                            .key_lifetime = 0,  /* 0=default 4GB */
                         };
                         /* ★ 参数顺序：policy, inbound, outbound — 看 srtp_session.h */
-                        nsbc_srtp_sess_t *sr = nsbc_srtp_session_create(&pol, &mat_in, &mat_out);
-                        if (!sr) {
+                        nsbc_srtp_sess_t *sr = NULL;
+                        if (nsbc_srtp_session_create(&pol, &mat_in, &mat_out, &sr) != NSBC_OK || !sr) {
                             llog(LOG_WARN, "b2b",
                                  "HA rebuild: srtp[%d] create failed cipher=%d callid=%s — SRTP 降级明文",
-                                 s, cipher, dlg->callid);
+                                 s, cipher, dlg->callid_a);
                             continue;
                         }
-                        /* ROC 跳到 ACTIVE 侧最后发的值 — libsrtp replay window 默认 64，
-                         * 只要备节点不落后超过 64 个包 UA 侧不会 replay 丢包 */
-                        nsbc_srtp_session_set_roc(sr, send_roc, recv_roc);
-                        r->srtp[s] = sr;
+                        rtp_relay_set_srtp(rl, s, sr);
                         llog(LOG_INFO, "b2b",
-                             "HA rebuild: srtp[%d] restored cipher=%s send_roc=%llu recv_roc=%llu",
-                             s, nsbc_srtp_cipher_name((nsbc_srtp_cipher_t)cipher),
-                             (unsigned long long)send_roc, (unsigned long long)recv_roc);
+                             "HA rebuild: srtp[%d] restored cipher=%s (ROC sync deferred)",
+                             s, nsbc_srtp_cipher_name((nsbc_srtp_cipher_t)cipher));
                     }
 
                     mb_mode_t mode = MB_RELAY;
@@ -3049,6 +3043,18 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                         uint16_t codec_cr_b;
                         uint32_t ssrc_a;
                         uint32_t ssrc_b;
+                        /* ★ v5: 入向 SSRC — 让 rebuild 时能预填 relay smap */
+                        uint32_t ssrc_in_a;
+                        uint32_t ssrc_in_b;
+                        /* ★ v6: SRTP material — failover rebuild 恢复 SRTP session */
+                        uint8_t  srtp_cipher_a;
+                        uint8_t  srtp_keylen_a;
+                        uint8_t  srtp_out_a[SRTP_KEY_MAX];
+                        uint8_t  srtp_in_a[SRTP_KEY_MAX];
+                        uint8_t  srtp_cipher_b;
+                        uint8_t  srtp_keylen_b;
+                        uint8_t  srtp_out_b[SRTP_KEY_MAX];
+                        uint8_t  srtp_in_b[SRTP_KEY_MAX];
                     } repl_dialog_v3_t;
                     repl_dialog_v3_t dlg; memset(&dlg, 0, sizeof(dlg));
                     dlg.action = 0;
@@ -3126,27 +3132,24 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                                 if (mv.have_ssrc_in[0])  dlg.ssrc_in_a = mv.ssrc_in[0];
                                 if (mv.have_ssrc_in[1])  dlg.ssrc_in_b = mv.ssrc_in[1];
 
-                                /* ★ v6: SRTP material + ROC — HA P3-3 failover SRTP restore
-                                 * side=0 朝 A: cipher[0]/keylen[0]/out[0]/in[0]/roc_send[0]/roc_recv[0]
-                                 * side=1 朝 B: cipher[1]/keylen[1]/out[1]/in[1]/roc_send[1]/roc_recv[1]
+                                /* ★ v6: SRTP material — HA P3-3 failover SRTP restore
+                                 * side=0 朝 A: cipher[0]/keylen[0]/out[0]/in[0]
+                                 * side=1 朝 B: cipher[1]/keylen[1]/out[1]/in[1]
                                  *
-                                 * keylen==0 → 该侧明文（bypass 或 SIP 侧没开 SRTP），rebuild 侧跳过
-                                 * material 副本进 replica payload（同 subnet 可信），走进程内 TCP */
+                                 * ROC sync 暂未做（libsrtp opaque struct 无公共 API） —
+                                 * 下一阶段在 relay 层维护 send_roc/recv_roc 计数器。
+                                 * payload struct 保留 srtp_roc_* 字段（零值）。 */
                                 dlg.srtp_cipher_a  = mv.srtp_cipher[0];
                                 dlg.srtp_keylen_a  = mv.srtp_keylen[0];
                                 if (mv.srtp_keylen[0] > 0) {
                                     memcpy(dlg.srtp_out_a, mv.srtp_out[0], SRTP_KEY_MAX);
                                     memcpy(dlg.srtp_in_a,  mv.srtp_in[0],  SRTP_KEY_MAX);
-                                    dlg.srtp_roc_send_a = mv.srtp_roc_send[0];
-                                    dlg.srtp_roc_recv_a = mv.srtp_roc_recv[0];
                                 }
                                 dlg.srtp_cipher_b  = mv.srtp_cipher[1];
                                 dlg.srtp_keylen_b  = mv.srtp_keylen[1];
                                 if (mv.srtp_keylen[1] > 0) {
                                     memcpy(dlg.srtp_out_b, mv.srtp_out[1], SRTP_KEY_MAX);
                                     memcpy(dlg.srtp_in_b,  mv.srtp_in[1],  SRTP_KEY_MAX);
-                                    dlg.srtp_roc_send_b = mv.srtp_roc_send[1];
-                                    dlg.srtp_roc_recv_b = mv.srtp_roc_recv[1];
                                 }
                             }
                         }
@@ -3591,14 +3594,15 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
             return;
         }
         if (ev == TXN_EV_TIMEOUT) {
-            /* Timer B/F：B 腿完全无响应（含 1xx 都没收到）。
-             * sip_txn 在收到 provisional 时会停 Timer B，所以此处与
-             * Ring NoAnswer 定时器是**互斥**的：收到 1xx 才 arm
-             * ring_noanswer，timer B 永远不会在收到 1xx 后触发。
+            /* Timer B/F 触发（B 腿 ICT 事务绝对期限 64*T1=32s）。
+             * RFC3261 §17.1.1.2：Timer B 覆盖整个 ICT 生命周期，收到 1xx
+             * 后 sip_txn 只停 Timer A（重传），**不停 B** —— 即此处与
+             * ring_noanswer 并不互斥：被叫回 1xx 后 32s 内无 final，
+             * Timer B 仍会先触发（早于 60s 级的 ring_noanswer）。
              * 响应码应为 408 Request Timeout（被叫超时）而非 504 Server
              * Time-out（上游超时——语义错，504 表示"我方到上游超时"）。 */
             llog(LOG_WARN, "b2b",
-                 "timer B/F: B leg no response (not even 1xx), callid=%s → 408",
+                 "timer B/F: B leg no final within 64*T1, callid=%s → 408",
                  c->leg[0].callid);
             disarm_noanswer_timer(c); /* 防御：若 Timer B 先触发，清 ring timer */
             if (reinv) {
@@ -4576,8 +4580,18 @@ void handle_new_invite(b2b_core_t *co, sip_txn_t *t,
 
     b2b_call_t *c = mem_slab_alloc_direct(co->slab);
     if (!c) {
-        /* slab 耗尽：撤回并发计数 */
+        /* slab 耗尽：撤回并发计数 + 503 Busy
+         * slab POP_FAIL 根因：core.max_calls 配太小 (默认 100000)
+         * 日志限频：第一次 + 每 1000 次 */
         concurrent_dec(co);
+        static uint32_t slab_fail_n = 0;
+        uint32_t n = __atomic_add_fetch(&slab_fail_n, 1, __ATOMIC_RELAXED);
+        if (n == 1 || n % 1000 == 0) {
+            llog(LOG_WARN, "b2b",
+                 "slab_pop_fail (total=%u) — core.max_calls config too small? "
+                 "currently=%d, INVITE rejected 503",
+                 n, co->cfg.capacity);
+        }
         respond_txn(co, t, 503, NULL, "Retry-After: 10\r\n", NULL, 0);
         return;
     }

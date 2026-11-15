@@ -639,6 +639,12 @@ pub trait CoreApi: Send + Sync {
         filter: &str,
     ) -> impl Future<Output = Result<Vec<BanEntry>, CoreError>> + Send;
 
+    fn security_ban_add(
+        &self,
+        ip: &str,
+        duration_s: u64,
+    ) -> impl Future<Output = Result<(), CoreError>> + Send;
+
     /// `security.ban.unban <ip>` — unban (clear all counts and ban state for that IP).
     fn security_ban_unban(
         &self,
@@ -1020,6 +1026,21 @@ impl CoreApi for RealCore {
         };
         let body = send_cmd(&self.sock_path, self.timeout, &cmd).await?;
         parse_ban_list(&body)
+    }
+    async fn security_ban_add(&self, ip: &str, duration_s: u64) -> Result<(), CoreError> {
+        let dur_str = if duration_s == 0 {
+            String::new()
+        } else {
+            format!(" {duration_s}")
+        };
+        let cmd = format!("security.ban.add {}{}", sanitize_arg(ip), dur_str);
+        let body = send_cmd(&self.sock_path, self.timeout, &cmd).await?;
+        if body.trim_start().starts_with("OK") {
+            Ok(())
+        } else {
+            let msg = body.trim().strip_prefix("ERR").unwrap_or(body.trim());
+            Err(CoreError::CoreRejected(msg.trim().to_string()))
+        }
     }
     async fn security_ban_unban(&self, ip: &str) -> Result<(), CoreError> {
         let cmd = format!("security.ban.unban {}", sanitize_arg(ip));
@@ -2571,6 +2592,20 @@ leg 0 sdp_offer 50\nabc\n";
                 .cloned()
                 .unwrap_or_else(|| Ok("bans=0 shown=0 total=0\n".to_string()));
             parse_ban_list(&canned?)
+        }
+        async fn security_ban_add(&self, ip: &str, duration_s: u64) -> Result<(), CoreError> {
+            self.calls.lock().unwrap().push(format!("security.ban.add {ip} {duration_s}"));
+            let canned = self
+                .canned
+                .get("security.ban.add")
+                .cloned()
+                .unwrap_or_else(|| Ok(format!("OK security.ban.add ip={ip} duration_s={duration_s}\n")));
+            let canned = canned?;
+            if canned.trim_start().starts_with("OK") { Ok(()) }
+            else {
+                let msg = canned.trim().strip_prefix("ERR").unwrap_or(canned.trim());
+                Err(CoreError::CoreRejected(msg.trim().to_string()))
+            }
         }
         async fn security_ban_unban(&self, ip: &str) -> Result<(), CoreError> {
             self.calls.lock().unwrap().push(format!("security.ban.unban {ip}"));

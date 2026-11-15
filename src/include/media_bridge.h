@@ -16,6 +16,10 @@
 #include "reactor_manager.h"
 #include "ssrc_policy.h"
 
+/* 前向声明 — 避免 media_bridge.h include srtp_session.h（头文件污染），
+ * nsbc_srtp_sess_t = struct srtp_sess，定义在 srtp_session.h */
+typedef struct srtp_sess nsbc_srtp_sess_t;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -146,6 +150,12 @@ uint64_t rtp_relay_drops(const rtp_relay_t *r);
  * on=1 时 relay 把 side 收到的 RTP 发回同一侧（side→side），
  * 实现"通话方听到自己回声"。调用需在 B 腿 LEG_CONFIRMED 之后。 */
 void rtp_relay_set_echo(rtp_relay_t *r, int on);
+
+/* ★ HA P3-3: failover rebuild 恢复 SRTP session —
+ * rebuild 侧先调 rtp_relay_start 建 relay，再用这个 API 把 ACTIVE 侧的
+ * srtp session 挂进来（必须在 bridge_register_call 之前，arm 后 relay thread
+ * 跑 protect/unprotect 需要 srtp 已就绪）。 */
+void rtp_relay_set_srtp(rtp_relay_t *r, int side, nsbc_srtp_sess_t *sr);
 
 /* b2bua 挂接：offer/answer SDP 出口重写；内部完成决策+端口分配+relay 建立。
  * call_key 为 b2b 层传入的不透明呼叫身份键（b2b_call_t*），本层只以其

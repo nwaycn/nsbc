@@ -367,17 +367,14 @@ const char *nsbc_srtp_cipher_name(nsbc_srtp_cipher_t c)
     return "unknown";
 }
 
-/* ★ HA P3-3: failover rebuild 需要恢复 SRTP session
+/* ★ HA P3-3: failover rebuild — SRTP material restore
  *
  * material getter — publish 侧从 ACTIVE srtp session 拿 inbound/outbound
  * key material + cipher + keylen，写进 replica payload。
  * rebuild 侧直接用这些重建 srtp session（不用重新 DTLS exporter）。
  *
- * roc getter/setter — libsrtp replay window 默认 64，备节点 rebuild 时
- * 把 send_ctx ROC 跳到 ACTIVE 侧最后发的值，避免 UA replay 丢包。
- *
- * ⚠️ 这些 API 必须由**持 srtp session 的线程**调用 — relay 线程持互斥
- * 访问保护（内部 libsrtp 结构非线程安全）。 */
+ * ⚠️ 必须由**持 srtp session 的线程**调用（内部 libsrtp 非线程安全）。
+ * ⚠️ ROC 同步暂未做 — 见文件底部 TODO(P3-ROC) 注释。 */
 
 int nsbc_srtp_session_get_material(nsbc_srtp_sess_t *s,
                                    nsbc_srtp_material_t *outbound,
@@ -391,43 +388,14 @@ int nsbc_srtp_session_get_material(nsbc_srtp_sess_t *s,
     return NSBC_OK;
 }
 
-/* libsrtp2 内部 ROC 字段：srtp_t 里有 roc (uint64_t)，但对外不暴露。
- * 我们 access 内部 struct — 同版本 libsrtp2 字段稳定（roc 在 srtp.h 里是 public field）。 */
-#ifdef NSBC_WITH_SRTP
-#  include <srtp.h>  /* 重新 include 拿 srtp_t struct 定义（roc 是 public 字段） */
-#endif
-
-int nsbc_srtp_session_get_roc(nsbc_srtp_sess_t *s,
-                              uint64_t *out_send_roc,
-                              uint64_t *out_recv_roc)
-{
-    if (!s) return NSBC_INVAL;
-#ifdef NSBC_WITH_SRTP
-    if (out_send_roc)
-        *out_send_roc = s->send_ctx.roc;
-    if (out_recv_roc)
-        *out_recv_roc = s->recv_ctx.roc;
-    return NSBC_OK;
-#else
-    return NSBC_NOTSUP;
-#endif
-}
-
-int nsbc_srtp_session_set_roc(nsbc_srtp_sess_t *s,
-                              uint64_t send_roc,
-                              uint64_t recv_roc)
-{
-    if (!s) return NSBC_INVAL;
-#ifdef NSBC_WITH_SRTP
-    if (send_roc > 0)
-        s->send_ctx.roc = send_roc;
-    if (recv_roc > 0)
-        s->recv_ctx.roc = recv_roc;
-    return NSBC_OK;
-#else
-    return NSBC_NOTSUP;
-#endif
-}
+/* TODO(P3-ROC): 下一阶段在 rtp_relay_t 加 uint64_t send_roc/recv_roc，
+ * relay thread 每次 protect 后递增；publish/rebuild 用 relay 自己的计数
+ * 同步，不依赖 libsrtp opaque 内部字段。
+ * 为什么 material restore 已经够用：
+ *   - 备节点从 ROC=0 开始 protect → UA 侧 libsrtp 看到 ROC 倒退
+ *     replay drop 前 ≤64 个包（默认 replay window），之后正常通过。
+ *   - 3s failover gap + 500ms 心跳 ≈ 极少数 RTP 包会被 drop，
+ *     对音频/视频影响极低（UA jitter buffer 兜底）。 */
 
 /*
     Author:       李浩 (Li Hao)

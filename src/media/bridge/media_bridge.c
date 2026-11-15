@@ -18,7 +18,7 @@
 #include "ivr.h"          /* ivr_on_dtmf — relay_recv_one 消费 DTMF */
 #include "sip_common.h"   /* sip_ci_eq */
 #include "media_bug.h"
-#include "srtp_session.h" /* ★ HA P3-3: nsbc_srtp_session_get_material / get_roc */
+#include "srtp_session.h" /* ★ HA P3-3: nsbc_srtp_session_get_material */
 
 /* ★ media_bridge.h 里 MB_SRTP_MATERIAL_MAX 和 srtp_session.h 里 SRTP_KEY_MAX
  * 必须一致 — 前者是 bridge_call_view 里的本地常量（避免头文件污染），
@@ -2818,6 +2818,14 @@ void rtp_relay_set_echo(rtp_relay_t *r, int on)
     llog(LOG_INFO, "relay", "echo_mode %d (call bridge)", want);
 }
 
+/* ★ HA P3-3: failover rebuild — 把 ACTIVE 侧 SRTP session 挂进新 relay
+ * 调用者（b2b_repl_rebuild_from_buf）保证 side ∈ [0,1] 且在 arm relay 之前 */
+void rtp_relay_set_srtp(rtp_relay_t *r, int side, nsbc_srtp_sess_t *sr)
+{
+    if (!r || side < 0 || side > 1) return;
+    r->srtp[side] = sr;
+}
+
 /* ------------------------------------------------------------------ */
 /* b2bua 挂接                                                           */
 /* ------------------------------------------------------------------ */
@@ -4348,10 +4356,11 @@ int bridge_call_view(bridge_mgr_t *m, void *call, mb_view_t *v)
             v->rtp_expected[i] = te;
             v->rtp_lost[i]     = tl;
         }
-        /* ★ HA P3-3: SRTP material + ROC — 每侧独立。
+        /* ★ HA P3-3: SRTP material — 每侧独立。
          * relay->srtp[i] = 该侧 DTLS-SRTP 会话（WebRTC 侧可能有，SIP 侧通常 NULL 明文）。
-         * get_material 只 memcpy struct 字段 — 桥层持 shard 锁 + material 只读安全；
-         * get_roc 读 libsrtp send_ctx.roc / recv_ctx.roc（uint64_t 内部字段）。 */
+         * get_material 只 memcpy struct 字段 — 桥层持 shard 锁 + material 只读安全。
+         * ⚠️ ROC 同步暂未做（libsrtp opaque struct 内部，无公共 API） —
+         * 下一阶段在 relay 层自己维护 send_roc/recv_roc 计数器。 */
         {
             nsbc_srtp_sess_t *sr = r->srtp[i];
             if (sr) {
@@ -4365,12 +4374,8 @@ int bridge_call_view(bridge_mgr_t *m, void *call, mb_view_t *v)
                     if (m_in.keylen > 0)
                         memcpy(v->srtp_in[i], m_in.key, SRTP_KEY_MAX);
                 }
-                uint64_t send_roc = 0, recv_roc = 0;
-                nsbc_srtp_session_get_roc(sr, &send_roc, &recv_roc);
-                v->srtp_roc_send[i] = send_roc;
-                v->srtp_roc_recv[i] = recv_roc;
             }
-        }  /* close HA P3-3 SRTP anonymous block */
+        }
         /* REQ-MEDIA-SEC-003⑤ P0：CNAME 绑定 + 安全计数。
          * d_have_cname 序列计数器：0=未写，≥1=写完且值为 len+1。
          * char 数组非原子，OAM 低频读 double-check 防 torn read（媒体线程

@@ -71,19 +71,14 @@ const char *nsbc_srtp_cipher_name(nsbc_srtp_cipher_t c);
  *
  * material getter — publish 侧从 ACTIVE srtp session 拿 inbound/outbound
  * key material + cipher + keylen，写进 replica payload。
- * rebuild 侧直接用这些重建 srtp session（不用重新 DTLS exporter）。 */
+ * rebuild 侧直接用这些重建 srtp session（不用重新 DTLS exporter）。
+ *
+ * ⚠️ ROC 同步暂未做 — libsrtp2 的 roc 在 opaque struct 内部，无公共 API。
+ * 下一阶段在 relay 层自己维护 ROC 计数器。 */
 int  nsbc_srtp_session_get_material(nsbc_srtp_sess_t *s,
                                     nsbc_srtp_material_t *outbound,
                                     nsbc_srtp_material_t *inbound,
                                     nsbc_srtp_cipher_t *cipher_out);
-
-/* ROC getter/setter — libsrtp replay window 默认 64。备节点 rebuild 时
- * 把 send_ctx ROC 跳到 ACTIVE 侧最后发的值，避免 UA replay 丢包。
- * ⚠️ 必须由持有 srtp session 的线程调用（libsrtp 非线程安全）。 */
-int  nsbc_srtp_session_get_roc(nsbc_srtp_sess_t *s,
-                               uint64_t *out_send_roc, uint64_t *out_recv_roc);
-int  nsbc_srtp_session_set_roc(nsbc_srtp_sess_t *s,
-                               uint64_t send_roc, uint64_t recv_roc);
 
 #ifdef __cplusplus
 }
