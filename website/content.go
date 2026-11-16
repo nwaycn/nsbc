@@ -102,7 +102,7 @@ func (s *Store) Sync(dir string) error {
 	seen := make(map[string]bool)
 	changed, removed := 0, 0
 
-	for _, kind := range []string{"docs", "blog"} {
+	for _, kind := range []string{"docs", "blog", "freeswitch", "opensips"} {
 		root := filepath.Join(dir, kind)
 		entries, err := os.ReadDir(root)
 		if err != nil {
@@ -206,6 +206,17 @@ func (s *Store) ListDocs() ([]Document, error) {
 func (s *Store) ListBlog() ([]Document, error) {
 	return s.list(`SELECT kind, slug, title, summary, html, date, tags, ord, title_en, summary_en, html_en, tags_en FROM documents
 		WHERE kind='blog' ORDER BY date DESC, title ASC`)
+}
+
+// ListFreeswitch / ListOpenSIPS 和 blog 结构相同，按日期倒序。
+func (s *Store) ListFreeswitch() ([]Document, error) {
+	return s.list(`SELECT kind, slug, title, summary, html, date, tags, ord, title_en, summary_en, html_en, tags_en FROM documents
+		WHERE kind='freeswitch' ORDER BY date DESC, title ASC`)
+}
+
+func (s *Store) ListOpenSIPS() ([]Document, error) {
+	return s.list(`SELECT kind, slug, title, summary, html, date, tags, ord, title_en, summary_en, html_en, tags_en FROM documents
+		WHERE kind='opensips' ORDER BY date DESC, title ASC`)
 }
 
 func (s *Store) list(query string) ([]Document, error) {

@@ -63,9 +63,9 @@
 {{define "page_blog"}}
 <section class="page-head">
   <div class="container">
-    <div class="breadcrumb"><a href="{{.Root}}/">{{lang . "Home" "首页"}}</a> / {{lang . "Blog" "博客"}}</div>
-    <h1>{{lang . "Blog" "博客"}}</h1>
-    <p>{{lang . "Release notes, implementation details and ops experience. Articles live in Markdown and appear here automatically." "版本发布、实现细节与运维经验。文章以 Markdown 存放，新增后自动进入列表。"}}</p>
+    <div class="breadcrumb"><a href="{{.Root}}/">{{lang . "Home" "首页"}}</a> / {{.Title}}</div>
+    <h1>{{.Title}}</h1>
+    <p>{{.Description}}</p>
   </div>
 </section>
 
@@ -76,14 +76,14 @@
       <article class="card" style="margin-bottom:24px;">
         {{with tags .Tags}}<span class="tag">{{index . 0}}</span>{{end}}
         <time datetime="{{.Date}}" style="display:block; margin-top:10px;">{{.Date}}</time>
-        <h2 style="margin-top:8px;"><a href="{{$.Root}}/blog/{{.Slug}}">{{.Title}}</a></h2>
+        <h2 style="margin-top:8px;"><a href="{{$.Root}}/{{$.Active}}/{{.Slug}}">{{.Title}}</a></h2>
         <p>{{.Summary}}</p>
-        <a class="more" href="{{$.Root}}/blog/{{.Slug}}">{{lang $ "Read post →" "阅读全文 →"}}</a>
+        <a class="more" href="{{$.Root}}/{{$.Active}}/{{.Slug}}">{{lang $ "Read post →" "阅读全文 →"}}</a>
       </article>
       {{end}}
 
       {{if not .Posts}}
-      <p class="footnote">{{lang . "No posts yet. Drop a Markdown file under <code>content/blog/</code>." "还没有文章。在 <code>content/blog/</code> 下新建 Markdown 文件即可。"}}</p>
+      <p class="footnote">{{lang . "No posts yet." "还没有文章。"}}</p>
       {{end}}
     </div>
   </section>
@@ -93,7 +93,7 @@
 {{define "page_post"}}
 <section class="page-head">
   <div class="container">
-    <div class="breadcrumb"><a href="{{.Root}}/">{{lang . "Home" "首页"}}</a> / <a href="{{.Root}}/blog">{{lang . "Blog" "博客"}}</a> / {{.Post.Title}}</div>
+    <div class="breadcrumb"><a href="{{.Root}}/">{{lang . "Home" "首页"}}</a> / <a href="{{.Root}}/{{.Active}}">{{.Active}}</a> / {{.Post.Title}}</div>
     <h1>{{.Post.Title}}</h1>
     <p>
       <time datetime="{{.Post.Date}}">{{.Post.Date}}</time>
@@ -107,7 +107,7 @@
     <div class="container">
       <article class="doc-body prose" style="max-width:780px; margin:0 auto;">{{.Markdown}}</article>
       <div style="max-width:780px; margin:40px auto 0;">
-        <a class="btn btn--ghost" href="{{.Root}}/blog">{{lang . "← Back to blog" "← 返回博客"}}</a>
+        <a class="btn btn--ghost" href="{{.Root}}/{{.Active}}">{{lang . "← Back" "← 返回"}}</a>
       </div>
     </div>
   </section>
