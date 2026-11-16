@@ -531,6 +531,146 @@ a=sendrecv</pre>
     </div>
   </section>
 
+  <!-- 11. RFC -->
+  <section class="section" id="rfc">
+    <div class="container">
+      <div class="section-head">
+        <span class="eyebrow">参考标准</span>
+        <h2>SIP / WebRTC / RTP 核心 RFC</h2>
+        <p>下面是 NSBC 实现时参考的主要 RFC，点击编号可直接跳到 IETF datatracker 查看全文。并非完整清单，覆盖了日常部署中最常遇到的协议、扩展与编解码。</p>
+      </div>
+
+      <div class="grid grid--2">
+
+        <div class="card">
+          <h3>SIP 核心</h3>
+          <div class="table-wrap" style="margin-top:14px;">
+            <table>
+              <thead><tr><th>RFC</th><th>说明</th></tr></thead>
+              <tbody>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc3261" target="_blank" rel="noopener">RFC 3261</a></td><td>SIP 核心协议（INVITE、REGISTER、Proxy、B2BUA）</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc3262" target="_blank" rel="noopener">RFC 3262</a></td><td>PRACK — 可靠临时响应</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc3264" target="_blank" rel="noopener">RFC 3264</a></td><td>Offer/Answer 模型 — SDP 协商方式</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc3265" target="_blank" rel="noopener">RFC 3265</a></td><td>SIP Events — SUBSCRIBE / NOTIFY</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>SIP 扩展与实践</h3>
+          <div class="table-wrap" style="margin-top:14px;">
+            <table>
+              <thead><tr><th>RFC</th><th>说明</th></tr></thead>
+              <tbody>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc3515" target="_blank" rel="noopener">RFC 3515</a></td><td>REFER — 呼叫转移</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc3891" target="_blank" rel="noopener">RFC 3891</a></td><td>Replaces header — 替代已有对话</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc4028" target="_blank" rel="noopener">RFC 4028</a></td><td>Session Timers — 会话保活与清理</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc4916" target="_blank" rel="noopener">RFC 4916</a></td><td>UPDATE — 会话中修改参数</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc5626" target="_blank" rel="noopener">RFC 5626</a></td><td>Outbound — NAT 穿透与 rport</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc7315" target="_blank" rel="noopener">RFC 7315</a></td><td>Path header — 注册路径记录</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc7989" target="_blank" rel="noopener">RFC 7989</a></td><td>Session-ID — 跨设备呼叫关联</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc8224" target="_blank" rel="noopener">RFC 8224</a></td><td>Path header（修订版）</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>SIP over WebSocket / WebRTC</h3>
+          <div class="table-wrap" style="margin-top:14px;">
+            <table>
+              <thead><tr><th>RFC</th><th>说明</th></tr></thead>
+              <tbody>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc7118" target="_blank" rel="noopener">RFC 7118</a></td><td>SIP over WebSocket（路径 <code>/ws</code>）</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc8834" target="_blank" rel="noopener">RFC 8834</a></td><td>WebRTC Transport — 浏览器媒体传输要求</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>SDP</h3>
+          <div class="table-wrap" style="margin-top:14px;">
+            <table>
+              <thead><tr><th>RFC</th><th>说明</th></tr></thead>
+              <tbody>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc4566" target="_blank" rel="noopener">RFC 4566</a></td><td>SDP — 会话描述格式</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc8839" target="_blank" rel="noopener">RFC 8839</a></td><td>SDP Offer/Answer 模型（修订）</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>RTP / RTCP</h3>
+          <div class="table-wrap" style="margin-top:14px;">
+            <table>
+              <thead><tr><th>RFC</th><th>说明</th></tr></thead>
+              <tbody>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc3550" target="_blank" rel="noopener">RFC 3550</a></td><td>RTP / RTCP 核心规范</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc3551" target="_blank" rel="noopener">RFC 3551</a></td><td>RTP Audio/Video Profile — PCMU/PCMA/G.722 等</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc5104" target="_blank" rel="noopener">RFC 5104</a></td><td>RTCP Feedback — NACK、FIR、PLI</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc5888" target="_blank" rel="noopener">RFC 5888</a></td><td>RTP Header Extension — 混合多扩展头</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc6184" target="_blank" rel="noopener">RFC 6184</a></td><td>RTP Payload for H.264</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc7587" target="_blank" rel="noopener">RFC 7587</a></td><td>RTP Payload for Opus</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc7798" target="_blank" rel="noopener">RFC 7798</a></td><td>RTP Payload for H.265 / HEVC</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>安全：TLS / SRTP / DTLS</h3>
+          <div class="table-wrap" style="margin-top:14px;">
+            <table>
+              <thead><tr><th>RFC</th><th>说明</th></tr></thead>
+              <tbody>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc5246" target="_blank" rel="noopener">RFC 5246</a></td><td>TLS 1.2 — SIP SIPS 依赖</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc8446" target="_blank" rel="noopener">RFC 8446</a></td><td>TLS 1.3</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc3711" target="_blank" rel="noopener">RFC 3711</a></td><td>SRTP — RTP 加密与认证</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc5764" target="_blank" rel="noopener">RFC 5764</a></td><td>DTLS-SRTP — WebRTC 媒体密钥协商</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>ICE / NAT 穿透</h3>
+          <div class="table-wrap" style="margin-top:14px;">
+            <table>
+              <thead><tr><th>RFC</th><th>说明</th></tr></thead>
+              <tbody>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc5245" target="_blank" rel="noopener">RFC 5245</a></td><td>ICE — 候选地址与连通性检查</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc5389" target="_blank" rel="noopener">RFC 5389</a></td><td>STUN — NAT 穿透基础协议</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc8489" target="_blank" rel="noopener">RFC 8489</a></td><td>STUN（修订版，与 RFC 5389 兼容）</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc5489" target="_blank" rel="noopener">RFC 5489</a></td><td>TURN — 中继穿越对称 NAT</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>DTMF / 媒体事件</h3>
+          <div class="table-wrap" style="margin-top:14px;">
+            <table>
+              <thead><tr><th>RFC</th><th>说明</th></tr></thead>
+              <tbody>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc2833" target="_blank" rel="noopener">RFC 2833</a></td><td>RTP Events — DTMF 带内事件方式</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc4733" target="_blank" rel="noopener">RFC 4733</a></td><td>RTP Payload for DTMF（修订版）</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+      </div>
+
+      <div class="note" style="margin-top:28px;">
+        <strong>其他 RFC：</strong>NSBC 还参考了 RFC 3611（RTCP XR）、RFC 3966（tel: URI）、RFC 5389/8489（STUN）、RFC 6716（Opus 编解码）、draft-ietf-rtcweb-* 系列（WebRTC 草案）。完整清单见仓库 <code>docs/rfc.txt</code>。
+      </div>
+    </div>
+  </section>
+
   <section class="section" style="padding-top: 0;">
     <div class="container">
       <div class="cta">
@@ -1079,6 +1219,146 @@ a=sendrecv</pre>
             <tr><td>CDR</td><td>Call Detail Record</td><td>Call record with start/end time, result and quality</td></tr>
           </tbody>
         </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- 11. RFC -->
+  <section class="section" id="rfc">
+    <div class="container">
+      <div class="section-head">
+        <span class="eyebrow">References</span>
+        <h2>Core RFCs for SIP / WebRTC / RTP</h2>
+        <p>Below are the main RFCs NSBC is built against. Click any number to open the full text on IETF datatracker. This is not an exhaustive list — it is the subset you'll encounter day to day when deploying a SIP / WebRTC service.</p>
+      </div>
+
+      <div class="grid grid--2">
+
+        <div class="card">
+          <h3>SIP Core</h3>
+          <div class="table-wrap" style="margin-top:14px;">
+            <table>
+              <thead><tr><th>RFC</th><th>What it covers</th></tr></thead>
+              <tbody>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc3261" target="_blank" rel="noopener">RFC 3261</a></td><td>The SIP core protocol — INVITE, REGISTER, Proxy, B2BUA</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc3262" target="_blank" rel="noopener">RFC 3262</a></td><td>PRACK — reliable provisional responses</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc3264" target="_blank" rel="noopener">RFC 3264</a></td><td>Offer/Answer — how SDP negotiation works</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc3265" target="_blank" rel="noopener">RFC 3265</a></td><td>SIP Events — SUBSCRIBE / NOTIFY</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>SIP Extensions &amp; Practices</h3>
+          <div class="table-wrap" style="margin-top:14px;">
+            <table>
+              <thead><tr><th>RFC</th><th>What it covers</th></tr></thead>
+              <tbody>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc3515" target="_blank" rel="noopener">RFC 3515</a></td><td>REFER — call transfer</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc3891" target="_blank" rel="noopener">RFC 3891</a></td><td>Replaces header — take over an existing dialog</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc4028" target="_blank" rel="noopener">RFC 4028</a></td><td>Session Timers — keepalive + cleanup</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc4916" target="_blank" rel="noopener">RFC 4916</a></td><td>UPDATE — modify parameters mid-session</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc5626" target="_blank" rel="noopener">RFC 5626</a></td><td>Outbound — NAT traversal and rport</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc7315" target="_blank" rel="noopener">RFC 7315</a></td><td>Path header — record of the registration path</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc7989" target="_blank" rel="noopener">RFC 7989</a></td><td>Session-ID — correlate calls across devices</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc8224" target="_blank" rel="noopener">RFC 8224</a></td><td>Path header (revised)</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>SIP over WebSocket / WebRTC</h3>
+          <div class="table-wrap" style="margin-top:14px;">
+            <table>
+              <thead><tr><th>RFC</th><th>What it covers</th></tr></thead>
+              <tbody>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc7118" target="_blank" rel="noopener">RFC 7118</a></td><td>SIP over WebSocket (path <code>/ws</code>)</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc8834" target="_blank" rel="noopener">RFC 8834</a></td><td>WebRTC Transport — browser media requirements</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>SDP</h3>
+          <div class="table-wrap" style="margin-top:14px;">
+            <table>
+              <thead><tr><th>RFC</th><th>What it covers</th></tr></thead>
+              <tbody>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc4566" target="_blank" rel="noopener">RFC 4566</a></td><td>SDP — the session description format</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc8839" target="_blank" rel="noopener">RFC 8839</a></td><td>SDP Offer/Answer model (revised)</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>RTP / RTCP</h3>
+          <div class="table-wrap" style="margin-top:14px;">
+            <table>
+              <thead><tr><th>RFC</th><th>What it covers</th></tr></thead>
+              <tbody>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc3550" target="_blank" rel="noopener">RFC 3550</a></td><td>RTP / RTCP core specification</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc3551" target="_blank" rel="noopener">RFC 3551</a></td><td>RTP Audio/Video Profile — PCMU / PCMA / G.722 / ...</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc5104" target="_blank" rel="noopener">RFC 5104</a></td><td>RTCP Feedback — NACK, FIR, PLI</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc5888" target="_blank" rel="noopener">RFC 5888</a></td><td>RTP Header Extension — mixing multiple extensions</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc6184" target="_blank" rel="noopener">RFC 6184</a></td><td>RTP Payload for H.264</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc7587" target="_blank" rel="noopener">RFC 7587</a></td><td>RTP Payload for Opus</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc7798" target="_blank" rel="noopener">RFC 7798</a></td><td>RTP Payload for H.265 / HEVC</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>Security: TLS / SRTP / DTLS</h3>
+          <div class="table-wrap" style="margin-top:14px;">
+            <table>
+              <thead><tr><th>RFC</th><th>What it covers</th></tr></thead>
+              <tbody>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc5246" target="_blank" rel="noopener">RFC 5246</a></td><td>TLS 1.2 — what SIP SIPS runs over</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc8446" target="_blank" rel="noopener">RFC 8446</a></td><td>TLS 1.3</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc3711" target="_blank" rel="noopener">RFC 3711</a></td><td>SRTP — encrypted and authenticated RTP</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc5764" target="_blank" rel="noopener">RFC 5764</a></td><td>DTLS-SRTP — WebRTC media key negotiation</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>ICE / NAT Traversal</h3>
+          <div class="table-wrap" style="margin-top:14px;">
+            <table>
+              <thead><tr><th>RFC</th><th>What it covers</th></tr></thead>
+              <tbody>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc5245" target="_blank" rel="noopener">RFC 5245</a></td><td>ICE — candidate addresses and connectivity checks</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc5389" target="_blank" rel="noopener">RFC 5389</a></td><td>STUN — the base NAT traversal protocol</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc8489" target="_blank" rel="noopener">RFC 8489</a></td><td>STUN (revised, backwards-compatible with 5389)</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc5489" target="_blank" rel="noopener">RFC 5489</a></td><td>TURN — relay through symmetric NAT</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>DTMF / Media Events</h3>
+          <div class="table-wrap" style="margin-top:14px;">
+            <table>
+              <thead><tr><th>RFC</th><th>What it covers</th></tr></thead>
+              <tbody>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc2833" target="_blank" rel="noopener">RFC 2833</a></td><td>RTP Events — in-band DTMF events</td></tr>
+                <tr><td><a href="https://datatracker.ietf.org/doc/html/rfc4733" target="_blank" rel="noopener">RFC 4733</a></td><td>RTP Payload for DTMF (revised)</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+      </div>
+
+      <div class="note" style="margin-top:28px;">
+        <strong>Other RFCs:</strong> NSBC also references RFC 3611 (RTCP XR), RFC 3966 (tel: URIs), RFC 6716 (Opus codec), and the draft-ietf-rtcweb-* series. A full list lives under the repo at <code>docs/rfc.txt</code>.
       </div>
     </div>
   </section>
