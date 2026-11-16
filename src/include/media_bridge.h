@@ -16,6 +16,10 @@
 #include "reactor_manager.h"
 #include "ssrc_policy.h"
 
+/* 前向声明 — 避免 media_bridge.h include srtp_session.h（头文件污染），
+ * nsbc_srtp_sess_t = struct srtp_sess，定义在 srtp_session.h */
+typedef struct srtp_sess nsbc_srtp_sess_t;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -131,6 +135,13 @@ void rtp_relay_stop(rtp_relay_t *r);
 void rtp_relay_set_peer_a(rtp_relay_t *r, const nsbc_sa_t *sa);
 void rtp_relay_set_peer_b(rtp_relay_t *r, const nsbc_sa_t *sa);
 
+/* ★ HA P3-2: failover rebuild 预填 SSRC 重写映射。
+ * 让 STANDBY→ACTIVE 新建的 relay 对同一路 UA 发同样的 out SSRC —
+ * UA 侧不感知 failover 导致的 SSRC 漂移，RTP session 不 drop。
+ * 必须在 rtp_relay_arm 之前调用（rebuild 恰好满足）。 */
+void rtp_relay_preset_ssrc(rtp_relay_t *r, int side,
+                           uint32_t in_ssrc, uint32_t out_ssrc);
+
 /* OBS：转发/丢弃计数 */
 uint64_t rtp_relay_pkts(const rtp_relay_t *r);
 uint64_t rtp_relay_drops(const rtp_relay_t *r);
@@ -139,6 +150,12 @@ uint64_t rtp_relay_drops(const rtp_relay_t *r);
  * on=1 时 relay 把 side 收到的 RTP 发回同一侧（side→side），
  * 实现"通话方听到自己回声"。调用需在 B 腿 LEG_CONFIRMED 之后。 */
 void rtp_relay_set_echo(rtp_relay_t *r, int on);
+
+/* ★ HA P3-3: failover rebuild 恢复 SRTP session —
+ * rebuild 侧先调 rtp_relay_start 建 relay，再用这个 API 把 ACTIVE 侧的
+ * srtp session 挂进来（必须在 bridge_register_call 之前，arm 后 relay thread
+ * 跑 protect/unprotect 需要 srtp 已就绪）。 */
+void rtp_relay_set_srtp(rtp_relay_t *r, int side, nsbc_srtp_sess_t *sr);
 
 /* b2bua 挂接：offer/answer SDP 出口重写；内部完成决策+端口分配+relay 建立。
  * call_key 为 b2b 层传入的不透明呼叫身份键（b2b_call_t*），本层只以其
@@ -149,6 +166,17 @@ int bridge_answer_hook(void *call_key, const char *in, size_t inlen,
                        char *out, size_t outsz, void *ud);
 /* 呼叫结束释放（挂 b2b terminate；P0 由 media confirm 回调反注册兜底） */
 void bridge_release_call(bridge_mgr_t *m, void *call_key);
+
+/* ★ HA P1: STANDBY → ACTIVE failover 时重建 call_key→relay 绑定。
+ * call_key 是新的 b2b_call_t*（rebuild 侧 mem_slab_alloc 来的，
+ * 和 ACTIVE 侧原 call_key 不同 — bridge_mgr 内部表要认新 key）。
+ * relay 是调用方（b2b rebuild）刚 rtp_relay_start + set_peer 好的。
+ * mode 通常是 MB_SIMPLE_RELAY / MB_TRANSCODE / MB_SRTP_RELAY。
+ *
+ * 幂等: 已存在就跳过（返回 NSBC_AGAIN）。
+ * 只挂 shard 链表，不触发 reactor/转发线程（relay 内部状态已由调用方建好）。 */
+int bridge_register_call(bridge_mgr_t *m, void *call_key,
+                         rtp_relay_t *relay, mb_mode_t mode);
 
 /* 两侧 SDP 齐备后的最终模式确认（挂 b2b media 回调）：
  * 已建 relay 实例不降级 bypass（媒体面已锚定）；决策为 transcode 时把
@@ -180,6 +208,18 @@ typedef struct {
     int      have_cname[2];
     uint64_t ssrc_inject_drops[2];   /* ≈ ssrc_unauthorized（白名单外陌生 SSRC） */
     uint64_t ssrc_collision_drops[2];
+
+    /* ★ HA P3-3: SRTP failover restore — 每侧独立
+     * 常量值 64 必须与 SRTP_KEY_MAX (srtp_session.h) 一致 — 用于在
+     * bridge_call_view 中从 rtp_relay_t 拷贝 srtp material 副本进
+     * mb_view_t，publish 侧直接 memcpy 到 replica payload。 */
+#define MB_SRTP_MATERIAL_MAX 64
+    uint8_t  srtp_cipher[2];       /* nsbc_srtp_cipher_t */
+    uint8_t  srtp_keylen[2];       /* 0=明文侧 */
+    uint8_t  srtp_out[2][MB_SRTP_MATERIAL_MAX]; /* outbound material */
+    uint8_t  srtp_in[2][MB_SRTP_MATERIAL_MAX];  /* inbound material */
+    uint64_t srtp_roc_send[2];     /* send_ctx.roc */
+    uint64_t srtp_roc_recv[2];     /* recv_ctx.roc */
 } mb_view_t;
 int bridge_call_view(bridge_mgr_t *m, void *call_key, mb_view_t *v);
 
@@ -203,8 +243,15 @@ int bridge_active_count(bridge_mgr_t *m);
 int bridge_lookup_relay(bridge_mgr_t *m, void *call_key,
                         rtp_relay_t **out_relay, nsbc_sa_t out_peer[2]);
 
+/* REQ-DP-APP-001：bridge 绑定/SDP 重写用的 local IP（offer_hook 同源。
+ * b2bua 合成 183 answer SDP 时 profile 未配 external_rtp_ip 的 fallback）。 */
+const char *bridge_local_ip(const bridge_mgr_t *m);
+
 /* relay 内部 fd 访问（media 层内部用，opaque 类型查询） */
 int rtp_relay_fd(const rtp_relay_t *r, int side);
+/* REQ-DP-APP-001：relay 指定侧本地 RTP 端口（b2bua 合成 183 Session Progress
+ * 的 SDP answer 时填 m=audio 端口用；side 0=A 腿侧，1=B 腿侧） */
+uint16_t rtp_relay_port(const rtp_relay_t *r, int side);
 /* relay 某侧是否已 latch 到真实 peer（1=已 latch，0=未 latch） */
 int rtp_relay_latched(const rtp_relay_t *r, int side);
 /* relay 某侧已 latch 的 peer 地址（未 latch 返回空 nsbc_sa_t） */

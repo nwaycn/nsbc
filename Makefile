@@ -131,11 +131,13 @@ SRC_DIRS := $(shell find src -type d)
 #   src/media/codec/g*  — codec impl files (g711/g729): g711 hard-linked for recorder (added separately in SRCS_BASE),
 #                         g729 goes to mod_codecs.so dynamic module; media_codec.c (registry + transcode engine)
 #                         must be kept (core/moat_bridge/obs_control hard-depend on codec_registry_*/transcode_*)
-#   src/media/playback_engine.c — ghost file (old location)，远程服务器残留；src/media/play/player.c 保留（STATIC core）
+#   src/media/playback_engine.c — ghost file (old location)，远程服务器残留
+#   src/media/play/player.c — 旧播放器链已被 src/media/play/snd_file.c 完全替代，排除
 SRCS_CORE ?= $(shell find src -name '*.c' ! -name 'nsbc_cli.c' \
               ! -path 'src/mod/*' ! -path 'src/media/rec/*' \
               ! -path 'src/db/*' ! -path 'src/media/codec/g*.c' \
-              ! -path 'src/media/playback_engine.c')
+              ! -path 'src/media/playback_engine.c' \
+              ! -path 'src/media/play/player.c')
 # default hand-picked STATIC modules (fallback when no configure)
 # note: intentionally excludes src/mod/codecs/*——codecs go DYNAMIC, g711.c hard-linked separately into main binary
 SRCS_MOD_STATIC ?= $(shell (find src/mod/endpoints src/mod/outbound_reg -name '*.c'; \

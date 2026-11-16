@@ -52,13 +52,13 @@
 #define BAN_REASON_AUTH_FAIL  0x02   /* REGISTER digest auth fail 超阈值 */
 #define BAN_REASON_REG_REQ    0x04   /* REGISTER 请求频率超阈值（ratelimit_registrations） */
 #define BAN_REASON_INV_REQ    0x08   /* 被动：INVITE/REGISTER txn slab 分配失败计数 */
-#define BAN_REASON_ALL        0x0F   /* 所有 ban 原因（0x01|0x02|0x04|0x08） */
+#define BAN_REASON_MANUAL     0x10   /* 运维手动 ban（security.ban.add / Web 一键封） */
+#define BAN_REASON_ALL        0x1F   /* 所有 ban 原因（0x01|0x02|0x04|0x08|0x10） */
 
 static int  ban_is_private_ip(const char *ip_str); /* 私网/loopback — 跳过 auto-ban */
 static int  ban_is_banned(const char *ip, int allow_reasons);
 static int  ban_note_fail(const char *ip);
 static int  ban_note_reg_req(const char *ip);
-static int  ban_note_inv_fail(const char *ip);   /* 被动：txn slab 分配失败计数 */
 static int  ban_note_inv_count(const char *ip); /* 主动：per-IP 新 INVITE 频率计数 */
 static uint32_t ban_duration_for_strikes(uint32_t base_s, int strikes, uint32_t max_s);
 
@@ -1878,55 +1878,10 @@ static int ip_in_deny_cidr(const char *ip_str)
         : bl_index_find_v6(&g_deny_index, ip_host);
 }
 
-/* INVITE/REGISTER 事务层分配失败 ratelimit：与 REGISTER ratelimit 共用窗口秒，
- * 阈值由 ratelimit_invites 控制（默认 30，设 0 关闭）。
- * b2bua 在 txn_server_input 返回负码（slab 满/NOMEM/NOSPC）时调此函数。
- * 典型场景：攻击者 flood 大量不同 branch 的 INVITE 打满 slab → 自己先被封，
- * 正常合法呼叫不受影响（阈值足够大时，正常呼叫不可能打满）。 */
-static int ban_note_inv_fail(const char *ip)
-{
-    if (!g_cfg.auto_ban) return 0;
-    if (ban_is_private_ip(ip)) return 0;
-    if (ip_in_allowlist(ip)) return 0;  /* GeoIP 白名单 → 可信来源不计数不封禁 */
-    int window_s = g_cfg.ratelimit_window_s > 0 ? g_cfg.ratelimit_window_s : 60;
-    int thr = g_cfg.ratelimit_invites > 0 ? g_cfg.ratelimit_invites : 30;
-    if (thr <= 0) return 0;
-    uint64_t now = nsbc_now_ms();
-    int banned_now = 0;
-    pthread_mutex_lock(&g_ban_lock);
-    ban_ent_t *e = ban_find_locked(ip);
-    if (!e) {
-        if (g_ban_count >= BAN_MAX_ENTRIES && !ban_evict_locked(now)) {
-            pthread_mutex_unlock(&g_ban_lock);
-            return 0;
-        }
-        e = calloc(1, sizeof(*e));
-        if (!e) { pthread_mutex_unlock(&g_ban_lock); return 0; }
-        snprintf(e->ip, sizeof(e->ip), "%s", ip);
-        e->win_start = now;
-        unsigned b = ban_hash(ip);
-        e->next = g_ban_tab[b];
-        g_ban_tab[b] = e;
-        ++g_ban_count;
-    }
-    e->last_act = now;
-    if (e->ban_until > now) { pthread_mutex_unlock(&g_ban_lock); return 0; }
-    if (now - e->win_start > (uint64_t)window_s * 1000) {
-        e->win_start = now; e->inv_req = 0;
-    }
-    if (++e->inv_req >= thr) {
-        e->strikes++;
-        e->ban_until = now + (uint64_t)ban_duration_for_strikes(g_cfg.ban_duration_s, e->strikes, (uint32_t)g_cfg.ban_duration_max_s) * 1000;
-        e->ban_reason |= BAN_REASON_INV_REQ;
-        banned_now = 1;
-    }
-    pthread_mutex_unlock(&g_ban_lock);
-    return banned_now;
-}
-
 /* 主动 INVITE flood 检测：per-IP 窗口内新 INVITE 到达次数。
  * 阈值 ratelimit_invites_active（默认 20），共用 ratelimit_window_s（默认 60s）。
- * 与 ban_note_inv_fail 被动阈值独立——攻击者还没打满 slab 就被封。
+ * （被动 alloc-fail 计数 ban_note_inv_fail 已删除：alloc-fail 是全局容量信号，
+ *  会连坐恰好经过的合法用户——2026-11-15 生产事故。）
  * 正常合法呼叫不会触发（坐席并发远低于 20 INVITE/s per IP）。
  * b2bua 在 txn_server_input 之前调本函数（纯 notify，返回值忽略）。 */
 static int ban_note_inv_count(const char *ip)
@@ -2302,17 +2257,19 @@ static int sec_guard_cb(const char *src_ip, b2b_guard_evt_t evt, void *ud)
 
     if (evt == B2B_GUARD_INVITE_FAIL) {
         /* b2bua 在 txn_server_input 返回负码时上报（slab 满/NOMEM/NOSPC）。
-         * 累计 inv_req 超 ratelimit_invites 阈值 → auto-ban。
-         * 正常合法呼叫不可能在短时间内打满 slab，攻击者 flood 才会触发。 */
-        if (ban_note_inv_fail(src_ip)) {
+         * ★ 2026-11-15 修复：alloc-fail 是**全局容量**信号，不是该 IP 的攻击
+         * 证据 —— slab 被其他 IP 的 flood 占满时，恰好经过的合法用户
+         * （REGISTER/INVITE）会连续失败并被计入本 IP 的 fail 计数 → 误 ban
+         * 3600s（生产事故：注册 IP 被扫描 flood 连坐封禁，注册不上）。
+         * per-IP 攻击检测由 B2B_GUARD_INVITE_COUNT（主动速率限制）承担；
+         * alloc-fail 只记日志做容量告警，不再计入 auto-ban。 */
+        static unsigned fail_dbg = 0;
+        if (fail_dbg++ % 30 == 0)
             log_warn("security",
-                     "auto-ban ip=%s: %d txn slab alloc-fails in %ds window, "
-                     "banning for %ds (INVITE/REGISTER flood detected)",
-                     src_ip, g_cfg.ratelimit_invites > 0 ? g_cfg.ratelimit_invites : 30,
-                     g_cfg.ratelimit_window_s > 0 ? g_cfg.ratelimit_window_s : 60,
-                     ban_duration_for_strikes(g_cfg.ban_duration_s, 1, (uint32_t)g_cfg.ban_duration_max_s));
-        }
-        return NSBC_OK;  /* 纯上报，拦截在 ban_is_banned 处生效 */
+                     "txn slab alloc-fail ip=%s (global capacity exhausted, NOT "
+                     "banning — check core.max_calls / attacker flood)",
+                     src_ip);
+        return NSBC_OK;  /* 纯观测，不计入 auto-ban */
     }
 
     if (evt == B2B_GUARD_INVITE_COUNT) {
@@ -2422,6 +2379,120 @@ static int cmd_ban_list(cmd_ctx_t *c, int argc, char **argv, void *ud)
     /* 汇总行在尾（Web 解析只认 ent 行，CLI 用户看统计） */
     c->io_printf(c->io_ud, "bans=%d shown=%d total=%d\n",
                  n_banned, n_out, total);
+    return NSBC_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* security.ban.add <ip> [duration_s] — 运维手动封 IP（跳过 fail2ban 阈值）。
+ * 用途：ops 在面板上看到某个 IP 明显是扫描器/攻击源但还没到 auto-ban 阈值时，
+ * 一键封死。duration 默认取 security.ban_duration_s（schema 默认 3600）。
+ * 若该 IP 已被 auto-ban，会延长剩余时间到 max(auto-ban_until, now+duration)。 */
+static int cmd_ban_add(cmd_ctx_t *c, int argc, char **argv, void *ud)
+{
+    (void)ud;
+    if (argc < 1 || !argv[0][0]) {
+        c->io_printf(c->io_ud, "ERR usage: security.ban.add <ip> [duration_s]\n");
+        return NSBC_ERR;
+    }
+    /* ip parse：复用 cmd_ban_unban 的粘合格式/分参数 + trim 模式 */
+    char ip[INET6_ADDRSTRLEN * 2];
+    const char *cmd = "security.ban.add";
+    size_t cmdlen = strlen(cmd);
+    if (strncmp(argv[0], cmd, cmdlen) == 0) {
+        snprintf(ip, sizeof(ip), "%s", argv[0] + cmdlen);
+    } else {
+        snprintf(ip, sizeof(ip), "%s", argv[0]);
+    }
+    char *p = ip;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    size_t ilen = strlen(p);
+    while (ilen > 0 && (p[ilen-1] == ' ' || p[ilen-1] == '\t' ||
+                        p[ilen-1] == '\r' || p[ilen-1] == '\n'))
+        p[--ilen] = '\0';
+    if (!p[0] && argc >= 2 && argv[1] && argv[1][0]) {
+        p = argv[1];
+        ilen = strlen(p);
+        while (ilen > 0 && (p[ilen-1] == ' ' || p[ilen-1] == '\t' ||
+                            p[ilen-1] == '\r' || p[ilen-1] == '\n'))
+            p[--ilen] = '\0';
+    }
+    if (!p[0]) {
+        c->io_printf(c->io_ud, "ERR ip empty after trim\n");
+        return NSBC_ERR;
+    }
+
+    /* duration_s：可选，从第二个参数取；否则 g_cfg.ban_duration_s；max_security 封顶 */
+    long duration_s = g_cfg.ban_duration_s;
+    if (argc >= 3 && argv[2] && argv[2][0]) {
+        const char *dp = argv[2];
+        while (*dp == ' ' || *dp == '\t') dp++;
+        duration_s = strtol(dp, NULL, 10);
+        if (duration_s <= 0)
+            duration_s = g_cfg.ban_duration_s;
+    }
+    if (duration_s > g_cfg.ban_duration_max_s && g_cfg.ban_duration_max_s > 0)
+        duration_s = g_cfg.ban_duration_max_s;
+
+    pthread_mutex_lock(&g_ban_lock);
+    ban_ent_t **pp = &g_ban_tab[ban_hash(p)];
+    ban_ent_t *e = NULL;
+    while (*pp) {
+        if (strcmp((*pp)->ip, p) == 0) { e = *pp; break; }
+        pp = &(*pp)->next;
+    }
+    uint64_t now = nsbc_now_ms();
+    if (!e) {
+        e = calloc(1, sizeof(*e));
+        if (!e) {
+            pthread_mutex_unlock(&g_ban_lock);
+            c->io_printf(c->io_ud, "ERR oom\n");
+            return NSBC_ERR;
+        }
+        if (g_ban_count >= BAN_MAX_ENTRIES) {
+            /* 满表驱逐过期项 —— 锁内调 ban_sweep_expired 不安全（已经持锁，自己做一遍） */
+            int freed = 0;
+            for (int b = 0; b < BAN_HASH_BUCKETS; ++b) {
+                pp = &g_ban_tab[b];
+                while (*pp) {
+                    ban_ent_t *x = *pp;
+                    if (x->ban_until <= now) {
+                        *pp = x->next;
+                        free(x);
+                        --g_ban_count;
+                        ++freed;
+                    } else {
+                        pp = &x->next;
+                    }
+                }
+            }
+            if (freed == 0) {
+                pthread_mutex_unlock(&g_ban_lock);
+                c->io_printf(c->io_ud, "ERR ban table full, no expired entries\n");
+                free(e);
+                return NSBC_ERR;
+            }
+        }
+        strncpy(e->ip, p, sizeof(e->ip) - 1);
+        e->win_start = now;
+        e->fails = g_cfg.authfail_threshold + 1; /* 人为超过 threshold：确保 ban_clear_counts 不会提前解除 */
+        *pp = e;
+        ++g_ban_count;
+    }
+
+    /* 设 ban_until：取 max(现状, now+duration)，不削短已有的 auto-ban 时间 */
+    uint64_t target = now + (uint64_t)duration_s * 1000;
+    if (target > e->ban_until)
+        e->ban_until = target;
+    e->ban_reason |= BAN_REASON_MANUAL;
+    e->last_act = now;
+    pthread_mutex_unlock(&g_ban_lock);
+
+    log_info("security", "ban.add ip=%s duration_s=%ld until_s=%llu reason=MANUAL(0x%x)",
+             p, duration_s,
+             (unsigned long long) (e->ban_until / 1000), e->ban_reason);
+    c->io_printf(c->io_ud,
+                 "OK security.ban.add ip=%s duration_s=%ld until_s=%llu reason=MANUAL\n",
+                 p, duration_s, (unsigned long long) (target / 1000));
     return NSBC_OK;
 }
 
@@ -2867,6 +2938,8 @@ static int security_init(struct nsbc_ctx *ctx)
         const cmd_desc_t descs[] = {
             { "security.ban.list",  "list ban/watch entries [ip-substring]",
               "security", CMD_L1_MONITOR, cmd_ban_list,  NULL },
+            { "security.ban.add",    "manually ban ip [duration_s], skip fail2ban threshold",
+              "security", CMD_L2_ADMIN,   cmd_ban_add,   NULL },
             { "security.ban.unban", "unban ip (clear entry)",
               "security", CMD_L2_ADMIN,   cmd_ban_unban, NULL },
             { "security.ban.clear", "clear whole ban table",
@@ -2912,6 +2985,7 @@ static void security_fini(struct nsbc_ctx *ctx)
     cmd_reg_t *creg = obs_control_get_cmd_reg();
     if (creg) {
         cmd_unregister(creg, "security.ban.list");
+        cmd_unregister(creg, "security.ban.add");
         cmd_unregister(creg, "security.ban.unban");
         cmd_unregister(creg, "security.ban.clear");
         cmd_unregister(creg, "security.blacklist.list");

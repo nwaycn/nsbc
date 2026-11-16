@@ -168,7 +168,13 @@ loc_rc_t loc_upsert(loc_db_t *db, const loc_binding_t *b, uint64_t now_ms)
         }
         if (!strcmp(p->b.contact, b->contact) ||
             (b->instance[0] && p->b.instance[0] &&
-             !strcmp(p->b.instance, b->instance))) {
+             !strcmp(p->b.instance, b->instance)) ||
+            /* instance 为空时的软判定（WS 重连最常见场景）：
+             * UA 不带 +sip.instance 时，WS 断线重连会生成新 contact + 新 callid
+             * → 以上三个条件全 miss。同 IP + 同 transport 基本锁定同一终端。 */
+            (!b->instance[0] && p->b.received_ip[0] && b->received_ip[0] &&
+             !strcmp(p->b.received_ip, b->received_ip) &&
+             p->b.transport_proto == b->transport_proto)) {
             match = p;
             break;
         }
@@ -253,6 +259,19 @@ int loc_remove(loc_db_t *db, const char *aor, const char *contact)
     aor_unlink_empty(bucket, entry);
     pthread_mutex_unlock(&s->lock);
     return removed;
+}
+
+void loc_db_clear_all(loc_db_t *db)
+{
+    if (!db) return;
+    for (int si = 0; si < LOC_SHARDS; si++) {
+        loc_shard_t *sh = &db->sh[si];
+        pthread_mutex_lock(&sh->lock);
+        for (int bi = 0; bi < LOC_AOR_BUCKETS; bi++)
+            sh->aors[bi] = NULL;
+        sh->n = 0;
+        pthread_mutex_unlock(&sh->lock);
+    }
 }
 
 int loc_query(loc_db_t *db, const char *aor, loc_binding_t *out, int max,

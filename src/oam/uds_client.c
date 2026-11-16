@@ -347,6 +347,41 @@ static void send_hello(void)
     pthread_mutex_unlock(&g.cmd_lock);
 }
 
+/* CMD 通道发 HEARTBEAT —— 无 payload，纯 ping。
+ * Rust 侧对 FT_HEARTBEAT 只回 ACK，**不触发** push_all（HELLO 才触发）。
+ * 区别：
+ *   - HELLO:   "我刚连上，请推全量配置" → push_all
+ *   - HEARTBEAT: "我还活着" → 仅回 ACK
+ *
+ * send HEARTBEAT 的目的：
+ *   Web 重启后 data_cmd.sock inode 变化 → 旧 fd connect 到旧 inode →
+ *   poll 永远等不到新 socket 数据。本函数每 3s 发一次，Rust 侧收到
+ *   就记录 peer path（CORE_PEER_CMD_PATH），后续 reload_via_uds 就能 sendto 新 socket。
+ *   如果 Rust 侧也没活 → 连续 6s 无回包 → force reconnect → open 新 inode。 */
+static void send_heartbeat(void)
+{
+    uint8_t frame[NSBC_FRAME_HDR_LEN + 1];  /* 最小：12B 头 + 1B 空 payload */
+    /* 手工拼 FT_HEARTBEAT 空帧（uds_encode_frame 要求 payload_len > 0，给 1 字节 0） */
+    frame[0] = NSBC_FRAME_MAGIC;
+    frame[1] = FT_HEARTBEAT;
+    uint32_t total = NSBC_FRAME_HDR_LEN + 1;
+    frame[2] = (uint8_t)((total >> 24) & 0xff);
+    frame[3] = (uint8_t)((total >> 16) & 0xff);
+    frame[4] = (uint8_t)((total >> 8) & 0xff);
+    frame[5] = (uint8_t)(total & 0xff);
+    frame[6] = frame[7] = frame[8] = frame[9] = 0;  /* ticket=0 */
+    frame[10] = 0;  /* flags */
+    frame[11] = 0;  /* rsvd */
+    frame[12] = 0;  /* 空 payload */
+    pthread_mutex_lock(&g.cmd_lock);
+    if (g.fd_cmd >= 0 && dgram_send_locked(g.fd_cmd, frame, sizeof(frame)) != 0) {
+        pthread_mutex_lock(&g.conn_lock);
+        mark_broken_locked();
+        pthread_mutex_unlock(&g.conn_lock);
+    }
+    pthread_mutex_unlock(&g.cmd_lock);
+}
+
 /* ========================================================================
  * 收帧分发（仅后台线程，datagram 天然完整帧 —— 无需重组）
  * ======================================================================*/
@@ -480,33 +515,68 @@ static void uds_handle_core_cmd(uint32_t ticket, const char *line, size_t len)
         return;
     }
 
-    /* 切分命令行：argv[0]=命令名，argv[1]=剩余全部（大 JSON payload 不按空格切） */
-    /* 找第一个空格 */
-    const char *sp = memchr(line, ' ', len);
-    char argv0[CMD_NAME_MAX] = {0};
-    const char *argv1 = "";
-    size_t argv1_len = 0;
+    /* 切分命令行：区分"payload 型"（.reload / config.set / config.validate）
+     * 和"普通命令型"（uuid_kill / uuid_hold / uuid_transfer ...）：
+     *   - payload 型：只切第一个空格，argv[1] 后面整段（JSON）
+     *   - 普通命令：全空格切分，每个 token 独立 argv[]
+     * 安全策略：cmd_name 只存命令名（不含任何参数），先查 cmd_registered 再决定如何切。 */
 
-    if (sp) {
-        size_t name_len = (size_t)(sp - line);
-        if (name_len >= sizeof(argv0)) name_len = sizeof(argv0) - 1;
-        memcpy(argv0, line, name_len);
-        argv0[name_len] = '\0';
-        argv1 = sp + 1;
-        argv1_len = len - (size_t)(sp + 1 - line);
-    } else {
-        /* 无参数命令 */
-        size_t name_len = len < sizeof(argv0) - 1 ? len : sizeof(argv0) - 1;
-        memcpy(argv0, line, name_len);
-        argv0[name_len] = '\0';
+    /* Step 1: 先拿纯命令名（到第一个空格为止） */
+    const char *sp0 = memchr(line, ' ', len);
+    char cmd_name[CMD_NAME_MAX] = {0};
+    size_t name_len = sp0 ? (size_t)(sp0 - line) : len;
+    if (name_len >= sizeof(cmd_name)) name_len = sizeof(cmd_name) - 1;
+    memcpy(cmd_name, line, name_len);
+    cmd_name[name_len] = '\0';
+
+    if (!cmd_name[0]) return;
+
+    /* Step 2: 先查命令是否存在（用纯命令名） */
+    if (!cmd_registered(reg, cmd_name)) {
+        llog(LOG_WARN, "uds", "unknown CMD_REQ command: %s", cmd_name);
+        return;
     }
 
-    if (!argv0[0]) return;
+    /* Step 3: 判断是否 payload 型命令 */
+    int is_payload = 0;
+    size_t nn = strlen(cmd_name);
+    if (nn >= 7 && strcmp(cmd_name + nn - 7, ".reload") == 0) is_payload = 1;
+    if (strcmp(cmd_name, "config.set") == 0 ||
+        strcmp(cmd_name, "config.validate") == 0) is_payload = 1;
 
-    /* 检查命令是否已注册 */
-    if (!cmd_registered(reg, argv0)) {
-        llog(LOG_WARN, "uds", "unknown CMD_REQ command: %s", argv0);
+    /* Step 4: 全量切分到动态 buffer（extensions.reload 可达 12.6MB，
+     * 栈上 1024 根本不够！旧版是 malloc(argv1_len+1)，这里保持动态分配） */
+    char *work = (char *)malloc(len + 1);
+    if (!work) {
+        llog(LOG_WARN, "uds", "CMD_REQ: malloc work failed");
         return;
+    }
+    memcpy(work, line, len);
+    work[len] = '\0';
+
+    char *argv[16] = {0};
+    int argc = 0;
+    char *p = work;
+
+    if (is_payload) {
+        /* 只切第一个空格：argv[0]=命令名，argv[1]=payload 整段 */
+        char *wsp = strchr(work, ' ');
+        argv[argc++] = p;           /* argv[0] 指向命令名 */
+        if (wsp) {
+            *wsp = '\0';            /* 在 work[] 里就地改写 */
+            argv[argc++] = wsp + 1;
+        }
+    } else {
+        /* 全空格切分，最多 15 个参数（argv[0] + argv[1..15]） */
+        while (p && argc < 16) {
+            /* 跳过前导空格 */
+            while (*p == ' ') p++;
+            if (!*p) break;
+            argv[argc++] = p;
+            /* 找下一个空格 */
+            p = strchr(p, ' ');
+            if (p) { *p = '\0'; p++; }
+        }
     }
 
     /* 构造 ctx + io buffer，执行命令 */
@@ -519,26 +589,13 @@ static void uds_handle_core_cmd(uint32_t ticket, const char *line, size_t len)
         .io_ud = &io,
     };
 
-    /* Rust 端 periodic push 每 60s 推全量命令（N 条/次），NOTICE 级会刷屏。
-     * 高频 CMD_REQ 详情降 DEBUG；CMD_REQ 本身的成功/失败由各 cmd handler 自打。 */
-    llog(LOG_DEBUG, "uds-cmd", "CMD_REQ argv0='%s' argv1_len=%zu ticket=%u",
-         argv0, argv1_len, ticket);
+    llog(LOG_DEBUG, "uds-cmd",
+         "CMD_REQ argv0='%s' argc=%d is_payload=%d ticket=%u",
+         argv[0] ? argv[0] : "-", argc, is_payload, ticket);
 
-    /* 把 argv1 拷贝到临时 buffer（cmd_execute 可能原地修改 argv[1]） */
-    char *argv1_copy = NULL;
-    if (argv1_len > 0) {
-        argv1_copy = (char *)malloc(argv1_len + 1);
-        if (!argv1_copy) goto cleanup;
-        memcpy(argv1_copy, argv1, argv1_len);
-        argv1_copy[argv1_len] = '\0';
-    }
-
-    char *argv[2] = { argv0, argv1_copy };
-    int argc = argv1_copy ? 2 : 1;
     int rc = cmd_execute(reg, &ctx, argc, argv);
     (void)rc;
 
-cleanup:
     /* 把命令结果作为 FT_CMD_RSP 发回 Rust 端
      * conn_lock 保护 fd_cmd 不被 reconnect 并发重建，
      * cmd_lock 保护 send 分片（uds_send_fragmented_locked 假设调用者持锁）。 */
@@ -555,8 +612,8 @@ cleanup:
             pthread_mutex_unlock(&g.cmd_lock);
         }
     }
-    free(argv1_copy);
     free(io.buf);
+    free(work);
 }
 
 /* 校验 magic + total_len + flags，然后按 frame_type 分发。
@@ -960,12 +1017,26 @@ static void *shard_consumer_thread(void *arg)
 /* ========================================================================
  * CMD poll 线程（独立，只管 CMD/HELLO/HEARTBEAT 的收和回）
  * 旧 uds_client_thread 拆出来的 CMD 通道循环
+ *
+ * ★ Web 重启后 C 侧重连机制：
+ *   nsbc-web 重启会 unlink + 重新 bind data_cmd.sock（inode 变化）。
+ *   C 侧旧 fd_cmd 指向旧 inode，poll(POLLIN) 永远等不到新 inode 数据。
+ *   本线程每 5s 主动 send_hello，若连续 2 次超时未收到任何帧 →
+ *   mark_broken → reconnect → open 新 inode → send HELLO → Rust 侧
+ *   recv_from 拿到 peer 路径 → 更新 CORE_PEER_CMD_PATH → 恢复。
  * ======================================================================*/
+
+#define CMD_POLL_TIMEOUT_MS       500    /* poll 单轮超时 */
+#define CMD_HEARTBEAT_INTERVAL_MS 3000   /* 两次 HELLO 间隔：3s */
+#define CMD_FORCE_RECONNECT_MS    6000   /* 6s 无任何帧 → 强制重连 */
 
 static void *cmd_poll_thread(void *ud)
 {
     (void)ud;
     g.backoff_ms = UDS_RECONNECT_BASE_MS;
+
+    uint64_t last_hb_ms = 0;     /* 上次发 HELLO 时间 */
+    int      missed_rx = 0;      /* 连续几轮没收到任何帧 */
 
     for (;;) {
         if (g.stop_flag) break;
@@ -986,9 +1057,11 @@ static void *cmd_poll_thread(void *ud)
                 continue;
             }
             g.backoff_ms = UDS_RECONNECT_BASE_MS;
+            missed_rx = 0;
             llog(LOG_NOTICE, "uds", "connected to %s + %s, sending hello",
                  g.path_push, g.path_cmd);
             send_hello();
+            last_hb_ms = nsbc_now_ms();
         }
 
         /* poll: fd_cmd (POLLIN) + wake_cmd (POLLIN)
@@ -1001,16 +1074,18 @@ static void *cmd_poll_thread(void *ud)
         pfd[nfds].events = POLLIN;
         nfds++;
 
-        int pr = poll(pfd, nfds, 500);
+        int pr = poll(pfd, nfds, CMD_POLL_TIMEOUT_MS);
         if (g.stop_flag) break;
         if (pr < 0) {
             if (errno == EINTR) continue;
             pthread_mutex_lock(&g.conn_lock);
             mark_broken_locked();
             pthread_mutex_unlock(&g.conn_lock);
+            missed_rx = 0;
             continue;
         }
 
+        int got_frame = 0;
         /* fd_cmd 可读 —— 收 RSP / HELLO_ACK / HEARTBEAT */
         if (fdc >= 0 && (pfd[0].revents & (POLLIN | POLLHUP | POLLERR))) {
             if (recv_cmd_once() != 0) {
@@ -1018,14 +1093,46 @@ static void *cmd_poll_thread(void *ud)
                 mark_broken_locked();
                 pthread_mutex_unlock(&g.conn_lock);
                 llog(LOG_INFO, "uds", "datagram path reset by peer, reconnecting");
+                missed_rx = 0;
                 continue;
             }
+            got_frame = 1;
         }
         /* wake pipe —— stop 或其它 */
         if (pfd[nfds-1].revents & POLLIN) {
             char buf[64];
             while (read(g.wake_cmd_rd, buf, sizeof(buf)) > 0)
                 ;
+        }
+
+        /* ---- Heartbeat: 每 3s 主动 send HEARTBEAT 验证链路 ----
+         * ★ 必须是 HEARTBEAT 不是 HELLO：
+         *   - HELLO 会触发 Rust 侧 push_all（14 kinds 全量 reload）
+         *   - HEARTBEAT Rust 侧只回 ACK，不触发任何 reload
+         *   Web 重启后 data_cmd.sock inode 变化 → 旧 fd connect 到旧 inode →
+         *   poll 永远等不到新 socket 数据。本逻辑连续 CMD_FORCE_RECONNECT_MS
+         *   没收到帧 → mark_broken → reopen → connect 新 inode → HELLO 能到。 */
+        uint64_t now = nsbc_now_ms();
+        if (got_frame) {
+            missed_rx = 0;
+        } else {
+            missed_rx++;
+            /* 超过 3s 没收到 → 发 HEARTBEAT ping */
+            if (now - last_hb_ms >= CMD_HEARTBEAT_INTERVAL_MS) {
+                send_heartbeat();
+                last_hb_ms = now;
+                /* 累计超过 6s 无任何帧 → 强制重连（旧 fd 指向旧 inode） */
+                if (missed_rx * CMD_POLL_TIMEOUT_MS > CMD_FORCE_RECONNECT_MS) {
+                    llog(LOG_WARN, "uds",
+                         "no cmd frame for %dms (last_recv=%llu), forcing reconnect",
+                         missed_rx * CMD_POLL_TIMEOUT_MS,
+                         (unsigned long long)g.last_recv_ms);
+                    pthread_mutex_lock(&g.conn_lock);
+                    mark_broken_locked();
+                    pthread_mutex_unlock(&g.conn_lock);
+                    missed_rx = 0;
+                }
+            }
         }
     }
 

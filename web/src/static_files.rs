@@ -55,9 +55,26 @@ async fn serve(rel: &str) -> Response {
     match tokio::fs::read(&canonical).await {
         Ok(data) => {
             let ctype = content_type(&canonical);
+            // Cache-Control 策略：
+            // - HTML (index.html 等): no-store，绝不缓存，每次都去服务器拿最新
+            // - 带 ?v= 的 JS/CSS: public, max-age=31536000, immutable（版本号变了就新 URL）
+            // - vendor/* 不带版本号: public, max-age=3600（最多缓存 1 小时）
+            let is_html = canonical.extension().and_then(|e| e.to_str()) == Some("html");
+            let is_vendor = rel.starts_with("vendor/");
+            let cache_control = if is_html {
+                "no-store"
+            } else if is_vendor {
+                "public, max-age=3600"
+            } else {
+                // 带 ?v= 的业务 JS/CSS
+                "public, max-age=31536000, immutable"
+            };
             (
                 StatusCode::OK,
-                [(header::CONTENT_TYPE, ctype)],
+                [
+                    (header::CONTENT_TYPE, ctype),
+                    (header::CACHE_CONTROL, cache_control),
+                ],
                 Body::from(data),
             )
                 .into_response()

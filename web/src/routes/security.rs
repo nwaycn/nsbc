@@ -4,6 +4,14 @@
 //!   GET    /security/bans?query=IP fragment → list (L0 read-only)
 //!   DELETE /security/bans/{ip}              → unban (L1 write by default)
 //!
+//! System firewall (nftables nsbc-auto-ban table — kernel-level DROP at NIC):
+//!   GET    /security/firewall            → list IPs currently pushed into nftables
+//!   POST   /security/firewall/sync       → pull live ban list from core + push all to nftables (差集, 幂等)
+//!   POST   /security/firewall/add        → push ONE IP into nftables (manual, independent of core ban list)
+//!   POST   /security/firewall/del        → remove ONE IP from nftables
+//!   All of these run inside spawn_blocking — nft binary is synchronous.
+//!   Background auto-sync task (fw::spawn in main.rs) keeps nftables in lockstep every 60s.
+//!
 //! Static fence (NIP three layers: IP CIDR / UA / number prefix, deny+allow dual mode):
 //!   GET    /security/blacklist?kind=deny|allow&type=... → list (L0)
 //!   POST   /security/blacklist                          → add (L1)
@@ -34,6 +42,7 @@ use serde_json::{json, Value};
 use crate::coreclient::CoreApi;
 use crate::db::{SecurityBlacklistCreate, SecurityBlacklistUpdate, SecurityConfig};
 use crate::error::{ApiError, ApiResult};
+use crate::fw;
 use crate::AppState;
 
 pub fn router<C>() -> Router<Arc<AppState<C>>>
@@ -41,8 +50,12 @@ where
     C: CoreApi + Clone + 'static,
 {
     Router::new()
-        .route("/security/bans", get(list_bans::<C>))
+        .route("/security/bans", get(list_bans::<C>).post(manual_ban::<C>))
         .route("/security/bans/:ip", delete(unban::<C>))
+        .route("/security/firewall", get(fw_list::<C>))
+        .route("/security/firewall/sync", post(fw_sync::<C>))
+        .route("/security/firewall/add", post(fw_add::<C>))
+        .route("/security/firewall/del", post(fw_del::<C>))
         .route(
             "/security/blacklist",
             get(list_blacklist::<C>).post(create_blacklist::<C>),
@@ -91,7 +104,43 @@ async fn list_bans<C: CoreApi + Clone>(
     Ok(axum::Json(json!({ "total": total, "data": data })))
 }
 
-async fn unban<C: CoreApi + Clone>(
+/// POST /security/bans — ops 手动封 IP，跳过 fail2ban 阈值。
+/// Body: { "ip": "1.2.3.4", "duration_s": 3600 }  (duration_s 可选，默认 security.ban_duration_s)
+/// 两层同步生效：先写 core ban 表（nsbc 进程内立即丢弃），再即时推 nftables drop（内核层静默）。
+/// 若 IP 已被 auto-ban，会延长剩余时间到 max(auto, now+duration)（不削短）。
+async fn manual_ban<C: CoreApi + Clone + Send + Sync + 'static>(
+    State(st): State<Arc<AppState<C>>>,
+    Json(body): Json<BanIpBody>,
+) -> ApiResult<axum::Json<Value>> {
+    if !is_safe_ip_fragment(&body.ip) || body.ip.is_empty() {
+        return Err(ApiError::BadRequest("invalid ip".into()));
+    }
+    let duration_s = body.duration_s.unwrap_or(0); // 0 → core 用自己的 ban_duration_s 配置
+
+    // 1) core 写入 ban entry（立即生效）
+    st.core
+        .security_ban_add(&body.ip, duration_s)
+        .await
+        .map_err(|e| ApiError::ServiceUnavailable(format!("core reject: {e}")))?;
+
+    // 2) 同步推 nftables（不等 60s auto-sync）
+    let ip2 = body.ip.clone();
+    let _ = tokio::task::spawn_blocking(move || fw::add_ip(&ip2)).await;
+
+    Ok(axum::Json(json!({
+        "ok": true, "ip": body.ip, "duration_s": duration_s, "fw_synced": true,
+        "note": "core ban + nftables drop 同步生效；unban 走 DELETE /security/bans/{ip} 一键清两层",
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct BanIpBody {
+    pub ip: String,
+    #[serde(default)]
+    pub duration_s: Option<u64>,
+}
+
+async fn unban<C: CoreApi + Clone + Send + Sync + 'static>(
     State(st): State<Arc<AppState<C>>>,
     Path(ip): Path<String>,
 ) -> ApiResult<axum::Json<Value>> {
@@ -99,7 +148,19 @@ async fn unban<C: CoreApi + Clone>(
         return Err(ApiError::BadRequest("invalid ip".into()));
     }
     st.core.security_ban_unban(&ip).await?;
-    Ok(axum::Json(json!({ "ok": true, "ip": ip })))
+
+    // Also remove from nftables immediately — do NOT wait for the 60s auto-sync
+    // tick that would otherwise purge it on the next flush+replace. This covers
+    // the "ops unban after auto-ban false-positive" case — packets must flow again NOW.
+    // Fail-open: if fw remove fails (e.g. nft missing, or IP was never pushed to fw),
+    // the core unban already took effect — auto-sync will clean up eventually.
+    let ip2 = ip.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        let _ = fw::remove_ip(&ip2);
+    })
+    .await;
+
+    Ok(axum::Json(json!({ "ok": true, "ip": ip, "fw_synced": true })))
 }
 
 // ====================== Validation helpers ======================
@@ -431,4 +492,91 @@ async fn put_config<C: CoreApi + Clone + Send + Sync + 'static>(
     // Trigger C reload (re-reads cfg from YAML via cfg_get)
     crate::sync::spawn_push(st.clone(), crate::sync::Kind::SecurityBlacklist);
     Ok(axum::Json(saved))
+}
+
+// ====================== nftables firewall ======================
+
+/// GET /security/firewall — list IPs currently in the nftables `nsbc_ban` set.
+async fn fw_list<C: CoreApi + Clone>(
+    State(_st): State<Arc<AppState<C>>>,
+) -> ApiResult<axum::Json<Value>> {
+    let ips = tokio::task::spawn_blocking(fw::list_ips)
+        .await
+        .map_err(|e| ApiError::ServiceUnavailable(e.to_string()))?.map_err(|e| ApiError::ServiceUnavailable(e.to_string()))?;
+    Ok(axum::Json(json!({
+        "table": fw::NFT_TABLE,
+        "set_v4": fw::NFT_SET_V4,
+        "set_v6": fw::NFT_SET_V6,
+        "count": ips.len(),
+        "ips": ips,
+    })))
+}
+
+/// POST /security/firewall/sync — pull live ban list from core, push all still-banned IPs into nftables.
+/// 差集语义：先 flush 再 add，自动清理过期 ban。幂等（重复调用结果相同）。
+async fn fw_sync<C: CoreApi + Clone + Send + Sync + 'static>(
+    State(st): State<Arc<AppState<C>>>,
+) -> ApiResult<axum::Json<Value>> {
+    let bans = st.core.security_ban_list("").await.map_err(|e| {
+        ApiError::ServiceUnavailable(format!("security.ban.list failed: {e}"))
+    })?;
+    let active = bans
+        .into_iter()
+        .filter(|b| b.remaining_s > 0)
+        .map(|b| b.ip)
+        .collect::<Vec<_>>();
+
+    let active2 = active.clone();
+    let (v4, v6) = tokio::task::spawn_blocking(move || fw::sync_all(&active2))
+        .await
+        .map_err(|e| ApiError::ServiceUnavailable(e.to_string()))?.map_err(|e| ApiError::ServiceUnavailable(e.to_string()))?;
+
+    Ok(axum::Json(json!({
+        "total_banned": active.len(),
+        "pushed_v4": v4,
+        "pushed_v6": v6,
+        "note": "差集同步：nftables 已 flush + replace，过期 ban 已自动剔除",
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct FwIpBody { pub ip: String }
+
+/// POST /security/firewall/add — manually push ONE IP into nftables (independent of core ban list).
+/// Useful when ops wants to pre-block an IP before core's ban threshold fires.
+async fn fw_add<C: CoreApi + Clone + Send + Sync + 'static>(
+    State(_st): State<Arc<AppState<C>>>,
+    Json(body): Json<FwIpBody>,
+) -> ApiResult<axum::Json<Value>> {
+    if !is_safe_ip_fragment(&body.ip) || body.ip.is_empty() {
+        return Err(ApiError::BadRequest("invalid ip".into()));
+    }
+    let ip = body.ip.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), fw::FwError> {
+        fw::ensure_table()?;
+        fw::add_ip(&ip)?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| ApiError::ServiceUnavailable(e.to_string()))?.map_err(|e| ApiError::ServiceUnavailable(e.to_string()))?;
+    Ok(axum::Json(json!({ "ok": true, "ip": body.ip })))
+}
+
+/// POST /security/firewall/del — remove ONE IP from nftables.
+async fn fw_del<C: CoreApi + Clone + Send + Sync + 'static>(
+    State(_st): State<Arc<AppState<C>>>,
+    Json(body): Json<FwIpBody>,
+) -> ApiResult<axum::Json<Value>> {
+    if !is_safe_ip_fragment(&body.ip) || body.ip.is_empty() {
+        return Err(ApiError::BadRequest("invalid ip".into()));
+    }
+    let ip = body.ip.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), fw::FwError> {
+        fw::ensure_table()?;
+        fw::remove_ip(&ip)?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| ApiError::ServiceUnavailable(e.to_string()))?.map_err(|e| ApiError::ServiceUnavailable(e.to_string()))?;
+    Ok(axum::Json(json!({ "ok": true, "ip": body.ip })))
 }

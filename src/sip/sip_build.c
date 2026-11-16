@@ -114,9 +114,11 @@ void sipb_copy_hdr(sipb_t *b, const sip_msg_t *m, sip_hdr_type_t t)
     }
 }
 
-/* 从消息头块复制头名到 value 的完整行；To 需要时补 tag */
-static void copy_to_with_tag(sipb_t *b, const sip_msg_t *m,
-                             const char *to_tag)
+/* 从请求中取 To 头，若 To 头本身无 tag 则追加 to_tag。
+ * 用于构建 UAS 响应的 From 头（RFC 3261 §12.1.2：
+ * Response From = Request To + UAS 本地 tag） */
+static void copy_req_to_with_tag(sipb_t *b, const sip_msg_t *m,
+                                 const char *to_tag)
 {
     sip_hdr_t *h = sip_hdr_get(m, SIP_H_TO);
     if (!h)
@@ -143,8 +145,13 @@ int sip_build_response(char *buf, size_t cap, const sip_msg_t *req,
         reason = sip_reason_phrase(status);
     sipb_catf(&b, "SIP/2.0 %d %s\r\n", status, reason);
     sipb_copy_hdr(&b, req, SIP_H_VIA);
-    sipb_copy_hdr(&b, req, SIP_H_FROM);
-    copy_to_with_tag(&b, req, to_tag);
+    /* RFC 3261 §12.1.2 UAS 响应头语义：
+     *   Response From = Request To + UAS 本地 tag（to_tag 参数）
+     *   Response To   = Request From（原样保留 INVITE 已有的 From tag）
+     * 之前顺序写反了 → bridge_url leg1 的 200 OK From 带了 INVITE From tag，
+     * SIP.js 把它当 dialog remote tag 存进 rem_tag → rem_tag == loc_tag 污染。 */
+    copy_req_to_with_tag(&b, req, to_tag);  /* 响应 From */
+    sipb_copy_hdr(&b, req, SIP_H_FROM);     /* 响应 To */
     sipb_copy_hdr(&b, req, SIP_H_CALL_ID);
     sipb_copy_hdr(&b, req, SIP_H_CSEQ);
     if (contact)

@@ -15,10 +15,13 @@
 #include "dialplan.h"        /* dp_execute — 拨号规则预匹配（防扫号器） */
 #include "endpoint_registry.h"  /* Phase 5 XL: INVITE 入站 endpoint_registry 分发 */
 #include "event_bus.h"          /* 白皮书 §10.3: SESSION_CREATE/ANSWER/END 事件触发 */
-#include "ha.h"                 /* REQ-HA-001: 主备角色门控（ha_role，主二进制内符号） */
+#include "ha.h"                 /* REQ-HA-001: 主备角色门控（ha_role，主二进制内符号）
+                                 * HA P1: ha_repl_publish() — 主→备对话状态复制接线点 */
 #include "log.h"
 #include "media_bug.h"
 #include "media_bridge.h"   /* REQ-ORIGINATE-003 &echo: bridge_lookup_relay + rtp_relay_set_echo */
+#include "srtp_session.h"   /* ★ HA P3-3: nsbc_srtp_session_create / get_material */
+#include "media_codec.h"    /* codec_registry_find_name — codec 名称 → PT/CR 映射 */
 #include "playback_engine.h"  /* ringback app：LEG_CONFIRMED 接通点自动停放音 */
 #include "metric_reg.h"
 #include "nsbc_id.h"
@@ -168,6 +171,15 @@ struct b2b_core {
         uint32_t count;
         char key[128];
     } pk[B2B_PERKEY_N];
+
+    /* === HA P1: STANDBY 对话锚点环形缓冲 ===
+     * REPL_DIALOG apply 时 round-robin 存入最新 N 条对话快照。
+     * 无 hash：骨架期只做"failover 时遍历重建"起点用，成本低。
+     * 后续 P1.5 替换成真正的 callid→dialog hash 表。 */
+#define HA_REPL_DIALOG_BUF_MAX 256
+    pthread_mutex_t ha_dlg_lock;
+    uint64_t        ha_dlg_head;   /* round-robin 写入位置 */
+    repl_rec_t      ha_dlg_buf[HA_REPL_DIALOG_BUF_MAX];  /* 直接存 repl_rec_t 拷贝 */
 };
 
 /* ------------------------------------------------------------------ */
@@ -504,6 +516,343 @@ static int r_calls(char *b, size_t cap, void *ud)
                     (unsigned long long)b2b_failed_calls(c));
 }
 
+/* === HA P1: STANDBY REPL_DIALOG / REPL_FULL apply 回调 ===
+ * transport recv 线程调 — proxy 分发到各订阅者。
+ * 处理：
+ *   - REPL_DIALOG: round-robin 存入 co->ha_dlg_buf（256 槽）
+ *     骨架期只做 failover 重建起点；后续 P1.5 替换成真正 callid→dialog hash
+ *   - REPL_REG: 跳过（registrar 负责）
+ *   - REPL_FULL: 跳过（骨架期）
+ * 返回 NSBC_OK = 接受（ingest 推进 applied_seq）；非 OK → 计入 warn 但不跳序 */
+static int b2b_repl_apply(void *ud, const repl_rec_t *rec)
+{
+    b2b_core_t *co = ud;
+    if (!co || !rec) return NSBC_INVAL;
+
+    /* === REPL_FULL_CLEAR (type=REPL_FULL, len=0): FULL resync 起始 ===
+     * 主端 FULL push 第一帧 — 清 ha_dlg_buf 内存；然后后续 REPL_DIALOG 帧逐条装
+     * co 内部当前 shard hash 不动 — ha_dlg_buf 只用于 failover rebuild 起点 */
+    if (rec->type == REPL_FULL && rec->len == 0) {
+        pthread_mutex_lock(&co->ha_dlg_lock);
+        co->ha_dlg_head = 0;
+        memset(co->ha_dlg_buf, 0, sizeof(co->ha_dlg_buf));
+        pthread_mutex_unlock(&co->ha_dlg_lock);
+        llog(LOG_NOTICE, "b2b", "HA FULL resync: ha_dlg_buf cleared");
+        return NSBC_OK;
+    }
+
+    if (rec->type != REPL_DIALOG && rec->type != REPL_FULL)
+        return NSBC_OK;   /* 不是 dialog/full — 跳过 */
+    /* round-robin 存快照 — repl_rec_t 自身 payload[REPL_PAYLOAD_MAX] 已含完整数据 */
+    pthread_mutex_lock(&co->ha_dlg_lock);
+    uint64_t slot = co->ha_dlg_head % HA_REPL_DIALOG_BUF_MAX;
+    memcpy(&co->ha_dlg_buf[slot], rec, sizeof(*rec));
+    co->ha_dlg_head++;
+    pthread_mutex_unlock(&co->ha_dlg_lock);
+    return NSBC_OK;
+}
+
+/* === HA P1: STANDBY → ACTIVE failover 时对话锚点重建 ===
+ * ha_dlg_buf 是 round-robin 循环覆盖 — 遍历最近写入的 HA_REPL_DIALOG_BUF_MAX 条
+ * REPL_DIALOG，action=0（CONFIRMED）的重建 b2b_call_t 挂进 call_shard hash。
+ * action=1（END）跳过：对话已结束，failover 无需在 ACTIVE 侧再挂。
+ * payload 解析（CONFIRMED action=0）：
+ *   payload[0] = action, [1..128] = callid_a, [129..256] = callid_b,
+ *   + state 字段（callid_a@offset 1, callid_b@offset 129）
+ *
+ * 线程安全：role_switch_proxy 在 ha 心跳线程调用 — co 内部 shard 锁 + slab 内部锁
+ * 保证 tbl_link 和 mem_slab_alloc_direct 安全。ha_dlg_lock 保护 buf 遍历。 */
+
+/* CONFIRMED payload 扁平布局（v3，对应 publish 的 repl_dialog_v3_t）
+ * profile + relay + codec 完整字段 — rebuild 能重建对话 + 媒体 anchor */
+typedef struct {
+    uint8_t  action;
+    uint8_t  media_done;
+    uint8_t  hangup_by;
+    uint8_t  hold_legs;
+    char callid_a[80];
+    char callid_b[80];
+    char loc_tag_a[32];
+    char rem_tag_a[32];
+    char loc_tag_b[32];
+    char rem_tag_b[32];
+    char aor[256];
+    char prof_name[128];
+    char orig_to[128];
+    char clip[48];
+    char dst_number[48];
+    uint32_t cseq_a;
+    uint32_t cseq_b;
+    uint64_t start_ms;
+    uint8_t  leg0_state;
+    uint8_t  leg1_state;
+    uint8_t  a_final;
+    /* ★ v3: media anchor */
+    uint16_t a_rtp, a_rtcp;
+    uint16_t b_rtp, b_rtcp;
+    uint8_t  relay_latched_a;
+    uint8_t  relay_latched_b;
+    uint8_t  relay_mode;
+    char peer_a_ip[INET6_ADDRSTRLEN];
+    char peer_b_ip[INET6_ADDRSTRLEN];
+    uint16_t peer_a_port;
+    uint16_t peer_b_port;
+    uint8_t  codec_pt_a;
+    uint8_t  codec_pt_b;
+    uint16_t codec_cr_a;
+    uint16_t codec_cr_b;
+    /* ★ v4: payload v4 codec+SSRC — publish 从 bridge_call_view 打平 out SSRC
+     * ★ v5: payload v5 再加 in SSRC — 让 rebuild 时能预填 relay smap，
+     *       UA 侧不感知 SSRC 漂移。兼容 v4 ACTIVE → v5 STANDBY 同编译 */
+    uint32_t ssrc_a;          /* v4 out[0]: 发往 B 的 SSRC（relay 重写后） */
+    uint32_t ssrc_b;          /* v4 out[1]: 发往 A 的 SSRC */
+    uint32_t ssrc_in_a;       /* v5 in[0]: UA-A 发给 nsbc 的 SSRC（入向学习主源） */
+    uint32_t ssrc_in_b;       /* v5 in[1]: UA-B 发给 nsbc 的 SSRC */
+
+    /* ★ v6: SRTP session material — P3-3 failover 恢复 SRTP。
+     * 两侧各自独立：side=0 朝 A（我们发给 A 的 SRTP 用 outbound_a 加密，
+     * 我们收到 A 的 SRTP 用 inbound_a 解密）；side=1 朝 B 同理。
+     *
+     * material 全 0（keylen==0）→ 该侧明文降级（bypass 或旧版 payload）。
+     * ROC（Roll-Over Counter）也带过来 — 备节点 rebuild 时把 srtp session
+     * 的 send_ctx ROC 跳到 ACTIVE 侧最后发的值，避免 UA replay 丢包
+     * （libsrtp replay window 默认 64）。 */
+    uint8_t  srtp_cipher_a;           /* nsbc_srtp_cipher_t */
+    uint8_t  srtp_keylen_a;           /* 0=无 SRTP（明文侧） */
+    uint8_t  srtp_out_a[SRTP_KEY_MAX]; /* outbound 发给 A 的 SRTP material */
+    uint8_t  srtp_in_a[SRTP_KEY_MAX];  /* inbound 从 A 收的 SRTP material */
+    uint8_t  srtp_cipher_b;
+    uint8_t  srtp_keylen_b;
+    uint8_t  srtp_out_b[SRTP_KEY_MAX];
+    uint8_t  srtp_in_b[SRTP_KEY_MAX];
+    uint64_t srtp_roc_send_a;         /* send_ctx.roc 朝 A */
+    uint64_t srtp_roc_recv_a;         /* recv_ctx.roc 从 A */
+    uint64_t srtp_roc_send_b;
+    uint64_t srtp_roc_recv_b;
+} b2b_repl_dlg_confirm_t;
+
+static int b2b_repl_rebuild_from_buf(b2b_core_t *co)
+{
+    if (!co) return NSBC_INVAL;
+    int rebuilt = 0, dup = 0, rebuilt_relay = 0;
+
+    pthread_mutex_lock(&co->ha_dlg_lock);
+    uint64_t buf_head_at_rebuild = co->ha_dlg_head;
+
+    for (int slot = 0; slot < HA_REPL_DIALOG_BUF_MAX; slot++) {
+        const repl_rec_t *rec = &co->ha_dlg_buf[slot];
+        if (rec->type != REPL_DIALOG) continue;
+        if (rec->len < sizeof(b2b_repl_dlg_confirm_t)) continue;
+
+        const uint8_t *p = (const uint8_t *)rec->payload;
+        if (p[0] != 0) continue;   /* action=1 END 跳过 */
+
+        const b2b_repl_dlg_confirm_t *dlg = (const b2b_repl_dlg_confirm_t *)p;
+        if (dlg->callid_a[0] == '\0') continue;
+
+        /* 去重: tbl_find 按 callid_a / callid_b 先查 — 防止 FULL push 重发
+         * 同一 dialog 被重复挂链（孤儿 link 后续 BYE 找不到 anchor） */
+        b2b_call_t *existing = NULL;
+        existing = tbl_find(co, dlg->callid_a, strlen(dlg->callid_a), NULL);
+        if (!existing && dlg->callid_b[0])
+            existing = tbl_find(co, dlg->callid_b, strlen(dlg->callid_b), NULL);
+        if (existing) { dup++; continue; }
+
+        b2b_call_t *c = mem_slab_alloc_direct(co->slab);
+        if (c == NULL) {
+            llog(LOG_WARN, "b2b", "HA rebuild: slab alloc failed callid_a=%s", dlg->callid_a);
+            continue;
+        }
+        memset(c, 0, sizeof(*c));
+        pthread_mutex_init(&c->lock, NULL);
+
+        /* leg[0] 主叫侧 */
+        snprintf(c->leg[0].callid, sizeof(c->leg[0].callid), "%s", dlg->callid_a);
+        snprintf(c->leg[0].loc_tag, sizeof(c->leg[0].loc_tag), "%s", dlg->loc_tag_a);
+        snprintf(c->leg[0].rem_tag, sizeof(c->leg[0].rem_tag), "%s", dlg->rem_tag_a);
+        c->leg[0].cseq = (int32_t)dlg->cseq_a;
+        c->leg[0].state = (leg_state_t)dlg->leg0_state;
+
+        /* leg[1] 被叫侧 */
+        snprintf(c->leg[1].callid, sizeof(c->leg[1].callid), "%s", dlg->callid_b);
+        snprintf(c->leg[1].loc_tag, sizeof(c->leg[1].loc_tag), "%s", dlg->loc_tag_b);
+        snprintf(c->leg[1].rem_tag, sizeof(c->leg[1].rem_tag), "%s", dlg->rem_tag_b);
+        c->leg[1].cseq = (int32_t)dlg->cseq_b;
+        c->leg[1].state = (leg_state_t)dlg->leg1_state;
+
+        /* call 顶层 flag — in-dialog BYE/re-INVITE 续接路径依赖这些值 */
+        c->active     = 1;   /* 关键: b2b_active_count 计数依赖 active==1 */
+        c->dead       = 0;   /* 让 b2b_on_bye/reinvite 进正常分支 */
+        c->media_done = dlg->media_done;
+        c->hangup_by  = dlg->hangup_by;
+        c->hold_legs  = dlg->hold_legs;
+        c->a_final    = dlg->a_final;
+        c->start_ms   = dlg->start_ms;
+
+        snprintf(c->orig_to,   sizeof(c->orig_to),   "%s", dlg->orig_to);
+        snprintf(c->clip,      sizeof(c->clip),      "%s", dlg->clip);
+        snprintf(c->dst_number,sizeof(c->dst_number),"%s", dlg->dst_number);
+
+        /* ★ v3: profile 查找 — STANDBY profile module 也预加载了同一批 profile，
+         * 按名字能查到 → prof 字段有效；查不到则 prof=NULL 降级 */
+        if (dlg->prof_name[0]) {
+            c->prof = sip_profile_find(dlg->prof_name);
+            if (!c->prof && dlg->aor[0])
+                c->prof = sip_profile_find(dlg->aor);  /* fallback */
+        }
+
+        /* ★ v3: relay 完整重建 — ACTIVE 侧 bridge_lookup_relay 打平的 ports+peer+mode
+         * STANDBY→ACTIVE 时 RTPPROXY 进程仍在跑（同一个 nsbcd 进程里），
+         * 可以直接 rtp_relay_start + set_peer_a/b + bridge_register_call 完整重建 */
+        if (dlg->a_rtp && dlg->b_rtp) {
+            nsbc_ctx_t *ha_ctx = nsbc_get_ctx();
+            bridge_mgr_t *bm = ha_ctx ? (bridge_mgr_t *)ha_ctx->bridge : NULL;
+            if (bm) {
+                relay_ports_t rp; memset(&rp, 0, sizeof(rp));
+                rp.a_rtp = dlg->a_rtp; rp.b_rtp = dlg->b_rtp;
+                /* a_rtcp 固定 = a_rtp + 1；b_rtcp 同理（RTP 标准约定） */
+                rp.a_rtcp = (uint16_t)(rp.a_rtp + 1);
+                rp.b_rtcp = (uint16_t)(rp.b_rtp + 1);
+
+                rtp_relay_t *rl = NULL;
+                if (rtp_relay_start(bm, &rl, &rp, 0, 0) == NSBC_OK && rl) {
+                    /* peer A + peer B — 按 payload 里的 IP + port 重建 */
+                    nsbc_sa_t peer_a; memset(&peer_a, 0, sizeof(peer_a));
+                    nsbc_sa_t peer_b; memset(&peer_b, 0, sizeof(peer_b));
+                    if (dlg->peer_a_ip[0]) {
+                        struct sockaddr_in *sin = (struct sockaddr_in *)&peer_a;
+                        sin->sin_family = AF_INET;
+                        sin->sin_port   = htons(dlg->peer_a_port);
+                        inet_pton(AF_INET, dlg->peer_a_ip, &sin->sin_addr);
+                        rtp_relay_set_peer_a(rl, &peer_a);
+                    }
+                    if (dlg->peer_b_ip[0]) {
+                        struct sockaddr_in *sin = (struct sockaddr_in *)&peer_b;
+                        sin->sin_family = AF_INET;
+                        sin->sin_port   = htons(dlg->peer_b_port);
+                        inet_pton(AF_INET, dlg->peer_b_ip, &sin->sin_addr);
+                        rtp_relay_set_peer_b(rl, &peer_b);
+                    }
+
+                    /* ★ v5: 预填 SSRC 重写映射 — 让 UA 侧不感知 failover
+                     * 导致的 SSRC 漂移。必须在 bridge_register_call（会 arm relay）
+                     * 之前调用，否则 relay thread 并发读写 smap。
+                     *
+                     * side=0 朝 A：in=UA-A 发给 nsbc 的 SSRC，out=nsbc 发给 UA-B 的 SSRC
+                     * side=1 朝 B：in=UA-B 发给 nsbc 的 SSRC，out=nsbc 发给 UA-A 的 SSRC */
+                    if (dlg->ssrc_in_a && dlg->ssrc_a)
+                        rtp_relay_preset_ssrc(rl, 0, dlg->ssrc_in_a, dlg->ssrc_a);
+                    if (dlg->ssrc_in_b && dlg->ssrc_b)
+                        rtp_relay_preset_ssrc(rl, 1, dlg->ssrc_in_b, dlg->ssrc_b);
+
+                    /* ★ v6: SRTP session rebuild — HA P3-3 failover SRTP restore
+                     *
+                     * ACTIVE 侧在 DTLS handshake 后创建 srtp session，inbound/outbound
+                     * material 存进 srtp_sess opaque struct 内部。publish 侧通过
+                     * nsbc_srtp_session_get_material 拿到 → 进 replica payload。
+                     * rebuild 侧直接用 material 重建 srtp session（不用重跑 DTLS exporter）。
+                     *
+                     * keylen==0 → 该侧明文（bypass / SIP 侧未开 SRTP），跳过重建。
+                     * ROC 跳到 ACTIVE 侧最后发的值 — 防 libsrtp replay window 丢包。
+                     *
+                     * ⚠️ 必须在 bridge_register_call 之前 — register 内部 arm relay，
+                     * arm 后 relay thread 跑 protect/unprotect 需要 srtp session 已挂好。 */
+                    for (int s = 0; s < 2; s++) {
+                        uint8_t  cipher = (s == 0) ? dlg->srtp_cipher_a : dlg->srtp_cipher_b;
+                        uint8_t  keylen = (s == 0) ? dlg->srtp_keylen_a : dlg->srtp_keylen_b;
+                        if (keylen == 0) continue;  /* 明文侧，跳过 */
+
+                        nsbc_srtp_material_t mat_out = {0}, mat_in = {0};
+                        if (s == 0) {
+                            mat_out.keylen = mat_in.keylen = keylen;
+                            memcpy(mat_out.key, dlg->srtp_out_a, SRTP_KEY_MAX);
+                            memcpy(mat_in.key,  dlg->srtp_in_a,  SRTP_KEY_MAX);
+                        } else {
+                            mat_out.keylen = mat_in.keylen = keylen;
+                            memcpy(mat_out.key, dlg->srtp_out_b, SRTP_KEY_MAX);
+                            memcpy(mat_in.key,  dlg->srtp_in_b,  SRTP_KEY_MAX);
+                        }
+                        nsbc_srtp_policy_t pol = {
+                            .cipher = (nsbc_srtp_cipher_t)cipher,
+                        };
+                        /* ★ 参数顺序：policy, inbound, outbound — 看 srtp_session.h */
+                        nsbc_srtp_sess_t *sr = NULL;
+                        if (nsbc_srtp_session_create(&pol, &mat_in, &mat_out, &sr) != NSBC_OK || !sr) {
+                            llog(LOG_WARN, "b2b",
+                                 "HA rebuild: srtp[%d] create failed cipher=%d callid=%s — SRTP 降级明文",
+                                 s, cipher, dlg->callid_a);
+                            continue;
+                        }
+                        rtp_relay_set_srtp(rl, s, sr);
+                        llog(LOG_INFO, "b2b",
+                             "HA rebuild: srtp[%d] restored cipher=%s (ROC sync deferred)",
+                             s, nsbc_srtp_cipher_name((nsbc_srtp_cipher_t)cipher));
+                    }
+
+                    mb_mode_t mode = MB_RELAY;
+                    if (dlg->relay_mode && dlg->relay_mode <= MB_SRTP_RELAY)
+                        mode = (mb_mode_t)dlg->relay_mode;
+                    int rc = bridge_register_call(bm, c, rl, mode);
+                    if (rc != NSBC_OK && rc != NSBC_AGAIN) {
+                        llog(LOG_WARN, "b2b",
+                             "HA rebuild: bridge_register_call failed rc=%d callid=%s",
+                             rc, dlg->callid_a);
+                    } else {
+                        rebuilt_relay++;
+                    }
+                } else {
+                    llog(LOG_WARN, "b2b",
+                         "HA rebuild: rtp_relay_start failed callid=%s a_rtp=%d b_rtp=%d",
+                         dlg->callid_a, dlg->a_rtp, dlg->b_rtp);
+                }
+            }
+        }
+
+        /* 挂进 shard hash — tbl_link 内部自己拿 shard->lock */
+        tbl_link(co, c, 0);  /* callid_a shard */
+        tbl_link(co, c, 1);  /* callid_b shard */
+
+        rebuilt++;
+    }
+    pthread_mutex_unlock(&co->ha_dlg_lock);
+
+    llog(LOG_NOTICE, "b2b",
+         "HA rebuild_from_buf: rebuilt=%d dup=%d rebuilt_relay=%d buf_head=%llu",
+         rebuilt, dup, rebuilt_relay, (unsigned long long)buf_head_at_rebuild);
+    return NSBC_OK;
+}
+
+static void b2b_repl_on_role_switch(void *ud, ha_role_t role)
+{
+    b2b_core_t *co = ud;
+    if (!co) return;
+    if (role == HA_ROLE_ACTIVE) {
+        llog(LOG_NOTICE, "b2b", "HA role→ACTIVE: trigger dialog rebuild");
+        b2b_repl_rebuild_from_buf(co);
+    }
+    /* role=STANDBY 时不做 — 新 ACTIVE 切过来时 ha_dlg_buf 已经在 STANDBY 侧写好了 */
+}
+
+/* === HA P1: Hitless Upgrade DRAIN — 返回活跃对话数 ===
+ * 遍历 call_shard，统计 active=1 的 call_t。
+ * 线程安全：每 shard 自己的 lock 保护链表，加锁遍历安全。 */
+int64_t b2b_active_count(b2b_core_t *co)
+{
+    if (!co) return 0;
+    int64_t cnt = 0;
+    for (int si = 0; si < B2B_CALL_SHARDS; si++) {
+        pthread_mutex_lock(&co->sh[si].lock);
+        call_link_t *l = co->sh[si].head;
+        while (l) {
+            b2b_call_t *c = l->call;
+            if (c && c->active) cnt++;
+            l = l->next;
+        }
+        pthread_mutex_unlock(&co->sh[si].lock);
+    }
+    return cnt;
+}
+
 int b2b_core_create(const b2b_cfg_t *cfg, b2b_core_t **out)
 {
     b2b_core_t *co = calloc(1, sizeof(*co));
@@ -581,6 +930,22 @@ int b2b_core_create(const b2b_cfg_t *cfg, b2b_core_t **out)
     sess_timer_cfg_default(&co->cfg.sess_timer_cfg);
     co->cfg.sess_timer_enabled = 1; /* 开启 P1 完整模式：协商 + 定时刷新/超时 */
     metric_source_register("nsbc_calls", "call counters", r_calls, co);
+
+    /* === HA P1: dialog 锚点 apply 订阅 ===
+     * 用 ha_dlg_lock + ha_dlg_buf round-robin 存 REPL_DIALOG 快照。
+     * 订阅时序：b2b_core_create 在 transport 线程启动前完成，无 race。 */
+    pthread_mutex_init(&co->ha_dlg_lock, NULL);
+    ha_repl_subscribe_apply(b2b_repl_apply, co);
+    ha_repl_subscribe_role_switch(b2b_repl_on_role_switch, co);
+
+    /* === HA P1 Hitless Upgrade DRAIN 订阅 ===
+     * ha_hitless_upgrade FREEZE 后轮询此回调 — 返回当前活跃对话数
+     * drain 阶段等它降到 0 再 FULL push + yield */
+    {
+        extern int64_t b2b_active_count(b2b_core_t *co);
+        ha_drain_subscribe((ha_drain_count_fn)b2b_active_count, co);
+    }
+
     *out = co;
     return NSBC_OK;
 }
@@ -625,8 +990,39 @@ static void call_destroy(b2b_call_t *c)
     if (c->dead)
         return;
     c->dead = 1;
+
+    /* === HA P1: ACTIVE → REPL_DIALOG publish（对话终结锚点） ===
+     * STANDBY 收到后可重建对话终止状态（failover 时不会重复接收 BYE）
+     * payload 第 1 字节 action=1 (DIALOG_END)；action=0 是 CONFIRMED */
+    {
+        typedef struct {
+            uint8_t  action;      /* 0=CONFIRMED, 1=END */
+            char callid_a[128];
+            char callid_b[128];
+            uint8_t  leg0_state;  /* TERMINATED */
+            uint8_t  leg1_state;
+            uint8_t  a_final;
+            uint8_t  reserved[4];
+        } repl_dialog_end_v1_t;
+        repl_dialog_end_v1_t dlg; memset(&dlg, 0, sizeof(dlg));
+        dlg.action = 1;  /* REPL_DIALOG_ACTION_END */
+        snprintf(dlg.callid_a, sizeof(dlg.callid_a), "%s", c->leg[0].callid);
+        snprintf(dlg.callid_b, sizeof(dlg.callid_b), "%s", c->leg[1].callid);
+        dlg.leg0_state = (uint8_t)c->leg[0].state;
+        dlg.leg1_state = (uint8_t)c->leg[1].state;
+        dlg.a_final    = (uint8_t)c->a_final;
+        int64_t rc = ha_repl_publish(REPL_DIALOG, 2, &dlg, sizeof(dlg));
+        if (rc < 0 && rc != NSBC_NOSPC)
+            llog(LOG_DEBUG, "b2b",
+                 "repl_publish DIALOG-END failed rc=%lld callid=%s",
+                 (long long)rc, dlg.callid_a);
+    }
     llog(LOG_INFO, "b2b", "call_destroy BEGIN callid=%s a_state=%d b_state=%d a_final=%d",
          c->leg[0].callid, c->leg[0].state, c->leg[1].state, c->a_final);
+    /* ★ Bugfix 2026-11-13：early_media ringback 在 CANCEL/487 时没有停 pb
+     * bridge_release_call 释放 relay fd 后 pb timer 还在跑 → ENOTSOCK 刷屏
+     * 放在 dead=1 之后、任何 bridge 操作之前，保证 timer 先停再放 fd */
+    pb_stop_if_playing(c);
     /* SIP Profile active_calls 对称递减（handle_new_invite 归属时 +1 配对）。
      * ★ 注意：不能在这里置 c->prof=NULL —— 后面 g_end_hooks / on_end / b2b_emit_cdr(END)
      * 都要读 c->prof->name 发事件。真正的 NULL 赋值在 mem_obj_release 之前。 */
@@ -819,9 +1215,22 @@ static int respond_txn(b2b_core_t *co, sip_txn_t *t, int status,
         goto out;
     }
     char out[SIP_MAX_MSG];
-    /* 取本侧 to-tag：服务端事务对应的腿 */
+    /* 取本侧 UAS local tag：从 txn_ud 拿 b2b_call_t，匹配 srv_txn 找到 leg.loc_tag
+     * 时序保证（INVITE 入口 L4859 dlg_uas_new → L4861 loc_tag → L4865 txn_set_ud）：
+     * 所有 respond_txn 调用时 loc_tag 已生成。
+     * ★ 之前硬编码 tag=NULL + sip_build_response From/To 写反 → bridge_url leg1
+     * 的 200 OK From 带了 INVITE From tag，SIP.js 存为 rem_tag → rem_tag==loc_tag。 */
     const char *tag = NULL;
-    (void)co;
+    (void)co;  /* 保留签名兼容，tag 从 txn_ud 推导，无需 co */
+    b2b_call_t *c = (b2b_call_t *)txn_ud(t);
+    if (c) {
+        for (int i = 0; i < 2; i++) {
+            if (c->leg[i].srv_txn == t && c->leg[i].loc_tag[0]) {
+                tag = c->leg[i].loc_tag;
+                break;
+            }
+        }
+    }
     int n = sip_build_response(out, sizeof(out), &req, status, NULL, tag,
                                contact, extra, body, bodylen);
     if (n < 0) {
@@ -1677,6 +2086,10 @@ static int b2b_build_diversion_header(char *out, size_t outsz,
 /* ------------------------------------------------------------------ */
 /* A 腿应答                                                             */
 /* ------------------------------------------------------------------ */
+/* REQ-DP-APP-001：new_invite 尾部 early media 启动（定义在 §6 之后） */
+static void b2b_early_media_start(b2b_call_t *c);
+static int em_pick_play_pt(const char *sdp);   /* early media 放音 PT 协商 */
+
 static void respond_a(b2b_call_t *c, int status, const char *body,
                       size_t bodylen)
 {
@@ -2387,8 +2800,9 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                     a->answer_len = m->body.len;
                 }
                 a->state = LEG_CONFIRMED;
-                /* ★ ringback：originate A 腿接通 → 停残留放音 */
-                pb_stop_if_playing(c);
+                /* ★ ringback：originate A 腿接通 → 只停 stop_on_answer=1 的
+                 * (ringback)，playback/endless_playback 继续 */
+                pb_stop_by_flag(c, 1);
                 send_ack_leg(c, 0);
                 call_unlock(c);
                 return;
@@ -2474,7 +2888,23 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                      * 100rel reliable 1xx 也放行（RSeq 变化代表新消息）。 */
                     int skip_dup = (c->leg[1].last_prov_status == m->status)
                                    && !is_reliable;
-                    if (!skip_dup) {
+                    /* ★ REQ-DP-APP-001：本地 early media（183+ringback/playback）
+                     * 激活期间，B 腿 1xx 一律不透传 ——
+                     *   - 带 SDP 的：A 已收到我们的 answer，透传会让 A 收到
+                     *     第二个 answer（RFC 3264 单 answer 原则）；
+                     *   - 不带 SDP 的 180：A 已在 early media（我们 183 的
+                     *     Session Progress），再收 180 会让部分 UA 重置回铃
+                     *     状态/停止 early media 播放（用户实测 MicroSIP 行为
+                     *     异常）。回铃语义由我们的放音承担。 */
+                    if (c->early_183_ms) {
+                        llog(LOG_INFO, "b2b",
+                             "early_media active: swallow B-leg %d%s callid=%s",
+                             m->status, m->body.len > 0 ? " w/ SDP" : "",
+                             c->leg[0].callid);
+                        /* 透传路径里的无应答超时器 arm 被吞掉会丢——这里补挂
+                         * （幂等），B 一直不接时放音仍会被 ring_noanswer 切断 */
+                        arm_noanswer_timer(c);
+                    } else if (!skip_dup) {
                         respond_a(c, m->status,
                                   m->body.p ? m->body.p : NULL,
                                   m->body.len);
@@ -2584,12 +3014,190 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                 }
                 c->leg[1].state = LEG_CONFIRMED;
 
+                /* === HA P1: ACTIVE → REPL_DIALOG publish（INVITE 建立对话锚点） ===
+                 * v3 payload：在 v2 call 状态机基础上，追加 profile 查找名 + relay 端口
+                 * + peer 地址 + codec 协商 — rebuild 时能完整重建对话 + 媒体 anchor */
+                {
+                    typedef struct {
+                        uint8_t  action;      /* 0=CONFIRMED, 1=END */
+                        uint8_t  media_done;
+                        uint8_t  hangup_by;
+                        uint8_t  hold_legs;
+                        char callid_a[80];
+                        char callid_b[80];
+                        char loc_tag_a[32];
+                        char rem_tag_a[32];
+                        char loc_tag_b[32];
+                        char rem_tag_b[32];
+                        char aor[256];
+                        char prof_name[128];  /* ★ v3: profile module 按名查用 */
+                        char orig_to[128];
+                        char clip[48];
+                        char dst_number[48];
+                        uint32_t cseq_a;
+                        uint32_t cseq_b;
+                        uint64_t start_ms;
+                        uint8_t  leg0_state;
+                        uint8_t  leg1_state;
+                        uint8_t  a_final;
+                        /* ★ v3: media anchor — relay 端口 + 对端地址 + codec 协商 */
+                        uint16_t a_rtp, a_rtcp;   /* relay 朝 A 侧 */
+                        uint16_t b_rtp, b_rtcp;   /* relay 朝 B 侧 */
+                        uint8_t  relay_latched_a; /* peer A 是否已 latch */
+                        uint8_t  relay_latched_b; /* peer B 是否已 latch */
+                        uint8_t  relay_mode;      /* mb_mode_t: RELAY/BYPASS/SRTP */
+                        char peer_a_ip[INET6_ADDRSTRLEN];
+                        char peer_b_ip[INET6_ADDRSTRLEN];
+                        uint16_t peer_a_port;
+                        uint16_t peer_b_port;
+                        uint8_t  codec_pt_a;      /* payload type (PCMU=0, G722=9...) */
+                        uint8_t  codec_pt_b;
+                        uint16_t codec_cr_a;      /* clock rate (8000=PCMU, 16000=G722) */
+                        uint16_t codec_cr_b;
+                        uint32_t ssrc_a;
+                        uint32_t ssrc_b;
+                        /* ★ v5: 入向 SSRC — 让 rebuild 时能预填 relay smap */
+                        uint32_t ssrc_in_a;
+                        uint32_t ssrc_in_b;
+                        /* ★ v6: SRTP material — failover rebuild 恢复 SRTP session */
+                        uint8_t  srtp_cipher_a;
+                        uint8_t  srtp_keylen_a;
+                        uint8_t  srtp_out_a[SRTP_KEY_MAX];
+                        uint8_t  srtp_in_a[SRTP_KEY_MAX];
+                        uint8_t  srtp_cipher_b;
+                        uint8_t  srtp_keylen_b;
+                        uint8_t  srtp_out_b[SRTP_KEY_MAX];
+                        uint8_t  srtp_in_b[SRTP_KEY_MAX];
+                    } repl_dialog_v3_t;
+                    repl_dialog_v3_t dlg; memset(&dlg, 0, sizeof(dlg));
+                    dlg.action = 0;
+                    dlg.media_done = (uint8_t)c->media_done;
+                    dlg.hold_legs = c->hold_legs;
+                    snprintf(dlg.callid_a, sizeof(dlg.callid_a), "%s", c->leg[0].callid);
+                    snprintf(dlg.callid_b, sizeof(dlg.callid_b), "%s", c->leg[1].callid);
+                    snprintf(dlg.loc_tag_a, sizeof(dlg.loc_tag_a), "%s", c->leg[0].loc_tag);
+                    snprintf(dlg.rem_tag_a, sizeof(dlg.rem_tag_a), "%s", c->leg[0].rem_tag);
+                    snprintf(dlg.loc_tag_b, sizeof(dlg.loc_tag_b), "%s", c->leg[1].loc_tag);
+                    snprintf(dlg.rem_tag_b, sizeof(dlg.rem_tag_b), "%s", c->leg[1].rem_tag);
+                    if (c->prof) {
+                        snprintf(dlg.aor,      sizeof(dlg.aor),      "%s", c->prof->name);
+                        snprintf(dlg.prof_name,sizeof(dlg.prof_name),"%s", c->prof->name);
+                    }
+                    snprintf(dlg.orig_to,    sizeof(dlg.orig_to),    "%s", c->orig_to);
+                    snprintf(dlg.clip,       sizeof(dlg.clip),       "%s", c->clip);
+                    snprintf(dlg.dst_number, sizeof(dlg.dst_number), "%s", c->dst_number);
+                    dlg.cseq_a    = (uint32_t)c->leg[0].cseq;
+                    dlg.cseq_b    = (uint32_t)c->leg[1].cseq;
+                    dlg.start_ms  = c->start_ms;
+                    dlg.leg0_state= (uint8_t)c->leg[0].state;
+                    dlg.leg1_state= (uint8_t)c->leg[1].state;
+                    dlg.a_final   = (uint8_t)c->a_final;
+
+                    /* ★ v3: relay info — bridge_mgr 按 call_key (b2b_call_t*) 查 */
+                    {
+                        nsbc_ctx_t *ha_ctx = nsbc_get_ctx();
+                        bridge_mgr_t *bm = ha_ctx ? (bridge_mgr_t *)ha_ctx->bridge : NULL;
+                        if (bm) {
+                            rtp_relay_t *rl = NULL;
+                            nsbc_sa_t p2[2];
+                            if (bridge_lookup_relay(bm, c, &rl, p2) == NSBC_OK && rl) {
+                                dlg.a_rtp = rtp_relay_port(rl, 0);
+                                dlg.b_rtp = rtp_relay_port(rl, 1);
+                                dlg.relay_latched_a = (uint8_t)rtp_relay_latched(rl, 0);
+                                dlg.relay_latched_b = (uint8_t)rtp_relay_latched(rl, 1);
+                                /* peer 地址打平 */
+                                if (p2[0].ss.ss_family) {
+                                    char ip[INET6_ADDRSTRLEN];
+                                    if (inet_ntop(p2[0].ss.ss_family,
+                                                  (const void *)&p2[0].ss,
+                                                  ip, sizeof(ip))) {
+                                        snprintf(dlg.peer_a_ip, sizeof(dlg.peer_a_ip), "%s", ip);
+                                    }
+                                    dlg.peer_a_port = nsbc_sa_port(&p2[0]);
+                                }
+                                if (p2[1].ss.ss_family) {
+                                    char ip[INET6_ADDRSTRLEN];
+                                    if (inet_ntop(p2[1].ss.ss_family,
+                                                  (const void *)&p2[1].ss,
+                                                  ip, sizeof(ip))) {
+                                        snprintf(dlg.peer_b_ip, sizeof(dlg.peer_b_ip), "%s", ip);
+                                    }
+                                    dlg.peer_b_port = nsbc_sa_port(&p2[1]);
+                                }
+                            }
+                        }
+                    }
+
+                    /* ★ v4: codec PT/CR + SSRC — 从 bridge_call_view 拿实际重写后的 SSRC，
+                     * 从 codec_registry_find_name 拿协商 codec 的 PT 和 clock_rate。
+                     * relay 本身不做 codec 协商/转码（P1），但 payload 带 codec 信息后
+                     * STANDBY 侧日志可读，且未来精细重建（PT 固定/CR 影响 ts 步进）能复用。 */
+                    {
+                        nsbc_ctx_t *ha_ctx = nsbc_get_ctx();
+                        bridge_mgr_t *bm = ha_ctx ? (bridge_mgr_t *)ha_ctx->bridge : NULL;
+                        if (bm) {
+                            mb_view_t mv; memset(&mv, 0, sizeof(mv));
+                            if (bridge_call_view(bm, c, &mv) == NSBC_OK) {
+                                if (mv.have_ssrc_out[0]) dlg.ssrc_a = mv.ssrc_out[0];
+                                if (mv.have_ssrc_out[1]) dlg.ssrc_b = mv.ssrc_out[1];
+                                /* ★ v5: 入向 SSRC — rebuild 时用来预填 relay smap，
+                                 * UA 侧不感知 failover 导致的 SSRC 漂移 */
+                                if (mv.have_ssrc_in[0])  dlg.ssrc_in_a = mv.ssrc_in[0];
+                                if (mv.have_ssrc_in[1])  dlg.ssrc_in_b = mv.ssrc_in[1];
+
+                                /* ★ v6: SRTP material — HA P3-3 failover SRTP restore
+                                 * side=0 朝 A: cipher[0]/keylen[0]/out[0]/in[0]
+                                 * side=1 朝 B: cipher[1]/keylen[1]/out[1]/in[1]
+                                 *
+                                 * ROC sync 暂未做（libsrtp opaque struct 无公共 API） —
+                                 * 下一阶段在 relay 层维护 send_roc/recv_roc 计数器。
+                                 * payload struct 保留 srtp_roc_* 字段（零值）。 */
+                                dlg.srtp_cipher_a  = mv.srtp_cipher[0];
+                                dlg.srtp_keylen_a  = mv.srtp_keylen[0];
+                                if (mv.srtp_keylen[0] > 0) {
+                                    memcpy(dlg.srtp_out_a, mv.srtp_out[0], SRTP_KEY_MAX);
+                                    memcpy(dlg.srtp_in_a,  mv.srtp_in[0],  SRTP_KEY_MAX);
+                                }
+                                dlg.srtp_cipher_b  = mv.srtp_cipher[1];
+                                dlg.srtp_keylen_b  = mv.srtp_keylen[1];
+                                if (mv.srtp_keylen[1] > 0) {
+                                    memcpy(dlg.srtp_out_b, mv.srtp_out[1], SRTP_KEY_MAX);
+                                    memcpy(dlg.srtp_in_b,  mv.srtp_in[1],  SRTP_KEY_MAX);
+                                }
+                            }
+                        }
+                        /* codec PT/CR — 按 c->codec_a/b 名称查 registry */
+                        if (c->codec_a[0]) {
+                            const codec_ops_t *ops = codec_registry_find_name(
+                                c->codec_a, strlen(c->codec_a));
+                            if (ops && ops->default_pt >= 0) {
+                                dlg.codec_pt_a  = (uint8_t)ops->default_pt;
+                                dlg.codec_cr_a  = (uint16_t)ops->clock_rate;
+                            }
+                        }
+                        if (c->codec_b[0]) {
+                            const codec_ops_t *ops = codec_registry_find_name(
+                                c->codec_b, strlen(c->codec_b));
+                            if (ops && ops->default_pt >= 0) {
+                                dlg.codec_pt_b  = (uint8_t)ops->default_pt;
+                                dlg.codec_cr_b  = (uint16_t)ops->clock_rate;
+                            }
+                        }
+                    }
+
+                    int64_t rc = ha_repl_publish(REPL_DIALOG, 4, &dlg, sizeof(dlg));
+                    if (rc < 0 && rc != NSBC_NOSPC)
+                        llog(LOG_WARN, "b2b",
+                             "repl_publish DIALOG-CONFIRMED failed rc=%lld callid=%s",
+                             (long long)rc, dlg.callid_a);
+                }
+
                 /* ★ ringback：B 腿接通瞬间停掉 A 腿回铃音放音。
-                 * playback 场景不受影响（chain 里 playback 在 answer 前已
-                 * EOF 自然结束；残留放音在接通时切断也是正确语义）。
-                 * pb_stop_if_playing 内部 call_key 查 pb 表，不碰 b2bua
-                 * call lock，持锁调用无死锁风险。 */
-                pb_stop_if_playing(c);
+                 * ★ stop_on_answer=1 只停 ringback，不影响 playback/endless_playback
+                 *   (工号提示音等 answer 后放的内容会继续播完 EOF)。
+                 * pb_stop_by_flag 内部 call_key 查 pb 表 + 匹配 flag，不碰
+                 * b2bua call lock，持锁调用无死锁风险。 */
+                pb_stop_by_flag(c, 1);
 
                 /* 存 Bob 200 OK 的 Session-Expires 到 B leg（P0 透传 + P1 协商都需要） */
                 {
@@ -2999,14 +3607,15 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
             return;
         }
         if (ev == TXN_EV_TIMEOUT) {
-            /* Timer B/F：B 腿完全无响应（含 1xx 都没收到）。
-             * sip_txn 在收到 provisional 时会停 Timer B，所以此处与
-             * Ring NoAnswer 定时器是**互斥**的：收到 1xx 才 arm
-             * ring_noanswer，timer B 永远不会在收到 1xx 后触发。
+            /* Timer B/F 触发（B 腿 ICT 事务绝对期限 64*T1=32s）。
+             * RFC3261 §17.1.1.2：Timer B 覆盖整个 ICT 生命周期，收到 1xx
+             * 后 sip_txn 只停 Timer A（重传），**不停 B** —— 即此处与
+             * ring_noanswer 并不互斥：被叫回 1xx 后 32s 内无 final，
+             * Timer B 仍会先触发（早于 60s 级的 ring_noanswer）。
              * 响应码应为 408 Request Timeout（被叫超时）而非 504 Server
              * Time-out（上游超时——语义错，504 表示"我方到上游超时"）。 */
             llog(LOG_WARN, "b2b",
-                 "timer B/F: B leg no response (not even 1xx), callid=%s → 408",
+                 "timer B/F: B leg no final within 64*T1, callid=%s → 408",
                  c->leg[0].callid);
             disarm_noanswer_timer(c); /* 防御：若 Timer B 先触发，清 ring timer */
             if (reinv) {
@@ -3962,6 +4571,18 @@ void handle_new_invite(b2b_core_t *co, sip_txn_t *t,
         return;
     }
 
+    /* === HA P1 Hitless Upgrade 冻结门控 ===
+     * ha_freeze_input() 后主机也拒绝新 INVITE —— 让老进程 drain 在途对话
+     * 再 detach，keepalived 收敛窗口内备机接呼。应急呼叫 SOS 同样放行。 */
+    if (ha_role() == HA_ROLE_ACTIVE && ha_is_frozen() && !is_emergency) {
+        static unsigned frozen_drop_n = 0;
+        if (frozen_drop_n++ % 50 == 0)
+            llog(LOG_WARN, "b2b",
+                 "HA frozen (hitless upgrade): drop new INVITE (dropped=%u)",
+                 frozen_drop_n);
+        return;
+    }
+
     /* REQ-ARCH-015 并发硬限制：try_inc 超限返回 0 → 503 Busy */
     if (!concurrent_try_inc(co)) {
         llog(LOG_WARN, "b2b", "concurrent_call_limit reached (%u), 503",
@@ -3972,8 +4593,18 @@ void handle_new_invite(b2b_core_t *co, sip_txn_t *t,
 
     b2b_call_t *c = mem_slab_alloc_direct(co->slab);
     if (!c) {
-        /* slab 耗尽：撤回并发计数 */
+        /* slab 耗尽：撤回并发计数 + 503 Busy
+         * slab POP_FAIL 根因：core.max_calls 配太小 (默认 100000)
+         * 日志限频：第一次 + 每 1000 次 */
         concurrent_dec(co);
+        static uint32_t slab_fail_n = 0;
+        uint32_t n = __atomic_add_fetch(&slab_fail_n, 1, __ATOMIC_RELAXED);
+        if (n == 1 || n % 1000 == 0) {
+            llog(LOG_WARN, "b2b",
+                 "slab_pop_fail (total=%u) — core.max_calls config too small? "
+                 "currently=%d, INVITE rejected 503",
+                 n, co->cfg.capacity);
+        }
         respond_txn(co, t, 503, NULL, "Retry-After: 10\r\n", NULL, 0);
         return;
     }
@@ -4836,6 +5467,14 @@ void handle_new_invite(b2b_core_t *co, sip_txn_t *t,
                  c->leg[0].from,
                  c->dst_number[0] ? c->dst_number : c->leg[0].to);
         uds_send_session(sess);
+
+        /* REQ-DP-APP-001：app_chain 登记的 early media（ringback/playback）
+         * 此刻执行 —— send_invite_b 内 offer_hook 已建 relay、A 侧 peer 已
+         * 解析：183+SDP answer 发 A 腿 → pb_start 放音（A 从此可收 RTP）。
+         * 注意必须 dispatch B 腿 INVITE 之后再发 183，保证 A 收 183 时
+         * B 腿呼叫已同时发起（标准 Early Media 并行时序）。 */
+        if (c->em_pending)
+            b2b_early_media_start(c);
     }
 }
 
@@ -4998,13 +5637,12 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
     /* REGISTER 多槽链：遍历所有注册模块直到某个返回非 0
      * （security 可返回 PERM_DENIED → 403 静默丢弃；registrar 返回 OK → 已处理） */
     if (m->method == SIP_M_REGISTER) {
-        /* HA 门控：备机不受理注册（防 AoR 双写/主备状态漂移），静默丢弃 */
-        if (ha_role() != HA_ROLE_ACTIVE) {
-            static unsigned drop_reg_n = 0;
-            llog(LOG_WARN, "b2b",
-                 "HA standby: drop REGISTER (dropped=%u)", drop_reg_n++);
-            return;
-        }
+        /* ★ 修复：HA 门控不再 drop REGISTER（2026-11-14）
+         * 之前：STANDBY 静默丢弃所有 REGISTER → 备机 loc_db 永远空
+         *       → failover 后 INVITE 找不到路由 → MicroSIP 5 分钟后 "错误网关"
+         * 现在：ACTIVE 和 STANDBY 都接 REGISTER 写入本地 loc_db（内存），
+         *       但 reg_push（DB/事件推送）只由 ACTIVE 执行 → 备机 DB 不双写，
+         *       failover 时新 ACTIVE 直接用已有注册数据接 INVITE。 */
         extern sip_tr_proto_t g_ws_bridge_proto; /* signaling.c */
         const nsbc_sa_t *rp = txn_peer(t);
         sip_tr_proto_t reg_proto =
@@ -5115,7 +5753,7 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                     sip_hdr_t *_cid = sip_hdr_get(m, SIP_H_CALL_ID);
                     const char *_cids = (_cid && _cid->value.p) ? _cid->value.p : "-";
                     llog(LOG_INFO, "b2b",
-                         "Phase 5 XL: INVITE dispatched to endpoint '%s' rc=%d callid=%s",
+                         "Phase 5 XL: INVITE dispatched to endpoint '%s' rc=%d callid=%.64s",
                          ep->name, rc, _cids);
                 }
                 return;
@@ -6326,8 +6964,9 @@ void b2b_on_rx(void *ud, sip_tr_proto_t proto, const nsbc_sa_t *src,
                                      c->leg[0].callid);
                             }
                             c->leg[0].state = LEG_CONFIRMED;
-                            /* ★ ringback：A 腿 ACK 双腿 CONFIRMED → 停残留放音（幂等兜底） */
-                            pb_stop_if_playing(c);
+                            /* ★ ringback：A 腿 ACK 双腿 CONFIRMED → 只停 stop_on_answer=1 的
+                             * (ringback)，playback 继续。幂等兜底路径。 */
+                            pb_stop_by_flag(c, 1);
                             /* CDR ANSWER 幂等 */
                             if (c->answer_ms == 0) {
                                 c->answer_ms = now_ms();
@@ -7690,6 +8329,277 @@ int b2b_pre_answer_call(b2b_call_t *call)
         llog(LOG_WARN, "b2b", "pre_answer: 183 send failed rc=%d call=%p", rc, c);
     }
     return rc;
+}
+
+/* ==================================================================
+ * REQ-DP-APP-001 Early Media（ringback / playback 正确时序）
+ *
+ * 时序（app_chain 在 resolve_cb 同步执行，早于 send_invite_b）：
+ *   app_ringback/app_playback
+ *     → b2b_request_early_media()   只登记 em_pending/em_wav/em_loop
+ *   new_invite 继续：send_invite_b（内部 offer_hook 建 relay + 解析 A 侧 peer）
+ *     → b2b_early_media_start()     ① bridge_lookup_relay 拿 A 侧端口
+ *                                   ② A 原始 offer 经 bridge_rewrite_sdp
+ *                                      换 c=/m= 为 SBC A 侧 relay 地址 → answer
+ *                                   ③ 183 Session Progress + answer 发 A 腿
+ *                                      （A 从此知道往哪收 RTP → 开始收音）
+ *                                   ④ pb_start 向 A 腿放 wav（relay 已存在，
+ *                                      lookup 立即成功，不再依赖 lazy 轮询）
+ *   B 腿 200 OK → LEG_CONFIRMED 的 pb_stop_if_playing 停放音转正常桥接
+ *   B 腿 1xx 带 SDP → 不透传（A 已有我们的 answer，RFC 3264 单 answer）
+ * ==================================================================*/
+
+int b2b_request_early_media(b2b_call_t *call, const char *wav, int loop,
+                            int stop_on_answer)
+{
+    if (!call || !wav || !wav[0]) return NSBC_INVAL;
+    b2b_call_t *c = call;
+
+    call_lock(c);
+    if (c->dead || c->leg[0].state == LEG_TERMINATED ||
+        c->leg[0].state == LEG_TERMINATING) {
+        call_unlock(c);
+        return NSBC_NOENT;
+    }
+    /* A 腿已 EARLY/CONFIRMED（in-dialog / originate 尾随场景）：
+     * 183 早已发过或已接通，relay 已存在 → 直接放音。
+     * PT 从历史 answer 的 m= 行选（我们发过的 answer，codec 即协商结果），
+     * 无 answer（罕见）回落 PCMU */
+    if (c->leg[0].state == LEG_EARLY || c->leg[0].state == LEG_CONFIRMED) {
+        int pt = (c->leg[0].answer_len > 0)
+                   ? em_pick_play_pt(c->leg[0].answer) : -1;
+        if (pt < 0) pt = 0;
+        call_unlock(c);
+        pb_stop_if_playing(c);
+        int rc = pb_start_ex(c, wav, 0 /* side 0 = A 腿 */, loop ? 1 : 0,
+                             pt, stop_on_answer ? 1 : 0, NULL);
+        llog(LOG_INFO, "b2b",
+             "early_media: in-dialog direct pb_start call=%p rc=%d pt=%d wav=%s loop=%d stop_on_answer=%d",
+             (void *)c, rc, pt, wav, loop ? 1 : 0, stop_on_answer ? 1 : 0);
+        return rc;
+    }
+    /* pre-answer 阶段：只登记，等 new_invite 尾部 relay ready 后统一执行 */
+    snprintf(c->em_wav, sizeof(c->em_wav), "%s", wav);
+    c->em_loop = loop ? 1 : 0;
+    c->em_stop_on_answer = stop_on_answer ? 1 : 0;
+    c->em_pending = 1;
+    call_unlock(c);
+    llog(LOG_INFO, "b2b",
+         "early_media: REQUEST call=%p wav=%s loop=%d stop_on_answer=%d (pending until relay ready)",
+         (void *)c, wav, loop ? 1 : 0, stop_on_answer ? 1 : 0);
+    return NSBC_OK;
+}
+
+/* 在 A 的 INVITE offer（或 in-dialog 场景的历史 answer）里找 audio m= 行，
+ * 按 offer 的 payload 顺序返回第一个 pb 引擎可编码的 PT（P0：0=PCMU /
+ * 8=PCMA，查表 g711.c）。全是非 G.711（opus/G729 等）时返回 -1。 */
+static int em_pick_play_pt(const char *sdp)
+{
+    if (!sdp) return -1;
+    const char *m = strstr(sdp, "m=audio");
+    if (!m) return -1;
+    const char *nl = strchr(m, '\n');
+    size_t n = nl ? (size_t)(nl - m) : strlen(m);
+    if (n > 512) return -1;
+    char line[512 + 1];
+    memcpy(line, m, n); line[n] = '\0';
+    /* 逐 token 走：m=audio / port / proto / payload... */
+    char *save = NULL;
+    char *tok = strtok_r(line, " \t\r\n", &save);   /* "m=audio" */
+    (void)tok;
+    tok = strtok_r(NULL, " \t\r\n", &save);         /* port */
+    (void)tok;
+    tok = strtok_r(NULL, " \t\r\n", &save);         /* proto */
+    (void)tok;
+    while ((tok = strtok_r(NULL, " \t\r\n", &save))) {
+        if (!strcmp(tok, "0") || !strcmp(tok, "8")) {
+            /* telephone-event(101/120) 等动态 PT 不在集合里，天然跳过 */
+            return atoi(tok);
+        }
+    }
+    return -1;
+}
+
+/* 合成 answer 压成单编码（G.711 静态 PT）：
+ * - m=audio 行 payload 只留协商出的 pt（否则沿用 offer 顺序 PCMA 优先时，
+ *   对端按 PCMA 建流而 pb 发 PCMU → 帧全被丢 → 无声，2026-11-13 实证）；
+ * - 删除全部 a=rtpmap:/a=fmtp: 行（静态 PT 无需 rtpmap；残留其它 PT 的
+ *   映射行描述未列出的 PT，一并清掉防歧义）。
+ * 返回写出长度；<0 = 缓冲不足。 */
+static int em_sdp_single_pt(const char *in, int in_len, char *out, size_t outsz,
+                            int pt)
+{
+    size_t o = 0;
+    const char *p = in, *end = in + in_len;
+    while (p < end) {
+        const char *nl = memchr(p, '\n', (size_t)(end - p));
+        size_t linelen = nl ? (size_t)(nl - p) + 1 : (size_t)(end - p);
+        if (!strncmp(p, "a=rtpmap:", 9) || !strncmp(p, "a=fmtp:", 7)) {
+            p += linelen;                          /* drop */
+            continue;
+        }
+        if (!strncmp(p, "m=audio", 7)) {
+            char line[512];
+            size_t cl = linelen < sizeof(line) ? linelen : sizeof(line) - 1;
+            memcpy(line, p, cl); line[cl] = '\0';
+            unsigned port = 0;
+            char proto[64] = "";
+            if (sscanf(line, "m=audio %u %63s", &port, proto) >= 2 && proto[0]) {
+                int n = snprintf(out + o, outsz - o,
+                                 "m=audio %u %s %d\r\n", port, proto, pt);
+                if (n < 0 || (size_t)n >= outsz - o) return -1;
+                o += (size_t)n;
+                p += linelen;
+                continue;
+            }
+        }
+        if (o + linelen > outsz) return -1;
+        memcpy(out + o, p, linelen);
+        o += linelen;
+        p += linelen;
+    }
+    if (o < outsz) out[o] = '\0';
+    return (int)o;
+}
+
+/* new_invite 尾部调用（send_invite_b 已返回：offer_hook 已建 relay，
+ * A 侧 peer 已从 SDP 解析）。同线程顺序保证 em 字段可见性，无需加锁读。 */
+static void b2b_early_media_start(b2b_call_t *c)
+{
+    if (!c || !c->em_pending || !c->em_wav[0]) return;
+    c->em_pending = 0;
+
+    nsbc_ctx_t *ctx = nsbc_get_ctx();
+    if (!ctx || !ctx->bridge) {
+        llog(LOG_WARN, "b2b", "early_media: no bridge ctx call=%p", (void *)c);
+        return;
+    }
+
+    /* ① relay（send_invite_b 的 offer_hook 已建） */
+    rtp_relay_t *relay = NULL;
+    nsbc_sa_t peer[2];
+    if (bridge_lookup_relay((bridge_mgr_t *)ctx->bridge, c, &relay, peer)
+        != NSBC_OK || !relay) {
+        llog(LOG_WARN, "b2b",
+             "early_media: relay not found call=%p (bypass mode?) — skip 183+playback",
+             (void *)c);
+        return;
+    }
+    uint16_t a_port = rtp_relay_port(relay, 0); /* side 0 = A 腿侧 */
+    if (!a_port) {
+        llog(LOG_WARN, "b2b", "early_media: relay port=0 call=%p", (void *)c);
+        return;
+    }
+
+    /* SDP c=/m= 地址：profile external_rtp_ip 优先（NAT），fallback local_ip
+     * （与 offer_hook / EXT_RTP 同一选择逻辑） */
+    const char *rtp_ip =
+        (c->prof && c->prof->external_rtp_ip[0])
+            ? c->prof->external_rtp_ip
+            : bridge_local_ip((const bridge_mgr_t *)ctx->bridge);
+    if (!rtp_ip || !rtp_ip[0]) {
+        llog(LOG_WARN, "b2b", "early_media: no rtp ip call=%p", (void *)c);
+        return;
+    }
+
+    /* ② A 腿 SDP answer：A 原始 offer 换 c=/m= 地址端口。
+     * MB_SDP_PLAIN 不改 proto/属性行——A 侧保持其原始 RTP/AVP 协商。 */
+    if (!c->leg[0].offer_len) {
+        llog(LOG_WARN, "b2b",
+             "early_media: A leg has no offer (delayed offer?) call=%p — skip 183",
+             (void *)c);
+        return;
+    }
+    /* WebRTC A 腿（SAVPF/DTLS）：183 answer 需注入本侧 DTLS-SRTP 凭证
+     * （fingerprint/ICE，Phase C 路径），P0 只支持明文 SIP A 腿。 */
+    if (strstr(c->leg[0].offer, "UDP/TLS/RTP/") ||
+        strstr(c->leg[0].offer, "a=fingerprint")) {
+        llog(LOG_WARN, "b2b",
+             "early_media: WebRTC A-leg not supported yet (SRTP answer) "
+             "call=%p — skip 183+playback",
+             (void *)c);
+        return;
+    }
+    char sdp[B2B_SDP_MAX];
+    int sdp_len = bridge_rewrite_sdp(c->leg[0].offer, c->leg[0].offer_len,
+                                     sdp, sizeof(sdp), rtp_ip, a_port,
+                                     MB_SDP_PLAIN);
+    if (sdp_len <= 0) {
+        llog(LOG_WARN, "b2b", "early_media: rewrite_sdp rc=%d call=%p",
+             sdp_len, (void *)c);
+        return;
+    }
+
+    /* ②b：按 A offer 的 codec 协商放音编码（不再强行 PCMU）。
+     * answer m= 行只留 pb 引擎可编码的那个 PT（A offer 顺序取第一个
+     * G.711：MicroSIP "8 0 120" → PCMA）；opus/G729-only 的 offer
+     * P0 无编码器 → WARN 跳过放音（不出非法 answer）。 */
+    int play_pt = em_pick_play_pt(c->leg[0].offer);
+    if (play_pt < 0) {
+        llog(LOG_WARN, "b2b",
+             "early_media: A offer has no playable codec (need PCMU/PCMA; "
+             "opus/G.729 transcode is P1) call=%p — skip",
+             (void *)c);
+        return;
+    }
+    {
+        char pt_sdp[B2B_SDP_MAX];
+        int plen = em_sdp_single_pt(sdp, sdp_len, pt_sdp, sizeof(pt_sdp),
+                                    play_pt);
+        if (plen > 0) {
+            memcpy(sdp, pt_sdp, (size_t)plen);
+            sdp_len = plen;
+        } else {
+            llog(LOG_WARN, "b2b",
+                 "early_media: single_pt rc=%d call=%p — keep original answer",
+                 plen, (void *)c);
+        }
+    }
+
+    /* ③ 183 + answer（锁内：leg state / early_183_ms 与 cli_tu 并发路径一致）
+     * ★ 用 respond_a 而非 b2b_respond_leg：新呼叫路径 A 腿 srv_txn 恒为
+     *   NULL（log 实证：180 透传即 respond_a a.srv_txn=(nil) 走 inv_txn
+     *   兜底），b2b_respond_leg 只认 srv_txn 会 NOENT；respond_a 走
+     *   inv_txn 兜底且 to-tag/Via received;rport/Content-Type 完整处理。 */
+    char wav[256];
+    int loop;
+    int stop_on_answer;
+    int started = 0;
+    call_lock(c);
+    if (!c->dead && c->leg[0].inv_txn &&
+        c->leg[0].state != LEG_TERMINATED &&
+        c->leg[0].state != LEG_TERMINATING) {
+        respond_a(c, 183, sdp, (size_t)sdp_len);
+        c->leg[0].state = LEG_EARLY;
+        c->early_183_ms = now_ms();
+        started = 1;
+        llog(LOG_NOTICE, "b2b",
+             "early_media: 183+SDP sent call=%p a_rtp=%s:%u pt=%d wav=%s loop=%d",
+             (void *)c, rtp_ip, (unsigned)a_port, play_pt, c->em_wav,
+             (int)c->em_loop);
+    } else {
+        llog(LOG_WARN, "b2b",
+             "early_media: skip 183 call=%p dead=%d inv_txn=%p state=%d",
+             (void *)c, c->dead, (void *)c->leg[0].inv_txn,
+             (int)c->leg[0].state);
+    }
+    snprintf(wav, sizeof(wav), "%s", c->em_wav);
+    loop = c->em_loop;
+    stop_on_answer = c->em_stop_on_answer;
+    call_unlock(c);
+
+    /* ④ 放音（锁外：pb_start_ex 内部 tw_add + player 打开，不允许持 call 锁）
+     * pt 用 ②b 协商结果：A offer 顺序第一个 G.711（0/8），pb 同码编码 */
+    if (!started) return;
+    pb_stop_if_playing(c);
+    int rc = pb_start_ex(c, wav, 0 /* side 0 = A 腿 */, loop, play_pt,
+                         stop_on_answer ? 1 : 0, NULL);
+    if (rc == NSBC_OK)
+        llog(LOG_INFO, "b2b", "early_media: pb_start OK call=%p pt=%d wav=%s loop=%d stop_on_answer=%d",
+             (void *)c, play_pt, wav, loop, stop_on_answer ? 1 : 0);
+    else
+        llog(LOG_WARN, "b2b", "early_media: pb_start rc=%d call=%p pt=%d wav=%s",
+             rc, (void *)c, play_pt, wav);
 }
 
 /* ==================================================================

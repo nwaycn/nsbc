@@ -22,6 +22,7 @@ mod coreclient;
 mod tls;
 mod db;
 mod error;
+mod fw;
 mod middleware;
 mod poller;
 mod ai_agent;
@@ -127,6 +128,11 @@ pub struct AppState<C: CoreApi + Clone> {
     pub api_major:     u32,
     pub bind:          SocketAddr,
     pub recording_root: std::path::PathBuf,
+    /// REQ-DP-UPLOAD: dialplan playback/ringback wav files live here.
+    /// Uploaded files get saved under this dir; app_chain.data uses either
+    /// absolute paths or filenames that C-side player resolves from its own
+    /// sounds directory — we keep both in sync by setting the same path.
+    pub sounds_root: std::path::PathBuf,
     /// REQ-EXT-API-004: true → 即使 127.0.0.1 / ::1 也必须 Bearer Token。
     /// 默认 false（本机脚本零摩擦）；反代部署必须开（否则反代进来的远程请求 peer 就是 loopback）。
     pub require_loopback_auth: bool,
@@ -179,8 +185,9 @@ fn api_router<C: CoreApi + Clone + 'static>(st: Arc<AppState<C>>) -> Router {
         .merge(routes::metrics::router())
         .merge(routes::cdrs::router())
         .merge(routes::security::router())
-        .merge(routes::recordings::router())       // ← 列表接口（需要鉴权）
-        .nest("/billing", routes::billing::router())
+        .merge(routes::recordings::router())
+        .merge(routes::sounds::router())          // ← 声音文件管理（REQ-DP-UPLOAD）
+        .merge(routes::billing::router())
         .merge(routes::transcode::router())
         .merge(routes::tenants::router())
         .merge(routes::auth::protected_router())
@@ -585,6 +592,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         recording_root.exists()
     );
 
+    // REQ-DP-UPLOAD: sounds_root — dialplan playback/ringback wav files.
+    // C-side player default is /var/sounds; web side writes to the same dir
+    // so app_chain.data can use the same absolute path that C resolves.
+    let sounds_root: std::path::PathBuf = std::path::PathBuf::from("/var/sounds");
+    if !sounds_root.exists() {
+        if let Err(e) = std::fs::create_dir_all(&sounds_root) {
+            tracing::warn!(path = %sounds_root.display(), err = %e, "create sounds_root failed");
+        } else {
+            tracing::info!(path = %sounds_root.display(), "created sounds_root");
+        }
+    }
+    tracing::info!(
+        "sounds_root = {} (exists={})",
+        sounds_root.display(),
+        sounds_root.exists()
+    );
+
     let state = Arc::new(AppState {
         core,
         auth,
@@ -592,6 +616,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         api_major: API_MAJOR,
         bind,
         recording_root: recording_root.clone(),
+        sounds_root: sounds_root.clone(),
         require_loopback_auth: cfg.web.ext.require_loopback_auth,
         data_pushed: Arc::new(AtomicBool::new(false)),
         calls_tx: tokio::sync::broadcast::channel(256).0,
@@ -600,6 +625,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // CDR background poller: fetch core-side cdr.recent every 15s → write DB.
     poller::spawn(state.clone(), 15, 100);
+
+    // nftables auto-ban synchronizer: every 60s pull security.ban.list → push
+    // all still-banned IPs into nftables table `inet nsbc_ban`, dropping packets
+    // at NIC level so reactor threads / slab pools are not even woken up by flood.
+    // Fail-open: if nft binary missing on host, task logs once then retries silently;
+    // dynamic ban still works inside nsbc — firewall sync is a hardening layer.
+    fw::spawn(state.clone(), 60);
 
     // AI Agent barge-in background task (REQ-AI-BARGEIN-001 P0):
     // Subscribe to VAD_EVENT pushed by C core's vad_engine; auto-mute AI side when user speaks.
@@ -887,10 +919,11 @@ ssrc_out=UNAVAILABLE vq=UNAVAILABLE\n".into()),
             api_major: API_MAJOR,
             bind: SocketAddr::from(([127, 0, 0, 1], 0)),
             recording_root: std::path::PathBuf::from("/tmp/nsbc-test-recordings"),
-            require_loopback_auth: false,  /* F-10 修复 */
+            sounds_root: std::path::PathBuf::from("/tmp/nsbc-test-sounds"),
+            require_loopback_auth: false,
             data_pushed: Arc::new(AtomicBool::new(false)),
             calls_tx: tokio::sync::broadcast::channel(256).0,
-        vad_tx:   tokio::sync::broadcast::channel(1024).0,
+            vad_tx:   tokio::sync::broadcast::channel(1024).0,
         });
         (app_router(st.clone()), st)
     }

@@ -11,6 +11,18 @@
 /* global Vue, ElementPlus, ElementPlusIconsVue */
 
 const { createApp, ref, reactive, computed, onMounted, onBeforeUnmount, watch } = Vue;
+const { ElMessage, ElMessageBox } = ElementPlus;
+// 挂到 window 供 pages-live.js 等 HTML onclick 模板使用
+window.ElMessage = ElMessage;
+window.ElMessageBox = ElMessageBox;
+
+// ===== 暗色模式 — Linear 风标配 =====
+window.isDark = localStorage.getItem('nsbc_theme') === 'dark';
+window.toggleTheme = function () {
+  var next = window.isDark ? 'light' : 'dark';
+  localStorage.setItem('nsbc_theme', next);
+  location.reload();
+};
 
 // ===== API wrapper =====
 const API = {
@@ -439,7 +451,7 @@ const DialplanActionEditor = {
         <div class="text-[11px] text-gray-500 font-semibold pt-2">{{ t('─ From Header (low → high priority) ─') }}</div>
         <div class="struct-row">
           <span class="struct-label w-40 shrink-0">{{ t('sip_from_display Display') }}</span>
-          <input v-model="action.sip_from_display" :placeholder="t('e.g. &quot;Sales Team&quot;')">
+          <input v-model="action.sip_from_display" :placeholder="t('e.g. “Sales Team”')">
           <span class="hint">{{ t('component') }}</span>
         </div>
         <div class="struct-row">
@@ -556,41 +568,62 @@ const DialplanActionEditor = {
     });
     let _s = false;
     const preview = computed(() => JSON.stringify(action));
+
+    // 兼容：后端 json_text_as_value 可能把 DB 里的 JSON 文本序列化成
+    // 真正的 object 返回（不是字符串）；而 v-model 传递时又是字符串。
+    // 统一成 object，避免 JSON.parse(object) 抛异常导致回显丢失所有字段。
+    function asObj(v) {
+      if (v == null || v === '') return {};
+      if (typeof v === 'object') return v;
+      if (typeof v === 'string') { try { return JSON.parse(v); } catch { return {}; } }
+      return {};
+    }
+
     function syncFrom() {
       _s = true;
-      try {
-        const v = JSON.parse(props.modelValue || '{}');
-        // 号码变换
-        action.dst_override = v.dst_override ?? '';
-        action.clip = v.clip ?? '';
-        action.perm = Number(v.perm ?? 0);
-        action.immediate = !!v.immediate;
-        // From 头
-        action.sip_invite_from = v.sip_invite_from ?? '';
-        action.sip_invite_from_uri = v.sip_invite_from_uri ?? '';
-        action.sip_from_uri = v.sip_from_uri ?? '';
-        action.sip_from_display = v.sip_from_display ?? '';
-        action.sip_invite_from_params = v.sip_invite_from_params ?? '';
-        // FS 精细化Caller
-        action.origination_caller_id_number = v.origination_caller_id_number ?? '';
-        action.origination_caller_id_name = v.origination_caller_id_name ?? '';
-        // To / R-URI / Contact
-        action.sip_invite_to_uri = v.sip_invite_to_uri ?? '';
-        action.sip_invite_to_params = v.sip_invite_to_params ?? '';
-        action.sip_invite_req_uri = v.sip_invite_req_uri ?? '';
-        action.sip_invite_tel_params = v.sip_invite_tel_params ?? '';
-        action.sip_invite_contact_params = v.sip_invite_contact_params ?? '';
-        // Domain
-        action.sip_invite_domain = v.sip_invite_domain ?? '';
-        // Extra
-        action.sip_invite_params = v.sip_invite_params ?? '';
-        action.sip_invite_pid_params = v.sip_invite_pid_params ?? '';
-        // legacy
-        action.clip_from = v.clip_from ?? '';
-      } catch {}
+      const v = asObj(props.modelValue);
+      // 号码变换
+      action.dst_override = v.dst_override ?? '';
+      action.clip = v.clip ?? '';
+      action.perm = Number(v.perm ?? 0);
+      action.immediate = !!v.immediate;
+      // From 头
+      action.sip_invite_from = v.sip_invite_from ?? '';
+      action.sip_invite_from_uri = v.sip_invite_from_uri ?? '';
+      action.sip_from_uri = v.sip_from_uri ?? '';
+      action.sip_from_display = v.sip_from_display ?? '';
+      action.sip_invite_from_params = v.sip_invite_from_params ?? '';
+      // FS 精细化Caller
+      action.origination_caller_id_number = v.origination_caller_id_number ?? '';
+      action.origination_caller_id_name = v.origination_caller_id_name ?? '';
+      // To / R-URI / Contact
+      action.sip_invite_to_uri = v.sip_invite_to_uri ?? '';
+      action.sip_invite_to_params = v.sip_invite_to_params ?? '';
+      action.sip_invite_req_uri = v.sip_invite_req_uri ?? '';
+      action.sip_invite_tel_params = v.sip_invite_tel_params ?? '';
+      action.sip_invite_contact_params = v.sip_invite_contact_params ?? '';
+      // Domain
+      action.sip_invite_domain = v.sip_invite_domain ?? '';
+      // Extra
+      action.sip_invite_params = v.sip_invite_params ?? '';
+      action.sip_invite_pid_params = v.sip_invite_pid_params ?? '';
+      // legacy
+      action.clip_from = v.clip_from ?? '';
       _s = false;
     }
-    function syncTo()  { if (_s) return; emit('update:modelValue', JSON.stringify(action)); }
+    // syncTo: 先 parse 当前 JSON，把已知字段覆盖进去（undefined 不覆盖），
+    // 保留 ringback / media_mode 等未知字段 —— 避免用户在 Raw JSON 里加的东西
+    // 被结构化编辑器覆盖掉。
+    function syncTo() {
+      if (_s) return;
+      const merged = asObj(props.modelValue);   // 先拿旧值（含未知字段如 ringback）
+      for (const k of Object.keys(action)) {
+        const v = action[k];
+        // undefined 不覆盖；布尔值 false、数字 0、空字符串 '' 都要覆盖（用户明确设过）
+        if (v !== undefined) merged[k] = v;
+      }
+      emit('update:modelValue', JSON.stringify(merged));
+    }
     watch(() => props.modelValue, syncFrom);
     watch(action, syncTo, { deep: true });
     syncFrom();
@@ -675,6 +708,29 @@ const AppChainEditor = {
                 <el-option label="mp4  · 音视频合成浏览器直放"  value="mp4" />
               </el-select>
             </div>
+            <!-- ★ 声音相关 app: data 输入框 + 已有文件下拉 + 上传按钮 -->
+            <div v-else-if="isSoundApp(item.app)" class="flex items-center gap-2">
+              <el-input v-model="item.data" size="small" style="flex:1"
+                        :placeholder="dataPlaceholder(item.app)" clearable>
+                <template #append>
+                  <el-select v-model="item.data" size="small" style="width:180px"
+                    filterable clearable placeholder="选已有文件"
+                    @change="v => onSoundPicked(item, v)">
+                    <el-option label="— 上传后自动填路径 —" disabled value=""></el-option>
+                    <el-option v-for="s in sounds" :key="s.name" :value="s.name">
+                      <span>{{ s.name }}</span>
+                      <span class="text-xs text-slate-400 ml-2">{{ fmtSize(s.size) }}</span>
+                    </el-option>
+                  </el-select>
+                </template>
+              </el-input>
+              <el-upload :show-file-list="false" :before-upload="f => onSoundUpload(f, item)"
+                accept=".wav,.mp3,.opus,.gsm">
+                <el-button size="small" type="primary" plain>
+                  <i class="fa-solid fa-upload mr-1"></i>上传
+                </el-button>
+              </el-upload>
+            </div>
             <!-- 其他 app: 通用 data 输入框 -->
             <el-input v-else-if="needsData(item.app)" v-model="item.data" size="small"
                       :placeholder="dataPlaceholder(item.app)" clearable></el-input>
@@ -703,13 +759,17 @@ const AppChainEditor = {
     const { ref, computed, watch } = Vue;
     const { Plus, ArrowUp, ArrowDown, Delete } = ElementPlusIconsVue || {};
 
-    /* C 侧 app_registry.c builtin_apps[] Register的 17 个内建 apps（必须对齐） */
+    /* C 侧 app_registry.c builtin_apps[] Register的 16 个内建 apps（必须对齐）
+     * ★ bridge 已废弃（deprecated）：路由完全由 dialplan rule.target 字段决定，
+     *   resolve_cb 里直接走 target → locate ext/trunk，bridge 在 app_chain 里是纯 no-op。
+     *   APP_DESCS 里保留 bridge 条是为了兼容已存在的 Raw JSON 配置能正常显示描述，
+     *   但 appGroups 不提供 bridge 作为选项，前端下拉里选不到。 */
     const APP_DESCS = {
       answer:              'Answer inbound (send 200 OK)',
       pre_answer:          'Early media pre-answer (183, no 200 OK)',
-      bridge:              'Bridge to sofia/gateway/<gw>/<ext>',
+      bridge:              '⚠️ DEPRECATED — routing handled by rule Target field (no-op)',
       playback:            'Play a single audio file (plays to completion)',
-      ringback:            'Ringback tone: loops while routing, auto-stops when B-leg answers (put BEFORE bridge/transfer)',
+      ringback:            'Ringback tone: loops while routing, auto-stops when B-leg answers',
       post_playback:       'Play after answer (phase marker)',
       record:              '录音：下拉选 start/stop + 格式（mp4 含视频合成）',
       transfer:            'Transfer current call (REFER or 302)',
@@ -725,12 +785,13 @@ const AppChainEditor = {
       read:                'Collect DTMF digits',
     };
 
-    /* 按执行阶段Group（引导用户构建合理顺序） */
+    /* 按执行阶段Group（引导用户构建合理顺序）
+     * ★ 精简：bridge 已废弃，不在可选列表中。路由 = rule.target 字段。 */
     const appGroups = computed(() => [
       { label: t('— Early Media / Answer Phase —'), apps: ['pre_answer', 'ringback', 'playback', 'post_playback', 'sleep', 'answer', 'endless_playback', 'read', 'play_and_get_digits'] },
-      { label: t('— Routing / Bridge Phase —'),        apps: ['bridge', 'transfer', 'att_xfer', 'conference', 'park'] },
-      { label: t('— Variables / Control —'),            apps: ['set', 'uuid_break', 'gentones'] },
-      { label: t('— Media / Recording —'),            apps: ['record'] },
+      { label: t('— Routing / Transfer Phase —'),   apps: ['transfer', 'att_xfer', 'conference', 'park'] },
+      { label: t('— Variables / Control —'),        apps: ['set', 'uuid_break', 'gentones'] },
+      { label: t('— Media / Recording —'),          apps: ['record'] },
     ].map(g => ({
       label: g.label,
       apps: g.apps.map(n => ({ name: n, desc: APP_DESCS[n] || '' })),
@@ -740,7 +801,8 @@ const AppChainEditor = {
     const chain = ref([]);
 
     function appHint(name)  { return APP_DESCS[name] || ''; }
-    function needsData(name){ return ['playback','ringback','post_playback','endless_playback','sleep','bridge','transfer','conference','set','gentones','play_and_get_digits','read'].includes(name); }
+    function needsData(name){ return ['playback','ringback','post_playback','endless_playback','sleep','transfer','conference','set','gentones','play_and_get_digits','read'].includes(name); }
+    function isSoundApp(name){ return ['playback','ringback','post_playback','endless_playback','play_and_get_digits'].includes(name); }
     function dataPlaceholder(name) {
       const H = {
         playback:             'welcome.wav or /path/to/file.wav',
@@ -748,7 +810,6 @@ const AppChainEditor = {
         post_playback:        'announce.wav',
         endless_playback:     'hold_music.wav',
         sleep:                '1500 (ms)',
-        bridge:               'sofia/gateway/my_trunk/8613800138000',
         transfer:             'sip:support@other.com',
         conference:           'my_room@default',
         set:                  'var_name=value',
@@ -772,17 +833,23 @@ const AppChainEditor = {
     const preview = computed(() => JSON.stringify(chain.value));
 
     let _s = false;
+    // 兼容：后端 json_text_as_value 可能把 app_chain 序列化成真正的 array
+    // 返回；v-model 传递时又是 JSON 字符串。统一成 array。
+    function asArr(v) {
+      if (v == null || v === '') return [];
+      if (Array.isArray(v)) return v;
+      if (typeof v === 'string') {
+        try { const x = JSON.parse(v); return Array.isArray(x) ? x : []; }
+        catch { return []; }
+      }
+      return [];
+    }
     function syncFrom() {
       _s = true;
-      try {
-        const v = JSON.parse(props.modelValue || '[]');
-        if (Array.isArray(v))
-          chain.value = v
-            .filter(x => x && typeof x.app === 'string' && x.app.length > 0)
-            .map(x => ({ app: x.app, data: x.data || '' }));
-        else
-          chain.value = [];
-      } catch { chain.value = []; }
+      const v = asArr(props.modelValue);
+      chain.value = v
+        .filter(x => x && typeof x.app === 'string' && x.app.length > 0)
+        .map(x => ({ app: x.app, data: x.data || '' }));
       _s = false;
     }
     function syncTo() {
@@ -817,9 +884,53 @@ const AppChainEditor = {
     watch(chain, syncTo, { deep: true });
     syncFrom();
 
+    // ★ Sound files 相关（REQ-DP-UPLOAD）
+    const sounds = ref([]);
+    async function fetchSounds() {
+      try {
+        const r = await API.get('/sounds');
+        sounds.value = r.files || [];
+      } catch { sounds.value = []; }
+    }
+    function fmtSize(b) {
+      if (b < 1024) return b + ' B';
+      if (b < 1024*1024) return (b/1024).toFixed(1) + ' KB';
+      return (b/1024/1024).toFixed(2) + ' MB';
+    }
+    function onSoundPicked(item, name) {
+      if (name) item.data = name;
+    }
+    async function onSoundUpload(file, item) {
+      const url = '/api/v1/sounds/' + encodeURIComponent(file.name);
+      const headers = { 'x-nsbc-api-version': '1' };
+      const token = localStorage.getItem('nsbc_token');
+      if (token) headers['Authorization'] = 'Bearer ' + token;
+      try {
+        console.log('[sounds] PUT', url, 'size=', file.size);
+        const r = await fetch(url, { method: 'PUT', body: file, headers });
+        console.log('[sounds] status:', r.status);
+        const text = await r.text();
+        console.log('[sounds] body:', text);
+        if (!r.ok) {
+          let msg = text;
+          try { msg = JSON.parse(text).error?.message || JSON.parse(text).detail || text; } catch {}
+          throw new Error(msg || r.statusText);
+        }
+        const res = JSON.parse(text);
+        item.data = res.name;
+        await fetchSounds();
+        ElementPlus.ElMessage({ message: `已上传 ${res.name}`, type: 'success', duration: 2000 });
+      } catch (e) {
+        ElementPlus.ElMessage({ message: '上传失败：' + e.message, type: 'error', duration: 4000 });
+      }
+      return false;
+    }
+    fetchSounds();
+
     return { chain, nextApp, appGroups, addApp, removeAt, moveUp, moveDown,
-             appHint, needsData, dataPlaceholder, preview,
-             recordField, recordSet };
+             appHint, needsData, isSoundApp, dataPlaceholder, preview,
+             recordField, recordSet,
+             sounds, fmtSize, onSoundPicked, onSoundUpload };
   },
 };
 
@@ -880,6 +991,10 @@ const app = createApp({
     const clientIp = ref('---');
     const route = ref(location.hash.replace('#', '') || '/realtime');
 
+    // ===== 暗色模式 — 从 window 全局引一份到 setup scope，让模板能引用 =====
+    const isDark = window.isDark;
+    const toggleTheme = window.toggleTheme;
+
     // ===== 多Tenant全局Status =====
     const tenantId = ref(parseInt(localStorage.getItem('nsbc_tenant_id') || '1', 10) || 1);
     const tenantOptions = ref([]);  // [{value, label}]
@@ -902,7 +1017,7 @@ const app = createApp({
         const r = await API.get('/tenants?limit=500&offset=0');
         tenantOptions.value = (r.items || []).map(t => ({
           value: t.id,
-          label: t.tenant_name + (t.enabled ? '' : t(' (Disable)')),
+          label: t.tenant_name + (t.enabled ? '' : ' (Disable)'),
         }));
       } catch (e) { tenantOptions.value = []; }
       finally { tenantLoading.value = false; }
@@ -1055,7 +1170,8 @@ const app = createApp({
 
     return { auth, loginForm, captchaSvg, clientIp, route, menuItems, login, logout, refreshCaptcha,
              tenantId, tenantOptions, tenantLoading, changeTenant, fetchTenants,
-             showPwdDialog, pwdLoading, pwdFormRef, pwdForm, pwdRules, submitChangePassword };
+             showPwdDialog, pwdLoading, pwdFormRef, pwdForm, pwdRules, submitChangePassword,
+             isDark, toggleTheme };
   },
 });
 
@@ -1284,7 +1400,7 @@ function crudTable(entity, path, columns, formSchema, asyncLoaders = null) {
           for (const f of formSchema) {
             if (f.type === 'json') {
               try { const v = form[f.key] || 'null'; if (v !== 'null') JSON.parse(v); }
-              catch { alert(f.label + ' is not valid JSON'); saving.value = false; return; }
+              catch { ElMessage.error(f.label + ' is not valid JSON'); saving.value = false; return; }
             }
           }
           const body = {};
@@ -1298,13 +1414,14 @@ function crudTable(entity, path, columns, formSchema, asyncLoaders = null) {
           if (editingId.value) await API.put(path + '/' + editingId.value, body);
           else await API.post(path, body);
           showModal.value = false; await load();
-        } catch (e) { alert('Save failed: ' + e.message); }
+        } catch (e) { ElMessage.error('Save failed: ' + e.message); }
         finally { saving.value = false; }
       }
       async function del(id) {
-        if (!confirm(t('Confirm delete ID=') + id + '?')) return;
+        try { await ElMessageBox.confirm(t('Confirm delete ID=') + id + '?', t('Confirm'), { type: 'warning' }); }
+        catch { return; }
         try { await API.delete(path + '/' + id); await load(); }
-        catch (e) { alert('Delete failed: ' + e.message); }
+        catch (e) { ElMessage.error('Delete failed: ' + e.message); }
       }
 
       onMounted(() => {
@@ -1361,7 +1478,7 @@ function livePanel(title, icon, columns, apiPath, opts = {}) {
           {{ searchKeyword ? t('No matching records') : 'No data' }}
         </div>
         <div v-else class="overflow-x-auto border rounded">
-        <table class="w-full text-sm border-collapse min-w-[1400px]">
+        <table class="live-table w-full text-sm border-collapse min-w-[1400px]">
           <thead>
             <tr class="bg-gray-50 border-b">
               <th v-for="c in columns" :key="c.key" class="px-3 py-2 text-left font-medium text-gray-600 whitespace-nowrap">{{ c.label }}</th>
@@ -1501,14 +1618,49 @@ function livePanel(title, icon, columns, apiPath, opts = {}) {
 // ===== 全局Hang up函数（livePanel actionCol 用 v-html + onclick 调） =====
 window.nsbcHangup = async function(callId) {
   if (!callId) return;
-  if (!confirm(t('Confirm hang up call ') + callId + '?')) return;
+  try { await ElMessageBox.confirm(t('Confirm hang up call ') + callId + '?', t('Confirm'), { type: 'warning' }); }
+  catch { return; }
   try {
     await API.post('/calls/' + encodeURIComponent(callId) + '/hangup', {});
-    // 触发所有 livePanel Refresh
     document.dispatchEvent(new CustomEvent('nsbc-refresh'));
-    alert('Hang up command sent');
+    ElMessage.success('Hang up command sent');
   } catch (e) {
-    alert('Hang up failed: ' + (e.message || e));
+    ElMessage.error('Hang up failed: ' + (e.message || e));
+  }
+};
+
+window.nsbcPlayback = async function(callId, wav, side, loop) {
+  if (!callId || !wav) return;
+  try {
+    await API.post('/calls/' + encodeURIComponent(callId) + '/playback', {
+      wav: wav,
+      side: (side !== undefined && side !== null) ? side : -1,
+      loop: (loop !== undefined && loop !== null) ? loop : 0
+    });
+    ElMessage.success('Playback started: ' + wav);
+  } catch (e) {
+    ElMessage.error('Playback failed: ' + (e.message || e));
+  }
+};
+
+window.nsbcPlaybackStop = async function(callId) {
+  if (!callId) return;
+  try {
+    await API.post('/calls/' + encodeURIComponent(callId) + '/playback-stop', {});
+    ElMessage.success('Playback stopped');
+  } catch (e) {
+    ElMessage.error('Playback stop failed: ' + (e.message || e));
+  }
+};
+
+window.nsbcPlaybackStatus = async function(callId) {
+  if (!callId) return null;
+  try {
+    const r = await API.get('/calls/' + encodeURIComponent(callId) + '/playback-status');
+    return r.data || r;
+  } catch (e) {
+    console.warn('Playback status failed:', e.message || e);
+    return null;
   }
 };
 

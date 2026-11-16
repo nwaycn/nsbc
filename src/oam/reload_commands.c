@@ -58,22 +58,45 @@ static int cmd_reload_generic(
         c->io_printf(c->io_ud, "ERR usage: %s.reload <json>\n", module);
         return NSBC_INVAL;
     }
-    if (strlen(argv[1]) > RELOAD_JSON_MAX) {
-        c->io_printf(c->io_ud, "ERR json too large (max %d)\n", RELOAD_JSON_MAX);
+
+    /* ★ 2026-11-13 修复：tokenize_cmd 按空格切分，JSON 字段值里的空格
+     * （如 "Internal extension-to-extension"）会把 JSON 拆成多个 argv！
+     * 拼回所有 argv[1..argc-1] 为完整 JSON，再传给 _reload_json()。
+     * 堆分配：RELOAD_JSON_MAX=32MB 太大，不能放栈上。 */
+    size_t maxj = (size_t)RELOAD_JSON_MAX + 1;
+    char *json_buf = (char *)malloc(maxj);
+    if (!json_buf) {
+        c->io_printf(c->io_ud, "ERR OOM json_buf\n");
+        return NSBC_NOMEM;
+    }
+    json_buf[0] = '\0';
+    size_t pos = 0;
+    for (int i = 1; i < argc && pos < (size_t)RELOAD_JSON_MAX; ++i) {
+        if (i > 1) json_buf[pos++] = ' ';  /* tokenize_cmd 吃掉了空格，补回来 */
+        size_t l = strlen(argv[i]);
+        if (pos + l > (size_t)RELOAD_JSON_MAX) { l = (size_t)RELOAD_JSON_MAX - pos; }
+        memcpy(json_buf + pos, argv[i], l);
+        pos += l;
+    }
+    json_buf[pos] = '\0';
+
+    if (pos == 0 || pos > (size_t)RELOAD_JSON_MAX) {
+        free(json_buf);
+        c->io_printf(c->io_ud, "ERR json invalid or too large (max %d)\n", RELOAD_JSON_MAX);
         return NSBC_INVAL;
     }
 
     /* 假期回来：调对应模块的 _reload_json()
-     *   int rc = ext_table_reload_json(argv[1], err, sizeof(err)); */
+     *   int rc = ext_table_reload_json(json_buf, err, sizeof(err)); */
     char err[256] = {0};
     int rc;
-    if (strcmp(module, "extensions") == 0)       rc = ext_table_reload_json(argv[1], err, sizeof(err));
-    else if (strcmp(module, "gateways") == 0)    rc = gw_table_reload_json(argv[1], err, sizeof(err));
-    else if (strcmp(module, "trunks") == 0)     rc = trunk_table_reload_json(argv[1], err, sizeof(err));
-    else if (strcmp(module, "dialplan-rules") == 0) rc = dp_rules_reload_json(argv[1], err, sizeof(err));
-    else if (strcmp(module, "profiles") == 0)   rc = sip_profiles_reload_json(argv[1], err, sizeof(err));
-    else if (strcmp(module, "queues") == 0)    rc = queue_table_reload_json(argv[1], err, sizeof(err));
-    else if (strcmp(module, "ivr") == 0)        rc = ivr_menus_reload_json(argv[1], err, sizeof(err));
+    if (strcmp(module, "extensions") == 0)       rc = ext_table_reload_json(json_buf, err, sizeof(err));
+    else if (strcmp(module, "gateways") == 0)    rc = gw_table_reload_json(json_buf, err, sizeof(err));
+    else if (strcmp(module, "trunks") == 0)     rc = trunk_table_reload_json(json_buf, err, sizeof(err));
+    else if (strcmp(module, "dialplan-rules") == 0) rc = dp_rules_reload_json(json_buf, err, sizeof(err));
+    else if (strcmp(module, "profiles") == 0)   rc = sip_profiles_reload_json(json_buf, err, sizeof(err));
+    else if (strcmp(module, "queues") == 0)    rc = queue_table_reload_json(json_buf, err, sizeof(err));
+    else if (strcmp(module, "ivr") == 0)        rc = ivr_menus_reload_json(json_buf, err, sizeof(err));
     else { rc = NSBC_INVAL; snprintf(err, sizeof(err), "unknown module %s", module); }
 
     if (rc == NSBC_OK) {
@@ -98,6 +121,7 @@ static int cmd_reload_generic(
         log_audit("oam", "control-config-reload",
                   "module=%s result=err rc=%d", module, rc);
     }
+    free(json_buf);
     return rc;
 }
 

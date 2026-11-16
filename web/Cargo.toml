@@ -15,6 +15,8 @@ path = "src/main.rs"
 # spawn_blocking is always available with rt/rt-multi-thread
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "io-util", "sync"] }
 axum = { version = "0.7", default-features = false, features = ["http1", "json", "matched-path", "query", "tokio"] }
+# NOTE: multer intentionally kept out of vendor/ — server builds offline.
+# Sound file upload uses plain PUT body, no multipart crate (REQ-DP-UPLOAD).
 # SSE real-time push (nsbc-esl-web §8#1): BroadcastStream converts tokio broadcast channel
 # into axum SSE event stream, so front-end /calls/stream can subscribe to SESSION events in real time
 # (replaces 5-second polling). This crate already ships with axum in vendor/ and Cargo.lock

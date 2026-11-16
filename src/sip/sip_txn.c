@@ -183,7 +183,16 @@ static void arm(sip_txn_t *t, tw_node_t *n, uint32_t ms, tw_cb_fn cb,
      * "静默丢失 timer arm"——竞态场景下的最小化损害。 */
     if (!t || !t->mgr || !t->mgr->cfg.tw)
         return;
-    tw_add(t->mgr->cfg.tw, n, now + ms, cb, t);
+    if (tw_add(t->mgr->cfg.tw, n, now + ms, cb, t) != NSBC_OK) {
+        /* tw_add 失败（expire<=now / n->queued 重复挂轮 / 超 L2 跨度）时
+         * 绝不能仍 t_ref —— 那会制造永不配对的引用（refs 永不归零 →
+         * 对象永不还 slab）。丢失定时器只影响该 txn 的重传/超时兜底，
+         * 由 WARN 暴露，可观测。 */
+        llog(LOG_WARN, "txn",
+             "arm: tw_add FAILED kind=%d state=%d ms=%u — timer lost",
+             t->kind, t->state, ms);
+        return;
+    }
     t_ref(t); /* 在轮 = +1；cb 结束若未重挂则对应 unref */
 }
 
@@ -234,10 +243,15 @@ static void cb_dead(uint64_t now, void *arg)
     t_unref(t); /* 消费本次在轮引用 */
     (void)now;
     switch (t->state) {
-    case TXN_ICT_CALLING:   /* Timer B */
-    case TXN_NICT_TRYING:   /* Timer F */
+    case TXN_ICT_CALLING:    /* Timer B */
+    case TXN_ICT_PROCEEDING: /* Timer B：1xx 不停 B（RFC3261 §17.1.1.2 B 是事务
+                              * 绝对期限），无 final 时 B 在 PROCEEDING 触发。
+                              * 2026-11-14 生产事故：此 case 缺失导致落
+                              * default 不摘 hash → refs=1 永久持有 →
+                              * sip_txn slab 20 槽全部泄漏、进程假死。 */
+    case TXN_NICT_TRYING:    /* Timer F */
     case TXN_NICT_PROCEEDING:
-    case TXN_IST_COMPLETED: /* Timer H */
+    case TXN_IST_COMPLETED:  /* Timer H */
         if (t->tu)
             t->tu(t, NULL, TXN_EV_TIMEOUT, t->ud);
         __atomic_add_fetch(&m->tmo, 1, __ATOMIC_RELAXED);
@@ -248,6 +262,8 @@ static void cb_dead(uint64_t now, void *arg)
         break;
     case TXN_IST_PROCEEDING:  /* BUG-1 兜底 Timer P 触发：IST 从未收到过 2xx+ */
     case TXN_NIST_TRYING:     /* BUG-1 兜底 Timer F 触发：NIST 从未收到过 2xx+ */
+    case TXN_NIST_PROCEEDING: /* 兜底 Timer F 触发：NIST 只发过 1xx 无 final
+                               *（1xx 不取消兜底 Timer F，见 txn_send_response）*/
         /* early return 场景（ACL deny / profile deny / 号码不存在等）。
          * 没有 server_respond 被调，所以没人 arm Timer H/J，
          * 我们在 TXN_NEW 时 arm 的 Timer P/F 就是最后的兜底。 */

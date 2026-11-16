@@ -18,6 +18,7 @@ struct ha_repl {
     uint64_t   gaps;
     int        ring_used;
     repl_rec_t ring[REPL_RING_CAP];
+    int        accept_any_seq;  /* FULL resync inflight: skip gap check, accept out-of-order */
 };
 
 int repl_create(const repl_ops_t *ops, int is_active, ha_repl_t **out)
@@ -38,6 +39,23 @@ int repl_create(const repl_ops_t *ops, int is_active, ha_repl_t **out)
 void repl_destroy(ha_repl_t *r)
 {
     free(r);
+}
+
+void repl_set_ops(ha_repl_t *r,
+                  int (*apply)(void *ud, const repl_rec_t *rec),
+                  int (*on_gap)(void *ud, uint64_t expect, uint64_t got),
+                  void *ud)
+{
+    if (r == NULL) return;
+    if (apply)  r->ops.apply  = apply;
+    if (on_gap) r->ops.on_gap = on_gap;
+    if (ud)     r->ops.ud     = ud;
+}
+
+void repl_set_accept_any_seq(ha_repl_t *r, int v)
+{
+    if (r == NULL) return;
+    r->accept_any_seq = v;
 }
 
 int64_t repl_publish(ha_repl_t *r, repl_type_t type, uint16_t ver,
@@ -80,7 +98,7 @@ int repl_ingest(ha_repl_t *r, const repl_rec_t *rec)
     if (rec->seq <= r->applied_seq)
         return NSBC_OK; /* 重复/重传已应用：幂等丢弃 */
     expect = r->applied_seq + 1;
-    if (rec->seq > expect) {
+    if (rec->seq > expect && !r->accept_any_seq) {
         ++r->gaps;
         if (r->ops.on_gap != NULL)
             (void)r->ops.on_gap(r->ops.ud, expect, rec->seq);
@@ -129,9 +147,24 @@ uint64_t repl_applied_seq(ha_repl_t *r)
     return r == NULL ? 0 : r->applied_seq;
 }
 
+uint64_t repl_ack_seq(ha_repl_t *r)
+{
+    return r == NULL ? 0 : r->ack_seq;
+}
+
 uint64_t repl_gap_count(ha_repl_t *r)
 {
     return r == NULL ? 0 : r->gaps;
+}
+
+const repl_rec_t *repl_at(ha_repl_t *r, uint64_t seq)
+{
+    if (r == NULL) return NULL;
+    /* 有效范围：(ack_seq, pub_seq] — ring 是 pub_seq 单调增写入、pub%CAP 位置覆盖
+     * ack_seq 之前的条可能被新 publish 覆盖掉，pub_seq 之后的还没 publish */
+    if (seq <= r->ack_seq || seq > r->pub_seq)
+        return NULL;
+    return &r->ring[seq % REPL_RING_CAP];
 }
 
 const char *repl_type_name(repl_type_t t)

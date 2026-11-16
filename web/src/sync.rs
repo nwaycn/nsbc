@@ -18,6 +18,7 @@
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -299,6 +300,48 @@ async fn snapshot<C: CoreApi + Clone + Send + Sync>(
 }
 
 // ---------------------------------------------------------------------------
+// Global core-down cooldown — kills retry storms.
+//
+// 当 Core UDS 通道断了（Connect/Io/Timeout/Protocol），push_all(bypass=true)
+// 会绕过 per-kind cooldown，14 kinds × 6 attempts = 84 次 snapshot+retry
+// 并发执行 — 这就是"nsbc-web CPU 持续几分钟跑满 2 核"的根因。
+//
+// 全局 cooldown 在 attempt==0 硬故障时触发（不管 bypass 与否），后续 15s 内
+// 所有 kind 直接 bail，不做任何 DB 查询/UDS 调用。任何一次成功 push 立即清除。
+//
+// 与 per-kind cooldown 的分工：
+//   - global  级：CoreError 硬故障（链路断）— 15s 内全部 bail
+//   - per-kind级：单 kind 大 payload  framing overflow — 只影响自己
+//   - CoreRejected/NotFound：软故障，不触发 global（C 是活的，命令只是暂时拒绝）
+// ---------------------------------------------------------------------------
+static CORE_DOWN_COOLDOWN: AtomicU64 = AtomicU64::new(0);
+
+fn mark_core_down(reason: &str) {
+    let until = now_ms() + 15_000;
+    let prev = CORE_DOWN_COOLDOWN.swap(until, Ordering::Relaxed);
+    if prev < now_ms() {
+        tracing::warn!(reason, "core UDS 通道熔断 — 15s 内所有 sync bail");
+    }
+}
+
+fn core_in_cooldown() -> bool {
+    let exp = CORE_DOWN_COOLDOWN.load(Ordering::Relaxed);
+    exp > 0 && now_ms() < exp
+}
+
+fn clear_core_down() {
+    CORE_DOWN_COOLDOWN.store(0, Ordering::Relaxed);
+}
+
+// 哪些 CoreError 是硬故障（熔断级，retry 没用）
+fn is_core_hard_error(e: &CoreError) -> bool {
+    matches!(e,
+        CoreError::Connect(_) | CoreError::Io(_) |
+        CoreError::Timeout    | CoreError::Protocol(_) | CoreError::Unsupported(_)
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Per-kind cooldown — one kind's failure (e.g. extensions large payload framing
 // overflow) must NOT block other kinds (dialplan-rules / sip-profiles / trunks)
 // from retrying immediately. Previously a single global AtomicU64 cooldown
@@ -397,6 +440,16 @@ async fn push_kind<C: CoreApi + Clone + Send + Sync>(
     kind: Kind,
     bypass_cooldown: bool,
 ) -> Result<(), String> {
+    // ★ Global core-down cooldown —— 熔断级 bail，防止 CPU spike。
+    // push_all(bypass=true) 会触发 14 kinds 并发 retry 循环
+    // （6 attempts × 14 = 84 次 DB 查询+backoff sleep）→ 2 核 tokio runtime 满负载。
+    // 一旦某 kind 在 attempt==0 检测到硬故障（Connect/Io/Timeout），
+    // 立即 mark_core_down(15s) → 其他 13 个 kind 到这里就 bail。
+    // 不管 bypass 与否 —— bypass 是为了绕过 per-kind cooldown，
+    // 但 global cooldown 是为了防止 retry storm（更高级别的熔断）。
+    if core_in_cooldown() {
+        return Err(format!("core unreachable (global 熔断)"));
+    }
     // Per-kind cooldown bail — save CPU and disk I/O for THIS kind only.
     if !bypass_cooldown && kind_in_cooldown(kind) {
         return Err(format!("core unreachable ({kind:?} cooldown)"));
@@ -409,6 +462,13 @@ async fn push_kind<C: CoreApi + Clone + Send + Sync>(
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(kind = kind.name(), attempt, error = %e, "sync snapshot failed");
+                // ★ snapshot 失败（DB pool timed out 等）在 attempt==0 时也立即熔断。
+                // 因为 push_all(bypass=true) 14 并发 push_kind 会把 DB pool 瞬间耗尽，
+                // 导致所有 kind 都 pool timed out —— 这就是 retry storm 的连锁反应。
+                if attempt == 0 {
+                    mark_core_down("snapshot failed (DB)");
+                    return Err(format!("sync snapshot 失败（全局熔断）: {e}"));
+                }
                 if attempt == DELAYS_MS.len() {
                     return Err(e);
                 }
@@ -447,20 +507,20 @@ async fn push_kind<C: CoreApi + Clone + Send + Sync>(
         };
         match r {
             Ok(()) => {
-                // ★ 成功后存 hash —— 下次相同 JSON 直接跳过
+                // ★ 成功后清全局熔断 —— C 活了，后续 push 立即恢复
+                clear_core_down();
                 kind_hashes().lock().unwrap().insert(kind, h);
                 tracing::info!(kind = kind.name(), count = n, attempt, "pushed to core");
                 clear_kind_cooldown(kind);
                 return Ok(());
             }
             Err(e) => {
-                // ★ Per-kind cooldown on ANY CoreError at attempt==0.
-                // Only mark THIS kind as cooldown — other kinds must keep retrying
-                // (e.g. extensions large-payload overflow must not black out dialplan-rules).
-                //
-                // 但 push_all (bypass_cooldown) 绝不能标记 cooldown —— 可能只是
-                // extensions 还在 41s 处理中，后续 retry 或下一次 periodic push 会成功。
-                if attempt == 0 && !bypass_cooldown {
+                // ★ Global cooldown on attempt==0 hard error —— 不管 bypass 与否！
+                // bypass=true 的原意是绕过 per-kind cooldown（extensions 大 payload
+                // 可能临时 framing overflow），但 retry storm 是更高级别的熔断需求。
+                // attempt==0 硬故障：14 并发 push_kind 里第一个触发熔断 → 剩下 13 个
+                // 下次循环入口 core_in_cooldown() 就 bail，不会继续 retry。
+                if attempt == 0 {
                     let reason = match &e {
                         CoreError::Connect(_)     => "connect refused",
                         CoreError::CoreRejected(_)=> "command rejected",
@@ -470,9 +530,15 @@ async fn push_kind<C: CoreApi + Clone + Send + Sync>(
                         CoreError::Protocol(_)   => "protocol error",
                         CoreError::Unsupported(_)=> "unsupported",
                     };
-                    tracing::warn!(kind = kind.name(), error = ?e,
-                        "kind reload failed ({reason}) — entering 15s per-kind cooldown");
-                    mark_kind_down(kind);
+                    // 硬故障 → 全局熔断（C 链路断了，retry 没用）
+                    if is_core_hard_error(&e) {
+                        mark_core_down(reason);
+                    }
+                    if !bypass_cooldown {
+                        tracing::warn!(kind = kind.name(), error = ?e,
+                            "kind reload failed ({reason}) — entering 15s per-kind cooldown");
+                        mark_kind_down(kind);
+                    }
                     return Err(format!("core channel broken ({reason}): {e:?}"));
                 }
                 tracing::warn!(kind = kind.name(), attempt, error = ?e, "reload cmd failed");

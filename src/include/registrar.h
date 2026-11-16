@@ -46,6 +46,13 @@ typedef struct {
     int aor_cps;         /* 单 AoR 每秒上限，0 = 不限（开源默认 0） */
     int global_cps;      /* 全局每秒上限，0 = 不限（开源默认 0） */
     int retry_after_s;   /* 限流时 Retry-After 秒数，默认 30 */
+    /* RFC 3608 Service-Route 生成主机：空 = 不发（默认）。
+     * ★ 2026-11-14 "错误的网关"事故教训：此前无条件发 <sip:{realm};lr>，
+     *   realm 是公网客户端永远无法解析的内部域名（如 nsbc.local），
+     *   遵循 RFC 3608 的 UA 会把它拷进路由集 → 后续请求 DNS 解析失败
+     *   → pjsip 报 502 Bad Gateway（MicroSIP 显示"错误的网关"）。
+     *   非 IMS 部署不需要此头；确需 IMS 语义时显式配置可路由地址。 */
+    char service_route_host[128];
 } reg_cfg_t;
 
 int reg_core_create(const reg_cfg_t *cfg, reg_core_t **out);

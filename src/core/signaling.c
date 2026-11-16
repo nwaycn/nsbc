@@ -1768,6 +1768,14 @@ static int sig_start(struct nsbc_ctx *ctx)
     rc.aor_cps = (int)aorcps;
     rc.global_cps = (int)gcps;
     rc.retry_after_s = 30;
+    {
+        /* RFC 3608 Service-Route：空 = 不发（默认，见 registrar.h 注释） */
+        const char *srh = NULL;
+        cfg_get_str(cfg, "registrar.service_route_host", &srh, NULL);
+        if (srh && *srh)
+            snprintf(rc.service_route_host, sizeof(rc.service_route_host),
+                     "%s", srh);
+    }
     if (reg_core_create(&rc, &s->reg) != NSBC_OK)
         return NSBC_ERR;
     ctx->reg_core = s->reg;

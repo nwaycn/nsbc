@@ -21,6 +21,7 @@
 #include "nsbc_common.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <string.h>
@@ -224,6 +225,11 @@ static void *stun_server_thread(void *ud)
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
                 continue;   /* 超时或信号中断 → 回到顶部检查 stop_flag */
+            /* 其他错误（EBADF 等）：打日志但不退出 */
+            static int err_warned = 0;
+            if (!err_warned++)
+                llog(LOG_WARN, "stun", "recvfrom errno=%d(%s) — continue",
+                     errno, strerror(errno));
             continue;
         }
         if (n < STUN_HDR_LEN) continue;
@@ -280,6 +286,16 @@ int stun_server_start(void)
     if (g_stun.fd < 0) {
         llog(LOG_ERR, "stun", "socket() failed errno=%d", errno);
         return NSBC_ERR;
+    }
+    /* 强制阻塞模式 — 防止外部（reload/其他模块）意外把 fd 改成 O_NONBLOCK
+     * 导致 SO_RCVTIMEO 失效、recvfrom 立即 EAGAIN → continue 死循环 → 吃满一个核。
+     * stun_server 设计是阻塞 + SO_RCVTIMEO=100ms 定期打断检查 stop_flag。 */
+    {
+        int fl = fcntl(g_stun.fd, F_GETFL, 0);
+        if (fl & O_NONBLOCK) {
+            fcntl(g_stun.fd, F_SETFL, fl & ~O_NONBLOCK);
+            llog(LOG_NOTICE, "stun", "socket was O_NONBLOCK, cleared to blocking");
+        }
     }
     int one = 1;
     setsockopt(g_stun.fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
