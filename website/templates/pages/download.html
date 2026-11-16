@@ -1,0 +1,477 @@
+{{define "page_download"}}
+
+<section class="page-head">
+  <div class="container">
+    <div class="breadcrumb"><a href="{{.Root}}/">首页</a> / 下载</div>
+    <h1>获取 NSBC</h1>
+    <p>NSBC 以源码形式发布（Apache-2.0）。一条 <code>./configure &amp;&amp; make</code> 构建出 <code>nsbcd</code>，管理控制台作为独立 Rust 边车构建。</p>
+  </div>
+</section>
+
+<main>
+
+  <section class="section">
+    <div class="container">
+      <div class="grid grid--3">
+
+        <article class="release release--featured">
+          <div class="release__ver">源码 · GitHub</div>
+          <div class="release__os">主仓库 · C11 + Rust</div>
+          <ul>
+            <li>完整 C 核心与动态模块</li>
+            <li>Rust 边车 + 内嵌 SPA</li>
+            <li>三端客户端 SDK（Android / Desktop / iOS）</li>
+            <li>Apache-2.0，欢迎 PR</li>
+          </ul>
+          <a class="btn btn--primary" href="https://github.com/nwaycn/nsbc" target="_blank" rel="noopener">前往 GitHub</a>
+        </article>
+
+        <article class="release">
+          <div class="release__ver">源码 · Gitee</div>
+          <div class="release__os">国内镜像 · 加速拉取</div>
+          <ul>
+            <li>与 GitHub 主仓库同步</li>
+            <li>国内网络拉取更快</li>
+            <li>适合内网构建环境</li>
+            <li>同样基于 Apache-2.0</li>
+          </ul>
+          <a class="btn btn--outline" href="https://gitee.com/nwaycn/nsbc" target="_blank" rel="noopener">前往 Gitee</a>
+        </article>
+
+        <article class="release">
+          <div class="release__ver">客户端 SDK</div>
+          <div class="release__os">三端软电话 · 可运行参考</div>
+          <ul>
+            <li>Android：Kotlin + WebRTC</li>
+            <li>Desktop：Electron</li>
+            <li>iOS：Swift + Google WebRTC</li>
+            <li>SIP / 媒体行为已对齐</li>
+          </ul>
+          <a class="btn btn--outline" href="{{.Root}}/handbook#clients">查看说明</a>
+        </article>
+
+      </div>
+      <p class="footnote">当前尚未提供官方二进制包与容器镜像，请从源码构建；如需离线构建产物或企业交付，请联系我们。</p>
+    </div>
+  </section>
+
+  <section class="section section--soft" id="build">
+    <div class="container">
+      <div class="section-head" style="text-align:left; margin-left:0;">
+        <span class="eyebrow">从源码构建</span>
+        <h2>四步跑通第一个呼叫</h2>
+      </div>
+
+      <div class="grid grid--2">
+        <div>
+          <h3>1. 安装依赖（Debian / Ubuntu）</h3>
+          <pre class="code"><span class="k">sudo</span> apt-get update
+<span class="k">sudo</span> apt-get install -y build-essential pkg-config git \
+  libssl-dev libsrtp2-dev libpcre2-dev libedit-dev \
+  libsqlite3-dev libcurl4-openssl-dev libopus-dev
+
+<span class="c"># Rust 工具链，仅 Web 边车需要</span>
+<span class="k">curl</span> --proto '=https' --tlsv1.2 -sSf \
+  https://sh.rustup.rs | sh
+<span class="k">source</span> $HOME/.cargo/env</pre>
+
+          <h3 style="margin-top:28px;">2. 构建核心</h3>
+          <pre class="code"><span class="k">git</span> clone https://github.com/nwaycn/nsbc.git
+<span class="k">cd</span> nsbc
+<span class="k">chmod</span> +x configure
+
+<span class="c"># 扫描 src/，读取 conf/modules.conf</span>
+<span class="k">./configure</span>
+<span class="k">make</span> -j$(nproc)
+<span class="k">make</span> check          <span class="c"># 单元测试</span></pre>
+        </div>
+
+        <div>
+          <h3>3. 构建 Web 边车</h3>
+          <pre class="code"><span class="k">cd</span> web
+
+<span class="c"># 国内网络建议配置 crates 镜像后执行</span>
+<span class="k">make</span> vendor
+<span class="k">make</span> build-acme
+<span class="c"># 自动复制 nsbc-web 与 static/ 到上级目录</span>
+<span class="k">cd</span> ..</pre>
+
+          <h3 style="margin-top:28px;">4. 启动</h3>
+          <pre class="code"><span class="c"># 先启动边车：生成 SQLite 与自签 TLS 证书</span>
+<span class="k">nohup</span> ./nsbc-web &amp;
+<span class="k">sleep</span> 3
+
+<span class="c"># 再启动 C 守护进程</span>
+<span class="k">nohup</span> ./nsbcd -c conf/nsbc.yaml &amp;
+
+<span class="c"># 浏览器验证</span>
+https://&lt;your-ip&gt;/webrtc.html</pre>
+        </div>
+      </div>
+
+      <div class="note">
+        <strong>默认测试账号：</strong>分机 <code>1000</code> – <code>1019</code>，密码 <code>876876</code>，
+        Realm <code>nsbc.local</code>。两个已注册分机（如 1001 与 1002）即可直接互拨。
+        管理台默认账号 <code>admin</code> / <code>Admin123</code>，首次登录后请立即修改。
+      </div>
+
+      <div class="note">
+        <strong>排障开关：</strong><code>registrar.force_register_ok: 1</code> 会跳过 REGISTER 的 Digest 与安全围栏检查，
+        仅用于内网联调；生产环境务必改为 <code>0</code>，并在 Web 控制台为分机设置密码。
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="ports">
+    <div class="container">
+      <div class="grid grid--2">
+        <div>
+          <h2>端口清单</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>端口</th><th>协议</th><th>用途</th></tr></thead>
+              <tbody>
+                <tr><td>5060</td><td>UDP / TCP</td><td>SIP 信令</td></tr>
+                <tr><td>5061</td><td>TCP / TLS</td><td>SIPS 加密信令</td></tr>
+                <tr><td>5062</td><td>TCP / WSS</td><td>SIP over WebSocket（路径 <code>/ws</code>）</td></tr>
+                <tr><td>443</td><td>HTTPS</td><td>Web 控制台与 <code>/api/v1</code></td></tr>
+                <tr><td>9100</td><td>HTTP</td><td>Prometheus 指标（默认仅本机）</td></tr>
+                <tr><td>10000–59999</td><td>UDP</td><td>RTP / SRTP 媒体端口段（可配置）</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div>
+          <h2>目录布局</h2>
+          <pre class="code">/opt/nsbc/
+├── nsbcd
+├── nsbc_cli
+├── conf/nsbc.yaml        <span class="c"># 两个进程共享</span>
+├── web/nsbc-web + static/
+├── tls/cert.pem + key.pem
+├── logs/nsbcd.log + audit.jsonl
+├── run/                  <span class="c"># UDS socket</span>
+├── recordings/
+└── data/snapshots/</pre>
+          <p class="footnote">所有相对路径都以 <code>conf/nsbc.yaml</code> 所在目录为基准解析，整棵部署目录可整体迁移。</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section--soft" id="requirements">
+    <div class="container">
+      <div class="section-head">
+        <span class="eyebrow">系统要求</span>
+        <h2>最低配置与推荐配置</h2>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>项目</th><th>最低</th><th>推荐</th><th>说明</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>操作系统</td><td>Linux x86_64，内核 4.15+</td><td>Ubuntu 22.04 LTS / RHEL 9+</td><td>暂不支持 Windows / macOS</td></tr>
+            <tr><td>CPU</td><td>2 核</td><td>4 核以上</td><td>媒体锚定按并发线性扩容</td></tr>
+            <tr><td>内存</td><td>256 MB</td><td>512 MB – 2 GB</td><td>取决于并发量与录音</td></tr>
+            <tr><td>磁盘</td><td>200 MB</td><td>1 GB 以上</td><td>含录音、CDR 与审计日志</td></tr>
+            <tr><td>GCC</td><td>4.8（C11）</td><td>GCC 8+ / Clang 10+</td><td>启用 <code>-Werror</code></td></tr>
+            <tr><td>OpenSSL</td><td>1.1.1+</td><td>3.0+</td><td>SIP TLS + DTLS-SRTP 硬依赖</td></tr>
+            <tr><td>libsrtp2</td><td>2.3+</td><td>2.5+</td><td>媒体加密</td></tr>
+            <tr><td>libpcre2</td><td>10.30+</td><td>10.40+</td><td>拨号计划正则</td></tr>
+            <tr><td>Rust</td><td>—</td><td>stable</td><td>仅 <code>nsbc-web</code> 边车需要</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="tls">
+    <div class="container split">
+      <div>
+        <span class="eyebrow">TLS 证书</span>
+        <h2>三种证书来源，按优先级自动选择</h2>
+        <ul class="checklist">
+          <li><strong>预置证书</strong> — 指向自己的 <code>cert_path</code> / <code>key_path</code></li>
+          <li><strong>自签名</strong> — <code>auto_generate: true</code>，内网默认，每小时轮换</li>
+          <li><strong>ACME</strong> — <code>public: true</code> + 域名，自动签发 Let's Encrypt</li>
+        </ul>
+        <p class="footnote">SIP TLS 与 Web HTTPS 共享同一套证书文件；nsbcd 只读取，不参与续期。</p>
+      </div>
+      <pre class="code"><span class="c"># 方式一：acme.sh 独立模式签发</span>
+<span class="k">acme.sh</span> --issue -d nsbc.nway.com.cn \
+  --server https://acme-v02.api.letsencrypt.org/directory \
+  --standalone
+
+<span class="c"># 方式二：部署到部署根目录 tls/</span>
+<span class="k">acme.sh</span> --install-cert -d nsbc.nway.com.cn \
+  --key-file       ../tls/key.pem \
+  --fullchain-file ../tls/cert.pem
+
+<span class="c"># 方式三：内网自签名（默认）</span>
+<span class="c"># conf/nsbc.yaml</span>
+web:
+  tls:
+    auto_generate: true
+    validity_days: 2</pre>
+    </div>
+  </section>
+
+  <section class="section" style="padding-top: 0;">
+    <div class="container">
+      <div class="cta">
+        <div>
+          <h2>需要离线构建或商业支持？</h2>
+          <p>我们可以提供内网构建产物、定制编解码策略与部署协助，联系项目维护者获取评估方案。</p>
+        </div>
+        <div class="cta__actions">
+          <a class="btn btn--outline" href="mailto:1354608370@qq.com">联系我们</a>
+          <a class="btn btn--ghost" href="{{.Root}}/handbook#build">查看构建文档</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+{{end}}
+
+{{define "page_download_en"}}
+
+<section class="page-head">
+  <div class="container">
+    <div class="breadcrumb"><a href="{{.Root}}/">Home</a> / Download</div>
+    <h1>Get NSBC</h1>
+    <p>NSBC is released as source (Apache-2.0). A single <code>./configure &amp;&amp; make</code> builds <code>nsbcd</code>; the management console is built as a separate Rust sidecar.</p>
+  </div>
+</section>
+
+<main>
+
+  <section class="section">
+    <div class="container">
+      <div class="grid grid--3">
+
+        <article class="release release--featured">
+          <div class="release__ver">Source · GitHub</div>
+          <div class="release__os">Main repository · C11 + Rust</div>
+          <ul>
+            <li>Full C core and dynamic modules</li>
+            <li>Rust sidecar + embedded SPA</li>
+            <li>Three-platform client SDKs (Android / Desktop / iOS)</li>
+            <li>Apache-2.0, PRs welcome</li>
+          </ul>
+          <a class="btn btn--primary" href="https://github.com/nwaycn/nsbc" target="_blank" rel="noopener">Go to GitHub</a>
+        </article>
+
+        <article class="release">
+          <div class="release__ver">Source · Gitee</div>
+          <div class="release__os">China mirror · faster clone</div>
+          <ul>
+            <li>Synced with GitHub main repo</li>
+            <li>Faster over mainland networks</li>
+            <li>Suitable for intranet builds</li>
+            <li>Also Apache-2.0 licensed</li>
+          </ul>
+          <a class="btn btn--outline" href="https://gitee.com/nwaycn/nsbc" target="_blank" rel="noopener">Go to Gitee</a>
+        </article>
+
+        <article class="release">
+          <div class="release__ver">Client SDKs</div>
+          <div class="release__os">Three-platform softphone · runnable reference</div>
+          <ul>
+            <li>Android: Kotlin + WebRTC</li>
+            <li>Desktop: Electron</li>
+            <li>iOS: Swift + Google WebRTC</li>
+            <li>SIP / media behavior aligned</li>
+          </ul>
+          <a class="btn btn--outline" href="{{.Root}}/handbook#clients">See docs</a>
+        </article>
+
+      </div>
+      <p class="footnote">Official binary packages and container images are not yet available — please build from source. If you need offline build artifacts or enterprise delivery, contact us.</p>
+    </div>
+  </section>
+
+  <section class="section section--soft" id="build">
+    <div class="container">
+      <div class="section-head" style="text-align:left; margin-left:0;">
+        <span class="eyebrow">Build from source</span>
+        <h2>Your first call in four steps</h2>
+      </div>
+
+      <div class="grid grid--2">
+        <div>
+          <h3>1. Install dependencies (Debian / Ubuntu)</h3>
+          <pre class="code"><span class="k">sudo</span> apt-get update
+<span class="k">sudo</span> apt-get install -y build-essential pkg-config git \
+  libssl-dev libsrtp2-dev libpcre2-dev libedit-dev \
+  libsqlite3-dev libcurl4-openssl-dev libopus-dev
+
+<span class="c"># Rust toolchain, only needed for the web sidecar</span>
+<span class="k">curl</span> --proto '=https' --tlsv1.2 -sSf \
+  https://sh.rustup.rs | sh
+<span class="k">source</span> $HOME/.cargo/env</pre>
+
+          <h3 style="margin-top:28px;">2. Build the core</h3>
+          <pre class="code"><span class="k">git</span> clone https://github.com/nwaycn/nsbc.git
+<span class="k">cd</span> nsbc
+<span class="k">chmod</span> +x configure
+
+<span class="c"># Scans src/, reads conf/modules.conf</span>
+<span class="k">./configure</span>
+<span class="k">make</span> -j$(nproc)
+<span class="k">make</span> check          <span class="c"># unit tests</span></pre>
+        </div>
+
+        <div>
+          <h3>3. Build the web sidecar</h3>
+          <pre class="code"><span class="k">cd</span> web
+
+<span class="c"># On slow networks, configure a crates mirror first</span>
+<span class="k">make</span> vendor
+<span class="k">make</span> build-acme
+<span class="c"># Copies nsbc-web and static/ into the parent directory</span>
+<span class="k">cd</span> ..</pre>
+
+          <h3 style="margin-top:28px;">4. Start</h3>
+          <pre class="code"><span class="c"># Start the sidecar first: generates SQLite and self-signed TLS cert</span>
+<span class="k">nohup</span> ./nsbc-web &amp;
+<span class="k">sleep</span> 3
+
+<span class="c"># Then start the C daemon</span>
+<span class="k">nohup</span> ./nsbcd -c conf/nsbc.yaml &amp;
+
+<span class="c"># Verify from a browser</span>
+https://&lt;your-ip&gt;/webrtc.html</pre>
+        </div>
+      </div>
+
+      <div class="note">
+        <strong>Default test accounts:</strong> Extensions <code>1000</code> – <code>1019</code>, password <code>876876</code>,
+        Realm <code>nsbc.local</code>. Two registered extensions (e.g. 1001 and 1002) can call each other immediately.
+        Admin console default account is <code>admin</code> / <code>Admin123</code> — change it right after first login.
+      </div>
+
+      <div class="note">
+        <strong>Debug switch:</strong> <code>registrar.force_register_ok: 1</code> skips Digest and security fence checks on REGISTER.
+        Use only for intranet integration testing. In production, set it to <code>0</code> and set passwords for extensions in the web console.
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="ports">
+    <div class="container">
+      <div class="grid grid--2">
+        <div>
+          <h2>Port list</h2>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Port</th><th>Protocol</th><th>Purpose</th></tr></thead>
+              <tbody>
+                <tr><td>5060</td><td>UDP / TCP</td><td>SIP signaling</td></tr>
+                <tr><td>5061</td><td>TCP / TLS</td><td>SIPS encrypted signaling</td></tr>
+                <tr><td>5062</td><td>TCP / WSS</td><td>SIP over WebSocket (path <code>/ws</code>)</td></tr>
+                <tr><td>443</td><td>HTTPS</td><td>Web console and <code>/api/v1</code></td></tr>
+                <tr><td>9100</td><td>HTTP</td><td>Prometheus metrics (localhost only by default)</td></tr>
+                <tr><td>10000–59999</td><td>UDP</td><td>RTP / SRTP media port range (configurable)</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div>
+          <h2>Directory layout</h2>
+          <pre class="code">/opt/nsbc/
+├── nsbcd
+├── nsbc_cli
+├── conf/nsbc.yaml        <span class="c"># shared by both processes</span>
+├── web/nsbc-web + static/
+├── tls/cert.pem + key.pem
+├── logs/nsbcd.log + audit.jsonl
+├── run/                  <span class="c"># UDS socket</span>
+├── recordings/
+└── data/snapshots/</pre>
+          <p class="footnote">All relative paths are resolved against the directory containing <code>conf/nsbc.yaml</code>. The entire deployment tree can be moved as a unit.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section--soft" id="requirements">
+    <div class="container">
+      <div class="section-head">
+        <span class="eyebrow">System requirements</span>
+        <h2>Minimum and recommended config</h2>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Item</th><th>Minimum</th><th>Recommended</th><th>Notes</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>OS</td><td>Linux x86_64, kernel 4.15+</td><td>Ubuntu 22.04 LTS / RHEL 9+</td><td>Windows / macOS not yet supported</td></tr>
+            <tr><td>CPU</td><td>2 cores</td><td>4 cores or more</td><td>Media anchoring scales linearly with concurrency</td></tr>
+            <tr><td>Memory</td><td>256 MB</td><td>512 MB – 2 GB</td><td>Depends on concurrency and recording</td></tr>
+            <tr><td>Disk</td><td>200 MB</td><td>1 GB or more</td><td>Includes recordings, CDRs and audit logs</td></tr>
+            <tr><td>GCC</td><td>4.8 (C11)</td><td>GCC 8+ / Clang 10+</td><td><code>-Werror</code> enabled</td></tr>
+            <tr><td>OpenSSL</td><td>1.1.1+</td><td>3.0+</td><td>Hard dep for SIP TLS + DTLS-SRTP</td></tr>
+            <tr><td>libsrtp2</td><td>2.3+</td><td>2.5+</td><td>Media encryption</td></tr>
+            <tr><td>libpcre2</td><td>10.30+</td><td>10.40+</td><td>Dialplan regex</td></tr>
+            <tr><td>Rust</td><td>—</td><td>stable</td><td>Only needed for the <code>nsbc-web</code> sidecar</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="tls">
+    <div class="container split">
+      <div>
+        <span class="eyebrow">TLS certificates</span>
+        <h2>Three certificate sources, picked automatically by priority</h2>
+        <ul class="checklist">
+          <li><strong>Pre-supplied</strong> — point to your own <code>cert_path</code> / <code>key_path</code></li>
+          <li><strong>Self-signed</strong> — <code>auto_generate: true</code>, default for intranet, rotated hourly</li>
+          <li><strong>ACME</strong> — <code>public: true</code> + domain, auto-issued via Let's Encrypt</li>
+        </ul>
+        <p class="footnote">SIP TLS and web HTTPS share the same certificate files. nsbcd only reads them — it does not participate in renewal.</p>
+      </div>
+      <pre class="code"><span class="c"># Method 1: acme.sh standalone issuance</span>
+<span class="k">acme.sh</span> --issue -d nsbc.nway.com.cn \
+  --server https://acme-v02.api.letsencrypt.org/directory \
+  --standalone
+
+<span class="c"># Method 2: deploy into the deployment root tls/</span>
+<span class="k">acme.sh</span> --install-cert -d nsbc.nway.com.cn \
+  --key-file       ../tls/key.pem \
+  --fullchain-file ../tls/cert.pem
+
+<span class="c"># Method 3: self-signed for intranet (default)</span>
+<span class="c"># conf/nsbc.yaml</span>
+web:
+  tls:
+    auto_generate: true
+    validity_days: 2</pre>
+    </div>
+  </section>
+
+  <section class="section" style="padding-top: 0;">
+    <div class="container">
+      <div class="cta">
+        <div>
+          <h2>Need offline build or commercial support?</h2>
+          <p>We can provide intranet build artifacts, customized codec strategies and deployment assistance. Contact the project maintainers for an evaluation plan.</p>
+        </div>
+        <div class="cta__actions">
+          <a class="btn btn--outline" href="mailto:1354608370@qq.com">Contact us</a>
+          <a class="btn btn--ghost" href="{{.Root}}/handbook#build">Read build docs</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+{{end}}

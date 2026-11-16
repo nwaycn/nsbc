@@ -315,7 +315,7 @@ final class WebRtcMediaEngine: NSObject, MediaEngine {
     private func attachLocalTracks(_ pc: RTCPeerConnection, allowVideo: Bool) {
         guard let factory = factory else { return }
 
-        // 音频：显式 addTransceiver 保证 Unified Plan 方向可控（sendRecv），跨端与 Android/desktop 对齐
+        // 音频：呼入时复用远端 offer 已创建的 transceiver，呼出时才新建
         let audio: RTCAudioTrack
         if let existing = audioTrack {
             audio = existing
@@ -327,18 +327,26 @@ final class WebRtcMediaEngine: NSObject, MediaEngine {
         }
         let audioInit = RTCRtpTransceiverInit()
         audioInit.direction = .sendRecv
-        _ = pc.addTransceiver(with: .audio, init: audioInit)
-        runCatching { pc.transceivers.last?.sender.setTrack(audio) }
+        let audioTx = pc.transceivers.first { $0.receiver.track?.kind == "audio" }
+            ?? pc.addTransceiver(with: .audio, init: audioInit)
+        runCatching {
+            audioTx.sender.setTrack(audio)
+            audioTx.direction = .sendRecv
+        }
         audio.isEnabled = micEnabled
 
         guard allowVideo else { return }
 
-        // 视频：显式 addTransceiver + sender.setTrack 绑定本地视频轨
+        // 视频：同样先复用远端 m=video 的 transceiver，再绑定本地视频轨
         guard let track = ensureVideoTrack() else { return }
         let videoInit = RTCRtpTransceiverInit()
         videoInit.direction = .sendRecv
-        _ = pc.addTransceiver(with: .video, init: videoInit)
-        runCatching { pc.transceivers.last?.sender.setTrack(track) }
+        let videoTx = pc.transceivers.first { $0.receiver.track?.kind == "video" }
+            ?? pc.addTransceiver(with: .video, init: videoInit)
+        runCatching {
+            videoTx.sender.setTrack(track)
+            videoTx.direction = .sendRecv
+        }
         track.isEnabled = cameraEnabled
         if cameraEnabled {
             startCaptureIfNeeded()
@@ -423,7 +431,7 @@ final class WebRtcMediaEngine: NSObject, MediaEngine {
 
     // MARK: - 商业级 SDP 过滤
 
-    private static let h264FmtpRegexPattern = "a=fmtp:\\d+ profile-level-id=[0-9a-fA-F]{6}($|[^\\r\\n]*)"
+    private static let h264FmtpRegexPattern = "a=fmtp:\\d+[^\\r\\n]*profile-level-id=[0-9a-fA-F]{6}[^\\r\\n]*"
     private static let opusFmtpRegexPattern = "a=fmtp:111[^\\r\\n]*"
 
     /// Offer SDP 过滤（商业软电话兼容策略）：

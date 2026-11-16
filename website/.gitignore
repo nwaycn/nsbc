@@ -1,0 +1,7 @@
+# 运行时产物
+data/
+*.exe
+
+# Go
+/nsbc-site
+/nsbc-site.exe

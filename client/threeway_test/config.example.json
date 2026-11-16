@@ -1,0 +1,14 @@
+{
+  "server": "10.0.0.80",
+  "wss_port": 5062,
+  "ws_path": "/ws",
+  "use_tls": true,
+  "allow_self_signed": true,
+  "realm": "nsbc.local",
+  "password": "876876",
+  "users": {
+    "android":  "10001",
+    "desktop":  "10002",
+    "ios":      "10003"
+  }
+}

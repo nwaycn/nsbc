@@ -328,32 +328,26 @@ export class WebRtcMedia {
 }
 
 // ================================================================ SDP 过滤
-// 对齐 Android WebRtcMediaEngine：H.264 统一降至 baseline profile (42e01f + packetization-mode=1)，
-// Opus 音频限定采样率 8kHz（maxplaybackrate=8000），提升跨厂商兼容。
+// 对齐 Android/iOS：仅 offer 将 H.264 降至 baseline profile (42e01f)，
+// 两向仅在缺失时补 packetization-mode=1；Opus 限定采样率 8kHz（maxplaybackrate=8000）。
 
 const H264_BASELINE_PROFILE = '42e01f';
 
-function filterSdp(sdp) {
+function filterSdp(sdp, isOffer) {
   let result = String(sdp);
 
-  // 1. H.264 fmtp：所有含 profile-level-id 的 a=fmtp 行统一降级为 baseline
+  // 1. H.264 fmtp：含 profile-level-id 的行视为 H.264（参数顺序不固定）
   result = result.replace(/^a=fmtp:(\d+)\s([^\r\n]*)$/gm, (match, pt, rest) => {
-    // 判断是否 H.264（对应的 a=rtpmap 为 H264）
-    // 先用简易策略：fmtp 行里若含 profile-level-id 就视为 H.264
     if (!/profile-level-id=([0-9a-fA-F]+)/.test(rest)) return match;
 
-    const newRest = rest
-      .replace(/profile-level-id=([0-9a-fA-F]+)/, (pidMatch, pid) => {
-        const lower = String(pid).toLowerCase();
-        if (lower === H264_BASELINE_PROFILE) return `profile-level-id=${H264_BASELINE_PROFILE}`;
-        return `profile-level-id=${H264_BASELINE_PROFILE}`;
-      })
-      .replace(/packetization-mode=\d+/g, 'packetization-mode=1');
+    // answer 必须与 offer 的 profile 保持一致，不能改写
+    const profileRest = isOffer
+      ? rest.replace(/profile-level-id=[0-9a-fA-F]+/, `profile-level-id=${H264_BASELINE_PROFILE}`)
+      : rest;
 
-    // 如果原来没有 packetization-mode，补上
-    const finalRest = /packetization-mode=/.test(newRest)
-      ? newRest
-      : `${newRest};packetization-mode=1`;
+    const finalRest = /packetization-mode/.test(profileRest)
+      ? profileRest
+      : `${profileRest};packetization-mode=1`;
 
     return `a=fmtp:${pt} ${finalRest}`;
   });
@@ -381,9 +375,9 @@ function filterSdp(sdp) {
 }
 
 function filterOfferSdp(sdp) {
-  return filterSdp(sdp);
+  return filterSdp(sdp, true);
 }
 
 function filterAnswerSdp(sdp) {
-  return filterSdp(sdp);
+  return filterSdp(sdp, false);
 }

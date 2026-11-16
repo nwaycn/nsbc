@@ -1,0 +1,327 @@
+{{define "page_community"}}
+
+<section class="page-head">
+  <div class="container">
+    <div class="breadcrumb"><a href="{{.Root}}/">首页</a> / 社区</div>
+    <h1>社区</h1>
+    <p>NSBC 的成长来自使用者的反馈与代码贡献。无论你是部署运维、集成开发还是协议研究者，都欢迎加入讨论。</p>
+  </div>
+</section>
+
+<main>
+
+  <section class="section">
+    <div class="container">
+      <div class="grid grid--3">
+        <article class="card community-card">
+          <div class="card__icon">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 19c-4 1.5-4-2.5-6-3m12 5v-3.5c0-1 .1-1.4-.5-2 2.8-.3 5.5-1.4 5.5-6a4.6 4.6 0 0 0-1.3-3.2 4.2 4.2 0 0 0-.1-3.2s-1.1-.3-3.5 1.3a12 12 0 0 0-6.2 0C6.5 2.8 5.4 3.1 5.4 3.1a4.2 4.2 0 0 0-.1 3.2A4.6 4.6 0 0 0 4 9.5c0 4.6 2.7 5.7 5.5 6-.6.6-.6 1.2-.5 2V21"/></svg>
+          </div>
+          <h3>GitHub</h3>
+          <p>主仓库：源码、Issue、Pull Request 与版本发布。大功能建议先开 Issue 讨论设计。</p>
+          <a class="btn btn--outline" href="https://github.com/nwaycn/nsbc" target="_blank" rel="noopener" style="margin-top:16px;">前往仓库</a>
+        </article>
+
+        <article class="card community-card">
+          <div class="card__icon">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M8 12h8M12 8v8"/></svg>
+          </div>
+          <h3>Gitee 镜像</h3>
+          <p>国内网络拉取更快，与 GitHub 主仓库同步，适合内网构建与团队协作。</p>
+          <a class="btn btn--outline" href="https://gitee.com/nwaycn/nsbc" target="_blank" rel="noopener" style="margin-top:16px;">前往 Gitee</a>
+        </article>
+
+        <article class="card community-card">
+          <div class="card__icon">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 7l9 6 9-6"/></svg>
+          </div>
+          <h3>邮件联系</h3>
+          <p>学术合作、企业评估与安全问题，可直接邮件联系维护者。</p>
+          <a class="btn btn--outline" href="mailto:1354608370@qq.com" style="margin-top:16px;">发送邮件</a>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section--soft">
+    <div class="container split">
+      <div>
+        <span class="eyebrow">参与贡献</span>
+        <h2>从第一个 Pull Request 开始</h2>
+        <p>欢迎修复文档、补充测试、优化信令路径，或实现新的编解码与路由策略。提交前请确认本地构建与测试通过。</p>
+        <ul class="checklist">
+          <li>运行 <code>./configure &amp;&amp; make -j$(nproc)</code> 与 <code>make check</code></li>
+          <li>解析器 / 传输层改动跑 <code>make asan check</code> 与 <code>make tsan check</code></li>
+          <li>遵循现有 C 风格：4 空格缩进、<code>snake_case</code>、公共 API 写 Doxygen 注释</li>
+          <li>新模块需声明 <code>NSBC_MOD()</code>；被信令核心直接调用的加入 <code>HARD_STATIC</code></li>
+          <li>大功能先开 Issue，一个 PR 只做一件事</li>
+        </ul>
+      </div>
+      <pre class="code"><span class="c"># 典型贡献流程</span>
+<span class="k">git</span> clone https://github.com/nwaycn/nsbc.git
+<span class="k">cd</span> nsbc
+<span class="k">git</span> checkout -b feat/my-change
+
+<span class="k">./configure</span>
+<span class="k">make</span> -j$(nproc)
+<span class="k">make</span> check
+
+<span class="c"># 解析器 / 传输层改动</span>
+<span class="k">make</span> SANITIZE=asan -j$(nproc)
+<span class="k">make</span> SANITIZE=tsan -j$(nproc)
+
+<span class="k">git</span> commit -am <span class="s">"feat: 描述你的改动"</span>
+<span class="k">git</span> push origin feat/my-change</pre>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <div class="section-head">
+        <span class="eyebrow">开发者资源</span>
+        <h2>可运行的事件订阅示例</h2>
+        <p><code>examples/event_client/</code> 提供四种语言的客户端，连接 UDS 并实时打印呼叫事件。</p>
+      </div>
+
+      <div class="grid grid--2">
+        <div class="resource-list">
+          <a class="resource" href="https://github.com/nwaycn/nsbc/tree/main/examples/event_client/c" target="_blank" rel="noopener">
+            <span class="resource__icon">C</span>
+            <span class="resource__body"><strong>event_client.c</strong><span>gcc event_client.c -o event_client</span></span>
+            <span>→</span>
+          </a>
+          <a class="resource" href="https://github.com/nwaycn/nsbc/tree/main/examples/event_client/go" target="_blank" rel="noopener">
+            <span class="resource__icon">GO</span>
+            <span class="resource__body"><strong>main.go</strong><span>cd go &amp;&amp; go run main.go</span></span>
+            <span>→</span>
+          </a>
+        </div>
+        <div class="resource-list">
+          <a class="resource" href="https://github.com/nwaycn/nsbc/tree/main/examples/event_client/python" target="_blank" rel="noopener">
+            <span class="resource__icon">PY</span>
+            <span class="resource__body"><strong>event_client.py</strong><span>python3 event_client.py</span></span>
+            <span>→</span>
+          </a>
+          <a class="resource" href="https://github.com/nwaycn/nsbc/tree/main/examples/event_client/rust" target="_blank" rel="noopener">
+            <span class="resource__icon">RS</span>
+            <span class="resource__body"><strong>src/main.rs</strong><span>cd rust &amp;&amp; cargo run</span></span>
+            <span>→</span>
+          </a>
+        </div>
+      </div>
+      <p class="footnote">所有客户端订阅 <code>SESSION_CREATE</code>、<code>SESSION_ANSWER</code>、<code>SESSION_END</code>，事件格式见 <code>src/include/event_bus.h</code>。</p>
+    </div>
+  </section>
+
+  <section class="section section--soft">
+    <div class="container">
+      <div class="section-head">
+        <span class="eyebrow">行为准则</span>
+        <h2>保持专业与尊重</h2>
+        <p>技术讨论可以激烈，但请始终针对问题本身。我们不会容忍人身攻击、歧视性言论或恶意骚扰。</p>
+      </div>
+      <div class="grid grid--2">
+        <article class="card">
+          <h3>我们鼓励</h3>
+          <ul>
+            <li>提供可复现步骤与日志片段</li>
+            <li>先搜索历史 Issue 再提问</li>
+            <li>对他人的方案给出具体建议</li>
+            <li>补充测试、文档与配置样例</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h3>我们不接受</h3>
+          <ul>
+            <li>公开他人隐私或凭证信息</li>
+            <li>与主题无关的推广内容</li>
+            <li>反复提交低质量重复 Issue</li>
+            <li>未披露的安全漏洞公开讨论</li>
+          </ul>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" style="padding-top: 0;">
+    <div class="container">
+      <div class="cta">
+        <div>
+          <h2>有想法但不确定怎么开始？</h2>
+          <p>先在 Issue 里描述你的场景与复现步骤，我们会一起判断它是否适合进入路线图。</p>
+        </div>
+        <div class="cta__actions">
+          <a class="btn btn--outline" href="https://github.com/nwaycn/nsbc/issues" target="_blank" rel="noopener">提交 Issue</a>
+          <a class="btn btn--ghost" href="{{.Root}}/handbook">阅读文档</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+{{end}}
+
+{{define "page_community_en"}}
+
+<section class="page-head">
+  <div class="container">
+    <div class="breadcrumb"><a href="{{.Root}}/">Home</a> / Community</div>
+    <h1>Community</h1>
+    <p>NSBC grows with feedback and code contributions from its users. Whether you do deployment ops, integration development or protocol research — you are welcome to join the discussion.</p>
+  </div>
+</section>
+
+<main>
+
+  <section class="section">
+    <div class="container">
+      <div class="grid grid--3">
+        <article class="card community-card">
+          <div class="card__icon">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 19c-4 1.5-4-2.5-6-3m12 5v-3.5c0-1 .1-1.4-.5-2 2.8-.3 5.5-1.4 5.5-6a4.6 4.6 0 0 0-1.3-3.2 4.2 4.2 0 0 0-.1-3.2s-1.1-.3-3.5 1.3a12 12 0 0 0-6.2 0C6.5 2.8 5.4 3.1 5.4 3.1a4.2 4.2 0 0 0-.1 3.2A4.6 4.6 0 0 0 4 9.5c0 4.6 2.7 5.7 5.5 6-.6.6-.6 1.2-.5 2V21"/></svg>
+          </div>
+          <h3>GitHub</h3>
+          <p>Main repo: source, issues, pull requests, and releases. For large features, please open an issue to discuss design first.</p>
+          <a class="btn btn--outline" href="https://github.com/nwaycn/nsbc" target="_blank" rel="noopener" style="margin-top:16px;">Go to repo</a>
+        </article>
+
+        <article class="card community-card">
+          <div class="card__icon">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M8 12h8M12 8v8"/></svg>
+          </div>
+          <h3>Gitee mirror</h3>
+          <p>Faster over mainland networks, synced with the GitHub main repo. Good for intranet builds and team collaboration.</p>
+          <a class="btn btn--outline" href="https://gitee.com/nwaycn/nsbc" target="_blank" rel="noopener" style="margin-top:16px;">Go to Gitee</a>
+        </article>
+
+        <article class="card community-card">
+          <div class="card__icon">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 7l9 6 9-6"/></svg>
+          </div>
+          <h3>Email us</h3>
+          <p>Academic cooperation, enterprise evaluation, and security issues — you can reach the maintainers directly by email.</p>
+          <a class="btn btn--outline" href="mailto:1354608370@qq.com" style="margin-top:16px;">Send email</a>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section--soft">
+    <div class="container split">
+      <div>
+        <span class="eyebrow">Contributing</span>
+        <h2>Start with your first pull request</h2>
+        <p>Documentation fixes, test additions, improved signaling paths, new codecs or routing strategies — all welcome. Please make sure local build and tests pass before submitting.</p>
+        <ul class="checklist">
+          <li>Run <code>./configure &amp;&amp; make -j$(nproc)</code> and <code>make check</code></li>
+          <li>For parser / transport-layer changes also run <code>make asan check</code> and <code>make tsan check</code></li>
+          <li>Follow existing C style: 4-space indent, <code>snake_case</code>, Doxygen comments on public APIs</li>
+          <li>New modules must declare <code>NSBC_MOD()</code>; those called directly by the signaling core go in <code>HARD_STATIC</code></li>
+          <li>Open an issue for large features; one PR does one thing</li>
+        </ul>
+      </div>
+      <pre class="code"><span class="c"># Typical contribution flow</span>
+<span class="k">git</span> clone https://github.com/nwaycn/nsbc.git
+<span class="k">cd</span> nsbc
+<span class="k">git</span> checkout -b feat/my-change
+
+<span class="k">./configure</span>
+<span class="k">make</span> -j$(nproc)
+<span class="k">make</span> check
+
+<span class="c"># For parser / transport-layer changes</span>
+<span class="k">make</span> SANITIZE=asan -j$(nproc)
+<span class="k">make</span> SANITIZE=tsan -j$(nproc)
+
+<span class="k">git</span> commit -am <span class="s">"feat: describe your change"</span>
+<span class="k">git</span> push origin feat/my-change</pre>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <div class="section-head">
+        <span class="eyebrow">Developer resources</span>
+        <h2>Runnable event-subscription examples</h2>
+        <p><code>examples/event_client/</code> provides clients in four languages that connect over UDS and print call events in real time.</p>
+      </div>
+
+      <div class="grid grid--2">
+        <div class="resource-list">
+          <a class="resource" href="https://github.com/nwaycn/nsbc/tree/main/examples/event_client/c" target="_blank" rel="noopener">
+            <span class="resource__icon">C</span>
+            <span class="resource__body"><strong>event_client.c</strong><span>gcc event_client.c -o event_client</span></span>
+            <span>→</span>
+          </a>
+          <a class="resource" href="https://github.com/nwaycn/nsbc/tree/main/examples/event_client/go" target="_blank" rel="noopener">
+            <span class="resource__icon">GO</span>
+            <span class="resource__body"><strong>main.go</strong><span>cd go &amp;&amp; go run main.go</span></span>
+            <span>→</span>
+          </a>
+        </div>
+        <div class="resource-list">
+          <a class="resource" href="https://github.com/nwaycn/nsbc/tree/main/examples/event_client/python" target="_blank" rel="noopener">
+            <span class="resource__icon">PY</span>
+            <span class="resource__body"><strong>event_client.py</strong><span>python3 event_client.py</span></span>
+            <span>→</span>
+          </a>
+          <a class="resource" href="https://github.com/nwaycn/nsbc/tree/main/examples/event_client/rust" target="_blank" rel="noopener">
+            <span class="resource__icon">RS</span>
+            <span class="resource__body"><strong>src/main.rs</strong><span>cd rust &amp;&amp; cargo run</span></span>
+            <span>→</span>
+          </a>
+        </div>
+      </div>
+      <p class="footnote">All clients subscribe to <code>SESSION_CREATE</code>, <code>SESSION_ANSWER</code>, <code>SESSION_END</code>. See <code>src/include/event_bus.h</code> for the event format.</p>
+    </div>
+  </section>
+
+  <section class="section section--soft">
+    <div class="container">
+      <div class="section-head">
+        <span class="eyebrow">Code of conduct</span>
+        <h2>Be professional and respectful</h2>
+        <p>Technical discussions can get heated — but always attack the problem, never the person. Personal attacks, discriminatory speech, or harassment will not be tolerated.</p>
+      </div>
+      <div class="grid grid--2">
+        <article class="card">
+          <h3>We encourage</h3>
+          <ul>
+            <li>Reproducible steps and log snippets</li>
+            <li>Searching existing issues before asking</li>
+            <li>Specific feedback on other people's proposals</li>
+            <li>Tests, documentation and config samples</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h3>We don't accept</h3>
+          <ul>
+            <li>Sharing other people's privacy or credentials</li>
+            <li>Off-topic promotion content</li>
+            <li>Repeated low-quality duplicate issues</li>
+            <li>Undisclosed security vulnerabilities discussed publicly</li>
+          </ul>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" style="padding-top: 0;">
+    <div class="container">
+      <div class="cta">
+        <div>
+          <h2>Have an idea but not sure where to start?</h2>
+          <p>Describe your scenario and reproduction steps in an issue — we'll help figure out whether it belongs on the roadmap.</p>
+        </div>
+        <div class="cta__actions">
+          <a class="btn btn--outline" href="https://github.com/nwaycn/nsbc/issues" target="_blank" rel="noopener">Open an issue</a>
+          <a class="btn btn--ghost" href="{{.Root}}/handbook">Read the docs</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+{{end}}

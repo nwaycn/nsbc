@@ -1,0 +1,149 @@
+{{define "page_docs"}}
+<section class="page-head">
+  <div class="container">
+    <div class="breadcrumb"><a href="{{.Root}}/">{{lang . "Home" "首页"}}</a> / {{lang . "Docs" "文档"}}</div>
+    <h1>{{lang . "Documentation" "文档中心"}}</h1>
+    <p>{{lang . "Configuration and troubleshooting docs organized by topic. New content appears here instantly — no rebuild needed." "按主题组织的配置与排障文档。新增内容会即时出现在这里，无需重新构建站点。"}}</p>
+  </div>
+</section>
+
+<main>
+  <section class="section">
+    <div class="container">
+      <div class="grid grid--2">
+        <article class="card">
+          <span class="tag">{{lang . "Handbook" "手册"}}</span>
+          <h2 style="margin-top:10px;"><a href="{{.Root}}/handbook">{{lang . "NSBC Configuration Handbook" "NSBC 配置手册"}}</a></h2>
+          <p>{{lang . "Complete reference from minimal YAML and module loading to codecs, dial plans, metrics and the REST API." "从最小 YAML、模块加载到编解码、拨号计划、指标与 REST API 的完整参考。"}}</p>
+          <a class="more" href="{{.Root}}/handbook">{{lang . "Open handbook →" "打开手册 →"}}</a>
+        </article>
+
+        {{range .Docs}}
+        <article class="card">
+          <span class="tag">{{lang $ "Doc" "文档"}}</span>
+          <h2 style="margin-top:10px;"><a href="{{$.Root}}/docs/{{.Slug}}">{{.Title}}</a></h2>
+          <p>{{.Summary}}</p>
+          <a class="more" href="{{$.Root}}/docs/{{.Slug}}">{{lang $ "Read →" "阅读 →"}}</a>
+        </article>
+        {{end}}
+      </div>
+
+      {{if not .Docs}}
+      <p class="footnote">{{lang . "No dynamic docs yet. Drop a Markdown file under <code>content/docs/</code>." "还没有动态文档。在 <code>content/docs/</code> 下新建 Markdown 文件即可。"}}</p>
+      {{end}}
+    </div>
+  </section>
+</main>
+{{end}}
+
+{{define "page_doc"}}
+<section class="page-head">
+  <div class="container">
+    <div class="breadcrumb"><a href="{{.Root}}/">{{lang . "Home" "首页"}}</a> / <a href="{{.Root}}/docs">{{lang . "Docs" "文档"}}</a> / {{.Doc.Title}}</div>
+    <h1>{{.Doc.Title}}</h1>
+    {{if .Doc.Summary}}<p>{{.Doc.Summary}}</p>{{end}}
+  </div>
+</section>
+
+<main>
+  <section class="section">
+    <div class="container doc-layout">
+      <aside class="side-nav">
+        <a href="{{.Root}}/handbook">{{lang . "Configuration handbook" "完整配置手册"}}</a>
+        {{range .Docs}}
+        <a href="{{$.Root}}/docs/{{.Slug}}"{{if eq .Slug $.Doc.Slug}} class="is-active"{{end}}>{{.Title}}</a>
+        {{end}}
+      </aside>
+      <article class="doc-body prose">{{.Markdown}}</article>
+    </div>
+  </section>
+</main>
+{{end}}
+
+{{define "page_blog"}}
+<section class="page-head">
+  <div class="container">
+    <div class="breadcrumb"><a href="{{.Root}}/">{{lang . "Home" "首页"}}</a> / {{lang . "Blog" "博客"}}</div>
+    <h1>{{lang . "Blog" "博客"}}</h1>
+    <p>{{lang . "Release notes, implementation details and ops experience. Articles live in Markdown and appear here automatically." "版本发布、实现细节与运维经验。文章以 Markdown 存放，新增后自动进入列表。"}}</p>
+  </div>
+</section>
+
+<main>
+  <section class="section">
+    <div class="container">
+      {{range .Posts}}
+      <article class="card" style="margin-bottom:24px;">
+        {{with tags .Tags}}<span class="tag">{{index . 0}}</span>{{end}}
+        <time datetime="{{.Date}}" style="display:block; margin-top:10px;">{{.Date}}</time>
+        <h2 style="margin-top:8px;"><a href="{{$.Root}}/blog/{{.Slug}}">{{.Title}}</a></h2>
+        <p>{{.Summary}}</p>
+        <a class="more" href="{{$.Root}}/blog/{{.Slug}}">{{lang $ "Read post →" "阅读全文 →"}}</a>
+      </article>
+      {{end}}
+
+      {{if not .Posts}}
+      <p class="footnote">{{lang . "No posts yet. Drop a Markdown file under <code>content/blog/</code>." "还没有文章。在 <code>content/blog/</code> 下新建 Markdown 文件即可。"}}</p>
+      {{end}}
+    </div>
+  </section>
+</main>
+{{end}}
+
+{{define "page_post"}}
+<section class="page-head">
+  <div class="container">
+    <div class="breadcrumb"><a href="{{.Root}}/">{{lang . "Home" "首页"}}</a> / <a href="{{.Root}}/blog">{{lang . "Blog" "博客"}}</a> / {{.Post.Title}}</div>
+    <h1>{{.Post.Title}}</h1>
+    <p>
+      <time datetime="{{.Post.Date}}">{{.Post.Date}}</time>
+      {{range tags .Post.Tags}} · <span class="tag">{{.}}</span>{{end}}
+    </p>
+  </div>
+</section>
+
+<main>
+  <section class="section">
+    <div class="container">
+      <article class="doc-body prose" style="max-width:780px; margin:0 auto;">{{.Markdown}}</article>
+      <div style="max-width:780px; margin:40px auto 0;">
+        <a class="btn btn--ghost" href="{{.Root}}/blog">{{lang . "← Back to blog" "← 返回博客"}}</a>
+      </div>
+    </div>
+  </section>
+</main>
+{{end}}
+
+{{define "page_404"}}
+<section class="page-head">
+  <div class="container">
+    <div class="breadcrumb"><a href="{{.Root}}/">{{lang . "Home" "首页"}}</a> / 404</div>
+    <h1>{{lang . "Page not found" "页面不存在"}}</h1>
+    <p>{{lang . "The link may have changed or the article has moved." "链接可能已更新，或者这篇文章已经被移动。"}}</p>
+  </div>
+</section>
+
+<main>
+  <section class="section">
+    <div class="container">
+      <div class="grid grid--3">
+        <article class="card">
+          <h3>{{lang . "Find docs" "找文档"}}</h3>
+          <p>{{lang . "Configuration, SIP & media, WebRTC interop and troubleshooting." "配置、SIP 与媒体、WebRTC 互通与排障。"}}</p>
+          <a class="more" href="{{.Root}}/docs">{{lang . "Go to docs →" "进入文档中心 →"}}</a>
+        </article>
+        <article class="card">
+          <h3>{{lang . "Read the blog" "读博客"}}</h3>
+          <p>{{lang . "Release notes and implementation details." "版本发布与实现细节。"}}</p>
+          <a class="more" href="{{.Root}}/blog">{{lang . "View blog →" "查看博客 →"}}</a>
+        </article>
+        <article class="card">
+          <h3>{{lang . "Back home" "回到首页"}}</h3>
+          <p>{{lang . "Learn about NSBC and its capabilities." "了解 NSBC 的定位与能力。"}}</p>
+          <a class="more" href="{{.Root}}/">{{lang . "Go home →" "返回首页 →"}}</a>
+        </article>
+      </div>
+    </div>
+  </section>
+</main>
+{{end}}
