@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/caddyserver/certmagic"
 )
 
 type Server struct {
@@ -18,25 +20,49 @@ type Server struct {
 }
 
 func main() {
-	addr := flag.String("addr", "127.0.0.1:8080", "HTTP 监听地址")
-	contentDir := flag.String("content", "content", "Markdown 内容目录")
-	dbPath := flag.String("db", "data/site.db", "SQLite 索引路径")
-	tplDir := flag.String("templates", "templates", "模板目录")
-	assetsDir := flag.String("assets", "assets", "静态资源目录")
+	// 命令行 flag 可覆盖 INI 配置。config 路径本身不受 ini 影响，必须用 flag 指定。
+	configPath := flag.String("config", "website.ini", "配置文件路径 (INI)")
+	addr := flag.String("addr", "", "HTTP 监听地址 (覆盖 ini [general].addr)")
+	contentDir := flag.String("content", "", "Markdown 内容目录")
+	dbPath := flag.String("db", "", "SQLite 索引路径")
+	tplDir := flag.String("templates", "", "模板目录")
+	assetsDir := flag.String("assets", "", "静态资源目录")
 	flag.Parse()
 
-	store, err := OpenStore(*dbPath)
+	cfg, err := LoadINI(*configPath)
+	if err != nil {
+		log.Fatalf("load config %s: %v", *configPath, err)
+	}
+
+	// flag 显式传参时覆盖 ini 值。
+	if *addr != "" {
+		cfg.Addr = *addr
+	}
+	if *contentDir != "" {
+		cfg.ContentDir = *contentDir
+	}
+	if *dbPath != "" {
+		cfg.DBDir = *dbPath
+	}
+	if *tplDir != "" {
+		cfg.TplDir = *tplDir
+	}
+	if *assetsDir != "" {
+		cfg.AssetsDir = *assetsDir
+	}
+
+	store, err := OpenStore(cfg.DBDir)
 	if err != nil {
 		log.Fatalf("open store: %v", err)
 	}
 	defer store.Close()
-	if err := store.Sync(*contentDir); err != nil {
+	if err := store.Sync(cfg.ContentDir); err != nil {
 		log.Printf("initial content sync: %v", err)
 	}
-	stopWatch := store.Watch(*contentDir, 2*time.Second)
+	stopWatch := store.Watch(cfg.ContentDir, 2*time.Second)
 	defer stopWatch()
 
-	renderer, err := NewRenderer(*tplDir)
+	renderer, err := NewRenderer(cfg.TplDir)
 	if err != nil {
 		log.Fatalf("parse templates: %v", err)
 	}
@@ -44,7 +70,7 @@ func main() {
 	s := &Server{store: store, r: renderer}
 	mux := http.NewServeMux()
 
-	assets := http.StripPrefix("/assets/", http.FileServer(http.Dir(*assetsDir)))
+	assets := http.StripPrefix("/assets/", http.FileServer(http.Dir(cfg.AssetsDir)))
 	mux.Handle("GET /assets/", withCache(assets))
 
 	// 中文路由（无前缀）
@@ -102,14 +128,53 @@ func main() {
 
 	mux.HandleFunc("GET /{path...}", s.handleNotFound)
 
-	log.Printf("NSBC website listening on http://%s (content: %s)", *addr, *contentDir)
+	handler := securityHeaders(requestLog(mux))
+
+	if cfg.ACMEEnable {
+		runHTTPS(cfg, handler)
+	} else {
+		runHTTP(cfg, handler)
+	}
+}
+
+// runHTTP 纯 HTTP 监听，适用于开发、内网预览或反代后的后端。
+func runHTTP(cfg Config, handler http.Handler) {
+	log.Printf("NSBC website listening on http://%s (content: %s)", cfg.Addr, cfg.ContentDir)
 	srv := &http.Server{
-		Addr:              *addr,
-		Handler:           securityHeaders(requestLog(mux)),
+		Addr:              cfg.Addr,
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
+	}
+}
+
+// runHTTPS 启用 Let's Encrypt / ZeroSSL 自动证书：certmagic 负责
+//   - :80  HTTP-01 challenge + 自动 301 → HTTPS
+//   - :443 TLS  自动签发 + 到期前 30 天后台续签
+func runHTTPS(cfg Config, handler http.Handler) {
+	certmagic.DefaultACME.Agreed = true
+	certmagic.DefaultACME.Email = cfg.ACMEEmail
+	if cfg.ACMEStaging {
+		certmagic.DefaultACME.CA = certmagic.LetsEncryptStagingCA
+		log.Printf("ACME using Let's Encrypt staging CA (cert will NOT be trusted by browsers)")
+	}
+	if cfg.ACMECache != "" {
+		certmagic.Default.Storage = &certmagic.FileStorage{Path: cfg.ACMECache}
+	}
+
+	log.Printf("NSBC website starting ACME HTTPS for %s", cfg.ACMEDomain)
+	log.Printf("  email: %s", cfg.ACMEEmail)
+	if cfg.ACMECache != "" {
+		log.Printf("  cache: %s", cfg.ACMECache)
+	}
+	log.Printf("  certmagic will listen on :443 (HTTPS) and :80 (challenge + redirect)")
+
+	// HTTPS() 是阻塞式的：内部自己 start goroutine 处理 challenge 和
+	// 后台续签，主 goroutine 阻塞在 TLS listener 上直到退出。
+	if err := certmagic.HTTPS([]string{cfg.ACMEDomain}, handler); err != nil {
+		log.Fatalf("acme https: %v", err)
 	}
 }
 
