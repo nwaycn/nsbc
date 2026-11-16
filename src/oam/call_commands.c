@@ -32,8 +32,11 @@
 #include "obs_sub.h"       /* obs_sub_global + obs_sub_add — siptrace on 自动订阅当前连接 */
 #include "sip_transport.h"
 #include "uDS_client.h"
+#include "ai_backend_registry.h"  /* REQ-AI-MEDIA-001: ai_set_producer / ai_get_rx_audio / ai_send_tx_audio / ai_request_transfer */
+#include "vad_engine.h"           /* REQ-AI-BARGEIN-001: vad_start_for_call / vad_stop_for_call / vad_query_for_call */
 #include <cjson/cJSON.h>
 #include <time.h>
+#include <stdint.h>
 
 #include <stdio.h>
 #include <string.h>
@@ -311,6 +314,226 @@ static int cmd_uuid_hold(cmd_ctx_t *c, int argc, char **argv, void *ud)
         c->io_printf(c->io_ud, "ERR not-supported\n");
     } else {
         c->io_printf(c->io_ud, "ERR hold failed rc=%d\n", rc);
+    }
+    return rc;
+}
+
+/* ==================================================================
+ * REQ-AI-MEDIA-001: AI pass-through OAM 命令组
+ *
+ *   ai-set-producer <call-id> <0|1>        — 切换 producer 模式（1=外部 AI 接管）
+ *   ai-request-transfer <call-id> <dest>   — 请求转人工座席（blind REFER）
+ *   ai-get-rx <call-id> <max-bytes>        — 拉用户语音（PCMU 8kHz），base64 输出
+ *   ai-send-tx <call-id> <format> <base64> — 推回复音频，base64 输入
+ *
+ * 语义：
+ *   外部 AI agent（Python/Go/Rust）通过 /ext/v1/cmd HTTP 透明代理调这些命令。
+ *   ai-get-rx / ai-send-tx 走 base64 编码是因为 UDS/HTTP 文本协议不能直接传二进制。
+ * ==================================================================*/
+
+/* ---- base64 encode/decode（ai-get-rx / ai-send-tx 用） ---- */
+static const char *b64_tbl =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static int b64_encode(const uint8_t *in, size_t in_len, char *out, size_t out_cap)
+{
+    size_t need = ((in_len + 2) / 3) * 4 + 1;
+    if (out_cap < need) return -1;
+    size_t o = 0;
+    for (size_t i = 0; i + 3 <= in_len; i += 3) {
+        uint32_t v = ((uint32_t)in[i] << 16) | ((uint32_t)in[i+1] << 8) | in[i+2];
+        out[o++] = b64_tbl[(v >> 18) & 0x3f];
+        out[o++] = b64_tbl[(v >> 12) & 0x3f];
+        out[o++] = b64_tbl[(v >> 6) & 0x3f];
+        out[o++] = b64_tbl[v & 0x3f];
+    }
+    size_t rem = in_len % 3;
+    if (rem == 1) {
+        uint32_t v = ((uint32_t)in[in_len-1]) << 16;
+        out[o++] = b64_tbl[(v >> 18) & 0x3f];
+        out[o++] = b64_tbl[(v >> 12) & 0x3f];
+        out[o++] = '=';
+        out[o++] = '=';
+    } else if (rem == 2) {
+        uint32_t v = ((uint32_t)in[in_len-2] << 16) | ((uint32_t)in[in_len-1] << 8);
+        out[o++] = b64_tbl[(v >> 18) & 0x3f];
+        out[o++] = b64_tbl[(v >> 12) & 0x3f];
+        out[o++] = b64_tbl[(v >> 6) & 0x3f];
+        out[o++] = '=';
+    }
+    out[o] = '\0';
+    return (int)o;
+}
+
+static int b64_val(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+static int b64_decode(const char *in, uint8_t *out, size_t out_cap)
+{
+    size_t il = strlen(in), o = 0;
+    int have = 0;
+    uint32_t buf = 0;
+    for (size_t i = 0; i < il; ++i) {
+        char c = in[i];
+        if (c == '=' || c == '\n' || c == ' ') continue;
+        int v = b64_val(c);
+        if (v < 0) return -1;
+        buf = (buf << 6) | v;
+        have++;
+        if (have == 4) {
+            if (o + 1 > out_cap) return -1;
+            out[o++] = (buf >> 16) & 0xff;
+            out[o++] = (buf >> 8) & 0xff;
+            out[o++] = buf & 0xff;
+            have = 0; buf = 0;
+        }
+    }
+    if (have == 2) { buf <<= 12; if (o + 1 > out_cap) return -1; out[o++] = (buf >> 16) & 0xff; }
+    else if (have == 3) { buf <<= 6; if (o + 2 > out_cap) return -1; out[o++] = (buf >> 16) & 0xff; out[o++] = (buf >> 8) & 0xff; }
+    return (int)o;
+}
+
+/* ---- ai-set-producer ---- */
+static int cmd_ai_set_producer(cmd_ctx_t *c, int argc, char **argv, void *ud)
+{
+    if (!c || !c->io_printf) return NSBC_INVAL;
+    char *callid = NULL;
+    if (!pick_callid(c, argv, argc, &callid)) return NSBC_INVAL;
+    if (argc < 3 || !argv[2] || argv[2][0] == '\0') {
+        c->io_printf(c->io_ud, "ERR missing producer (0|1)\n"); return NSBC_INVAL;
+    }
+    int producer = atoi(argv[2]) ? 1 : 0;
+    b2b_core_t *b = b2b_from_ctx(ctx_from_ud(ud));
+    if (!b) { c->io_printf(c->io_ud, "ERR b2b not available\n"); return NSBC_ERR; }
+    b2b_call_t *call = b2b_find_callid(b, callid, strlen(callid));
+    if (!call) { c->io_printf(c->io_ud, "ERR notfound\n"); return NSBC_NOENT; }
+    int rc = ai_set_producer(call, producer);
+    if (rc == NSBC_OK) {
+        c->io_printf(c->io_ud, "OK producer=%d call=%s\n", producer, callid);
+        /* REQ-AI-BARGEIN-001: producer=1 时自动启动 VAD（barge-in 依赖） */
+        if (producer) {
+            int vrc = vad_start_for_call(call, /*leg_mask=*/3 /*双腿*/, /*threshold=*/0 /*默认*/);
+            if (vrc == 0) {
+                c->io_printf(c->io_ud, "OK vad_start legs=AB threshold=default (barge-in ready)\n");
+            } else {
+                c->io_printf(c->io_ud, "WARN vad_start rc=%d (barge-in disabled)\n", vrc);
+            }
+        } else {
+            vad_stop_for_call(call);
+            c->io_printf(c->io_ud, "OK vad_stop call=%s\n", callid);
+        }
+        log_audit("oam", "ai-set-producer", "call-id=%s producer=%d", callid, producer);
+    } else {
+        c->io_printf(c->io_ud, "ERR rc=%d\n", rc);
+    }
+    return rc;
+}
+
+/* ---- ai-vad-state <call-id> — REQ-AI-BARGEIN-001：查询当前 VAD 状态 ---- */
+static int cmd_ai_vad_state(cmd_ctx_t *c, int argc, char **argv, void *ud)
+{
+    if (!c || !c->io_printf) return NSBC_INVAL;
+    char *callid = NULL;
+    if (!pick_callid(c, argv, argc, &callid)) return NSBC_INVAL;
+    b2b_core_t *b = b2b_from_ctx(ctx_from_ud(ud));
+    if (!b) { c->io_printf(c->io_ud, "ERR b2b not available\n"); return NSBC_ERR; }
+    b2b_call_t *call = b2b_find_callid(b, callid, strlen(callid));
+    if (!call) { c->io_printf(c->io_ud, "ERR notfound\n"); return NSBC_NOENT; }
+    vad_state_t a_state = VAD_STATE_SILENCE, b_state = VAD_STATE_SILENCE;
+    uint16_t a_rms = 0, b_rms = 0;
+    int a_rc = vad_query_for_call(call, 0, &a_state, &a_rms);
+    int b_rc = vad_query_for_call(call, 1, &b_state, &b_rms);
+    const char *a_str = (a_state == VAD_STATE_SPEECH) ? "SPEECH" : "SILENCE";
+    const char *b_str = (b_state == VAD_STATE_SPEECH) ? "SPEECH" : "SILENCE";
+    c->io_printf(c->io_ud, "OK A_leg=%s rms=%u vad_active=%d\n", a_str, a_rms, a_rc == 0);
+    c->io_printf(c->io_ud, "OK B_leg=%s rms=%u vad_active=%d\n", b_str, b_rms, b_rc == 0);
+    return NSBC_OK;
+}
+
+/* ---- ai-request-transfer ---- */
+static int cmd_ai_request_transfer(cmd_ctx_t *c, int argc, char **argv, void *ud)
+{
+    if (!c || !c->io_printf) return NSBC_INVAL;
+    char *callid = NULL;
+    if (!pick_callid(c, argv, argc, &callid)) return NSBC_INVAL;
+    if (argc < 3 || !argv[2] || argv[2][0] == '\0') {
+        c->io_printf(c->io_ud, "ERR missing dest\n"); return NSBC_INVAL;
+    }
+    b2b_core_t *b = b2b_from_ctx(ctx_from_ud(ud));
+    if (!b) { c->io_printf(c->io_ud, "ERR b2b not available\n"); return NSBC_ERR; }
+    b2b_call_t *call = b2b_find_callid(b, callid, strlen(callid));
+    if (!call) { c->io_printf(c->io_ud, "ERR notfound\n"); return NSBC_NOENT; }
+    int rc = ai_request_transfer(call, argv[2]);
+    if (rc == NSBC_OK) {
+        c->io_printf(c->io_ud, "OK transfer-pending dest=%s call=%s\n", argv[2], callid);
+        log_audit("oam", "ai-request-transfer", "call-id=%s dest=%s", callid, argv[2]);
+    } else {
+        c->io_printf(c->io_ud, "ERR rc=%d\n", rc);
+    }
+    return rc;
+}
+
+/* ---- ai-get-rx <call-id> <max-bytes> — 输出 base64 PCMU ---- */
+static int cmd_ai_get_rx(cmd_ctx_t *c, int argc, char **argv, void *ud)
+{
+    if (!c || !c->io_printf) return NSBC_INVAL;
+    char *callid = NULL;
+    if (!pick_callid(c, argv, argc, &callid)) return NSBC_INVAL;
+    int max_bytes = (argc >= 3 && argv[2] && argv[2][0]) ? atoi(argv[2]) : 4096;
+    if (max_bytes <= 0 || max_bytes > 65536) max_bytes = 4096;
+    b2b_core_t *b = b2b_from_ctx(ctx_from_ud(ud));
+    if (!b) { c->io_printf(c->io_ud, "ERR b2b not available\n"); return NSBC_ERR; }
+    b2b_call_t *call = b2b_find_callid(b, callid, strlen(callid));
+    if (!call) { c->io_printf(c->io_ud, "ERR notfound\n"); return NSBC_NOENT; }
+    uint8_t *buf = malloc(max_bytes);
+    if (!buf) { c->io_printf(c->io_ud, "ERR nomem\n"); return NSBC_NOMEM; }
+    size_t n = ai_get_rx_audio(call, buf, max_bytes);
+    if (n == 0) {
+        free(buf);
+        c->io_printf(c->io_ud, "OK empty call=%s\n", callid);
+        return NSBC_OK;
+    }
+    char *b64 = malloc(((n + 2) / 3) * 4 + 2);
+    if (!b64) { free(buf); c->io_printf(c->io_ud, "ERR nomem\n"); return NSBC_NOMEM; }
+    b64_encode(buf, n, b64, ((n + 2) / 3) * 4 + 2);
+    c->io_printf(c->io_ud, "OK rx_bytes=%zu call=%s\nb64:%s\n", n, callid, b64);
+    free(buf); free(b64);
+    return NSBC_OK;
+}
+
+/* ---- ai-send-tx <call-id> <format> <base64> — format=0 PCMU / 1 PCM16 ---- */
+static int cmd_ai_send_tx(cmd_ctx_t *c, int argc, char **argv, void *ud)
+{
+    if (!c || !c->io_printf) return NSBC_INVAL;
+    char *callid = NULL;
+    if (!pick_callid(c, argv, argc, &callid)) return NSBC_INVAL;
+    if (argc < 4 || !argv[2] || !argv[3] || argv[2][0] == '\0' || argv[3][0] == '\0') {
+        c->io_printf(c->io_ud, "ERR usage: ai-send-tx <call-id> <0|1> <base64>\n");
+        return NSBC_INVAL;
+    }
+    int format = atoi(argv[2]) ? 1 : 0;
+    const char *b64 = argv[3];
+    size_t b64_len = strlen(b64);
+    size_t bin_cap = (b64_len / 4) * 3 + 2;
+    if (bin_cap > 65536) { c->io_printf(c->io_ud, "ERR too large\n"); return NSBC_INVAL; }
+    uint8_t *buf = malloc(bin_cap);
+    if (!buf) { c->io_printf(c->io_ud, "ERR nomem\n"); return NSBC_NOMEM; }
+    int n = b64_decode(b64, buf, bin_cap);
+    if (n < 0) { free(buf); c->io_printf(c->io_ud, "ERR bad-base64\n"); return NSBC_INVAL; }
+    b2b_core_t *b = b2b_from_ctx(ctx_from_ud(ud));
+    if (!b) { free(buf); c->io_printf(c->io_ud, "ERR b2b not available\n"); return NSBC_ERR; }
+    b2b_call_t *call = b2b_find_callid(b, callid, strlen(callid));
+    if (!call) { free(buf); c->io_printf(c->io_ud, "ERR notfound\n"); return NSBC_NOENT; }
+    int rc = ai_send_tx_audio(call, buf, (size_t)n, format);
+    free(buf);
+    if (rc == NSBC_OK) {
+        c->io_printf(c->io_ud, "OK tx_bytes=%d format=%d call=%s\n", n, format, callid);
+    } else {
+        c->io_printf(c->io_ud, "ERR rc=%d\n", rc);
     }
     return rc;
 }
@@ -829,7 +1052,9 @@ static int parse_fs_brace_vars(const char *src, const char **out_buf,
                                 char *opt_orig_name, size_t opt_orig_name_sz,
                                 char *opt_realm, size_t opt_realm_sz,
                                 char *opt_audio_codecs, size_t opt_audio_sz,
-                                char *opt_video_codecs, size_t opt_video_sz)
+                                char *opt_video_codecs, size_t opt_video_sz,
+                                int *opt_sched_hangup_s,
+                                int *opt_originate_call_timeout_s)
 {
     if (!src || !*src || !out_buf) return NSBC_INVAL;
     /* 跳过开头空白 */
@@ -894,6 +1119,30 @@ static int parse_fs_brace_vars(const char *src, const char **out_buf,
              * 例 {video_codecs=H264} → 生成 m=video 行 + a=rtpmap，offer_hook 激活端口。 */
             if (opt_video_codecs && opt_video_sz && !opt_video_codecs[0] && strlen(val) < opt_video_sz)
                 snprintf(opt_video_codecs, opt_video_sz, "%s", val);
+        } else if (!strcasecmp(key, "sched_hangup")) {
+            /* REQ-DP-TIMEOUT-001：接通后最大通话时长（秒）。
+             * 例 {sched_hangup=3600} → 通话 1h 后强制挂断（cause=486）。
+             * 0=不限；范围 0..86400（24h）。 */
+            if (opt_sched_hangup_s) {
+                int is_num = 1;
+                for (const char *p = val; *p; ++p) if (*p < '0' || *p > '9') { is_num = 0; break; }
+                if (is_num) {
+                    int t = atoi(val);
+                    if (t >= 0 && t <= 86400) *opt_sched_hangup_s = t;
+                }
+            }
+        } else if (!strcasecmp(key, "originate_call_timeout")) {
+            /* REQ-DP-TIMEOUT-001：originate B-leg 等待接通超时（秒）。
+             * 例 {originate_call_timeout=30} → B-leg 只等 30s 就 486。
+             * 0=走全局默认 50s；范围 0..3600。 */
+            if (opt_originate_call_timeout_s) {
+                int is_num = 1;
+                for (const char *p = val; *p; ++p) if (*p < '0' || *p > '9') { is_num = 0; break; }
+                if (is_num) {
+                    int t = atoi(val);
+                    if (t >= 0 && t <= 3600) *opt_originate_call_timeout_s = t;
+                }
+            }
         } else {
             /* 其他 FS 变量（ignore_early_media / export_media / hangup_after_bridge 等）
              * 暂不处理，只 warn */
@@ -926,6 +1175,8 @@ static int cmd_originate(cmd_ctx_t *c, int argc, char **argv, void *ud)
     char opt_realm[128] = {0};
     char opt_audio_codecs[128] = {0};   /* REQ-ORIGINATE-004 */
     char opt_video_codecs[128] = {0};   /* REQ-ORIGINATE-004 */
+    int opt_sched_hangup_s = 0;         /* REQ-DP-TIMEOUT-001 */
+    int opt_originate_call_timeout_s = 0; /* REQ-DP-TIMEOUT-001 */
     char bridge_url_buf[512] = {0};  /* 前置：argv[2+] 位置参数先写这里 */
     const char *bridge_url_saved = NULL;
     int post_app = B2B_APP_NONE;
@@ -935,7 +1186,9 @@ static int cmd_originate(cmd_ctx_t *c, int argc, char **argv, void *ud)
                                   opt_caller_name, sizeof(opt_caller_name),
                                   opt_realm, sizeof(opt_realm),
                                   opt_audio_codecs, sizeof(opt_audio_codecs),
-                                  opt_video_codecs, sizeof(opt_video_codecs));
+                                  opt_video_codecs, sizeof(opt_video_codecs),
+                                  &opt_sched_hangup_s,
+                                  &opt_originate_call_timeout_s);
     if (rc != NSBC_OK) {
         c->io_printf(c->io_ud, "ERR invalid brace-vars\n"); return NSBC_INVAL;
     }
@@ -1207,6 +1460,16 @@ static int cmd_originate(cmd_ctx_t *c, int argc, char **argv, void *ud)
     if (opt_video_codecs[0]) {
         snprintf(o.video_codecs, sizeof(o.video_codecs), "%s", opt_video_codecs);
         llog(LOG_INFO, "oam", "originate: video_codecs='%s'", opt_video_codecs);
+    }
+
+    /* REQ-DP-TIMEOUT-001：OAM brace var 新支持 — 接通后最大通话时长 + B-leg 等待接通超时 */
+    if (opt_sched_hangup_s > 0) {
+        o.sched_hangup_s = opt_sched_hangup_s;
+        llog(LOG_INFO, "oam", "originate: sched_hangup=%ds", opt_sched_hangup_s);
+    }
+    if (opt_originate_call_timeout_s > 0) {
+        o.originate_call_timeout_s = opt_originate_call_timeout_s;
+        llog(LOG_INFO, "oam", "originate: originate_call_timeout=%ds", opt_originate_call_timeout_s);
     }
 
     b2b_call_t *call = NULL;
@@ -1852,6 +2115,19 @@ void call_commands_register(cmd_reg_t *reg, nsbc_ctx_t *ctx)
           "b2b", CMD_L2_ADMIN, cmd_uuid_wait_for_answer, ctx },
         { "uuid_bridge",   "桥接两呼叫（L2，审计）",
           "b2b", CMD_L2_ADMIN, cmd_uuid_bridge, ctx },
+
+        /* ---- REQ-AI-MEDIA-001 + REQ-AI-BARGEIN-001: AI pass-through + barge-in 命令组 ---- */
+        { "ai-set-producer",     "切换 AI producer 模式 <call-id> <0|1>（自动启/停 VAD）（L2）",
+          "ai", CMD_L2_ADMIN, cmd_ai_set_producer, ctx },
+        { "ai-request-transfer", "请求 AI 转人工座席 <call-id> <dest>（L2）",
+          "ai", CMD_L2_ADMIN, cmd_ai_request_transfer, ctx },
+        { "ai-get-rx",          "拉 AI 接收用户语音（PCMU 8kHz base64） <call-id> [max-bytes]（L1 读）",
+          "ai", CMD_L1_MONITOR, cmd_ai_get_rx, ctx },
+        { "ai-send-tx",         "推 AI 回复音频（base64） <call-id> <0|1> <base64>（L2）",
+          "ai", CMD_L2_ADMIN, cmd_ai_send_tx, ctx },
+        { "ai-vad-state",       "REQ-AI-BARGEIN-001 查询 VAD A/B 腿状态（SPEECH/SILENCE + RMS） <call-id>（L1 读）",
+          "ai", CMD_L1_MONITOR, cmd_ai_vad_state, ctx },
+
         { "uuid_broadcast","向通话注入音频（L2）",
           "b2b", CMD_L2_ADMIN, cmd_uuid_broadcast, ctx },
         { "uuid_break",    "打断当前媒体流（L2）",

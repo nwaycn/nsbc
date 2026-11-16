@@ -56,6 +56,10 @@ int  vad_start_for_call(void *call_key, int leg_mask, uint16_t threshold);
 int  vad_stop_for_call (void *call_key);
 void vad_stop_all(void);
 
+/* REQ-AI-BARGEIN-001: 查询 per-call per-leg VAD 状态（外部 AI barge-in 决策用）
+ * 返回 0=监控中，*state_out 为 SPEECH/SILENCE；-1=无监控槽或 call_key 不存在 */
+int  vad_query_for_call(void *call_key, int leg, vad_state_t *state_out, uint16_t *rms_out);
+
 /* ===== 内部：media_bug 回调（热路径入口，外部不应调）===== */
 void vad_on_rtp_frame(media_bug_frame_t *frame, void *ud);
 

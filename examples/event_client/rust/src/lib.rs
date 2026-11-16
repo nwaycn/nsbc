@@ -248,6 +248,9 @@ pub struct OriginateOpts<'a> {
     pub timeout:     Option<i64>,
     pub caller_id:   Option<&'a str>,
     pub caller_name: Option<&'a str>,
+    /* REQ-DP-TIMEOUT-001 */
+    pub sched_hangup:            Option<i64>,
+    pub originate_call_timeout:  Option<i64>,
     pub call_url:    Option<&'a str>,
 }
 
@@ -262,6 +265,9 @@ pub fn build_call_url(opts: OriginateOpts) -> String {
     if let Some(t)  = opts.timeout     { parts.push(format!("originate_timeout={t}")); }
     if let Some(a)  = opts.audio       { parts.push(format!("audio_codecs={}", a.join(","))); }
     if let Some(v)  = opts.video       { parts.push(format!("video_codecs={}", v.join(","))); }
+    // REQ-DP-TIMEOUT-001: per-call timeout overrides (0/None → skip,走 dialplan rule / 全局)
+    if let Some(sh) = opts.sched_hangup            { if sh > 0 { parts.push(format!("sched_hangup={sh}")); } }
+    if let Some(ot) = opts.originate_call_timeout  { if ot > 0 { parts.push(format!("originate_call_timeout={ot}")); } }
 
     let vars = if parts.is_empty() { String::new() } else { format!("{{{}}}", parts.join(",")) };
     format!("{vars}user/{ext} &{app}")

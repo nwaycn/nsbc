@@ -521,6 +521,20 @@ app.component('dialplan-rules', {
                 <el-option :value="2" :label="t('Force OFF')"></el-option>
               </el-select>
             </el-form-item>
+          </el-divider>
+          <div class="grid grid-cols-2 gap-4">
+            <el-form-item label="接通后最大通话时长 (秒)">
+              <el-input-number v-model="form.sched_hangup_s" :min="0" :max="86400" :step="60"
+                controls-position="right" style="width:100%"
+                :placeholder="t('0 = 不限 / 走全局')"></el-input-number>
+              <div class="form-hint">REQ-DP-TIMEOUT-001：双腿 confirm 后强制挂断（0=Session Timer 继续生效）</div>
+            </el-form-item>
+            <el-form-item label="B-leg 等待接通超时 (秒)">
+              <el-input-number v-model="form.originate_call_timeout_s" :min="0" :max="3600" :step="5"
+                controls-position="right" style="width:100%"
+                :placeholder="t('0 = 走全局默认 50s')"></el-input-number>
+              <div class="form-hint">REQ-DP-TIMEOUT-001：originate 创建的 call 发起 B-leg INVITE 后等待 answer 的超时</div>
+            </el-form-item>
           </div>
           <el-form-item label="Enable">
             <el-switch v-model="form.enabled" active-text="ON" inactive-text="OFF"></el-switch>
@@ -635,6 +649,8 @@ app.component('dialplan-rules', {
         force_precondition: f.force_precondition ?? 0,
         force_timer: f.force_timer ?? 0,
         force_gruu: f.force_gruu ?? 0,
+        sched_hangup_s: f.sched_hangup_s ?? 0,
+        originate_call_timeout_s: f.originate_call_timeout_s ?? 0,
         action_json: toJsonObj(f.action_json || '{}'),
         app_chain: (() => {
           try { return typeof f.app_chain === 'string' ? JSON.parse(f.app_chain || '[]') : f.app_chain; }
@@ -689,6 +705,8 @@ app.component('dialplan-rules', {
       if (obj.force_precondition !== undefined) f.force_precondition = Number(obj.force_precondition);
       if (obj.force_timer !== undefined) f.force_timer = Number(obj.force_timer);
       if (obj.force_gruu !== undefined) f.force_gruu = Number(obj.force_gruu);
+      if (obj.sched_hangup_s !== undefined) f.sched_hangup_s = Number(obj.sched_hangup_s);
+      if (obj.originate_call_timeout_s !== undefined) f.originate_call_timeout_s = Number(obj.originate_call_timeout_s);
       if (obj.action_json !== undefined) f.action_json = typeof obj.action_json === 'string'
         ? obj.action_json : JSON.stringify(obj.action_json);
       if (obj.app_chain !== undefined) f.app_chain = typeof obj.app_chain === 'string'
@@ -721,6 +739,7 @@ app.component('dialplan-rules', {
       'name','profile_name','src_ip_cidr','match_expr','caller_match',
       'prio','strip','target','rec_action','rec_path_template','rec_fmt',
       'force_prack','force_precondition','force_timer','force_gruu',
+      'sched_hangup_s','originate_call_timeout_s',
       'action_json','app_chain','enabled','description',
     ];
     Vue.watch(
@@ -871,6 +890,9 @@ app.component('dialplan-rules', {
         force_precondition: 0,
         force_timer: 0,
         force_gruu: 0,
+        /* REQ-DP-TIMEOUT-001：dialplan 规则级 per-call timeout override */
+        sched_hangup_s: 0,
+        originate_call_timeout_s: 0,
         action_json: '{}',
         /* REQ-DP-APP-001: Application 链 JSON 数组 —— C 侧 dp_json_parse_one 解析 */
         app_chain: '[]',

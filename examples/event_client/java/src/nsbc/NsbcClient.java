@@ -51,16 +51,33 @@ public class NsbcClient {
     public static void setSslVerify(boolean verify) { SSL_VERIFY.set(verify); }
     public static boolean isSslVerify() { return SSL_VERIFY.get(); }
 
-    /** Build call_url per REQ-ORIGINATE-004 — same codec defaults as Python/Go/Rust. */
+    /** Build call_url per REQ-ORIGINATE-004 + REQ-DP-TIMEOUT-001 — same codec defaults as Python/Go/Rust. */
     public static String buildCallUrl(OriginateOpts opts) {
+        // callUrl 直接返回（绕过 builder）
+        if (opts.callUrl != null && !opts.callUrl.isEmpty())
+            return opts.callUrl;
+
         StringBuilder sb = new StringBuilder();
-        sb.append('{');
-        sb.append("audio_codecs=").append(opts.audioCodecs == null ? DEFAULT_AUDIO_CODECS : opts.audioCodecs);
-        sb.append(",video_codecs=").append(opts.videoCodecs == null ? DEFAULT_VIDEO_CODECS : opts.videoCodecs);
-        sb.append("}");
+        // 先拼所有 brace var（caller_id / caller_name / timeout / codecs / timeout overrides）
+        java.util.List<String> vars = new java.util.ArrayList<>();
+        if (opts.callerId != null && !opts.callerId.isEmpty())
+            vars.add("origination_caller_id_number=" + opts.callerId);
+        if (opts.callerName != null && !opts.callerName.isEmpty())
+            vars.add("origination_caller_id_name=" + opts.callerName);
+        if (opts.timeout != null && opts.timeout > 0)
+            vars.add("originate_timeout=" + opts.timeout);
+        // codecs（Java 版保留默认值，和其他语言行为一致）
+        vars.add("audio_codecs=" + (opts.audioCodecs == null ? DEFAULT_AUDIO_CODECS : opts.audioCodecs));
+        vars.add("video_codecs=" + (opts.videoCodecs == null ? DEFAULT_VIDEO_CODECS : opts.videoCodecs));
+        // REQ-DP-TIMEOUT-001: per-call timeout overrides
+        if (opts.schedHangup != null && opts.schedHangup > 0)
+            vars.add("sched_hangup=" + opts.schedHangup);
+        if (opts.originateCallTimeout != null && opts.originateCallTimeout > 0)
+            vars.add("originate_call_timeout=" + opts.originateCallTimeout);
+
+        sb.append('{').append(String.join(",", vars)).append('}');
         sb.append("user/").append(opts.origTo == null ? "7gja30rf" : opts.origTo);
-        if (opts.app != null) sb.append('/').append(opts.app);
-        sb.append("&echo");
+        sb.append(" &").append(opts.app == null ? "echo" : opts.app);
         return sb.toString();
     }
 
@@ -87,6 +104,10 @@ public class NsbcClient {
         public Integer timeout;
         public String callerId;
         public String callerName;
+        /* REQ-DP-TIMEOUT-001: per-call timeout overrides（秒）。
+         * >0 → 拼进 brace var；0/None → 跳过（走 dialplan rule / 全局默认） */
+        public Integer schedHangup;
+        public Integer originateCallTimeout;
         public String callUrl;
     }
 

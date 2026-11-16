@@ -25,6 +25,71 @@ typedef struct {
 static ab_slot_t g_backends[AI_BACKEND_MAX];
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* =========================================================================
+ * REQ-AI-MEDIA-001 / REQ-AI-TRANSFER-001: Pass-through 函数指针注册表
+ *
+ * 为什么在 ai_backend_registry.c（主二进制）：
+ *   ai_dialog 编译成 mod_ai_dialog.so —— 主二进制链接器看不到 .so 里的符号。
+ *   所以 4 个 pass-through 公共 API 在主二进制里实现为 wrapper，
+ *   内部通过这些函数指针转发。mod_ai_dialog.so 的 ai_init 里注册。
+ * ========================================================================= */
+static ai_passthrough_fns_t g_passthrough = { 0 };  /* 全 NULL = 模块未加载 */
+static pthread_mutex_t g_passthrough_lock = PTHREAD_MUTEX_INITIALIZER;
+
+int ai_passthrough_register_fns(const ai_passthrough_fns_t *fns)
+{
+    if (!fns || !fns->set_producer || !fns->get_rx_audio ||
+        !fns->send_tx_audio || !fns->request_transfer) {
+        log_err("ai_backend", "passthrough register: fn pointer missing");
+        return NSBC_INVAL;
+    }
+    pthread_mutex_lock(&g_passthrough_lock);
+    g_passthrough = *fns;
+    pthread_mutex_unlock(&g_passthrough_lock);
+    log_info("ai_backend", "passthrough fns registered (ai_dialog ready)");
+    return NSBC_OK;
+}
+
+int ai_passthrough_unregister(void)
+{
+    pthread_mutex_lock(&g_passthrough_lock);
+    memset(&g_passthrough, 0, sizeof(g_passthrough));
+    pthread_mutex_unlock(&g_passthrough_lock);
+    log_info("ai_backend", "passthrough fns unregistered (ai_dialog fini)");
+    return NSBC_OK;
+}
+
+int ai_passthrough_available(void)
+{
+    return g_passthrough.set_producer ? 1 : 0;
+}
+
+/* --- 4 个 wrapper --- */
+
+int ai_set_producer(void *call_key, int producer)
+{
+    if (!g_passthrough.set_producer) return NSBC_NOENT;
+    return g_passthrough.set_producer(call_key, producer);
+}
+
+size_t ai_get_rx_audio(void *call_key, uint8_t *out_buf, size_t out_max_len)
+{
+    if (!g_passthrough.get_rx_audio) return 0;
+    return g_passthrough.get_rx_audio(call_key, out_buf, out_max_len);
+}
+
+int ai_send_tx_audio(void *call_key, const uint8_t *data, size_t len, int format)
+{
+    if (!g_passthrough.send_tx_audio) return NSBC_NOENT;
+    return g_passthrough.send_tx_audio(call_key, data, len, format);
+}
+
+int ai_request_transfer(void *call_key, const char *dest)
+{
+    if (!g_passthrough.request_transfer) return NSBC_NOENT;
+    return g_passthrough.request_transfer(call_key, dest);
+}
+
 /* === 注册（AI backend 允许同名覆盖，endpoint 不允许） === */
 int ai_backend_registry_register(const ai_backend_ops_t *ops)
 {

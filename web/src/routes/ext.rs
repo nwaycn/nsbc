@@ -68,6 +68,7 @@ pub struct CmdBody {
 
 /// 成功响应：nsbcd 返回的纯文本 stdout（命令执行后、下一个 nsbc> 之前的内容）。
 /// 调用方自己判断输出里有没有 "ERR" / "OK"。
+#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 pub struct CmdResp {
     pub cmd: String,

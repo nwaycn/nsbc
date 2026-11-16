@@ -85,6 +85,10 @@ typedef struct {
     const char *caller_id;
     const char *caller_name;
     int         timeout;       /* 0 → skip */
+    /* REQ-DP-TIMEOUT-001: per-call timeout overrides（秒）。
+     * >0 → 拼进 brace var；0 → 跳过（走 dialplan rule / 全局默认） */
+    int         sched_hangup;
+    int         originate_call_timeout;
     const char *call_url;      /* explicit call_url → bypass builder */
 } nsbc_orig_opts_t;
 

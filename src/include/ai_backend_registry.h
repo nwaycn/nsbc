@@ -58,6 +58,74 @@ int  ai_backend_registry_unload_wait(const char *name, int timeout_ms);
 int  ai_backend_registry_count(void);
 const ai_backend_ops_t *ai_backend_registry_find_by_slot(int slot);
 
+/* =========================================================================
+ * REQ-AI-MEDIA-001 / REQ-AI-TRANSFER-001: Pass-through 公共 API
+ *
+ * 设计：
+ *   ai_dialog 编译成动态模块 mod_ai_dialog.so —— 主二进制链接器看不到 .so 里的符号。
+ *   所以这 4 个公共 API 在 ai_backend_registry.c（主二进制）里实现为
+ *   **wrapper**，内部通过函数指针转发给 mod_ai_dialog.so 的真实实现。
+ *
+ *   mod_ai_dialog.so 的 ai_init() 里调 ai_passthrough_register_fns()
+ *   注册 4 个真实函数指针。
+ *   如果模块没加载，指针为 NULL，wrapper 返回 NSBC_NOENT。
+ * ========================================================================= */
+
+/* 函数指针类型（签名和下面 4 个 wrapper 完全对齐）*/
+typedef int     (*ai_fp_set_producer_t)(void *call_key, int producer);
+typedef size_t  (*ai_fp_get_rx_audio_t)(void *call_key, uint8_t *out_buf, size_t out_max_len);
+typedef int     (*ai_fp_send_tx_audio_t)(void *call_key, const uint8_t *data, size_t len, int format);
+typedef int     (*ai_fp_request_transfer_t)(void *call_key, const char *dest);
+
+/* mod_ai_dialog.so 的 ai_init 里调这个注册真实实现 */
+typedef struct {
+    ai_fp_set_producer_t      set_producer;
+    ai_fp_get_rx_audio_t      get_rx_audio;
+    ai_fp_send_tx_audio_t     send_tx_audio;
+    ai_fp_request_transfer_t  request_transfer;
+} ai_passthrough_fns_t;
+
+int ai_passthrough_register_fns(const ai_passthrough_fns_t *fns);
+int ai_passthrough_unregister(void);  /* fini 时调 */
+int ai_passthrough_available(void);   /* 1=模块已加载 0=未加载 */
+
+/* REQ-AI-TRANSFER-001：ai_dialog 公共 API —— 请求 AI session 在下次管道跑完后
+ * 调 b2b_transfer_call 发 blind transfer REFER 给 dest。
+ *
+ * 非阻塞：只设 session->transfer_pending=1 + transfer_dest，
+ * 实际 REFER 由 ai_session_thread 自己触发（避免跨线程碰 b2b_call_t.lock）。
+ *
+ * call_key:  b2b_call_t*（不透明指针）
+ * dest:      目标分机号或完整 SIP URI，最长 256 字节，可见 ASCII
+ * 返回：     NSBC_OK=设置成功；NSBC_NOENT=call_key 没 session 或模块未加载；NSBC_INVAL=dest 非法 */
+int  ai_request_transfer(void *call_key, const char *dest);
+
+/* REQ-AI-MEDIA-001：Pass-through 公共 API —— AI 模块做媒体管道，ASR/LLM/TTS 交给外部第三方 AI
+ *
+ * 架构：
+ *   ai_dialog (C)  ← ring buffer + bridge_send_raw + transfer 钩子
+ *        ↓
+ *   外部 AI agent (Python/Go/Rust) → ai_get_rx_audio 拉用户语音 → ASR/LLM/TTS → ai_send_tx_audio 推回复
+ *
+ * 为什么这么分：C 核心只做媒体桥接（零 HTTP/curl 副作用）；第三方 AI 想用什么云 ASR/本地 LLM 都能接；
+ * 转人工座席是 B2BUA 业务层能力，留在 C 核心（b2b_transfer_call 已实现）；
+ * 内建 ASR/LLM/TTS 管道降级为 demo 模式（cfg.llm_enabled=0 默认关闭）。 */
+
+/* 设置 session producer 模式：
+ *   producer=1 → ai_session_thread 空转，外部 AI 通过 ai_get_rx_audio/ai_send_tx_audio 直接接管
+ *   producer=0 → 默认，由 cfg.llm_enabled 控制内建 demo 管道开关
+ * 返回：NSBC_OK / NSBC_NOENT / NSBC_INVAL */
+int     ai_set_producer(void *call_key, int producer);
+
+/* 拉取用户语音（PCMU 8kHz）。非阻塞，消费语义（读了就不保留）。
+ * 返回：实际读取的字节数（0 = ring buffer 空 / 无 session / 模块未加载）*/
+size_t  ai_get_rx_audio(void *call_key, uint8_t *out_buf, size_t out_max_len);
+
+/* 推送回复音频给用户。format=0 PCMU 8kHz；format=1 PCM16（函数内自动转 PCMU）。
+ * 非阻塞。内部 bridge_send_raw 按 RTP 节奏注入 A 腿。
+ * 返回：NSBC_OK / NSBC_NOENT / NSBC_INVAL / NSBC_NOMEM */
+int     ai_send_tx_audio(void *call_key, const uint8_t *data, size_t len, int format);
+
 #ifdef __cplusplus
 }
 #endif

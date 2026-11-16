@@ -114,7 +114,13 @@ static pthread_mutex_t g_mv_hook_lock = PTHREAD_MUTEX_INITIALIZER;
 /* b2b_leg_t / call_link_t / struct b2b_call 已在 b2bua.h 完整定义 */
 
 static void disarm_noanswer_timer(b2b_call_t *c); /* 前置声明 */
+static void arm_call_limit_timer(b2b_call_t *c);
 static void disarm_call_limit_timer(b2b_call_t *c);
+/* REQ-DP-TIMEOUT-001：sched_hangup timer 三函数 + 决策链 */
+static void arm_sched_hangup_timer(b2b_call_t *c);
+static void disarm_sched_hangup_timer(b2b_call_t *c);
+static void sched_hangup_expire_cb(uint64_t cb_now, void *arg);
+static void call_limit_expire_cb(uint64_t cb_now, void *arg);
 static void b2b_emit_cdr(b2b_call_t *c, cdr_phase_t phase);
 
 /* nsbc_sa_t → 纯 IP 字符串（无端口；nsbc_sa_fmt 带 ":port" 不能喂 CIDR 匹配）。
@@ -498,6 +504,7 @@ static void call_ctor(void *obj, void *ud)
     pthread_mutex_init(&c->lock, NULL);
     tw_node_init(&c->noanswer_node);
     tw_node_init(&c->call_limit_node);
+    tw_node_init(&c->sched_hangup_node);
     c->prof = NULL;
     c->out_prof = NULL;
 }
@@ -1033,6 +1040,7 @@ static void call_destroy(b2b_call_t *c)
     }
     disarm_noanswer_timer(c); /* catch-all：所有终止路径最终走到这里 */
     disarm_call_limit_timer(c); /* REQ-ORIGINATE-005：通话时长上限 timer */
+    disarm_sched_hangup_timer(c); /* REQ-DP-TIMEOUT-001：应用层硬上限 timer */
     /* Session Timer: disarm all timer nodes */
     if (c->core->cfg.tw) {
         tw_del(c->core->cfg.tw, &c->leg[0].refresh_node);
@@ -2253,6 +2261,7 @@ static void maybe_start_media(b2b_call_t *c)
                       c->leg[1].answer, c->leg[1].answer_len,
                       co->cfg.media_ud);
         arm_call_limit_timer(c); /* REQ-ORIGINATE-005：originate 创建的 call 自动 arm */
+        arm_sched_hangup_timer(c); /* REQ-DP-TIMEOUT-001：统一 arm（入站+originate 都可能 arm） */
         return;
     }
 
@@ -2264,6 +2273,7 @@ static void maybe_start_media(b2b_call_t *c)
                       co->cfg.media_ud);
         llog(LOG_INFO, "media", "maybe_start_media: originate mode confirmed");
         arm_call_limit_timer(c); /* REQ-ORIGINATE-005 */
+        arm_sched_hangup_timer(c); /* REQ-DP-TIMEOUT-001 */
     }
 }
 
@@ -2522,12 +2532,22 @@ static void arm_noanswer_timer(b2b_call_t *c)
         return;
     if (c->dead || c->a_final)
         return;
-    /* REQ-ORIGINATE-001：per-call override 优先（>0），否则走全局。
-     * 注意 memset 初始化后 noanswer_ms_override=0，入站 INVITE 路径
-     * 自然走全局 ring_noanswer_ms，originate 显式设 >0 才覆盖。 */
-    uint32_t ms = (c->noanswer_ms_override > 0)
-                  ? (uint32_t)c->noanswer_ms_override
-                  : co->cfg.ring_noanswer_ms;
+    /* REQ-ORIGINATE-001 + REQ-DP-TIMEOUT-001：五层决策链
+     * 优先级从高到低：
+     *   1) noanswer_ms_override (>0)              — FS originate_timeout brace var（既有，最高优先）
+     *   2) originate_call_timeout_ms_override (>0) — dialplan rule / 新 brace var（仅 originate）
+     *   3) cfg.originate_call_timeout_ms (>0)      — 全局默认 50s（仅 originate）
+     *   4) cfg.ring_noanswer_ms                     — 全局 60s（入站 + fallback） */
+    uint32_t ms;
+    if (c->noanswer_ms_override > 0) {
+        ms = (uint32_t)c->noanswer_ms_override;
+    } else if (c->originate_created && c->originate_call_timeout_ms_override > 0) {
+        ms = (uint32_t)c->originate_call_timeout_ms_override;
+    } else if (c->originate_created && co->cfg.originate_call_timeout_ms > 0) {
+        ms = co->cfg.originate_call_timeout_ms;
+    } else {
+        ms = co->cfg.ring_noanswer_ms;
+    }
     if (ms == 0)
         return;
     tw_del(co->cfg.tw, &c->noanswer_node); /* 续约先摘再挂（幂等） */
@@ -2578,7 +2598,6 @@ static void disarm_call_limit_timer(b2b_call_t *c)
 static void call_limit_expire_cb(uint64_t cb_now, void *arg)
 {
     b2b_call_t *c = (b2b_call_t *)arg;
-    b2b_core_t *co = c->core;
     (void)cb_now;
     call_lock(c);
     if (c->dead) { call_unlock(c); return; }
@@ -2588,6 +2607,84 @@ static void call_limit_expire_cb(uint64_t cb_now, void *arg)
          "call_limit EXPIRED callid=%s dur_ms=%llu → terminate cause=486",
          c->leg[0].callid, (unsigned long long)dur_ms);
     disarm_call_limit_timer(c);
+    call_unlock(c);
+    b2b_terminate(c, 486);
+}
+
+/* ====================================================================
+ * REQ-DP-TIMEOUT-001：sched_hangup — 接通后应用层硬上限 timer
+ *
+ * 设计原则：
+ *   - 任何 call（入站 + originate）双腿 confirm 后都可 arm
+ *   - 优先级链：call->sched_hangup_ms_override > cfg.originate_caller_timeout_ms（仅 originate）
+ *   - 入站 INVITE：默认不 arm（Session Timer 继续生效），dialplan rule 设了 override 才 arm
+ *   - originate：cfg.originate_caller_timeout_ms 作为兜底（已有 call_limit_node 也会独立 arm）
+ *   - 到期 cause=486 Busy Here — 语义最接近（系统强制挂断）
+ *
+ * 与 call_limit_node 的关系：
+ *   call_limit_node 是 originate 专属的旧 timer（cfg.originate_caller_timeout_ms 驱动）；
+ *   sched_hangup_node 是新的统一 timer（入站+originate 都可 arm）。
+ *   两者并存不冲突——call_limit_node 只看 cfg，sched_hangup_node 优先看 override。
+ *   如果 originate 路径 cfg.originate_caller_timeout_ms=3600 且 dialplan rule 也没设 override，
+ *   则 call_limit_node 会 arm（走 3600s），sched_hangup_node 不会 arm（因为没 override）。
+ *   如果 dialplan rule 设了 sched_hangup_s=1800，则 sched_hangup_node 会 arm（走 1800s），
+ *   call_limit_node 仍然会 arm（走 cfg 3600s）。两者先到先挂。
+ * ====================================================================*/
+
+/* REQ-DP-TIMEOUT-001：sched_hangup 决策链 — 返回 0=不限，>0=毫秒数 */
+static uint32_t decide_sched_hangup_ms(const b2b_call_t *c)
+{
+    const b2b_core_t *co = c->core;
+    /* 1) per-call override（dialplan rule / OAM brace var） */
+    if (c->sched_hangup_ms_override > 0)
+        return (uint32_t)c->sched_hangup_ms_override;
+    /* 2) originate 路径：走 cfg.originate_caller_timeout_ms 兜底 */
+    if (c->originate_created && co->cfg.originate_caller_timeout_ms > 0)
+        return co->cfg.originate_caller_timeout_ms;
+    /* 3) 入站 INVITE：默认 0=不限（Session Timer 继续生效） */
+    return 0;
+}
+
+static void arm_sched_hangup_timer(b2b_call_t *c)
+{
+    b2b_core_t *co = c->core;
+    if (!co->cfg.tw)
+        return;
+    if (c->dead || c->a_final)
+        return;
+    uint32_t ms = decide_sched_hangup_ms(c);
+    if (ms == 0)
+        return;
+    tw_del(co->cfg.tw, &c->sched_hangup_node);
+    tw_add(co->cfg.tw, &c->sched_hangup_node,
+           now_ms() + ms,
+           sched_hangup_expire_cb, c);
+    llog(LOG_NOTICE, "b2b",
+         "sched_hangup armed callid=%s timeout_ms=%u (override=%d originate=%d)",
+         c->leg[0].callid, ms, c->sched_hangup_ms_override, c->originate_created);
+}
+
+static void disarm_sched_hangup_timer(b2b_call_t *c)
+{
+    b2b_core_t *co = c->core;
+    if (!co->cfg.tw)
+        return;
+    tw_del(co->cfg.tw, &c->sched_hangup_node);
+}
+
+static void sched_hangup_expire_cb(uint64_t cb_now, void *arg)
+{
+    b2b_call_t *c = (b2b_call_t *)arg;
+    b2b_core_t *co = c->core;
+    (void)cb_now; (void)co;
+    call_lock(c);
+    if (c->dead) { call_unlock(c); return; }
+    if (!c->leg[0].st.active && !c->leg[1].st.active) { call_unlock(c); return; }
+    uint64_t dur_ms = c->answer_ms ? (now_ms() - c->answer_ms) : 0;
+    llog(LOG_WARN, "b2b",
+         "sched_hangup EXPIRED callid=%s dur_ms=%llu override=%d → terminate cause=486",
+         c->leg[0].callid, (unsigned long long)dur_ms, c->sched_hangup_ms_override);
+    disarm_sched_hangup_timer(c);
     call_unlock(c);
     b2b_terminate(c, 486);
 }
@@ -7261,6 +7358,11 @@ int b2b_originate(b2b_core_t *co, const b2b_orig_t *o, b2b_call_t **out)
     /* REQ-ORIGINATE-001：per-call noanswer override（>0 覆盖全局，否则走全局）
      * 在 alloc 之后立即设，方便 bridge 模式两次 arm_noanswer_timer 复用 */
     c->noanswer_ms_override = o->timeout_ms;
+    /* REQ-DP-TIMEOUT-001：OAM brace var 新支持的两个 per-call override */
+    if (o->sched_hangup_s > 0)
+        c->sched_hangup_ms_override = o->sched_hangup_s * 1000;
+    if (o->originate_call_timeout_s > 0)
+        c->originate_call_timeout_ms_override = o->originate_call_timeout_s * 1000;
     /* REQ-ORIGINATE-003 待补：携带尾随 app（&park/&hangup/&echo）到呼叫上下文 */
     c->post_app = o->post_app;
 

@@ -317,6 +317,15 @@ char *nsbc_build_call_url(const nsbc_orig_opts_t *opts)
     }
     APPENDV("audio_codecs", opts->audio_codecs);
     APPENDV("video_codecs", opts->video_codecs);
+    /* REQ-DP-TIMEOUT-001: per-call timeout overrides */
+    if (opts->sched_hangup > 0) {
+        vi += (size_t)snprintf(vars + vi, sizeof(vars) - vi,
+                                "sched_hangup=%d,", opts->sched_hangup);
+    }
+    if (opts->originate_call_timeout > 0) {
+        vi += (size_t)snprintf(vars + vi, sizeof(vars) - vi,
+                                "originate_call_timeout=%d,", opts->originate_call_timeout);
+    }
 
     #undef APPENDV
 

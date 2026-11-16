@@ -230,6 +230,7 @@ def originate(call_url, via="auto", uds_path=DEFAULT_UDS,
 def build_call_url(orig_to=None, app=None,
                    audio=None, video=None,
                    timeout=None, caller_id=None, caller_name=None,
+                   sched_hangup=None, originate_call_timeout=None,
                    call_url=None):
     """Build FS-style originate call_url with brace-var codec block.
 
@@ -245,13 +246,17 @@ def build_call_url(orig_to=None, app=None,
         video:          video codecs as list or comma-separated str.
                         True (default) → DEFAULT_VIDEO_CODECS
                         None/False → no video_codecs brace var
-        timeout:        ringing timeout seconds
+        timeout:        ringing timeout seconds (originate_timeout brace var)
         caller_id:      origination caller ID number
         caller_name:    origination caller ID name
+        sched_hangup:   REQ-DP-TIMEOUT-001 — 接通后最大通话时长（秒）。
+                        >0 → 强制 arm sched_hangup timer；0/None → 不限（走 dialplan rule / 全局）
+        originate_call_timeout:  REQ-DP-TIMEOUT-001 — B-leg 等待接通超时（秒）。
+                        >0 → 覆盖 arm_noanswer_timer 决策链；0/None → 走全局默认 50s
         call_url:       explicit call_url (bypass builder)
 
     Returns:
-        str  e.g. "{audio_codecs=PCMU,PCMA,G722,OPUS,video_codecs=H264,VP8}user/7gja30rf &echo"
+        str  e.g. "{audio_codecs=PCMU,...,sched_hangup=3600,originate_call_timeout=30}user/1001 &park"
     """
     if call_url:
         return call_url
@@ -266,6 +271,12 @@ def build_call_url(orig_to=None, app=None,
         vars_parts.append(f"origination_caller_id_name={caller_name}")
     if timeout:
         vars_parts.append(f"originate_timeout={timeout}")
+
+    # --- REQ-DP-TIMEOUT-001: per-call timeout overrides ---
+    if sched_hangup and sched_hangup > 0:
+        vars_parts.append(f"sched_hangup={sched_hangup}")
+    if originate_call_timeout and originate_call_timeout > 0:
+        vars_parts.append(f"originate_call_timeout={originate_call_timeout}")
 
     # --- Audio codecs ---
     if audio is True:

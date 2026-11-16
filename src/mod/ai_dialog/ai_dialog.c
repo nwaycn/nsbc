@@ -46,7 +46,8 @@
 #include "log.h"
 #include "media_bridge.h"
 #include "g711_codec.h"
-#include "b2bua.h"        /* P0-1: b2b_call_destroy_add */
+#include "b2bua.h"        /* P0-1: b2b_call_destroy_add + REQ-AI-TRANSFER-001: b2b_transfer_call */
+#include "callctrl.h"     /* REQ-AI-TRANSFER-001: CCF_XFER_BLIND */
 #include "dp_sleep.h"     /* P0-2: dp_sleep_app_reg() */
 #include "app_registry.h" /* P0-2: app_register / app_desc_t */
 #include "app_ctx.h"      /* struct nsbc_ctx 完整定义（ctx->cfg）*/
@@ -62,6 +63,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>     /* ENODEV — bridge_send_raw relay 未 latch 时返回此值 */
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -112,6 +114,10 @@ typedef struct ai_session {
     size_t    r_tail;
     time_t    opened_at;
     int       enabled;   /* 1 = 已被 dp "ai" app 显式启用；全局 hook 也能启 session 但 enabled=0 */
+    int       producer;  /* REQ-AI-MEDIA-001: 1 = 外部 producer 模式（第三方 AI 直接喂 tx_audio，
+                           * ai_session_thread 空转只抓 rx_audio 到 ring buffer；
+                           * 0 = 内建 demo 模式（ai_session_thread 里做 ASR→LLM→TTS 管道，
+                           * 默认关闭：cfg.llm_enabled=0 时也空转）*/
 
     /* ASR chunk 临时文件路径（每个 chunk 落一个 .pcm） */
     char      chunk_paths[AI_MAX_CHUNKS][64];
@@ -121,6 +127,13 @@ typedef struct ai_session {
     int16_t  *pcm_buf;              /* 累计的 PCM16 缓冲（ASR 和 LLM 之后 TTS 用）*/
     size_t    pcm_samples;          /* 累计的 16bit 样本数（不是字节）*/
     size_t    pcm_cap;
+
+    /* REQ-AI-TRANSFER-001：外部请求 AI 转人工座席（blind transfer）。
+     * 调用方（OAM CLI / Webhook 回调 / LLM function call 解析后）
+     * 设 transfer_dest + transfer_pending=1 → ai_session_thread 下次循环
+     * 管道跑完后调 b2b_transfer_call 发 REFER + 设置 running=0 让线程退出。 */
+    char      transfer_dest[256];
+    int       transfer_pending;
 
     struct ai_session *next;
 } ai_session_t;
@@ -233,7 +246,143 @@ static void ai_rec_feed(void *ud, void *call_key,
 }
 
 /* ================================================================== */
-/* ASR → transcript（openai whisper multipart）                         */
+/* REQ-AI-MEDIA-001：Pass-through 公共 API —— 让第三方 AI 直接读写音频流     */
+/* ================================================================== */
+
+/* AI 模块架构分层：
+ *   ┌──────────────────────────────────────────────────────────┐
+ *   │ ai_dialog 模块（本文件，C 核心媒体管道层）                  │
+ *   │   • ai_rec_feed hook → ring buffer 入队                   │
+ *   │   • ring buffer ← ai_get_rx_audio（第三方 AI 读用户语音）    │
+ *   │   • ai_send_tx_audio（第三方 AI 写回复） → bridge_send_raw → A 腿 │
+ *   │   • ai_request_transfer → b2b_transfer_call（转人工座席）     │
+ *   │   • 内建 ASR/LLM/TTS 管道（demo 模式，默认 cfg.llm_enabled=0 关闭）│
+ *   └──────────────────────────────────────────────────────────┘
+ *   ┌──────────────────────────────────────────────────────────┐
+ *   │ 外部 AI（第三方 Python/Go/Rust agent，跑在 nsbc-web 侧车或独立进程） │
+ *   │   • HTTP / UDS 订阅 nsbc 事件 → 知道哪通电话要接管            │
+ *   │   • ai_get_rx_audio 拉用户语音 → ASR（本地 Whisper/云端）      │
+ *   │   • LLM 对话管理（function call / 多轮上下文 / 知识库检索）      │
+ *   │   • TTS（云或本地 VITS/GPT-SoVITS）                         │
+ *   │   • ai_send_tx_audio 推回复 → 用户听                         │
+ *   │   • ai_request_transfer → b2b_transfer_call（复杂意图识别到转人工）│
+ *   └──────────────────────────────────────────────────────────┘
+ *
+ * 为什么这么分：
+ *   - C 核心只做媒体桥接（ring buffer + bridge_send_raw），HTTP/curl 都在这里
+ *   - 第三方 AI 想用什么 ASR/LLM/TTS 都能接（OpenAI / 本地 Ollama / 火山引擎 / 腾讯云）
+ *   - 转人工座席是 B2BUA 业务层能力，留在 C 核心（b2b_transfer_call 已实现）
+ *   - 内建 ASR/LLM/TTS 管道降级为 demo 模式，方便快速验证 dialplan "ai" app 端到端
+ *
+ * 音频格式约定：
+ *   - RX（用户→AI）：PCMU 8kHz，每次 ai_rec_feed 入队的是完整 RTP 载荷（通常 160 字节 / 20ms）
+ *   - TX（AI→用户）：PCMU 8kHz 原始字节（**调用方必须喂 PCMU，本模块不管 codec 转换**），
+ *     bridge_send_raw 按 RTP 节奏注入 —— codec 转换已模块化嵌入（media_bridge 只管 RTP 封装 + sendto）
+ *   - 缓冲区大小：256KB（≈32s @ 8kHz PCMU）
+ */
+
+/* 外部 producer 模式启动 session（绕过 dp ai app，直接让外部 AI 接管音频）
+ *
+ * call_key:   b2b_call_t*（不透明指针）
+ * producer:   1 = 外部 AI 喂 tx_audio，内建 ASR/LLM/TTS 关闭
+ *             0 = 默认 demo 模式（cfg.llm_enabled 控制管道开关）
+ * 返回：NSBC_OK / NSBC_NOENT（没 session）/ NSBC_INVAL */
+int ai_set_producer(void *call_key, int producer)
+{
+    if (!call_key) return NSBC_INVAL;
+    pthread_mutex_lock(&g_ai.lock);
+    ai_session_t *s = NULL;
+    for (s = g_ai.head; s; s = s->next) {
+        if (s->call_key == call_key) break;
+    }
+    if (!s) { pthread_mutex_unlock(&g_ai.lock); return NSBC_NOENT; }
+    pthread_mutex_lock(&s->lock);
+    s->producer = producer ? 1 : 0;
+    pthread_mutex_unlock(&s->lock);
+    pthread_mutex_unlock(&g_ai.lock);
+    llog(LOG_INFO, "ai", "ai_set_producer call=%p producer=%d", call_key, producer);
+    return NSBC_OK;
+}
+
+/* 第三方 AI 拉取用户语音（PCMU 8kHz 原始字节，不重采样）
+ *
+ * call_key:  b2b_call_t*
+ * out_buf:   调用方缓冲区（至少 out_max_len 字节）
+ * out_max_len: 最多读多少字节（建议 160 的整数倍 = 20ms 的 RTP 载荷）
+ * 返回：实际读取的字节数（0 = ring buffer 空 / 无 session / session 未启动）
+ *
+ * 语义：非阻塞。ring buffer 里有多少读多少，**消费语义**（读了就不保留）。
+ * 建议调用方以 20ms（160 字节）节奏调，和 ai_rec_feed 入队节奏对齐。 */
+size_t ai_get_rx_audio(void *call_key, uint8_t *out_buf, size_t out_max_len)
+{
+    if (!call_key || !out_buf || out_max_len == 0) return 0;
+    pthread_mutex_lock(&g_ai.lock);
+    ai_session_t *s = NULL;
+    for (s = g_ai.head; s; s = s->next) {
+        if (s->call_key == call_key) break;
+    }
+    if (!s || !s->running) { pthread_mutex_unlock(&g_ai.lock); return 0; }
+
+    pthread_mutex_lock(&s->lock);
+    pthread_mutex_unlock(&g_ai.lock);   /* 避免死锁：g_ai.lock → s->lock 已按顺序 */
+
+    size_t n = 0;
+    while (n < out_max_len && s->r_head != s->r_tail) {
+        out_buf[n++] = s->ring[s->r_tail];
+        s->r_tail = (s->r_tail + 1) % AI_RING_CAP;
+    }
+    pthread_mutex_unlock(&s->lock);
+    return n;
+}
+
+/* 第三方 AI 推送回复音频给用户 —— REQ-AI-MEDIA-001 Pass-through
+ *
+ * call_key:  b2b_call_t*（不透明指针）
+ * data:      PCMU 8kHz 原始字节（**调用方必须自己转好，本模块不做 codec 转换**）
+ * len:       字节数
+ * 返回：NSBC_OK / NSBC_NOENT / NSBC_INVAL
+ *
+ * 语义：非阻塞。内部调 bridge_send_raw 按 RTP 节奏注入 A 腿。
+ * 建议 20ms（160 字节 PCMU）节奏喂，和媒体桥接节奏对齐。
+ * relay 不存在 / 还没 latch（-ENODEV）时返回 NSBC_AGAIN，调用方决定 retry 还是 drop。
+ *
+ * 设计决定：ai_dialog 不管编码 —— codec 转换已模块化嵌入（media_bridge 只负责
+ * RTP 封装 + sendto，payload 本身必须是 PCMU/PCMA）。调用方（外部 Python AI agent
+ * 或内建 demo 模式）负责喂进来正确格式。这样模块职责清晰，零 codec 依赖。 */
+int ai_send_tx_audio(void *call_key, const uint8_t *data, size_t len, int format)
+{
+    (void)format;  /* 预留：未来可支持 PCMA/PCM16，但现在只管 PCMU */
+    if (!call_key || !data || len == 0) return NSBC_INVAL;
+
+    pthread_mutex_lock(&g_ai.lock);
+    ai_session_t *s = NULL;
+    for (s = g_ai.head; s; s = s->next) {
+        if (s->call_key == call_key) break;
+    }
+    if (!s || !s->running) { pthread_mutex_unlock(&g_ai.lock); return NSBC_NOENT; }
+
+    uint8_t   pt       = g_ai.cfg.target_pt;  /* 0=PCMU */
+    uint32_t  ssrc     = s->ssrc;
+    uint16_t *seq_ptr  = &s->seq;
+    uint32_t *ts_ptr   = &s->ts;
+    pthread_mutex_unlock(&g_ai.lock);
+
+    /* bridge_send_raw 签名：
+     *   int bridge_send_raw(bridge_mgr_t *m, void *call_key, int leg,
+     *                       const void *payload, size_t len, uint8_t pt,
+     *                       uint32_t ssrc, uint16_t *seq, uint32_t *ts, uint32_t ts_inc);
+     * 返回实际 send 字节数（含 RTP 头），<0 表示失败 */
+    int n = bridge_send_raw(g_ai.bridge, call_key, 0,
+                            data, len, pt, ssrc, seq_ptr, ts_ptr, 160);
+    if (n < 0) {
+        if (n == -ENODEV) return NSBC_AGAIN;
+        return NSBC_NOENT;
+    }
+    return NSBC_OK;
+}
+
+/* ================================================================== */
+/* ASR → transcript（openai whisper multipart） — demo 模式               */
 /* ================================================================== */
 
 static char *do_asr(ai_cfg_t *cfg, const char *pcm_path, size_t pcm_len)
@@ -677,6 +826,24 @@ static void *ai_session_thread_stub(void *arg)
     int chunk_written = 0;
 
     while (s->running) {
+        /* REQ-AI-MEDIA-001 producer 模式：外部 AI 直接喂 tx_audio，
+         * ai_session_thread 空转只抓 rx_audio 到 ring buffer，不做 ASR/LLM/TTS。
+         * 外部 producer 通过 ai_get_rx_audio() 拉音频、ai_send_tx_audio() 推回复。 */
+        pthread_mutex_lock(&s->lock);
+        int is_producer = s->producer;
+        pthread_mutex_unlock(&s->lock);
+
+        if (is_producer) {
+            nanosleep(&(struct timespec){.tv_sec = 0, .tv_nsec = 20000000}, NULL); /* 20ms 空转 */
+            continue;
+        }
+
+        /* demo 模式但 cfg.llm_enabled=0（默认）：同样空转，等外部 set_producer=1 接管 */
+        if (!st->cfg.llm_enabled) {
+            nanosleep(&(struct timespec){.tv_sec = 0, .tv_nsec = 20000000}, NULL);
+            continue;
+        }
+
         /* 如果还没被 dp "ai" app 显式启用（enabled=0），只等 enable 或 exit；
          * ring buffer 继续被全局 hook 写着，但 thread 空转不做 ASR/TTS */
         if (!s->enabled) {
@@ -739,6 +906,38 @@ static void *ai_session_thread_stub(void *arg)
             free(transcript);
             chunk_written = 0;
         }
+
+        /* === REQ-AI-TRANSFER-001：如果 transfer_pending，在这里触发 blind transfer ===
+         *
+         * 设计原则：
+         *   - 在管道跑完后检查（避免 ASR/LLM/TTS 执行中途打断）
+         *   - transfer 后立刻 running=0 让线程退出（后续不再抓流、不再做 AI 管道）
+         *   - 用 b2b_transfer_call 发 REFER（双腿都发，b_leg=-1, kind=CCF_XFER_BLIND）
+         *
+         * 为什么在 thread 里调而不是外部直接调：
+         *   b2b_transfer_call 内部要拿 b2b_call_t.lock —— 外部线程调也能拿，
+         *   但在 AI thread 里调顺序更可控（最后一次 ASR/TTS 注入 → REFER → 退出）。 */
+        pthread_mutex_lock(&s->lock);
+        if (s->transfer_pending && s->transfer_dest[0]) {
+            char dest[256];
+            snprintf(dest, sizeof(dest), "%s", s->transfer_dest);
+            s->transfer_pending = 0;
+            pthread_mutex_unlock(&s->lock);
+
+            llog(LOG_INFO, "ai", "★ ai_session transfer trigger call=%p dest=%s",
+                 s->call_key, dest);
+            int trc = b2b_transfer_call((b2b_call_t *)s->call_key,
+                                        /*b_leg=*/-1, dest,
+                                        /*kind=*/CCF_XFER_BLIND, NULL, NULL);
+            llog(trc == NSBC_OK ? LOG_INFO : LOG_WARN, "ai",
+                 "★ ai_session transfer rc=%d call=%p dest=%s", trc, s->call_key, dest);
+
+            /* 不管 transfer 成功与否，都停 AI session —— 后续不再抓流 */
+            s->running = 0;
+            break;  /* 跳出 while 循环 → 走线程退出清理 */
+        } else {
+            pthread_mutex_unlock(&s->lock);
+        }
     }
 
     /* 线程退出清理 */
@@ -794,6 +993,48 @@ static void ai_on_call_destroy(void *call_key, int a_final, void *ud)
      * 简单起见 timeout 时不 free，让进程退出时 fini 统一清）*/
 }
 
+/* ================================================================== */
+/* REQ-AI-TRANSFER-001：公共 API —— 请求 AI session 转人工座席           */
+/* ================================================================== */
+
+/* 外部（OAM CLI / LLM function call / Webhook / IVR）可调用此 API
+ * 让 AI session 在下次 ASR→LLM→TTS 管道跑完后（或立即如果管道空闲）
+ * 调 b2b_transfer_call(call, -1, dest, CCF_XFER_BLIND) 发 REFER。
+ *
+ * 非阻塞：只设 session->transfer_dest + transfer_pending=1，
+ * 实际 transfer 由 ai_session_thread 自己做（避免跨线程碰 b2b_call_t）。
+ *
+ * 返回：NSBC_OK=设置成功；NSBC_NOENT=call_key 没 session；NSBC_INVAL=dest 非法 */
+int ai_request_transfer(void *call_key, const char *dest)
+{
+    if (!call_key || !dest || !dest[0]) return NSBC_INVAL;
+    size_t dl = strlen(dest);
+    if (dl > 256) return NSBC_INVAL;
+    for (size_t i = 0; i < dl; ++i) {
+        unsigned char ch = (unsigned char)dest[i];
+        if (ch < 0x21 || ch > 0x7e) return NSBC_INVAL; /* 白名单校验 */
+    }
+
+    pthread_mutex_lock(&g_ai.lock);
+    ai_session_t *s = NULL;
+    for (s = g_ai.head; s; s = s->next) {
+        if (s->call_key == call_key) break;
+    }
+    if (!s) {
+        pthread_mutex_unlock(&g_ai.lock);
+        llog(LOG_WARN, "ai", "ai_request_transfer: no session for call=%p", call_key);
+        return NSBC_NOENT;
+    }
+    pthread_mutex_lock(&s->lock);
+    snprintf(s->transfer_dest, sizeof(s->transfer_dest), "%s", dest);
+    s->transfer_pending = 1;
+    pthread_mutex_unlock(&s->lock);
+    pthread_mutex_unlock(&g_ai.lock);
+    llog(LOG_INFO, "ai", "ai_request_transfer call=%p dest=%s (pending)", call_key, dest);
+    return NSBC_OK;
+}
+
+/* ================================================================== */
 /* P0-2: dp app "ai" 执行 —— 在 INVITE resolve 命中 dialplan ai app_chain 时调
  * 创建 per-call ai_session（早于 ai_rec_feed 全局 hook 创建的时间点）。
  * 立即返回 APP_RC_OK（per-call 线程异步处理媒体 → ASR → LLM → TTS 注入，
@@ -952,6 +1193,23 @@ static int ai_init(struct nsbc_ctx *ctx)
     }
 #endif
 
+    /* REQ-AI-MEDIA-001 / REQ-AI-TRANSFER-001: 注册 pass-through 公共 API 函数指针
+     *
+     * 为什么需要：ai_dialog 编译成 mod_ai_dialog.so，主二进制链接器看不到 .so 里的符号。
+     * 主二进制的 ai_backend_registry.c 里有 wrapper ai_set_producer/ai_get_rx_audio/
+     * ai_send_tx_audio/ai_request_transfer，内部通过这里注册的函数指针转发。 */
+    {
+        ai_passthrough_fns_t fns = {
+            .set_producer     = ai_set_producer,
+            .get_rx_audio     = ai_get_rx_audio,
+            .send_tx_audio    = ai_send_tx_audio,
+            .request_transfer = ai_request_transfer,
+        };
+        int prc = ai_passthrough_register_fns(&fns);
+        llog(prc == NSBC_OK ? LOG_INFO : LOG_WARN, "ai",
+             "passthrough_register rc=%d", prc);
+    }
+
     return NSBC_OK;
 }
 
@@ -959,6 +1217,9 @@ static void ai_fini(struct nsbc_ctx *ctx)
 {
     (void)ctx;
     llog(LOG_INFO, "ai", "ai_dialog fini");
+
+    /* REQ-AI-MEDIA-001: 先 unregister passthrough fns（避免 fini 过程中还有外部 AI 调进来）*/
+    ai_passthrough_unregister();
 
     /* P0-1: 卸载 call_destroy hook */
     b2b_call_destroy_rm(ai_on_call_destroy, &g_ai);

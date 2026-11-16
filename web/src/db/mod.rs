@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use md5::{Md5, Digest};
 use sqlx::{Any, Pool, Row};
-use tokio::sync::{mpsc, Mutex};
-use tracing::{info, warn, error, debug};
+use tokio::sync::mpsc;
+use tracing::{info, warn, error};
 
 // sqlx Any driver reads SQLite INTEGER as i64, but the business layer needs bool.
 // Solution: the FromRow struct stores as i64; serde output auto-converts to bool.
@@ -1185,7 +1185,9 @@ pub enum DbBatchItem {
 ///   - 队满：submit 侧 try_send → 同步 fallback 单条写（保证不丢）
 pub struct DbBatch {
     tx: mpsc::Sender<DbBatchItem>,
+    #[allow(dead_code)]
     pool: Arc<Pool<Any>>,
+    #[allow(dead_code)]
     backend: &'static str,
 }
 
@@ -1639,7 +1641,7 @@ async fn flush_cdrs(
 
 async fn flush_runtimes(
     pool: &Arc<Pool<Any>>,
-    backend: &'static str,
+    _backend: &'static str,
     bucket: &mut Vec<DbBatchItem>,
 ) {
     let n = bucket.len();
@@ -1903,7 +1905,7 @@ async fn connect_and_migrate(dsn: &str) -> Result<Pool<Any>, sqlx::Error> {
             // busy_timeout / foreign_keys 都是 connection-level，
             // 必须在 after_connect 里设才能对所有 Acquire Guard 生效。
             // journal_mode=WAL 是 database-level（持久化到 sqlite_master），这里重复设无副作用。
-            .after_connect(move |mut conn, _meta| Box::pin(async move {
+            .after_connect(move |conn, _meta| Box::pin(async move {
                 // after_connect: 每个 SQLite 新连接建立时强制执行 PRAGMA。
                 // busy_timeout / foreign_keys 是 connection-level，
                 // WAL 等是 database-level（持久化但重复设无害）。
@@ -3040,6 +3042,9 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
                 force_precondition INTEGER NOT NULL DEFAULT 0,
                 force_timer        INTEGER NOT NULL DEFAULT 0,
                 force_gruu         INTEGER NOT NULL DEFAULT 0,
+                /* REQ-DP-TIMEOUT-001：dialplan 规则级 per-call timeout override（秒，0=不限/走全局） */
+                sched_hangup_s           INTEGER NOT NULL DEFAULT 0,
+                originate_call_timeout_s INTEGER NOT NULL DEFAULT 0,
                 action_json   TEXT    NOT NULL DEFAULT '{}',
                 app_chain     TEXT    NOT NULL DEFAULT '[]',  /* REQ-DP-APP-001: Application chain JSON array */
                 enabled       INTEGER NOT NULL DEFAULT 1,
@@ -3072,6 +3077,9 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
                 force_precondition INTEGER NOT NULL DEFAULT 0,
                 force_timer        INTEGER NOT NULL DEFAULT 0,
                 force_gruu         INTEGER NOT NULL DEFAULT 0,
+                /* REQ-DP-TIMEOUT-001：dialplan 规则级 per-call timeout override（秒，0=不限/走全局） */
+                sched_hangup_s           INTEGER NOT NULL DEFAULT 0,
+                originate_call_timeout_s INTEGER NOT NULL DEFAULT 0,
                 action_json   TEXT   NOT NULL DEFAULT '{}',
                 app_chain     TEXT   NOT NULL DEFAULT '[]',  /* REQ-DP-APP-001: Application chain JSON array */
                 enabled       INTEGER NOT NULL DEFAULT 1,
@@ -3104,6 +3112,9 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
                 force_precondition TINYINT NOT NULL DEFAULT 0,
                 force_timer        TINYINT NOT NULL DEFAULT 0,
                 force_gruu         TINYINT NOT NULL DEFAULT 0,
+                /* REQ-DP-TIMEOUT-001：dialplan 规则级 per-call timeout override（秒，0=不限/走全局） */
+                sched_hangup_s           INT NOT NULL DEFAULT 0,
+                originate_call_timeout_s INT NOT NULL DEFAULT 0,
                 action_json   JSON         NOT NULL,
                 app_chain     JSON         NOT NULL,  /* REQ-DP-APP-001: Application chain JSON array */
                 enabled       TINYINT(1)   NOT NULL DEFAULT 1,
@@ -3146,6 +3157,8 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
                     ADD COLUMN force_precondition TINYINT NOT NULL DEFAULT 0 AFTER force_prack, \
                     ADD COLUMN force_timer        TINYINT NOT NULL DEFAULT 0 AFTER force_precondition, \
                     ADD COLUMN force_gruu         TINYINT NOT NULL DEFAULT 0 AFTER force_timer, \
+                    ADD COLUMN sched_hangup_s           INT NOT NULL DEFAULT 0 AFTER force_gruu, \
+                    ADD COLUMN originate_call_timeout_s INT NOT NULL DEFAULT 0 AFTER sched_hangup_s, \
                     ADD COLUMN app_chain  JSON NOT NULL AFTER action_json",
         _ => {
             // SQLite / PostgreSQL each get their own statements
@@ -3165,6 +3178,11 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
             sqlx::query("ALTER TABLE dialplan_rules ADD COLUMN force_timer INTEGER NOT NULL DEFAULT 0")
                 .execute(pool).await.ok();
             sqlx::query("ALTER TABLE dialplan_rules ADD COLUMN force_gruu INTEGER NOT NULL DEFAULT 0")
+                .execute(pool).await.ok();
+            /* REQ-DP-TIMEOUT-001：dialplan 规则级 per-call timeout override */
+            sqlx::query("ALTER TABLE dialplan_rules ADD COLUMN sched_hangup_s INTEGER NOT NULL DEFAULT 0")
+                .execute(pool).await.ok();
+            sqlx::query("ALTER TABLE dialplan_rules ADD COLUMN originate_call_timeout_s INTEGER NOT NULL DEFAULT 0")
                 .execute(pool).await.ok();
             /* REQ-DP-APP-001: Application chain column (backfill for existing DBs) */
             sqlx::query("ALTER TABLE dialplan_rules ADD COLUMN app_chain TEXT NOT NULL DEFAULT '[]'")
@@ -6191,6 +6209,9 @@ pub struct DialplanRule {
     pub force_precondition: i64,
     pub force_timer:       i64,
     pub force_gruu:        i64,
+    /* REQ-DP-TIMEOUT-001：dialplan 规则级 per-call timeout override（秒，0=不限/走全局） */
+    pub sched_hangup_s:           i64,
+    pub originate_call_timeout_s: i64,
     #[serde(with = "json_text_as_value")]
     pub action_json:    String,
     /* REQ-DP-APP-001: Application chain JSON array — pushed to C side dp_json_parse_one on reload.
@@ -6240,6 +6261,11 @@ pub struct DialplanRuleCreate {
     pub force_timer:       i64,
     #[serde(default)]
     pub force_gruu:        i64,
+    /* REQ-DP-TIMEOUT-001：dialplan 规则级 per-call timeout override（秒，0=不限/走全局） */
+    #[serde(default)]
+    pub sched_hangup_s:           i64,
+    #[serde(default)]
+    pub originate_call_timeout_s: i64,
     #[serde(default = "default_empty_json")]
     pub action_json:    String,
     /* REQ-DP-APP-001: default empty array (skip when no app_chain) */
@@ -6272,6 +6298,9 @@ pub struct DialplanRuleUpdate {
     pub force_precondition: Option<i64>,
     pub force_timer:       Option<i64>,
     pub force_gruu:        Option<i64>,
+    /* REQ-DP-TIMEOUT-001：dialplan 规则级 per-call timeout override */
+    pub sched_hangup_s:           Option<i64>,
+    pub originate_call_timeout_s: Option<i64>,
     pub action_json:    Option<String>,
     /* REQ-DP-APP-001 */
     pub app_chain:      Option<String>,
@@ -6985,6 +7014,7 @@ pub struct BillingTransaction {
     pub created_at:     String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct BillingTransactionCreate {
     pub account_id:  i64,
@@ -7185,14 +7215,16 @@ impl Db {
                 (tenant_id, name, layer, profile_name, src_ip_cidr, match_expr, caller_match,
                  prio, strip, target, rec_action, rec_path_template, rec_fmt,
                  force_prack, force_precondition, force_timer, force_gruu,
+                 sched_hangup_s, originate_call_timeout_s,
                  action_json, app_chain, enabled, description)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
              RETURNING *"
         )
         .bind(c.tenant_id).bind(&c.name).bind(&c.layer).bind(&c.profile_name).bind(&c.src_ip_cidr)
         .bind(&c.match_expr).bind(&c.caller_match)
         .bind(c.prio).bind(c.strip).bind(&c.target).bind(c.rec_action).bind(&c.rec_path_template).bind(&c.rec_fmt)
         .bind(c.force_prack).bind(c.force_precondition).bind(c.force_timer).bind(c.force_gruu)
+        .bind(c.sched_hangup_s).bind(c.originate_call_timeout_s)
         .bind(&act).bind(&ac)
         .bind(c.enabled as i64).bind(&c.description)
         .fetch_one(pool).await
@@ -7242,6 +7274,9 @@ impl Db {
         set_ir!("force_precondition", u.force_precondition);
         set_ir!("force_timer", u.force_timer);
         set_ir!("force_gruu", u.force_gruu);
+        /* REQ-DP-TIMEOUT-001：dialplan 规则级 per-call timeout override */
+        set_ir!("sched_hangup_s", u.sched_hangup_s);
+        set_ir!("originate_call_timeout_s", u.originate_call_timeout_s);
         set_sr!("action_json", u.action_json.clone());
         set_sr!("app_chain", u.app_chain.clone());  /* REQ-DP-APP-001 */
         set_br!("enabled", u.enabled);
@@ -8657,7 +8692,7 @@ pub async fn settle_billing(&self, account_id: i64, call_id: &str, charge_uc: i6
     let new_balance = acct.balance_uc - charge_uc;
 
     // Update account (deduct charge)
-    let is_mysql = backend == "mysql";
+    let _is_mysql = backend == "mysql";  /* 预留（PostgreSQL 用 $1/$2，MySQL 用 ?） */
     let update_sql_raw = format!(
         "UPDATE accounts SET balance_uc = balance_uc - $1, updated_at = {ts} WHERE id = $2"
     );

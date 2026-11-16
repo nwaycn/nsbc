@@ -659,6 +659,11 @@ static int resolve_cb(b2b_call_t *call, const char *ruri, size_t ruri_len,
         call->force_precondition = dres.force_precondition;
         call->force_timer        = dres.force_timer;
         call->force_gruu         = dres.force_gruu;
+        /* REQ-DP-TIMEOUT-001：dialplan 规则级 timeout override → b2b_call */
+        if (dres.sched_hangup_s > 0)
+            call->sched_hangup_ms_override = (int)dres.sched_hangup_s * 1000;
+        if (dres.originate_call_timeout_s > 0)
+            call->originate_call_timeout_ms_override = (int)dres.originate_call_timeout_s * 1000;
     }
     /* FreeSWITCH 风格精细化主叫覆盖：origination_caller_id_number/name 透传
      * orig_caller_id_num 只填 user part，host 在 b2bua.c From 构造时根据 trunk 自动补 */
@@ -1822,6 +1827,11 @@ static int sig_start(struct nsbc_ctx *ctx)
     long rna_s = 60;
     cfg_get_int(cfg, "sip.ring_noanswer_timeout_s", &rna_s, NULL);
     bc.ring_noanswer_ms = (uint32_t)rna_s * 1000u;
+    /* REQ-DP-TIMEOUT-001：originate B-leg 等待接通的默认超时（秒→ms；默认 50s）。
+     * 0=回退 ring_noanswer_ms（后面 arm_noanswer_timer 决策链里处理）。 */
+    long octo_s = 50;
+    cfg_get_int(cfg, "sip.originate_call_timeout_s", &octo_s, NULL);
+    bc.originate_call_timeout_ms = (uint32_t)((octo_s > 0) ? octo_s * 1000u : 0);
     /* REQ-ORIGINATE-005：originate 呼出通话时长上限（秒→ms；默认 0=不限） */
     long oct_s = 0;
     cfg_get_int(cfg, "sip.originate_caller_timeout_s", &oct_s, NULL);

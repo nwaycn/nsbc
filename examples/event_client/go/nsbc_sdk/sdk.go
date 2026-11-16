@@ -225,6 +225,10 @@ type OriginateOpts struct {
 	Timeout    int      // ringing timeout seconds; 0 → skipped
 	CallerID   string   // origination caller ID number
 	CallerName string   // origination caller ID name
+	/* REQ-DP-TIMEOUT-001: per-call timeout overrides (秒)。
+	 * >0 → 拼进 brace var；0 → 跳过（走 dialplan rule / 全局默认） */
+	SchedHangup           int
+	OriginateCallTimeout  int
 	CallUrl    string   // explicit call_url (bypasses builder)
 }
 
@@ -257,6 +261,13 @@ func BuildCallUrl(opts OriginateOpts) string {
 	}
 	if len(opts.Video) > 0 {
 		parts = append(parts, "video_codecs="+strings.Join(opts.Video, ","))
+	}
+	// REQ-DP-TIMEOUT-001: per-call timeout overrides
+	if opts.SchedHangup > 0 {
+		parts = append(parts, fmt.Sprintf("sched_hangup=%d", opts.SchedHangup))
+	}
+	if opts.OriginateCallTimeout > 0 {
+		parts = append(parts, fmt.Sprintf("originate_call_timeout=%d", opts.OriginateCallTimeout))
 	}
 
 	vars := ""

@@ -349,6 +349,18 @@ int vad_stop_for_call(void *call_key) {
     return idx >= 0 ? 0 : 0;  /* 本来就没监控也算 OK */
 }
 
+/* REQ-AI-BARGEIN-001: 查询 per-call per-leg VAD 状态 —— 外部 AI barge-in 用 */
+int vad_query_for_call(void *call_key, int leg, vad_state_t *state_out, uint16_t *rms_out) {
+    if (!call_key || !state_out || leg < 0 || leg >= VAD_LEGS_PER_CALL) return -1;
+    pthread_mutex_lock(&g_states_lock);
+    int idx = find_slot(call_key);
+    if (idx < 0 || !g_states[idx].active) { pthread_mutex_unlock(&g_states_lock); return -1; }
+    *state_out = g_states[idx].state[leg];
+    if (rms_out) *rms_out = g_states[idx].last_rms[leg];
+    pthread_mutex_unlock(&g_states_lock);
+    return 0;
+}
+
 void vad_stop_all(void) {
     pthread_mutex_lock(&g_states_lock);  /* P1 */
     for (int i = 0; i < VAD_MAX_CALLS; ++i) {

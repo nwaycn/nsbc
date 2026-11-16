@@ -630,6 +630,15 @@ static int dp_json_parse_one(cJSON *obj, dp_rule_t *r, uint32_t rid,
     if (j && cJSON_IsNumber(j) && j->valueint >= 0 && j->valueint <= 2)
         r->force_gruu = (uint8_t)j->valueint;
 
+    /* REQ-DP-TIMEOUT-001：dialplan 规则级 per-call timeout override（秒）。
+     * 默认 0=不限/走全局。取值范围 0..86400（24h 封顶）。 */
+    j = cJSON_GetObjectItem(obj, "sched_hangup_s");
+    if (j && cJSON_IsNumber(j) && j->valueint >= 0 && j->valueint <= 86400)
+        r->sched_hangup_s = (uint32_t)j->valueint;
+    j = cJSON_GetObjectItem(obj, "originate_call_timeout_s");
+    if (j && cJSON_IsNumber(j) && j->valueint >= 0 && j->valueint <= 3600)
+        r->originate_call_timeout_s = (uint32_t)j->valueint;
+
     /* §18 新增：可选录音路径模板（空串=系统默认） */
     j = cJSON_GetObjectItem(obj, "rec_path_template");
     if (j && cJSON_IsString(j) && j->valuestring[0])
@@ -712,6 +721,19 @@ static int dp_json_parse_one(cJSON *obj, dp_rule_t *r, uint32_t rid,
             if      (!strcmp(a->valuestring, "bypass")) r->media_mode = 1;
             else if (!strcmp(a->valuestring, "relay"))  r->media_mode = 2;
             else if (!strcmp(a->valuestring, "auto"))   r->media_mode = 0;
+        }
+
+        /* —— REQ-DP-TIMEOUT-001：拨号规则级 per-call timeout override（action_json 内也可写） ——
+         * 权威来源：top-level 字段优先，action_json 内写了但 top-level 没写才用 */
+        if (r->sched_hangup_s == 0) {
+            a = cJSON_GetObjectItem(aj, "sched_hangup_s");
+            if (a && cJSON_IsNumber(a) && a->valueint >= 0 && a->valueint <= 86400)
+                r->sched_hangup_s = (uint32_t)a->valueint;
+        }
+        if (r->originate_call_timeout_s == 0) {
+            a = cJSON_GetObjectItem(aj, "originate_call_timeout_s");
+            if (a && cJSON_IsNumber(a) && a->valueint >= 0 && a->valueint <= 3600)
+                r->originate_call_timeout_s = (uint32_t)a->valueint;
         }
 
         /* —— REQ-DP-SIP-001：SIP 头重写（sip_hdr_rewrite_t hdr_rw） —— */

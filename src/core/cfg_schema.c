@@ -83,6 +83,11 @@ static const cfg_desc_t k_core[] = {
     {"sip.t4_ms", CGT_INT, CGF_HOT, "5000", NULL, 500, 20000},
     {"sip.timer_d_ms", CGT_INT, CGF_HOT, "32000", NULL, 1000, 120000},
     {"sip.ring_noanswer_timeout_s", CGT_INT, CGF_HOT, "60", NULL, 5, 3600},
+    /* REQ-DP-TIMEOUT-001：originate 发起 B-leg 等待接通的默认超时（秒）。
+     * 默认 50s（比 ring_noanswer=60s 短，外呼更积极失败）；0=回退 ring_noanswer_timeout_s。
+     * dialplan rule / OAM brace var {originate_call_timeout=N} 可 override。
+     * 仅对 originate 创建的 call 生效，入站 INVITE 不受影响。 */
+    {"sip.originate_call_timeout_s", CGT_INT, CGF_HOT, "50", NULL, 0, 3600},
     /* REQ-ORIGINATE-005：originate 呼出后的最长通话时长（秒）。
      * 默认 0 = 不限制；>0 则到期自动 BYE（cause=486）。
      * 仅对 originate 呼出生效，不影响入站 INVITE。生产可设 3600(1h)/7200(2h) 封顶。 */

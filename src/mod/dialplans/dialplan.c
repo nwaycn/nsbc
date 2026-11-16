@@ -401,6 +401,9 @@ int dp_execute(const dp_ctx_t *ctx, const dp_call_t *call, dp_result_t *res)
         res->force_precondition = r->force_precondition;
         res->force_timer        = r->force_timer;
         res->force_gruu         = r->force_gruu;
+        /* REQ-DP-TIMEOUT-001：dialplan 规则级 timeout override 透传到 signaling → b2b_call */
+        res->sched_hangup_s           = r->sched_hangup_s;
+        res->originate_call_timeout_s = r->originate_call_timeout_s;
         snprintf(res->rec_path_template, sizeof(res->rec_path_template), "%s", r->rec_path_template);
         snprintf(res->rec_fmt, sizeof(res->rec_fmt), "%s", r->rec_fmt);
         if (clip_sub[0])
