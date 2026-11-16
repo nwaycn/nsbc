@@ -131,6 +131,95 @@ English body here. Same Markdown features available.
 - front matter 里的 YAML 字段名（`title:` 不是 `title_zh:`）
 - 表格里的版本号、度量值（例如 "5062"、"Opus maxplaybackrate=8000"）
 
+## 历史专栏 — FreeSWITCH / OpenSIPS / Kamailio
+
+网站集成了两个历史技术专栏，从旧站 `freeswitch.net.cn`（2015 起约 239 篇）和 `docs.opensips.net.cn`（约 62 篇）归档而来。
+
+### 目录结构
+
+```
+content/
+├── freeswitch/*.md     →  /freeswitch/N
+└── opensips/*.md       →  /opensips/N
+```
+
+每篇文章用源站的文章 ID 作为文件名（如 `263.md`），slug 就是这个数字。路由自动映射：
+
+- `/freeswitch/263` 显示 "Na Stream 新能力发布：被叫侧实时 TTS 检测"
+- `/opensips/1` 显示 "WLBLOG 项目说明"
+- 英文页自动加 `/en` 前缀：`/en/freeswitch/263`、`/en/opensips/1`
+
+### 格式（简化 front matter）
+
+历史专栏文章**不做双语翻译**（源站全中文），用简化版 front matter：
+
+```markdown
+---
+title: 文章标题
+date: 2026-12-10
+tags: FreeSWITCH,ASR,TTS
+source: http://freeswitch.net.cn/263.html
+slug: 263
+---
+
+正文（中文 Markdown / HTML 混合）。
+```
+
+和 docs/blog 相比的差异：
+- 没有 `title_en` / `<!-- en -->` — 英文页回退到中文内容 + 中文标题
+- 多了 `source:` 字段，指向源站原始文章 URL（便于回溯）
+- `slug:` 字段明确写出来（等于文件名的数字）
+
+### 增加新文章
+
+**方式 A：手工新建**（推荐用于原创或编辑过的新内容）
+
+```markdown
+---
+title: FreeSWITCH mod_sofia 调优笔记
+date: 2026-11-17
+tags: FreeSWITCH,sofia,调优
+---
+
+正文。
+```
+
+文件名取一个唯一数字（比如 `264.md`，下一个可用 ID），放到 `content/freeswitch/` 或 `content/opensips/` 下。重启进程即生效。
+
+**方式 B：批量从旧站抓取**（importblog.go）
+
+```powershell
+# 首次抓取（自动探测最新 ID）
+Set-Location c:\github\nsbc\website
+$env:GOPROXY = "https://goproxy.cn,direct"
+& "C:\Go\bin\go.exe" run importblog.go --domain freeswitch.net.cn --out content/freeswitch --workers 10 --force
+& "C:\Go\bin\go.exe" run importblog.go --domain docs.opensips.net.cn --out content/opensips --workers 8 --force
+
+# 增量更新：只抓指定 ID 范围（--force 覆盖已有文件）
+& "C:\Go\bin\go.exe" run importblog.go --domain freeswitch.net.cn --out content/freeswitch --start 264 --end 300
+```
+
+importblog.go 会：
+1. 从首页侧边栏 "最新" 列表自动探测最大文章 ID（跳过月份归档 `202604.html` 这类 6 位编号）
+2. 并发抓取每篇文章 HTML（默认 10 worker，--workers 可调）
+3. 用 `golang.org/x/net/html` tokenizer 找到正文容器（按 id/class 优先级：`content` → `main-content` → `article` → `span9` → 最大 div）
+4. 从 `<title>` 标签、meta keywords、源站 "创建时间：yyyy-mm-dd" 正则提取 title/tags/date
+5. 清洗：剥 script/style/iframe/noscript、剥 HTML 注释、剥 `<br/>` `<hr/>`、剥内部导航链接、剥所有残留 HTML 标签只留文本
+6. 写 Markdown 文件（UTF-8 无 BOM）
+
+注意：源站部分老文章会返回 HTTP 500（约 24 篇 freeswitch + 3 篇 opensips），属源站服务器故障，importblog.go 会跳过并记录在日志里。
+
+### 修改 / 删除
+
+和 docs/blog 完全一样：
+- **改** — 直接编辑 `.md` 文件，重启进程
+- **删** — 删 `.md` 文件，重启进程
+- **批量替换作者名** — 已通过 PowerShell 脚本把所有 "上海老李" 改成 "上海李浩"，如需再次批量替换可参考根目录历史命令
+
+### 架构说明
+
+`content.go` 的 `Scan()` 扫描 `[docs, blog, freeswitch, opensips]` 四个目录，每个目录的文件按 `WHERE kind='xxx'` 查询分类。`ListBlog()` / `ListFreeswitch()` / `ListOpenSIPS()` 全部在 SQLite 上独立查询，互不干扰。`main.go` 的 `handleList` / `handleDetail` 是通用 handler，通过 `kind` / `Active` / `Title` / `Description` 四个参数区分三个专栏（blog / freeswitch / opensips）。
+
 ## 增删改查 — 模板
 
 ### 新增一个静态页面（例如 `/pricing`）

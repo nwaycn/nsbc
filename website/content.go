@@ -346,6 +346,8 @@ func findSeparator(body string) (int, int) {
 
 func parseFrontMatter(raw string) (map[string]string, string) {
 	meta := make(map[string]string)
+	// 剥 UTF-8 BOM（EF BB BF），否则 strings.HasPrefix("---\n") 会失败
+	raw = strings.TrimPrefix(raw, "\uFEFF")
 	raw = strings.ReplaceAll(raw, "\r\n", "\n")
 	if !strings.HasPrefix(raw, "---\n") {
 		return meta, raw

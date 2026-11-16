@@ -364,12 +364,28 @@ func normalizeTags(raw string) string {
 	return strings.Join(parts, ",")
 }
 
-// cleanHTML 简单清洗：去掉 script/style/iframe/noscript 标签块。
+// cleanHTML 清洗抓取到的正文 HTML：
+//   1. 剥 script/style/iframe/noscript 标签块
+//   2. 剥 HTML 注释 <!-- ... -->
+//   3. 剥 <br> <hr> 这类无意义标签
+//   4. 剥源站残留的内部导航 <a href="NNN.html"> 包装（保留链接文本）
 func cleanHTML(s string) string {
 	for _, tag := range []string{"script", "style", "iframe", "noscript"} {
 		re := regexp.MustCompile(`(?is)<` + tag + `[^>]*>.*?</` + tag + `>`)
 		s = re.ReplaceAllString(s, "")
 	}
+	// HTML 注释
+	commentRe := regexp.MustCompile(`(?s)<!--.*?-->`)
+	s = commentRe.ReplaceAllString(s, "")
+	// <br> / <hr>
+	breakRe := regexp.MustCompile(`<(br|hr)\s*/?>`, regexp.IgnoreCase)
+	s = breakRe.ReplaceAllString(s, "")
+	// 内部文章链接 <a href="123.html">...</a> → 保留文本
+	linkRe := regexp.MustCompile(`(?is)<a\s+href="\d+\.html"[^>]*>(.*?)</a>`)
+	s = linkRe.ReplaceAllString(s, "$1")
+	// 空 <a> 包装
+	aRe := regexp.MustCompile(`(?is)<a\s+[^>]*>(.*?)</a>`)
+	s = aRe.ReplaceAllString(s, "$1")
 	return s
 }
 
