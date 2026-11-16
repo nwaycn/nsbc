@@ -85,6 +85,16 @@ func main() {
 		http.Redirect(w, r, "/blog", http.StatusMovedPermanently)
 	})
 	mux.HandleFunc("GET /blog/{slug}", func(w http.ResponseWriter, r *http.Request) { s.handlePost(w, r, "zh") })
+	mux.HandleFunc("GET /freeswitch", func(w http.ResponseWriter, r *http.Request) { s.handleFreeswitch(w, r, "zh") })
+	mux.HandleFunc("GET /freeswitch/{$}", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/freeswitch", http.StatusMovedPermanently)
+	})
+	mux.HandleFunc("GET /freeswitch/{slug}", func(w http.ResponseWriter, r *http.Request) { s.handleFreeswitchPost(w, r, "zh") })
+	mux.HandleFunc("GET /opensips", func(w http.ResponseWriter, r *http.Request) { s.handleOpenSIPS(w, r, "zh") })
+	mux.HandleFunc("GET /opensips/{$}", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/opensips", http.StatusMovedPermanently)
+	})
+	mux.HandleFunc("GET /opensips/{slug}", func(w http.ResponseWriter, r *http.Request) { s.handleOpenSIPSPost(w, r, "zh") })
 
 	// 英文路由（/en/ 前缀，剥掉前缀后复用同一套 handler，Lang 设为 en）
 	enMux := http.NewServeMux()
@@ -99,6 +109,16 @@ func main() {
 		http.Redirect(w, r, "/en/blog", http.StatusMovedPermanently)
 	})
 	enMux.HandleFunc("GET /blog/{slug}", func(w http.ResponseWriter, r *http.Request) { s.handlePost(w, r, "en") })
+	enMux.HandleFunc("GET /freeswitch", func(w http.ResponseWriter, r *http.Request) { s.handleFreeswitch(w, r, "en") })
+	enMux.HandleFunc("GET /freeswitch/{$}", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/en/freeswitch", http.StatusMovedPermanently)
+	})
+	enMux.HandleFunc("GET /freeswitch/{slug}", func(w http.ResponseWriter, r *http.Request) { s.handleFreeswitchPost(w, r, "en") })
+	enMux.HandleFunc("GET /opensips", func(w http.ResponseWriter, r *http.Request) { s.handleOpenSIPS(w, r, "en") })
+	enMux.HandleFunc("GET /opensips/{$}", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/en/opensips", http.StatusMovedPermanently)
+	})
+	enMux.HandleFunc("GET /opensips/{slug}", func(w http.ResponseWriter, r *http.Request) { s.handleOpenSIPSPost(w, r, "en") })
 	mux.Handle("GET /en/", http.StripPrefix("/en", enMux))
 
 	// /en 裸路径 → /en/
@@ -303,39 +323,70 @@ func (s *Server) handleDoc(w http.ResponseWriter, r *http.Request, lang string) 
 }
 
 func (s *Server) handleBlog(w http.ResponseWriter, r *http.Request, lang string) {
-	posts, err := s.store.ListBlog()
+	s.handleList(w, r, "blog", "博客", "Blog", "blog", lang)
+}
+func (s *Server) handleFreeswitch(w http.ResponseWriter, r *http.Request, lang string) {
+	s.handleList(w, r, "freeswitch", "FreeSWITCH 专栏", "FreeSWITCH", "freeswitch", lang)
+}
+func (s *Server) handleOpenSIPS(w http.ResponseWriter, r *http.Request, lang string) {
+	s.handleList(w, r, "opensips", "OpenSIPS / Kamailio 专栏", "OpenSIPS", "opensips", lang)
+}
+
+// handleList 通用列表 handler — 复用 blog/freeswitch/opensips 三栏。
+func (s *Server) handleList(w http.ResponseWriter, r *http.Request, kind, labelZh, labelEn, active, lang string) {
+	var items []Document
+	var err error
+	switch kind {
+	case "freeswitch":
+		items, err = s.store.ListFreeswitch()
+	case "opensips":
+		items, err = s.store.ListOpenSIPS()
+	default:
+		items, err = s.store.ListBlog()
+	}
 	if err != nil {
-		log.Printf("list blog: %v", err)
+		log.Printf("list %s: %v", kind, err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	for i := range posts {
-		posts[i] = localizeDoc(posts[i], lang)
+	for i := range items {
+		items[i] = localizeDoc(items[i], lang)
 	}
-	title := "博客 — NSBC"
-	desc := "NSBC 版本发布、实现细节与运维经验。"
+	title := labelZh + " — NSBC"
+	desc := "历史文章与实践经验。"
 	if lang == "en" {
-		title = "Blog — NSBC"
-		desc = "NSBC releases, implementation notes and ops experience."
+		title = labelEn + " — NSBC"
+		desc = "Historical articles and hands-on notes."
 	}
 	s.render(w, r, PageData{
 		Title:       title,
 		Description: desc,
-		Active:      "blog",
+		Active:      active,
 		Content:     "page_blog",
-		Posts:       posts,
+		Posts:       items,
 		Lang:        lang,
 	})
 }
 
 func (s *Server) handlePost(w http.ResponseWriter, r *http.Request, lang string) {
-	post, err := s.store.Get("blog", r.PathValue("slug"))
+	s.handleDetail(w, r, "blog", "blog", lang)
+}
+func (s *Server) handleFreeswitchPost(w http.ResponseWriter, r *http.Request, lang string) {
+	s.handleDetail(w, r, "freeswitch", "freeswitch", lang)
+}
+func (s *Server) handleOpenSIPSPost(w http.ResponseWriter, r *http.Request, lang string) {
+	s.handleDetail(w, r, "opensips", "opensips", lang)
+}
+
+// handleDetail 通用详情 handler。
+func (s *Server) handleDetail(w http.ResponseWriter, r *http.Request, kind, active, lang string) {
+	post, err := s.store.Get(kind, r.PathValue("slug"))
 	if err == ErrNotFound {
 		s.notFound(w, r, lang)
 		return
 	}
 	if err != nil {
-		log.Printf("get post: %v", err)
+		log.Printf("get %s post: %v", kind, err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -344,7 +395,7 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request, lang string)
 	s.render(w, r, PageData{
 		Title:       post.Title + " — NSBC",
 		Description: post.Summary,
-		Active:      "blog",
+		Active:      active,
 		Content:     "page_post",
 		Post:        post,
 		Markdown:    template.HTML(post.HTML),
