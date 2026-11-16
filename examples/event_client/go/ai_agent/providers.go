@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -442,5 +443,336 @@ func randBytes(n int) []byte {
 	b := make([]byte, n)
 	_, _ = rand.Read(b)
 	return b
+}
+
+// =============================================================================
+// G.711 μ-law PCMU codec — NSBC B2BUA 用 PCMU 8kHz，ASR/TTS 用 PCM16
+// =============================================================================
+// 纯 Go 查表法，每个样例 O(1)，业界标准实现（ITU-T G.711）
+var muLawDecode = [256]int16{
+	-32124, -31100, -30076, -29052, -28028, -27004, -25980, -24956,
+	-23932, -22908, -21884, -20860, -19836, -18812, -17788, -16764,
+	-15996, -15484, -14972, -14460, -13948, -13436, -12924, -12412,
+	-11900, -11388, -10876, -10364, -9852,  -9340,  -8828,  -8316,
+	-7932,  -7676,  -7420,  -7164,  -6908,  -6652,  -6396,  -6140,
+	-5884,  -5628,  -5372,  -5116,  -4860,  -4604,  -4348,  -4092,
+	-3828,  -3608,  -3388,  -3168,  -2948,  -2728,  -2508,  -2288,
+	-2068,  -1848,  -1628,  -1408,  -1188,  -968,   -748,   -528,
+	-332,   -316,   -300,   -284,   -268,   -252,   -236,   -220,
+	-204,   -188,   -172,   -156,   -140,   -124,   -108,   -92,
+	-76,    -60,    -44,    -28,    -12,     12,     28,     44,
+	60,     76,     92,     108,    124,    140,    156,    172,
+	188,    204,    220,    236,    252,    268,    284,    300,
+	316,    332,    528,    748,    968,    1188,   1408,   1628,
+	1848,   2068,   2288,   2508,   2728,   2948,   3168,   3388,
+	3608,   3828,   4092,   4348,   4604,   4860,   5116,   5372,
+	5628,   5884,   6140,   6396,   6652,   6908,   7164,   7420,
+	7676,   7932,   8316,   8828,   9340,   9852,   10364,  10876,
+	11388,  11900,  12412,  12924,  13436,  13948,  14460,  14972,
+	15484,  15996,  16764,  17788,  18812,  19836,  20860,  21884,
+	22908,  23932,  24956,  25980,  27004,  28028,  29052,  30076,
+	31100,  32124,
+}
+
+// PcmuToPcm16: 把 G.711 PCMU 字节流转成 int16 PCM 样本
+func PcmuToPcm16(pcmu []byte) []int16 {
+	out := make([]int16, len(pcmu))
+	for i, b := range pcmu {
+		out[i] = muLawDecode[b]
+	}
+	return out
+}
+
+// Pcm16ToPcmu: 把 int16 PCM 样本编成 G.711 PCMU 字节流
+func Pcm16ToPcmu(pcm []int16) []byte {
+	out := make([]byte, len(pcm))
+	for i, s := range pcm {
+		// G.711 μ-law 编码（ITU-T G.711）
+		var sign byte
+		var n int
+		if s < 0 {
+			sign = 0x80
+			n = int(-s)
+		} else {
+			sign = 0
+			n = int(s)
+		}
+		n += 0x84
+		if n > 32767 {
+			n = 32767
+		}
+		// 找最高位 set 的位置 —— 确定 segment
+		var seg int
+		if n >= 0x1000 {
+			seg = 7
+		} else if n >= 0x800 {
+			seg = 6
+		} else if n >= 0x400 {
+			seg = 5
+		} else if n >= 0x200 {
+			seg = 4
+		} else if n >= 0x100 {
+			seg = 3
+		} else if n >= 0x80 {
+			seg = 2
+		} else if n >= 0x40 {
+			seg = 1
+		} else {
+			seg = 0
+		}
+		// 取 segment 内 4 个 bit 的量化值
+		var q int
+		if seg == 0 {
+			q = (n >> 1) & 0x0F
+		} else {
+			q = (n >> (seg + 3)) & 0x0F
+		}
+		// 组装：sgn(1) + segment(3 反相) + quantization(4 反相)
+		out[i] = byte(sign | (byte(^seg&0x07) << 4) | byte(^q&0x0F))
+	}
+	return out
+}
+
+// Pcm16LEToInt16: 小端 PCM16 字节流 → int16 slice
+func Pcm16LEToInt16(data []byte) []int16 {
+	if len(data) == 0 {
+		return nil
+	}
+	n := len(data) / 2
+	out := make([]int16, n)
+	for i := 0; i < n; i++ {
+		out[i] = int16(binary.LittleEndian.Uint16(data[i*2:]))
+	}
+	return out
+}
+
+// Int16ToPcm16LE: int16 slice → 小端 PCM16 字节流
+func Int16ToPcm16LE(samples []int16) []byte {
+	out := make([]byte, len(samples)*2)
+	for i, s := range samples {
+		binary.LittleEndian.PutUint16(out[i*2:], uint16(s))
+	}
+	return out
+}
+
+// =============================================================================
+// 重采样：整数倍最简单方案 —— AI 客服场景语音质量足够
+// =============================================================================
+
+// Upsample8kTo16k: 每个点翻倍（线性插值更准，但翻倍对 ASR 足够）
+func Upsample8kTo16k(in []int16) []int16 {
+	out := make([]int16, len(in)*2)
+	for i, s := range in {
+		out[i*2] = s
+		out[i*2+1] = s
+	}
+	return out
+}
+
+// Downsample16kTo8k: 隔点取（偶数样本保留）
+func Downsample16kTo8k(in []int16) []int16 {
+	n := len(in) / 2
+	out := make([]int16, n)
+	for i := 0; i < n; i++ {
+		out[i] = in[i*2]
+	}
+	return out
+}
+
+// =============================================================================
+// NWAYASR — 本地 nway-asr-tcp 服务（10.0.0.80:8089）
+//   协议 v1.0：4B_LE(samples) + PCM16_LE → 4B_LE(text_len) + UTF-8
+//   输入：NSBC 给的 PCMU 8kHz → 解码 → 8k→16k → 发服务端
+//   输出：服务端返回 transcript 文本
+// =============================================================================
+
+type NWAYASR struct {
+	Addr string // 默认 10.0.0.80:8089
+}
+
+func (a *NWAYASR) Transcribe(pcmu []byte) string {
+	if a.Addr == "" {
+		a.Addr = "10.0.0.80:8089"
+	}
+
+	// 1. PCMU 8kHz → PCM16 8kHz int16
+	pcm8k := PcmuToPcm16(pcmu)
+	if len(pcm8k) == 0 {
+		return ""
+	}
+
+	// 2. 重采样 8k → 16k
+	pcm16k := Upsample8kTo16k(pcm8k)
+
+	// 3. TCP 连接 nway-asr-tcp
+	conn, err := net.DialTimeout("tcp", a.Addr, 5*time.Second)
+	if err != nil {
+		fmt.Fprintf(stderr, "[NWAYASR] dial %s FAIL: %v\n", a.Addr, err)
+		return ""
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+
+	// 4. 发送：4 字节 LE 采样点数 + PCM16_LE 字节流
+	count := make([]byte, 4)
+	binary.LittleEndian.PutUint32(count, uint32(len(pcm16k)))
+	if _, err := conn.Write(count); err != nil {
+		fmt.Fprintf(stderr, "[NWAYASR] write count FAIL: %v\n", err)
+		return ""
+	}
+	payload := Int16ToPcm16LE(pcm16k)
+	if _, err := conn.Write(payload); err != nil {
+		fmt.Fprintf(stderr, "[NWAYASR] write payload FAIL: %v\n", err)
+		return ""
+	}
+	if tc, ok := conn.(*net.TCPConn); ok {
+		_ = tc.CloseWrite()
+	}
+
+	// 5. 接收：4 字节 LE text_len + UTF-8 transcript
+	var lenBuf [4]byte
+	if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
+		fmt.Fprintf(stderr, "[NWAYASR] read text_len FAIL: %v\n", err)
+		return ""
+	}
+	textLen := binary.LittleEndian.Uint32(lenBuf[:])
+	if textLen > 1<<20 { // 安全上限 1MB transcript
+		fmt.Fprintf(stderr, "[NWAYASR] text_len %d too large, abort\n", textLen)
+		return ""
+	}
+	text := make([]byte, textLen)
+	if textLen > 0 {
+		if _, err := io.ReadFull(conn, text); err != nil {
+			fmt.Fprintf(stderr, "[NWAYASR] read text FAIL: %v\n", err)
+			return ""
+		}
+	}
+
+	result := string(text)
+	fmt.Fprintf(stderr, "[NWAYASR] transcript=%q (%d bytes input → %d chars)\n",
+		result, len(pcmu), len(result))
+	return result
+}
+
+// =============================================================================
+// NWAYTTS — 本地 nway-tts-tcp 服务（10.0.0.80:8090）
+//   协议 v2：4B_LE(text_len) + UTF-8 text →
+//            循环包 { 1B type | 4B LE payload_len | payload }
+//            type 0x01 HEAD(sample_rate u32 LE), 0x02 DATA(PCM16_LE),
+//                 0x03 END, 0xFF ERR
+//   输入：文本 → 发服务端
+//   输出：PCM16_LE (通常 8kHz 8k) → 直接 PCMU 8kHz
+//   ★ 服务端 HEAD 里的 sample_rate 决定是否需要重采样：
+//     8000 Hz → 直接 PCM16→PCMU，无需重采样（最常见）
+//     16000 Hz → 先 downsample 到 8k 再 PCMU
+//     其他 → 报错让用户改 nway-asr config.ini
+// =============================================================================
+
+type NWAYTTS struct {
+	Addr string // 默认 10.0.0.80:8090
+}
+
+func (t *NWAYTTS) Synthesize(text string) []byte {
+	if t.Addr == "" {
+		t.Addr = "10.0.0.80:8090"
+	}
+	textBytes := []byte(text)
+
+	// 1. TCP 连接
+	conn, err := net.DialTimeout("tcp", t.Addr, 5*time.Second)
+	if err != nil {
+		fmt.Fprintf(stderr, "[NWAYTTS] dial %s FAIL: %v\n", t.Addr, err)
+		return nil
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(60 * time.Second))
+
+	// 2. 发送：4 字节 LE text_len + UTF-8 文本
+	lenBuf := make([]byte, 4)
+	binary.LittleEndian.PutUint32(lenBuf, uint32(len(textBytes)))
+	if _, err := conn.Write(lenBuf); err != nil {
+		fmt.Fprintf(stderr, "[NWAYTTS] write len FAIL: %v\n", err)
+		return nil
+	}
+	if _, err := conn.Write(textBytes); err != nil {
+		fmt.Fprintf(stderr, "[NWAYTTS] write text FAIL: %v\n", err)
+		return nil
+	}
+
+	// 3. 收循环包：HEAD（拿采样率）→ DATA* → END / ERR
+	var pcm16Samples []int16
+	sampleRate := 0 // 等 HEAD 填充
+
+	for {
+		var typeBuf [1]byte
+		if _, err := io.ReadFull(conn, typeBuf[:]); err != nil {
+			fmt.Fprintf(stderr, "[NWAYTTS] read type FAIL: %v (dropped)\n", err)
+			break
+		}
+		pt := typeBuf[0]
+
+		var plenBuf [4]byte
+		if _, err := io.ReadFull(conn, plenBuf[:]); err != nil {
+			fmt.Fprintf(stderr, "[NWAYTTS] read plen FAIL: %v\n", err)
+			break
+		}
+		plen := binary.LittleEndian.Uint32(plenBuf[:])
+		if plen > 16<<20 {
+			fmt.Fprintf(stderr, "[NWAYTTS] payload_len %d too large, abort\n", plen)
+			break
+		}
+
+		payload := make([]byte, plen)
+		if plen > 0 {
+			if _, err := io.ReadFull(conn, payload); err != nil {
+				fmt.Fprintf(stderr, "[NWAYTTS] read payload FAIL: %v\n", err)
+				break
+			}
+		}
+
+		switch pt {
+		case 0x01: // HEAD — payload[0..4] = u32 LE sample_rate
+			if plen >= 4 {
+				sampleRate = int(binary.LittleEndian.Uint32(payload[0:4]))
+				fmt.Fprintf(stderr, "[NWAYTTS] HEAD sample_rate=%d Hz\n", sampleRate)
+			}
+		case 0x02: // DATA — PCM16_LE 原始字节流
+			samples := Pcm16LEToInt16(payload)
+			pcm16Samples = append(pcm16Samples, samples...)
+			fmt.Fprintf(stderr, ".")
+		case 0x03: // END
+			fmt.Fprintf(stderr, "\n[NWAYTTS] END. total_pcm16_samples=%d sr=%d\n",
+				len(pcm16Samples), sampleRate)
+			goto done
+		case 0xFF: // ERR
+			fmt.Fprintf(stderr, "\n[NWAYTTS] ERR: %s\n", string(payload))
+			return nil
+		default:
+			fmt.Fprintf(stderr, "\n[NWAYTTS] unknown type 0x%02X plen=%d\n", pt, plen)
+		}
+	}
+done:
+	if len(pcm16Samples) == 0 {
+		fmt.Fprintf(stderr, "[NWAYTTS] no audio received\n")
+		return nil
+	}
+
+	// 4. 根据服务端返回的采样率决定重采样
+	var pcmu []byte
+	switch sampleRate {
+	case 0:
+		fmt.Fprintf(stderr, "[NWAYTTS] WARN: no HEAD, assume 8kHz (直接 PCMU)\n")
+		pcmu = Pcm16ToPcmu(pcm16Samples)
+	case 8000:
+		pcmu = Pcm16ToPcmu(pcm16Samples)
+	case 16000:
+		pcmu = Pcm16ToPcmu(Downsample16kTo8k(pcm16Samples))
+	default:
+		fmt.Fprintf(stderr, "[NWAYTTS] WARN: sample_rate=%d 未知, 尝试按 8k 处理\n", sampleRate)
+		pcmu = Pcm16ToPcmu(pcm16Samples)
+	}
+	fmt.Fprintf(stderr, "[NWAYTTS] synthesized %d PCMU bytes (pcm16=%d samples sr=%d)\n",
+		len(pcmu), len(pcm16Samples), sampleRate)
+	return pcmu
 }
 

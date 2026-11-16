@@ -434,10 +434,12 @@ func (b *bargeIn) waitUntilSilence(timeout time.Duration) bool {
 // Provider 工厂（--asr / --llm / --tts → 真实实例）
 // =============================================================================
 
-func buildASR(name string, apiKey string) ASRProvider {
+func buildASR(name string, apiKey string, nwayAddr string) ASRProvider {
 	switch name {
 	case "whisper":
 		return &WhisperASR{APIKey: apiKey, Model: "whisper-1", TimeoutS: 30}
+	case "nway":
+		return &NWAYASR{Addr: nwayAddr}
 	}
 	return &MockASR{TriggerWord: "我想转人工", EnergyThreshold: 24}
 }
@@ -453,10 +455,12 @@ func buildLLM(name, transferDest string, apiKey, endpoint, model string, transfe
 		HangupKeywords:    []string{"挂断", "再见", "拜拜", "hangup", "bye"}}
 }
 
-func buildTTS(name, apiKey, voiceID string) TTSProvider {
+func buildTTS(name, apiKey, voiceID, nwayAddr string) TTSProvider {
 	switch name {
 	case "elevenlabs":
 		return &ElevenLabsTTS{APIKey: apiKey, VoiceID: voiceID, ModelID: "eleven_monolingual_v1", TimeoutS: 15}
+	case "nway":
+		return &NWAYTTS{Addr: nwayAddr}
 	}
 	return &MockTTS{DurationMs: 2000}
 }
@@ -476,9 +480,9 @@ func main() {
 	transport := flag.String("transport", "auto", "http | ws | auto")
 
 	// Provider flags
-	asrName := flag.String("asr", "mock", "mock | whisper")
+	asrName := flag.String("asr", "mock", "mock | whisper | nway")
 	llmName := flag.String("llm", "mock", "mock | ollama | openai_chat")
-	ttsName := flag.String("tts", "mock", "mock | elevenlabs")
+	ttsName := flag.String("tts", "mock", "mock | elevenlabs | nway")
 
 	apiKeyWhisper := flag.String("api-key-whisper", os.Getenv("NSBC_WHISPER_API_KEY"), "")
 	llmEndpoint := flag.String("llm-endpoint", getEnv("NSBC_OLLAMA_ENDPOINT", "http://localhost:11434/api/chat"), "")
@@ -486,6 +490,8 @@ func main() {
 	apiKeyLLM := flag.String("api-key-llm", os.Getenv("NSBC_OLLAMA_API_KEY"), "")
 	apiKeyTTS := flag.String("api-key-tts", os.Getenv("NSBC_ELEVENLABS_API_KEY"), "")
 	ttsVoiceID := flag.String("tts-voice-id", getEnv("NSBC_ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM"), "")
+	nwayASRAddr := flag.String("nway-asr-addr", "10.0.0.80:8089", "nway ASR TCP 服务地址")
+	nwayTTSAddr := flag.String("nway-tts-addr", "10.0.0.80:8090", "nway TTS TCP 服务地址")
 
 	flag.Parse()
 
@@ -497,9 +503,9 @@ func main() {
 	// --- providers ---
 	transferKeywords := []string{"转人工", "人工", "客服", "人工服务", "找人工", "转客服",
 		"agent", "human", "operator", "representative"}
-	asr := buildASR(*asrName, *apiKeyWhisper)
+	asr := buildASR(*asrName, *apiKeyWhisper, *nwayASRAddr)
 	llm := buildLLM(*llmName, *transferDest, *apiKeyLLM, *llmEndpoint, *llmModel, transferKeywords)
-	tts := buildTTS(*ttsName, *apiKeyTTS, *ttsVoiceID)
+	tts := buildTTS(*ttsName, *apiKeyTTS, *ttsVoiceID, *nwayTTSAddr)
 
 	fmt.Printf("\n%s\n", strings.Repeat("=", 70))
 	fmt.Printf("[ai_agent Go] call=%s transfer_dest=%s\n", *callID, *transferDest)
