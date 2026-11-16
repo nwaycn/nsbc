@@ -223,7 +223,16 @@ where C: CoreApi + Clone + 'static
 
 // =========================================================================
 // ws_bridge_async —— 完整 WS ↔ UDS 双向桥接（串行单 task，避免 tokio::net 并发 mut）
+//
+// Heartbeat 策略（REQ-AI-WS-001 补强）：
+//   服务端→客户端 ping 间隔 30s；发出 ping 后 10s 内没收到任何客户端帧（pong/binary/close）→ 主动断开
+//   僵尸检测：如果 120s 没收到来自客户端的任何数据（包括 pong）→ 连接已死 → 断开
+//   客户端→服务端数据帧（binary / pong）都会刷新 last_client_activity，天然解决 pong 帧偶尔丢的场景
 // =========================================================================
+
+const WS_PING_INTERVAL: Duration = Duration::from_secs(30);
+const WS_PONG_TIMEOUT:   Duration = Duration::from_secs(10);   // ping 发出后等 pong
+const WS_ZOMBIE_TIMEOUT: Duration = Duration::from_secs(120);  // 客户端最长静默时间
 
 async fn ws_bridge_async<C: CoreApi + Clone + 'static>(
     io: &mut SimpleIo,
@@ -233,39 +242,73 @@ async fn ws_bridge_async<C: CoreApi + Clone + 'static>(
     // 1. producer=1（让 nsbcd 停内建 ASR/LLM/TTS + 自动启 VAD）
     let _ = state.core.exec_cmd(&format!("ai-set-producer {} 1", call_id)).await;
 
-    let mut last_ping = tokio::time::Instant::now();
+    let now = tokio::time::Instant::now();
+    let mut last_ping_sent   = now - WS_PING_INTERVAL;  // 立刻允许发第一个 ping
+    let mut last_client_activity = now;                  // 最近收到客户端任何帧的时间
+    let mut pending_ping = false;                         // 是否有一个 ping 还没等到 pong
     let mut disconnected = false;
-    let keep_alive = ws_write(io, Opcode::Binary, b"").await;  // 首个空 binary frame
-    if keep_alive.is_err() { disconnected = true; }
+
+    // 首个空 binary frame 测试链路
+    if ws_write(io, Opcode::Binary, b"").await.is_err() {
+        tracing::warn!(ws_call_id = %call_id, "WS initial probe failed");
+        disconnected = true;
+    }
 
     while !disconnected {
+        let now = tokio::time::Instant::now();
+
         // === A: 读 WS frame（带 timeout，避免阻塞 UDS 50ms 轮询）===
         match tokio::time::timeout(Duration::from_millis(50), ws_read(io)).await {
-            Ok(Ok(frame)) => match frame.opcode {
-                Opcode::Binary => {
-                    // WS→UDS：外部 AI 推的 PCMU → base64 → ai-send-tx
-                    let b64 = B64.encode(&frame.payload);
-                    let _ = state.core.exec_cmd(
-                        &format!("ai-send-tx {} 0 {}", call_id, b64),
-                    ).await;
+            Ok(Ok(frame)) => {
+                // 任何来自客户端的合法帧都刷新僵尸计时器
+                last_client_activity = now;
+                if pending_ping {
+                    pending_ping = false;   // 收到客户端帧就认为 ping 已被响应（可能客户端回了 binary 而不是 pong）
                 }
-                Opcode::Ping => { let _ = ws_write(io, Opcode::Pong, &frame.payload).await; }
-                Opcode::Close => {
-                    let _ = ws_write(io, Opcode::Close, &[]).await;
-                    disconnected = true;
+
+                match frame.opcode {
+                    Opcode::Binary => {
+                        // WS→UDS：外部 AI 推的 PCMU → base64 → ai-send-tx
+                        let b64 = B64.encode(&frame.payload);
+                        let _ = state.core.exec_cmd(
+                            &format!("ai-send-tx {} 0 {}", call_id, b64),
+                        ).await;
+                    }
+                    Opcode::Ping => { let _ = ws_write(io, Opcode::Pong, &frame.payload).await; }
+                    Opcode::Close => {
+                        let _ = ws_write(io, Opcode::Close, &[]).await;
+                        disconnected = true;
+                    }
+                    Opcode::Pong => { /* 我方 ping 的响应 */ }
                 }
-                Opcode::Pong => { /* 我方 ping 的响应 */ }
-            },
+            }
             Ok(Err(e)) => { tracing::warn!("WS read err: {}", e); break; }
-            Err(_) => { /* 50ms timeout — 继续下面的 UDS poll + ping 检查 */ }
+            Err(_) => { /* 50ms timeout — 继续下面的检查 */ }
         }
 
         if disconnected { break; }
 
-        // === B: 30s ping ===
-        if last_ping.elapsed() > Duration::from_secs(30) {
+        // === B: heartbeat 三重检查 ===
+
+        // B1. 僵尸检测：120s 没收到任何客户端帧 → 断开
+        if now.duration_since(last_client_activity) > WS_ZOMBIE_TIMEOUT {
+            tracing::warn!(ws_call_id = %call_id, "WS zombie: {}s no client data → disconnect",
+                           WS_ZOMBIE_TIMEOUT.as_secs());
+            break;
+        }
+
+        // B2. 已发出 ping 但 10s 内没收到任何帧 → pong 超时 → 断开
+        if pending_ping && now.duration_since(last_ping_sent) > WS_PONG_TIMEOUT {
+            tracing::warn!(ws_call_id = %call_id, "WS pong timeout: {}s → disconnect",
+                           WS_PONG_TIMEOUT.as_secs());
+            break;
+        }
+
+        // B3. 30s 发一次 ping（只有没有 pending ping 时才发，避免堆积）
+        if !pending_ping && now.duration_since(last_ping_sent) > WS_PING_INTERVAL {
             if ws_write(io, Opcode::Ping, b"ping").await.is_err() { break; }
-            last_ping = tokio::time::Instant::now();
+            last_ping_sent = now;
+            pending_ping = true;
         }
 
         // === C: UDS→WS：ai-get-rx 50ms 轮询 → binary frame ===
@@ -292,6 +335,6 @@ async fn ws_bridge_async<C: CoreApi + Clone + 'static>(
         }
     }
 
-    // 清理：producer=0 切回 demo 模式
+    // 清理：producer=0 切回 demo 模式（幂等，Close 帧处理里也会走到这里）
     let _ = state.core.exec_cmd(&format!("ai-set-producer {} 0", call_id)).await;
 }

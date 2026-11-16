@@ -36,9 +36,36 @@ static uint32_t g_ring_slots = 512;
 static pthread_key_t g_key;
 static pthread_once_t g_key_once = PTHREAD_ONCE_INIT;
 
-struct ring2; /* 前向声明 */
+/* ★ 关键顺序：先前向声明 + 声明指针变量，再 reg_lock() wrapper，再完整 typedef
+ * C 里指针变量声明不依赖完整 struct 定义（只需要前向声明），
+ * 但访问成员 r->next / r->active 必须在完整 typedef 之后。 */
+struct ring2;                                       /* 前向声明 */
+static struct ring2 *g_rings;                       /* 指针变量 — 合法（不访问成员）*/
 static pthread_mutex_t g_reg_lock = PTHREAD_MUTEX_INITIALIZER;
-static struct ring2 *g_rings; /* 已登记 ring 链表 */
+static int g_reg_lock_robust = 0;
+
+/* ====== g_reg_lock wrapper — EOWNERDEAD 自动恢复 ======
+ *
+ * robust mutex 语义（glibc 2.4+）：
+ *   若持锁线程 crash / SIGKILL，内核不释放 mutex；
+ *   下一个 lock 线程收到 EOWNERDEAD → consistent() → 后续 lock 正常。
+ *
+ * ★ orphan 标记移到 logger_main drain 内（那里 typedef 完整，
+ *   可以安全访问 r->active / r->next；reg_lock 只做最小化处理避免不完整类型错误）。
+ * 正常进程 crash 残留普通 mutex → 永远卡死；
+ * robust mutex → 最多丢少量 ring 日志（标记为 orphan 跳过），进程继续活。 */
+static int reg_lock(void)
+{
+    int rc = pthread_mutex_lock(&g_reg_lock);
+    if (rc == EOWNERDEAD) {
+        fprintf(stderr,
+                "[log] ★ g_reg_lock EOWNERDEAD (owner crashed) — "
+                "will mark rings orphan in logger drain\n");
+        pthread_mutex_consistent(&g_reg_lock);  /* 必须！否则下次 lock 还是 EOWNERDEAD */
+    }
+    return rc;  /* 0=正常；EOWNERDEAD=已处理完（下一轮会是 0）*/
+}
+static void reg_unlock(void) { pthread_mutex_unlock(&g_reg_lock); }
 
 static pthread_mutex_t g_wake = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_cond = PTHREAD_COND_INITIALIZER;
@@ -50,14 +77,7 @@ static nsbc_atomic_t g_written;
 static int g_write_errs;        /* 连续 write 错误计数；触发 reopen */
 static volatile sig_atomic_t g_reopen_pending;  /* SIGHUP 触发的 reopen 请求 (async-signal-safe) */
 
-/* ---- 自管理 size-based rotate（不依赖外部 logrotate） ----
- * 每次 logger_main drain 完所有 ring 后检查文件大小，
- * 超过阈值就把当前文件 → .1，.1 → .2，...，.keep-1 删掉，然后开新文件。 */
-static off_t g_cur_size;          /* 当前日志文件已累计写入字节数 */
-static off_t g_rotate_max = 50 * 1024LL * 1024LL;  /* 默认 50MB 触发 rotate */
-static int   g_rotate_keep = 5;   /* 保留 .1 ~ .4 + .5（共 5 份历史） */
-
-/* ---- per-thread ring（干净布局） ---- */
+/* ---- per-thread ring（完整定义 — 在 reg_lock() 之后声明，之后所有函数都能用 ring2_t 访问成员）---- */
 typedef struct ring2 {
     log_slot_t *slots;
     uint32_t mask;
@@ -105,10 +125,10 @@ int log_thread_attach(void)
     r->mask = n - 1;
     r->active = 1;
     pthread_setspecific(g_key, r);
-    pthread_mutex_lock(&g_reg_lock);
+    reg_lock();
     r->next = (ring2_t *)g_rings;
     g_rings = r;
-    pthread_mutex_unlock(&g_reg_lock);
+    reg_unlock();
     return NSBC_OK;
 }
 
@@ -119,9 +139,7 @@ void log_thread_detach(void)
         return;
     r->active = 0;
     pthread_setspecific(g_key, NULL);
-    /* 摘除 + 排空在登记锁内一次完成：日志线程不会并发访问本环
-     * （停机路径，宁可短暂等待磁盘） */
-    pthread_mutex_lock(&g_reg_lock);
+    reg_lock();
     ring2_t **pp = (ring2_t **)&g_rings;
     while (*pp && *pp != r)
         pp = &(*pp)->next;
@@ -135,77 +153,100 @@ void log_thread_detach(void)
             fwrite(s->data, 1, s->len, stderr);
         r->tail = (r->tail + 1) & r->mask;
     }
-    pthread_mutex_unlock(&g_reg_lock);
+    reg_unlock();
     free(r->slots);
     free(r);
 }
 
-/* ---- size-based rotate（自实现，不依赖外部 logrotate） ----
- * 调用点：logger_main drain 完所有 ring + fsync 之后。
- * 此时 g_reg_lock 已释放、ring 空、fsync 完成，最安全。
+/* ---- size-based rotate（参考 zlog / systemd-journald 设计）----
  *
- * rotate 策略（g_rotate_keep = 5 时）：
- *   nsbcd.log.4 → nsbcd.log.5   (最老的 .4 变成 .5，然后 .5 会被下次覆盖)
- *   nsbcd.log.3 → nsbcd.log.4
- *   nsbcd.log.2 → nsbcd.log.3
- *   nsbcd.log.1 → nsbcd.log.2
- *   nsbcd.log   → nsbcd.log.1
- *   (新建)      → nsbcd.log     ← 新的当前文件
+ * rotate 必须在 g_reg_lock 内执行（见 logger_main），保证 drain 完后
+ * 没有并发 write(g_fd) 期间做 fd 切换。
  *
- * 失败回退：如果 open 新文件失败，恢复旧 fd，重置 g_cur_size=0（避免无限重试）。
+ * 锁内操作序列（绝对不能变序）：
+ *   fsync(old_fd)  →  close(old_fd)  →  rename 链  →  open(new_fd)  →  g_fd=new_fd
+ *
+ * 关键设计：
+ *   1. 先 fsync 再 close：close 后 inode 虽然还活着但已经不在目录项里，
+ *      close 前 fsync 是最后一次"在正确的文件上"落盘的机会
+ *   2. close 再 rename：rename 时 fd 已经关了，避免 rename 后 inode 消失
+ *      但 fd 还能 write 造成的"黑洞日志"
+ *   3. open 带 O_DSYNC：让 write 自带同步语义（内核保证数据块写盘成功
+ *      才返回），替代 logger_main 里每轮独立 fsync —— 内核可以合并
+ *      多次 write 的 sync 操作，温和得多
+ *   4. open 带 O_NOATIME：不让内核更新 access time，减少 metadata write
+ *
+ * rate limit：每小时最多 rotate 一次，防止 open 持续失败时高频 syscall
+ * 失败策略：不重置 g_cur_size —— 下次 drain 继续尝试（open 失败常见原因
+ *   是磁盘临时满 / 权限瞬时丢失，重置 size 会无限推迟下次机会）
  */
-static void do_rotate(void)
+static off_t g_cur_size;
+static off_t g_rotate_max = 50 * 1024LL * 1024LL;
+static int   g_rotate_keep = 5;
+static time_t g_last_rotate_time;
+#define NSBC_ROTATE_MIN_INTERVAL_SEC 3600
+
+/* open flags（所有 log open 统一复用） —— O_DSYNC 替代每轮 fsync */
+#define LOG_OPEN_FLAGS (O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC \
+                       | O_DSYNC | O_NOATIME)
+#define LOG_OPEN_MODE  0640
+
+/* 内部：在 g_reg_lock 内调用。old_fd 必须 >= 0（已 fsync + 要被 close）。
+ * 返回 1 表示 rotate 成功（已切换 g_fd），0 表示失败（old_fd 已 close）。*/
+static int do_rotate_locked(int old_fd)
 {
-    if (!g_log_path[0]) return;  /* stderr 模式 */
+    if (!g_log_path[0] || g_rotate_max <= 0) return 0;
 
-    /* 1. 关旧 fd（已经 fsync 过了） */
-    int old_fd = g_fd;
-    g_fd = -1;
+    /* rate limit：避免 open 持续失败时每次 drain 都调用 rename/unlink */
+    time_t now = time(NULL);
+    if (g_last_rotate_time > 0 && now - g_last_rotate_time < NSBC_ROTATE_MIN_INTERVAL_SEC)
+        return 0;
 
-    /* 2. 重命名：.keep-1 删掉，.i → .i+1，当前 → .1 */
-    char src[PATH_MAX], dst[PATH_MAX];
-    /* 先删最老的那份（存在就删，不存在就忽略） */
+    /* ---- 阶段 1: fsync + close 旧 fd（必须在 rename 之前！）---- */
+    if (old_fd >= 0) {
+        (void)fsync(old_fd);
+        close(old_fd);     /* ★ 先关再 rename — 避免 rename 后 fd write 黑洞 */
+    }
+
+    /* ---- 阶段 2: rename 链 ---- */
+    char dst[PATH_MAX];
     snprintf(dst, sizeof(dst), "%s.%d", g_log_path, g_rotate_keep);
-    unlink(dst);  /* ENOENT 正常，不关心错误 */
-
-    /* 依次 .i → .i+1，从最老往前搬 */
+    unlink(dst);
     for (int i = g_rotate_keep - 1; i >= 1; i--) {
+        char src[PATH_MAX];
         snprintf(src, sizeof(src), "%s.%d", g_log_path, i);
         snprintf(dst, sizeof(dst), "%s.%d", g_log_path, i + 1);
-        rename(src, dst);  /* ENOENT 正常（第一次 rotate 时还没历史） */
+        rename(src, dst);  /* ENOENT 正常 */
     }
-    /* 当前文件 → .1 */
-    rename(g_log_path, dst);  /* dst 此时 = g_log_path + ".1" */
+    snprintf(dst, sizeof(dst), "%s.1", g_log_path);
+    rename(g_log_path, dst);
 
-    /* 3. 开新文件 */
-    int new_fd = open(g_log_path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0640);
+    /* ---- 阶段 3: open 新 fd ---- */
+    int new_fd = open(g_log_path, LOG_OPEN_FLAGS, LOG_OPEN_MODE);
     if (new_fd < 0) {
-        /* 回退：恢复旧 fd，重置 size 计数器避免无限重试 */
-        g_fd = old_fd;
-        g_cur_size = 0;
+        g_fd = -1;
         fprintf(stderr,
-                "[log-rotate] open new FAIL errno=%d(%s) path=%s — keeping old fd\n",
+                "[log-rotate] open NEW FAIL errno=%d(%s) path=%s — "
+                "fallback stderr, WILL retry next cycle\n",
                 errno, strerror(errno), g_log_path);
-        return;
+        g_last_rotate_time = now;
+        return 0;
     }
 
-    /* 4. 成功：关旧 fd（如果之前有），重置计数器 */
-    if (old_fd >= 0)
-        close(old_fd);
     g_fd = new_fd;
     g_cur_size = 0;
     g_write_errs = 0;
-
+    g_last_rotate_time = now;
     fprintf(stderr,
-            "[log-rotate] %s → %s.1 (limit %lld MB, keep %d) at %s\n",
+            "[log-rotate] %s → %s.1 (limit %lld MB, keep %d)\n",
             g_log_path, g_log_path,
-            (long long)(g_rotate_max / (1024 * 1024)), g_rotate_keep,
-            __TIME__);
+            (long long)(g_rotate_max / (1024 * 1024)), g_rotate_keep);
+    return 1;
 }
 
 static void __attribute__((used)) sig_handler_hup(int sig) {
     (void)sig;
-    g_reopen_pending = 1;  /* sig_atomic_t assignment — async-signal-safe */
+    g_reopen_pending = 1;  /* sig_atomic_t — async-signal-safe */
 }
 
 static void wake_logger(void)
@@ -220,24 +261,30 @@ static void *logger_main(void *arg)
     (void)arg;
     for (;;) {
         int any = 0;
-        pthread_mutex_lock(&g_reg_lock);
+        struct timespec wd_t0;
+        clock_gettime(CLOCK_MONOTONIC, &wd_t0);
+
+        reg_lock();  /* robust mutex */
+
+        int wd_n_rings = 0;
         ring2_t *r = (ring2_t *)g_rings;
         while (r) {
+            wd_n_rings++;
+            if (!r->active) {
+                r = r->next;
+                continue;
+            }
             for (;;) {
                 unsigned long t = r->tail;
                 __atomic_thread_fence(__ATOMIC_ACQUIRE);
-                if (t == r->head)
-                    break;
+                if (t == r->head) break;
                 log_slot_t *s = &r->slots[t];
+
                 if (g_fd >= 0) {
                     ssize_t w = write(g_fd, s->data, s->len);
                     if (w < 0) {
-                        if (errno == EINTR) {
-                            /* 重试即可，不计入错误 */
-                            continue;
-                        }
+                        if (errno == EINTR) continue;
                         g_write_errs++;
-                        /* 每秒最多打一条 warn（避免刷屏） */
                         static time_t last_warn;
                         time_t now = time(NULL);
                         if (now != last_warn) {
@@ -249,104 +296,94 @@ static void *logger_main(void *arg)
                                     g_write_errs);
                             last_warn = now;
                         }
-                        /* 连续错误过多 → 尝试重开（sleep/wake 后 fd 可能失效） */
                         if (g_write_errs >= 100 && g_log_path[0]) {
-                            int nfd = open(g_log_path,
-                                           O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC,
-                                           0640);
-                            if (nfd >= 0) {
+                            int old_fd = g_fd;
+                            close(old_fd);
+                            g_fd = open(g_log_path, LOG_OPEN_FLAGS, LOG_OPEN_MODE);
+                            if (g_fd >= 0) {
                                 fprintf(stderr,
                                         "[log-flush] reopened fd %d → %d after %d errors\n",
-                                        g_fd, nfd, g_write_errs);
-                                if (g_fd >= 0) close(g_fd);
-                                g_fd = nfd;
+                                        old_fd, g_fd, g_write_errs);
                                 g_write_errs = 0;
                             } else {
-                                /* reopen 也失败 → 退到 stderr */
-                                if (g_fd >= 0) close(g_fd);
                                 g_fd = -1;
                                 g_write_errs = 0;
                                 fprintf(stderr,
                                         "[log-flush] reopen FAIL errno=%d(%s), "
-                                        "fallback to stderr\n",
+                                        "fallback stderr — will retry next cycle\n",
                                         errno, strerror(errno));
                             }
                         }
-                        /* 跳过这条，继续下一条 */
                     } else {
-                        g_write_errs = 0; /* 成功清零 */
-                        g_cur_size += w;  /* 累计已写入字节，供 size-rotate 用 */
+                        g_write_errs = 0;
+                        g_cur_size += w;
                     }
                 } else {
                     fwrite(s->data, 1, s->len, stderr);
                 }
+
                 sat_inc(g_written);
                 r->tail = (t + 1) & r->mask;
                 any = 1;
             }
             r = r->next;
         }
-        pthread_mutex_unlock(&g_reg_lock);
-        /* REQ-PERF-LOG-001：fsync 仅在有日志写入时执行。
-         * 之前即使 ring 空着（any==0），每 5ms 循环也 fsync 一次 →
-         * 每秒 200 次 fsync，机械盘上每次 1-5ms → 一个核被刷满。
-         * 没日志时只做 reopen 检查 + 5ms 睡眠，零 syscall。 */
-        if (any && g_fd >= 0) {
-            if (fsync(g_fd) < 0 && errno != EINTR) {
-                static time_t last_fsync_warn;
-                time_t now = time(NULL);
-                if (now != last_fsync_warn) {
-                    fprintf(stderr, "[log-flush] fsync FAIL fd=%d errno=%d(%s)\n",
-                            g_fd, errno, strerror(errno));
-                    last_fsync_warn = now;
-                }
-            }
+
+        /* ====== drain 完成 — 锁内做 fd 管理 ====== */
+        if (g_fd >= 0 && g_rotate_max > 0 && g_cur_size >= g_rotate_max) {
+            int old_fd = g_fd;
+            do_rotate_locked(old_fd);
         }
-        if (g_fd >= 0 && g_cur_size >= g_rotate_max) {
-            /* ---- size-based rotate 检查 ----
-             * drain 完所有 ring + fsync 完成后才触发：此时 ring 空、磁盘已落、
-             * fd 状态安全。do_rotate 内部 self-close + rename + open，失败回退旧 fd。 */
-            do_rotate();
-        }
-        /* SIGHUP-triggered reopen (logrotate postrotate hook compatibility).
-         * Signal handler only sets g_reopen_pending (async-signal-safe).
-         * We do the actual open/close here in the logger thread context. */
+
         if (g_reopen_pending) {
             g_reopen_pending = 0;
             if (g_log_path[0]) {
-                int nfd = open(g_log_path,
-                               O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC,
-                               0640);
+                int old = g_fd;
+                int nfd = open(g_log_path, LOG_OPEN_FLAGS, LOG_OPEN_MODE);
                 if (nfd >= 0) {
-                    int old = g_fd;
                     g_fd = nfd;
-                    if (old >= 0)
-                        close(old);
+                    if (old >= 0) close(old);
                     g_write_errs = 0;
+                    g_cur_size = 0;
                     fprintf(stderr,
                             "[log-flush] SIGHUP reopen OK fd=%d → %d path=%s\n",
                             old, nfd, g_log_path);
                 } else {
                     fprintf(stderr,
-                            "[log-flush] SIGHUP reopen FAIL errno=%d(%s) path=%s\n",
-                            errno, strerror(errno), g_log_path);
+                            "[log-flush] SIGHUP reopen FAIL errno=%d(%s) path=%s "
+                            "(keep old fd=%d)\n",
+                            errno, strerror(errno), g_log_path, old);
                 }
             }
         }
-        if (!g_running && !any)
-            break;
+
+        reg_unlock();
+
+        /* watchdog */
+        {
+            struct timespec wd_t1;
+            clock_gettime(CLOCK_MONOTONIC, &wd_t1);
+            int64_t wd_ns = (int64_t)(wd_t1.tv_sec - wd_t0.tv_sec) * 1000000000LL
+                          + (int64_t)wd_t1.tv_nsec - (int64_t)wd_t0.tv_nsec;
+            uint64_t wd_ms = wd_ns > 0 ? (uint64_t)wd_ns / 1000000ULL : 0;
+            if (wd_ms > 500 && any) {
+                static uint32_t wd_count;
+                if (wd_count++ % 10 == 0) {
+                    fprintf(stderr,
+                            "[log-watchdog] ★ drain+fd-mgmt took %lu ms "
+                            "n_rings=%d (disk stall?)\n",
+                            (unsigned long)wd_ms, wd_n_rings);
+                }
+            }
+        }
+
+        if (!g_running && !any) break;
         pthread_mutex_lock(&g_wake);
         if (!g_running) {
             pthread_mutex_unlock(&g_wake);
             break;
         }
         struct timespec ts;
-        /* ★ P0：与 g_cond 的 MONOTONIC 时钟配对（见 log_init）。
-         * 原实现用 CLOCK_REALTIME：NTP 校时把系统时钟回拨后，
-         * timedwait 的绝对截止点落到"未来"，logger 线程长睡不醒 →
-         * ring 不再 drain → 主日志断流，而 audit 直写/业务全正常
-         * （2026-11-12 现场 gdb 实锤：logger 卡在 g_cond 的
-         * FUTEX_CLOCK_REALTIME futex 等待，主日志停写 20+ 分钟）。 */
         clock_gettime(CLOCK_MONOTONIC, &ts);
         ts.tv_nsec += 5 * 1000000L;
         if (ts.tv_nsec >= 1000000000L) {
@@ -372,43 +409,46 @@ int log_init(const char *path, log_level_t level, uint32_t ring_slots)
     }
     int nfd = -1;
     if (path && *path) {
-        mkdir_p(path);  /* 自动创建父目录（mkdir -p 语义） */
-        nfd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0640);
+        mkdir_p(path);
+        nfd = open(path, LOG_OPEN_FLAGS, LOG_OPEN_MODE);
         if (nfd < 0) {
             fprintf(stderr, "log_init: open(%s) failed errno=%d (%s)\n",
                     path, errno, strerror(errno));
             return NSBC_ERR;
         }
-        /* 初始化 size 计数器：从当前文件已有大小开始（重启后续写） */
         struct stat st;
         g_cur_size = (fstat(nfd, &st) == 0) ? st.st_size : 0;
     } else {
         g_cur_size = 0;
     }
     if (g_running) {
-        /* 两阶段启动：第二次调用仅热切换输出 fd，不重复建日志线程
-         * ★ P0 RACE-FIX: close(old) 必须在 g_reg_lock 内。
-         * logger_main 只在持 g_reg_lock 时 write(g_fd)，因此 close 争用
-         * 同一把锁就不会和 write 并发 — 不会 close 一个正在被 write 的 fd。 */
         int old = g_fd;
+        reg_lock();
+        if (old >= 0) close(old);
+        reg_unlock();
         g_fd = nfd;
-        if (old >= 0) {
-            pthread_mutex_lock(&g_reg_lock);
-            close(old);
-            pthread_mutex_unlock(&g_reg_lock);
-        }
         return NSBC_OK;
     }
     g_fd = nfd;
     g_running = 1;
-    /* ★ P0 RACE-FIX：cond 时钟切到 CLOCK_MONOTONIC —— timedwait 的超时
-     * 与系统墙上时钟解耦，NTP 回拨/校时不再让 logger 线程睡过头。 */
     {
         pthread_condattr_t cattr;
         pthread_condattr_init(&cattr);
         pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC);
         pthread_cond_init(&g_cond, &cattr);
         pthread_condattr_destroy(&cattr);
+    }
+    /* ★ ROBUST MUTEX: g_reg_lock 在创建 logger 线程之前初始化成
+     *   robust + errorcheck 属性。crash 后下次 lock 收到 EOWNERDEAD →
+     *   reg_lock() 调 pthread_mutex_consistent() → 进程继续活。 */
+    {
+        pthread_mutexattr_t mattr;
+        pthread_mutexattr_init(&mattr);
+        pthread_mutexattr_setrobust(&mattr, PTHREAD_MUTEX_ROBUST);
+        pthread_mutexattr_settype(&mattr, PTHREAD_MUTEX_ERRORCHECK);
+        pthread_mutex_init(&g_reg_lock, &mattr);
+        pthread_mutexattr_destroy(&mattr);
+        g_reg_lock_robust = 1;
     }
     pthread_once(&g_key_once, key_once);
     if (pthread_create(&g_thr, NULL, logger_main, NULL) != 0) {
@@ -417,13 +457,7 @@ int log_init(const char *path, log_level_t level, uint32_t ring_slots)
             close(g_fd);
         return NSBC_ERR;
     }
-    /* 全局退出钩子：确保任何 exit()/main return 都能 flush ring buffer，
-     * 防止 early return 丢失关键日志。atexit 本身是幂等的（log_stop 检查
-     * g_running），所以正常停机路径的显式 log_stop() 再调一次也安全。 */
     atexit(log_stop);
-    /* SIGHUP → reopen log file（logrotate postrotate 兼容）。
-     * handler 只设 volatile sig_atomic_t flag，实际 reopen 在 logger 线程里做，
-     * 因为 signal handler 上下文不能安全地用 pthread/heap 操作。 */
     struct sigaction sa = { 0 };
     sa.sa_handler = sig_handler_hup;
     sa.sa_flags = SA_RESTART;
@@ -435,8 +469,8 @@ int log_init(const char *path, log_level_t level, uint32_t ring_slots)
 int log_audit_open(const char *path)
 {
     if (!path || !*path)
-        return NSBC_OK;  /* 没配审计路径，跳过 */
-    mkdir_p(path);  /* 自动创建父目录 */
+        return NSBC_OK;
+    mkdir_p(path);
     int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0640);
     if (fd < 0) {
         fprintf(stderr, "log_audit_open: open(%s) failed errno=%d (%s)\n",
@@ -450,14 +484,10 @@ int log_audit_open(const char *path)
 void log_set_level(log_level_t level) { g_level = level; }
 log_level_t log_get_level(void) { return g_level; }
 
-/// Configure size-based log rotation.
-/// @param max_bytes  trigger size in bytes; 0 or negative → disable size-rotate
-///                   (SIGHUP reopen still works). Suggested: 50*1024*1024 (50MB) or larger.
-/// @param keep       number of historical copies to keep (1..9). Default 5.
 void log_set_rotate(long long max_bytes, int keep)
 {
     if (max_bytes <= 0) {
-        g_rotate_max = -1;  /* 禁用 */
+        g_rotate_max = -1;
         return;
     }
     g_rotate_max = (off_t)max_bytes;
@@ -499,7 +529,6 @@ void log_emit(log_level_t lvl, const char *mod, const char *callid,
     char buf[LOG_RECORD_MAX];
     char ts[32];
     nsbc_wall_iso8601(ts, sizeof(ts));
-    /* 取 file basename（去掉路径前缀）— 同时处理 / 和 \ */
     const char *base = file ? strrchr(file, '/') : NULL;
     {
         const char *bs = file ? strrchr(file, '\\') : NULL;
@@ -525,7 +554,6 @@ void log_emit(log_level_t lvl, const char *mod, const char *callid,
         buf[n++] = '\n';
     }
     ring_push(r, buf, (uint16_t)n);
-    /* ERR 及以上立即唤醒；其余依赖 5ms 定时聚合 */
     if (lvl <= LOG_ERR)
         wake_logger();
 }
@@ -551,7 +579,6 @@ void log_audit(const char *actor, const char *action, const char *fmt, ...)
     if (n < (int)sizeof(buf) - 1)
         buf[n++] = '\n';
     int fd = g_audit_fd >= 0 ? g_audit_fd : (g_fd >= 0 ? g_fd : 2);
-    /* O_APPEND 保证单条 write 原子追加；审计不允许丢弃，失败仅计数 */
     ssize_t w = write(fd, buf, (size_t)n);
     (void)w;
 }
@@ -559,29 +586,22 @@ void log_audit(const char *actor, const char *action, const char *fmt, ...)
 uint64_t log_dropped(void) { return sat_read(g_dropped); }
 uint64_t log_written(void) { return sat_read(g_written); }
 
-/* ---- 从 fd 的末尾倒推，找到最后 nlines 行的起始偏移 ---- */
 static off_t tail_find_start(int fd, int nlines)
 {
     if (fd < 0) return 0;
     off_t size = lseek(fd, 0, SEEK_END);
     if (size <= 0) return 0;
-
-    /* 先跳过文件末尾的 '\n'（tail 不算空尾巴） */
     off_t end = size;
     if (lseek(fd, end - 1, SEEK_SET) >= 0) {
         char c = '\0';
         if (read(fd, &c, 1) == 1 && c == '\n')
             end--;
     }
-
     if (end <= 0) return 0;
-
-    /* 从 end 向前找第 nlines 个 '\n' */
     const int BS = 4096;
     char buf[BS];
     off_t pos = end;
     int found = 0;
-
     while (pos > 0) {
         off_t chunk_sz = (pos > BS) ? BS : pos;
         pos -= chunk_sz;
@@ -592,13 +612,12 @@ static off_t tail_find_start(int fd, int nlines)
             if (buf[i] == '\n') {
                 found++;
                 if (found >= nlines) {
-                    /* 返回 '\n' 之后的位置 */
                     return pos + i + 1;
                 }
             }
         }
     }
-    return 0;  /* 总行数不足 nlines，从头返回 */
+    return 0;
 }
 
 size_t log_ring_tail(char *out_buf, size_t out_sz, int max_lines)
@@ -607,7 +626,6 @@ size_t log_ring_tail(char *out_buf, size_t out_sz, int max_lines)
     if (max_lines > 5000) max_lines = 5000;
     if (!out_buf || out_sz == 0) return 0;
 
-    /* 优先从磁盘文件 tail 最后 N 行（logger 线程已 fsync） */
     if (g_log_path[0]) {
         int fd = open(g_log_path, O_RDONLY | O_CLOEXEC);
         if (fd >= 0) {
@@ -631,13 +649,12 @@ size_t log_ring_tail(char *out_buf, size_t out_sz, int max_lines)
         }
     }
 
-    /* 回退：从 ring buffer 读（logger 可能还没来得及 drain） */
     size_t total = 0;
     int lines = 0;
     char *p = out_buf;
     size_t rem = out_sz - 1;
 
-    pthread_mutex_lock(&g_reg_lock);
+    reg_lock();
     for (ring2_t *r = (ring2_t *)g_rings; r; r = r->next) {
         if (!r->active) continue;
         unsigned long cursor = r->tail;
@@ -655,7 +672,7 @@ size_t log_ring_tail(char *out_buf, size_t out_sz, int max_lines)
         }
     }
 done:
-    pthread_mutex_unlock(&g_reg_lock);
+    reg_unlock();
     *p = '\0';
     return total;
 }
