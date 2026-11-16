@@ -1,0 +1,113 @@
+{{define "layout"}}<!DOCTYPE html>
+<html lang="{{lang . "en" "zh-CN"}}">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{.Title}}</title>
+  <meta name="description" content="{{.Description}}">
+  <link rel="canonical" href="https://nsbc.nway.com.cn{{.Canonical}}">
+  <link rel="stylesheet" href="/assets/css/style.css">
+</head>
+<body>
+{{template "header" .}}
+{{.Body}}
+{{template "footer" .}}
+<script src="/assets/js/main.js"></script>
+</body>
+</html>
+{{end}}
+
+{{define "header"}}
+{{$root := ""}}{{if eq .Lang "en"}}{{$root = "/en"}}{{end}}
+<header class="site-header">
+  <div class="container site-header__inner">
+    <a class="brand" href="{{if $root}}{{$root}}{{else}}/{{end}}">
+      <span class="brand__mark">NS</span>
+      <span class="brand__text">
+        <span class="brand__name">NSBC</span>
+        <span class="brand__sub">NWAY Session Border Controller</span>
+      </span>
+    </a>
+    <nav class="nav">
+      <a href="{{$root}}"{{if eq .Active "home"}} class="is-active"{{end}}>{{lang . "Home" "首页"}}</a>
+      <a href="{{$root}}/features"{{if eq .Active "features"}} class="is-active"{{end}}>{{lang . "Features" "功能特性"}}</a>
+      <a href="{{$root}}/learn"{{if eq .Active "learn"}} class="is-active"{{end}}>{{lang . "SIP Primer" "SIP 科普"}}</a>
+      <a href="{{$root}}/download"{{if eq .Active "download"}} class="is-active"{{end}}>{{lang . "Get Source" "下载"}}</a>
+      <a href="{{$root}}/docs"{{if eq .Active "docs"}} class="is-active"{{end}}>{{lang . "Docs" "文档"}}</a>
+      <a href="{{$root}}/blog"{{if eq .Active "blog"}} class="is-active"{{end}}>{{lang . "Blog" "博客"}}</a>
+      <a href="{{$root}}/community"{{if eq .Active "community"}} class="is-active"{{end}}>{{lang . "Community" "社区"}}</a>
+      <a href="{{$root}}/about"{{if eq .Active "about"}} class="is-active"{{end}}>{{lang . "About" "关于"}}</a>
+    </nav>
+    <div class="header-actions">
+      {{if eq .Lang "en"}}
+      <span class="btn btn--ghost" style="pointer-events:none;border:none;color:#8fa9c6;">EN</span>
+      <a class="btn btn--ghost" href="{{.SwitchURL}}">中文</a>
+      {{else}}
+      <a class="btn btn--ghost" href="{{.SwitchURL}}">EN</a>
+      <span class="btn btn--ghost" style="pointer-events:none;border:none;color:#8fa9c6;">中文</span>
+      {{end}}
+      <a class="btn btn--ghost" href="https://github.com/nwaycn/nsbc" target="_blank" rel="noopener">GitHub</a>
+      <a class="btn btn--primary" href="{{$root}}/download">{{lang . "Get Source" "开始使用"}}</a>
+    </div>
+    <button class="nav-toggle" type="button" aria-label="{{lang . "Toggle menu" "展开导航"}}" aria-expanded="false">
+      <span></span><span></span><span></span>
+    </button>
+  </div>
+</header>
+{{end}}
+
+{{define "footer"}}
+{{$root := ""}}{{if eq .Lang "en"}}{{$root = "/en"}}{{end}}
+<footer class="site-footer">
+  <div class="container">
+    <div class="footer-grid">
+      <div class="footer-brand">
+        <a class="brand" href="{{if $root}}{{$root}}{{else}}/{{end}}">
+          <span class="brand__mark">NS</span>
+          <span class="brand__text">
+            <span class="brand__name">NSBC</span>
+            <span class="brand__sub">by Nway</span>
+          </span>
+        </a>
+        <p>{{lang . "All-in-one SIP platform: SBC security, PBX features and SIP proxy performance in a single binary. Apache-2.0 open source." "一体化 SIP 全栈平台：SBC 安全、PBX 功能与 SIP 代理性能，单二进制部署，Apache-2.0 开源。"}}</p>
+      </div>
+      <div>
+        <h4>{{lang . "Product" "产品"}}</h4>
+        <a href="{{$root}}/features">{{lang . "Features" "功能特性"}}</a>
+        <a href="{{$root}}/learn">{{lang . "SIP & SBC Primer" "SIP 与 SBC 原理"}}</a>
+        <a href="{{$root}}/webrtc-sip">{{lang . "WebRTC ↔ SIP Interop" "WebRTC 与 SIP 互通"}}</a>
+        <a href="{{$root}}/download">{{lang . "Get Source" "获取源码"}}</a>
+        <a href="{{$root}}/docs">{{lang . "Docs" "文档"}}</a>
+        <a href="{{$root}}/handbook">{{lang . "Handbook" "配置手册"}}</a>
+      </div>
+      <div>
+        <h4>{{lang . "Community" "社区"}}</h4>
+        <a href="{{$root}}/community">{{lang . "Contribute" "参与贡献"}}</a>
+        <a href="{{$root}}/blog">{{lang . "Blog" "博客"}}</a>
+        <a href="https://github.com/nwaycn/nsbc" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://gitee.com/nwaycn/nsbc" target="_blank" rel="noopener">Gitee Mirror</a>
+      </div>
+      <div>
+        <h4>{{lang . "Support" "支持"}}</h4>
+        <a href="{{$root}}/about">{{lang . "Contact" "联系我们"}}</a>
+        <a href="{{$root}}/handbook#faq">{{lang . "FAQ" "常见问题"}}</a>
+        <a href="mailto:1354608370@qq.com">1354608370@qq.com</a>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <span>© 2011–{{.Year}} Shanghai Nway Technology Co., Ltd. · Apache-2.0</span>
+      <span>nsbc.nway.com.cn</span>
+    </div>
+    <div class="footer-filing">
+      <a class="footer-filing__item" href="https://beian.miit.gov.cn" target="_blank" rel="noopener">沪ICP备11043919号</a>
+      <a class="footer-filing__item" href="https://beian.gov.cn/portal/registerSystemInfo?recordcode=31010502001724" target="_blank" rel="noopener">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" style="vertical-align:-2px;margin-right:4px;">
+          <path d="M8 1L2 3.5v4.5c0 3.2 2.4 6.2 6 7 3.6-.8 6-3.8 6-7V3.5L8 1z" stroke="currentColor" stroke-width="1.2" fill="none"/>
+          <path d="M8 4v5M5.5 6.5h5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+        </svg>
+        沪公网安备 31010502001724号
+      </a>
+    </div>
+  </div>
+</footer>
+{{end}}

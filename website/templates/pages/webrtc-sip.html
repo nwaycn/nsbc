@@ -1,0 +1,543 @@
+{{define "page_webrtc-sip"}}
+
+<section class="page-head">
+  <div class="container">
+    <div class="breadcrumb"><a href="{{if .Root}}{{.Root}}{{else}}/{{end}}">首页</a> / <a href="{{.Root}}/learn">SIP 科普</a> / WebRTC 与 SIP 互通</div>
+    <h1>WebRTC 与 SIP 互通</h1>
+    <p>浏览器说的是 WebRTC 语言，话机与运营商说的是 SIP 语言。SBC 站在中间，同时翻译信令、媒体与地址。这一页把转换过程、抓包特征与故障排查讲清楚。</p>
+  </div>
+</section>
+
+<main>
+
+  <!-- 总览 -->
+  <section class="section" id="overview">
+    <div class="container">
+      <div class="section-head">
+        <span class="eyebrow">总览</span>
+        <h2>两端不直接对话</h2>
+        <p>WebRTC 与 SIP 并不会"互相兼容"，而是各自与 SBC 建立一段独立会话，由 SBC 负责把两侧拼起来。</p>
+      </div>
+
+      <figure class="figure">
+        <svg viewBox="0 0 720 320" role="img" aria-label="WebRTC 与 SIP 经 SBC 互通的协议转换示意图">
+          <!-- 左侧浏览器 -->
+          <g>
+            <rect x="24" y="36" width="156" height="96" rx="10" fill="#eef5fd" stroke="#c7dcf5"/>
+            <text x="102" y="60" text-anchor="middle" fill="#16324f" font-size="11" font-weight="700">浏览器 / WebRTC</text>
+            <text x="102" y="78" text-anchor="middle" fill="#5b7a99" font-size="9">SIP over WSS</text>
+            <text x="102" y="94" text-anchor="middle" fill="#5b7a99" font-size="9">DTLS-SRTP · ICE</text>
+            <text x="102" y="110" text-anchor="middle" fill="#5b7a99" font-size="9">Opus · VP8 / H.264</text>
+          </g>
+
+          <!-- 中间 SBC -->
+          <g>
+            <rect x="266" y="28" width="188" height="112" rx="12" fill="#eafaf6" stroke="#9fddcd" stroke-width="1.6"/>
+            <text x="360" y="52" text-anchor="middle" fill="#0f6f61" font-size="11.5" font-weight="700">NSBC 互通层</text>
+            <text x="360" y="72" text-anchor="middle" fill="#4c7f75" font-size="9">WSS ↔ SIP</text>
+            <text x="360" y="88" text-anchor="middle" fill="#4c7f75" font-size="9">DTLS-SRTP ↔ SRTP / RTP</text>
+            <text x="360" y="104" text-anchor="middle" fill="#4c7f75" font-size="9">ICE ↔ NAT 改写</text>
+            <text x="360" y="120" text-anchor="middle" fill="#4c7f75" font-size="9">Opus ↔ G.711（可选转码）</text>
+          </g>
+
+          <!-- 右侧 SIP -->
+          <g>
+            <rect x="540" y="36" width="156" height="96" rx="10" fill="#eef5fd" stroke="#c7dcf5"/>
+            <text x="618" y="60" text-anchor="middle" fill="#16324f" font-size="11" font-weight="700">SIP 话机 / 中继</text>
+            <text x="618" y="78" text-anchor="middle" fill="#5b7a99" font-size="9">SIP over UDP / TLS</text>
+            <text x="618" y="94" text-anchor="middle" fill="#5b7a99" font-size="9">RTP / RTCP（或 SRTP）</text>
+            <text x="618" y="110" text-anchor="middle" fill="#5b7a99" font-size="9">PCMU · PCMA · G.722</text>
+          </g>
+
+          <!-- 连线 -->
+          <g stroke-width="1.6">
+            <line x1="182" y1="62" x2="262" y2="62" stroke="#1b5db3"/>
+            <text x="222" y="55" text-anchor="middle" fill="#1b5db3" font-size="8.5">WSS :5062/ws</text>
+
+            <line x1="182" y1="100" x2="262" y2="100" stroke="#00a88f"/>
+            <text x="222" y="93" text-anchor="middle" fill="#0f8a76" font-size="8.5">SRTP</text>
+
+            <line x1="458" y1="62" x2="536" y2="62" stroke="#1b5db3"/>
+            <text x="497" y="55" text-anchor="middle" fill="#1b5db3" font-size="8.5">SIP :5060/5061</text>
+
+            <line x1="458" y1="100" x2="536" y2="100" stroke="#00a88f"/>
+            <text x="497" y="93" text-anchor="middle" fill="#0f8a76" font-size="8.5">RTP</text>
+          </g>
+
+          <!-- 下方四个转换点 -->
+          <g>
+            <rect x="24" y="186" width="156" height="46" rx="8" fill="#f8fafc" stroke="#e2e8f0"/>
+            <text x="102" y="205" text-anchor="middle" fill="#16324f" font-size="9.5" font-weight="600">信令转换</text>
+            <text x="102" y="221" text-anchor="middle" fill="#7b8fa5" font-size="8.5">WebSocket 帧 → SIP 报文</text>
+
+            <rect x="196" y="186" width="156" height="46" rx="8" fill="#f8fafc" stroke="#e2e8f0"/>
+            <text x="274" y="205" text-anchor="middle" fill="#16324f" font-size="9.5" font-weight="600">媒体转换</text>
+            <text x="274" y="221" text-anchor="middle" fill="#7b8fa5" font-size="8.5">终结 DTLS，再加密或明文</text>
+
+            <rect x="368" y="186" width="156" height="46" rx="8" fill="#f8fafc" stroke="#e2e8f0"/>
+            <text x="446" y="205" text-anchor="middle" fill="#16324f" font-size="9.5" font-weight="600">地址转换</text>
+            <text x="446" y="221" text-anchor="middle" fill="#7b8fa5" font-size="8.5">ICE 候选 → 可达的公网地址</text>
+
+            <rect x="540" y="186" width="156" height="46" rx="8" fill="#f8fafc" stroke="#e2e8f0"/>
+            <text x="618" y="205" text-anchor="middle" fill="#16324f" font-size="9.5" font-weight="600">能力转换</text>
+            <text x="618" y="221" text-anchor="middle" fill="#7b8fa5" font-size="8.5">编解码、DTMF、视频 profile</text>
+          </g>
+
+          <text x="360" y="272" text-anchor="middle" fill="#94a3b8" font-size="8.5">浏览器与 SIP 终端不直接对话：各自与 SBC 建立独立的两段会话</text>
+        </svg>
+        <figcaption>WebRTC 与 SIP 在 SBC 处完成信令、媒体、地址与能力的四类转换，两端都以为自己在与"同类"通信。</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- 三个平面 -->
+  <section class="section section--soft" id="planes">
+    <div class="container">
+      <div class="section-head">
+        <span class="eyebrow">差异</span>
+        <h2>三个平面，逐项对齐</h2>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>平面</th><th>WebRTC 侧</th><th>SBC 的处理</th><th>SIP 侧</th></tr></thead>
+          <tbody>
+            <tr><td>信令</td><td>WSS，子协议 <code>sip</code></td><td>还原为 SIP，补 Via / rport / Session-ID</td><td>UDP / TCP / TLS</td></tr>
+            <tr><td>会话描述</td><td>ICE 候选、DTLS 指纹、BUNDLE、rtcp-mux</td><td>终结 ICE，重写 <code>c=</code> / <code>m=</code>，过滤不适用的属性</td><td>普通 SDP，静态地址与端口</td></tr>
+            <tr><td>媒体加密</td><td>强制 DTLS-SRTP</td><td>浏览器侧终结 DTLS，SIP 侧按策略用 SRTP 或 RTP</td><td>SRTP 或 RTP</td></tr>
+            <tr><td>编解码</td><td>Opus、VP8、H.264 Baseline</td><td>取交集；需要时转码</td><td>PCMU / PCMA / G.722、H.264</td></tr>
+            <tr><td>DTMF</td><td>RFC 4733 或 SIP INFO</td><td>统一事件方式，避免按键丢失</td><td>RFC 4733 / SIP INFO</td></tr>
+            <tr><td>保活</td><td>WebSocket PING + OPTIONS</td><td>双向响应，维持 NAT 映射</td><td>OPTIONS / 注册刷新</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- 呼叫过程 -->
+  <section class="section" id="flow">
+    <div class="container split">
+      <div>
+        <span class="eyebrow">过程</span>
+        <h2>一次浏览器呼叫话机</h2>
+        <p>从注册到媒体桥接，SBC 一共做了六件事。任何一步缺失，表现都是"能振铃但没声音"。</p>
+        <ol class="steps">
+          <li><strong>注册</strong> — 浏览器通过 WSS 连接 <code>/ws</code>，完成 Digest 注册与保活。</li>
+          <li><strong>发起</strong> — 拨号后发送 INVITE，offer 中带 ICE 候选、DTLS 指纹与 Opus。</li>
+          <li><strong>鉴权与路由</strong> — SBC 校验身份，查询注册库，命中拨号计划。</li>
+          <li><strong>重建 B 腿</strong> — 向话机发起新的 INVITE，SDP 换成话机能理解的地址与编解码。</li>
+          <li><strong>应答与握手</strong> — 话机 200 OK 后，SBC 回填 answer，浏览器完成 DTLS 握手。</li>
+          <li><strong>媒体中继</strong> — 两段媒体在 SBC 内桥接，同时统计质量并生成 CDR。</li>
+        </ol>
+      </div>
+
+      <div>
+        <h3>WSS 帧与 SIP 报文的关系</h3>
+        <pre class="code"><span class="c"># 1) WebSocket 握手（浏览器 → NSBC:5062）</span>
+GET /ws HTTP/1.1
+Upgrade: websocket
+Sec-WebSocket-Protocol: <span class="s">sip</span>
+
+<span class="c"># 2) 握手成功后，每个文本帧装载一条完整 SIP 报文</span>
+INVITE sip:1002@nsbc.local SIP/2.0
+Via: SIP/2.0/WSS 192.168.1.20;branch=z9hG4bK-1a2b;rport
+From: &lt;sip:1001@nsbc.local&gt;;tag=8f3c
+To: &lt;sip:1002@nsbc.local&gt;
+Call-ID: 5d1e9c7a
+CSeq: 1 INVITE
+Content-Type: application/sdp
+
+v=0
+m=audio 40000 UDP/TLS/RTP/SAVPF 111
+a=fingerprint:sha-256 3A:...
+a=rtpmap:111 opus/48000/2</pre>
+        <p class="footnote">WebSocket 的帧边界就是 SIP 报文边界，因此不需要靠 <code>Content-Length</code> 分帧；WSS 上也不允许使用 UDP。</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 对齐要点 -->
+  <section class="section section--soft" id="checklist">
+    <div class="container">
+      <div class="section-head">
+        <span class="eyebrow">实现要点</span>
+        <h2>四个必须对齐的点</h2>
+      </div>
+      <div class="grid grid--2">
+        <article class="card">
+          <h3>信令：WSS 进，SIP 出</h3>
+          <p>浏览器连接 <code>wss://&lt;host&gt;:5062/ws</code>，子协议固定为 <code>sip</code>。SBC 需要补齐 <code>Via</code> 的 <code>rport</code>、<code>Contact</code> 与 RFC 7989 <code>Session-ID</code>，否则抓包时无法把两段会话对应起来。</p>
+        </article>
+        <article class="card">
+          <h3>媒体：先终结，再决定加密</h3>
+          <p>SBC 在浏览器侧终结 DTLS-SRTP，再以 SRTP 或 RTP 与 SIP 侧通信。只要 B 腿是 WS/WSS，就应视为 WebRTC 并走媒体锚定，否则容易出现"信令通、媒体不通"。</p>
+        </article>
+        <article class="card">
+          <h3>编解码：先取交集，再谈转码</h3>
+          <p>H.264 统一收敛到 Baseline（<code>profile-level-id=42e01f</code>，<code>packetization-mode=1</code>）；Opus 可限制 <code>maxplaybackrate=8000</code>。若对端只有 G.711，需要启用转码模块，否则会以 488 / 415 结束。</p>
+        </article>
+        <article class="card">
+          <h3>连接性：ICE 失败要能恢复</h3>
+          <p>网络切换或 NAT 映射过期时，客户端应调用一次 <code>restartIce()</code> 重新收集候选；服务端保持媒体端口稳定，避免频繁 re-INVITE 造成额外抖动。</p>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- 最小配置 -->
+  <section class="section" id="config">
+    <div class="container split">
+      <div>
+        <span class="eyebrow">最小配置</span>
+        <h2>让互通先跑起来</h2>
+        <p>下面只保留与 WebRTC 接入直接相关的键。证书由 <code>nsbc-web</code> 首次启动时生成，或提前放入 <code>tls/</code> 目录。</p>
+        <pre class="code"><span class="k">sip</span>:
+  <span class="k">ws</span>:
+    <span class="k">enabled</span>: true
+    <span class="k">port</span>: 5062
+    <span class="k">tls</span>: true
+
+<span class="k">media</span>:
+  <span class="c"># WebRTC 接入建议锚定媒体，才能看得见 SRTP 与质量</span>
+  <span class="k">default_mode</span>: relay
+  <span class="k">allow_bypass</span>: false
+  <span class="c"># 内网对等测试可临时改为 true</span>
+  <span class="k">trust_private</span>: false</pre>
+        <p class="footnote">修改后执行 <code>nsbc_cli config.reload</code> 或发送 <code>SIGHUP</code>，无需重启进程。</p>
+      </div>
+
+      <div>
+        <h3>上线前自测清单</h3>
+        <ul class="checklist">
+          <li>浏览器控制台没有 ICE failed，候选包含 <code>srflx</code></li>
+          <li>抓包能看到 DTLS ClientHello / ServerHello</li>
+          <li>answer 中的 <code>m=</code> 数量与 offer 一致</li>
+          <li>双向音频正常，DTMF 按键可被对端识别</li>
+          <li>切换网络后 30 秒内自动恢复</li>
+          <li>CDR 中编解码字段与预期一致（opus 或转码后 g711）</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- 故障 -->
+  <section class="section section--soft" id="troubleshooting">
+    <div class="container">
+      <div class="section-head">
+        <span class="eyebrow">排障</span>
+        <h2>常见互通故障</h2>
+        <p>先确认是哪一段出了问题：浏览器到 SBC，还是 SBC 到话机。两边分别抓包，通常五分钟内能定位。</p>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>现象</th><th>常见根因</th><th>处理方向</th></tr></thead>
+          <tbody>
+            <tr><td>注册成功，呼叫返回 488 / 415</td><td>双方编解码无交集（Opus 对 G.711）</td><td>启用转码，或在 offer 中加入 PCMU</td></tr>
+            <tr><td>能振铃，接通后无声</td><td>SDP 地址不可达，或 ICE 未完成</td><td>开启媒体中继，放行 RTP 端口段</td></tr>
+            <tr><td>只有单向音频</td><td>呼入时新建 transceiver，answer 未包含该 m-line</td><td>复用 offer 已创建的 transceiver 再绑定轨道</td></tr>
+            <tr><td>ICE failed，媒体中断</td><td>候选不足，UDP 被防火墙拦截</td><td>配置 STUN / TURN，客户端重启一次 ICE</td></tr>
+            <tr><td>DTLS 握手失败</td><td>证书指纹被中间设备改写，或 SDP 被裁剪</td><td>检查 <code>a=fingerprint</code> 是否原样透传</td></tr>
+            <tr><td>挂断后会话残留</td><td>WebSocket 异常断开，未发出 BYE</td><td>依赖 OPTIONS 保活与超时清理机制</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note">
+        <strong>与 NSBC 的对应：</strong>WSS 监听 <code>5062/ws</code>；B 腿为 WS/WSS 时自动选择 SRTP 中继；
+        三端 SDK 统一了 transceiver 复用、H.264 Baseline 与 Opus <code>maxplaybackrate=8000</code>，
+        并在 ICE 失败时重启一次。细节见 <a href="{{.Root}}/handbook#sip">文档 · SIP 与媒体</a>。
+      </div>
+    </div>
+  </section>
+
+  <section class="section" style="padding-top: 0;">
+    <div class="container">
+      <div class="cta">
+        <div>
+          <h2>回到基础，或直接上手</h2>
+          <p>SIP 与 SBC 的基本概念在科普页；具体配置、模块与指标在文档页。</p>
+        </div>
+        <div class="cta__actions">
+          <a class="btn btn--outline" href="{{.Root}}/learn">SIP 与 SBC 原理</a>
+          <a class="btn btn--ghost" href="{{.Root}}/handbook#sip">SIP 与媒体配置</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+{{end}}
+
+{{define "page_webrtc-sip_en"}}
+
+<section class="page-head">
+  <div class="container">
+    <div class="breadcrumb"><a href="{{if .Root}}{{.Root}}{{else}}/{{end}}">Home</a> / <a href="{{.Root}}/learn">SIP Primer</a> / WebRTC ↔ SIP Interop</div>
+    <h1>WebRTC and SIP Interoperation</h1>
+    <p>Browsers speak WebRTC, phones and carriers speak SIP. The SBC sits in the middle, translating signaling, media and addresses all at once. This page walks through the conversion process, packet-capture characteristics and troubleshooting.</p>
+  </div>
+</section>
+
+<main>
+
+  <!-- Overview -->
+  <section class="section" id="overview">
+    <div class="container">
+      <div class="section-head">
+        <span class="eyebrow">Overview</span>
+        <h2>They don't talk to each other directly</h2>
+        <p>WebRTC and SIP are not "mutually compatible". Instead, each establishes its own independent session with the SBC, and the SBC stitches the two sides together.</p>
+      </div>
+
+      <figure class="figure">
+        <svg viewBox="0 0 720 320" role="img" aria-label="WebRTC and SIP interop protocol conversion via SBC">
+          <!-- Left: Browser -->
+          <g>
+            <rect x="24" y="36" width="156" height="96" rx="10" fill="#eef5fd" stroke="#c7dcf5"/>
+            <text x="102" y="60" text-anchor="middle" fill="#16324f" font-size="11" font-weight="700">Browser / WebRTC</text>
+            <text x="102" y="78" text-anchor="middle" fill="#5b7a99" font-size="9">SIP over WSS</text>
+            <text x="102" y="94" text-anchor="middle" fill="#5b7a99" font-size="9">DTLS-SRTP · ICE</text>
+            <text x="102" y="110" text-anchor="middle" fill="#5b7a99" font-size="9">Opus · VP8 / H.264</text>
+          </g>
+
+          <!-- Middle SBC -->
+          <g>
+            <rect x="266" y="28" width="188" height="112" rx="12" fill="#eafaf6" stroke="#9fddcd" stroke-width="1.6"/>
+            <text x="360" y="52" text-anchor="middle" fill="#0f6f61" font-size="11.5" font-weight="700">NSBC Interop Layer</text>
+            <text x="360" y="72" text-anchor="middle" fill="#4c7f75" font-size="9">WSS ↔ SIP</text>
+            <text x="360" y="88" text-anchor="middle" fill="#4c7f75" font-size="9">DTLS-SRTP ↔ SRTP / RTP</text>
+            <text x="360" y="104" text-anchor="middle" fill="#4c7f75" font-size="9">ICE ↔ NAT Rewrite</text>
+            <text x="360" y="120" text-anchor="middle" fill="#4c7f75" font-size="9">Opus ↔ G.711 (transcode opt-in)</text>
+          </g>
+
+          <!-- Right: SIP -->
+          <g>
+            <rect x="540" y="36" width="156" height="96" rx="10" fill="#eef5fd" stroke="#c7dcf5"/>
+            <text x="618" y="60" text-anchor="middle" fill="#16324f" font-size="11" font-weight="700">SIP Phone / Trunk</text>
+            <text x="618" y="78" text-anchor="middle" fill="#5b7a99" font-size="9">SIP over UDP / TLS</text>
+            <text x="618" y="94" text-anchor="middle" fill="#5b7a99" font-size="9">RTP / RTCP (or SRTP)</text>
+            <text x="618" y="110" text-anchor="middle" fill="#5b7a99" font-size="9">PCMU · PCMA · G.722</text>
+          </g>
+
+          <!-- Links -->
+          <g stroke-width="1.6">
+            <line x1="182" y1="62" x2="262" y2="62" stroke="#1b5db3"/>
+            <text x="222" y="55" text-anchor="middle" fill="#1b5db3" font-size="8.5">WSS :5062/ws</text>
+
+            <line x1="182" y1="100" x2="262" y2="100" stroke="#00a88f"/>
+            <text x="222" y="93" text-anchor="middle" fill="#0f8a76" font-size="8.5">SRTP</text>
+
+            <line x1="458" y1="62" x2="536" y2="62" stroke="#1b5db3"/>
+            <text x="497" y="55" text-anchor="middle" fill="#1b5db3" font-size="8.5">SIP :5060/5061</text>
+
+            <line x1="458" y1="100" x2="536" y2="100" stroke="#00a88f"/>
+            <text x="497" y="93" text-anchor="middle" fill="#0f8a76" font-size="8.5">RTP</text>
+          </g>
+
+          <!-- Four conversion points below -->
+          <g>
+            <rect x="24" y="186" width="156" height="46" rx="8" fill="#f8fafc" stroke="#e2e8f0"/>
+            <text x="102" y="205" text-anchor="middle" fill="#16324f" font-size="9.5" font-weight="600">Signaling</text>
+            <text x="102" y="221" text-anchor="middle" fill="#7b8fa5" font-size="8.5">WebSocket frames → SIP packets</text>
+
+            <rect x="196" y="186" width="156" height="46" rx="8" fill="#f8fafc" stroke="#e2e8f0"/>
+            <text x="274" y="205" text-anchor="middle" fill="#16324f" font-size="9.5" font-weight="600">Media</text>
+            <text x="274" y="221" text-anchor="middle" fill="#7b8fa5" font-size="8.5">Terminate DTLS, then encrypt or leave plain</text>
+
+            <rect x="368" y="186" width="156" height="46" rx="8" fill="#f8fafc" stroke="#e2e8f0"/>
+            <text x="446" y="205" text-anchor="middle" fill="#16324f" font-size="9.5" font-weight="600">Address</text>
+            <text x="446" y="221" text-anchor="middle" fill="#7b8fa5" font-size="8.5">ICE candidates → reachable public addresses</text>
+
+            <rect x="540" y="186" width="156" height="46" rx="8" fill="#f8fafc" stroke="#e2e8f0"/>
+            <text x="618" y="205" text-anchor="middle" fill="#16324f" font-size="9.5" font-weight="600">Capabilities</text>
+            <text x="618" y="221" text-anchor="middle" fill="#7b8fa5" font-size="8.5">Codecs, DTMF, video profiles</text>
+          </g>
+
+          <text x="360" y="272" text-anchor="middle" fill="#94a3b8" font-size="8.5">Browsers and SIP terminals don't talk to each other directly — each establishes an independent two-leg session with the SBC</text>
+        </svg>
+        <figcaption>WebRTC and SIP complete four classes of conversion at the SBC — signaling, media, addresses and capabilities. Both sides believe they are talking to "their own kind".</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- Planes -->
+  <section class="section section--soft" id="planes">
+    <div class="container">
+      <div class="section-head">
+        <span class="eyebrow">The Differences</span>
+        <h2>Three planes, aligned item by item</h2>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Plane</th><th>WebRTC Side</th><th>SBC Processing</th><th>SIP Side</th></tr></thead>
+          <tbody>
+            <tr><td>Signaling</td><td>WSS, subprotocol <code>sip</code></td><td>Unwrap back to SIP, fill Via / rport / Session-ID</td><td>UDP / TCP / TLS</td></tr>
+            <tr><td>Session Description</td><td>ICE candidates, DTLS fingerprint, BUNDLE, rtcp-mux</td><td>Terminate ICE, rewrite <code>c=</code> / <code>m=</code>, filter inapplicable attributes</td><td>Plain SDP with static address and port</td></tr>
+            <tr><td>Media Encryption</td><td>Mandatory DTLS-SRTP</td><td>Terminate DTLS on the browser side; use SRTP or RTP on the SIP side per policy</td><td>SRTP or RTP</td></tr>
+            <tr><td>Codecs</td><td>Opus, VP8, H.264 Baseline</td><td>Take the intersection; transcode when needed</td><td>PCMU / PCMA / G.722, H.264</td></tr>
+            <tr><td>DTMF</td><td>RFC 4733 or SIP INFO</td><td>Normalize event mode to avoid keypad loss</td><td>RFC 4733 / SIP INFO</td></tr>
+            <tr><td>Keepalive</td><td>WebSocket PING + OPTIONS</td><td>Bidirectional response, maintain NAT mapping</td><td>OPTIONS / registration refresh</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- Flow -->
+  <section class="section" id="flow">
+    <div class="container split">
+      <div>
+        <span class="eyebrow">The Process</span>
+        <h2>A browser calling a phone</h2>
+        <p>From registration to media bridging, the SBC does exactly six things. Miss any one and the symptom is "it rings but has no voice".</p>
+        <ol class="steps">
+          <li><strong>Register</strong> — The browser connects to <code>/ws</code> over WSS, completes Digest registration and keepalive.</li>
+          <li><strong>Initiate</strong> — Dialing sends an INVITE with ICE candidates, DTLS fingerprint and Opus in the offer.</li>
+          <li><strong>Auth &amp; Route</strong> — SBC verifies identity, queries the registration store and matches the dial plan.</li>
+          <li><strong>Rebuild B-leg</strong> — Originate a new INVITE toward the phone, with SDP rewritten to addresses and codecs the phone understands.</li>
+          <li><strong>Answer &amp; Handshake</strong> — After the phone's 200 OK, SBC fills in the answer and the browser completes its DTLS handshake.</li>
+          <li><strong>Media Relay</strong> — The two media legs are bridged inside the SBC; quality stats are collected and a CDR is generated.</li>
+        </ol>
+      </div>
+
+      <div>
+        <h3>How WSS frames relate to SIP packets</h3>
+        <pre class="code"><span class="c"># 1) WebSocket handshake (browser → NSBC:5062)</span>
+GET /ws HTTP/1.1
+Upgrade: websocket
+Sec-WebSocket-Protocol: <span class="s">sip</span>
+
+<span class="c"># 2) After handshake, each text frame carries one complete SIP packet</span>
+INVITE sip:1002@nsbc.local SIP/2.0
+Via: SIP/2.0/WSS 192.168.1.20;branch=z9hG4bK-1a2b;rport
+From: &lt;sip:1001@nsbc.local&gt;;tag=8f3c
+To: &lt;sip:1002@nsbc.local&gt;
+Call-ID: 5d1e9c7a
+CSeq: 1 INVITE
+Content-Type: application/sdp
+
+v=0
+m=audio 40000 UDP/TLS/RTP/SAVPF 111
+a=fingerprint:sha-256 3A:...
+a=rtpmap:111 opus/48000/2</pre>
+        <p class="footnote">WebSocket frame boundaries are SIP packet boundaries, so <code>Content-Length</code> framing is unnecessary. UDP is also not allowed over WSS.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Checklist -->
+  <section class="section section--soft" id="checklist">
+    <div class="container">
+      <div class="section-head">
+        <span class="eyebrow">Implementation Keys</span>
+        <h2>Four points that must align</h2>
+      </div>
+      <div class="grid grid--2">
+        <article class="card">
+          <h3>Signaling: WSS in, SIP out</h3>
+          <p>Browsers connect to <code>wss://&lt;host&gt;:5062/ws</code> with a fixed subprotocol of <code>sip</code>. The SBC must fill in <code>rport</code> in <code>Via</code>, <code>Contact</code> and RFC 7989 <code>Session-ID</code> — otherwise you won't be able to correlate the two legs in packet captures.</p>
+        </article>
+        <article class="card">
+          <h3>Media: terminate first, then decide encryption</h3>
+          <p>The SBC terminates DTLS-SRTP on the browser side and then talks to the SIP side with SRTP or RTP. Whenever the B-leg is WS/WSS, treat it as WebRTC and anchor media — otherwise you will see "signaling works, media doesn't".</p>
+        </article>
+        <article class="card">
+          <h3>Codecs: intersect first, transcode second</h3>
+          <p>H.264 always converges to Baseline (<code>profile-level-id=42e01f</code>, <code>packetization-mode=1</code>); Opus can cap <code>maxplaybackrate=8000</code>. If the peer only speaks G.711, enable the transcoder module or the call ends with 488 / 415.</p>
+        </article>
+        <article class="card">
+          <h3>Connectivity: ICE failure must be recoverable</h3>
+          <p>On network switches or NAT-map expiry, the client should call <code>restartIce()</code> to recollect candidates. The server should keep media ports stable to avoid unnecessary re-INVITEs and extra jitter.</p>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- Minimal config -->
+  <section class="section" id="config">
+    <div class="container split">
+      <div>
+        <span class="eyebrow">Minimal Config</span>
+        <h2>Get interop running first</h2>
+        <p>Only the keys directly related to WebRTC access are shown below. Certificates are generated by <code>nsbc-web</code> on first start, or pre-placed into the <code>tls/</code> directory.</p>
+        <pre class="code"><span class="k">sip</span>:
+  <span class="k">ws</span>:
+    <span class="k">enabled</span>: true
+    <span class="k">port</span>: 5062
+    <span class="k">tls</span>: true
+
+<span class="k">media</span>:
+  <span class="c"># WebRTC access should anchor media so SRTP and quality are visible</span>
+  <span class="k">default_mode</span>: relay
+  <span class="k">allow_bypass</span>: false
+  <span class="c"># Can be set to true temporarily for internal peer tests</span>
+  <span class="k">trust_private</span>: false</pre>
+        <p class="footnote">Run <code>nsbc_cli config.reload</code> or send <code>SIGHUP</code> after changes — no process restart needed.</p>
+      </div>
+
+      <div>
+        <h3>Pre-launch self-check list</h3>
+        <ul class="checklist">
+          <li>No ICE failed in the browser console; candidates include <code>srflx</code></li>
+          <li>Packet captures show DTLS ClientHello / ServerHello</li>
+          <li>Number of <code>m=</code> lines in the answer matches the offer</li>
+          <li>Bidirectional audio is normal; DTMF keys are recognized by the peer</li>
+          <li>Automatic recovery within 30 seconds after network switch</li>
+          <li>Codec field in CDR matches expectation (opus or g711 after transcode)</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- Troubleshooting -->
+  <section class="section section--soft" id="troubleshooting">
+    <div class="container">
+      <div class="section-head">
+        <span class="eyebrow">Troubleshooting</span>
+        <h2>Common interop failures</h2>
+        <p>First figure out which leg is broken: browser ↔ SBC, or SBC ↔ phone. Capture both sides separately — most issues can be localized within five minutes.</p>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Symptom</th><th>Common Root Cause</th><th>Direction to Fix</th></tr></thead>
+          <tbody>
+            <tr><td>Registration OK, call returns 488 / 415</td><td>No codec intersection (Opus vs G.711)</td><td>Enable transcoding, or add PCMU to the offer</td></tr>
+            <tr><td>Rings, but silent when answered</td><td>Unreachable SDP addresses, or ICE didn't complete</td><td>Enable media relay, allow the RTP port range</td></tr>
+            <tr><td>One-way audio only</td><td>Inbound creates a new transceiver, answer doesn't include that m-line</td><td>Reuse the transceiver already created by the offer before binding tracks</td></tr>
+            <tr><td>ICE failed, media drops</td><td>Not enough candidates, UDP blocked by firewall</td><td>Configure STUN / TURN, restart ICE once on the client</td></tr>
+            <tr><td>DTLS handshake fails</td><td>Certificate fingerprint rewritten by an intermediate device, or SDP trimmed</td><td>Check that <code>a=fingerprint</code> is passed through verbatim</td></tr>
+            <tr><td>Session lingers after hangup</td><td>WebSocket closed abnormally, no BYE was sent</td><td>Rely on OPTIONS keepalive and timeout cleanup</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note">
+        <strong>Mapping to NSBC:</strong> WSS listens on <code>5062/ws</code>; when the B-leg is WS/WSS it automatically picks SRTP relay;
+        the cross-platform SDKs unify transceiver reuse, H.264 Baseline, Opus <code>maxplaybackrate=8000</code>,
+        and restart ICE once on failure. Details in <a href="{{.Root}}/handbook#sip">Docs · SIP and Media</a>.
+      </div>
+    </div>
+  </section>
+
+  <section class="section" style="padding-top: 0;">
+    <div class="container">
+      <div class="cta">
+        <div>
+          <h2>Back to basics, or jump right in</h2>
+          <p>Core SIP and SBC concepts are on the primer page; concrete configuration, modules and metrics live in the docs.</p>
+        </div>
+        <div class="cta__actions">
+          <a class="btn btn--outline" href="{{.Root}}/learn">SIP &amp; SBC Primer</a>
+          <a class="btn btn--ghost" href="{{.Root}}/handbook#sip">SIP &amp; Media Config</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+{{end}}
