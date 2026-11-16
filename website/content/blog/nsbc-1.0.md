@@ -8,7 +8,7 @@ tags: 版本发布
 tags_en: release
 ---
 
-0.5.6-beta 是 NSBC 当前的 beta 版本。它把 SBC、PBX 与 SIP 代理三类能力放在同一套 C 核心中，对外只需部署 `nsbcd` 与 `nsbc-web` 两个进程。
+0.5.6-beta 是 NSBC 当前的 beta 版本。它在一个 C 核心里同时实现了 SBC、PBX 和 SIP 代理三类能力，对外只需部署 `nsbcd` 与 `nsbc-web` 两个进程。
 
 ## 本版本包含
 
@@ -25,7 +25,7 @@ tags_en: release
 
 <!-- en -->
 
-0.5.6-beta is the current beta release of NSBC. It unifies SBC, PBX and SIP proxy capabilities into a single C core; only two processes — `nsbcd` and `nsbc-web` — need to be deployed externally.
+0.5.6-beta is the current beta release of NSBC. One C core implements SBC, PBX and SIP proxy capabilities; only two processes — `nsbcd` and `nsbc-web` — need to be deployed externally.
 
 ## What's in this release
 
