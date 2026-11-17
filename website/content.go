@@ -5,11 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	stdhtml "html"
 	"log"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -508,11 +506,10 @@ func parseDocument(path, kind, version, fallbackSlug string, mtime int64) (*Docu
 		enBody = strings.TrimSpace(body[idx+mlen:])
 	}
 
-	// 清洗：剥段落前导缩进（避免 goldmark 把整段渲染成 <pre><code>）+ 残留 HTML 标签
-	zhBody = sanitizeBody(zhBody)
-	if enBody != "" {
-		enBody = sanitizeBody(enBody)
-	}
+	// 注：sanitizeBody 已撤回。importblog.go 在抓取时已经做过
+	// HTML 标签剥离、实体还原、TOC/标题去重、BOM 清理。
+	// 运行时再做 dedent 会破坏原文有意的格式缩进（shell 命令、
+	// 代码块示例、层次化段落等），见 commit 3e25326 回退说明。
 
 	slug := strings.TrimSpace(fm["slug"])
 	if slug == "" {
@@ -661,98 +658,4 @@ func normalizeTags(raw string) string {
 		}
 	}
 	return strings.Join(out, ",")
-}
-
-var (
-	htmlATagRe  = regexp.MustCompile(`(?is)<a\s+href=["']([^"']+)["'][^>]*>(.*?)</a>`)
-	htmlTagRe   = regexp.MustCompile(`(?s)<[^>]+>`)
-	htmlCommentRe = regexp.MustCompile(`(?s)<!--.*?-->`)
-)
-
-// sanitizeBody 在渲染 Markdown 之前清洗正文：
-//  1. dedent：剥掉爬取过程中带入的整段均匀缩进，避免被 goldmark 渲染成 <pre><code>
-//  2. <a href="...">text</a> → [text](url)
-//  3. 其余 HTML 标签剥离（保留内部文本），注释一并移除
-//  4. 还原 HTML 实体（&nbsp; &amp; 等）
-//  5. 压缩多余空行
-func sanitizeBody(body string) string {
-	if strings.TrimSpace(body) == "" {
-		return body
-	}
-
-	// 1. 先把 HTML <a> 转成 markdown 链接，再剥其他标签
-	body = htmlATagRe.ReplaceAllStringFunc(body, func(m string) string {
-		sub := htmlATagRe.FindStringSubmatch(m)
-		if len(sub) < 3 {
-			return m
-		}
-		url := sub[1]
-		text := sub[2]
-		// 先剥掉 text 内部的嵌套标签
-		text = htmlTagRe.ReplaceAllString(text, "")
-		text = strings.TrimSpace(stdhtml.UnescapeString(text))
-		if text == "" {
-			text = url
-		}
-		return "[" + text + "](" + url + ")"
-	})
-
-	// 2. 剥注释、剥所有剩余 HTML 标签
-	body = htmlCommentRe.ReplaceAllString(body, "")
-	body = htmlTagRe.ReplaceAllString(body, "")
-
-	// 3. 还原 HTML 实体（&nbsp; &amp; &quot; &#39; 等）
-	body = stdhtml.UnescapeString(body)
-
-	// 4. dedent：剥掉爬取带入的段级缩进
-	body = dedent(body)
-
-	// 5. 压缩 3+ 连续空行 → 2 个，去掉首尾多余空行
-	reMultiBlank := regexp.MustCompile(`\n{3,}`)
-	body = reMultiBlank.ReplaceAllString(body, "\n\n")
-	body = strings.TrimSpace(body) + "\n"
-
-	return body
-}
-
-// dedent 剥掉爬取带入的垃圾缩进：
-//  非 fence 块内，前导空白（tab 算 8、空格算 1）累计 ≥8 视为垃圾缩进，全部剥掉；
-//  fence 代码块内的行完全保留。
-// 真正常见的 markdown 列表/引用缩进（2–3 空格、1 个 tab）不会被误杀。
-func dedent(body string) string {
-	lines := strings.Split(body, "\n")
-	inFence := false
-	var out []string
-	for _, l := range lines {
-		trimmed := strings.TrimSpace(l)
-		if trimmed == "" {
-			out = append(out, l)
-			continue
-		}
-		if strings.HasPrefix(trimmed, "```") {
-			inFence = !inFence
-			out = append(out, l)
-			continue
-		}
-		if inFence {
-			out = append(out, l)
-			continue
-		}
-		// 非 fence 行：计算前导空白（tab 算 8），累计 ≥8 就全剥
-		visualLeading := 0
-		for _, c := range l {
-			if c == ' ' {
-				visualLeading++
-			} else if c == '\t' {
-				visualLeading += 8
-			} else {
-				break
-			}
-		}
-		if visualLeading >= 8 {
-			l = strings.TrimLeft(l, " \t")
-		}
-		out = append(out, l)
-	}
-	return strings.Join(out, "\n")
 }
