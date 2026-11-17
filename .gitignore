@@ -29,3 +29,15 @@ SIP方法实现完整性审计.md
 /tls/
 /logs/
 /scripts/
+website/SKILL.md
+client/threeway_test/__pycache__/nsbc_harness.cpython-312.pyc
+client/threeway_test/__pycache__/test_mutual_calls.cpython-312.pyc
+article-01-why-rewrite.md
+docs/nsbc-control-api.md
+nsbc-web-db-write-optimization.md
+article-05-security-checklist.md
+article-03-quickstart-10min.md
+article-02-sip-stack-anatomy.md
+article-04-c11-rust-architecture.md
+cookbook-blow-hard-analysis.md
+/.trae-html-share-packages
