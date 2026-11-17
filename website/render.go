@@ -23,6 +23,11 @@ type PageData struct {
 	Lang        string // "zh" 或 "en"
 	Root        string // "" 或 "/en"，用于模板中拼接 href
 	Year        int
+
+	// docs 版本化相关
+	Version  string   // 当前 docs 版本，如 "v0.5"；非 docs 页面为空
+	Versions []string // 所有可用 docs 版本（升序），用于侧边栏切换器
+	IsLatest bool     // 当前版本是否为最新版本
 }
 
 type Renderer struct {

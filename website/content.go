@@ -5,9 +5,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	stdhtml "html"
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,6 +26,7 @@ import (
 // 英文未提供时（字段为空、或正文无 <!-- en --> 分隔符）回退到中文。
 type Document struct {
 	Kind         string
+	Version      string // docs 才用，如 "v0.5"；blog/freeswitch/opensips 留空
 	Slug         string
 	Title        string // 中文标题
 	Summary      string // 中文摘要
@@ -67,6 +71,7 @@ func OpenStore(path string) (*Store, error) {
 	if _, err := db.Exec(`
 CREATE TABLE IF NOT EXISTS documents (
   kind        TEXT NOT NULL,
+  version     TEXT NOT NULL DEFAULT '',
   slug        TEXT NOT NULL,
   title       TEXT NOT NULL,
   summary     TEXT NOT NULL DEFAULT '',
@@ -79,93 +84,100 @@ CREATE TABLE IF NOT EXISTS documents (
   summary_en  TEXT NOT NULL DEFAULT '',
   html_en     TEXT NOT NULL DEFAULT '',
   tags_en     TEXT NOT NULL DEFAULT '',
-  PRIMARY KEY (kind, slug)
+  PRIMARY KEY (kind, version, slug)
 )`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("create schema: %w", err)
 	}
-	// 旧版本表迁移：补四个英文字段。
+	// 旧版本表迁移
 	for _, col := range []string{"title_en", "summary_en", "html_en", "tags_en"} {
 		db.Exec(fmt.Sprintf("ALTER TABLE documents ADD COLUMN %s TEXT NOT NULL DEFAULT ''", col))
 	}
+	// docs 版本化迁移：version 列
+	db.Exec(`ALTER TABLE documents ADD COLUMN version TEXT NOT NULL DEFAULT ''`)
+	// docs 有了 version 列后，如果还存在旧版 PRIMARY KEY(kind, slug) 会冲突 —
+	// SQLite 不支持修改主键，建个新表重导。
+	ensureVersionedPK(db)
 	return &Store{db: db}, nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
 
-// Sync 扫描 content/{docs,blog}，只重新解析 mtime 变化的文件，并删除已移除的文件。
+// ensureVersionedPK 把旧表 PRIMARY KEY(kind, slug) 替换成 (kind, version, slug)。
+// SQLite 不支持修改主键，所以用 CREATE TABLE AS 重建。
+func ensureVersionedPK(db *sql.DB) {
+	var pkCols int
+	db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('documents')
+		WHERE pk=1`).Scan(&pkCols)
+	if pkCols == 3 {
+		return // 已是 versioned PK
+	}
+	db.Exec(`
+CREATE TABLE IF NOT EXISTS documents_new (
+  kind        TEXT NOT NULL,
+  version     TEXT NOT NULL DEFAULT '',
+  slug        TEXT NOT NULL,
+  title       TEXT NOT NULL,
+  summary     TEXT NOT NULL DEFAULT '',
+  html        TEXT NOT NULL DEFAULT '',
+  date        TEXT NOT NULL DEFAULT '',
+  tags        TEXT NOT NULL DEFAULT '',
+  ord         INTEGER NOT NULL DEFAULT 0,
+  mtime       INTEGER NOT NULL DEFAULT 0,
+  title_en    TEXT NOT NULL DEFAULT '',
+  summary_en  TEXT NOT NULL DEFAULT '',
+  html_en     TEXT NOT NULL DEFAULT '',
+  tags_en     TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (kind, version, slug)
+)`)
+	db.Exec(`INSERT OR IGNORE INTO documents_new
+	SELECT kind, COALESCE(version, ''), slug, title, summary, html, date, tags, ord, mtime,
+	       title_en, summary_en, html_en, tags_en
+	FROM documents`)
+	db.Exec(`DROP TABLE IF EXISTS documents`)
+	db.Exec(`ALTER TABLE documents_new RENAME TO documents`)
+}
+
+// Sync 扫描 content/{docs,blog,freeswitch,opensips}，只重新解析 mtime 变化的文件，并删除已移除的文件。
+// docs 目录是特殊处理：递归扫描 content/docs/vX.X/*.md，version 从中间目录名提取。
+// 其他 kind（blog/freeswitch/opensips）是扁平目录，version 留空。
 func (s *Store) Sync(dir string) error {
 	s.syncMu.Lock()
 	defer s.syncMu.Unlock()
 	s.contentDir = dir
 
-	seen := make(map[string]bool)
+	seen := make(map[string]bool) // key: "kind|version|slug"
 	changed, removed := 0, 0
 
 	for _, kind := range []string{"docs", "blog", "freeswitch", "opensips"} {
 		root := filepath.Join(dir, kind)
-		entries, err := os.ReadDir(root)
-		if err != nil {
+		if err := s.syncKind(root, kind, seen, &changed); err != nil {
 			if os.IsNotExist(err) {
 				continue
 			}
-			return fmt.Errorf("read %s: %w", root, err)
-		}
-		for _, entry := range entries {
-			if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".md") {
-				continue
-			}
-			full := filepath.Join(root, entry.Name())
-			info, err := entry.Info()
-			if err != nil {
-				log.Printf("content: stat %s: %v", full, err)
-				continue
-			}
-			slug := strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name()))
-			seen[kind+"/"+slug] = true
-
-			var old int64
-			err = s.db.QueryRow(`SELECT mtime FROM documents WHERE kind=? AND slug=?`, kind, slug).Scan(&old)
-			if err == nil && old == info.ModTime().UnixNano() {
-				continue
-			}
-
-			doc, err := parseDocument(full, kind, slug, info.ModTime().UnixNano())
-			if err != nil {
-				log.Printf("content: %v", err)
-				continue
-			}
-			if _, err := s.db.Exec(`
-INSERT INTO documents (kind, slug, title, summary, html, date, tags, ord, mtime, title_en, summary_en, html_en, tags_en)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(kind, slug) DO UPDATE SET
-  title=excluded.title, summary=excluded.summary, html=excluded.html,
-  date=excluded.date, tags=excluded.tags, ord=excluded.ord, mtime=excluded.mtime,
-  title_en=excluded.title_en, summary_en=excluded.summary_en,
-  html_en=excluded.html_en, tags_en=excluded.tags_en`,
-				doc.Kind, doc.Slug, doc.Title, doc.Summary, doc.HTML, doc.Date, doc.Tags, doc.Order, doc.Mtime,
-				doc.TitleEn, doc.SummaryEn, doc.HTMLEn, doc.TagsEn); err != nil {
-				log.Printf("content: upsert %s: %v", full, err)
-				continue
-			}
-			changed++
+			log.Printf("content: sync %s: %v", kind, err)
 		}
 	}
 
-	rows, err := s.db.Query(`SELECT kind, slug FROM documents`)
+	// 删 stale
+	rows, err := s.db.Query(`SELECT kind, version, slug FROM documents`)
 	if err != nil {
 		return err
 	}
-	var stale [][2]string
+	var stale [][3]string
 	for rows.Next() {
-		var kind, slug string
-		if err := rows.Scan(&kind, &slug); err == nil && !seen[kind+"/"+slug] {
-			stale = append(stale, [2]string{kind, slug})
+		var k, v, slug string
+		if err := rows.Scan(&k, &v, &slug); err == nil {
+			key := k + "|" + v + "|" + slug
+			if !seen[key] {
+				stale = append(stale, [3]string{k, v, slug})
+			}
 		}
 	}
 	rows.Close()
 	for _, key := range stale {
-		if _, err := s.db.Exec(`DELETE FROM documents WHERE kind=? AND slug=?`, key[0], key[1]); err == nil {
+		if _, err := s.db.Exec(`DELETE FROM documents WHERE kind=? AND version=? AND slug=?`,
+			key[0], key[1], key[2]); err == nil {
 			removed++
 		}
 	}
@@ -173,6 +185,136 @@ ON CONFLICT(kind, slug) DO UPDATE SET
 	if changed > 0 || removed > 0 {
 		log.Printf("content synced: %d updated, %d removed", changed, removed)
 	}
+	return nil
+}
+
+// syncKind 递归扫描一个 kind 的目录。
+// kind="docs" 时，content/docs/v0.5/quickstart.md → version="v0.5", slug="quickstart"
+// kind="docs" 时，content/docs/quickstart.md（无版本子目录）→ version=""，保留旧结构兼容
+// 其他 kind 只扫直接子文件，version 永远是 ""
+func (s *Store) syncKind(root, kind string, seen map[string]bool, changed *int) error {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return err
+	}
+
+	if kind == "docs" {
+		// 先处理扁平文件（向后兼容旧结构）
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			name := e.Name()
+			if !strings.HasSuffix(strings.ToLower(name), ".md") {
+				continue
+			}
+			slug := strings.TrimSuffix(name, filepath.Ext(name))
+			if err := s.indexFile(root, kind, "", slug, seen, changed); err != nil {
+				log.Printf("content: %v", err)
+			}
+		}
+		// 再处理版本子目录
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			ver := e.Name()
+			// 版本目录要求匹配 vX.Y 模式（v0.5 / v1.0 / devel 等）
+			if !versionDirNameOK(ver) {
+				continue
+			}
+			subRoot := filepath.Join(root, ver)
+			subFiles, err := os.ReadDir(subRoot)
+			if err != nil {
+				continue
+			}
+			for _, f := range subFiles {
+				if f.IsDir() || !strings.HasSuffix(strings.ToLower(f.Name()), ".md") {
+					continue
+				}
+				slug := strings.TrimSuffix(f.Name(), filepath.Ext(f.Name()))
+				if err := s.indexFile(subRoot, kind, ver, slug, seen, changed); err != nil {
+					log.Printf("content: %v", err)
+				}
+			}
+		}
+		return nil
+	}
+
+	// blog / freeswitch / opensips — 扁平
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".md") {
+			continue
+		}
+		slug := strings.TrimSuffix(e.Name(), filepath.Ext(e.Name()))
+		if err := s.indexFile(root, kind, "", slug, seen, changed); err != nil {
+			log.Printf("content: %v", err)
+		}
+	}
+	return nil
+}
+
+// versionDirNameOK 接受的版本目录名：v0.5 / v1.0 / v1.11 / v2.4 / devel / latest 等
+func versionDirNameOK(name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	// 允许 v\d+(\.\d+)* 或 devel / latest
+	if strings.HasPrefix(strings.ToLower(name), "devel") {
+		return true
+	}
+	if strings.HasPrefix(strings.ToLower(name), "latest") {
+		return true
+	}
+	for _, prefix := range []string{"v", "V"} {
+		if strings.HasPrefix(name, prefix) {
+			rest := name[1:]
+			rest = strings.ReplaceAll(rest, ".", "")
+			if _, err := strconv.Atoi(rest); err == nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (s *Store) indexFile(dir, kind, version, slug string,
+	seen map[string]bool, changed *int) error {
+
+	full := filepath.Join(dir, slug+".md")
+	info, err := os.Stat(full)
+	if err != nil {
+		return err
+	}
+	seen[kind+"|"+version+"|"+slug] = true
+
+	var old int64
+	err = s.db.QueryRow(`SELECT mtime FROM documents WHERE kind=? AND version=? AND slug=?`,
+		kind, version, slug).Scan(&old)
+	if err == nil && old == info.ModTime().UnixNano() {
+		return nil
+	}
+
+	doc, err := parseDocument(full, kind, version, slug, info.ModTime().UnixNano())
+	if err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`
+INSERT INTO documents (kind, version, slug, title, summary, html, date, tags, ord, mtime,
+  title_en, summary_en, html_en, tags_en)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(kind, version, slug) DO UPDATE SET
+  title=excluded.title, summary=excluded.summary, html=excluded.html,
+  date=excluded.date, tags=excluded.tags, ord=excluded.ord, mtime=excluded.mtime,
+  title_en=excluded.title_en, summary_en=excluded.summary_en,
+  html_en=excluded.html_en, tags_en=excluded.tags_en`,
+		doc.Kind, doc.Version, doc.Slug,
+		doc.Title, doc.Summary, doc.HTML, doc.Date, doc.Tags, doc.Order, doc.Mtime,
+		doc.TitleEn, doc.SummaryEn, doc.HTMLEn, doc.TagsEn); err != nil {
+		return fmt.Errorf("upsert %s: %w", full, err)
+	}
+	*changed++
 	return nil
 }
 
@@ -198,9 +340,9 @@ func (s *Store) Watch(dir string, interval time.Duration) func() {
 	}
 }
 
-func (s *Store) ListDocs() ([]Document, error) {
-	return s.list(`SELECT kind, slug, title, summary, html, date, tags, ord, title_en, summary_en, html_en, tags_en FROM documents
-		WHERE kind='docs' ORDER BY ord ASC, title ASC`)
+func (s *Store) ListDocs(version string) ([]Document, error) {
+	return s.listVersioned(`SELECT kind, version, slug, title, summary, html, date, tags, ord, title_en, summary_en, html_en, tags_en FROM documents
+		WHERE kind='docs' AND version=? ORDER BY ord ASC, title ASC`, version)
 }
 
 func (s *Store) ListBlog() ([]Document, error) {
@@ -219,6 +361,7 @@ func (s *Store) ListOpenSIPS() ([]Document, error) {
 		WHERE kind='opensips' ORDER BY date DESC, title ASC`)
 }
 
+// list 不含 version 列的查询（blog/freeswitch/opensips 用）。
 func (s *Store) list(query string) ([]Document, error) {
 	rows, err := s.db.Query(query)
 	if err != nil {
@@ -237,11 +380,30 @@ func (s *Store) list(query string) ([]Document, error) {
 	return docs, rows.Err()
 }
 
-func (s *Store) Get(kind, slug string) (*Document, error) {
+// listVersioned 含 version 列的查询（docs 用）。
+func (s *Store) listVersioned(query string, args ...any) ([]Document, error) {
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var docs []Document
+	for rows.Next() {
+		var d Document
+		if err := rows.Scan(&d.Kind, &d.Version, &d.Slug, &d.Title, &d.Summary, &d.HTML, &d.Date, &d.Tags, &d.Order,
+			&d.TitleEn, &d.SummaryEn, &d.HTMLEn, &d.TagsEn); err != nil {
+			return nil, err
+		}
+		docs = append(docs, d)
+	}
+	return docs, rows.Err()
+}
+
+func (s *Store) Get(kind, version, slug string) (*Document, error) {
 	var d Document
-	err := s.db.QueryRow(`SELECT kind, slug, title, summary, html, date, tags, ord, title_en, summary_en, html_en, tags_en
-		FROM documents WHERE kind=? AND slug=?`, kind, slug).
-		Scan(&d.Kind, &d.Slug, &d.Title, &d.Summary, &d.HTML, &d.Date, &d.Tags, &d.Order,
+	err := s.db.QueryRow(`SELECT kind, version, slug, title, summary, html, date, tags, ord, title_en, summary_en, html_en, tags_en
+		FROM documents WHERE kind=? AND version=? AND slug=?`, kind, version, slug).
+		Scan(&d.Kind, &d.Version, &d.Slug, &d.Title, &d.Summary, &d.HTML, &d.Date, &d.Tags, &d.Order,
 			&d.TitleEn, &d.SummaryEn, &d.HTMLEn, &d.TagsEn)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -252,7 +414,86 @@ func (s *Store) Get(kind, slug string) (*Document, error) {
 	return &d, nil
 }
 
-func parseDocument(path, kind, fallbackSlug string, mtime int64) (*Document, error) {
+// ListVersions 返回所有非空、非 flat-document 的 docs 版本号，按版本号倒序（最新在前）。
+func (s *Store) ListVersions() ([]string, error) {
+	rows, err := s.db.Query(`SELECT DISTINCT version FROM documents WHERE kind='docs' AND version != ''`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var vers []string
+	for rows.Next() {
+		var v string
+		if err := rows.Scan(&v); err == nil {
+			vers = append(vers, v)
+		}
+	}
+	return sortVersions(vers), rows.Err()
+}
+
+// LatestVersion 返回当前最新的 docs 版本；没文档时返回默认 "v0.5"。
+func (s *Store) LatestVersion() (string, error) {
+	vers, err := s.ListVersions()
+	if err != nil {
+		return "v0.5", err
+	}
+	if len(vers) == 0 {
+		return "v0.5", nil
+	}
+	return vers[len(vers)-1], nil // sortVersions 结果最新在末尾
+}
+
+// sortVersions 把版本号（v0.5 / v1.11 / devel 等）按语义版本升序排列。
+// devel / latest 永远放末尾。
+func sortVersions(vers []string) []string {
+	isSpecial := func(v string) bool {
+		v = strings.ToLower(v)
+		return strings.HasPrefix(v, "devel") || strings.HasPrefix(v, "latest")
+	}
+	sort.SliceStable(vers, func(i, j int) bool {
+		vi, vj := vers[i], vers[j]
+		if isSpecial(vi) && !isSpecial(vj) {
+			return false // special 放后面
+		}
+		if !isSpecial(vi) && isSpecial(vj) {
+			return true
+		}
+		// 两个都是普通版本号：按数值比较
+		return compareSemver(vi, vj) < 0
+	})
+	return vers
+}
+
+func compareSemver(a, b string) int {
+	a = strings.TrimPrefix(a, "v")
+	a = strings.TrimPrefix(a, "V")
+	b = strings.TrimPrefix(b, "v")
+	b = strings.TrimPrefix(b, "V")
+	ap := strings.Split(a, ".")
+	bp := strings.Split(b, ".")
+	max := len(ap)
+	if len(bp) > max {
+		max = len(bp)
+	}
+	for i := 0; i < max; i++ {
+		var ai, bi int
+		if i < len(ap) {
+			ai, _ = strconv.Atoi(ap[i])
+		}
+		if i < len(bp) {
+			bi, _ = strconv.Atoi(bp[i])
+		}
+		if ai != bi {
+			if ai < bi {
+				return -1
+			}
+			return 1
+		}
+	}
+	return 0
+}
+
+func parseDocument(path, kind, version, fallbackSlug string, mtime int64) (*Document, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", path, err)
@@ -265,6 +506,12 @@ func parseDocument(path, kind, fallbackSlug string, mtime int64) (*Document, err
 	if idx, mlen := findSeparator(body); idx >= 0 {
 		zhBody = strings.TrimSpace(body[:idx])
 		enBody = strings.TrimSpace(body[idx+mlen:])
+	}
+
+	// 清洗：剥段落前导缩进（避免 goldmark 把整段渲染成 <pre><code>）+ 残留 HTML 标签
+	zhBody = sanitizeBody(zhBody)
+	if enBody != "" {
+		enBody = sanitizeBody(enBody)
 	}
 
 	slug := strings.TrimSpace(fm["slug"])
@@ -315,6 +562,7 @@ func parseDocument(path, kind, fallbackSlug string, mtime int64) (*Document, err
 
 	doc := &Document{
 		Kind:       kind,
+		Version:    version,
 		Slug:       slug,
 		Title:      title,
 		Summary:    summary,
@@ -413,4 +661,98 @@ func normalizeTags(raw string) string {
 		}
 	}
 	return strings.Join(out, ",")
+}
+
+var (
+	htmlATagRe  = regexp.MustCompile(`(?is)<a\s+href=["']([^"']+)["'][^>]*>(.*?)</a>`)
+	htmlTagRe   = regexp.MustCompile(`(?s)<[^>]+>`)
+	htmlCommentRe = regexp.MustCompile(`(?s)<!--.*?-->`)
+)
+
+// sanitizeBody 在渲染 Markdown 之前清洗正文：
+//  1. dedent：剥掉爬取过程中带入的整段均匀缩进，避免被 goldmark 渲染成 <pre><code>
+//  2. <a href="...">text</a> → [text](url)
+//  3. 其余 HTML 标签剥离（保留内部文本），注释一并移除
+//  4. 还原 HTML 实体（&nbsp; &amp; 等）
+//  5. 压缩多余空行
+func sanitizeBody(body string) string {
+	if strings.TrimSpace(body) == "" {
+		return body
+	}
+
+	// 1. 先把 HTML <a> 转成 markdown 链接，再剥其他标签
+	body = htmlATagRe.ReplaceAllStringFunc(body, func(m string) string {
+		sub := htmlATagRe.FindStringSubmatch(m)
+		if len(sub) < 3 {
+			return m
+		}
+		url := sub[1]
+		text := sub[2]
+		// 先剥掉 text 内部的嵌套标签
+		text = htmlTagRe.ReplaceAllString(text, "")
+		text = strings.TrimSpace(stdhtml.UnescapeString(text))
+		if text == "" {
+			text = url
+		}
+		return "[" + text + "](" + url + ")"
+	})
+
+	// 2. 剥注释、剥所有剩余 HTML 标签
+	body = htmlCommentRe.ReplaceAllString(body, "")
+	body = htmlTagRe.ReplaceAllString(body, "")
+
+	// 3. 还原 HTML 实体（&nbsp; &amp; &quot; &#39; 等）
+	body = stdhtml.UnescapeString(body)
+
+	// 4. dedent：剥掉爬取带入的段级缩进
+	body = dedent(body)
+
+	// 5. 压缩 3+ 连续空行 → 2 个，去掉首尾多余空行
+	reMultiBlank := regexp.MustCompile(`\n{3,}`)
+	body = reMultiBlank.ReplaceAllString(body, "\n\n")
+	body = strings.TrimSpace(body) + "\n"
+
+	return body
+}
+
+// dedent 剥掉爬取带入的垃圾缩进：
+//  非 fence 块内，前导空白（tab 算 8、空格算 1）累计 ≥8 视为垃圾缩进，全部剥掉；
+//  fence 代码块内的行完全保留。
+// 真正常见的 markdown 列表/引用缩进（2–3 空格、1 个 tab）不会被误杀。
+func dedent(body string) string {
+	lines := strings.Split(body, "\n")
+	inFence := false
+	var out []string
+	for _, l := range lines {
+		trimmed := strings.TrimSpace(l)
+		if trimmed == "" {
+			out = append(out, l)
+			continue
+		}
+		if strings.HasPrefix(trimmed, "```") {
+			inFence = !inFence
+			out = append(out, l)
+			continue
+		}
+		if inFence {
+			out = append(out, l)
+			continue
+		}
+		// 非 fence 行：计算前导空白（tab 算 8），累计 ≥8 就全剥
+		visualLeading := 0
+		for _, c := range l {
+			if c == ' ' {
+				visualLeading++
+			} else if c == '\t' {
+				visualLeading += 8
+			} else {
+				break
+			}
+		}
+		if visualLeading >= 8 {
+			l = strings.TrimLeft(l, " \t")
+		}
+		out = append(out, l)
+	}
+	return strings.Join(out, "\n")
 }

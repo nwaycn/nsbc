@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"flag"
+	"fmt"
 	"html/template"
 	"log"
 	"mime"
@@ -75,11 +76,22 @@ func main() {
 
 	// 中文路由（无前缀）
 	s.registerPages(mux, "zh")
-	mux.HandleFunc("GET /docs", func(w http.ResponseWriter, r *http.Request) { s.handleDocs(w, r, "zh") })
+	// docs 版本化路由
+	mux.HandleFunc("GET /docs", func(w http.ResponseWriter, r *http.Request) {
+		s.latestDocsRedirect(w, r, "zh")
+	})
 	mux.HandleFunc("GET /docs/{$}", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/docs", http.StatusMovedPermanently)
 	})
-	mux.HandleFunc("GET /docs/{slug}", func(w http.ResponseWriter, r *http.Request) { s.handleDoc(w, r, "zh") })
+	mux.HandleFunc("GET /docs/{version}", func(w http.ResponseWriter, r *http.Request) {
+		s.handleDocs(w, r, "zh")
+	})
+	mux.HandleFunc("GET /docs/{version}/{$}", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/docs/"+r.PathValue("version"), http.StatusMovedPermanently)
+	})
+	mux.HandleFunc("GET /docs/{version}/{slug}", func(w http.ResponseWriter, r *http.Request) {
+		s.handleDoc(w, r, "zh")
+	})
 	mux.HandleFunc("GET /blog", func(w http.ResponseWriter, r *http.Request) { s.handleBlog(w, r, "zh") })
 	mux.HandleFunc("GET /blog/{$}", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/blog", http.StatusMovedPermanently)
@@ -99,11 +111,21 @@ func main() {
 	// 英文路由（/en/ 前缀，剥掉前缀后复用同一套 handler，Lang 设为 en）
 	enMux := http.NewServeMux()
 	s.registerPages(enMux, "en")
-	enMux.HandleFunc("GET /docs", func(w http.ResponseWriter, r *http.Request) { s.handleDocs(w, r, "en") })
+	enMux.HandleFunc("GET /docs", func(w http.ResponseWriter, r *http.Request) {
+		s.latestDocsRedirect(w, r, "en")
+	})
 	enMux.HandleFunc("GET /docs/{$}", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/en/docs", http.StatusMovedPermanently)
 	})
-	enMux.HandleFunc("GET /docs/{slug}", func(w http.ResponseWriter, r *http.Request) { s.handleDoc(w, r, "en") })
+	enMux.HandleFunc("GET /docs/{version}", func(w http.ResponseWriter, r *http.Request) {
+		s.handleDocs(w, r, "en")
+	})
+	enMux.HandleFunc("GET /docs/{version}/{$}", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/en/docs/"+r.PathValue("version"), http.StatusMovedPermanently)
+	})
+	enMux.HandleFunc("GET /docs/{version}/{slug}", func(w http.ResponseWriter, r *http.Request) {
+		s.handleDoc(w, r, "en")
+	})
 	enMux.HandleFunc("GET /blog", func(w http.ResponseWriter, r *http.Request) { s.handleBlog(w, r, "en") })
 	enMux.HandleFunc("GET /blog/{$}", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/en/blog", http.StatusMovedPermanently)
@@ -262,22 +284,52 @@ func (s *Server) registerPages(mux *http.ServeMux, lang string) {
 	}
 }
 
-func (s *Server) handleDocs(w http.ResponseWriter, r *http.Request, lang string) {
-	docs, err := s.store.ListDocs()
+func (s *Server) latestDocsRedirect(w http.ResponseWriter, r *http.Request, lang string) {
+	latest, err := s.store.LatestVersion()
 	if err != nil {
-		log.Printf("list docs: %v", err)
+		latest = "v0.5"
+	}
+	prefix := ""
+	if lang == "en" {
+		prefix = "/en"
+	}
+	http.Redirect(w, r, prefix+"/docs/"+latest, http.StatusMovedPermanently)
+}
+
+func (s *Server) handleDocs(w http.ResponseWriter, r *http.Request, lang string) {
+	version := r.PathValue("version")
+	docs, err := s.store.ListDocs(version)
+	if err != nil {
+		log.Printf("list docs %s: %v", version, err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	// 为英文页面选择英文字段（无英文时回退到中文）。
+	// 404: 版本不存在且也没有 flat legacy 文档
+	if len(docs) == 0 {
+		// 查一下这个版本是否压根不存在
+		vers, _ := s.store.ListVersions()
+		found := false
+		for _, v := range vers {
+			if v == version {
+				found = true
+				break
+			}
+		}
+		if !found {
+			s.notFound(w, r, lang)
+			return
+		}
+	}
 	for i := range docs {
 		docs[i] = localizeDoc(docs[i], lang)
 	}
-	title := "文档中心 — NSBC"
-	desc := "NSBC 配置、SIP 与媒体、WebRTC 互通与排障文档。"
+	allVers, _ := s.store.ListVersions()
+	latest, _ := s.store.LatestVersion()
+	title := fmt.Sprintf("文档中心 — NSBC %s", version)
+	desc := fmt.Sprintf("NSBC %s 配置、SIP 与媒体、WebRTC 互通与排障文档。", version)
 	if lang == "en" {
-		title = "Documentation — NSBC"
-		desc = "NSBC configuration, SIP & media, WebRTC interoperability and troubleshooting docs."
+		title = fmt.Sprintf("Documentation — NSBC %s", version)
+		desc = fmt.Sprintf("NSBC %s configuration, SIP & media, WebRTC interoperability and troubleshooting docs.", version)
 	}
 	s.render(w, r, PageData{
 		Title:       title,
@@ -286,30 +338,36 @@ func (s *Server) handleDocs(w http.ResponseWriter, r *http.Request, lang string)
 		Content:     "page_docs",
 		Docs:        docs,
 		Lang:        lang,
+		Version:     version,
+		Versions:    allVers,
+		IsLatest:    version == latest,
 	})
 }
 
 func (s *Server) handleDoc(w http.ResponseWriter, r *http.Request, lang string) {
+	version := r.PathValue("version")
 	slug := r.PathValue("slug")
-	doc, err := s.store.Get("docs", slug)
+	doc, err := s.store.Get("docs", version, slug)
 	if err == ErrNotFound {
 		s.notFound(w, r, lang)
 		return
 	}
 	if err != nil {
-		log.Printf("get doc %s: %v", slug, err)
+		log.Printf("get doc %s/%s: %v", version, slug, err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	docs, err := s.store.ListDocs()
+	docs, err := s.store.ListDocs(version)
 	if err != nil {
-		log.Printf("list docs: %v", err)
+		log.Printf("list docs %s: %v", version, err)
 	}
 	for i := range docs {
 		docs[i] = localizeDoc(docs[i], lang)
 	}
 	localized := localizeDoc(*doc, lang)
 	doc = &localized
+	allVers, _ := s.store.ListVersions()
+	latest, _ := s.store.LatestVersion()
 	s.render(w, r, PageData{
 		Title:       doc.Title + " — NSBC",
 		Description: doc.Summary,
@@ -319,6 +377,9 @@ func (s *Server) handleDoc(w http.ResponseWriter, r *http.Request, lang string) 
 		Doc:         doc,
 		Markdown:    template.HTML(doc.HTML),
 		Lang:        lang,
+		Version:     version,
+		Versions:    allVers,
+		IsLatest:    version == latest,
 	})
 }
 
@@ -380,7 +441,7 @@ func (s *Server) handleOpenSIPSPost(w http.ResponseWriter, r *http.Request, lang
 
 // handleDetail 通用详情 handler。
 func (s *Server) handleDetail(w http.ResponseWriter, r *http.Request, kind, active, lang string) {
-	post, err := s.store.Get(kind, r.PathValue("slug"))
+	post, err := s.store.Get(kind, "", r.PathValue("slug"))
 	if err == ErrNotFound {
 		s.notFound(w, r, lang)
 		return

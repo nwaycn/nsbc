@@ -1,8 +1,8 @@
 {{define "page_docs"}}
 <section class="page-head">
   <div class="container">
-    <div class="breadcrumb"><a href="{{.Root}}/">{{lang . "Home" "首页"}}</a> / {{lang . "Docs" "文档"}}</div>
-    <h1>{{lang . "Documentation" "文档中心"}}</h1>
+    <div class="breadcrumb"><a href="{{.Root}}/">{{lang . "Home" "首页"}}</a> / <a href="{{.Root}}/docs">{{lang . "Docs" "文档"}}</a> / {{.Version}}</div>
+    <h1>{{lang . "Documentation" "文档中心"}} <span style="font-size:0.6em; font-weight:400; color:#888;">{{.Version}}</span></h1>
     <p>{{lang . "Configuration and troubleshooting docs organized by topic. New content appears here instantly — no rebuild needed." "按主题组织的配置与排障文档。新增内容会即时出现在这里，无需重新构建站点。"}}</p>
   </div>
 </section>
@@ -10,6 +10,18 @@
 <main>
   <section class="section">
     <div class="container">
+      {{if .Versions}}
+      <div class="version-switch" style="margin-bottom:20px;">
+        <label style="margin-right:8px; color:#888; font-size:14px;">{{lang . "Version:" "版本："}}</label>
+        <select onchange="location.href='{{.Root}}/docs/'+this.value" style="padding:6px 10px; border:1px solid #ddd; border-radius:6px; font-size:14px;">
+          {{range .Versions}}
+          <option value="{{.}}"{{if eq . $.Version}} selected{{end}}>{{.}}</option>
+          {{end}}
+        </select>
+        {{if not .IsLatest}}<span style="margin-left:10px; font-size:12px; color:#e67e22;">{{lang . "⚠ not the latest version" "⚠ 非最新版本"}}</span>{{end}}
+      </div>
+      {{end}}
+
       <div class="grid grid--2">
         <article class="card">
           <span class="tag">{{lang . "Handbook" "手册"}}</span>
@@ -21,15 +33,15 @@
         {{range .Docs}}
         <article class="card">
           <span class="tag">{{lang $ "Doc" "文档"}}</span>
-          <h2 style="margin-top:10px;"><a href="{{$.Root}}/docs/{{.Slug}}">{{.Title}}</a></h2>
+          <h2 style="margin-top:10px;"><a href="{{$.Root}}/docs/{{$.Version}}/{{.Slug}}">{{.Title}}</a></h2>
           <p>{{.Summary}}</p>
-          <a class="more" href="{{$.Root}}/docs/{{.Slug}}">{{lang $ "Read →" "阅读 →"}}</a>
+          <a class="more" href="{{$.Root}}/docs/{{$.Version}}/{{.Slug}}">{{lang $ "Read →" "阅读 →"}}</a>
         </article>
         {{end}}
       </div>
 
       {{if not .Docs}}
-      <p class="footnote">{{lang . "No dynamic docs yet. Drop a Markdown file under <code>content/docs/</code>." "还没有动态文档。在 <code>content/docs/</code> 下新建 Markdown 文件即可。"}}</p>
+      <p class="footnote">{{lang . "No docs for version " "版本 "}}{{.Version}}{{lang . " yet." " 暂无文档。"}}</p>
       {{end}}
     </div>
   </section>
@@ -39,8 +51,8 @@
 {{define "page_doc"}}
 <section class="page-head">
   <div class="container">
-    <div class="breadcrumb"><a href="{{.Root}}/">{{lang . "Home" "首页"}}</a> / <a href="{{.Root}}/docs">{{lang . "Docs" "文档"}}</a> / {{.Doc.Title}}</div>
-    <h1>{{.Doc.Title}}</h1>
+    <div class="breadcrumb"><a href="{{.Root}}/">{{lang . "Home" "首页"}}</a> / <a href="{{.Root}}/docs">{{lang . "Docs" "文档"}}</a> / <a href="{{.Root}}/docs/{{.Version}}">{{.Version}}</a> / {{.Doc.Title}}</div>
+    <h1>{{.Doc.Title}} <span style="font-size:0.55em; font-weight:400; color:#888; margin-left:8px;">{{.Version}}</span></h1>
     {{if .Doc.Summary}}<p>{{.Doc.Summary}}</p>{{end}}
   </div>
 </section>
@@ -49,9 +61,19 @@
   <section class="section">
     <div class="container doc-layout">
       <aside class="side-nav">
+        {{if .Versions}}
+        <div style="margin-bottom:16px; padding-bottom:12px; border-bottom:1px solid #eee;">
+          <label style="display:block; font-size:12px; color:#888; margin-bottom:4px;">{{lang . "Version" "版本"}}</label>
+          <select onchange="location.href='{{.Root}}/docs/'+this.value" style="width:100%; padding:6px 8px; border:1px solid #ddd; border-radius:4px; font-size:13px;">
+            {{range .Versions}}
+            <option value="{{.}}"{{if eq . $.Version}} selected{{end}}>{{.}}</option>
+            {{end}}
+          </select>
+        </div>
+        {{end}}
         <a href="{{.Root}}/handbook">{{lang . "Configuration handbook" "完整配置手册"}}</a>
         {{range .Docs}}
-        <a href="{{$.Root}}/docs/{{.Slug}}"{{if eq .Slug $.Doc.Slug}} class="is-active"{{end}}>{{.Title}}</a>
+        <a href="{{$.Root}}/docs/{{$.Version}}/{{.Slug}}"{{if eq .Slug $.Doc.Slug}} class="is-active"{{end}}>{{.Title}}</a>
         {{end}}
       </aside>
       <article class="doc-body prose">{{.Markdown}}</article>
