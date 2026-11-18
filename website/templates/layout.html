@@ -118,4 +118,20 @@
     </div>
   </div>
 </footer>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js" defer></script>
+<script>
+  document.addEventListener('DOMContentLoaded', function() {
+    if (typeof mermaid !== 'undefined') {
+      mermaid.initialize({ startOnLoad: false, securityLevel: 'loose', theme: 'base' });
+      document.querySelectorAll('pre code.language-mermaid, pre code.language-graph').forEach(function(el) {
+        var pre = el.parentElement;
+        var div = document.createElement('div');
+        div.className = 'mermaid';
+        div.textContent = el.textContent;
+        pre.replaceWith(div);
+      });
+      mermaid.run({ querySelector: '.mermaid' });
+    }
+  });
+</script>
 {{end}}
