@@ -147,7 +147,7 @@ func (s *Store) Sync(dir string) error {
 	seen := make(map[string]bool) // key: "kind|version|slug"
 	changed, removed := 0, 0
 
-	for _, kind := range []string{"docs", "blog", "freeswitch", "opensips"} {
+	for _, kind := range []string{"docs", "blog", "freeswitch", "opensips", "nip"} {
 		root := filepath.Join(dir, kind)
 		if err := s.syncKind(root, kind, seen, &changed); err != nil {
 			if os.IsNotExist(err) {
@@ -357,6 +357,11 @@ func (s *Store) ListFreeswitch() ([]Document, error) {
 func (s *Store) ListOpenSIPS() ([]Document, error) {
 	return s.list(`SELECT kind, slug, title, summary, html, date, tags, ord, title_en, summary_en, html_en, tags_en FROM documents
 		WHERE kind='opensips' ORDER BY date DESC, title ASC`)
+}
+
+func (s *Store) ListNIP() ([]Document, error) {
+	return s.list(`SELECT kind, slug, title, summary, html, date, tags, ord, title_en, summary_en, html_en, tags_en FROM documents
+		WHERE kind='nip' ORDER BY ord ASC, date DESC`)
 }
 
 // list 不含 version 列的查询（blog/freeswitch/opensips 用）。
