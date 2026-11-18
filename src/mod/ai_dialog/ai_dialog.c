@@ -1,4 +1,4 @@
-﻿/* REQ-AI-001：AI 对话模块（可选加载，DYNAMIC 组）
+/* AI dialog module (optional, MOD_F_DYNAMIC)
  *
  * 纯媒体桥接层（passthrough）：
  *   [1] 媒体抓流    —— bridge_add_rec_feed_hook 挂 B 腿原始 PCMU/G.711 帧
@@ -23,12 +23,15 @@
 #include "cfg.h"
 #include "log.h"
 #include "media_bridge.h"
-#include "media_codec.h"   /* 统一 codec 层：transcode_open/process 跨 codec 转码（PCMA/PCMU/G729/G722/...） */
+#include "media_codec.h"   /* codec layer: transcode_open/process cross-codec transcode (PCMA/PCMU/G729/G722/...) */
+#include "g711.h"          /* AI internal format: PCMU/PCMA <-> PCM16 LE 8kHz */
 #include "b2bua.h"        /* P0-1: b2b_call_destroy_add + REQ-AI-TRANSFER-001: b2b_transfer_call */
 #include "callctrl.h"     /* REQ-AI-TRANSFER-001: CCF_XFER_BLIND */
 #include "dp_sleep.h"     /* P0-2: dp_sleep_app_reg() */
 #include "app_registry.h" /* P0-2: app_register / app_desc_t */
 #include "app_ctx.h"      /* struct nsbc_ctx 完整定义（ctx->cfg）*/
+#include "vad_engine.h"   /* REQ-AI-VAD-001: vad_start_for_call / vad_stop_for_call + HPF API */
+#include "obs.h"          /* obs_event for AI_SESSION_OPENED/CLOSED via SSE */
 
 #include "ai_backend_registry.h"
 
@@ -55,14 +58,14 @@ typedef struct ai_cfg {
 /* per-call 会话                                                       */
 /* ================================================================== */
 
-#define AI_RING_CAP (256 * 1024)   /* 256KB 足够 ~32s @ 8kHz PCMU */
+#define AI_RING_CAP (512 * 1024)   /* 512KB ~16s @ 8kHz PCM16 LE (AI unified format) */
 
 typedef struct ai_session {
     void     *call_key;
     int       b_leg;
     int       pt_in;                /* 抓进来的 PT（通常 0=PCMU） */
-    /* ★ 统一 codec 层：内部统一 PCMU（ASR/TTS 基准）。in_codec 由首帧 RX 动态确定
-     * （默认 CODEC_PCMU）；rx_tc/tx_tc 是跨 codec 转码会话，codec 变化时重建。 */
+    /* codec layer: internal baseline is PCMU. in_codec resolved from first RX frame
+     * （默认 CODEC_PCMU）；rx_tc/tx_tc 是cross-codec transcode sessions, rebuilt on codec change. */
     codec_id_t     in_codec;        /* 主叫实际 codec（CODEC_PCMA/G729/...）*/
     transcode_sess_t *rx_tc;        /* in_codec → PCMU（收流转码）*/
     transcode_sess_t *tx_tc;        /* PCMU → in_codec（发流转码，format=0 用）*/
@@ -79,7 +82,11 @@ typedef struct ai_session {
     time_t    opened_at;
     int       producer;  /* 外部 producer 模式（第三方 AI 直接喂 tx_audio / 拉 rx_audio）*/
 
-    /* REQ-AI-TRANSFER-001：外部请求 AI 转人工座席（blind transfer）。
+    /* per-leg HPF — same butterworth filter as vad_engine, strips DC + 50Hz mains hum
+     * ring buffer previously had no HPF, so ASR fed slightly different audio than VAD detected */
+    vad_hpf_t hpf[2];       /* leg 0 + leg 1 独立 HPF 状态 */
+
+    /* external request to transfer AI session to human agent (blind transfer)
      * 设 transfer_dest + transfer_pending=1 → ai_session_thread 下次循环调
      * b2b_transfer_call 发 REFER + 设置 running=0 让线程退出。 */
     char      transfer_dest[256];
@@ -126,16 +133,36 @@ static ai_session_t *ai_session_find_or_create(ai_store_t *st, void *call_key,
         s->ts = 0;
         s->opened_at = time(NULL);
         pthread_mutex_init(&s->lock, NULL);
+
+        /* per-leg HPF init, 50Hz cutoff / 8kHz mono — same coefficients as vad_engine*/
+        vad_hpf_init(&s->hpf[0], 50.0f, 8000.0f);
+        vad_hpf_init(&s->hpf[1], 50.0f, 8000.0f);
+
         st->head = s;
-        llog(LOG_INFO, "ai", "session opened call=%p pt=%d via=%s",
+        llog(LOG_INFO, "ai", "session opened call=%p pt=%d via=%s HPF init",
              call_key, pt_in, src);
+
+        /* emit AI_SESSION_OPENED via obs_event into SSE event bus
+         * Go agent only takes over after this + CALL_ANSWERED dual-event gate
+         * 防止普通通话（拨号规则没命中 ai）的 goroutine 空转浪费。
+         * level=6 (INFO) 与 CALL_ANSWERED 同级，domain_action=唯一字符串。
+         * 同时带 call_id（SIP Call-ID，Go 侧 SSE 字段用这个关联 CALL_ANSWERED）
+         * 和 call_key（b2b_call_t* 指针，C 内部追踪用）。 */
+        {
+            b2b_call_t *b2b = (b2b_call_t *)call_key;
+            const char *cid = (b2b && b2b->leg[0].callid[0])
+                              ? b2b->leg[0].callid : "unknown";
+            obs_event(6, "AI_SESSION_OPENED",
+                "call_id=%s call_key=%p pt_in=%d in_codec=%d",
+                cid, call_key, pt_in, s->in_codec);
+        }
         s->running = 1;
         int prc = pthread_create(&s->th, NULL, ai_session_thread_stub, s);
         if (prc != 0) {
             llog(LOG_ERR, "ai", "session opened but pthread_create failed rc=%d (EAGAIN=%d)! thread NOT started", prc, 11);
             s->running = 0;
         } else {
-            llog(LOG_INFO, "ai", "★pthread_create OK thread started call=%p tid=%lu", call_key, (unsigned long)s->th);
+            llog(LOG_INFO, "ai", "pthread_create OK thread started call=%p tid=%lu", call_key, (unsigned long)s->th);
         }
     } else {
         /* 复用旧 session —— 如果 thread 已退出（running=0 或 th=0），重新启动 */
@@ -151,7 +178,7 @@ static ai_session_t *ai_session_find_or_create(ai_store_t *st, void *call_key,
                 llog(LOG_ERR, "ai", "reuse session pthread_create failed rc=%d (EAGAIN=%d)! running=0", prc, 11);
                 s->running = 0;
             } else {
-                llog(LOG_INFO, "ai", "★reuse pthread_create OK call=%p tid=%lu", call_key, (unsigned long)s->th);
+                llog(LOG_INFO, "ai", "reuse pthread_create OK call=%p tid=%lu", call_key, (unsigned long)s->th);
             }
         }
     }
@@ -170,16 +197,16 @@ static void ai_rec_feed(void *ud, void *call_key,
     ai_store_t *st = (ai_store_t *)ud;
     if (!st || !st->cfg.enabled || !call_key) return;
     static __thread unsigned g_rx = 0;
-    llog(LOG_INFO, "ai", "★AF g_rx=%u call=%p pt=%d leg=%d st=%p en=%d",
+    llog(LOG_DEBUG, "ai", "AF g_rx=%u call=%p pt=%d leg=%d st=%p en=%d",
          ++g_rx, call_key, pt, leg, (void*)st, st->cfg.enabled);
 
-    /* ★ 2026-11-17 修复：两边都抓（leg=0 主叫 + leg=1 被叫）。
-     * 之前只抓 leg=1（被叫），但 SIPp UAS 被叫不发 RTP → hook 零调用。
+    /*  2026-11-17 修复：两边都抓（leg=0 主叫 + leg=1 被叫）。
+     * previously only leg=1 (B side), but SIPp UAS B side sends no RTP -> zero hook invocations.
      * 用户可能在主叫也可能在被叫 —— 两边都进 ring buffer，thread 做 ASR 时拿到完整对话。
      * 注：后续可加 per-leg ring 分区避免 AI 听到自己 TTS 回复，但 demo 模式 ASR 返回空不影响。*/
     (void)leg;  /* 两边都抓 —— 不做 leg 过滤 */
 
-    /* ★ 核心修复（2026-11-17）：全局 hook 只负责喂数据，不自动创建 session。
+    /*  核心修复（2026-11-17）：全局 hook 只负责喂数据，不自动创建 session。
      * 只有 dialplan 配了 "ai" app（如拨 9999）时 ai_app_exec 才显式创建 session，
      * 避免分机对打、落地呼叫等误进入 AI 管道。
      * 找不到 session → 说明这个 call 没走 AI dialplan → 直接 return，零开销。*/
@@ -191,7 +218,7 @@ static void ai_rec_feed(void *ud, void *call_key,
     pthread_mutex_unlock(&st->lock);
     if (!s) return;   /* 没有 dialplan ai app 触发 → 跳过 */
 
-    /* ★ 统一 codec 层：静态 PT → codec_id。动态 PT（≥96，如 Opus）需 SDP rtpmap
+    /*   codec layer: static PT maps to codec_id. Dynamic PT (>=96, e.g. Opus) needs SDP rtpmap
      * 建立 per-session 映射（见 media_codec.h），暂不支持 → drop，不污染 ring。 */
     const codec_ops_t *ops = codec_registry_find_pt(pt, 8000);
     if (!ops) {
@@ -200,16 +227,39 @@ static void ai_rec_feed(void *ud, void *call_key,
     }
     codec_id_t in_codec = ops->id;
 
-    /* 内部统一 PCMU（ASR/TTS 基准）：in_codec != PCMU 时经 transcode 转码。 */
-    const uint8_t *ring_data = (const uint8_t *)payload;
-    size_t ring_len = len;
-    uint8_t tc_buf[2048];
+    /* P1 defense: clock_rate must be 8kHz (AI internal format is PCM16 LE 8kHz mono)
+     * codec_registry_find_pt 完全忽略 clock_rate 参数（被 (void) 吃掉），
+     * 所以非 8kHz codec 可能会被误命中 —— 这里显式检查。
+     * 允许非 8kHz 但必须走 transcode（transcode 内部做重采样）；
+     * 禁止非 8kHz 且 codec 本身就是 G.711 的（不存在，G.711 永远 8kHz）。*/
+    if (ops->clock_rate != 8000) {
+        /* 非 8kHz：transcode 应该会做重采样，但我们在首次确定 codec 时
+         * 打一条 WARN 提醒运维 —— 避免 silent bug（半速/倍速 decode 歪音）*/
+        llog(LOG_WARN, "ai", "⚠️ codec %s(pt=%d) clock_rate=%d ≠ 8000 → 依赖 transcode 重采样 call=%p",
+             ops->name, pt, ops->clock_rate, call_key);
+    }
 
-    /* 写 ring buffer（持 s->lock 保护并发写）；转码也在锁内完成 ——
+    /*  AI internal format: PCM16 LE 8kHz mono (NASR ASR / NWAYTTS intermediate)
+     * 入站路径：RTP payload → (transcode 非PCMU→PCMU) → g711_ulaw_decode → PCM16 → ring buffer
+     * 为什么 PCM16？
+     *   - PCMU 是 8bit 有损压缩，NASR ASR 喂 PCMU 识别精度差
+     *   - PCM16 是完整 16bit 无损，后续 DSP（高通/降噪）也在 PCM16 域做
+     *   - ring buffer 每帧字节翻倍（20ms → 320B PCM16 vs 160B PCMU），256KB 够 16s
+     *   - Go agent ai_get_rx_audio 直接拿 PCM16 喂 NASR，不用再转 */
+    uint8_t tc_buf[2048];
+    const uint8_t *pcmu_bytes = (const uint8_t *)payload;
+    size_t pcmu_len = len;
+
+    /* per-frame PCM16 栈缓冲（20ms @ 8kHz PCMU → 160 samples → 320B PCM16，留 1024 够 60ms） */
+    int16_t pcm16_buf[1024];
+    const uint8_t *ring_data = NULL;
+    size_t ring_len = 0;
+
+    /* 写 ring buffer（持 s->lock 保护并发写）；转码+解码都在锁内完成 ——
      * rx_tc 是 per-session 会话，仅在媒体线程单线程访问，无并发。 */
     pthread_mutex_lock(&s->lock);
     if (in_codec != s->in_codec) {
-        /* 首次确定 / codec 变化（re-INVITE）→ 重建 RX+TX 转码会话 + PCM16 encoder */
+        /* first resolution / codec change (re-INVITE) -> rebuild RX+TX transcode sessions + PCM16 encoder */
         if (s->rx_tc) { transcode_close(s->rx_tc); s->rx_tc = NULL; }
         if (s->tx_tc) { transcode_close(s->tx_tc); s->tx_tc = NULL; }
         if (s->tx_pcm16_enc) { codec_registry_find(in_codec)->fini(s->tx_pcm16_enc); s->tx_pcm16_enc = NULL; }
@@ -218,7 +268,7 @@ static void ai_rec_feed(void *ud, void *call_key,
             transcode_sess_t *rx = NULL, *tx = NULL;
             if (transcode_open(in_codec, CODEC_PCMU, &rx) == NSBC_OK) s->rx_tc = rx;
             if (transcode_open(CODEC_PCMU, in_codec, &tx) == NSBC_OK) s->tx_tc = tx;
-            /* format=1 优化：raw PCM16 直接 encode 到 in_codec，跳过中间 PCMU 有损编码 */
+            /* format=1/2 优化：raw PCM16 直接 encode 到 in_codec，跳过中间 PCMU 有损编码 */
             const codec_ops_t *enc_ops = codec_registry_find(in_codec);
             if (enc_ops) {
                 codec_sess_t *enc = NULL;
@@ -231,15 +281,29 @@ static void ai_rec_feed(void *ud, void *call_key,
         }
     }
     if (s->rx_tc) {
+        /* codec != PCMU → transcode 先转到 PCMU，再 decode */
         size_t out_len = 0;
         int rc = transcode_process(s->rx_tc, payload, len, tc_buf, sizeof(tc_buf), &out_len);
         if (rc != NSBC_OK) {
             pthread_mutex_unlock(&s->lock);
             return;  /* AGAIN/错误：本帧跳过 */
         }
-        ring_data = tc_buf;
-        ring_len = out_len;
+        pcmu_bytes = tc_buf;
+        pcmu_len = out_len;
     }
+
+    /* PCMU -> PCM16 LE 8kHz mono — AI internal unified format */
+    size_t pcm16_samples = g711_ulaw_decode(pcmu_bytes, pcmu_len, pcm16_buf);
+
+    /* P0: HPF strips DC offset and 50Hz mains hum
+     * ring buffer previously had no HPF, so ASR fed slightly different audio than VAD detected
+     * 现在两边都用同一份 HPF 系数，ASR 吃到干净音频 */
+    if (pcm16_samples > 0 && leg >= 0 && leg < 2) {
+        vad_hpf_process(&s->hpf[leg], pcm16_buf, pcm16_samples);
+    }
+
+    ring_data = (const uint8_t *)pcm16_buf;
+    ring_len = pcm16_samples * 2;  /* int16_t → 2 bytes each */
 
     size_t space = (s->r_head >= s->r_tail)
         ? (AI_RING_CAP - s->r_head + s->r_tail - 1)
@@ -262,7 +326,7 @@ static void ai_rec_feed(void *ud, void *call_key,
 }
 
 /* ================================================================== */
-/* REQ-AI-MEDIA-001：Pass-through 公共 API —— 让第三方 AI 直接读写音频流     */
+/* Pass-through public API for third-party AI to read/write audio     */
 /* ================================================================== */
 
 /* AI 模块架构分层：
@@ -312,22 +376,37 @@ int ai_set_producer(void *call_key, int producer)
     }
     if (!s) { pthread_mutex_unlock(&g_ai.lock); return NSBC_NOENT; }
     pthread_mutex_lock(&s->lock);
+    int old_producer = s->producer;
     s->producer = producer ? 1 : 0;
     pthread_mutex_unlock(&s->lock);
     pthread_mutex_unlock(&g_ai.lock);
     llog(LOG_INFO, "ai", "ai_set_producer call=%p producer=%d", call_key, producer);
+
+    /* producer mode auto-starts/stops VAD monitoring
+     * producer=1 → 对 A 腿（被叫用户腿）启动 VAD，Go 侧按 VAD 边界切句
+     * producer=0 → 停止 VAD，call_destroy 时也会停 */
+    if (producer && !old_producer) {
+        int rc = vad_start_for_call(call_key, 2 /* leg_mask=A+B */, 0 /* 默认阈值 */);
+        llog(rc == 0 ? LOG_INFO : LOG_WARN, "ai",
+             "vad_start_for_call call=%p (auto by producer=1) rc=%d", call_key, rc);
+    } else if (!producer && old_producer) {
+        int rc = vad_stop_for_call(call_key);
+        llog(LOG_INFO, "ai", "vad_stop_for_call call=%p (auto by producer=0) rc=%d",
+             call_key, rc);
+    }
     return NSBC_OK;
 }
 
-/* 第三方 AI 拉取用户语音（PCMU 8kHz 原始字节，不重采样）
+/* 第三方 AI 拉取用户语音 —— AI 内部统一 PCM16 LE 8kHz mono
  *
- * call_key:  b2b_call_t*
- * out_buf:   调用方缓冲区（至少 out_max_len 字节）
- * out_max_len: 最多读多少字节（建议 160 的整数倍 = 20ms 的 RTP 载荷）
+ * call_key:    b2b_call_t*
+ * out_buf:     调用方缓冲区（至少 out_max_len 字节）
+ * out_max_len: 最多读多少字节（建议 320 的整数倍 = 20ms PCM16 @ 8kHz）
  * 返回：实际读取的字节数（0 = ring buffer 空 / 无 session / session 未启动）
  *
- * 语义：非阻塞。ring buffer 里有多少读多少，**消费语义**（读了就不保留）。
- * 建议调用方以 20ms（160 字节）节奏调，和 ai_rec_feed 入队节奏对齐。 */
+ * ring buffer 存 PCM16 LE 8kHz mono（由 ai_rec_feed 的 g711_ulaw_decode 入队），
+ * 每 20ms 帧 = 160 samples = 320 bytes。NASR ASR 直接喂此 PCM16，
+ * 不再走 PCMU→PCM16 有损转换。 */
 size_t ai_get_rx_audio(void *call_key, uint8_t *out_buf, size_t out_max_len)
 {
     if (!call_key || !out_buf || out_max_len == 0) return 0;
@@ -353,17 +432,19 @@ size_t ai_get_rx_audio(void *call_key, uint8_t *out_buf, size_t out_max_len)
 /* 第三方 AI 推送回复音频给用户 —— REQ-AI-MEDIA-001 Pass-through
  *
  * call_key:  b2b_call_t*（不透明指针）
- * data:      PCMU 8kHz 原始字节（内部统一 PCMU；本模块按协商 codec 经 transcode 转码）
+ * data:      按 format 解释（见下）
  * len:       字节数
+ * format:    音频格式标识
+ *   0 = PCMU 8kHz（legacy，经 transcode PCMU→in_codec）
+ *   1 =  PCM16 LE 8kHz mono（AI 内部统一格式，一次 encode 到 in_codec）
+ *   2 = PCMA 8kHz（legacy）
  * 返回：NSBC_OK / NSBC_NOENT / NSBC_INVAL / NSBC_AGAIN
  *
- * 语义：非阻塞。内部调 bridge_send_raw 按 RTP 节奏注入 A 腿。
- * 建议 20ms（160 字节 PCMU）节奏喂，和媒体桥接节奏对齐。
- * relay 不存在 / 还没 latch（-ENODEV）时返回 NSBC_AGAIN，调用方决定 retry 还是 drop。
- *
- * 设计决定：ai_dialog 内部统一 PCMU；跨 codec 转码经统一 codec 层
- * transcode_open/process（decode→encode 两段流水线，支持 PCMA/G729/G722/Opus 等）。
- * 调用方（外部 AI agent / 内建 demo）只需喂 PCMU，无需感知对端 codec。 */
+ * AI 内部统一格式 = PCM16 LE 8kHz mono：
+ *   RX：ai_rec_feed → g711_ulaw_decode → ring buffer 存 PCM16 → ai_get_rx_audio 拿 PCM16
+ *   TX：外部 AI agent 喂 PCM16 (format=1) → C 侧 codec.encode() 一次 → bridge_send_raw
+ * 为什么 PCM16？NASR ASR / NWAYTTS 都是 16bit 中间格式，PCMU 8bit 有损编码会直接降低识别精度。
+ * Go agent ai_agent_daemon 所有音频传递用 format=1，cross-codec encoding handled by C side codec layer. */
 int ai_send_tx_audio(void *call_key, const uint8_t *data, size_t len, int format)
 {
     if (!call_key || !data || len == 0) return NSBC_INVAL;
@@ -394,7 +475,7 @@ int ai_send_tx_audio(void *call_key, const uint8_t *data, size_t len, int format
     uint32_t *ts_ptr   = &s->ts;
     pthread_mutex_unlock(&s->lock);
 
-    /* ★ format=1（PCM16 raw）→ 一次 encode 到 in_codec（无中间 PCMU 有损）
+    /* format=1 (PCM16 raw) -> one-shot encode to in_codec, no intermediate PCMU loss
      * format=0（PCMU）→ 走 transcode PCMU→in_codec（旧路径，兼容） */
     const uint8_t *tx_data = data;
     size_t tx_len = len;
@@ -422,11 +503,33 @@ int ai_send_tx_audio(void *call_key, const uint8_t *data, size_t len, int format
             pthread_mutex_unlock(&s->lock);
         }
 
-        /* 按 codec ptime_ms 分帧 encode — G.711 ptime=20ms,
-         * 即 160 samples PCM16 = 320 bytes → encode 后 80 bytes PCMA */
+        /* dynamic sample rate from codec_ops->clock_rate instead of hardcoded 8000
+         * 硬编码 8kHz 会导致 G.722(16k) 等非 8k codec 半速快放 */
+        int codec_rate = enc_ops->clock_rate > 0 ? enc_ops->clock_rate : 8000;
+        int input_rate = 8000;  /* Go TTS 喂的固定 8kHz PCM16（format=1 约定）*/
+
+        /* P3 defense: resample gap when codec_rate != 8000
+         * 当前 resample.c 只有骨架（resampler_process 返回 NOTSUP），
+         * 所以非 8kHz codec 的 TX 路径暂时不通 —— 打 WARN 提醒运维
+         * （RX 侧 codec_registry_find_pt 已修复 clock_rate 过滤，
+         * 16kHz static PT codec 会被 drop；动态 PT 需要 SDP rtpmap）*/
+        if (codec_rate != input_rate) {
+            static __thread int rate_mismatch_warned = 0;
+            if (!rate_mismatch_warned++) {
+                llog(LOG_WARN, "ai",
+                    "⚠️ TX path: input PCM16 rate=%d ≠ codec rate=%d (codec=%s) → "
+                    "resample skeleton NOTSUP, encode 可能歪音",
+                    input_rate, codec_rate, enc_ops->name);
+            }
+        }
+
+        /* 按 codec ptime_ms + 真实 clock_rate 动态算帧长
+         * G.711 ptime=20ms, 8kHz → 160 samples → ts_inc=160
+         * G.722 ptime=20ms, 16kHz → 320 samples → ts_inc=320 */
         int ptime_ms = enc_ops->ptime_ms > 0 ? enc_ops->ptime_ms : 20;
-        size_t samples_per_frame = (size_t)ptime_ms * 8; /* 8kHz → samples */
+        size_t samples_per_frame = (size_t)ptime_ms * (size_t)codec_rate / 1000;
         size_t bytes_per_frame   = samples_per_frame * 2; /* 16bit → bytes */
+        uint32_t ts_inc = (uint32_t)ptime_ms * (uint32_t)codec_rate / 1000;
 
         for (size_t off = 0; off < len; off += bytes_per_frame) {
             size_t frame_bytes = (off + bytes_per_frame > len)
@@ -434,7 +537,7 @@ int ai_send_tx_audio(void *call_key, const uint8_t *data, size_t len, int format
             media_frame_t mf = {
                 .pcm      = (int16_t *)(data + off),
                 .samples  = frame_bytes / 2,
-                .rate     = 8000,
+                .rate     = codec_rate,   /*  动态采样率，不再硬编码 8000 */
                 .channels = 1,
             };
             size_t out_len = 0;
@@ -442,7 +545,7 @@ int ai_send_tx_audio(void *call_key, const uint8_t *data, size_t len, int format
             if (rc != NSBC_OK || out_len == 0) continue;
 
             int n = bridge_send_raw(g_ai.bridge, call_key, 0,
-                                    tc_buf, out_len, pt, ssrc, seq_ptr, ts_ptr, 160);
+                                    tc_buf, out_len, pt, ssrc, seq_ptr, ts_ptr, ts_inc);
             if (n < 0 && n == -ENODEV) return NSBC_AGAIN;
         }
         return NSBC_OK;
@@ -534,7 +637,7 @@ static void *ai_session_thread_stub(void *arg)
 }
 
 /* P0-1: b2b_call_destroy 回调 —— 主动关 per-call session 线程
- * 在 call_destroy 末尾（mem_obj_release 之前）调，必须尽快返回（禁阻塞）。
+ * 在 call_destroy 末尾（mem_obj_release 之前）调，must return quickly (no blocking).
  * 这里只做 running=0 + 异步 pthread_join（timeout 1s，超时 log 但不阻塞 call_destroy）。
  * 线程退出时会从链表摘除 session 并 free。*/
 static void ai_on_call_destroy(void *call_key, int a_final, void *ud)
@@ -553,13 +656,23 @@ static void ai_on_call_destroy(void *call_key, int a_final, void *ud)
     llog(LOG_INFO, "ai", "call_destroy call=%p a_final=%d → stop session",
          call_key, a_final);
 
+    /* emit AI_SESSION_CLOSED via obs_event into SSE event bus
+     * session 被销毁信号，不是通话结束。通话结束(CALL_END)在 b2bua 里走。 */
+    {
+        b2b_call_t *b2b = (b2b_call_t *)call_key;
+        const char *cid = (b2b && b2b->leg[0].callid[0])
+                          ? b2b->leg[0].callid : "unknown";
+        obs_event(6, "AI_SESSION_CLOSED",
+            "call_id=%s call_key=%p a_final=%d", cid, call_key, a_final);
+    }
+
     /* 告诉线程该退出了 */
     victim->running = 0;
 
     /* 最多等 10s pthread_join —— transfer 触发 + 线程清理可能耗时，
      * 加长到 10s 避免 call_destroy 还没等完 AI 请求就释放 call 对象。
-     * ★ pthread_timedjoin_np 的 timespec 是**绝对时间**（CLOCK_REALTIME），
-     * 之前写成 {10,0} 等于 1970 年，立即超时 → call_destroy 提前释放 call
+     *  pthread_timedjoin_np 的 timespec 是**绝对时间**（CLOCK_REALTIME），
+     * old code wrote {10,0} = year 1970, immediate timeout -> call_destroy releases call early
      * 对象，空转线程随后解引用已释放内存（延时崩溃/段错误）。 */
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -573,7 +686,7 @@ static void ai_on_call_destroy(void *call_key, int a_final, void *ud)
 }
 
 /* ================================================================== */
-/* REQ-AI-TRANSFER-001：公共 API —— 请求 AI session 转人工座席           */
+/* public API — request AI session blind transfer to agent           */
 /* ================================================================== */
 
 /* 外部（OAM CLI / LLM function call / Webhook / IVR）可调用此 API
@@ -604,11 +717,23 @@ int ai_request_transfer(void *call_key, const char *dest)
         llog(LOG_WARN, "ai", "ai_request_transfer: no session for call=%p", call_key);
         return NSBC_NOENT;
     }
+
+    /* dest 格式兜底：如果只给了分机号（如 "1001"），补成 SIP URI。
+     * 含 "sip:" 前缀或 "@" 视为已完整。domain 优先用 call 的 orig_host（b2b_call 里有），
+     * 拿不到就用默认 "nsbc.local"。 */
+    char full_dest[300];
+    if (strstr(dest, "sip:") || strchr(dest, '@')) {
+        snprintf(full_dest, sizeof(full_dest), "%s", dest);
+    } else {
+        snprintf(full_dest, sizeof(full_dest), "sip:%s@nsbc.local", dest);
+    }
+
     pthread_mutex_lock(&s->lock);
-    snprintf(s->transfer_dest, sizeof(s->transfer_dest), "%s", dest);
+    snprintf(s->transfer_dest, sizeof(s->transfer_dest), "%s", full_dest);
     s->transfer_pending = 1;
     pthread_mutex_unlock(&s->lock);
     pthread_mutex_unlock(&g_ai.lock);
+    llog(LOG_INFO, "ai", "ai_request_transfer call=%p dest=%s", call_key, full_dest);
     llog(LOG_INFO, "ai", "ai_request_transfer call=%p dest=%s (pending)", call_key, dest);
     return NSBC_OK;
 }
@@ -717,7 +842,7 @@ static int ai_init(struct nsbc_ctx *ctx)
     llog(hrc == NSBC_OK ? LOG_INFO : LOG_WARN, "ai",
          "b2b_call_destroy_add rc=%d", hrc);
 
-    /* REQ-AI-MEDIA-001 / REQ-AI-TRANSFER-001: 注册 pass-through 公共 API 函数指针
+    /* register pass-through public API function pointers
      *
      * 为什么需要：ai_dialog 编译成 mod_ai_dialog.so，主二进制链接器看不到 .so 里的符号。
      * 主二进制的 ai_backend_registry.c 里有 wrapper ai_set_producer/ai_get_rx_audio/
@@ -742,7 +867,7 @@ static void ai_fini(struct nsbc_ctx *ctx)
     (void)ctx;
     llog(LOG_INFO, "ai", "ai_dialog fini");
 
-    /* REQ-AI-MEDIA-001: 先 unregister passthrough fns（避免 fini 过程中还有外部 AI 调进来）*/
+    /* unregister passthrough fns first to avoid late calls during fini*/
     ai_passthrough_unregister();
 
     /* P0-1: 卸载 call_destroy hook */

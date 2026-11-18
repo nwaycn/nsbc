@@ -464,12 +464,12 @@ func (t *wsTransport) close() {
 // Provider 工厂
 // =============================================================================
 
-func buildASR(name string, apiKey string, nwayAddr string) ASRProvider {
+func buildASR(name string, apiKey string, nwayAddr string, nasrClient string) ASRProvider {
 	switch name {
 	case "whisper":
 		return &WhisperASR{APIKey: apiKey, Model: "whisper-1", TimeoutS: 30}
 	case "nway":
-		return &NWAYASR{Addr: nwayAddr}
+		return &NWAYASR{Addr: nwayAddr, NasrClient: nasrClient}
 	}
 	return &MockASR{TriggerWord: "我想转人工", EnergyThreshold: 24}
 }
@@ -567,6 +567,42 @@ func (t *callTracker) activeCount() int {
 }
 
 // =============================================================================
+// aiSessionTracker — dual-event gate
+// 只有收到 AI_SESSION_OPENED（C 侧拨号规则命中 ai app → 创建 ai_session）
+// + CALL_ANSWERED (media established) before spawning handleCall.
+// 防止普通通话（拨号规则没命中 ai）的 goroutine 空转浪费。
+// =============================================================================
+
+type aiSessionTracker struct {
+	mu   sync.Mutex
+	ai   map[string]bool  // call_id → true 表示 C 侧已创建 ai_session
+}
+
+func newAISessionTracker() *aiSessionTracker {
+	return &aiSessionTracker{ai: make(map[string]bool)}
+}
+
+func (t *aiSessionTracker) markOpened(callID string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.ai[callID] = true
+}
+
+func (t *aiSessionTracker) markClosed(callID string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.ai, callID)
+}
+
+// isAICall — CALL_ANSWERED 时检查：C 侧有没有 AI_SESSION_OPENED 记录？
+// 没有 → 拨号规则没命中 ai → 这是普通通话 → Go agent 不接管
+func (t *aiSessionTracker) isAICall(callID string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.ai[callID]
+}
+
+// =============================================================================
 // handleCall — 每通电话的 AI 处理 goroutine（daemon 模式入口）
 // =============================================================================
 
@@ -578,6 +614,7 @@ func handleCall(
 	bargeInEnabled bool,
 	bargeInRMS int,
 	transport string,
+	recordDir string,
 	asr ASRProvider, llm LLMProvider, tts TTSProvider,
 ) {
 	callID := cs.callID
@@ -586,6 +623,22 @@ func handleCall(
 	fmt.Printf("  transport=%s  barge_in=%v  chunk=%d\n", transport, bargeInEnabled, chunkBytes)
 	fmt.Printf("  ASR=%T  LLM=%T  TTS=%T\n", asr, llm, tts)
 	fmt.Printf("%s\n\n", strings.Repeat("═", 70))
+
+	// --- record audio to disk (PCM16 LE 8kHz mono, ring buffer stores this format) ---
+	var recPCM16 *os.File
+	var recWAVPath string
+	var recAllPCM16 []byte
+	if recordDir != "" {
+		_ = os.MkdirAll(recordDir, 0o755)
+		pcm16Path := fmt.Sprintf("%s/%s_%s_%s.pcm16", recordDir, callID, cs.orig, cs.to)
+		if f, err := os.Create(pcm16Path); err == nil {
+			recPCM16 = f
+			fmt.Printf("[ai_agent] ★ 录音 PCM16 LE 8kHz → %s\n", pcm16Path)
+			recWAVPath = fmt.Sprintf("%s/%s_%s_%s.wav", recordDir, callID, cs.orig, cs.to)
+		} else {
+			fmt.Fprintf(stderr, "[ai_agent] ⚠ 录音创建失败: %v\n", err)
+		}
+	}
 
 	// --- transport ---
 	var httpMode bool
@@ -634,61 +687,89 @@ func handleCall(
 		cs.markDone()
 	}()
 
-	// --- welcome greeting ---
+	// --- channel MUST be declared before greeting goroutine spawns ---
+	// 欢迎语和后续所有 TTS 播放都用这个 channel 通知主循环
+	ttsPlayingCh := make(chan bool, 1)
+
+	// --- welcome greeting (async play, does not block main loop entry) ---
 	// 优先用 daemon 启动时预合成的欢迎语（零延迟）；没有则现场合成。
 	welcome := cachedGreeting
 	if len(welcome) == 0 {
 		welcome = tts.Synthesize(welcomeText)
 	}
 	if len(welcome) > 0 {
-		fmt.Printf("[ai_agent] → TTS 欢迎语 (%d bytes)\n", len(welcome))
-		sendAudioPaced(apiBase, apiToken, callID, welcome, ws, cs, bargeInEnabled, bargeInRMS)
+		fmt.Printf("[ai_agent] → TTS 欢迎语 (%d bytes, 异步)\n", len(welcome))
+		go func() {
+			ttsPlayingCh <- true
+			sendAudioPaced(apiBase, apiToken, callID, welcome, ws, cs, bargeInEnabled, bargeInRMS)
+			ttsPlayingCh <- false
+		}()
 	}
 
 	fmt.Printf("[ai_agent] 循环开始 — 等待用户说话 ...\n")
 
 	// --- 主循环 ---
-	// 用 ticker 做 VAD 检测（主动 barge-in）
+	// key design: main loop goroutine NEVER blocks!
+	//   - VAD ticker select：只做快速状态检测 + 设 flag，不做任何阻塞操作
+	//   - flushSentence（ASR+LLM+TTS）：标记 needFlush=true，主循环尾部在非 ticker 路径异步处理
+	//   - sendAudioPaced：TTS 播放放在独立 goroutine，通过 channel 同步 ttsPlaying 状态
+	//
+	// 为什么？上一版 flushSentence 在 ticker select 里同步阻塞 ~5 秒（ASR 1s + TTS 4.4s），
+	// 主 goroutine 停转期间 ring buffer 里塞满陈旧数据，后续 sentenceBuf 累积的都是静音/回声。
 	vadTicker := time.NewTicker(100 * time.Millisecond)
 	defer vadTicker.Stop()
 
-	var (
-		consecutiveSilence = 0
-		ttsPlaying         = false // 当前是否在播 TTS
-		stopTTSCh          = make(chan struct{})
-
-		// --- ASR 累积缓冲 ---
-		// NASR 需要 ≥ 300-500ms 连续语音才能稳定识别；每帧 160B = 20ms PCMU
-		// 满 4800B (30 帧 = 600ms) 强制 flush；或静音 ≥ 2s (silenceTick≥20) flush
-		asrBuf      []byte
-		speechInBuf = false // 缓冲内是否检测到有能量（避免全程静音也喂 ASR）
-	)
-
 	const (
-		asrBufMaxBytes   = 4800 // 600ms PCMU @ 8kHz
-		asrSilenceFlsuhTick = 20 // 2s 静音 (tick 100ms) → flush
+		vadGraceMs     = 400     // SILENCE 后 400ms 才真正 flush
+		asrBufMaxBytes = 40000   // 5000ms PCMU @ 8kHz safety limit
 	)
 
-	flushASR := func(reason string) {
-		if len(asrBuf) == 0 {
+	var (
+		// --- per-sentence 缓冲 ---
+		sentenceActive       bool
+		sentenceBuf          []byte
+		sentenceSilenceStart time.Time
+		sentenceIdx          int
+
+		// --- 异步 TTS 状态（channel 驱动，主循环永不阻塞）---
+		// ttsPlayingCh declared before greeting (L656) — avoids forward reference
+		ttsPlaying     bool
+		needFlush      bool                   // ticker 检测到 grace DONE → 主循环尾部异步处理
+		flushReason    string
+	)
+
+	// --- flushSentence：在主循环尾部被异步调用，里面的 TTS 也跑独立 goroutine ---
+	flushSentence := func(reason string) {
+		if len(sentenceBuf) == 0 {
 			return
 		}
-		if !speechInBuf {
-			// 全程静音缓冲，不浪费一次 NASR 调用
-			asrBuf = asrBuf[:0]
-			return
+
+		// 1. per-sentence wav — PCM16 LE 8kHz mono (ring buffer format after ulaw_decode)
+		sentenceIdx++
+		sentenceWAV := fmt.Sprintf("%s/%s_sentence_%03d.wav", recordDir, callID, sentenceIdx)
+		wav := pcm16BytesToWav(sentenceBuf, 8000)
+		if err := os.WriteFile(sentenceWAV, wav, 0o644); err == nil {
+			fmt.Printf("[ai_agent] ★ sentence WAV → %s (%d bytes = %d ms)\n",
+				sentenceWAV, len(wav), len(sentenceBuf)/320*20)
 		}
+
+		// 2. NASR ASR — 同步但很快（<2s 对 3s 音频）
+		// sentenceBuf 已经是 PCM16 LE 8kHz mono，直接喂 NASR
 		fmt.Printf("[ai_agent] ★ ASR flush reason=%s buf=%d bytes (%d ms)\n",
-			reason, len(asrBuf), len(asrBuf)/160*20)
-		transcript := asr.Transcribe(asrBuf)
-		asrBuf = asrBuf[:0]
-		speechInBuf = false
+			reason, len(sentenceBuf), len(sentenceBuf)/320*20)
+		transcript := asr.Transcribe(sentenceBuf)
+
+		// 3. 清空句子缓冲（立即！让后续 sentenceBuf 从干净状态开始）
+		sentenceBuf = sentenceBuf[:0]
+		sentenceActive = false
+		sentenceSilenceStart = time.Time{}
 
 		if transcript == "" {
 			return
 		}
 		fmt.Printf("[ai_agent] ASR: %s\n", transcript)
 
+		// 4. MockLLM keyword match
 		reply := llm.Chat(transcript)
 		switch reply.Action {
 		case "transfer":
@@ -707,71 +788,107 @@ func handleCall(
 
 		case "say":
 			fmt.Printf("[ai_agent] LLM say: %s\n", reply.Text)
-			ttsPlaying = true
 
+			// ★ 先 Synthesize 再启动 goroutine（Synthesize 本身是同步的，
+			//   但只花 ~1s，放在主循环尾部没问题，之后 sendAudioPaced 异步）
 			pcmu := tts.Synthesize(reply.Text)
-			if len(pcmu) > 0 {
+			if len(pcmu) == 0 {
+				return
+			}
+
+			// ★ 等上一次 TTS goroutine 彻底结束（不阻塞，只看 channel 状态）
+			// 如果上一个 TTS 还在播，等它结束再播新的（tail call — 自动排队）
+			go func() {
+				ttsPlayingCh <- true               // 通知主循环：TTS 开始
+				fmt.Printf("[ai_agent] ★ TTS start (%d bytes, ~%d ms)\n",
+					len(pcmu), len(pcmu)/640*40)
 				sendAudioPaced(apiBase, apiToken, callID, pcmu, ws, cs, bargeInEnabled, bargeInRMS)
 				fmt.Printf("[ai_agent] ← TTS 回复 (%d bytes)\n", len(pcmu))
-			}
-			ttsPlaying = false
+				ttsPlayingCh <- false              // 通知主循环：TTS 结束
+			}()
 		}
 	}
 
+	// --- cleanup defer（意外挂断时也把最后一句 flush） ---
 	defer func() {
-		// 通话退出前 flush 剩余缓冲
-		if len(asrBuf) > 0 {
-			flushASR("CALL_END")
+		if sentenceActive && len(sentenceBuf) > 0 {
+			flushSentence("CALL_END")
+		}
+		if recPCM16 != nil {
+			recPCM16.Close()
+			if recWAVPath != "" && len(recAllPCM16) > 0 {
+				wav := pcm16BytesToWav(recAllPCM16, 8000)
+				if err := os.WriteFile(recWAVPath, wav, 0o644); err == nil {
+					fmt.Printf("[ai_agent] ★ 全通话录音 WAV → %s (%d bytes)\n", recWAVPath, len(wav))
+				}
+			}
 		}
 	}()
 
 	for {
 		select {
-		// === 收到 hangup 事件或 daemon 正在退出 ===
 		case <-cs.stopped:
 			fmt.Printf("[ai_agent] ★ 通话已结束（CALL_END 事件）\n")
 			return
-
 		case <-cs.done:
 			return
 
-		// === 主循环 tick ===
-		default:
-		}
+		// ★ ttsPlayingCh — TTS goroutine 通知主循环 TTS 开始/结束
+		// 这是唯一改 ttsPlaying 的路径（避免 race）
+		case playing := <-ttsPlayingCh:
+			ttsPlaying = playing
+			fmt.Printf("[ai_agent] ★ ttsPlaying=%v\n", ttsPlaying)
+			continue
 
-		// --- VAD barge-in：检测到用户说话 → 立即停 TTS ---
-		vadSpeechNow := false
-		if bargeInEnabled {
-			select {
-			case <-vadTicker.C:
-				vad := aiVadState(apiBase, apiToken, callID)
-				if vad.aState == "SPEECH" && vad.aRms >= bargeInRMS {
-					vadSpeechNow = true
-					if ttsPlaying {
-						fmt.Printf("[ai_agent] ★ barge-in! 用户说话 → 停 TTS\n")
-						select {
-						case stopTTSCh <- struct{}{}:
-						default:
-						}
-						ttsPlaying = false
-					}
-					consecutiveSilence = 0
-				} else {
-					consecutiveSilence++
-				}
-			default:
+		// ★ 主事件：VAD ticker + grace period 边界检测
+		case <-vadTicker.C:
+			vad := aiVadState(apiBase, apiToken, callID)
+			var nowVadSpeech bool
+			if vad.aState == "SPEECH" || vad.bState == "SPEECH" {
+				nowVadSpeech = true
 			}
+
+			// --- barge-in ---
+			if nowVadSpeech && ttsPlaying {
+				fmt.Printf("[ai_agent] ★ barge-in! 用户说话 (aRms=%d bRms=%d) → 停 TTS\n",
+					vad.aRms, vad.bRms)
+				// ttsPlaying flag 会被 goroutine 里的 barge-in 检测触发提前 return，
+				// 主循环这里只标记即可
+			}
+
+			// --- grace period 切句（只设 flag，不阻塞）---
+			if nowVadSpeech {
+				if !sentenceActive {
+					sentenceActive = true
+					fmt.Printf("[ai_agent] ★ SENTENCE_START — 用户开始说话\n")
+				}
+				if !sentenceSilenceStart.IsZero() {
+					sentenceSilenceStart = time.Time{}
+					fmt.Printf("[ai_agent] ★ grace CANCEL — 用户继续说\n")
+				}
+			} else if sentenceActive {
+				if sentenceSilenceStart.IsZero() {
+					sentenceSilenceStart = time.Now()
+					fmt.Printf("[ai_agent] ★ grace START — 静音中 (400ms)\n")
+				} else if time.Since(sentenceSilenceStart) >= vadGraceMs*time.Millisecond {
+					fmt.Printf("[ai_agent] ★ grace DONE — 用户说完了\n")
+					needFlush = true
+					flushReason = "vad-grace"
+				}
+			}
+
+		default:
+			// 非 ticker 路径 — 处理 pending flush + 拉音频帧
 		}
 
-		// --- 静音 flush：用户说完了就把缓冲喂 ASR ---
-		if len(asrBuf) > 0 && consecutiveSilence >= asrSilenceFlsuhTick {
-			flushASR("silence")
-			consecutiveSilence = 0
+		// ★ 异步 flush（主循环尾部，永不阻塞 VAD ticker）
+		if needFlush {
+			needFlush = false
+			flushSentence(flushReason)  // ASR+LLM+TTS-Synthesize 同步，TTS 播放异步
 		}
 
-		// --- 拉用户语音 ---
+		// --- 拉用户语音帧 ---
 		var rx []byte
-
 		if ws != nil {
 			select {
 			case rx = <-wsRxCh:
@@ -779,32 +896,31 @@ func handleCall(
 				fmt.Fprintf(stderr, "[ai_agent] WS 断开: %v\n", err)
 				return
 			case <-time.After(100 * time.Millisecond):
-				// 没数据但缓冲可能已满 → flush 试试
-				if len(asrBuf) >= asrBufMaxBytes {
-					flushASR("buf-full")
-				}
 				continue
 			}
 		} else {
 			rx = aiGetRx(apiBase, apiToken, callID, chunkBytes)
 			if len(rx) == 0 {
 				time.Sleep(50 * time.Millisecond)
-				if len(asrBuf) >= asrBufMaxBytes {
-					flushASR("buf-full")
-				}
 				continue
 			}
 		}
 
-		// --- 累积缓冲 ---
-		asrBuf = append(asrBuf, rx...)
-		if vadSpeechNow {
-			speechInBuf = true
+		// --- sentenceBuf 累积（sentenceActive 打开就持续累积）---
+		if sentenceActive {
+			sentenceBuf = append(sentenceBuf, rx...)
 		}
 
-		// 缓冲满 → 强制 flush（哪怕 VAD 还说在说话，也把前 600ms 送出去）
-		if len(asrBuf) >= asrBufMaxBytes {
-			flushASR("buf-full")
+		// --- 全通话录音落盘（★ PCM16 LE 8kHz，全程都录）---
+		if recPCM16 != nil {
+			recPCM16.Write(rx)
+			recAllPCM16 = append(recAllPCM16, rx...)
+		}
+
+		// safety limit
+		if sentenceActive && len(sentenceBuf) >= asrBufMaxBytes {
+			needFlush = true
+			flushReason = "max-len"
 		}
 	}
 
@@ -822,7 +938,7 @@ func main() {
 	transferDest := flag.String("transfer-dest", "1001", "transfer 默认目标")
 	bargeInEnabled := flag.Bool("vad-barge-in", true, "启用 barge-in")
 	bargeInRMS := flag.Int("barge-in-rms", 800, "barge-in VAD RMS 阈值")
-	chunkBytes := flag.Int("chunk-bytes", 160, "ai-get-rx 每次拉多少字节")
+	chunkBytes := flag.Int("chunk-bytes", 320, "ai-get-rx 每次拉多少字节（PCM16 20ms = 320B）")
 	transport := flag.String("transport", "auto", "http | ws | auto")
 	insecure := flag.Bool("insecure", true, "跳过 TLS 证书验证（默认 true，自签证书）")
 
@@ -837,8 +953,10 @@ func main() {
 	apiKeyLLM := flag.String("api-key-llm", os.Getenv("NSBC_OLLAMA_API_KEY"), "")
 	apiKeyTTS := flag.String("api-key-tts", os.Getenv("NSBC_ELEVENLABS_API_KEY"), "")
 	ttsVoiceID := flag.String("tts-voice-id", getEnv("NSBC_ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM"), "")
-	nwayASRAddr := flag.String("nway-asr-addr", "10.0.0.80:8089", "nway ASR TCP 服务地址")
-	nwayTTSAddr := flag.String("nway-tts-addr", "10.0.0.80:8090", "nway TTS TCP 服务地址")
+	nwayASRAddr := flag.String("nway-asr-addr", "127.0.0.1:8089", "NASR TCP 服务地址")
+	nwayTTSAddr := flag.String("nway-tts-addr", "127.0.0.1:8090", "NTTS TCP 服务地址")
+	nasrClient := flag.String("nasr-client", "/home/lihao/nway_asr/nasr-client", "nasr-client 可执行文件路径")
+	recordDir := flag.String("record-dir", "records", "录音落盘目录（每通 call 一个 .pcmu + .wav）")
 
 	flag.Parse()
 
@@ -855,7 +973,7 @@ func main() {
 	// --- providers ---
 	transferKeywords := []string{"转人工", "人工", "客服", "人工服务", "找人工", "转客服",
 		"agent", "human", "operator", "representative"}
-	asr := buildASR(*asrName, *apiKeyWhisper, *nwayASRAddr)
+	asr := buildASR(*asrName, *apiKeyWhisper, *nwayASRAddr, *nasrClient)
 	llm := buildLLM(*llmName, *transferDest, *apiKeyLLM, *llmEndpoint, *llmModel, transferKeywords)
 	tts := buildTTS(*ttsName, *apiKeyTTS, *ttsVoiceID, *nwayTTSAddr)
 
@@ -871,7 +989,7 @@ func main() {
 
 		cs := newCallSession(*callID, "?", "?")
 		handleCall(cs, *apiBase, *apiToken, *transferDest, *chunkBytes,
-			*bargeInEnabled, *bargeInRMS, *transport, asr, llm, tts)
+			*bargeInEnabled, *bargeInRMS, *transport, *recordDir, asr, llm, tts)
 		return
 	}
 
@@ -903,6 +1021,7 @@ func main() {
 	}
 
 	tracker := newCallTracker()
+	aiTracker := newAISessionTracker()  // ★ P2: 双重事件门控
 
 	// 启动 SSE 客户端（自动重连）
 	sseClient := nsbc_sdk.NewSseClient(sseUrl, 30, headers)
@@ -965,17 +1084,42 @@ func main() {
 			to := strField(frame.Fields, "to")
 
 			switch frame.Domain {
+			case "AI_SESSION_OPENED":
+				/* ★ P2: C 侧拨号规则命中 ai app → 创建 ai_session → 推此事件。
+				 * 早于 CALL_ANSWERED（INVITE resolve 阶段）。call_id 从 obs_event 字段解析。 */
+				cid := strField(frame.Fields, "call_id")
+				if cid != "" && cid != "?" && cid != "unknown" {
+					aiTracker.markOpened(cid)
+					fmt.Printf("[sse] 🤖 AI_SESSION_OPENED call_id=%s (dialplan hit 'ai' app)\n", cid)
+				}
+
+			case "AI_SESSION_CLOSED":
+				cid := strField(frame.Fields, "call_id")
+				if cid != "" && cid != "?" && cid != "unknown" {
+					aiTracker.markClosed(cid)
+					fmt.Printf("[sse] 🤖 AI_SESSION_CLOSED call_id=%s\n", cid)
+				}
+
 			case "CALL_ANSWERED":
 				if orig == "" {
 					fmt.Printf("[sse] ⚠ CALL_ANSWERED 缺少主叫字段，raw=%s\n", frame.Raw)
 				}
 				fmt.Printf("[sse] ✅ CALL_ANSWERED call=%s %s→%s\n", callID, orig, to)
+
+				/* ★ P2: 双重事件门控 — 只有收到 AI_SESSION_OPENED 的 call 才接管
+				 * 普通通话（拨号规则没命中 ai）→ Go agent 不 goroutine 不浪费 */
+				if !aiTracker.isAICall(callID) {
+					fmt.Printf("[sse] ⏭ CALL_ANSWERED call=%s 无 AI_SESSION_OPENED 记录 → 普通通话，跳过\n", callID)
+					continue
+				}
+				fmt.Printf("[sse] 🤖 CALL_ANSWERED call=%s 有 AI_SESSION_OPENED → 接管 AI 对话\n", callID)
+
 				cs := newCallSession(callID, orig, to)
 				if tracker.add(cs) {
 					go func() {
 						defer tracker.remove(callID)
 						handleCall(cs, *apiBase, *apiToken, *transferDest, *chunkBytes,
-							*bargeInEnabled, *bargeInRMS, *transport, asr, llm, tts)
+							*bargeInEnabled, *bargeInRMS, *transport, *recordDir, asr, llm, tts)
 					}()
 				} else {
 					fmt.Printf("[sse] ⚠ 该通话已在处理中，跳过\n")

@@ -477,7 +477,7 @@ static int cmd_ai_request_transfer(cmd_ctx_t *c, int argc, char **argv, void *ud
     return rc;
 }
 
-/* ---- ai-get-rx <call-id> <max-bytes> — 输出 base64 PCMU ---- */
+/* ---- ai-get-rx <call-id> <max-bytes> — 输出 base64 PCM16 LE 8kHz mono（AI unified format) ---- */
 static int cmd_ai_get_rx(cmd_ctx_t *c, int argc, char **argv, void *ud)
 {
     if (!c || !c->io_printf) return NSBC_INVAL;
@@ -1538,7 +1538,7 @@ static int cmd_status(cmd_ctx_t *c, int argc, char **argv, void *ud)
  *
  * ⚠️ 不自动升 loglevel！sip_trace_dump 走 obs_sub_publish_trace（独立
  * TRACE topic），CLI 订阅 trace topic 就能实时收到，完全不依赖 loglevel。
- * 自动升 loglevel 是之前的严重 bug：全局 DEBUG 让所有模块的 DEBUG 日志
+ * auto-loglevel-upgrade was a severe old bug: global DEBUG floods all module DEBUG logs
  * 疯狂产出 → log topic 帧爆炸 → CLI event_hook 疯狂 poll → CPU 飙 200%+。
  * 需要看 DEBUG 日志的用户自己调 console loglevel。
  *

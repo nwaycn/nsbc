@@ -1,17 +1,21 @@
-/* vad_engine.c — AI barge-in VAD 引擎实现
+/* vad_engine.c — AI barge-in VAD 引擎实现（v2 生产级算法）
  *
- * 热路径约束：vad_on_rtp_frame 是 media_bug global consumer 回调，
- * 必须无锁、无阻塞、无 I/O、无 malloc。
+ * v2: production VAD algorithm ported from na_stream/VadWord
+ *   旧：单 RMS 固定阈值 + 二态 FSM → 噪音环境下漏检/误报
+ *   Butterworth HPF (DC+mains) + dual-window energy (NEAR vs FAR background)
+ *       + 自适应阈值 + 三态表驱动 FSM + 1s trace ring + 120ms pre-roll
  *
- * 状态表：固定大小数组 + call_key 线性探查哈希。
- * 每帧工作：查表 → rtp_parse → pt=0/8 → g711_decode → RMS → 状态机 → 变化时 ring_push。
+ * 热路径约束：vad_on_rtp_frame 是 media_bug global consumer 回调
+ *   —— 必须无锁、无阻塞、无 I/O、无 malloc。
  *
- * 并发模型（P1 修复）：
+ * 并发模型（继承 + 增强）：
  *   - g_states 数组加全局 pthread_mutex_t g_states_lock — OAM 线程
  *     （vad_start_for_call/vad_stop_for_call）和热路径（vad_on_rtp_frame）
  *     并发读写 g_states[idx].active/call_key/threshold/state 时持锁。
  *     锁内只做简单赋值（<10ns），不会阻塞；
  *   - g_ring.shutdown 从 volatile 改成 _Atomic int，跨线程可见性保证。
+ *   - 热路径 producer 无锁写 ring.tail（atomic store_release），
+ *     consumer 侧读 tail（atomic load_acquire）后取事件。
  */
 
 #include "vad_engine.h"
@@ -20,12 +24,12 @@
 #include "nsbc_common.h"    /* nsbc_rc_t, NSBC_OK */
 #include "media_codec.h"   /* CODEC_PCMU=0, CODEC_PCMA=8 */
 #include "g711.h"           /* g711_ulaw_decode, g711_alaw_decode */
-#include "uDS_client.h"     /* uds_send_session —— P1: 推 JSON VAD_EVENT 到 data.sock */
+#include "uDS_client.h"     /* uds_send_vad —— 推 JSON VAD_EVENT 到 data.sock */
 #include "log.h"
 
 #include <math.h>
 #include <pthread.h>
-#include <stdatomic.h>      /* P1: _Atomic */
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,33 +37,127 @@
 #include <time.h>
 #include <unistd.h>
 
-/* ===== per-call per-leg 状态槽 ===== */
+/* ============================================================================
+ * ===== HPF：二阶 Butterworth 高通滤波器（RBJ Cookbook 系数）=====
+ *   strips DC offset and 50Hz mains hum. Direct Form I, hot-path friendly.
+ *  vad_hpf_t 类型定义已移至 vad_engine.h（跨模块共享）。
+ * ==========================================================================*/
+
+void vad_hpf_init(vad_hpf_t *hpf, float cutoff_hz, float sample_rate) {
+    if (!hpf || sample_rate <= 0.0f) return;
+    if (cutoff_hz < 1.0f) cutoff_hz = 1.0f;
+    if (cutoff_hz > sample_rate * 0.49f) cutoff_hz = sample_rate * 0.49f;
+
+    memset(hpf, 0, sizeof(*hpf));
+    const float omega = 2.0f * 3.14159265f * cutoff_hz / sample_rate;
+    const float cos_omega = cosf(omega);
+    const float sin_omega = sinf(omega);
+    const float alpha = sin_omega / (2.0f * VAD_HPF_Q_BUTTER);
+
+    const float a0_inv = 1.0f / (1.0f + alpha);
+
+    /* RBJ Cookbook Highpass */
+    hpf->b0 =  (1.0f + cos_omega) * 0.5f * a0_inv;
+    hpf->b1 = -(1.0f + cos_omega) * a0_inv;
+    hpf->b2 =  (1.0f + cos_omega) * 0.5f * a0_inv;
+    hpf->a1 = (-2.0f * cos_omega) * a0_inv;
+    hpf->a2 =  (1.0f - alpha) * a0_inv;
+}
+
+/* Direct Form I 处理一帧 PCM（16bit LE mono）。热路径零 malloc。*/
+void vad_hpf_process(vad_hpf_t *hpf, int16_t *pcm, size_t samples) {
+    if (!hpf || !pcm || samples == 0) return;
+    /* b0==0 && a1==0 说明没初始化过 → 直通 */
+    if (hpf->b0 == 0.0f && hpf->a1 == 0.0f) return;
+
+    float x1 = hpf->x1, x2 = hpf->x2;
+    float y1 = hpf->y1, y2 = hpf->y2;
+
+    for (size_t i = 0; i < samples; ++i) {
+        const float x = (float)pcm[i];
+        /* Direct Form I: y[n] = b0*x + b1*x1 + b2*x2 - a1*y1 - a2*y2 */
+        float y = hpf->b0 * x + hpf->b1 * x1 + hpf->b2 * x2
+                - hpf->a1 * y1 - hpf->a2 * y2;
+
+        /* 去 denormal（极小值会导致 CPU 飙升）*/
+        if (fabsf(y) < 1.0e-10f) y = 0.0f;
+
+        /* 饱和 */
+        if (y >  32767.0f) y =  32767.0f;
+        if (y < -32768.0f) y = -32768.0f;
+
+        pcm[i] = (int16_t)lrintf(y);
+
+        x2 = x1; x1 = x;
+        y2 = y1; y1 = y;
+    }
+
+    hpf->x1 = x1; hpf->x2 = x2;
+    hpf->y1 = y1; hpf->y2 = y2;
+}
+
+/* ============================================================================
+ * ===== per-call per-leg 状态槽（v2 扩展）=====
+ *
+ * 固定大小数组预分配。256 calls × 32KB ≈ 8MB 静态内存，可接受。
+ * 热路径只查 active==1 的槽。
+ * ==========================================================================*/
 typedef struct {
-    void        *call_key;          /* NULL = 空槽 */
-    uint16_t     threshold;          /* RMS 阈值（可变，uuid_vad_start 可覆盖） */
-    vad_state_t  state[VAD_LEGS_PER_CALL];
-    int          hangover_frames[VAD_LEGS_PER_CALL]; /* 连续同状态帧数 */
-    uint16_t     last_rms[VAD_LEGS_PER_CALL];        /* 上一帧 RMS（诊断） */
+    /* --- 固定小字段（cache line 友好）--- */
+    void        *call_key;
     int          active;
+
+    /* --- 状态（每 leg 独立）--- */
+    vad_state_t  state[VAD_LEGS_PER_CALL];
+    uint16_t     threshold[VAD_LEGS_PER_CALL];     /* 自适应阈值 */
+    uint16_t     last_rms[VAD_LEGS_PER_CALL];      /* 诊断 */
+
+    /* --- 双窗口能量（每 leg 独立）--- */
+    double       near_power[VAD_LEGS_PER_CALL];    /* 近窗累加值 */
+    double       far_power[VAD_LEGS_PER_CALL];     /* 远窗累加值 */
+    double       active_begin_far[VAD_LEGS_PER_CALL]; /* 进入 SPEECH 时的 far_power 快照 */
+
+    /* --- 状态机计数（sample 单位）--- */
+    int          active_count[VAD_LEGS_PER_CALL];
+    int          silence_count[VAD_LEGS_PER_CALL];
+    int          last_silence_trace[VAD_LEGS_PER_CALL];
+    int          active_begin_trace[VAD_LEGS_PER_CALL];
+
+    /* --- HPF 状态（每 leg 独立）--- */
+    vad_hpf_t    hpf[VAD_LEGS_PER_CALL];
+
+    /* --- 1s Trace ring（每 leg 独立环形缓冲）--- */
+    int          trace_wpos[VAD_LEGS_PER_CALL];
+    short        trace_data[VAD_LEGS_PER_CALL][VAD_TRACE_SIZE];
 } vad_call_state_t;
 
 static vad_call_state_t g_states[VAD_MAX_CALLS];
-static pthread_mutex_t g_states_lock;  /* P1: 全局状态表锁 */
+static pthread_mutex_t g_states_lock;  /* OAM 线程持有，热路径快速查询 */
 
-/* ===== MPSC ring（状态变化异步推送）===== */
+/* ============================================================================
+ * ===== MPSC ring（状态变化异步推送）=====
+ *
+ * producer（热路径 vad_state_step）：无锁写 tail + atomic store_release
+ * consumer（vad_worker 线程）：atomic load_acquire 读 tail
+ *
+ * 只在状态从 SILENCE→SPEECH 或 SPEECH/HESITATION→SILENCE 时推事件。
+ * HESITATION 中间停顿也推事件（让外部知道"说一半歇气了"）。
+ * ==========================================================================*/
 typedef struct {
     vad_event_t slots[VAD_RING_SIZE];
     uint32_t    head;           /* consumer 读 */
     uint32_t    tail;           /* producer 写 */
     pthread_cond_t not_empty;
     pthread_mutex_t lock;      /* consumer 侧用（热路径 producer 无锁） */
-    _Atomic int  shutdown;      /* P1: _Atomic — 跨线程可见性 */
+    _Atomic int  shutdown;
 } vad_ring_t;
 
 static vad_ring_t g_ring;
 static pthread_t g_worker_tid;
 
-/* ===== 工具函数 ===== */
+/* ============================================================================
+ * ===== 工具函数 =====
+ * ==========================================================================*/
 static inline uint64_t now_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -67,136 +165,383 @@ static inline uint64_t now_ns(void) {
 }
 
 /* call_key → 槽索引（线性探查，空槽 = NULL）
- * 调用者须已持 g_states_lock（P1 并发保护）。 */
+ * 调用者须已持 g_states_lock。*/
 static int find_or_alloc_slot(void *call_key) {
-    uintptr_t h = ((uintptr_t)call_key) >> 4; /* 低地址对齐 */
-    for (int i = 0; i < VAD_MAX_CALLS; ++i) {
-        int idx = (h + i) % VAD_MAX_CALLS;
-        if (!g_states[idx].call_key) {
-            g_states[idx].call_key = call_key;
-            g_states[idx].threshold = VAD_DEFAULT_THRESHOLD;
-            g_states[idx].active = 1;
-            g_states[idx].state[0] = VAD_STATE_SILENCE;
-            g_states[idx].state[1] = VAD_STATE_SILENCE;
-            g_states[idx].hangover_frames[0] = 0;
-            g_states[idx].hangover_frames[1] = 0;
-            g_states[idx].last_rms[0] = 0;
-            g_states[idx].last_rms[1] = 0;
-            return idx;
-        }
-        if (g_states[idx].call_key == call_key && g_states[idx].active)
-            return idx;
-    }
-    return -1; /* 满了 */
-}
-
-/* 调用者须已持 g_states_lock（P1 并发保护）。 */
-static int find_slot(void *call_key) {
     uintptr_t h = ((uintptr_t)call_key) >> 4;
     for (int i = 0; i < VAD_MAX_CALLS; ++i) {
         int idx = (h + i) % VAD_MAX_CALLS;
-        if (!g_states[idx].call_key) return -1; /* 空槽 */
+        if (!g_states[idx].call_key) {
+            memset(&g_states[idx], 0, sizeof(g_states[idx]));
+            g_states[idx].call_key = call_key;
+            for (int leg = 0; leg < VAD_LEGS_PER_CALL; ++leg) {
+                g_states[idx].state[leg] = VAD_STATE_SILENCE;
+                g_states[idx].threshold[leg] = VAD_ACTIVE_VOLUME_THRESHOLD;
+                vad_hpf_init(&g_states[idx].hpf[leg], (float)VAD_HPF_CUTOFF_HZ, 8000.0f);
+            }
+            g_states[idx].active = 1;
+            return idx;
+        }
         if (g_states[idx].call_key == call_key && g_states[idx].active)
             return idx;
     }
     return -1;
 }
 
-/* ===== 热路径：RMS 计算 ===== */
+static int find_slot(void *call_key) {
+    uintptr_t h = ((uintptr_t)call_key) >> 4;
+    for (int i = 0; i < VAD_MAX_CALLS; ++i) {
+        int idx = (h + i) % VAD_MAX_CALLS;
+        if (!g_states[idx].call_key) return -1;
+        if (g_states[idx].call_key == call_key && g_states[idx].active)
+            return idx;
+    }
+    return -1;
+}
+
+/* ============================================================================
+ * ===== 热路径：双窗口能量滑动更新（每 sample 调用）=====
+ *
+ * NEAR 近窗滑 N 步就减一帧；FAR 远窗滑 M 步就减一帧（背景噪声基线）。
+ * 时间 O(1) per sample —— 只加只减。
+ * ==========================================================================*/
+static inline void power_update_sliding(vad_call_state_t *cs, int leg,
+                                        const int16_t *pcm, size_t samples) {
+    double *near = &cs->near_power[leg];
+    double *far  = &cs->far_power[leg];
+    short  *ring = cs->trace_data[leg];
+    int    *wpos = &cs->trace_wpos[leg];
+
+    for (size_t i = 0; i < samples; ++i) {
+        double abs_s = (double)abs(pcm[i]);
+
+        /* trace ring 写入（环形）*/
+        ring[*wpos % VAD_TRACE_SIZE] = pcm[i];
+        (*wpos)++;
+
+        /* NEAR：滑窗更新 —— 加新 sample，减最老的 */
+        double drop_near = (double)abs(ring[(*wpos - VAD_NEAR_SAMPLES + VAD_TRACE_SIZE) % VAD_TRACE_SIZE]);
+        *near += abs_s - drop_near;
+
+        /* FAR：滑窗更新 —— 加新 sample，减最老的背景样本 */
+        double drop_far = (double)abs(ring[(*wpos - VAD_FAR_SAMPLES + VAD_TRACE_SIZE) % VAD_TRACE_SIZE]);
+        *far += abs_s - drop_far;
+    }
+}
+
+/* 近窗平均（VAD_NEAR_SAMPLES 个 sample 的 avg abs）*/
+static inline double near_ave(vad_call_state_t *cs, int leg) {
+    return cs->near_power[leg] / (double)VAD_NEAR_SAMPLES;
+}
+/* 远窗平均（VAD_FAR_SAMPLES 个 sample 的 avg abs）—— 背景噪声基线 */
+static inline double far_ave(vad_call_state_t *cs, int leg) {
+    return cs->far_power[leg] / (double)VAD_FAR_SAMPLES;
+}
+
+/* ============================================================================
+ * ===== 热路径：RMS 计算（诊断用）=====
+ * ==========================================================================*/
 static inline uint16_t compute_rms_pcm(const int16_t *pcm, size_t samples) {
     if (!pcm || samples == 0) return 0;
-    /* 用 32bit 累加避免溢出 */
     int32_t sum_sq = 0;
     for (size_t i = 0; i < samples; ++i) {
         int32_t s = (int32_t)pcm[i];
         sum_sq += s * s;
     }
-    /* 近似：用移位代替 sqrt（热路径优化）
-     * 但这里直接用 sqrt —— VAD 是可选功能，perf 优先但不差这一点 */
     double mean = (double)sum_sq / (double)samples;
     return (uint16_t)(mean > 0.0 ? sqrt(mean) : 0.0);
 }
 
-/* ===== 热路径：状态机 ===== */
-static inline void vad_state_step(vad_call_state_t *cs, int leg, uint16_t rms) {
-    cs->last_rms[leg] = rms;
-    int above = (rms >= cs->threshold);
+/* ============================================================================
+ * ===== 表驱动三态 FSM —— 状态转换 + 事件投递 =====
+ *
+ * 设计约束（nsbc-fsm skill）：
+ *   - 状态转换表驱动，禁止深层 if-else
+ *   - 动作函数纯粹：只做副作用（推 ring、更新计数），不写状态
+ *   - 状态变更由 dispatch 统一控制
+ *
+ * 稳定约束（stability-first P0）：
+ *   - 热路径零 malloc、零锁（无锁写 ring.tail，atomic store_release）
+ *   - HPF applied post-decode, so DC offset/mains hum does not bias energy estimation
+ * ==========================================================================*/
 
-    if (cs->state[leg] == VAD_STATE_SILENCE) {
-        if (above) {
-            cs->hangover_frames[leg]++;
-            if (cs->hangover_frames[leg] >= VAD_SPEECH_FRAMES) {
-                cs->state[leg] = VAD_STATE_SPEECH;
-                cs->hangover_frames[leg] = 0;
-                /* 状态变化 → 异步投递 VAD_EVENT_SPEECH */
-                vad_event_t ev = {
-                    .call_key = cs->call_key,
-                    .leg      = leg,
-                    .new_state = VAD_STATE_SPEECH,
-                    .rms      = rms,
-                    .timestamp_ns = now_ns(),
-                };
-                /* 热路径：直接写 ring.tail（无锁），满了丢 */
-                uint32_t next = (g_ring.tail + 1) & (VAD_RING_SIZE - 1);
-                if (next != g_ring.head) {
-                    g_ring.slots[g_ring.tail] = ev;
-                    __atomic_store_n(&g_ring.tail, next, __ATOMIC_RELEASE);
-                    pthread_cond_signal(&g_ring.not_empty); /* 有锁开销，但只在状态变化时调一次 */
-                }
-            }
-        } else {
-            cs->hangover_frames[leg] = 0; /* 没连续超阈值 → 重置 */
+/* 状态机输入条件（从当前能量/计数计算）*/
+typedef struct {
+    double near_a;         /* 近窗 avg abs */
+    double far_a;          /* 远窗 avg abs = 背景噪声基线 */
+    int    above_near_far; /* near > far × 倍率 → 能量上升 */
+    int    below_near_thr; /* near < threshold → 能量下降 */
+    int    sil_got_pause;  /* silence_count >= PAUSE_SILENCE_MIN_SAMPLES → 中间停 */
+    int    sil_got_start;  /* silence_count >= START_SILENCE_MIN_SAMPLES → 结束 */
+    int    act_got_pause;  /* active_count >= PAUSE_ACTIVE_MIN_SAMPLES → 继续说 */
+    int    act_got_start;  /* active_count >= START_ACTIVE_MIN_SAMPLES → 有效说话 */
+    double threshold_val;  /* 当前自适应 threshold */
+    double custom_thr;     /* 可配置的 active_begin_far 阈值覆盖 */
+} fsm_input_t;
+
+/* 动作函数 —— 只做副作用，不写 cs->state[leg] */
+static void act_push_event(vad_call_state_t *cs, int leg, vad_state_t new_state,
+                           uint16_t rms, uint16_t thresh, int preroll) {
+    vad_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.call_key   = cs->call_key;
+    ev.leg        = leg;
+    ev.new_state  = new_state;
+    ev.rms        = rms;
+    ev.threshold  = thresh;
+    ev.timestamp_ns = now_ns();
+
+    if (preroll) {
+        ev.has_preroll   = 1;
+        int pr = cs->trace_wpos[leg] - VAD_PREROLL_SAMPLES;
+        if (pr < 0) pr = 0;
+        ev.preroll_offset = pr;
+    }
+
+    /* MPSC ring 无锁写 —— 用 atomic store_release 保证 tail 递增后 consumer 可见 */
+    uint32_t next = (g_ring.tail + 1) & (VAD_RING_SIZE - 1);
+    uint32_t head = __atomic_load_n(&g_ring.head, __ATOMIC_ACQUIRE);
+    if (next != head) {
+        g_ring.slots[g_ring.tail] = ev;
+        __atomic_store_n(&g_ring.tail, next, __ATOMIC_RELEASE);
+        pthread_cond_signal(&g_ring.not_empty);
+    }
+    /* ring 满了就丢 —— VAD_EVENT 是诊断/边界信息，丢了主路径不崩 */
+}
+
+static void act_enter_speech(vad_call_state_t *cs, int leg, const fsm_input_t *in,
+                             uint16_t rms) {
+    /* 记录进入 SPEECH 的时刻和 far_power 快照（自适应 threshold 基线）*/
+    cs->active_begin_far[leg] = in->far_a > 0.0 ? in->far_a : 30.0;
+    cs->active_begin_trace[leg] = cs->trace_wpos[leg];
+    cs->active_count[leg] = 0;
+    cs->silence_count[leg] = 0;
+    cs->threshold[leg] = (uint16_t)in->threshold_val;
+
+    act_push_event(cs, leg, VAD_STATE_SPEECH, rms, cs->threshold[leg], 1 /* preroll */);
+}
+
+static void act_enter_hesitation(vad_call_state_t *cs, int leg, uint16_t rms) {
+    cs->silence_count[leg] = 0;
+    cs->threshold[leg] = VAD_ACTIVE_VOLUME_THRESHOLD / 2;  /* 中间歇气时降低阈值 —— 更快重新进入 SPEECH */
+    act_push_event(cs, leg, VAD_STATE_HESITATION, rms, cs->threshold[leg], 0);
+}
+
+static void act_enter_silence(vad_call_state_t *cs, int leg, uint16_t rms) {
+    cs->last_silence_trace[leg] = cs->trace_wpos[leg];
+    cs->active_count[leg] = 0;
+    cs->silence_count[leg] = 0;
+    cs->threshold[leg] = VAD_ACTIVE_VOLUME_THRESHOLD;  /* 回到默认高阈值 */
+    act_push_event(cs, leg, VAD_STATE_SILENCE, rms, cs->threshold[leg], 0);
+}
+
+/* FSM 转换表 —— 每一行 = (from_state, condition_check, new_state, action_func)
+ * dispatch 按 from_state 扫描，第一个匹配条件命中就执行 action 并推进状态。*/
+typedef void (*fsm_action_t)(vad_call_state_t *, int, const fsm_input_t *, uint16_t);
+
+typedef struct {
+    vad_state_t   from;
+    int           condition;   /* 条件码（见下方 enum），0=恒真 */
+    vad_state_t   to;
+    fsm_action_t  action;
+} fsm_transition_t;
+
+/* 条件码 —— 用整数字段简化表驱动查找 */
+enum {
+    FSM_COND_ALWAYS = 0,
+    /* SILENCE 状态 */
+    FSM_COND_SIL_TO_SPEECH,       /* near>far*3 & far>threshold*2 → 正常开始说话 */
+    FSM_COND_SIL_TO_SPEECH_BURST, /* near>threshold*3 & far>near*3 → 突发开始 */
+    /* SPEECH 状态 */
+    FSM_COND_SPEECH_TO_SIL,       /* near<threshold & sil>=START_SILENCE → 说完了 */
+    FSM_COND_SPEECH_TO_HESIT,     /* near<threshold & sil>=PAUSE_SILENCE → 中间歇气 */
+    /* HESITATION 状态 */
+    FSM_COND_HESIT_TO_SPEECH,     /* near>far*3 & act>=PAUSE_ACTIVE → 继续说 */
+    FSM_COND_HESIT_TO_SIL,        /* sil>=START_SILENCE → 歇太长=说完了 */
+};
+
+/* SILENCE → SPEECH：必须满足 near>far 且 far_power 相对 active_begin_far 有足够倍率 */
+static int cond_sil_to_speech(vad_call_state_t *cs, int leg, const fsm_input_t *in) {
+    double far_thr = (in->custom_thr > 0.0) ? in->custom_thr : cs->active_begin_far[leg];
+    if (far_thr < 30.0) far_thr = 30.0;  /* fallback */
+
+    /* 条件 1：near > far（能量开始上升）且 far_power 是背景噪声的 2-3 倍 */
+    if (in->above_near_far > 0 && in->far_a > far_thr * 2.0 && in->far_a > VAD_SILENCE_VOLUME_THRESHOLD * 2.0) {
+        /* 有效说话 —— 还需要 active_count >= START_ACTIVE_MIN_SAMPLES */
+        if (cs->active_count[leg] >= VAD_START_ACTIVE_MIN_SAMPLES) return 1;
+    }
+    return 0;
+}
+
+/* SILENCE → SPEECH（突发）：near 突然跳到大值，不用等 far_power 提升 */
+static int cond_sil_to_speech_burst(vad_call_state_t *cs, int leg, const fsm_input_t *in) {
+    if (in->above_near_far > 0 && in->far_a > in->near_a * 3.0) {
+        if (cs->active_count[leg] >= VAD_START_ACTIVE_MIN_SAMPLES) return 1;
+    }
+    return 0;
+}
+
+/* SPEECH → SILENCE：near < threshold 且 silence_count >= 150ms */
+static int cond_speech_to_sil(vad_call_state_t *cs, int leg, const fsm_input_t *in) {
+    (void)cs; (void)leg;
+    return (in->below_near_thr && in->sil_got_start);
+}
+
+/* SPEECH → HESITATION：near < threshold 且 silence_count >= 40ms */
+static int cond_speech_to_hesit(vad_call_state_t *cs, int leg, const fsm_input_t *in) {
+    (void)cs; (void)leg;
+    return (in->below_near_thr && in->sil_got_pause && !in->sil_got_start);
+}
+
+/* HESITATION → SPEECH：near 又上来了 */
+static int cond_hesit_to_speech(vad_call_state_t *cs, int leg, const fsm_input_t *in) {
+    (void)cs; (void)leg;
+    return (in->above_near_far > 0 && in->act_got_pause);
+}
+
+/* HESITATION → SILENCE：歇气太久（>=150ms）*/
+static int cond_hesit_to_sil(vad_call_state_t *cs, int leg, const fsm_input_t *in) {
+    (void)cs; (void)leg;
+    return (in->sil_got_start);
+}
+
+/* 动作函数：dispatch 包装 */
+static void act_enter_speech_wrap(vad_call_state_t *cs, int leg, const fsm_input_t *in, uint16_t rms) {
+    act_enter_speech(cs, leg, in, rms);
+}
+static void act_enter_hesit_wrap(vad_call_state_t *cs, int leg, const fsm_input_t *in, uint16_t rms) {
+    (void)in;
+    act_enter_hesitation(cs, leg, rms);
+}
+static void act_enter_sil_wrap(vad_call_state_t *cs, int leg, const fsm_input_t *in, uint16_t rms) {
+    (void)in;
+    act_enter_silence(cs, leg, rms);
+}
+
+/* 转换表 —— 按 from_state 分组；每条 transition 先检查前一条条件，
+ * 未命中就继续往下扫。last 行恒真 catch-all（SPEECH/SILENCE 保持不变）。*/
+static const fsm_transition_t FSM_TABLE[] = {
+    /* ===== SILENCE 状态（0）===== */
+    { VAD_STATE_SILENCE,    FSM_COND_SIL_TO_SPEECH,         VAD_STATE_SPEECH,     act_enter_speech_wrap   },
+    { VAD_STATE_SILENCE,    FSM_COND_SIL_TO_SPEECH_BURST,   VAD_STATE_SPEECH,     act_enter_speech_wrap   },
+    /* catch-all：保持 SILENCE */
+    { VAD_STATE_SILENCE,    FSM_COND_ALWAYS,                VAD_STATE_SILENCE,    NULL                    },
+
+    /* ===== SPEECH 状态（1）===== */
+    { VAD_STATE_SPEECH,     FSM_COND_SPEECH_TO_SIL,         VAD_STATE_SILENCE,    act_enter_sil_wrap      },
+    { VAD_STATE_SPEECH,     FSM_COND_SPEECH_TO_HESIT,       VAD_STATE_HESITATION, act_enter_hesit_wrap    },
+    /* catch-all：保持 SPEECH —— 更新自适应 threshold */
+    { VAD_STATE_SPEECH,     FSM_COND_ALWAYS,                VAD_STATE_SPEECH,     NULL                    },
+
+    /* ===== HESITATION 状态（2）===== */
+    { VAD_STATE_HESITATION, FSM_COND_HESIT_TO_SIL,          VAD_STATE_SILENCE,    act_enter_sil_wrap      },
+    { VAD_STATE_HESITATION, FSM_COND_HESIT_TO_SPEECH,       VAD_STATE_SPEECH,     act_enter_speech_wrap   },
+    /* catch-all：保持 HESITATION */
+    { VAD_STATE_HESITATION, FSM_COND_ALWAYS,                VAD_STATE_HESITATION, NULL                    },
+};
+
+static const int FSM_TABLE_SIZE = (int)(sizeof(FSM_TABLE) / sizeof(FSM_TABLE[0]));
+
+/* dispatch：从 from_state 开始扫表，第一个匹配条件的 transition 执行 */
+static inline void fsm_step(vad_call_state_t *cs, int leg, uint16_t rms,
+                            double near_a, double far_a, double custom_thr,
+                            int frame_samples) {
+    const vad_state_t from = cs->state[leg];
+
+    /* --- 动态计算条件 --- */
+    fsm_input_t in;
+    memset(&in, 0, sizeof(in));
+    in.near_a = near_a;
+    in.far_a  = far_a;
+    in.above_near_far = (near_a > far_a) ? 1 : 0;
+    in.below_near_thr = (near_a < (double)cs->threshold[leg]) ? 1 : 0;
+    in.sil_got_pause  = (cs->silence_count[leg] >= VAD_PAUSE_SILENCE_MIN_SAMPLES) ? 1 : 0;
+    in.sil_got_start  = (cs->silence_count[leg] >= VAD_START_SILENCE_MIN_SAMPLES) ? 1 : 0;
+    in.act_got_pause  = (cs->active_count[leg] >= VAD_PAUSE_ACTIVE_MIN_SAMPLES) ? 1 : 0;
+    in.act_got_start  = (cs->active_count[leg] >= VAD_START_ACTIVE_MIN_SAMPLES) ? 1 : 0;
+    /* 自适应 threshold —— 取背景噪声的 3 倍 vs 600 上限 vs active_begin_far 的 2 倍 */
+    in.threshold_val = (double)cs->threshold[leg];  /* 先用旧值，下面更新 */
+    in.custom_thr    = custom_thr;
+
+    /* 自适应 threshold 动态更新（只在 SPEECH 状态更新）*/
+    if (from == VAD_STATE_SPEECH) {
+        double noise_based = in.far_a * 3.0;
+        double active_based = cs->active_begin_far[leg] * 2.0;
+        double auto_thr = noise_based;
+        if (auto_thr < active_based) auto_thr = active_based;
+        if (auto_thr < 60.0) auto_thr = 60.0;
+        if (auto_thr > (double)VAD_ACTIVE_VOLUME_THRESHOLD) auto_thr = VAD_ACTIVE_VOLUME_THRESHOLD;
+        in.threshold_val = auto_thr;
+        cs->threshold[leg] = (uint16_t)auto_thr;
+    }
+
+    /* --- 计数更新（sample 单位 —— 用本帧实际 samples 数）--- */
+    if (in.above_near_far > 0) {
+        cs->active_count[leg] += frame_samples;
+        cs->silence_count[leg] = 0;
+    } else {
+        cs->silence_count[leg] += frame_samples;
+        cs->active_count[leg] = 0;
+    }
+
+    /* --- 扫表 dispatch --- */
+    for (int i = 0; i < FSM_TABLE_SIZE; ++i) {
+        if (FSM_TABLE[i].from != from) continue;  /* 只扫 from_state 匹配的行 */
+
+        const fsm_transition_t *tr = &FSM_TABLE[i];
+        int match = 0;
+
+        switch (tr->condition) {
+            case FSM_COND_ALWAYS:                match = 1; break;
+            case FSM_COND_SIL_TO_SPEECH:         match = cond_sil_to_speech(cs, leg, &in); break;
+            case FSM_COND_SIL_TO_SPEECH_BURST:   match = cond_sil_to_speech_burst(cs, leg, &in); break;
+            case FSM_COND_SPEECH_TO_SIL:         match = cond_speech_to_sil(cs, leg, &in); break;
+            case FSM_COND_SPEECH_TO_HESIT:       match = cond_speech_to_hesit(cs, leg, &in); break;
+            case FSM_COND_HESIT_TO_SPEECH:       match = cond_hesit_to_speech(cs, leg, &in); break;
+            case FSM_COND_HESIT_TO_SIL:          match = cond_hesit_to_sil(cs, leg, &in); break;
         }
-    } else { /* SPEECH */
-        if (!above) {
-            cs->hangover_frames[leg]++;
-            if (cs->hangover_frames[leg] >= VAD_SILENCE_FRAMES) {
-                cs->state[leg] = VAD_STATE_SILENCE;
-                cs->hangover_frames[leg] = 0;
-                vad_event_t ev = {
-                    .call_key = cs->call_key,
-                    .leg      = leg,
-                    .new_state = VAD_STATE_SILENCE,
-                    .rms      = rms,
-                    .timestamp_ns = now_ns(),
-                };
-                uint32_t next = (g_ring.tail + 1) & (VAD_RING_SIZE - 1);
-                if (next != g_ring.head) {
-                    g_ring.slots[g_ring.tail] = ev;
-                    __atomic_store_n(&g_ring.tail, next, __ATOMIC_RELEASE);
-                    pthread_cond_signal(&g_ring.not_empty);
-                }
+
+        if (match) {
+            /* 状态变更（只有 from != to 才算真转换；catch-all 行 to==from）*/
+            if (from != tr->to) {
+                cs->state[leg] = tr->to;
+                if (tr->action) tr->action(cs, leg, &in, rms);
+            } else if (tr->action) {
+                /* catch-all 也可能有动作（但目前都是 NULL）*/
+                tr->action(cs, leg, &in, rms);
             }
-        } else {
-            cs->hangover_frames[leg] = 0;
+            return;  /* 第一个匹配就 dispatch */
         }
     }
 }
 
-/* ===== 热路径回调（media_bug global consumer）===== */
+/* ============================================================================
+ * ===== 热路径回调（media_bug global consumer）=====
+ *
+ * 每帧调用一次，典型帧长 20ms = 160 bytes G.711 payload → 160 samples PCM。
+ * 流程：
+ *   rtp_parse → pt=0/8 → g711_decode → HPF → 双窗口能量更新 → FSM step
+ * 锁策略：
+ *   - g_states_lock 保护 find_slot + cs 读写（持锁时间 <<10ns，只有简单赋值）
+ *   - ring.producer 无锁（atomic store_release 写 tail）
+ *   - worker consumer 用 condvar（不在此路径）
+ * ==========================================================================*/
 void vad_on_rtp_frame(media_bug_frame_t *frame, void *ud) {
     (void)ud;
     if (!frame || !frame->call_key || !frame->data || frame->data_len < 12) return;
-
-    /* 只处理 A/B 腿（0 或 1） */
     if (frame->leg != 0 && frame->leg != 1) return;
 
-    /* 自己 rtp_parse（media_bug dispatch 没填 pt/ssrc/seq/ts） */
+    /* 1) RTP parse */
     rtp_pkt_t pkt;
     nsbc_rc_t prc = rtp_parse(frame->data, frame->data_len, &pkt);
     if (prc != NSBC_OK) return;
+    if (pkt.pt != 0 && pkt.pt != 8) return;  /* 只处理 G.711 */
 
-    /* 只处理 G.711 PCMU(pt=0) / PCMA(pt=8) */
-    if (pkt.pt != 0 && pkt.pt != 8) return;
-
-    /* payload → PCM */
-    int16_t pcm_stack[320]; /* 最大 G.711 payload ≈ 320 字节 → 320 samples → 640B
-                             * rtp.hdr_len + payload ≤ RELAY_BUF ≈ 1500B，这里给 320 够 */
+    /* 2) G.711 → PCM16（项目已有的查表实现）*/
+    int16_t pcm_stack[320];  /* 最多 320 字节 payload = 320 samples = 640B */
     int16_t *pcm = pcm_stack;
     size_t pcm_cap = sizeof(pcm_stack) / sizeof(pcm_stack[0]);
 
     if (pkt.payload_len > pcm_cap) {
-        /* 大 payload 走临时缓冲区（热路径避免 malloc，但这里极少见） */
         static __thread int16_t pcm_large[8192];
         pcm = pcm_large;
         pcm_cap = sizeof(pcm_large) / sizeof(pcm_large[0]);
@@ -204,32 +549,61 @@ void vad_on_rtp_frame(media_bug_frame_t *frame, void *ud) {
     }
 
     size_t samples;
-    if (pkt.pt == 0) /* PCMU */
+    if (pkt.pt == 0)
         samples = g711_ulaw_decode(pkt.payload, pkt.payload_len, pcm);
-    else /* PCMA */
+    else
         samples = g711_alaw_decode(pkt.payload, pkt.payload_len, pcm);
-
     if (samples == 0) return;
 
-    /* RMS → 状态机
-     * P1: 持 g_states_lock — 保护 find_slot + vad_state_step 对 g_states 的读写 */
+    /* 3) HPF strip DC + mains — zero-malloc hot path, per-leg state from cs->hpf[leg] */
+    /* 锁内取 hp 指针，但 HPF 本身是无状态处理（只读写 hpf->x1/y1 等）
+     * 这里 hpf 的 x1/y1/x2/y2 读写和 cs 其他字段一起被 g_states_lock 保护 */
+
+    /* 4) RMS（诊断）—— 在 HPF 之后计算，干净的 PCM */
     uint16_t rms = compute_rms_pcm(pcm, samples);
+
+    /* 5) 持锁：查槽 → HPF → 能量 → FSM */
     pthread_mutex_lock(&g_states_lock);
     int idx = find_slot(frame->call_key);
-    if (idx >= 0)
-        vad_state_step(&g_states[idx], frame->leg, rms);
+    if (idx >= 0) {
+        vad_call_state_t *cs = &g_states[idx];
+        int leg = frame->leg;
+
+        /* 5a) HPF 处理 */
+        vad_hpf_process(&cs->hpf[leg], pcm, samples);
+
+        /* 5b) 双窗口能量更新（滑窗 + trace ring）*/
+        power_update_sliding(cs, leg, pcm, samples);
+
+        /* 5c) 取 avg */
+        double near_a = near_ave(cs, leg);
+        double far_a  = far_ave(cs, leg);
+
+        /* 5d) FSM step —— 可能推 ring（状态变化时）
+         * samples = 本帧实际 PCM 样本数（G.711 默认 160，异常时可能不同）*/
+        fsm_step(cs, leg, rms, near_a, far_a, (double)cs->threshold[leg], (int)samples);
+
+        /* 5e) 更新诊断 RMS */
+        cs->last_rms[leg] = rms;
+    }
     pthread_mutex_unlock(&g_states_lock);
 }
 
-/* ===== Worker 线程：异步推 data.sock VAD_EVENT（P1 升级）=====
+/* ============================================================================
+ * ===== Worker 线程：异步推 data.sock VAD_EVENT =====
  *
- * 复用 uds_send_session（通用 JSON 推送，data.sock Event Bus 协议）。
- * JSON schema: {"event":"VAD_EVENT","call_key":"0x%p","leg":0,"state":"SPEECH|SILENCE","rms":N,"ts_ns":N} */
+ * 复用 uds_send_vad（通用 JSON 推送，data.sock Event Bus 协议）。
+ * JSON schema:
+ *   {"event":"VAD_EVENT","call_key":"0x%p","leg":0,
+ *    "state":"SPEECH|SILENCE|HESITATION",
+ *    "rms":N,"threshold":N,"ts_ns":N,"has_preroll":1}
+ * ==========================================================================*/
 static void *vad_worker(void *arg) {
     (void)arg;
-    llog(LOG_NOTICE, "vad", "worker started (P1: data.sock VAD_EVENT push)");
+    llog(LOG_NOTICE, "vad", "worker started (v2: adaptive VAD + HPF + trace ring)");
 
-    while (!atomic_load(&g_ring.shutdown)) {  /* P1: _Atomic 读 */
+
+    while (!atomic_load(&g_ring.shutdown)) {
         uint32_t tail = __atomic_load_n(&g_ring.tail, __ATOMIC_ACQUIRE);
         if (g_ring.head == tail) {
             pthread_mutex_lock(&g_ring.lock);
@@ -238,31 +612,45 @@ static void *vad_worker(void *arg) {
             continue;
         }
 
+        /* 取一个事件 */
         vad_event_t ev = g_ring.slots[g_ring.head];
         __atomic_store_n(&g_ring.head, (g_ring.head + 1) & (VAD_RING_SIZE - 1), __ATOMIC_RELEASE);
 
-        /* P1: 推 JSON VAD_EVENT 到 data.sock Event Bus */
-        const char *state_str = (ev.new_state == VAD_STATE_SPEECH) ? "SPEECH" : "SILENCE";
-        char json[256];
-        int n = snprintf(json, sizeof(json),
-            "{\"event\":\"VAD_EVENT\",\"call_key\":\"%p\",\"leg\":%d,\"state\":\"%s\",\"rms\":%u,\"ts_ns\":%lu}",
-            ev.call_key, ev.leg, state_str, ev.rms, (unsigned long)ev.timestamp_ns);
-        if (n > 0 && n < (int)sizeof(json)) {
-            uds_send_vad(json);   /* 异步非阻塞：UDS 内部有 ring buffer，kind="vad_event" */
+        const char *state_str;
+        switch (ev.new_state) {
+            case VAD_STATE_SPEECH:     state_str = "SPEECH"; break;
+            case VAD_STATE_HESITATION: state_str = "HESITATION"; break;
+            default:                   state_str = "SILENCE"; break;
         }
 
-        /* 同时打 audit log（调试用） */
-        llog(LOG_INFO, "vad", "VAD_EVENT call=%p leg=%d state=%s rms=%u",
-             ev.call_key, ev.leg, state_str, ev.rms);
+        char json[384];
+        int n = snprintf(json, sizeof(json),
+            "{\"event\":\"VAD_EVENT\",\"call_key\":\"%p\",\"leg\":%d,\"state\":\"%s\","
+            "\"rms\":%u,\"threshold\":%u,\"ts_ns\":%lu,"
+            "\"has_preroll\":%d,\"preroll_offset\":%d}",
+            ev.call_key, ev.leg, state_str,
+            ev.rms, ev.threshold, (unsigned long)ev.timestamp_ns,
+            ev.has_preroll, ev.preroll_offset);
+
+        if (n > 0 && n < (int)sizeof(json)) {
+            uds_send_vad(json);
+        }
+
+        /* audit log（只打状态变化，HESITATION 中间停顿不打 —— 太吵）*/
+        if (ev.new_state != VAD_STATE_HESITATION) {
+            llog(LOG_INFO, "vad", "VAD_EVENT call=%p leg=%d state=%s rms=%u thr=%u preroll=%d",
+                 ev.call_key, ev.leg, state_str, ev.rms, ev.threshold, ev.has_preroll);
+        }
     }
 
     llog(LOG_NOTICE, "vad", "worker stopped");
     return NULL;
 }
 
-/* ===== 生命周期 ===== */
+/* ============================================================================
+ * ===== 生命周期 =====
+ * ==========================================================================*/
 
-/* 文件级 static consumer：init 时注册，shutdown 时注销（需要指针匹配） */
 static const media_bug_consumer_t kVadConsumer = {
     .name      = "vad_engine",
     .type_mask = BUG_RAW_RTP,
@@ -277,79 +665,87 @@ int vad_engine_init(void) {
         return rc;
     }
 
-    /* P1: 初始化全局状态表锁 */
     pthread_mutex_init(&g_states_lock, NULL);
+    memset(g_states, 0, sizeof(g_states));
 
-    /* 初始化 ring */
     memset(&g_ring, 0, sizeof(g_ring));
     pthread_mutex_init(&g_ring.lock, NULL);
     pthread_cond_init(&g_ring.not_empty, NULL);
 
-    /* 起 worker 线程 */
     pthread_create(&g_worker_tid, NULL, vad_worker, NULL);
 
-    llog(LOG_NOTICE, "vad", "vad_engine initialized (consumer registered, worker started)");
+    llog(LOG_NOTICE, "vad", "vad_engine v2 initialized (adaptive VAD + HPF + trace ring + table-driven FSM)");
     return 0;
 }
 
 void vad_engine_shutdown(void) {
-    atomic_store(&g_ring.shutdown, 1);  /* P1: _Atomic 写 */
+    atomic_store(&g_ring.shutdown, 1);
     pthread_cond_signal(&g_ring.not_empty);
     pthread_join(g_worker_tid, NULL);
 
     pthread_mutex_destroy(&g_ring.lock);
     pthread_cond_destroy(&g_ring.not_empty);
 
-    /* 注销 media_bug consumer */
     media_bug_unregister_global_consumer(&kVadConsumer);
 
-    /* P1: 清空状态表（持锁） */
     pthread_mutex_lock(&g_states_lock);
     memset(g_states, 0, sizeof(g_states));
     pthread_mutex_unlock(&g_states_lock);
     pthread_mutex_destroy(&g_states_lock);
 
-    llog(LOG_NOTICE, "vad", "vad_engine shutdown complete");
+    llog(LOG_NOTICE, "vad", "vad_engine v2 shutdown complete");
 }
 
-/* ===== OAM 控制 ===== */
+/* ============================================================================
+ * ===== OAM 控制 =====
+ * ==========================================================================*/
 int vad_start_for_call(void *call_key, int leg_mask, uint16_t threshold) {
     if (!call_key) return -1;
-    pthread_mutex_lock(&g_states_lock);  /* P1 */
+    pthread_mutex_lock(&g_states_lock);
     int idx = find_or_alloc_slot(call_key);
     if (idx < 0) {
         pthread_mutex_unlock(&g_states_lock);
         llog(LOG_WARN, "vad", "VAD state table full (%d slots)", VAD_MAX_CALLS);
         return -1;
     }
-    if (threshold > 0) g_states[idx].threshold = threshold;
+
+    /* leg_mask 控制哪些 leg 启用 VAD（0=A, 1=B）—— v2 简化：两 leg 都启 */
+    for (int leg = 0; leg < VAD_LEGS_PER_CALL; ++leg) {
+        if (!(leg_mask & (1 << leg))) continue;
+        g_states[idx].state[leg] = VAD_STATE_SILENCE;
+        g_states[idx].threshold[leg] = threshold > 0 ? threshold : VAD_ACTIVE_VOLUME_THRESHOLD;
+        g_states[idx].last_rms[leg] = 0;
+        g_states[idx].near_power[leg] = 0;
+        g_states[idx].far_power[leg]  = 0;
+        g_states[idx].active_begin_far[leg] = 0;
+        g_states[idx].active_count[leg] = 0;
+        g_states[idx].silence_count[leg] = 0;
+        g_states[idx].last_silence_trace[leg] = 0;
+        g_states[idx].active_begin_trace[leg] = 0;
+        g_states[idx].trace_wpos[leg] = 0;
+        memset(g_states[idx].trace_data[leg], 0, sizeof(g_states[idx].trace_data[leg]));
+        vad_hpf_init(&g_states[idx].hpf[leg], (float)VAD_HPF_CUTOFF_HZ, 8000.0f);
+    }
     g_states[idx].active = 1;
-    g_states[idx].state[0] = VAD_STATE_SILENCE;
-    g_states[idx].state[1] = VAD_STATE_SILENCE;
-    g_states[idx].hangover_frames[0] = 0;
-    g_states[idx].hangover_frames[1] = 0;
 
     llog(LOG_NOTICE, "vad", "vad_start call=%p leg_mask=%d threshold=%u slot=%d",
-         call_key, leg_mask, g_states[idx].threshold, idx);
+         call_key, leg_mask, g_states[idx].threshold[0], idx);
     pthread_mutex_unlock(&g_states_lock);
     return 0;
 }
 
 int vad_stop_for_call(void *call_key) {
     if (!call_key) return -1;
-    pthread_mutex_lock(&g_states_lock);  /* P1 */
+    pthread_mutex_lock(&g_states_lock);
     int idx = find_slot(call_key);
     if (idx >= 0) {
         g_states[idx].active = 0;
         g_states[idx].call_key = NULL;
     }
     pthread_mutex_unlock(&g_states_lock);
-
-    llog(LOG_NOTICE, "vad", "vad_stop call=%p slot=%d", call_key, idx);
-    return idx >= 0 ? 0 : 0;  /* 本来就没监控也算 OK */
+    return idx >= 0 ? 0 : 0;
 }
 
-/* REQ-AI-BARGEIN-001: 查询 per-call per-leg VAD 状态 —— 外部 AI barge-in 用 */
 int vad_query_for_call(void *call_key, int leg, vad_state_t *state_out, uint16_t *rms_out) {
     if (!call_key || !state_out || leg < 0 || leg >= VAD_LEGS_PER_CALL) return -1;
     pthread_mutex_lock(&g_states_lock);
@@ -362,7 +758,7 @@ int vad_query_for_call(void *call_key, int leg, vad_state_t *state_out, uint16_t
 }
 
 void vad_stop_all(void) {
-    pthread_mutex_lock(&g_states_lock);  /* P1 */
+    pthread_mutex_lock(&g_states_lock);
     for (int i = 0; i < VAD_MAX_CALLS; ++i) {
         if (g_states[i].active) {
             g_states[i].active = 0;
@@ -372,17 +768,58 @@ void vad_stop_all(void) {
     pthread_mutex_unlock(&g_states_lock);
 }
 
-/* ===== OAM 状态输出 ===== */
+/* v2 新增：取 pre-roll 数据（从 trace ring 向前回溯 120ms）
+ * out_ring_ptr → trace_data[leg] 起始指针（环形）
+ * out_start_idx → pre-roll 起始索引（0..VAD_TRACE_SIZE-1）
+ * out_samples → pre-roll 样本数（最多 960 = 120ms @8kHz）
+ *
+ * 外部使用：先读 out_ring_ptr[out_start_idx..TRACE_SIZE-1]，
+ *   若不够再读 out_ring_ptr[0..剩余数-1]（环形回绕）。
+ *   也可以直接：
+ *     memcpy(out_buf, out_ring_ptr + out_start_idx, remaining)
+ *     memcpy(out_buf + remaining, out_ring_ptr, pr - remaining)
+ */
+int vad_get_preroll(void *call_key, int leg,
+                    short **out_ring_ptr, int *out_start_idx, int *out_samples) {
+    if (!call_key || !out_ring_ptr || !out_start_idx || !out_samples
+        || leg < 0 || leg >= VAD_LEGS_PER_CALL)
+        return -1;
+
+    pthread_mutex_lock(&g_states_lock);
+    int idx = find_slot(call_key);
+    if (idx < 0 || !g_states[idx].active) { pthread_mutex_unlock(&g_states_lock); return -1; }
+
+    short *ring = g_states[idx].trace_data[leg];
+    int wpos    = g_states[idx].trace_wpos[leg];
+
+    /* 最多回溯 VAD_PREROLL_SAMPLES = 960 samples = 120ms */
+    int pr = VAD_PREROLL_SAMPLES;
+    if (pr > wpos) pr = wpos;
+
+    /* 环形回绕：从 wpos 向前数 pr 个 sample 的起点 */
+    int start = wpos - pr;
+    while (start < 0) start += VAD_TRACE_SIZE;
+    start %= VAD_TRACE_SIZE;
+
+    *out_ring_ptr   = ring;
+    *out_start_idx  = start;
+    *out_samples    = pr;
+
+    pthread_mutex_unlock(&g_states_lock);
+    return 0;
+}
+
+/* OAM 状态输出 */
 int vad_status(char *out, size_t outsz) {
     int active = 0;
-    pthread_mutex_lock(&g_states_lock);  /* P1: 读 active 也要锁保护 */
+    pthread_mutex_lock(&g_states_lock);
     for (int i = 0; i < VAD_MAX_CALLS; ++i)
         if (g_states[i].active) ++active;
     pthread_mutex_unlock(&g_states_lock);
 
     return snprintf(out, outsz,
-        "vad_engine: active_calls=%d ring_head=%u ring_tail=%u threshold_default=%u\n",
-        active, g_ring.head, g_ring.tail, VAD_DEFAULT_THRESHOLD);
+        "vad_engine v2: active_calls=%d ring_head=%u ring_tail=%u\n",
+        active, g_ring.head, g_ring.tail);
 }
 
 /*
