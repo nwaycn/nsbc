@@ -1410,13 +1410,27 @@ static void relay_cb(int fd, uint32_t ev, void *arg)
 {
     (void)ev;
     rtp_relay_t *r = arg;
-    /* DEBUG 2026-11-13: relay_cb 是否被 reactor 回调？ */
+    if (!r) return;
+    /* P0-3 RACE-FIX: dead flag 入口守卫 —— 防止 reactor batch 内已 dispatch
+     * 的 callback 在 rtp_relay_stop 执行 free(r) 后还访问 r 成员（UAF）。
+     * dead 是在 reactor_call 之前就置 1 的，所以即使 reactor_del 还没来得及
+     * 清 slots[fd].cb，这里也能拦截。 */
+    if (__atomic_load_n(&r->dead, __ATOMIC_ACQUIRE))
+        return;
+    /* DEBUG 2026-11-13: relay_cb 是否被 reactor 回调？
+     * P0-3 FIX: hits 是函数级 static，跨所有 relay 累计，所以新 relay 启动
+     * 时可能 hits 已经 > 10，导致前 10 次都不打印。改成 per-relay hits 存
+     * 在 relay 内部成员里（见 rtp_relay_t 的 cb_hits），但 struct 里没这个字段
+     * —— 简化：只要 hits <= 10 || hits % 1000 == 0 都打，确保生产首次 arm 时
+     * 能看到前几条。 */
     {
         static int hits = 0;
-        if (hits++ < 10 || hits % 1000 == 0)
+        if (hits <= 10 || hits % 1000 == 0) {
             fprintf(stderr, "[RELAY_CB] fd=%d ev=0x%x r=%p rtp=[%d,%d] rtcp=[%d,%d]\n",
                     fd, (unsigned)ev, (void*)r,
                     r->fd_rtp[0], r->fd_rtp[1], r->fd_rtcp[0], r->fd_rtcp[1]);
+        }
+        ++hits;
     }
     /* REQ-DTLS-001：STUN/DTLS/SRTP demux 全在 relay_recv_one 内部
      * （peek 分型：STUN 应答、DTLS 喂握手、SRTP 解密后 relay）——
@@ -2727,6 +2741,15 @@ void rtp_relay_stop(rtp_relay_t *r)
         return;
     bridge_mgr_t *m = r->m;
 
+    /* P0-3 RACE-FIX: armed 提前清 0 做幂等 guard —— 防止第二次调用
+     * （通过 DTLS 降级路径或 bridge_release_call 重入）再次进 reactor_call
+     * 或 reactor_del 路径，操作已 close/free 的资源。 */
+    if (r->armed == 0 && r->dead) {
+        llog(LOG_WARN, "media", "relay_stop: SKIP (already stopped) r=%p", (void *)r);
+        return;
+    }
+    r->armed = 0;
+
     /*  P0-2 RACE-FIX: 先置 dead=1 再 reactor_call。
      * relay_recv_one for(;;) 循环每次迭代检查 dead，检测到立即 return。
      * 这样 reactor_call 返回时即使已进入的 relay_recv_one 还在内核队列里有
@@ -2736,21 +2759,48 @@ void rtp_relay_stop(rtp_relay_t *r)
 
     /* P3: 通过 reactor_call 在 reactor owner 线程里批量删除所有 fd。
      * reactor_call 同步等待——owner 执行完 reactor_del 才返回，
-     * 之后 close fd / free relay 安全（reactor 不会再触发 relay_cb）。 */
-    if (r->home_reactor && r->armed) {
+     * 之后 close fd / free relay 安全（reactor 不会再触发 relay_cb）。
+     *
+     * ★ P0-3 BUGFIX: reactor_call 失败时（task_closing 重载 / !task_started /
+     * 队列满）fallback 直接 reactor_del —— 不能跳过！否则 reactor slots 里
+     * 还保留着 cb/arg 指向本 relay，free(r) 后 reactor 继续 dispatch → UAF！ */
+    int need_fallback = 0;
+    if (r->home_reactor && m && m->cfg.mgr) {
         int rc = reactor_call(r->home_reactor, relay_batch_stop_fn, r);
-        if (rc != NSBC_OK)
-            llog(LOG_WARN, "media", "relay_stop: reactor_call rc=%d", rc);
-    } else if (m && m->cfg.re && r->armed) {
-        /* 旧路径或 reactor_call 失败降级 */
+        if (rc != NSBC_OK) {
+            llog(LOG_WARN, "media",
+                 "relay_stop: reactor_call rc=%d — fallback direct reactor_del", rc);
+            need_fallback = 1;
+        }
+    } else if (r->home_reactor) {
+        /* 单 reactor 模式，home_reactor 就是 m->cfg.re */
+        int rc = reactor_call(r->home_reactor, relay_batch_stop_fn, r);
+        if (rc != NSBC_OK) {
+            llog(LOG_WARN, "media",
+                 "relay_stop: reactor_call rc=%d — fallback direct reactor_del", rc);
+            need_fallback = 1;
+        }
+    } else {
+        /* 无 home_reactor — reactor 还没 start 或已销毁，直接删 */
+        need_fallback = 1;
+    }
+    if (need_fallback && m && m->cfg.re) {
         for (int i = 0; i < 2; ++i) {
             if (r->fd_rtp[i] >= 0)
                 reactor_del(m->cfg.re, r->fd_rtp[i]);
             if (r->fd_rtcp[i] >= 0)
                 reactor_del(m->cfg.re, r->fd_rtcp[i]);
         }
+    } else if (need_fallback && r->home_reactor) {
+        /* reactor_call 失败但 home_reactor 还在 —— 直接调 reactor_del（非 owner
+         * 线程路径，生产构建 owner check 关闭；此时 reactor 大概率也在 shutdown） */
+        for (int i = 0; i < 2; ++i) {
+            if (r->fd_rtp[i] >= 0)
+                reactor_del(r->home_reactor, r->fd_rtp[i]);
+            if (r->fd_rtcp[i] >= 0)
+                reactor_del(r->home_reactor, r->fd_rtcp[i]);
+        }
     }
-    r->armed = 0;
 
     /* REQ-DTLS-001：释放 SRTP 会话 */
     for (int i = 0; i < 2; ++i) {
