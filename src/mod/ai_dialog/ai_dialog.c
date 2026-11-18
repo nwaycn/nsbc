@@ -31,7 +31,8 @@
 #include "app_registry.h" /* P0-2: app_register / app_desc_t */
 #include "app_ctx.h"      /* struct nsbc_ctx 完整定义（ctx->cfg）*/
 #include "vad_engine.h"   /* REQ-AI-VAD-001: vad_start_for_call / vad_stop_for_call + HPF API */
-#include "obs.h"          /* obs_event for AI_SESSION_OPENED/CLOSED via SSE */
+#include "obs.h"          /* obs_event (redundant for AI_SESSION — see uDS_client.h below) */
+#include "uDS_client.h"   /* ★ AI_SESSION_OPENED/CLOSED go through UDS 'session' topic → calls_tx → /calls/stream SSE */
 
 #include "ai_backend_registry.h"
 
@@ -142,19 +143,24 @@ static ai_session_t *ai_session_find_or_create(ai_store_t *st, void *call_key,
         llog(LOG_INFO, "ai", "session opened call=%p pt=%d via=%s HPF init",
              call_key, pt_in, src);
 
-        /* emit AI_SESSION_OPENED via obs_event into SSE event bus
-         * Go agent only takes over after this + CALL_ANSWERED dual-event gate
-         * 防止普通通话（拨号规则没命中 ai）的 goroutine 空转浪费。
-         * level=6 (INFO) 与 CALL_ANSWERED 同级，domain_action=唯一字符串。
-         * 同时带 call_id（SIP Call-ID，Go 侧 SSE 字段用这个关联 CALL_ANSWERED）
-         * 和 call_key（b2b_call_t* 指针，C 内部追踪用）。 */
+        /* emit AI_SESSION_OPENED via uds_send_session('session' topic)
+         * → UDS data.sock → uds_server.rs → calls_tx.send()
+         * → /calls/stream (SSE) → Go SseEventToFrame fallback:
+         *   payload["event"]="ai_session_opened" → strings.ToUpper → Domain="AI_SESSION_OPENED" ✅
+         * Go agent's aiSessionTracker.markOpened(callID) on receive.
+         * Must NOT use obs_event here — obs_event writes to C-internal g_ev ring,
+         * web/src has zero subscribers, Go agent would never see it (confirmed
+         * by poller.rs comment + grep for calls_tx.send = only uds_server.rs). */
         {
             b2b_call_t *b2b = (b2b_call_t *)call_key;
             const char *cid = (b2b && b2b->leg[0].callid[0])
                               ? b2b->leg[0].callid : "unknown";
-            obs_event(6, "AI_SESSION_OPENED",
-                "call_id=%s call_key=%p pt_in=%d in_codec=%d",
-                cid, call_key, pt_in, s->in_codec);
+            char sess[384];
+            snprintf(sess, sizeof(sess),
+                "{\"event\":\"ai_session_opened\",\"call_id\":\"%s\","
+                "\"pt_in\":%d,\"in_codec\":%d}",
+                cid, pt_in, s->in_codec);
+            uds_send_session(sess);
         }
         s->running = 1;
         int prc = pthread_create(&s->th, NULL, ai_session_thread_stub, s);
@@ -656,14 +662,16 @@ static void ai_on_call_destroy(void *call_key, int a_final, void *ud)
     llog(LOG_INFO, "ai", "call_destroy call=%p a_final=%d → stop session",
          call_key, a_final);
 
-    /* emit AI_SESSION_CLOSED via obs_event into SSE event bus
-     * session 被销毁信号，不是通话结束。通话结束(CALL_END)在 b2bua 里走。 */
+    /* emit AI_SESSION_CLOSED via uds_send_session (same 'session' topic path as OPENED) */
     {
         b2b_call_t *b2b = (b2b_call_t *)call_key;
         const char *cid = (b2b && b2b->leg[0].callid[0])
                           ? b2b->leg[0].callid : "unknown";
-        obs_event(6, "AI_SESSION_CLOSED",
-            "call_id=%s call_key=%p a_final=%d", cid, call_key, a_final);
+        char sess[256];
+        snprintf(sess, sizeof(sess),
+            "{\"event\":\"ai_session_closed\",\"call_id\":\"%s\",\"a_final\":%d}",
+            cid, a_final);
+        uds_send_session(sess);
     }
 
     /* 告诉线程该退出了 */
