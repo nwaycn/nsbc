@@ -5,6 +5,9 @@
 > **语言栈**：Go 为主（`examples/event_client/go/ai_agent/`）+ nsbcd C 核心 + nsbc-web Rust 侧车
 > **参考协议**：`examples/event_client/PROTOCOL.md` §4 AI Pass-through
 
+## 总体要求：
+默认当我们的ai路由触发时应给ai_agent一个带callid，主被叫等信息的一个接入事件，然后主动播放一个语音，如果人在说话，则停止放音，等人说话，人说话的时候，同时还是要接收语音流，而且还有个问题，当停止播放语音时，得给被叫送静音包，不管是哪侧挂机，都应停止这两个收和发语音流。 这个服务应是可以一直启动的，而不是通过watch来监视有来电了才拉取服务，而是服务在监听着，当有新的来电，则启一个ai_session处理。
+
 ---
 
 ## 0. 架构回顾 — 各层职责边界
@@ -53,7 +56,7 @@ ASR / LLM / TTS / 转人工决策 100% 在 Go Agent 侧。
 ```
  ┌─── 10.0.0.80 (Debian 12) ──────┐
  │  nsbcd:5060 (SIP UDP)           │
- │  nsbc-web:8080 (HTTPS)          │
+ │  nsbc-web:443 (HTTPS)          │
  │  /var/run/nsbc/control.sock     │── VLAN 直连 1Gbps
  │  SSH: ssh -p 22322 root@10.0.0.80  │
  │  代码: /home/github/nsbc/        │
@@ -100,7 +103,7 @@ ssh -p 22322 root@10.0.0.80
 cd /home/github/nsbc
 nohup ./nsbc-web > /tmp/web.log 2>&1 &
 sleep 25
-nohup ./build/nsbcd -c conf/nsbc.yaml > /tmp/bcd.log 2>&1 &
+nohup ./nsbcd > /tmp/bcd.log 2>&1 &   无需build/目录下的，我们make时会自动更新到/home/github/nsbc/
 
 # 日志
 tailf /home/github/nsbc/logs/nsbcd.log
@@ -139,6 +142,14 @@ sipp -sn uac -d 10000 -s 2001 10.0.0.80:5060 -trace_msg
 ```
 
 ### 1.4 10.0.0.80 本机额外服务（ASR / TTS / LLM）
+
+切记：
+本机如果要编译nsbcd，则
+cd /home/github/nsbc
+make
+这样后，会由Makefile中的nsbcd及相关模块复制到/home/github/nsbc目录
+/home/github/nsbc/下的nsbcd和nsbc-web都在这个目录下统一使用db/web.db数据库和conf/nsbc.yaml配置文件
+
 
 > **关键约束**：nway-asr / nway-tts 服务端只允许 **127.0.0.1** 连接。
 > 所以 Go Agent 必须 **部署在 10.0.0.80 同机** 才能访问。

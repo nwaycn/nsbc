@@ -101,6 +101,8 @@ typedef struct cnode {
      * 只改 RTP header 的 PT 字节，不做 PCM 往返转码。比 transcode 快得多。 */
     struct { uint8_t src_pt; uint8_t dst_pt; } pt_rewrite[2];
     int pt_rewrite_active[2];
+    /* ★ 单腿本地媒体（AI 内循环）：无 B 腿，bridge_send_raw 一律发回 A 侧 */
+    uint8_t local_media;
     /* ★ 2026-10-16 诊断：transcode_seen 从 static __thread 改 per-call，
      * 避免长寿命媒体线程跨呼叫累积导致短通话（~400 包）永远碰不到 %1000 阈值。 */
     int transcode_seen_diag[2];
@@ -970,12 +972,45 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
                  * 只放行静态 G.711 PT（0/8）：rec_feed_raw 只解 G.711；
                  * 动态 PT 的解码依赖后级 transcode，被丢的包没有后级。
                  * 转发与录音互斥（这里喂完就 continue，不会双重写）。 */
+                /* ★ 2026-11-17 修复：SSRC_DROP 也要喂动态 rec_hooks 链表（ai_dialog）。
+                 * 之前只喂了 cfg.rec_feed_fn 主槽，动态 hook 完全漏掉。 */
                 if (r->m->cfg.rec_feed_fn && r->node && r->node->call &&
                     ((uint8_t)pkt.pt == 0 || (uint8_t)pkt.pt == 8)) {
                     r->m->cfg.rec_feed_fn(r->m->cfg.rec_feed_ud,
                                           r->node->call,
                                           pkt.payload, pkt.payload_len,
                                           side, (int)pkt.pt);
+                }
+                /* ★ 动态 hooks（ai_dialog）：SSRC 被 drop 但 G.711 音频仍然喂 */
+                if ((uint8_t)pkt.pt == 0 || (uint8_t)pkt.pt == 8) {
+                    void *hhead = __atomic_load_n(&r->m->rec_hooks, __ATOMIC_ACQUIRE);
+                    if (hhead) {
+                        static __thread int dh_cnt = 0;
+                        if (dh_cnt++ < 3)
+                            llog(LOG_INFO, "relay", "★SSRC_DROP_REC_HOOK m=%p hooks=%p side=%d pt=%u len=%zu",
+                                 (void *)r->m, hhead, side, (unsigned)pkt.pt, pkt.payload_len);
+                        mb_rec_hook_t *local[MB_REC_HOOK_MAX];
+                        int nh = 0;
+                        pthread_mutex_lock(&r->m->rec_hook_lock);
+                        for (mb_rec_hook_t *h = (mb_rec_hook_t *)hhead;
+                             h && nh < MB_REC_HOOK_MAX; h = h->next) {
+                            ++h->refs; local[nh++] = h;
+                        }
+                        pthread_mutex_unlock(&r->m->rec_hook_lock);
+                        ++rec_hook_dispatch_depth;
+                        for (int hi = 0; hi < nh; ++hi)
+                            local[hi]->fn(local[hi]->ud,
+                                          r->node ? r->node->call : NULL,
+                                          pkt.payload, pkt.payload_len,
+                                          side, (int)pkt.pt);
+                        --rec_hook_dispatch_depth;
+                        if (nh > 0) {
+                            pthread_mutex_lock(&r->m->rec_hook_lock);
+                            for (int hi = 0; hi < nh; ++hi) --local[hi]->refs;
+                            pthread_cond_broadcast(&r->m->rec_hook_cond);
+                            pthread_mutex_unlock(&r->m->rec_hook_lock);
+                        }
+                    }
                 }
                 continue;
             }
@@ -3284,6 +3319,89 @@ int bridge_offer_hook(void *call, const char *in, size_t inlen,
     return n;
 }
 
+/* ★ 单腿本地媒体（AI 内循环）：A 腿单独接通，无 B 腿。
+ * 与 offer_hook 的差别：
+ *   - 不重写"给 B 的 offer"，而是生成"回给 A 的 200 OK SDP"（指向 relay A 侧端口）
+ *   - B 侧设一个 discard sink（127.0.0.1:9），只为让 relay 转发路径/rec hook
+ *     （ai rx）正常触发；AI 的音频注入走 bridge_send_raw → cnode->local_media
+ *     强制 dst_side=0 发回 A，不会产生回声。
+ *   - WebRTC A 腿（需 DTLS 终结）暂不支持，返回 NSBC_NOTSUP。 */
+int bridge_local_start(void *call_key, const char *offer, size_t offer_len,
+                       char *out, size_t outsz, void *ud)
+{
+    bridge_mgr_t *m = ud;
+    if (!m || !call_key || !offer || !offer_len || !out || !outsz)
+        return NSBC_INVAL;
+    if (is_webrtc_sdp(offer, offer_len)) {
+        llog(LOG_WARN, "media",
+             "local_start: WebRTC A-leg 不支持单腿模式（需要 DTLS 终结）");
+        return NSBC_NOTSUP;
+    }
+    cnode_t *e = entry_get(m, call_key);
+    if (!e) {
+        llog(LOG_WARN, "media", "local_start: entry_get NOMEM call=%p", call_key);
+        return NSBC_NOMEM;
+    }
+    e->mode = MB_RELAY;
+    e->local_media = 1;
+    e->a_ws = 0;
+    e->b_ws = 0;
+    e->precond_active = 0;
+    e->precond_met = 0;
+
+    /* per-call NAT 公网 RTP IP（与 offer_hook 同源） */
+    e->external_rtp_ip[0] = '\0';
+    if (m->cfg.call_external_rtp_ip) {
+        const char *nip = m->cfg.call_external_rtp_ip(
+            m->cfg.call_external_rtp_ip_ud, call_key);
+        if (nip && nip[0])
+            snprintf(e->external_rtp_ip, sizeof(e->external_rtp_ip), "%s", nip);
+    }
+    parse_media_addr(offer, offer_len, e->a_ip, sizeof(e->a_ip), &e->a_port);
+
+    uint16_t rlo = 0, rhi = 0;
+    if (m->cfg.call_port_range)
+        m->cfg.call_port_range(m->cfg.call_port_range_ud, call_key, &rlo, &rhi);
+    relay_ports_t ports;
+    if (rtp_relay_start(m, &e->relay, &ports, rlo, rhi) != NSBC_OK &&
+        (rlo != 0 || rhi != 0)) {
+        llog(LOG_WARN, "media",
+             "local_start: port range %u-%u exhausted, fallback default",
+             (unsigned)rlo, (unsigned)rhi);
+        if (rtp_relay_start(m, &e->relay, &ports, 0, 0) != NSBC_OK)
+            return NSBC_NOSPC;
+    }
+    if (!e->relay) return NSBC_NOSPC;
+    e->relay->node = e;
+
+    admit_ssrc_from_sdp(e->relay, 0, offer, offer_len);
+
+    if (e->a_ip[0]) {
+        nsbc_sa_t sa;
+        if (nsbc_sa_from(&sa, e->a_ip, e->a_port, AF_UNSPEC) == NSBC_OK)
+            rtp_relay_set_peer_a(e->relay, &sa);
+    }
+    /* B 侧 discard sink：让 relay 认为对侧就绪（rec hook 正常触发）；
+     * 转发的包打到 127.0.0.1:9，不会形成回声。 */
+    {
+        nsbc_sa_t sink;
+        if (nsbc_sa_from(&sink, "127.0.0.1", 9, AF_UNSPEC) == NSBC_OK)
+            rtp_relay_set_peer_b(e->relay, &sink);
+    }
+    rtp_relay_arm(m, e->relay);
+
+    int n = bridge_rewrite_sdp(offer, offer_len, out, outsz,
+                               e->external_rtp_ip[0] ? e->external_rtp_ip
+                                                     : m->cfg.local_ip,
+                               ports.a_rtp, MB_SDP_ASIS);
+    if (n < 0) return NSBC_NOSPC;
+    llog(LOG_INFO, "media",
+         "local_start: call=%p a_rtp=%u b_rtp=%u a_ip=%s a_port=%u sdp=%dB",
+         call_key, (unsigned)ports.a_rtp, (unsigned)ports.b_rtp,
+         e->a_ip[0] ? e->a_ip : "(null)", (unsigned)e->a_port, n);
+    return n;
+}
+
 int bridge_answer_hook(void *call, const char *in, size_t inlen,
                        char *out, size_t outsz, void *ud)
 {
@@ -3623,6 +3741,10 @@ int bridge_send_raw(bridge_mgr_t *m, void *call_key, int leg,
         return -ENODEV; /* bypass 或 relay 还没建 */
 
     int dst_side = 1 - leg;  /* 向 leg 对侧发 */
+    /* ★ 单腿本地媒体：只有 A 侧（side=0），AI 注入一律发回 A，
+     * 否则 1-leg 会算到不存在对侧 → -ENODEV（"听不到 AI"根因之一）。 */
+    if (r->node && r->node->local_media)
+        dst_side = 0;
     const nsbc_sa_t *dst = r->latched[dst_side] ? &r->latch[dst_side]
                           : (r->have_peer[dst_side] ? &r->peer[dst_side]
                           : NULL);

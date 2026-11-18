@@ -1818,6 +1818,21 @@ static void ctl_detach_sub(ctl_conn_t *c)
         obs_sub_detach(g_sub_hub, c);
 }
 
+/* ★ obs 连接 trace 开关：默认关闭（NSBC_OBS_TRACE=1 打开）。
+ * 这些 fprintf(stderr) 与 llog 各持一个 fd、各自维护文件偏移，同时写
+ * logs/nsbcd.log 会互相覆盖 —— 表现为"先写入的日志行后面凭空消失"。
+ * 排查连接生命周期问题时才打开。 */
+static int obs_trace_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("NSBC_OBS_TRACE");
+        cached = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return cached;
+}
+#define OBS_TRC(...) do { if (obs_trace_enabled()) fprintf(stderr, __VA_ARGS__); } while (0)
+
 static void on_conn_event(int fd, uint32_t ev, void *arg)
 {
     ctl_conn_t *c = (ctl_conn_t *)arg;
@@ -1826,22 +1841,22 @@ static void on_conn_event(int fd, uint32_t ev, void *arg)
      * 导致 reactor_del(re, -1) → INVAL → slots 没清 → 下一个 reactor_wait
      * batch 继续 dispatch 到同一 fd，arg 已是已 free 的 c → UAF。
      * 所以：**所有 fd 操作统一用参数 fd，绝不信 c->fd**。 */
-    fprintf(stderr, "[obs] ENTER fd=%d ev=0x%x c=%p c->fd=%d (epoll fd is truth)\n",
+    OBS_TRC("[obs] ENTER fd=%d ev=0x%x c=%p c->fd=%d (epoll fd is truth)\n",
             fd, (unsigned)ev, (void*)c, c ? c->fd : -999);
     if (c && c->fd != fd) {
-        fprintf(stderr, "[obs] ⚠ c->fd(%d) != epoll fd(%d) — c->fd 被外部代码改过！\n",
+        OBS_TRC("[obs] ⚠ c->fd(%d) != epoll fd(%d) — c->fd 被外部代码改过！\n",
                 c->fd, fd);
     }
     if (ev & (EPOLLHUP | EPOLLERR)) {
-        fprintf(stderr, "[obs] HUP path fd=%d c=%p\n", fd, (void*)c);
+        OBS_TRC("[obs] HUP path fd=%d c=%p\n", fd, (void*)c);
         ctl_detach_sub(c);
-        fprintf(stderr, "[obs] HUP calling reactor_del(%p, %d)\n", (void*)g_ctx->re, fd);
+        OBS_TRC("[obs] HUP calling reactor_del(%p, %d)\n", (void*)g_ctx->re, fd);
         int rc = reactor_del(g_ctx->re, fd);
-        fprintf(stderr, "[obs] HUP reactor_del returned rc=%d\n", rc);
+        OBS_TRC("[obs] HUP reactor_del returned rc=%d\n", rc);
         close(fd);
-        fprintf(stderr, "[obs] HUP free(c=%p)\n", (void*)c);
+        OBS_TRC("[obs] HUP free(c=%p)\n", (void*)c);
         free(c);
-        fprintf(stderr, "[obs] HUP return\n");
+        OBS_TRC("[obs] HUP return\n");
         return;
     }
 
@@ -1856,7 +1871,7 @@ static void on_conn_event(int fd, uint32_t ev, void *arg)
     }
 
     if (!(ev & EPOLLIN)) {
-        fprintf(stderr, "[obs] return (no EPOLLIN)\n");
+        OBS_TRC("[obs] return (no EPOLLIN)\n");
         return;
     }
 
@@ -1864,19 +1879,19 @@ static void on_conn_event(int fd, uint32_t ev, void *arg)
         ssize_t n = recv(fd, c->buf + c->n, sizeof(c->buf) - c->n, 0);
         if (n <= 0) {
             if (n == 0) {
-                fprintf(stderr, "[obs] EOF path fd=%d c=%p\n", fd, (void*)c);
+                OBS_TRC("[obs] EOF path fd=%d c=%p\n", fd, (void*)c);
                 llog(LOG_NOTICE, "oam", "control client fd=%d closed (EOF)", fd);
                 ctl_detach_sub(c);
-                fprintf(stderr, "[obs] EOF calling reactor_del(%p, %d)\n", (void*)g_ctx->re, fd);
+                OBS_TRC("[obs] EOF calling reactor_del(%p, %d)\n", (void*)g_ctx->re, fd);
                 int rc = reactor_del(g_ctx->re, fd);
-                fprintf(stderr, "[obs] EOF reactor_del returned rc=%d\n", rc);
+                OBS_TRC("[obs] EOF reactor_del returned rc=%d\n", rc);
                 close(fd);
-                fprintf(stderr, "[obs] EOF free(c=%p)\n", (void*)c);
+                OBS_TRC("[obs] EOF free(c=%p)\n", (void*)c);
                 free(c);
             } else {
-                fprintf(stderr, "[obs] recv EAGAIN n=%zd fd=%d\n", n, fd);
+                OBS_TRC("[obs] recv EAGAIN n=%zd fd=%d\n", n, fd);
             }
-            fprintf(stderr, "[obs] return (recv done)\n");
+            OBS_TRC("[obs] return (recv done)\n");
             return;
         }
         c->n += (size_t)n;
@@ -1892,24 +1907,24 @@ static void on_conn_event(int fd, uint32_t ev, void *arg)
                          "ctl fd=%d recv buf full (%zu) no \\n — command discarded",
                          fd, sizeof(c->buf));
                 }
-                fprintf(stderr, "[obs] break (no \\n)\n");
+                OBS_TRC("[obs] break (no \\n)\n");
                 break;
             }
             size_t llen = (size_t)(lf - c->buf) + 1;
             *lf = '\0';
-            fprintf(stderr, "[obs] dispatch cmd=%s fd=%d c=%p\n", c->buf, fd, (void*)c);
+            OBS_TRC("[obs] dispatch cmd=%s fd=%d c=%p\n", c->buf, fd, (void*)c);
             dispatch(c, c->buf);
-            fprintf(stderr, "[obs] dispatch returned c->fd=%d (epoll fd=%d)\n", c->fd, fd);
+            OBS_TRC("[obs] dispatch returned c->fd=%d (epoll fd=%d)\n", c->fd, fd);
             if (c->fd < 0) { /* quit：就地释放 */
-                fprintf(stderr, "[obs] QUIT path fd=%d c=%p\n", fd, (void*)c);
+                OBS_TRC("[obs] QUIT path fd=%d c=%p\n", fd, (void*)c);
                 ctl_detach_sub(c);
-                fprintf(stderr, "[obs] QUIT calling reactor_del(%p, %d)\n", (void*)g_ctx->re, fd);
+                OBS_TRC("[obs] QUIT calling reactor_del(%p, %d)\n", (void*)g_ctx->re, fd);
                 int rc = reactor_del(g_ctx->re, fd);
-                fprintf(stderr, "[obs] QUIT reactor_del returned rc=%d\n", rc);
+                OBS_TRC("[obs] QUIT reactor_del returned rc=%d\n", rc);
                 close(fd);
-                fprintf(stderr, "[obs] QUIT free(c=%p)\n", (void*)c);
+                OBS_TRC("[obs] QUIT free(c=%p)\n", (void*)c);
                 free(c);
-                fprintf(stderr, "[obs] QUIT return\n");
+                OBS_TRC("[obs] QUIT return\n");
                 return;
             }
             memmove(c->buf, c->buf + llen, c->n - llen);

@@ -222,6 +222,7 @@ impl AuthSvc {
             rl_login: env_u64_or("NSBC_RL_LOGIN_PER_MIN", 10)? as u32,
             rl_refresh: env_u64_or("NSBC_RL_REFRESH_PER_MIN", 30)? as u32,
             rl_api: env_u64_or("NSBC_RL_API_PER_MIN", 120)? as u32,
+            rl_ext: env_u64_or("NSBC_RL_EXT_PER_MIN", 6000)? as u32,
             window_secs: 60,
         };
         let audit = match std::env::var("NSBC_AUDIT_FILE") {

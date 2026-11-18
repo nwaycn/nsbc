@@ -206,6 +206,10 @@ struct b2b_call {
     /* REQ-MEDIA-DP-001：拨号规则级媒体模式 override（0=auto,1=bypass,2=relay）
      * media_bridge 在 bridge_decide 时从 call 里读，WebRTC 强制 SRTP_RELAY 不受影响 */
     uint8_t media_mode;
+    /* ★ 单腿本地媒体（AI 内循环）：dialplan target="local:..." 时置 1。
+     * b2bua 见 1 → 不建 B 腿，直接对 A 腿 200 OK（SDP 由 media_bridge 单腿
+     * relay 生成），媒体由 ai/ai_dialog app 在 A 腿上消费/注入。 */
+    uint8_t local_media;
     /* ★ 拨号规则级 3GPP IMS 强制覆盖（从 dp_result_t 透传，三态：0=auto/1=开/2=关）
      * 优先级链：call->force_* (dialplan route) → call->prof->enable_* (profile) → 默认
      * 例：IMS 中继 route 强制 force_precondition=1，老 PSTN 中继强制 force_precondition=2 */

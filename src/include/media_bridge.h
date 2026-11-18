@@ -162,6 +162,12 @@ void rtp_relay_set_srtp(rtp_relay_t *r, int side, nsbc_srtp_sess_t *sr);
  * 指针值做 mgr 表键（每呼叫一个），禁止解引用（REQ-ARCH-011 解耦）。 */
 int bridge_offer_hook(void *call_key, const char *in, size_t inlen,
                       char *out, size_t outsz, void *ud);
+/* ★ 单腿本地媒体（AI 内循环）：A 腿单独接通，无 B 腿。
+ * 建 relay（A 侧 peer 来自 offer SDP + B 侧 discard sink 让转发路径/rec hook
+ * 正常触发），并生成回给 A 的 200 OK SDP（指向 relay A 侧端口）。
+ * ud = bridge_mgr_t*。返回 SDP 长度；<0 = 错误（NSBC_NOTSUP/NSBC_NOSPC）。 */
+int bridge_local_start(void *call_key, const char *offer, size_t offer_len,
+                       char *out, size_t outsz, void *ud);
 int bridge_answer_hook(void *call_key, const char *in, size_t inlen,
                        char *out, size_t outsz, void *ud);
 /* 呼叫结束释放（挂 b2b terminate；P0 由 media confirm 回调反注册兜底） */

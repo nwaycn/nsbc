@@ -757,22 +757,23 @@ done:
 		return nil
 	}
 
-	// 4. 根据服务端返回的采样率决定重采样
-	var pcmu []byte
-	switch sampleRate {
-	case 0:
-		fmt.Fprintf(stderr, "[NWAYTTS] WARN: no HEAD, assume 8kHz (直接 PCMU)\n")
-		pcmu = Pcm16ToPcmu(pcm16Samples)
-	case 8000:
-		pcmu = Pcm16ToPcmu(pcm16Samples)
-	case 16000:
-		pcmu = Pcm16ToPcmu(Downsample16kTo8k(pcm16Samples))
-	default:
-		fmt.Fprintf(stderr, "[NWAYTTS] WARN: sample_rate=%d 未知, 尝试按 8k 处理\n", sampleRate)
-		pcmu = Pcm16ToPcmu(pcm16Samples)
+	// 4. 直接返回 raw PCM16_LE —— 让 C 侧 ai_send_tx_audio(format=1) 用
+	//    G.711 encoder.encode() 一次编码到对端 codec（PCMA/PCMU/G729），
+	//    跳过 Go 侧 PCM16→PCMU（8bit 有损）+ C 侧 transcode（8bit 有损）的两次编码叠加。
+	if sampleRate != 8000 {
+		// 非 8k 重采样：downsample 16k→8k，其他采样率报错
+		switch sampleRate {
+		case 16000:
+			pcm16Samples = Downsample16kTo8k(pcm16Samples)
+			fmt.Fprintf(stderr, "[NWAYTTS] WARN: sample_rate=16000, downsampled to 8k PCM16\n")
+		default:
+			fmt.Fprintf(stderr, "[NWAYTTS] ERR: sample_rate=%d 未知，无法处理\n", sampleRate)
+			return nil
+		}
 	}
-	fmt.Fprintf(stderr, "[NWAYTTS] synthesized %d PCMU bytes (pcm16=%d samples sr=%d)\n",
-		len(pcmu), len(pcm16Samples), sampleRate)
-	return pcmu
+	pcm16Bytes := Int16ToPcm16LE(pcm16Samples)
+	fmt.Fprintf(stderr, "[NWAYTTS] synthesized %d PCM16_LE bytes (%d samples sr=%d)\n",
+		len(pcm16Bytes), len(pcm16Samples), sampleRate)
+	return pcm16Bytes
 }
 

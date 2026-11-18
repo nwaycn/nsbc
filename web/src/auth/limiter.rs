@@ -23,6 +23,9 @@ pub enum Bucket {
     Login,
     Refresh,
     Api,
+    /// `/ext/v1/*` 外部 API（API Key 鉴权）。AI agent 通过 ext 通道高频轮询
+    /// （ai-get-rx/ai-vad-state 约 10Hz），不能和 Web UI 共用 120/min 的桶。
+    Ext,
 }
 
 impl Bucket {
@@ -31,6 +34,7 @@ impl Bucket {
             Bucket::Login => 0,
             Bucket::Refresh => 1,
             Bucket::Api => 2,
+            Bucket::Ext => 3,
         }
     }
 
@@ -39,6 +43,7 @@ impl Bucket {
         match path {
             "/auth/login" => Bucket::Login,
             "/auth/refresh" => Bucket::Refresh,
+            _ if path.starts_with("/ext/") => Bucket::Ext,
             _ => Bucket::Api,
         }
     }
@@ -48,6 +53,7 @@ impl Bucket {
             Bucket::Login => "login",
             Bucket::Refresh => "refresh",
             Bucket::Api => "api",
+            Bucket::Ext => "ext",
         }
     }
 }
@@ -67,6 +73,8 @@ pub struct Limits {
     pub rl_refresh: u32,
     /// remaining /api requests per IP per minute (default 120)
     pub rl_api: u32,
+    /// /ext requests per IP per minute (default 6000；AI agent 媒体轮询需要)
+    pub rl_ext: u32,
     /// Rate-limit window seconds (default 60; Retry-After given per window remainder)
     pub window_secs: u64,
 }
@@ -80,6 +88,7 @@ impl Default for Limits {
             rl_login: 10,
             rl_refresh: 30,
             rl_api: 120,
+            rl_ext: 6000,
             window_secs: 60,
         }
     }
@@ -116,6 +125,7 @@ impl RateLimiter {
             Bucket::Login => self.cfg.rl_login,
             Bucket::Refresh => self.cfg.rl_refresh,
             Bucket::Api => self.cfg.rl_api,
+            Bucket::Ext => self.cfg.rl_ext,
         }
     }
 

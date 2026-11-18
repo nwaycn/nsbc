@@ -52,6 +52,31 @@ static inline route_table_t *b2b_rt(b2b_core_t *co)
     return ctx ? ctx->rt : NULL;
 }
 
+/* JSON 字符串转义：只处理会破坏 JSON 的字符（" \ \\ 和 <0x20 控制字符）。
+ * uds_push → nsbc-web submit_session 用 cJSON_Parse 解析 payload；
+ * 未转义的 From 头（如 "1006" <sip:...>）会让 parse 失败 → payload 退化成
+ * 字符串 → web 报 "missing call_id"，SSE 订阅端收不到 CALL_ANSWERED。 */
+static void b2b_json_esc(const char *in, char *out, size_t outsz)
+{
+    size_t j = 0;
+    if (!out || outsz == 0) return;
+    if (!in) in = "";
+    for (size_t i = 0; in[i] && j + 2 < outsz; i++) {
+        unsigned char ch = (unsigned char)in[i];
+        switch (ch) {
+        case '"':  out[j++] = '\\'; out[j++] = '"';  break;
+        case '\\': out[j++] = '\\'; out[j++] = '\\'; break;
+        case '\n': out[j++] = '\\'; out[j++] = 'n';  break;
+        case '\r': out[j++] = '\\'; out[j++] = 'r';  break;
+        case '\t': out[j++] = '\\'; out[j++] = 't';  break;
+        default:
+            if (ch < 0x20) break; /* 丢弃其他控制字符 */
+            out[j++] = (char)ch;
+        }
+    }
+    out[j] = '\0';
+}
+
 /* ---------- reactor 线程内 local port 传递 ----------
  * transport rx callback（b2b_on_rx）拿到入向 local 端口，但 handle_new_invite
  * 在 txn_server_input 更深层调用，签名没有 local 参数。用 __thread 临时变量
@@ -4346,8 +4371,14 @@ static void b2b_emit_cdr(b2b_call_t *c, cdr_phase_t phase)
         return;
     cdr_event_t ev; memset(&ev, 0, sizeof(ev));
     snprintf(ev.call_id, sizeof(ev.call_id), "%s", c->leg[0].callid);
-    if (c->leg[0].from[0]) {
-        char user[128]; sip_uri_extract_user(user, sizeof(user), c->leg[0].from);
+    {
+        char user[128] = {0};
+        if (c->leg[0].from[0])
+            sip_uri_extract_user(user, sizeof(user), c->leg[0].from);
+        /* inbound 场景 leg[0].from 为空或解析不出 user（From 头未存完整 URI），
+         * 回退到 INVITE From 提取的 orig_number，避免话单/事件 from 一直为空 */
+        if (!user[0] && c->orig_number[0])
+            snprintf(user, sizeof(user), "%s", c->orig_number);
         snprintf(ev.from, sizeof(ev.from), "%s", user);
     }
     /* leg[1].to 在 CDR_PHASE_START 时尚未赋值（send_invite_b 在 emit 之后），
@@ -5248,6 +5279,66 @@ void handle_new_invite(b2b_core_t *co, sip_txn_t *t,
         a->state = LEG_TERMINATED;
         add_atomic(&co->failed, 1);
         call_destroy(c);
+        return;
+    }
+
+    /* ★ 单腿本地媒体（AI 内循环）：dialplan target="local:..." 命中 →
+     * 不建 B 腿，直接对 A 腿回 200 OK（SDP 指向 media_bridge 单腿 relay 的
+     * A 侧端口）。之后 ai/ai_dialog 在 A 腿上消费媒体、注入 TTS；ai_agent
+     * 通过 SSE CALL_ANSWERED 接管对话。 */
+    if (c->local_media) {
+        char ans[B2B_SDP_MAX];
+        int n = -1;
+        if (a->offer_len && co->cfg.media_ud)
+            n = bridge_local_start(c, a->offer, a->offer_len,
+                                   ans, sizeof(ans), co->cfg.media_ud);
+        if (n <= 0) {
+            llog(LOG_WARN, "b2b",
+                 "local_media: bridge_local_start failed rc=%d callid=%s → 488",
+                 n, a->callid);
+            c->a_final = 488;
+            respond_txn(co, t, 488, NULL, NULL, NULL, 0);
+            a->state = LEG_TERMINATED;
+            add_atomic(&co->failed, 1);
+            call_destroy(c);
+            return;
+        }
+        if ((size_t)n < sizeof(a->answer)) {
+            memcpy(a->answer, ans, (size_t)n);
+            a->answer[(size_t)n] = '\0';
+            a->answer_len = (size_t)n;
+        }
+        respond_a(c, 200, ans, (size_t)n);
+        c->a_final = 200;
+        c->media_done = 1;
+        if (!c->active) {
+            c->active = 1;
+            add_atomic(&co->active, 1);
+        }
+        arm_call_limit_timer(c);
+        arm_sched_hangup_timer(c);
+        {
+            /* from=主叫 user（orig_number，INVITE From 提取）；
+             * to=被叫号码（A 腿 To/R-URI 的 user part）。local:ai 场景
+             * dst_number 会被拨号规则改写成 "local:ai"，不能直接展示。 */
+            char sess[640], fesc[256], tesc[256], to_user[128] = {0};
+            const char *from_num = c->orig_number[0] ? c->orig_number : "";
+            const char *to_src   = c->leg[0].to[0] ? c->leg[0].to : c->leg[0].ruri;
+            sip_uri_extract_user(to_user, sizeof(to_user), to_src);
+            if (!to_user[0])
+                snprintf(to_user, sizeof(to_user), "%s", c->dst_number);
+            b2b_json_esc(from_num, fesc, sizeof(fesc));
+            b2b_json_esc(to_user, tesc, sizeof(tesc));
+            snprintf(sess, sizeof(sess),
+                     "{\"event\":\"answer\",\"call_id\":\"%s\",\"state\":\"confirmed\","
+                     "\"from\":\"%s\",\"orig\":\"%s\",\"to\":\"%s\",\"dir\":\"inbound\",\"cause\":0}",
+                     c->leg[0].callid, fesc, fesc, tesc);
+            uds_send_session(sess);
+        }
+        llog(LOG_INFO, "b2b",
+             "local_media: answered A directly (no B leg) callid=%s sdp=%dB",
+             a->callid, n);
+        call_unlock(c);
         return;
     }
 

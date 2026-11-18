@@ -331,6 +331,11 @@ $(BUILD)/mod/%.so: MOD_EXTRA_CPPFLAGS ?=
 $(BUILD)/mod/%.so: MOD_EXTRA_CFLAGS   ?=
 
 # ---- pattern rule ----
+# ★ 每个 .so 必须显式依赖自己的源码：pattern rule 里拿不到 $*，而
+#   MOD_SRC_$(...) 只能在 recipe 里展开，导致 .so 一旦存在就永远不重建
+#   （改了 ai_dialog.c 却一直在跑旧 .so）。这里在解析期用 foreach+eval
+#   为每个动态模块生成显式依赖。
+$(foreach m,$(DYNAMIC_MODS),$(eval $(BUILD)/mod/mod_$(m).so: $(MOD_SRC_$(m))))
 $(BUILD)/mod/%.so:
 	@mkdir -p $(dir $@)
 	@echo "  MOD $@"
