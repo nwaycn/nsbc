@@ -117,6 +117,14 @@ typedef struct ws_conn {
     void          *ssl;
     void          *rbio;
     int            tls_want;
+
+    /* WebSocket ping/pong (RFC 6455 §5.5.2) — idle conn detection
+     * Proxy idle timeout (Nginx/HAProxy 60-300s) silently drops WSS TCP
+     * when no SIP traffic. Session Timer is a TODO skeleton; ws ping
+     * every 30s keeps the conn alive and detects dead proxies quickly. */
+    uint64_t       last_rx_ms;     /* last frame received (ms since epoch) */
+    uint64_t       last_ping_ms;   /* last ping sent */
+    int            pongs_missed;   /* consecutive pong misses, close at 3 */
 } ws_conn_t;
 
 /* compact: read_pos > 0 时把剩余数据移到 buf 开头 */
@@ -130,6 +138,36 @@ static void ws_compact_read_buf(ws_conn_t *c)
         c->read_pos = 0;
     }
 }
+
+/* ==== WebSocket ping/pong helpers (RFC 6455 §5.5.2) ==== */
+
+/* ws_now_ms — monotonic wall clock in ms (CLOCK_REALTIME, fine for idle checks).
+ * Avoids gettimeofday every frame — called once per worker loop pass (500ms). */
+static uint64_t ws_now_ms(void)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (uint64_t)tv.tv_sec * 1000ULL + (uint64_t)tv.tv_usec / 1000ULL;
+}
+
+/* RFC 6455 ping frame: FIN=1 opcode=0x9 RSV=0 mask=0 payload=0 → 2 bytes total.
+ * Returns len (2) or 0 if send queue full. */
+static size_t ws_build_ping_frame(uint8_t *out, size_t out_sz)
+{
+    if (out_sz < 2) return 0;
+    out[0] = 0x89;  /* FIN + PING opcode (0x9) */
+    out[1] = 0x00;  /* mask=0, payload len=0 */
+    return 2;
+}
+
+/* ws_build_pong_frame intentionally omitted — PING handler (L621+) builds
+ * pong inline there because it needs to echo the exact payload bytes. */
+
+/* RFC 6455 §11.8 default ping interval recommended 20-30s.
+ * We use 30s — comfortably below Nginx/HAProxy default idle timeout (60s). */
+#define WS_PING_INTERVAL_MS   30000ULL   /* send ping if idle >= this */
+#define WS_PING_TIMEOUT_MS    15000ULL   /* wait this long for pong before counting miss */
+#define WS_PING_MAX_MISSED    3          /* close after N consecutive misses (~90s total) */
 
 /* ==== atomic 替代（GCC builtin — 不用 C11 stdatomic）==== */
 #define WS_ATOMIC_STORE(p, v)     __atomic_store_n((p), (v), __ATOMIC_SEQ_CST)
@@ -568,7 +606,12 @@ static int ws_conn_step(ws_conn_t *c, int events)
                     return -1;
                 }
 
-                /* PING — 回 PONG */
+                /* ANY frame received = connection alive — reset idle timer + ping miss counter
+                 * (covers PING from remote, PONG to our ping, TEXT/BINARY SIP, etc.) */
+                c->last_rx_ms = ws_now_ms();
+                c->pongs_missed = 0;
+
+                /* PING — 回 PONG (already reset pongs_missed above) */
                 if (opcode == WS_OP_PING) {
                     uint8_t pong[14];
                     size_t phdr = 0;
@@ -727,6 +770,82 @@ static void *ws_worker_thread(void *ud)
             uint32_t new_ev = ws_calc_epoll_events(c);
             ws_epoll_update(w->epfd, c, new_ev);
         }
+
+        /* ==== Idle pass (ping detection) — runs every 500ms ====
+         * Iterate all active conns on this worker's round-robin slice.
+         * If a conn has been idle (no RX) >= WS_PING_INTERVAL_MS,
+         * send a ping frame. If ping sent and no pong after
+         * WS_PING_TIMEOUT_MS, increment pongs_missed. On >=3 missed
+         * (~90s total dead), close the conn.
+         *
+         * Why? Session Timer (RFC 4028) is a TODO skeleton in sip_sess_timer.c —
+         * after answer zero SIP traffic is exchanged → middle proxy
+         * (Nginx/HAProxy idle timeout 60-300s) silently drops WSS TCP →
+         * A leg BYE later finds B leg WSS dead → B leg never gets BYE.
+         * Ping every 30s keeps proxy table entries alive and detects
+         * dead proxies/peers quickly. */
+        {
+            uint64_t now = ws_now_ms();
+            pthread_mutex_lock(&g_ws.conn_mtx);
+            ws_conn_t *c = g_ws.conn_head;
+            while (c) {
+                ws_conn_t *next = c->next;  /* snapshot — c may close below */
+                if (!c->closed && c->worker_idx == w->idx) {
+                    uint64_t idle = now - c->last_rx_ms;
+
+                    /* 1) Already waiting for pong — check timeout */
+                    if (c->last_ping_ms > 0) {
+                        uint64_t ping_age = now - c->last_ping_ms;
+                        if (ping_age >= WS_PING_TIMEOUT_MS) {
+                            c->pongs_missed++;
+                            c->last_ping_ms = now;  /* reset for next cycle */
+                            llog(LOG_DEBUG, "ws",
+                                 "worker[%d] pong miss #%d fd=%d",
+                                 w->idx, c->pongs_missed, c->fd);
+                            if (c->pongs_missed >= WS_PING_MAX_MISSED) {
+                                llog(LOG_WARN, "ws",
+                                     "worker[%d] pong miss MAX -> close fd=%d",
+                                     w->idx, c->fd);
+                                c->closed = 1;
+                                pthread_mutex_unlock(&g_ws.conn_mtx);
+                                ws_close_conn(w->epfd, c);
+                                pthread_mutex_lock(&g_ws.conn_mtx);
+                            }
+                        }
+                    }
+
+                    /* 2) Idle long enough — send ping */
+                    if (c->pongs_missed < WS_PING_MAX_MISSED &&
+                        idle >= WS_PING_INTERVAL_MS) {
+                        uint8_t ping_frame[2];
+                        size_t plen = ws_build_ping_frame(ping_frame, sizeof(ping_frame));
+                        if (plen > 0) {
+                            ws_send_item_t item = {
+                                .data = (uint8_t *)malloc(plen),
+                                .len  = plen,
+                                .sent = 0
+                            };
+                            if (item.data) {
+                                memcpy(item.data, ping_frame, plen);
+                                pthread_mutex_lock(&c->send_mtx);
+                                if (c->send_q_count < WS_SEND_QUEUE_CAP) {
+                                    c->send_q[c->send_q_tail] = item;
+                                    c->send_q_tail = (c->send_q_tail + 1) % WS_SEND_QUEUE_CAP;
+                                    c->send_q_count++;
+                                    c->send_pending = 1;
+                                    c->last_ping_ms = now;
+                                } else {
+                                    free(item.data);
+                                }
+                                pthread_mutex_unlock(&c->send_mtx);
+                            }
+                        }
+                    }
+                }
+                c = next;
+            }
+            pthread_mutex_unlock(&g_ws.conn_mtx);
+        }
     }
 
     llog(LOG_INFO, "ws", "worker[%d] exiting", w->idx);
@@ -827,6 +946,11 @@ static void *ws_accept_thread(void *ud)
         c->rbio = rbio;
         c->state = CS_HANDSHAKE;
         pthread_mutex_init(&c->send_mtx, NULL);
+
+        /* Ping/pong init — conn just created, baseline last_rx = now. */
+        c->last_rx_ms   = ws_now_ms();
+        c->last_ping_ms = 0;
+        c->pongs_missed = 0;
 
         /* ★ P4 fix: 动态 read_buf —— 默认只 malloc WS_READ_BUF + 128B ≈ 16KB，
          * 大 payload 触发 realloc 到 WS_MAX_PAYLOAD + 128B ≈ 64KB。
