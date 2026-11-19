@@ -29,24 +29,33 @@ SIP方法实现完整性审计.md
 /tls/
 /logs/
 /scripts/
-<<<<<<< HEAD
+
+# Website docs & drafts
 /website/SKILL.md
-=======
 website/SKILL.md
+website/nip/
+
+# Python cache
 client/threeway_test/__pycache__/nsbc_harness.cpython-312.pyc
 client/threeway_test/__pycache__/test_mutual_calls.cpython-312.pyc
+
+# Draft docs (not in repo)
 article-01-why-rewrite.md
+article-02-sip-stack-anatomy.md
+article-03-quickstart-10min.md
+article-04-c11-rust-architecture.md
+article-05-security-checklist.md
+cookbook-blow-hard-analysis.md
 docs/nsbc-control-api.md
 nsbc-web-db-write-optimization.md
-article-05-security-checklist.md
-article-03-quickstart-10min.md
-article-02-sip-stack-anatomy.md
-article-04-c11-rust-architecture.md
-cookbook-blow-hard-analysis.md
+
+# Trae share packages
 /.trae-html-share-packages
-<<<<<<< HEAD
->>>>>>> 5ae3f6ad4001613946271837bd5fa670da41b508
+
+# Other binaries / local build outputs
 /na_stream
-=======
-website/nip/
->>>>>>> dc1bb6771f6a672d654a16f9c69ec7adc2c09611
+ai_agent
+ai_agent_cpm
+ai_agent_daemon.exe
+binaries/
+dist/
