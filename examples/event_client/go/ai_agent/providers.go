@@ -587,7 +587,8 @@ func Downsample16kTo8k(in []int16) []int16 {
 // =============================================================================
 
 type NWAYASR struct {
-	Addr string // 默认 10.0.0.80:8089
+	Addr       string // 默认 10.0.0.80:8089
+	NasrClient string // nasr-client 可执行文件路径（备用，当前走 TCP 直接转）
 }
 
 func (a *NWAYASR) Transcribe(pcmu []byte) string {
@@ -775,5 +776,28 @@ done:
 	fmt.Fprintf(stderr, "[NWAYTTS] synthesized %d PCM16_LE bytes (%d samples sr=%d)\n",
 		len(pcm16Bytes), len(pcm16Samples), sampleRate)
 	return pcm16Bytes
+}
+
+// pcm16BytesToWav — PCM16 LE 8kHz raw → WAV 文件字节（44 字节 header + data）
+func pcm16BytesToWav(pcm16 []byte, sampleRate int) []byte {
+	nSamples := len(pcm16) / 2
+	dataSize := len(pcm16)
+	buf := make([]byte, 44+dataSize)
+	copy(buf[0:4], "RIFF")
+	binary.LittleEndian.PutUint32(buf[4:], uint32(dataSize+36))
+	copy(buf[8:12], "WAVE")
+	copy(buf[12:16], "fmt ")
+	binary.LittleEndian.PutUint32(buf[16:], 16) // fmt chunk size
+	binary.LittleEndian.PutUint16(buf[20:], 1)  // audio format PCM
+	binary.LittleEndian.PutUint16(buf[22:], 1)  // channels
+	binary.LittleEndian.PutUint32(buf[24:], uint32(sampleRate))
+	binary.LittleEndian.PutUint32(buf[28:], uint32(sampleRate*2))
+	binary.LittleEndian.PutUint16(buf[32:], 2)  // block align
+	binary.LittleEndian.PutUint16(buf[34:], 16) // bits per sample
+	copy(buf[36:40], "data")
+	binary.LittleEndian.PutUint32(buf[40:], uint32(dataSize))
+	copy(buf[44:], pcm16)
+	_ = nSamples
+	return buf
 }
 

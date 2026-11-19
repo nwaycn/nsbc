@@ -567,12 +567,13 @@ func handleCall(
 	bargeInRMS int,
 	transport string,
 	recordDir string,
+	vadMode string,
 	cpm *CPMOllamaProvider,
 ) {
 	callID := cs.callID
 	fmt.Printf("\n%s\n", strings.Repeat("═", 70))
 	fmt.Printf("[ai_agent_cpm] ★ 接管通话 call=%s  %s → %s\n", callID, cs.orig, cs.to)
-	fmt.Printf("  transport=%s  barge_in=%v  chunk=%d\n", transport, bargeInEnabled, chunkBytes)
+	fmt.Printf("  transport=%s  barge_in=%v  chunk=%d  vad_mode=%s\n", transport, bargeInEnabled, chunkBytes, vadMode)
 	fmt.Printf("  Ollama endpoint=%s model=%s\n", cpm.Endpoint, cpm.Model)
 	fmt.Printf("%s\n\n", strings.Repeat("═", 70))
 
@@ -868,8 +869,11 @@ func handleCall(
 			}
 		}
 
-		// --- sentenceBuf 累积（sentenceActive 打开就持续累积）---
-		if sentenceActive {
+		// --- sentenceBuf 累积 ---
+		// external 模式：C 侧 VAD SPEECH 期间才累积（sentenceActive 门控）
+		// passthrough 模式：Provider 自带 VAD（MiniCPM-o 内置 Whisper-medium），
+		// Go 端全量 stream 无条件累积，避免 C 侧 VAD 门控丢音频前导
+		if vadMode == "passthrough" || sentenceActive {
 			sentenceBuf = append(sentenceBuf, rx...)
 		}
 
@@ -879,8 +883,8 @@ func handleCall(
 			recAllPCM16 = append(recAllPCM16, rx...)
 		}
 
-		// safety limit
-		if sentenceActive && len(sentenceBuf) >= asrBufMaxBytes {
+		// safety limit（两种模式都检查）
+		if len(sentenceBuf) >= asrBufMaxBytes {
 			needFlush = true
 			flushReason = "max-len"
 		}
@@ -903,6 +907,7 @@ func main() {
 	chunkBytes := flag.Int("chunk-bytes", 320, "ai-get-rx 每次拉多少字节（PCM16 20ms = 320B）")
 	transport := flag.String("transport", "auto", "http | ws | auto")
 	insecure := flag.Bool("insecure", true, "跳过 TLS 证书验证（默认 true，自签证书）")
+	vadMode := flag.String("vad-mode", "passthrough", "VAD 模式：external=C侧VAD切句, passthrough=全量stream Provider自切 (默认 passthrough)")
 
 	// ★ MiniCPM-o / Ollama flags（一体化，不需要单独 ASR/LLM/TTS）
 	ollamaEndpoint := flag.String("ollama-endpoint", "http://127.0.0.1:11434", "Ollama 服务地址")
@@ -936,7 +941,7 @@ func main() {
 
 		cs := newCallSession(*callID, "?", "?")
 		handleCall(cs, *apiBase, *apiToken, *transferDest, *chunkBytes,
-			*bargeInEnabled, *bargeInRMS, *transport, *recordDir, cpm)
+			*bargeInEnabled, *bargeInRMS, *transport, *recordDir, *vadMode, cpm)
 		return
 	}
 
@@ -1040,7 +1045,7 @@ func main() {
 					go func() {
 						defer tracker.remove(callID)
 						handleCall(cs, *apiBase, *apiToken, *transferDest, *chunkBytes,
-							*bargeInEnabled, *bargeInRMS, *transport, *recordDir, cpm)
+							*bargeInEnabled, *bargeInRMS, *transport, *recordDir, *vadMode, cpm)
 					}()
 				} else {
 					fmt.Printf("[sse] ⚠ 该通话已在处理中，跳过\n")

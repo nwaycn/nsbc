@@ -4730,6 +4730,7 @@ sqlx::query(acct_ddl).execute(pool).await?;
                 transfer_dest    TEXT,
                 barge_in         INTEGER NOT NULL DEFAULT 1,
                 vad_threshold    TEXT    DEFAULT 'default',
+                vad_mode         TEXT    NOT NULL DEFAULT 'external',
                 record_dir       TEXT    DEFAULT 'records',
 
                 enabled          INTEGER NOT NULL DEFAULT 1,
@@ -4760,6 +4761,7 @@ sqlx::query(acct_ddl).execute(pool).await?;
                 transfer_dest    VARCHAR(64),
                 barge_in         INTEGER NOT NULL DEFAULT 1,
                 vad_threshold    VARCHAR(16) DEFAULT 'default',
+                vad_mode         VARCHAR(16) NOT NULL DEFAULT 'external',
                 record_dir       VARCHAR(256) DEFAULT 'records',
 
                 enabled          INTEGER NOT NULL DEFAULT 1,
@@ -4790,6 +4792,7 @@ sqlx::query(acct_ddl).execute(pool).await?;
                 transfer_dest    VARCHAR(64),
                 barge_in         TINYINT(1)   NOT NULL DEFAULT 1,
                 vad_threshold    VARCHAR(16) DEFAULT 'default',
+                vad_mode         VARCHAR(16) NOT NULL DEFAULT 'external',
                 record_dir       VARCHAR(256) DEFAULT 'records',
 
                 enabled          TINYINT(1)   NOT NULL DEFAULT 1,
@@ -6501,6 +6504,7 @@ pub struct AiBackend {
     #[serde(serialize_with = "bool_i64::serialize")]
     pub barge_in: i64,
     pub vad_threshold: Option<String>,
+    pub vad_mode: String,
     pub record_dir: Option<String>,
 
     #[serde(serialize_with = "bool_i64::serialize")]
@@ -6548,6 +6552,8 @@ pub struct AiBackendCreate {
     pub barge_in: bool,
     #[serde(default = "default_vad")]
     pub vad_threshold: Option<String>,
+    #[serde(default = "default_vad_mode")]
+    pub vad_mode: String,
     #[serde(default = "default_record_dir")]
     pub record_dir: Option<String>,
 
@@ -6579,6 +6585,7 @@ pub struct AiBackendUpdate {
     pub transfer_dest: Option<String>,
     pub barge_in: Option<bool>,
     pub vad_threshold: Option<String>,
+    pub vad_mode: Option<String>,
     pub record_dir: Option<String>,
 
     pub enabled: Option<bool>,
@@ -6592,6 +6599,7 @@ fn default_nway() -> String { "nway".to_string() }
 fn default_asr_addr() -> Option<String> { Some("127.0.0.1:8089".to_string()) }
 fn default_tts_addr() -> Option<String> { Some("127.0.0.1:8090".to_string()) }
 fn default_vad() -> Option<String> { Some("default".to_string()) }
+fn default_vad_mode() -> String { "external".to_string() }
 fn default_record_dir() -> Option<String> { Some("records".to_string()) }
 
 fn default_priority() -> String { "priority".to_string() }
@@ -7674,9 +7682,9 @@ impl Db {
              llm_provider, llm_api_key, llm_model, llm_endpoint,
              asr_provider, asr_addr,
              tts_provider, tts_addr,
-             transfer_dest, barge_in, vad_threshold, record_dir,
+             transfer_dest, barge_in, vad_threshold, vad_mode, record_dir,
              enabled)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
          RETURNING *";
 
         if backend == "mysql" {
@@ -7691,7 +7699,7 @@ impl Db {
                 .bind(&c.tts_provider).bind(&c.tts_addr)
                 .bind(&c.transfer_dest)
                 .bind(c.barge_in as i64)
-                .bind(&c.vad_threshold).bind(&c.record_dir)
+                .bind(&c.vad_threshold).bind(&c.vad_mode).bind(&c.record_dir)
                 .bind(c.enabled as i64)
                 .execute(pool).await?;
             let row = sqlx::query_as::<_, AiBackend>(
@@ -7710,7 +7718,7 @@ impl Db {
                 .bind(&c.tts_provider).bind(&c.tts_addr)
                 .bind(&c.transfer_dest)
                 .bind(c.barge_in as i64)
-                .bind(&c.vad_threshold).bind(&c.record_dir)
+                .bind(&c.vad_threshold).bind(&c.vad_mode).bind(&c.record_dir)
                 .bind(c.enabled as i64)
                 .fetch_one(pool).await?)
         }
@@ -7755,6 +7763,7 @@ impl Db {
         set_s!("transfer_dest", u.transfer_dest.clone());
         set_b!("barge_in", u.barge_in);
         set_s!("vad_threshold", u.vad_threshold.clone());
+        set_s!("vad_mode", u.vad_mode.clone());
         set_s!("record_dir", u.record_dir.clone());
         set_b!("enabled", u.enabled);
 
