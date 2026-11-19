@@ -349,7 +349,7 @@ app.component('dialplan-rules', {
 
       <!-- 新建/Edit弹窗 -->
       <el-dialog v-model="showModal" :title="editingId ? 'Edit Dialplan Rule' : 'New Dialplan Rule'" width="900px" destroy-on-close>
-        <el-form :model="form" label-position="top">
+        <el-form tag="div" :model="form" label-position="top">
           <el-form-item label="所属Tenant">
             <el-select v-model="form.tenant_id" style="width:100%" filterable>
               <el-option v-for="t in tenantOptions" :key="t.id" :value="t.id"
@@ -358,7 +358,7 @@ app.component('dialplan-rules', {
             </el-select>
             <div class="text-xs text-slate-400 mt-1">{{ t('跨Tenant规则互相隔离，Default选 T1 (default)') }}</div>
           </el-form-item>
-          <el-form-item label="Rule Name"><el-input v-model="form.name" placeholder="例：DID 51350820 → 内部 alice"></el-input></el-form-item>
+          <el-form-item label="Rule Name" required><el-input v-model="form.name" placeholder="例：DID 51350820 → 内部 alice"></el-input></el-form-item>
           <el-form-item label="所属 Profile（= FreeSWITCH context）">
             <el-select v-model="form.profile_name" style="width:100%" @change="onProfileChange">
               <el-option value="internal" label="internal (SIP → internal)"></el-option>
@@ -425,10 +425,13 @@ app.component('dialplan-rules', {
                 <el-option disabled value="" label="(none available)"></el-option>
               </el-option-group>
               <el-option-group label="— EXT Extension / BIZ 业务 —">
-                <el-option value="extension:" label="extension:<extension> → BIZ"></el-option>
-                <el-option value="queue:"     label="queue:<队列> → BIZ"></el-option>
-                <el-option value="ivr:"       label="ivr:<IVR> → BIZ"></el-option>
+                <el-option value="extension:" label="extension:<extension> → BIZ 内部分机"></el-option>
+                <el-option value="queue:"     label="queue:<队列> → BIZ 队列"></el-option>
+                <el-option value="ivr:"       label="ivr:<IVR> → BIZ 语音菜单"></el-option>
                 <el-option value="hangup"     label="hangup → BIZ 挂机"></el-option>
+              </el-option-group>
+              <el-option-group label="— LOCAL 本地 —">
+                <el-option value="local:ai"   label="local:ai → 🤖 AI 对话 (走 ai_backends 表)"></el-option>
               </el-option-group>
             </el-select>
             <div class="text-xs text-slate-400 mt-1">
@@ -972,6 +975,13 @@ app.component('dialplan-rules', {
     async function save() {
       saving.value = true;
       try {
+        // ★ 前端必填校验 — name trim 后为空直接拦截，避免打到后端 400
+        if (!form.value.name || !form.value.name.trim()) {
+          ElMessage.error('Rule Name 不能为空');
+          return;
+        }
+        form.value.name = form.value.name.trim();
+
         // ★ 如果用户直接编辑了 JSON 并且合法 → 优先用 JSON 作为 payload
         let payload;
         if (ruleJsonUserEdited.value && ruleJsonValid.value) {
@@ -1018,6 +1028,324 @@ app.component('dialplan-rules', {
              ruleJson, ruleJsonValid, ruleJsonError, ruleJsonUserEdited,
              ruleJsonOnInput, ruleJsonOnBlur, ruleJsonSyncFromForm, ruleJsonFormat, ruleJsonCopy,
              load, reloadRules, openCreate, openEdit, onProfileChange, save, del };
+  },
+});
+
+// =============================================================================
+// AI Backends — AI 对话后端配置 CRUD（2026-11-19 NEW）
+// REST API: /ai-backends
+// =============================================================================
+app.component('ai-backends', {
+  template: `
+    <div class="space-y-4">
+      <div class="flex items-center justify-between">
+        <h2 class="text-lg font-semibold text-slate-800"><i class="fa-solid fa-robot mr-2 text-purple-600"></i>{{ t('AI Backends') }}</h2>
+        <div class="flex items-center gap-2">
+          <el-input v-model="keyword" size="small" placeholder="搜索 name / provider..." clearable style="width:220px"
+            @keyup.enter="load"></el-input>
+          <el-button type="primary" size="small" @click="openCreate">
+            <el-icon><Plus /></el-icon>{{ t('New') }}
+          </el-button>
+        </div>
+      </div>
+
+      <el-table :data="items" border stripe size="default" style="width:100%">
+        <el-table-column type="index" label="#" width="55" align="center"></el-table-column>
+        <el-table-column prop="name" label="Name" min-width="140"></el-table-column>
+        <el-table-column prop="nsb_web_url" label="nsb-web URL" min-width="180">
+          <template #default="{ row }"><code class="text-xs">{{ row.nsb_web_url }}</code></template>
+        </el-table-column>
+        <el-table-column prop="llm_provider" label="LLM" width="100" align="center">
+          <template #default="{ row }"><el-tag size="small" effect="plain">{{ row.llm_provider }}</el-tag></template>
+        </el-table-column>
+        <el-table-column prop="llm_model" label="Model" width="140" align="center">
+          <template #default="{ row }"><span class="text-xs text-slate-500">{{ row.llm_model || '—' }}</span></template>
+        </el-table-column>
+        <el-table-column prop="asr_provider" label="ASR" width="100" align="center">
+          <template #default="{ row }"><el-tag size="small" type="success" effect="plain">{{ row.asr_provider }}</el-tag></template>
+        </el-table-column>
+        <el-table-column prop="tts_provider" label="TTS" width="100" align="center">
+          <template #default="{ row }"><el-tag size="small" type="warning" effect="plain">{{ row.tts_provider }}</el-tag></template>
+        </el-table-column>
+        <el-table-column prop="transfer_dest" label="转人工" width="100" align="center">
+          <template #default="{ row }">
+            <span v-if="row.transfer_dest" class="text-sm font-mono text-amber-600">{{ row.transfer_dest }}</span>
+            <span v-else class="text-slate-400 text-xs">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column prop="barge_in" label="打断" width="70" align="center">
+          <template #default="{ row }">
+            <span v-if="row.barge_in" class="text-green-600 font-bold">✓</span>
+            <span v-else class="text-slate-300">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column prop="enabled" label="Enabled" width="80" align="center">
+          <template #default="{ row }">
+            <el-tag :type="row.enabled ? 'success' : 'info'" effect="light" size="small" round>
+              {{ row.enabled ? 'ON' : 'OFF' }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="updated_at" label="Updated" width="180">
+          <template #default="{ row }"><span class="text-xs text-slate-400">{{ row.updated_at }}</span></template>
+        </el-table-column>
+        <el-table-column label="Actions" width="150" align="center" fixed="right">
+          <template #default="{ row }">
+            <el-button link type="primary" size="small" @click="openEdit(row)">{{ t('Edit') }}</el-button>
+            <el-popconfirm title="Delete this AI backend?" @confirm="del(row.id)">
+              <template #reference><el-button link type="danger" size="small">{{ t('Delete') }}</el-button></template>
+            </el-popconfirm>
+          </template>
+        </el-table-column>
+      </el-table>
+
+      <!-- 新建/编辑弹窗 -->
+      <el-dialog v-model="showModal" :title="editingId ? 'Edit AI Backend' : 'New AI Backend'" width="820px" destroy-on-close>
+        <el-form tag="div" :model="form" label-position="top">
+          <el-tabs v-model="activeTab">
+            <!-- Tab 1: 基本 -->
+            <el-tab-pane label="基本信息" name="basic">
+              <div class="grid grid-cols-2 gap-4">
+                <el-form-item label="Name" required>
+                  <el-input v-model="form.name" placeholder="例：default / doubao-cn / mock-test"></el-input>
+                </el-form-item>
+                <el-form-item label="Enable">
+                  <el-switch v-model="form.enabled" active-text="ON" inactive-text="OFF"></el-switch>
+                </el-form-item>
+              </div>
+              <el-form-item label="Description">
+                <el-input v-model="form.description" type="textarea" :rows="2" placeholder="可选"></el-input>
+              </el-form-item>
+            </el-tab-pane>
+
+            <!-- Tab 2: 控制通道 -->
+            <el-tab-pane label="nsb-web 控制通道" name="control">
+              <el-form-item label="nsb-web URL">
+                <el-input v-model="form.nsb_web_url" placeholder="https://127.0.0.1:443"></el-input>
+                <div class="text-xs text-slate-400 mt-1">AI agent 通过此 URL 调用 nsb-web HTTP API 发起 SIP 呼叫</div>
+              </el-form-item>
+              <div class="grid grid-cols-2 gap-4">
+                <el-form-item label="Transport">
+                  <el-select v-model="form.transport" style="width:100%">
+                    <el-option value="https" label="HTTPS (推荐)"></el-option>
+                    <el-option value="http" label="HTTP (内网开发)"></el-option>
+                    <el-option value="wss" label="WSS (WebSocket Secure)"></el-option>
+                    <el-option value="ws" label="WS (WebSocket)"></el-option>
+                  </el-select>
+                </el-form-item>
+                <el-form-item label="TLS 证书校验">
+                  <el-switch v-model="form.insecure"
+                    active-text="跳过校验" inactive-text="严格校验"></el-switch>
+                  <div class="text-xs text-slate-400 mt-1">内网自签证书建议打开跳过</div>
+                </el-form-item>
+              </div>
+              <el-form-item label="API Token">
+                <el-input v-model="form.nsb_web_token" type="password" show-password placeholder="nsb-web /api/v1/login 登录获取"></el-input>
+              </el-form-item>
+            </el-tab-pane>
+
+            <!-- Tab 3: LLM -->
+            <el-tab-pane label="LLM 大模型" name="llm">
+              <div class="grid grid-cols-2 gap-4">
+                <el-form-item label="LLM Provider">
+                  <el-select v-model="form.llm_provider" style="width:100%">
+                    <el-option value="mock" label="mock（内置回音，开发测试用）"></el-option>
+                    <el-option value="openai" label="OpenAI / 兼容 (gpt-4o-mini 等)"></el-option>
+                    <el-option value="doubao" label="豆包 / 火山方舟"></el-option>
+                    <el-option value="ollama" label="Ollama (本地部署)"></el-option>
+                    <el-option value="qwen" label="通义千问"></el-option>
+                  </el-select>
+                </el-form-item>
+                <el-form-item label="Model">
+                  <el-input v-model="form.llm_model" placeholder="gpt-4o-mini"></el-input>
+                </el-form-item>
+              </div>
+              <el-form-item label="API Key">
+                <el-input v-model="form.llm_api_key" type="password" show-password placeholder="sk-..."></el-input>
+              </el-form-item>
+              <el-form-item label="Endpoint (可选，自定义 URL)">
+                <el-input v-model="form.llm_endpoint" placeholder="https://api.openai.com/v1"></el-input>
+                <div class="text-xs text-slate-400 mt-1">留空 = Provider 默认地址；私有化部署或中转代理时填写</div>
+              </el-form-item>
+            </el-tab-pane>
+
+            <!-- Tab 4: ASR -->
+            <el-tab-pane label="ASR 语音识别" name="asr">
+              <div class="grid grid-cols-2 gap-4">
+                <el-form-item label="ASR Provider">
+                  <el-select v-model="form.asr_provider" style="width:100%">
+                    <el-option value="nway" label="nway (NSBC 内建，走 Event Client)"></el-option>
+                    <el-option value="whisper" label="Whisper / faster-whisper"></el-option>
+                    <el-option value="aliyun" label="阿里云智能语音"></el-option>
+                    <el-option value="tencent" label="腾讯云 ASR"></el-option>
+                  </el-select>
+                </el-form-item>
+                <el-form-item label="ASR 地址">
+                  <el-input v-model="form.asr_addr" placeholder="127.0.0.1:8089"></el-input>
+                </el-form-item>
+              </div>
+            </el-tab-pane>
+
+            <!-- Tab 5: TTS -->
+            <el-tab-pane label="TTS 语音合成" name="tts">
+              <div class="grid grid-cols-2 gap-4">
+                <el-form-item label="TTS Provider">
+                  <el-select v-model="form.tts_provider" style="width:100%">
+                    <el-option value="nway" label="nway (NSBC 内建)"></el-option>
+                    <el-option value="edge" label="Edge TTS (免费, 离线)"></el-option>
+                    <el-option value="aliyun" label="阿里云智能语音"></el-option>
+                    <el-option value="tencent" label="腾讯云 TTS"></el-option>
+                  </el-select>
+                </el-form-item>
+                <el-form-item label="TTS 地址">
+                  <el-input v-model="form.tts_addr" placeholder="127.0.0.1:8090"></el-input>
+                </el-form-item>
+              </div>
+            </el-tab-pane>
+
+            <!-- Tab 6: 呼叫控制 -->
+            <el-tab-pane label="呼叫控制" name="call">
+              <div class="grid grid-cols-2 gap-4">
+                <el-form-item label="转人工目标分机">
+                  <el-input v-model="form.transfer_dest" placeholder="例：1007"></el-input>
+                  <div class="text-xs text-slate-400 mt-1">用户说「帮我转人工」时，REFER 发到这个分机</div>
+                </el-form-item>
+                <el-form-item label="VAD 静音阈值">
+                  <el-select v-model="form.vad_threshold" style="width:100%" clearable>
+                    <el-option value="low" label="low (静音判定宽松，适合噪声大环境)"></el-option>
+                    <el-option value="default" label="default (平衡)"></el-option>
+                    <el-option value="high" label="high (静音判定严格，安静环境)"></el-option>
+                  </el-select>
+                </el-form-item>
+              </div>
+              <div class="grid grid-cols-2 gap-4">
+                <el-form-item label="Barge-in（打断说话）">
+                  <el-switch v-model="form.barge_in" active-text="允许" inactive-text="禁止"></el-switch>
+                  <div class="text-xs text-slate-400 mt-1">用户开始说话时立即停止 LLM 正在播的 TTS</div>
+                </el-form-item>
+                <el-form-item label="录音保存目录">
+                  <el-input v-model="form.record_dir" placeholder="/var/lib/nsbc/ai-records"></el-input>
+                </el-form-item>
+              </div>
+            </el-tab-pane>
+          </el-tabs>
+        </el-form>
+        <template #footer>
+          <el-button @click="showModal = false">{{ t('Cancel') }}</el-button>
+          <el-button type="primary" :loading="saving" @click="save">{{ t('Save') }}</el-button>
+        </template>
+      </el-dialog>
+    </div>
+  `,
+  setup() {
+    const API_PATH = '/ai-backends';
+    const { ref, onMounted } = Vue;
+
+    const items = ref([]);
+    const keyword = ref('');
+    const showModal = ref(false);
+    const editingId = ref(null);
+    const activeTab = ref('basic');
+    const form = ref({});
+    const saving = ref(false);
+
+    function defaultForm() {
+      return {
+        name: '',
+        description: '',
+        nsb_web_url: 'https://127.0.0.1:443',
+        nsb_web_token: '',
+        transport: 'https',
+        insecure: true,
+        llm_provider: 'mock',
+        llm_api_key: '',
+        llm_model: 'gpt-4o-mini',
+        llm_endpoint: '',
+        asr_provider: 'nway',
+        asr_addr: '127.0.0.1:8089',
+        tts_provider: 'nway',
+        tts_addr: '127.0.0.1:8090',
+        transfer_dest: '',
+        barge_in: true,
+        vad_threshold: 'default',
+        record_dir: '',
+        enabled: true,
+      };
+    }
+
+    async function load() {
+      const params = new URLSearchParams({ limit: '500', offset: '0' });
+      if (keyword.value) params.set('keyword', keyword.value.trim());
+      const r = await API.get(API_PATH + '?' + params.toString());
+      items.value = r.items || [];
+    }
+
+    function openCreate() {
+      form.value = defaultForm();
+      activeTab.value = 'basic';
+      editingId.value = null;
+      showModal.value = true;
+    }
+
+    function openEdit(row) {
+      // 后端 AiBackend bool 字段返回 i64 (0/1)，前端直接映射
+      const f = { ...row };
+      // Option 字段：null → ''（输入框友好）
+      for (const k of ['description','nsb_web_token','llm_api_key','llm_endpoint','asr_addr','tts_addr','transfer_dest','record_dir']) {
+        if (f[k] == null) f[k] = '';
+      }
+      editingId.value = row.id;
+      form.value = f;
+      activeTab.value = 'basic';
+      showModal.value = true;
+    }
+
+    async function save() {
+      saving.value = true;
+      try {
+        if (!form.value.name || !form.value.name.trim()) {
+          ElMessage.error('AI Backend Name 不能为空');
+          return;
+        }
+        const payload = { ...form.value };
+        payload.name = payload.name.trim();
+
+        // 空字符串 → null（后端 Option<String>）
+        for (const k of ['description','nsb_web_token','llm_api_key','llm_model','llm_endpoint','asr_addr','tts_addr','transfer_dest','vad_threshold','record_dir']) {
+          if (payload[k] != null && payload[k] !== '' && payload[k].trim() !== '') {
+            payload[k] = payload[k].trim();
+          } else {
+            payload[k] = null;
+          }
+        }
+
+        if (editingId.value) {
+          await API.put(API_PATH + '/' + editingId.value, payload);
+        } else {
+          await API.post(API_PATH, payload);
+        }
+        showModal.value = false;
+        await load();
+      } catch (e) {
+        ElMessage.error('Save 失败: ' + (e.message || e));
+      } finally {
+        saving.value = false;
+      }
+    }
+
+    async function del(id) {
+      try {
+        await API.delete(API_PATH + '/' + id);
+        await load();
+      } catch (e) { ElMessage.error('Delete 失败: ' + (e.message || e)); }
+    }
+
+    onMounted(load);
+
+    return {
+      items, keyword, showModal, editingId, activeTab, form, saving,
+      load, openCreate, openEdit, save, del,
+    };
   },
 });
 

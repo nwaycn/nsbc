@@ -1042,6 +1042,7 @@ const app = createApp({
       { path: '/trunks',       label: t('Trunk'),     icon: 'fa-solid fa-signal' },
       // 路由组已移到后端Core侧（nsbcd route_group_t），Web 侧暂不暴露
       { path: '/dialplan-rules', label: t('Dialplan Rules'), icon: 'fa-solid fa-code-branch' },
+      { path: '/ai-backends',   label: t('AI Backends'), icon: 'fa-solid fa-robot' },
       { path: '/time-groups',  label: t('Time Groups'), icon: 'fa-solid fa-clock' },
       { path: '/queues',       label: t('Extension Queues'), icon: 'fa-solid fa-people-group' },
       { path: '/ivr-menus',    label: t('IVR Menus'), icon: 'fa-solid fa-circle-question' },

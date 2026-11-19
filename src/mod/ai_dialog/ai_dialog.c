@@ -234,9 +234,6 @@ static void ai_rec_feed(void *ud, void *call_key,
 {
     ai_store_t *st = (ai_store_t *)ud;
     if (!st || !st->cfg.enabled || !call_key) return;
-    static __thread unsigned g_rx = 0;
-    llog(LOG_DEBUG, "ai", "AF g_rx=%u call=%p pt=%d leg=%d st=%p en=%d",
-         ++g_rx, call_key, pt, leg, (void*)st, st->cfg.enabled);
 
     /*  2026-11-17 修复：两边都抓（leg=0 主叫 + leg=1 被叫）。
      * previously only leg=1 (B side), but SIPp UAS B side sends no RTP -> zero hook invocations.
@@ -650,6 +647,12 @@ static void *ai_session_thread_stub(void *arg)
         pthread_mutex_unlock(&s->lock);
         nanosleep((const struct timespec[]){{0, 20 * 1000 * 1000}}, NULL);
     }
+
+    /* ★ transfer 或其他原因退出线程前，必须先停 producer → 停 VAD 引擎 + 通知 ai_agent。
+     * VAD 是独立注册在媒体桥的回调，session free 不会自动停它，
+     * 会继续把音频转发给 ai_agent → 出现几百条 "grace DONE" 刷屏。 */
+    llog(LOG_INFO, "ai", "thread exit cleanup call=%p (producer→0, vad_stop)", s->call_key);
+    ai_set_producer(s->call_key, 0);
 
     /* 线程退出清理 */
     pthread_mutex_lock(&st->lock);

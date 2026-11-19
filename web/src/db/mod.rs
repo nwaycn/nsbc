@@ -4816,6 +4816,46 @@ sqlx::query(acct_ddl).execute(pool).await?;
         tracing::info!("🤖 ai_backends: seeded default backend (name='default', llm=mock, transfer=1007)");
     }
 
+    // 种子：dialplan_rules 为空时自动插入 9999 → local:ai 默认入口
+    // ★ prio 必须=0（全局最高优先级）——C 端 dp_execute 排序是 prio 升序，
+    //   命中第一条就 return。若 9999 规则 prio 比通配 ^\d{4}$ 大，9999 永远被通配先抢。
+    // ★ app_chain 必须是 [{"app":"ai","data":""}] — 空数组 ai_dialog 不执行。
+    // 迁移 UPDATE 同时修已有 DB 的 prio 和 app_chain。
+    let dp_fix = sqlx::query(
+        "UPDATE dialplan_rules SET prio=0, app_chain='[{\"app\":\"ai\",\"data\":\"\"}]' \
+         WHERE match_expr='^9999$' AND target='local:ai'"
+    ).execute(pool).await;
+    if let Ok(ur) = dp_fix {
+        if ur.rows_affected() > 0 {
+            tracing::info!("📞 dialplan_rules: fixed {} AI rule rows (prio→0, app_chain→ai)", ur.rows_affected());
+        }
+    }
+
+    let dp_count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM dialplan_rules WHERE match_expr='^9999$' AND target='local:ai'"
+    ).fetch_one(pool).await.unwrap_or((0,));
+    if dp_count.0 == 0 {
+        let seed_dp = match backend {
+            "postgres" =>
+                "INSERT INTO dialplan_rules
+                    (tenant_id, name, profile_name, match_expr, caller_match, prio, strip, target,
+                     action_json, app_chain, enabled, description)
+                 VALUES
+                    (1, '默认 AI 入口 9999', 'internal', '^9999$', '', 0, 0, 'local:ai',
+                     '{}', '[{\"app\":\"ai\",\"data\":\"\"}]', 1, '首次启动自动创建 — 分机拨 9999 进入 AI 对话（依赖 ai_backends 表 default 行）')
+                 ON CONFLICT (tenant_id, name) DO NOTHING",
+            _ =>
+                "INSERT OR IGNORE INTO dialplan_rules
+                    (tenant_id, name, profile_name, match_expr, caller_match, prio, strip, target,
+                     action_json, app_chain, enabled, description)
+                 VALUES
+                    (1, '默认 AI 入口 9999', 'internal', '^9999$', '', 0, 0, 'local:ai',
+                     '{}', '[{\"app\":\"ai\",\"data\":\"\"}]', 1, '首次启动自动创建 — 分机拨 9999 进入 AI 对话（依赖 ai_backends 表 default 行）')",
+        };
+        let _ = sqlx::query(seed_dp).execute(pool).await;
+        tracing::info!("📞 dialplan_rules: seeded default AI entry (9999 → local:ai, app_chain=[ai], prio=0)");
+    }
+
     Ok(())
 }
 
@@ -7504,6 +7544,8 @@ impl Db {
             }};
         }
 
+        set_ir!("tenant_id", u.tenant_id);
+        set_sr!("name", u.name.clone());
         set_sr!("layer", u.layer.clone());
         set_sr!("profile_name", u.profile_name.clone());
         set_sr!("src_ip_cidr", u.src_ip_cidr.clone());
@@ -7626,7 +7668,8 @@ impl Db {
         let pool = self.pool().ok_or(
             sqlx::Error::Configuration("NSBC_DB_DSN not set".into())
         )?;
-        let sql = "INSERT INTO ai_backends
+        let backend = self.backend();
+        let raw_sql = "INSERT INTO ai_backends
             (name, description, nsb_web_url, nsb_web_token, transport, insecure,
              llm_provider, llm_api_key, llm_model, llm_endpoint,
              asr_provider, asr_addr,
@@ -7635,19 +7678,42 @@ impl Db {
              enabled)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
          RETURNING *";
-        sqlx::query_as::<_, AiBackend>(sql)
-            .bind(&c.name).bind(&c.description)
-            .bind(&c.nsb_web_url).bind(&c.nsb_web_token)
-            .bind(&c.transport).bind(c.insecure as i64)
-            .bind(&c.llm_provider).bind(&c.llm_api_key)
-            .bind(&c.llm_model).bind(&c.llm_endpoint)
-            .bind(&c.asr_provider).bind(&c.asr_addr)
-            .bind(&c.tts_provider).bind(&c.tts_addr)
-            .bind(&c.transfer_dest)
-            .bind(c.barge_in as i64)
-            .bind(&c.vad_threshold).bind(&c.record_dir)
-            .bind(c.enabled as i64)
-            .fetch_one(pool).await
+
+        if backend == "mysql" {
+            let exec_sql = fix_ph(&strip_returning(raw_sql), backend);
+            sqlx::query(&exec_sql)
+                .bind(&c.name).bind(&c.description)
+                .bind(&c.nsb_web_url).bind(&c.nsb_web_token)
+                .bind(&c.transport).bind(c.insecure as i64)
+                .bind(&c.llm_provider).bind(&c.llm_api_key)
+                .bind(&c.llm_model).bind(&c.llm_endpoint)
+                .bind(&c.asr_provider).bind(&c.asr_addr)
+                .bind(&c.tts_provider).bind(&c.tts_addr)
+                .bind(&c.transfer_dest)
+                .bind(c.barge_in as i64)
+                .bind(&c.vad_threshold).bind(&c.record_dir)
+                .bind(c.enabled as i64)
+                .execute(pool).await?;
+            let row = sqlx::query_as::<_, AiBackend>(
+                "SELECT * FROM ai_backends WHERE id = LAST_INSERT_ID()"
+            ).fetch_one(pool).await?;
+            Ok(row)
+        } else {
+            let exec_sql = fix_ph(raw_sql, backend);
+            Ok(sqlx::query_as::<_, AiBackend>(&exec_sql)
+                .bind(&c.name).bind(&c.description)
+                .bind(&c.nsb_web_url).bind(&c.nsb_web_token)
+                .bind(&c.transport).bind(c.insecure as i64)
+                .bind(&c.llm_provider).bind(&c.llm_api_key)
+                .bind(&c.llm_model).bind(&c.llm_endpoint)
+                .bind(&c.asr_provider).bind(&c.asr_addr)
+                .bind(&c.tts_provider).bind(&c.tts_addr)
+                .bind(&c.transfer_dest)
+                .bind(c.barge_in as i64)
+                .bind(&c.vad_threshold).bind(&c.record_dir)
+                .bind(c.enabled as i64)
+                .fetch_one(pool).await?)
+        }
     }
 
     pub async fn update_ai_backend(
@@ -7702,11 +7768,24 @@ impl Db {
         };
         sets.push(format!("updated_at = {ts}"));
         let where_idx = idx + 1;
-        let sql = format!("UPDATE ai_backends SET {} WHERE id = ${where_idx} RETURNING *", sets.join(", "));
-        let mut q = sqlx::query_as::<_, AiBackend>(&sql);
-        for b in &binds { q = q.bind(b.as_str()); }
-        q = q.bind(id);
-        q.fetch_one(pool).await
+        let raw_sql = format!("UPDATE ai_backends SET {} WHERE id = ${where_idx} RETURNING *", sets.join(", "));
+
+        if backend == "mysql" {
+            let exec_sql = fix_ph(&strip_returning(&raw_sql), backend);
+            let mut q = sqlx::query(&exec_sql);
+            for b in &binds { q = q.bind(b.as_str()); }
+            q = q.bind(id);
+            q.execute(pool).await?;
+            let row_sql = fix_ph("SELECT * FROM ai_backends WHERE id = $1", backend);
+            let row = sqlx::query_as::<_, AiBackend>(&row_sql).bind(id).fetch_one(pool).await?;
+            Ok(row)
+        } else {
+            let exec_sql = fix_ph(&raw_sql, backend);
+            let mut q = sqlx::query_as::<_, AiBackend>(&exec_sql);
+            for b in &binds { q = q.bind(b.as_str()); }
+            q = q.bind(id);
+            q.fetch_one(pool).await
+        }
     }
 
     pub async fn delete_ai_backend(&self, id: i64) -> Result<bool, sqlx::Error> {

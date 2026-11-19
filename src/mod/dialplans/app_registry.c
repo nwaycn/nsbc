@@ -267,9 +267,20 @@ int dp_rule_set_app_chain(dp_rule_t *rule,
                           const dp_app_action_t *chain, size_t n)
 {
     if (!rule) return NSBC_INVAL;
-    /* 清空旧 chain（reload 时旧表由 RCU 宽限期后统一回收，
-     * 这里调用方已保证指针归属——P0 简化：不 free，依赖 RCU） */
-    rule->app_chain = (struct dp_app_action *)chain;
+    if (rule->app_chain) {
+        free(rule->app_chain);
+        rule->app_chain = NULL;
+        rule->app_chain_n = 0;
+    }
+    if (n == 0 || !chain)
+        return NSBC_OK;
+    /* ★ 统一所有权：calloc + memcpy，让 rule 永远持有自己的独立副本。
+     * 调用侧的 chain 可以是 static 数组（signaling.c 默认规则）或 calloc（stub_mods.c reload），
+     * 但 rule->app_chain 永远指向 calloc 内存 → dp_table_free 里 free() 不会崩。 */
+    dp_app_action_t *copy = (dp_app_action_t *)calloc(n, sizeof(*copy));
+    if (!copy) return NSBC_NOMEM;
+    memcpy(copy, chain, n * sizeof(*copy));
+    rule->app_chain = copy;
     rule->app_chain_n = n;
     return NSBC_OK;
 }

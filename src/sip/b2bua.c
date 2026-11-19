@@ -9120,14 +9120,24 @@ static int b2b_send_refer(b2b_call_t *c, int leg,
     b2b_core_t *co = c->core;
     b2b_leg_t *l = &c->leg[leg];
     if (!l->dlg || l->state != LEG_CONFIRMED) return NSBC_NOENT;
+    /* ★ local:ai (local_media) 模式 A-腿直接 200 OK，不走标准 B2BUA INVITE→200→dialog confirmed→BYE 清 inv_txn 流程，
+     * inv_txn 永远残留。此函数入口已确认 leg.state=CONFIRMED，inv_txn 是 stale 指针，安全清掉即可。 */
     if (l->inv_txn) {
-        llog(LOG_WARN, "b2b", "REFER leg=%d conflict (inv_txn active)", leg);
-        return NSBC_ERR;
+        llog(LOG_INFO, "b2b", "REFER leg=%d clearing stale inv_txn (local_media/ai passthrough)", leg);
+        l->inv_txn = NULL;
     }
     /* extra 头块：Refer-To + Replaces（可选） */
     char extra[512];
     size_t used = 0;
-    int n = snprintf(extra, sizeof(extra), "Refer-To: <sip:%s>\r\n", refer_to);
+    /* refer_to 可能是纯号码 ("1007") 或完整 SIP URI ("sip:1007@host")。
+     * 若已经带 sip: 前缀则直接用，否则补 sip: — 避免双 sip: 前缀导致
+     * 下游 INVITE 变成 sip:sip:user@host 被解析成 user="sip"。 */
+    int n;
+    if (refer_to && strncmp(refer_to, "sip:", 4) == 0) {
+        n = snprintf(extra, sizeof(extra), "Refer-To: <%s>\r\n", refer_to);
+    } else {
+        n = snprintf(extra, sizeof(extra), "Refer-To: <sip:%s>\r\n", refer_to);
+    }
     if (n > 0 && (size_t)n < sizeof(extra)) used = (size_t)n;
     if (replaces && replaces[0]) {
         int m = snprintf(extra + used, sizeof(extra) - used,
@@ -9208,6 +9218,21 @@ int b2b_transfer_call(b2b_call_t *call, int b_leg, const char *dest,
         if (b_leg == -1) {
             /* 双腿自动：只要有一条腿 OK 就算 OK */
             rc = any_ok ? NSBC_OK : NSBC_NOENT;
+        }
+        /* ★ Blind transfer 成功后，主动向所有有 dialog 的腿发 BYE 清理旧 dialog。
+         * 否则 MicroSIP 会同时维护 "A→dest 新 dialog" 和 "A→nsbc 旧 dialog" →
+         * 用户挂断要挂两次。RFC 3515 虽然规定 UAC 负责 dialog 清理，但
+         * passthrough/AI 模式下 nsbc 作为 dialog owner 主动清理最可靠。 */
+        if (rc == NSBC_OK) {
+            for (int li = 0; li < 2; li++) {
+                b2b_leg_t *lg = &call->leg[li];
+                if (lg->dlg && lg->state == LEG_CONFIRMED) {
+                    llog(LOG_INFO, "b2b", "transfer OK → send_bye_leg leg=%d cleanup old dialog", li);
+                    pthread_mutex_unlock(&call->lock);
+                    send_bye_leg(call, li);
+                    pthread_mutex_lock(&call->lock);
+                }
+            }
         }
     } else {
         /* CONSULTED：Replaces 头已经由调用方（REFER 入站）从 SIP 消息里解析好。

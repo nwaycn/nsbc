@@ -110,6 +110,11 @@ pub async fn create<C: CoreApi + Clone + Send + Sync + 'static>(
 ) -> Result<impl IntoResponse, ApiError> {
     st.db.pool().ok_or(ApiError::DbUnavailable)?;
 
+    // Name 非空校验（前后端双保险）
+    if body.name.trim().is_empty() {
+        return Err(ApiError::BadRequest("dialplan rule name is required".into()));
+    }
+
     // P2-security: app_chain whitelist validation (skip when core dialplan module is
     // not loaded; an empty known_apps array will make a non-empty app_chain all fail —
     // which is correct: you cannot request a non-existent app when the dialplan
@@ -156,6 +161,13 @@ pub async fn update<C: CoreApi + Clone + Send + Sync + 'static>(
     Json(body): Json<crate::db::DialplanRuleUpdate>,
 ) -> Result<impl IntoResponse, ApiError> {
     st.db.pool().ok_or(ApiError::DbUnavailable)?;
+
+    // Name 非空校验：如果传了 name 但 trim 后为空 → 拒绝
+    if let Some(ref n) = body.name {
+        if n.trim().is_empty() {
+            return Err(ApiError::BadRequest("dialplan rule name cannot be empty".into()));
+        }
+    }
 
     // P2-security: only validate when app_chain is being updated.
     // ★ Fault-tolerant: same as create() — do NOT block DB write on core failure.
