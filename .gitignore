@@ -15,8 +15,10 @@ SIP方法实现完整性审计.md
 /.vscode
 /configs
 /config/
-/examples/event_client/python/__pycache__/
-/发行版/
+
+# Python cache
+__pycache__/
+*.pyc
 
 # Build artifacts (configure + make outputs)
 /config.mk
@@ -29,24 +31,14 @@ SIP方法实现完整性审计.md
 /tls/
 /logs/
 /scripts/
-<<<<<<< HEAD
-/website/SKILL.md
-=======
-website/SKILL.md
-client/threeway_test/__pycache__/nsbc_harness.cpython-312.pyc
-client/threeway_test/__pycache__/test_mutual_calls.cpython-312.pyc
-article-01-why-rewrite.md
-docs/nsbc-control-api.md
-nsbc-web-db-write-optimization.md
-article-05-security-checklist.md
-article-03-quickstart-10min.md
-article-02-sip-stack-anatomy.md
-article-04-c11-rust-architecture.md
-cookbook-blow-hard-analysis.md
-/.trae-html-share-packages
-<<<<<<< HEAD
->>>>>>> 5ae3f6ad4001613946271837bd5fa670da41b508
 /na_stream
-=======
-website/nip/
->>>>>>> dc1bb6771f6a672d654a16f9c69ec7adc2c09611
+
+# Website: kept local-only, not tracked in main nsbc repo
+/website/
+
+# Drafts / local-only docs
+/发行版/
+/docs/nsbc-control-api.md
+article-*.md
+cookbook-*.md
+*.html-share-packages
