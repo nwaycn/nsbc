@@ -1,9 +1,9 @@
 /* AI dialog module (optional, MOD_F_DYNAMIC)
  *
  * 纯媒体桥接层（passthrough）：
- *   [1] 媒体抓流    —— bridge_add_rec_feed_hook 挂 B 腿原始 PCMU/G.711 帧
+ *   [1] 媒体抓流    —— bridge_add_rec_feed_hook 挂 B 腿原始 G.711 帧
  *                      → per-call ring buffer (256KB)
- *   [2] 跨 codec 转码 —— 内部统一 PCMU；in_codec 由首帧 RX 动态确定，
+ *   [2] 跨 codec 转码 —— 内部统一 PCMA；in_codec 由首帧 RX 动态确定，
  *                      transcode_open/process 跨 PCMA/G729/G722/... 转码
  *   [3] 注入 + 转人工 —— bridge_send_raw 注入 A 腿；b2b_transfer_call 转人工座席
  *
@@ -26,6 +26,7 @@
 #include "media_codec.h"   /* codec layer: transcode_open/process cross-codec transcode (PCMA/PCMU/G729/G722/...) */
 #include "g711.h"          /* AI internal format: PCMU/PCMA <-> PCM16 LE 8kHz */
 #include "b2bua.h"        /* P0-1: b2b_call_destroy_add + REQ-AI-TRANSFER-001: b2b_transfer_call */
+#include "sdp.h"          /* AI_SESSION_OPENED 的 pt_in 需从 A 腿 SDP offer 解析真实 codec PT */
 #include "callctrl.h"     /* REQ-AI-TRANSFER-001: CCF_XFER_BLIND */
 #include "dp_sleep.h"     /* P0-2: dp_sleep_app_reg() */
 #include "app_registry.h" /* P0-2: app_register / app_desc_t */
@@ -64,12 +65,12 @@ typedef struct ai_cfg {
 typedef struct ai_session {
     void     *call_key;
     int       b_leg;
-    int       pt_in;                /* 抓进来的 PT（通常 0=PCMU） */
-    /* codec layer: internal baseline is PCMU. in_codec resolved from first RX frame
-     * （默认 CODEC_PCMU）；rx_tc/tx_tc 是cross-codec transcode sessions, rebuilt on codec change. */
+    int       pt_in;                /* 抓进来的 PT（通常 8=PCMA） */
+    /* codec layer: internal baseline is PCMA. in_codec resolved from first RX frame
+     * （默认 CODEC_PCMA）；rx_tc/tx_tc 是cross-codec transcode sessions, rebuilt on codec change. */
     codec_id_t     in_codec;        /* 主叫实际 codec（CODEC_PCMA/G729/...）*/
-    transcode_sess_t *rx_tc;        /* in_codec → PCMU（收流转码）*/
-    transcode_sess_t *tx_tc;        /* PCMU → in_codec（发流转码，format=0 用）*/
+    transcode_sess_t *rx_tc;        /* in_codec → PCMA（收流转码）*/
+    transcode_sess_t *tx_tc;        /* PCMA → in_codec（发流转码，format=0 用）*/
     codec_sess_t     *tx_pcm16_enc; /* in_codec encoder（format=1，PCM16 raw → in_codec 一次编码）*/
     uint32_t  ssrc;                 /* 自己注入用的 SSRC */
     uint16_t  seq;
@@ -114,6 +115,32 @@ static void ai_on_call_destroy(void *call_key, int a_final, void *ud);
 static app_rc_t ai_app_exec(app_ctx_t *c, const char *data, void *ud);
 
 /* P0-2: 给 dp app 或全局 hook 共用的 session 查找/创建辅助 */
+
+/*  从 A 腿 SDP offer 解析第一个 audio codec 的 PT。
+ * local:ai 模式下 A 腿自答，AI_SESSION_OPENED 事件的 pt_in 不能硬编码 0（PCMU）——
+ * 否则 microsip 配 PCMA（pt=8）时，Go agent 会把 PCMA 误判成 PCMU，
+ * 导致 TX 编码错乱 / ASR 精度下降。offer 里首个 audio 段的首个 codec 即真实 PT。 */
+static int ai_first_audio_pt(b2b_call_t *call)
+{
+    if (!call) return 0;
+    b2b_leg_t *a = &call->leg[0];
+    if (!a->offer_len || !a->offer[0]) return 0;
+
+    sdp_t s;
+    memset(&s, 0, sizeof(s));
+    if (sdp_parse(&s, a->offer, a->offer_len) != NSBC_OK)
+        return 0;
+
+    for (int i = 0; i < s.nmedia; ++i) {
+        sdp_media_t *m = &s.media[i];
+        if (m->port == 0 || m->rejected) continue;
+        if (m->type != SDP_M_AUDIO) continue;
+        if (sdp_media_build_codecs(&s, m) == NSBC_OK && m->ncodecs > 0)
+            return m->codecs[0].pt;
+    }
+    return 0;
+}
+
 static ai_session_t *ai_session_find_or_create(ai_store_t *st, void *call_key,
                                                int pt_in, const char *src)
 {
@@ -128,7 +155,7 @@ static ai_session_t *ai_session_find_or_create(ai_store_t *st, void *call_key,
         s->call_key = call_key;
         s->b_leg = 1;
         s->pt_in = pt_in;
-        s->in_codec = CODEC_PCMU;  /* 默认 PCMU；首帧 RX 到达后动态修正为实际 codec */
+        s->in_codec = CODEC_PCMA;  /* 默认 PCMA；首帧 RX 到达后动态修正为实际 codec */
         s->ssrc = 0x4E534243 ^ ((uintptr_t)call_key & 0xFFFFFFFFu);
         s->seq = (uint16_t)(rand() & 0xFFFF);
         s->ts = 0;
@@ -155,11 +182,16 @@ static ai_session_t *ai_session_find_or_create(ai_store_t *st, void *call_key,
             b2b_call_t *b2b = (b2b_call_t *)call_key;
             const char *cid = (b2b && b2b->leg[0].callid[0])
                               ? b2b->leg[0].callid : "unknown";
+            /* in_codec 字段用 pt_in 解析真实 codec_id（PCMA=8 → CODEC_PCMA），
+             * 不能直接报 s->in_codec（默认 PCMA，首帧才动态修正）——否则 Go agent
+             * 会在 AI_SESSION_OPENED 阶段把 PCMA 误判成 PCMU。 */
+            const codec_ops_t *opsc = (pt_in > 0) ? codec_registry_find_pt(pt_in, 8000) : NULL;
+            int in_codec_report = opsc ? (int)opsc->id : (int)s->in_codec;
             char sess[384];
             snprintf(sess, sizeof(sess),
                 "{\"event\":\"ai_session_opened\",\"call_id\":\"%s\","
                 "\"pt_in\":%d,\"in_codec\":%d}",
-                cid, pt_in, s->in_codec);
+                cid, pt_in, in_codec_report);
             uds_send_session(sess);
         }
         s->running = 1;
@@ -246,17 +278,17 @@ static void ai_rec_feed(void *ud, void *call_key,
     }
 
     /*  AI internal format: PCM16 LE 8kHz mono (NASR ASR / NWAYTTS intermediate)
-     * 入站路径：RTP payload → (transcode 非PCMU→PCMU) → g711_ulaw_decode → PCM16 → ring buffer
+     * 入站路径：RTP payload → (transcode 非PCMA→PCMA) → g711_alaw_decode → PCM16 → ring buffer
      * 为什么 PCM16？
-     *   - PCMU 是 8bit 有损压缩，NASR ASR 喂 PCMU 识别精度差
+     *   - PCMA 是 8bit 有损压缩，NASR ASR 喂 PCMA 识别精度差
      *   - PCM16 是完整 16bit 无损，后续 DSP（高通/降噪）也在 PCM16 域做
-     *   - ring buffer 每帧字节翻倍（20ms → 320B PCM16 vs 160B PCMU），256KB 够 16s
+     *   - ring buffer 每帧字节翻倍（20ms → 320B PCM16 vs 160B PCMA），256KB 够 16s
      *   - Go agent ai_get_rx_audio 直接拿 PCM16 喂 NASR，不用再转 */
     uint8_t tc_buf[2048];
-    const uint8_t *pcmu_bytes = (const uint8_t *)payload;
-    size_t pcmu_len = len;
+    const uint8_t *pcma_bytes = (const uint8_t *)payload;
+    size_t pcma_len = len;
 
-    /* per-frame PCM16 栈缓冲（20ms @ 8kHz PCMU → 160 samples → 320B PCM16，留 1024 够 60ms） */
+    /* per-frame PCM16 栈缓冲（20ms @ 8kHz PCMA → 160 samples → 320B PCM16，留 1024 够 60ms） */
     int16_t pcm16_buf[1024];
     const uint8_t *ring_data = NULL;
     size_t ring_len = 0;
@@ -270,11 +302,11 @@ static void ai_rec_feed(void *ud, void *call_key,
         if (s->tx_tc) { transcode_close(s->tx_tc); s->tx_tc = NULL; }
         if (s->tx_pcm16_enc) { codec_registry_find(in_codec)->fini(s->tx_pcm16_enc); s->tx_pcm16_enc = NULL; }
         s->in_codec = in_codec;
-        if (in_codec != CODEC_PCMU) {
+        if (in_codec != CODEC_PCMA) {
             transcode_sess_t *rx = NULL, *tx = NULL;
-            if (transcode_open(in_codec, CODEC_PCMU, &rx) == NSBC_OK) s->rx_tc = rx;
-            if (transcode_open(CODEC_PCMU, in_codec, &tx) == NSBC_OK) s->tx_tc = tx;
-            /* format=1/2 优化：raw PCM16 直接 encode 到 in_codec，跳过中间 PCMU 有损编码 */
+            if (transcode_open(in_codec, CODEC_PCMA, &rx) == NSBC_OK) s->rx_tc = rx;
+            if (transcode_open(CODEC_PCMA, in_codec, &tx) == NSBC_OK) s->tx_tc = tx;
+            /* format=1/2 优化：raw PCM16 直接 encode 到 in_codec，跳过中间 PCMA 有损编码 */
             const codec_ops_t *enc_ops = codec_registry_find(in_codec);
             if (enc_ops) {
                 codec_sess_t *enc = NULL;
@@ -282,24 +314,24 @@ static void ai_rec_feed(void *ud, void *call_key,
                 else if (enc_ops->init)    enc_ops->init(NULL, &enc);
                 s->tx_pcm16_enc = enc;
             }
-            llog(LOG_INFO, "ai", "transcode init call=%p in=%d→PCMU rx=%p PCMU→in tx=%p pcm16_enc=%p",
+            llog(LOG_INFO, "ai", "transcode init call=%p in=%d→PCMA rx=%p PCMA→in tx=%p pcm16_enc=%p",
                  call_key, (int)in_codec, (void*)s->rx_tc, (void*)s->tx_tc, (void*)s->tx_pcm16_enc);
         }
     }
     if (s->rx_tc) {
-        /* codec != PCMU → transcode 先转到 PCMU，再 decode */
+        /* codec != PCMA → transcode 先转到 PCMA，再 decode */
         size_t out_len = 0;
         int rc = transcode_process(s->rx_tc, payload, len, tc_buf, sizeof(tc_buf), &out_len);
         if (rc != NSBC_OK) {
             pthread_mutex_unlock(&s->lock);
             return;  /* AGAIN/错误：本帧跳过 */
         }
-        pcmu_bytes = tc_buf;
-        pcmu_len = out_len;
+        pcma_bytes = tc_buf;
+        pcma_len = out_len;
     }
 
-    /* PCMU -> PCM16 LE 8kHz mono — AI internal unified format */
-    size_t pcm16_samples = g711_ulaw_decode(pcmu_bytes, pcmu_len, pcm16_buf);
+    /* PCMA -> PCM16 LE 8kHz mono — AI internal unified format */
+    size_t pcm16_samples = g711_alaw_decode(pcma_bytes, pcma_len, pcm16_buf);
 
     /* P0: HPF strips DC offset and 50Hz mains hum
      * ring buffer previously had no HPF, so ASR fed slightly different audio than VAD detected
@@ -360,10 +392,10 @@ static void ai_rec_feed(void *ud, void *call_key,
  *   - 转人工座席是 B2BUA 业务层能力，留在 C 核心（b2b_transfer_call 已实现）
  *
  * 音频格式约定：
- *   - RX（用户→AI）：PCMU 8kHz，每次 ai_rec_feed 入队的是完整 RTP 载荷（通常 160 字节 / 20ms）
- *   - TX（AI→用户）：PCMU 8kHz 原始字节（**调用方必须喂 PCMU，本模块不管 codec 转换**），
+ *   - RX（用户→AI）：PCMA 8kHz，每次 ai_rec_feed 入队的是完整 RTP 载荷（通常 160 字节 / 20ms）
+ *   - TX（AI→用户）：PCMA 8kHz 原始字节（**调用方必须喂 PCMA，本模块不管 codec 转换**），
  *     bridge_send_raw 按 RTP 节奏注入 —— codec 转换已模块化嵌入（media_bridge 只管 RTP 封装 + sendto）
- *   - 缓冲区大小：256KB（≈32s @ 8kHz PCMU）
+ *   - 缓冲区大小：256KB（≈32s @ 8kHz PCMA）
  */
 
 /* 外部 producer 模式启动 session（绕过 dp ai app，直接让外部 AI 接管音频）
@@ -410,9 +442,9 @@ int ai_set_producer(void *call_key, int producer)
  * out_max_len: 最多读多少字节（建议 320 的整数倍 = 20ms PCM16 @ 8kHz）
  * 返回：实际读取的字节数（0 = ring buffer 空 / 无 session / session 未启动）
  *
- * ring buffer 存 PCM16 LE 8kHz mono（由 ai_rec_feed 的 g711_ulaw_decode 入队），
+ * ring buffer 存 PCM16 LE 8kHz mono（由 ai_rec_feed 的 g711_alaw_decode 入队），
  * 每 20ms 帧 = 160 samples = 320 bytes。NASR ASR 直接喂此 PCM16，
- * 不再走 PCMU→PCM16 有损转换。 */
+ * 不再走 PCMA→PCM16 有损转换。 */
 size_t ai_get_rx_audio(void *call_key, uint8_t *out_buf, size_t out_max_len)
 {
     if (!call_key || !out_buf || out_max_len == 0) return 0;
@@ -441,15 +473,15 @@ size_t ai_get_rx_audio(void *call_key, uint8_t *out_buf, size_t out_max_len)
  * data:      按 format 解释（见下）
  * len:       字节数
  * format:    音频格式标识
- *   0 = PCMU 8kHz（legacy，经 transcode PCMU→in_codec）
+ *   0 = PCMA 8kHz（legacy，经 transcode PCMA→in_codec）
  *   1 =  PCM16 LE 8kHz mono（AI 内部统一格式，一次 encode 到 in_codec）
  *   2 = PCMA 8kHz（legacy）
  * 返回：NSBC_OK / NSBC_NOENT / NSBC_INVAL / NSBC_AGAIN
  *
  * AI 内部统一格式 = PCM16 LE 8kHz mono：
- *   RX：ai_rec_feed → g711_ulaw_decode → ring buffer 存 PCM16 → ai_get_rx_audio 拿 PCM16
+ *   RX：ai_rec_feed → g711_alaw_decode → ring buffer 存 PCM16 → ai_get_rx_audio 拿 PCM16
  *   TX：外部 AI agent 喂 PCM16 (format=1) → C 侧 codec.encode() 一次 → bridge_send_raw
- * 为什么 PCM16？NASR ASR / NWAYTTS 都是 16bit 中间格式，PCMU 8bit 有损编码会直接降低识别精度。
+ * 为什么 PCM16？NASR ASR / NWAYTTS 都是 16bit 中间格式，PCMA 8bit 有损编码会直接降低识别精度。
  * Go agent ai_agent_daemon 所有音频传递用 format=1，cross-codec encoding handled by C side codec layer. */
 int ai_send_tx_audio(void *call_key, const uint8_t *data, size_t len, int format)
 {
@@ -469,8 +501,8 @@ int ai_send_tx_audio(void *call_key, const uint8_t *data, size_t len, int format
     if (!s->running) { pthread_mutex_unlock(&s->lock); return NSBC_NOENT; }
 
     codec_id_t in_codec = s->in_codec;
-    uint8_t   pt       = 0;  /* 默认 PCMU */
-    if (in_codec != CODEC_PCMU && in_codec != CODEC_NONE) {
+    uint8_t   pt       = 8;  /* 默认 PCMA */
+    if (in_codec != CODEC_PCMA && in_codec != CODEC_NONE) {
         const codec_ops_t *cops = codec_registry_find(in_codec);
         if (cops && cops->default_pt >= 0) pt = (uint8_t)cops->default_pt;
     }
@@ -481,8 +513,8 @@ int ai_send_tx_audio(void *call_key, const uint8_t *data, size_t len, int format
     uint32_t *ts_ptr   = &s->ts;
     pthread_mutex_unlock(&s->lock);
 
-    /* format=1 (PCM16 raw) -> one-shot encode to in_codec, no intermediate PCMU loss
-     * format=0（PCMU）→ 走 transcode PCMU→in_codec（旧路径，兼容） */
+    /* format=1 (PCM16 raw) -> one-shot encode to in_codec, no intermediate PCMA loss
+     * format=0（PCMA）→ 走 transcode PCMA→in_codec（旧路径，兼容） */
     const uint8_t *tx_data = data;
     size_t tx_len = len;
     uint8_t tc_buf[2048];
@@ -490,15 +522,15 @@ int ai_send_tx_audio(void *call_key, const uint8_t *data, size_t len, int format
     if (format == 1) {
         /* --- format=1：PCM16 raw → in_codec（一次 encode）---
          * Go agent NWAYTTS 合成的是 8kHz 16bit mono PCM16_LE，
-         * 我们跳过 Go 侧 PCM16→PCMU（8bit 有损编码），直接在 C 侧
+         * 我们跳过 Go 侧 PCM16→PCMA（8bit 有损编码），直接在 C 侧
          * 用 G.711 encoder.encode() 一次编码到 in_codec。
-         * 对比原来两次编码（Go PCM16→PCMU + C PCMU→PCMA），
+         * 对比原来两次编码（Go PCM16→PCMA + C PCMA→in_codec），
          * 现在只编码 1 次 = 和用户说话链路同保真度。 */
         const codec_ops_t *enc_ops = codec_registry_find(
-            in_codec != CODEC_NONE ? in_codec : CODEC_PCMU);
+            in_codec != CODEC_NONE ? in_codec : CODEC_PCMA);
         if (!enc_ops || !enc_ops->encode) return NSBC_NOENT;
 
-        /* 懒创建 encoder sess（欢迎语阶段 in_codec 可能还是默认 CODEC_PCMU）*/
+        /* 懒创建 encoder sess（欢迎语阶段 in_codec 可能还是默认 CODEC_PCMA）*/
         codec_sess_t *enc = tx_pcm16_enc;
         if (!enc) {
             if (enc_ops->encoder_init) enc_ops->encoder_init(NULL, &enc);
@@ -557,8 +589,8 @@ int ai_send_tx_audio(void *call_key, const uint8_t *data, size_t len, int format
         return NSBC_OK;
     }
 
-    /* --- format=0：PCMU → in_codec（transcode 一次或直通）---
-     * 内部统一 PCMU，如果 in_codec == PCMU 则不转码直接注入 */
+    /* --- format=0：PCMA → in_codec（transcode 一次或直通）---
+     * 内部统一 PCMA，如果 in_codec == PCMA 则不转码直接注入 */
     if (tx_tc) {
         size_t out_len = 0;
         int rc = transcode_process(tx_tc, data, len, tc_buf, sizeof(tc_buf), &out_len);
@@ -631,7 +663,7 @@ static void *ai_session_thread_stub(void *arg)
     if (s->rx_tc) { transcode_close(s->rx_tc); s->rx_tc = NULL; }
     if (s->tx_tc) { transcode_close(s->tx_tc); s->tx_tc = NULL; }
     if (s->tx_pcm16_enc) {
-        const codec_ops_t *ops = codec_registry_find(s->in_codec != CODEC_NONE ? s->in_codec : CODEC_PCMU);
+        const codec_ops_t *ops = codec_registry_find(s->in_codec != CODEC_NONE ? s->in_codec : CODEC_PCMA);
         if (ops && ops->fini) ops->fini(s->tx_pcm16_enc);
         s->tx_pcm16_enc = NULL;
     }
@@ -765,7 +797,13 @@ static app_rc_t ai_app_exec(app_ctx_t *c, const char *data, void *ud)
     }
     if (!s) {
         pthread_mutex_unlock(&st->lock);
-        s = ai_session_find_or_create(st, c->call_key, 0, "dp_ai");
+        /* ★ 修复 payload 误判：pt_in 不能硬编码 0（PCMU）。
+         * 从 A 腿 SDP offer 解析真实 codec PT（microsip 配 PCMA 时 = 8），
+         * AI_SESSION_OPENED 事件带正确的 pt_in/in_codec，Go agent 才能正确编码 TX 音频。 */
+        int real_pt = ai_first_audio_pt((b2b_call_t *)c->call_key);
+        llog(LOG_INFO, "ai", "ai_app_exec: A-leg offer first audio pt=%d (was hardcoded 0)",
+             real_pt);
+        s = ai_session_find_or_create(st, c->call_key, real_pt, "dp_ai");
         if (!s) {
             llog(LOG_WARN, "ai", "ai_app_exec: session create failed");
             return APP_RC_FAILED;

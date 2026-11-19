@@ -173,6 +173,7 @@ fn api_router<C: CoreApi + Clone + 'static>(st: Arc<AppState<C>>) -> Router {
         .merge(routes::route_groups::router())
         .merge(routes::dialplan_rules::router())
         .merge(routes::dialplan_apps::router())
+        .merge(routes::ai_backends::router())
         .merge(routes::codecs::router())
         .merge(routes::ha_groups::router())
         .merge(routes::time_groups::router())

@@ -176,6 +176,7 @@ static int find_or_alloc_slot(void *call_key) {
             for (int leg = 0; leg < VAD_LEGS_PER_CALL; ++leg) {
                 g_states[idx].state[leg] = VAD_STATE_SILENCE;
                 g_states[idx].threshold[leg] = VAD_ACTIVE_VOLUME_THRESHOLD;
+                g_states[idx].far_power[leg] = 30.0;  /* 背景噪声 EMA 合理初值（PCMA 静音 avg abs ≈ 0-20）*/
                 vad_hpf_init(&g_states[idx].hpf[leg], (float)VAD_HPF_CUTOFF_HZ, 8000.0f);
             }
             g_states[idx].active = 1;
@@ -207,7 +208,6 @@ static int find_slot(void *call_key) {
 static inline void power_update_sliding(vad_call_state_t *cs, int leg,
                                         const int16_t *pcm, size_t samples) {
     double *near = &cs->near_power[leg];
-    double *far  = &cs->far_power[leg];
     short  *ring = cs->trace_data[leg];
     int    *wpos = &cs->trace_wpos[leg];
 
@@ -218,23 +218,23 @@ static inline void power_update_sliding(vad_call_state_t *cs, int leg,
         ring[*wpos % VAD_TRACE_SIZE] = pcm[i];
         (*wpos)++;
 
-        /* NEAR：滑窗更新 —— 加新 sample，减最老的 */
+        /* NEAR：滑窗更新 —— 加新 sample，减最老的（10ms avg abs = 当前能量）*/
         double drop_near = (double)abs(ring[(*wpos - VAD_NEAR_SAMPLES + VAD_TRACE_SIZE) % VAD_TRACE_SIZE]);
         *near += abs_s - drop_near;
-
-        /* FAR：滑窗更新 —— 加新 sample，减最老的背景样本 */
-        double drop_far = (double)abs(ring[(*wpos - VAD_FAR_SAMPLES + VAD_TRACE_SIZE) % VAD_TRACE_SIZE]);
-        *far += abs_s - drop_far;
     }
+    /* FAR（背景噪声基线）不再在 per-sample 热路径里滑窗。
+     * 改成 fsm_step 里基于 near_a 的条件 EMA —— 只在静音时跟随，说话中冻结。
+     * 原因：原版 far 和 near 共享 trace ring，说话时 far 也被语音能量拉高
+     * （实测 near=145, far=399, above_nf 永远为 0 — 依赖 near>far 的 FSM 条件全废）*/
 }
 
 /* 近窗平均（VAD_NEAR_SAMPLES 个 sample 的 avg abs）*/
 static inline double near_ave(vad_call_state_t *cs, int leg) {
     return cs->near_power[leg] / (double)VAD_NEAR_SAMPLES;
 }
-/* 远窗平均（VAD_FAR_SAMPLES 个 sample 的 avg abs）—— 背景噪声基线 */
+/* 背景噪声基线（EMA avg abs）—— 只在 near 低时更新，说话中冻结 */
 static inline double far_ave(vad_call_state_t *cs, int leg) {
-    return cs->far_power[leg] / (double)VAD_FAR_SAMPLES;
+    return cs->far_power[leg];  /* 现在 far_power 本身就是 EMA avg 值，不再做滑窗除法 */
 }
 
 /* ============================================================================
@@ -359,24 +359,24 @@ enum {
     FSM_COND_HESIT_TO_SIL,        /* sil>=START_SILENCE → 歇太长=说完了 */
 };
 
-/* SILENCE → SPEECH：必须满足 near>far 且 far_power 相对 active_begin_far 有足够倍率 */
+/* SILENCE → SPEECH（简化版）：
+ *   只要 near_a（最近 10ms 能量）超过 threshold * 0.6，且 active_count >= MIN_SAMPLES，就触发。
+ *   原版条件（far_a > 背景 2-3 倍）在低噪声环境下永远不成立 —— 这里彻底简化。*/
 static int cond_sil_to_speech(vad_call_state_t *cs, int leg, const fsm_input_t *in) {
-    double far_thr = (in->custom_thr > 0.0) ? in->custom_thr : cs->active_begin_far[leg];
-    if (far_thr < 30.0) far_thr = 30.0;  /* fallback */
-
-    /* 条件 1：near > far（能量开始上升）且 far_power 是背景噪声的 2-3 倍 */
-    if (in->above_near_far > 0 && in->far_a > far_thr * 2.0 && in->far_a > VAD_SILENCE_VOLUME_THRESHOLD * 2.0) {
-        /* 有效说话 —— 还需要 active_count >= START_ACTIVE_MIN_SAMPLES */
-        if (cs->active_count[leg] >= VAD_START_ACTIVE_MIN_SAMPLES) return 1;
-    }
+    /* 核心条件：能量显著上升 near > threshold*0.6，且持续 >= START_ACTIVE_MIN_SAMPLES */
+    if (in->near_a > (double)cs->threshold[leg] * 0.6
+        && cs->active_count[leg] >= VAD_START_ACTIVE_MIN_SAMPLES)
+        return 1;
     return 0;
 }
 
-/* SILENCE → SPEECH（突发）：near 突然跳到大值，不用等 far_power 提升 */
+/* SILENCE → SPEECH（突发）：near 突然跳到大值 —— 保持原有逻辑（但用简化 threshold 比较）*/
 static int cond_sil_to_speech_burst(vad_call_state_t *cs, int leg, const fsm_input_t *in) {
-    if (in->above_near_far > 0 && in->far_a > in->near_a * 3.0) {
-        if (cs->active_count[leg] >= VAD_START_ACTIVE_MIN_SAMPLES) return 1;
-    }
+    (void)in;
+    /* near 超过 threshold * 1.5 且 active_count 够长 */
+    if (cs->active_count[leg] >= VAD_START_ACTIVE_MIN_SAMPLES / 2
+        && in->near_a > (double)cs->threshold[leg] * 1.5)
+        return 1;
     return 0;
 }
 
@@ -447,6 +447,22 @@ static inline void fsm_step(vad_call_state_t *cs, int leg, uint16_t rms,
                             int frame_samples) {
     const vad_state_t from = cs->state[leg];
 
+    /* === 背景噪声 EMA 更新（far_power 重定义：真正的背景基线）===
+     * 原版 far 和 near 共享 trace ring 滑窗 — 说话时 far 也被语音拉高（far=399 而 near=145），
+     * 导致 above_nf(near>far) 永远为 0，依赖该关系的 FSM 条件全废。
+     * 现在 far 只在"确认静音"时跟随 near 更新；说话中完全冻结 —— 保证 far 始终反映背景噪声。 */
+    {
+        double *far_ema = &cs->far_power[leg];
+        if (near_a < (double)VAD_SILENCE_VOLUME_THRESHOLD) {
+            /* 真静音（near < 40）— 快速跟随背景噪声变化（α=0.05，时间常数约 200ms）*/
+            *far_ema = *far_ema * 0.95 + near_a * 0.05;
+        } else if (near_a < (double)cs->threshold[leg] * 0.3) {
+            /* 低能量过渡区（40 ≤ near < threshold*0.3）— 极慢跟随，不被短暂/突发噪声污染 */
+            *far_ema = *far_ema * 0.995 + near_a * 0.005;
+        }
+        /* near_a >= threshold*0.3：说话中 — far 完全冻结，绝不被语音能量污染 */
+    }
+
     /* --- 动态计算条件 --- */
     fsm_input_t in;
     memset(&in, 0, sizeof(in));
@@ -474,13 +490,18 @@ static inline void fsm_step(vad_call_state_t *cs, int leg, uint16_t rms,
         cs->threshold[leg] = (uint16_t)auto_thr;
     }
 
-    /* --- 计数更新（sample 单位 —— 用本帧实际 samples 数）--- */
-    if (in.above_near_far > 0) {
+    /* --- 计数更新（sample 单位 —— 用本帧实际 samples 数）---
+     * 关键：active_count 用衰减代替清零。near 短暂低于 far 时不清零 active_count ——
+     * 只有当 near 持续低于 threshold * 0.4 超过 300ms 才清零。
+     * 原版 near<far 就清零 → active_count 永远累不到 640（near/far 微小波动）*/
+    if (in.near_a > (double)cs->threshold[leg] * 0.4) {
         cs->active_count[leg] += frame_samples;
         cs->silence_count[leg] = 0;
     } else {
+        /* 衰减：缓慢减少 active_count（不是立刻清零），silence_count 累加 */
+        cs->active_count[leg] = (cs->active_count[leg] > frame_samples / 2)
+                                ? cs->active_count[leg] - frame_samples / 2 : 0;
         cs->silence_count[leg] += frame_samples;
-        cs->active_count[leg] = 0;
     }
 
     /* --- 扫表 dispatch --- */
@@ -527,14 +548,31 @@ static inline void fsm_step(vad_call_state_t *cs, int leg, uint16_t rms,
  * ==========================================================================*/
 void vad_on_rtp_frame(media_bug_frame_t *frame, void *ud) {
     (void)ud;
+    static __thread int vd_ent = 0;
+    if (vd_ent++ < 3)
+        llog(LOG_NOTICE, "vad", "vad_on_rtp_frame ENTRY call=%p leg=%d len=%zu",
+             frame ? frame->call_key : NULL, frame ? frame->leg : -1,
+             frame ? frame->data_len : 0);
     if (!frame || !frame->call_key || !frame->data || frame->data_len < 12) return;
     if (frame->leg != 0 && frame->leg != 1) return;
 
     /* 1) RTP parse */
     rtp_pkt_t pkt;
     nsbc_rc_t prc = rtp_parse(frame->data, frame->data_len, &pkt);
-    if (prc != NSBC_OK) return;
-    if (pkt.pt != 0 && pkt.pt != 8) return;  /* 只处理 G.711 */
+    if (prc != NSBC_OK) {
+        static __thread int vd_pf = 0;
+        if (vd_pf++ < 3)
+            llog(LOG_WARN, "vad", "vad_on_rtp_frame rtp_parse FAIL rc=%d call=%p",
+                 (int)prc, frame->call_key);
+        return;
+    }
+    if (pkt.pt != 0 && pkt.pt != 8) {
+        static __thread int vd_pt = 0;
+        if (vd_pt++ < 3)
+            llog(LOG_WARN, "vad", "vad_on_rtp_frame pt=%d 不是G.711 call=%p",
+                 (int)pkt.pt, frame->call_key);
+        return;  /* 只处理 G.711 */
+    }
 
     /* 2) G.711 → PCM16（项目已有的查表实现）*/
     int16_t pcm_stack[320];  /* 最多 320 字节 payload = 320 samples = 640B */
@@ -555,6 +593,19 @@ void vad_on_rtp_frame(media_bug_frame_t *frame, void *ud) {
         samples = g711_alaw_decode(pkt.payload, pkt.payload_len, pcm);
     if (samples == 0) return;
 
+    /* 2.5) 诊断：每 50 帧打一次 pt/payload_len/samples/rms_before_hpf */
+    static __thread int dec_cnt = 0;
+    if ((dec_cnt++ % 50) == 0) {
+        uint16_t rms_raw = compute_rms_pcm(pcm, samples);
+        int16_t first = pcm[0], mid = pcm[samples/2], last = pcm[samples-1];
+        llog(LOG_INFO, "vad",
+             "DECODE call=%p leg=%d pt=%d payload_len=%zu samples=%zu "
+             "rms_raw=%u first=%d mid=%d last=%d",
+             frame->call_key, frame->leg, (int)pkt.pt,
+             pkt.payload_len, samples, (unsigned)rms_raw,
+             (int)first, (int)mid, (int)last);
+    }
+
     /* 3) HPF strip DC + mains — zero-malloc hot path, per-leg state from cs->hpf[leg] */
     /* 锁内取 hp 指针，但 HPF 本身是无状态处理（只读写 hpf->x1/y1 等）
      * 这里 hpf 的 x1/y1/x2/y2 读写和 cs 其他字段一起被 g_states_lock 保护 */
@@ -565,6 +616,12 @@ void vad_on_rtp_frame(media_bug_frame_t *frame, void *ud) {
     /* 5) 持锁：查槽 → HPF → 能量 → FSM */
     pthread_mutex_lock(&g_states_lock);
     int idx = find_slot(frame->call_key);
+    if (idx < 0) {
+        static __thread int vd_nf = 0;
+        if (vd_nf++ < 3)
+            llog(LOG_WARN, "vad", "vad_on_rtp_frame find_slot MISS call=%p (vad_start 未命中?)",
+                 frame->call_key);
+    }
     if (idx >= 0) {
         vad_call_state_t *cs = &g_states[idx];
         int leg = frame->leg;
@@ -583,7 +640,21 @@ void vad_on_rtp_frame(media_bug_frame_t *frame, void *ud) {
          * samples = 本帧实际 PCM 样本数（G.711 默认 160，异常时可能不同）*/
         fsm_step(cs, leg, rms, near_a, far_a, (double)cs->threshold[leg], (int)samples);
 
-        /* 5e) 更新诊断 RMS */
+        /* 5e) 每 50 帧打一次诊断（1s @20ms/frame）—— 观察 near/far/active_count 关系 */
+        static __thread int diag_cnt = 0;
+        if ((diag_cnt++ % 50) == 0) {
+            llog(LOG_INFO, "vad",
+                 "DIAG call=%p leg=%d state=%d rms=%u thr=%u "
+                 "near=%.1f far=%.1f above_nf=%d "
+                 "act_cnt=%d sil_cnt=%d act_begin_far=%.1f",
+                 frame->call_key, leg, cs->state[leg],
+                 (unsigned)rms, (unsigned)cs->threshold[leg],
+                 near_a, far_a, (near_a > far_a) ? 1 : 0,
+                 cs->active_count[leg], cs->silence_count[leg],
+                 cs->active_begin_far[leg]);
+        }
+
+        /* 5f) 更新诊断 RMS */
         cs->last_rms[leg] = rms;
     }
     pthread_mutex_unlock(&g_states_lock);
@@ -716,7 +787,7 @@ int vad_start_for_call(void *call_key, int leg_mask, uint16_t threshold) {
         g_states[idx].threshold[leg] = threshold > 0 ? threshold : VAD_ACTIVE_VOLUME_THRESHOLD;
         g_states[idx].last_rms[leg] = 0;
         g_states[idx].near_power[leg] = 0;
-        g_states[idx].far_power[leg]  = 0;
+        g_states[idx].far_power[leg]  = 30.0;  /* 背景噪声 EMA 合理初值（PCMA 静音 avg abs ≈ 0-20）*/
         g_states[idx].active_begin_far[leg] = 0;
         g_states[idx].active_count[leg] = 0;
         g_states[idx].silence_count[leg] = 0;

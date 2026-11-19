@@ -1465,13 +1465,23 @@ static int build_dlg_req(b2b_core_t *co, b2b_leg_t *l,
         rt[0] = '\0';
     else
         route_block(l, rt, sizeof(rt));
-    /* REQ-NAT-001：dialog 内请求（BYE/PRACK/UPDATE 等）Via host 也走 external_sip_ip */
-    /* REQ-NAT-002：优先 per-call profile 的 external_sip_ip，fallback cfg */
-    /* build_dlg_req 只有 b2b_core_t*co、b2b_leg_t*l——通过 l->dlg->ud 反查 b2b_call_t */
+    /* REQ-NAT-001：dialog 内请求（BYE/PRACK/UPDATE 等）Via host 也走 external_sip_ip
+     * REQ-NAT-002：优先 per-call profile 的 external_sip_ip，fallback cfg
+     * ★ 2026-11-19 FIX：只有 call_ref->out_prof 是 "external" profile 才用 external_sip_ip，
+     *   否则一律 local_host（EXT 层 dialog 内请求不应宣告公网 IP） */
     b2b_call_t *call_ref = (l && l->dlg) ? (b2b_call_t *)l->dlg->ud : NULL;
-    const char *prof_ext = (call_ref && call_ref->prof && call_ref->prof->external_sip_ip[0])
-                           ? call_ref->prof->external_sip_ip : co->cfg.external_sip_ip;
-    const char *adv_host = (prof_ext && prof_ext[0]) ? prof_ext : co->cfg.local_host;
+    struct sip_profile *dlg_op = (call_ref && call_ref->out_prof)
+                                 ? call_ref->out_prof
+                                 : (call_ref ? call_ref->prof : NULL);
+    int dlg_is_ext = (dlg_op && dlg_op->name[0] && strcasecmp(dlg_op->name, "external") == 0);
+    const char *adv_host;
+    if (dlg_is_ext) {
+        const char *prof_ext = (dlg_op && dlg_op->external_sip_ip[0])
+                               ? dlg_op->external_sip_ip : co->cfg.external_sip_ip;
+        adv_host = (prof_ext && prof_ext[0]) ? prof_ext : co->cfg.local_host;
+    } else {
+        adv_host = co->cfg.local_host;
+    }
     const char *ex = extra ? extra : rt;
     /* REQ-ORIGINATE-WS-003：Via transport 动态选择（包含 WS/WSS）
      * 之前只有 TCP/TLS/UDP 三分支，WS/WSS 会 fallthrough 到 "UDP"
@@ -1747,11 +1757,25 @@ static sip_txn_t *send_invite_b(b2b_call_t *c, int leg_idx,
      * FreeSWITCH ext-sip-ip 等效。Call-ID 后缀不改（标识符非寻址）。
      * REQ-NAT-002：优先 per-call profile 的 external_sip_ip，fallback cfg
      * ★ 2026-10-19：用 out_prof（B 腿出站 profile，resolve 按 dp_layer 设），
-     *   OUT 层自动走 external profile；EXT/BIZ 走 c->prof */
+     *   OUT 层自动走 external profile；EXT/BIZ 走 c->prof
+     *
+     * ★ 2026-11-19 FIX：只有 out_prof 是 "external" profile 时才宣告公网 IP，
+     *   否则一律 local_host！之前 fallback 到全局 cfg.external_sip_ip，导致
+     *   EXT 层（内部分机互打）INVITE 的 Via/Contact 被写成公网 IP → MicroSIP
+     *   收到后直接丢弃（认为是未知来源）。FreeSWITCH 只在 trunk 路由时用
+     *   ext-sip-ip，内部分机路由永远用内网 IP。 */
     struct sip_profile *op = c->out_prof ? c->out_prof : c->prof;
-    const char *prof_ext = (op && op->external_sip_ip[0])
-                           ? op->external_sip_ip : co->cfg.external_sip_ip;
-    const char *adv_host = (prof_ext && prof_ext[0]) ? prof_ext : co->cfg.local_host;
+    int is_ext_profile = (op && op->name[0] && strcasecmp(op->name, "external") == 0);
+    const char *adv_host;
+    if (is_ext_profile) {
+        /* OUT 层（trunk/公网）：优先 profile external_sip_ip，fallback cfg */
+        const char *prof_ext = (op && op->external_sip_ip[0])
+                               ? op->external_sip_ip : co->cfg.external_sip_ip;
+        adv_host = (prof_ext && prof_ext[0]) ? prof_ext : co->cfg.local_host;
+    } else {
+        /* EXT/BIZ/LOCAL 层（内部分机/队列/AI）：一律 local_host */
+        adv_host = co->cfg.local_host;
+    }
 
     char rt[DLG_URI_MAX * DLG_ROUTE_MAX + 64];
     route_block(b, rt, sizeof(rt));
@@ -2138,10 +2162,18 @@ static void respond_a(b2b_call_t *c, int status, const char *body,
         return;
     txn_ref(t); /* ★ 防竞态：respond_a 可能被 Timer 回调触发，call_destroy 可并发释放 txn */
     /* REQ-NAT-001：respond_a 里构造的 Contact 也走 external_sip_ip
-     * REQ-NAT-002：优先 per-call profile，fallback cfg */
-    const char *prof_ext = (c->prof && c->prof->external_sip_ip[0])
-                           ? c->prof->external_sip_ip : co->cfg.external_sip_ip;
-    const char *adv_host = (prof_ext && prof_ext[0]) ? prof_ext : co->cfg.local_host;
+     * REQ-NAT-002：优先 per-call profile，fallback cfg
+     * ★ 2026-11-19 FIX：只有 c->prof 是 "external" profile（主叫来自公网 trunk）
+     *   才用 external_sip_ip，否则一律 local_host（主叫在内网，回内网 IP） */
+    int a_is_ext = (c->prof && c->prof->name[0] && strcasecmp(c->prof->name, "external") == 0);
+    const char *adv_host;
+    if (a_is_ext) {
+        const char *prof_ext = (c->prof && c->prof->external_sip_ip[0])
+                               ? c->prof->external_sip_ip : co->cfg.external_sip_ip;
+        adv_host = (prof_ext && prof_ext[0]) ? prof_ext : co->cfg.local_host;
+    } else {
+        adv_host = co->cfg.local_host;
+    }
     /* extra 头块：Content-Type(28) + History-Info(≤1024) + Diversion(≤130) → 1300 够装 */
     char extra[1300];
     size_t used = 0;
@@ -9153,13 +9185,29 @@ int b2b_transfer_call(b2b_call_t *call, int b_leg, const char *dest,
      * dialog（A hold + 拨 C → A 确认接通 → REFER 让 B 和 C 对话）。 */
     int rc = NSBC_OK;
     if (kind == CCF_XFER_BLIND) {
-        if (b_leg == -1 || b_leg == 1) {
-            int lr = b2b_send_refer(call, 1, dest, NULL);
-            if (lr != NSBC_OK) rc = lr;
-        }
+        /* Blind transfer：优先给 A-腿（用户侧 leg[0]）发 REFER。
+         * 原因：passthrough/AI 模式下 B-腿（leg[1]）可能 dlg=NULL 或非 CONFIRMED
+         * （llog L9090: !l->dlg || state != LEG_CONFIRMED → NSBC_NOENT=-6）。
+         * 原版先试 B-腿，失败后 rc=-6 导致 A-腿根本不被尝试（rc==NSBC_OK 条件不满足）。
+         * 修复：先 A 后 B，只要有一条腿成功就算 OK，B 腿失败只打 warning。 */
+        int any_ok = 0;
         if (b_leg == -1 || b_leg == 0) {
             int lr = b2b_send_refer(call, 0, dest, NULL);
-            if (lr != NSBC_OK && rc == NSBC_OK) rc = lr;
+            if (lr == NSBC_OK) { any_ok = 1; }
+            else if (b_leg != -1) rc = lr;  /* 指定只 A 腿时失败才算失败 */
+        }
+        if (b_leg == -1 || b_leg == 1) {
+            int lr = b2b_send_refer(call, 1, dest, NULL);
+            if (lr == NSBC_OK) { any_ok = 1; }
+            else {
+                llog(LOG_WARN, "b2b",
+                     "transfer B-leg refer rc=%d (expected in passthrough/AI mode)", lr);
+                if (b_leg == 1) rc = lr;  /* 指定只 B 腿时失败才算失败 */
+            }
+        }
+        if (b_leg == -1) {
+            /* 双腿自动：只要有一条腿 OK 就算 OK */
+            rc = any_ok ? NSBC_OK : NSBC_NOENT;
         }
     } else {
         /* CONSULTED：Replaces 头已经由调用方（REFER 入站）从 SIP 消息里解析好。

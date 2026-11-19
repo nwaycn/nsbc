@@ -197,7 +197,11 @@ static int uri_to_sa(const char *uri, size_t len, nsbc_sa_t *dst)
 /* binding 的 name-addr contact（<sip:...>）→ 裸 R-URI：剥最外层尖括号。
  * Request-URI 语法（RFC 3261 §25.1 Request-Line）不允许 name-addr 的 <>，
  * 严格 UA（SIP.js Grammar）解析首行失败直接丢弃整条 INVITE。
- * URI 本体参数（;transport=ws 等）原样保留。 */
+ * URI 本体参数（;transport=ws 等）原样保留。
+ *
+ * ★ 2026-11-19 FIX：原版只检查 contact 开头是 '<' 的情况，漏掉了
+ *   "\"display\" <sip:...>" 格式（MicroSIP/PJSIP 常见）。
+ *   现在统一用 strrchr 找最后一对 <>，不管前面有没有 display name。 */
 static void ruri_from_contact(const char *contact, char *out, size_t outsz)
 {
     if (!out || outsz == 0)
@@ -205,16 +209,23 @@ static void ruri_from_contact(const char *contact, char *out, size_t outsz)
     out[0] = '\0';
     if (!contact)
         return;
-    const char *p = contact;
-    size_t n = strlen(p);
-    if (n >= 2 && p[0] == '<' && p[n - 1] == '>') {
-        ++p;
-        n -= 2;
+    const char *lt = strrchr(contact, '<');
+    const char *gt = strrchr(contact, '>');
+    if (lt && gt && gt > lt) {
+        /* name-addr 格式："xxx" <sip:user@host> 或 <sip:user@host> */
+        size_t n = (size_t)(gt - lt - 1);
+        if (n >= outsz)
+            n = outsz - 1;
+        memcpy(out, lt + 1, n);
+        out[n] = '\0';
+    } else {
+        /* 纯 URI 格式：sip:user@host  — 直接拷贝 */
+        size_t n = strlen(contact);
+        if (n >= outsz)
+            n = outsz - 1;
+        memcpy(out, contact, n);
+        out[n] = '\0';
     }
-    if (n >= outsz)
-        n = outsz - 1;
-    memcpy(out, p, n);
-    out[n] = '\0';
 }
 
 /* Phase 0: rec_feed_wrapper 已删除 —— recording 模块 init 时通过

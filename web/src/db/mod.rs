@@ -4692,6 +4692,130 @@ sqlx::query(acct_ddl).execute(pool).await?;
         );
     }
 
+    // ================================================================
+    //  AI backend registry — 2026-11-19 NEW TABLE
+    //  Stores per-AI-provider configuration. Dialplan rules reference
+    //  ai_backends by name (e.g. target='local:ai:default'). The Go
+    //  ai_agent_daemon reads this table via nsbc-web HTTP API so operators
+    //  can change ASR/TTS/LLM endpoints + credentials without restarting.
+    // ================================================================
+    let ai_backend_ddl = match backend {
+        "sqlite" =>
+            "CREATE TABLE IF NOT EXISTS ai_backends (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                name             TEXT    NOT NULL UNIQUE,
+                description      TEXT,
+
+                -- nsbc-web connection (ai_agent reads this to talk back)
+                nsb_web_url      TEXT    NOT NULL DEFAULT 'https://127.0.0.1:443',
+                nsb_web_token    TEXT,
+                transport        TEXT    NOT NULL DEFAULT 'https',
+                insecure         INTEGER NOT NULL DEFAULT 1,
+
+                -- LLM
+                llm_provider     TEXT    NOT NULL DEFAULT 'mock',
+                llm_api_key      TEXT,
+                llm_model        TEXT    DEFAULT 'gpt-4o-mini',
+                llm_endpoint     TEXT,
+
+                -- ASR
+                asr_provider     TEXT    NOT NULL DEFAULT 'nway',
+                asr_addr         TEXT    DEFAULT '127.0.0.1:8089',
+
+                -- TTS
+                tts_provider     TEXT    NOT NULL DEFAULT 'nway',
+                tts_addr         TEXT    DEFAULT '127.0.0.1:8090',
+
+                -- Agent behaviour
+                transfer_dest    TEXT,
+                barge_in         INTEGER NOT NULL DEFAULT 1,
+                vad_threshold    TEXT    DEFAULT 'default',
+                record_dir       TEXT    DEFAULT 'records',
+
+                enabled          INTEGER NOT NULL DEFAULT 1,
+                updated_at       TEXT    NOT NULL DEFAULT (datetime('now'))
+            )",
+        "postgres" =>
+            "CREATE TABLE IF NOT EXISTS ai_backends (
+                id               BIGSERIAL PRIMARY KEY,
+                name             VARCHAR(64) NOT NULL UNIQUE,
+                description      TEXT,
+
+                nsb_web_url      VARCHAR(512) NOT NULL DEFAULT 'https://127.0.0.1:443',
+                nsb_web_token    TEXT,
+                transport        VARCHAR(16) NOT NULL DEFAULT 'https',
+                insecure         INTEGER NOT NULL DEFAULT 1,
+
+                llm_provider     VARCHAR(32) NOT NULL DEFAULT 'mock',
+                llm_api_key      TEXT,
+                llm_model        VARCHAR(128) DEFAULT 'gpt-4o-mini',
+                llm_endpoint     VARCHAR(512),
+
+                asr_provider     VARCHAR(32) NOT NULL DEFAULT 'nway',
+                asr_addr         VARCHAR(128) DEFAULT '127.0.0.1:8089',
+
+                tts_provider     VARCHAR(32) NOT NULL DEFAULT 'nway',
+                tts_addr         VARCHAR(128) DEFAULT '127.0.0.1:8090',
+
+                transfer_dest    VARCHAR(64),
+                barge_in         INTEGER NOT NULL DEFAULT 1,
+                vad_threshold    VARCHAR(16) DEFAULT 'default',
+                record_dir       VARCHAR(256) DEFAULT 'records',
+
+                enabled          INTEGER NOT NULL DEFAULT 1,
+                updated_at       TEXT NOT NULL DEFAULT (to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD') || 'T' || to_char(NOW() AT TIME ZONE 'UTC', 'HH24:MI:SS.MS') || 'Z')
+            )",
+        _ =>  /* mysql */
+            "CREATE TABLE IF NOT EXISTS ai_backends (
+                id               BIGINT AUTO_INCREMENT PRIMARY KEY,
+                name             VARCHAR(64) NOT NULL UNIQUE,
+                description      TEXT,
+
+                nsb_web_url      VARCHAR(512) NOT NULL DEFAULT 'https://127.0.0.1:443',
+                nsb_web_token    TEXT,
+                transport        VARCHAR(16) NOT NULL DEFAULT 'https',
+                insecure         TINYINT(1)   NOT NULL DEFAULT 1,
+
+                llm_provider     VARCHAR(32) NOT NULL DEFAULT 'mock',
+                llm_api_key      TEXT,
+                llm_model        VARCHAR(128) DEFAULT 'gpt-4o-mini',
+                llm_endpoint     VARCHAR(512),
+
+                asr_provider     VARCHAR(32) NOT NULL DEFAULT 'nway',
+                asr_addr         VARCHAR(128) DEFAULT '127.0.0.1:8089',
+
+                tts_provider     VARCHAR(32) NOT NULL DEFAULT 'nway',
+                tts_addr         VARCHAR(128) DEFAULT '127.0.0.1:8090',
+
+                transfer_dest    VARCHAR(64),
+                barge_in         TINYINT(1)   NOT NULL DEFAULT 1,
+                vad_threshold    VARCHAR(16) DEFAULT 'default',
+                record_dir       VARCHAR(256) DEFAULT 'records',
+
+                enabled          TINYINT(1)   NOT NULL DEFAULT 1,
+                updated_at       DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )",
+    };
+    sqlx::query(ai_backend_ddl).execute(pool).await?;
+
+    // 种子：ai_backends 为空时自动插入一条 name='default' 的默认配置
+    // 这样 dialplan 规则 target='local:ai' 或 'local:ai:default' 立即可用
+    let ai_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM ai_backends")
+        .fetch_one(pool).await.unwrap_or((0,));
+    if ai_count.0 == 0 {
+        let seed_sql = match backend {
+            "postgres" =>
+                "INSERT INTO ai_backends (name, description, llm_provider, transfer_dest) \
+                 VALUES ('default', '默认 AI 后端 — 首次启动自动创建，可在 AI 配置页修改', 'mock', '1007') \
+                 ON CONFLICT (name) DO NOTHING",
+            _ =>
+                "INSERT OR IGNORE INTO ai_backends (name, description, llm_provider, transfer_dest) \
+                 VALUES ('default', '默认 AI 后端 — 首次启动自动创建，可在 AI 配置页修改', 'mock', '1007')",
+        };
+        let _ = sqlx::query(seed_sql).execute(pool).await;
+        tracing::info!("🤖 ai_backends: seeded default backend (name='default', llm=mock, transfer=1007)");
+    }
+
     Ok(())
 }
 
@@ -6308,6 +6432,128 @@ pub struct DialplanRuleUpdate {
     pub description:    Option<String>,
 }
 
+// ===== ai_backends =====  (2026-11-19 NEW)
+
+#[derive(Clone, Debug, Default, sqlx::FromRow, serde::Serialize)]
+pub struct AiBackend {
+    pub id: i64,
+    pub name: String,
+    pub description: Option<String>,
+
+    pub nsb_web_url: String,
+    pub nsb_web_token: Option<String>,
+    pub transport: String,
+    #[serde(serialize_with = "bool_i64::serialize")]
+    pub insecure: i64,
+
+    pub llm_provider: String,
+    pub llm_api_key: Option<String>,
+    pub llm_model: Option<String>,
+    pub llm_endpoint: Option<String>,
+
+    pub asr_provider: String,
+    pub asr_addr: Option<String>,
+
+    pub tts_provider: String,
+    pub tts_addr: Option<String>,
+
+    pub transfer_dest: Option<String>,
+    #[serde(serialize_with = "bool_i64::serialize")]
+    pub barge_in: i64,
+    pub vad_threshold: Option<String>,
+    pub record_dir: Option<String>,
+
+    #[serde(serialize_with = "bool_i64::serialize")]
+    pub enabled: i64,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct AiBackendCreate {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+
+    #[serde(default = "default_https_url")]
+    pub nsb_web_url: String,
+    #[serde(default)]
+    pub nsb_web_token: Option<String>,
+    #[serde(default = "default_https")]
+    pub transport: String,
+    #[serde(default = "default_true")]
+    pub insecure: bool,
+
+    #[serde(default = "default_mock")]
+    pub llm_provider: String,
+    #[serde(default)]
+    pub llm_api_key: Option<String>,
+    #[serde(default = "default_gpt_model")]
+    pub llm_model: Option<String>,
+    #[serde(default)]
+    pub llm_endpoint: Option<String>,
+
+    #[serde(default = "default_nway")]
+    pub asr_provider: String,
+    #[serde(default = "default_asr_addr")]
+    pub asr_addr: Option<String>,
+
+    #[serde(default = "default_nway")]
+    pub tts_provider: String,
+    #[serde(default = "default_tts_addr")]
+    pub tts_addr: Option<String>,
+
+    #[serde(default)]
+    pub transfer_dest: Option<String>,
+    #[serde(default = "default_true")]
+    pub barge_in: bool,
+    #[serde(default = "default_vad")]
+    pub vad_threshold: Option<String>,
+    #[serde(default = "default_record_dir")]
+    pub record_dir: Option<String>,
+
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct AiBackendUpdate {
+    pub name: Option<String>,
+    pub description: Option<String>,
+
+    pub nsb_web_url: Option<String>,
+    pub nsb_web_token: Option<String>,
+    pub transport: Option<String>,
+    pub insecure: Option<bool>,
+
+    pub llm_provider: Option<String>,
+    pub llm_api_key: Option<String>,
+    pub llm_model: Option<String>,
+    pub llm_endpoint: Option<String>,
+
+    pub asr_provider: Option<String>,
+    pub asr_addr: Option<String>,
+
+    pub tts_provider: Option<String>,
+    pub tts_addr: Option<String>,
+
+    pub transfer_dest: Option<String>,
+    pub barge_in: Option<bool>,
+    pub vad_threshold: Option<String>,
+    pub record_dir: Option<String>,
+
+    pub enabled: Option<bool>,
+}
+
+fn default_https_url() -> String { "https://127.0.0.1:443".to_string() }
+fn default_https() -> String { "https".to_string() }
+fn default_mock() -> String { "mock".to_string() }
+fn default_gpt_model() -> Option<String> { Some("gpt-4o-mini".to_string()) }
+fn default_nway() -> String { "nway".to_string() }
+fn default_asr_addr() -> Option<String> { Some("127.0.0.1:8089".to_string()) }
+fn default_tts_addr() -> Option<String> { Some("127.0.0.1:8090".to_string()) }
+fn default_vad() -> Option<String> { Some("default".to_string()) }
+fn default_record_dir() -> Option<String> { Some("records".to_string()) }
+
 fn default_priority() -> String { "priority".to_string() }
 fn default_empty_json() -> String { "{}".to_string() }
 fn default_ivr_entry() -> String { "main".to_string() }
@@ -7330,6 +7576,145 @@ impl Db {
             )).fetch_all(pool).await?
         };
         Ok(rows)
+    }
+
+    // ===== ai_backends CRUD =====  (2026-11-19 NEW)
+
+    pub async fn list_ai_backends(
+        &self, enabled: Option<bool>, keyword: Option<&str>,
+    ) -> Result<Vec<AiBackend>, sqlx::Error> {
+        let Some(pool) = self.pool() else { return Ok(Vec::new()); };
+        let backend = self.backend();
+        let mut clauses: Vec<String> = Vec::new();
+        let mut binds: Vec<String> = Vec::new();
+        let mut idx: u32 = 0;
+
+        if let Some(v) = enabled {
+            idx += 1; clauses.push(format!("enabled = ${idx}"));
+            binds.push(if v { "1".into() } else { "0".into() });
+        }
+        if let Some(kw) = keyword {
+            let kw = kw.trim();
+            if !kw.is_empty() {
+                idx += 1;
+                clauses.push(format!("(name LIKE ${idx} OR description LIKE ${idx} OR llm_provider LIKE ${idx} OR asr_provider LIKE ${idx} OR tts_provider LIKE ${idx})"));
+                binds.push(format!("%{}%", kw));
+            }
+        }
+        let where_sql = if clauses.is_empty() { String::new() } else { "WHERE ".to_string() + &clauses.join(" AND ") };
+        let sql = fix_ph(&format!("SELECT * FROM ai_backends {where_sql} ORDER BY name"), backend);
+        let mut q = sqlx::query_as::<_, AiBackend>(&sql);
+        for b in &binds { q = q.bind(b.as_str()); }
+        q.fetch_all(pool).await
+    }
+
+    pub async fn get_ai_backend(&self, id: i64) -> Result<Option<AiBackend>, sqlx::Error> {
+        let Some(pool) = self.pool() else { return Ok(None); };
+        let backend = self.backend();
+        sqlx::query_as::<_, AiBackend>(&fix_ph("SELECT * FROM ai_backends WHERE id = $1", backend))
+            .bind(id).fetch_optional(pool).await
+    }
+
+    pub async fn get_ai_backend_by_name(&self, name: &str) -> Result<Option<AiBackend>, sqlx::Error> {
+        let Some(pool) = self.pool() else { return Ok(None); };
+        let backend = self.backend();
+        sqlx::query_as::<_, AiBackend>(&fix_ph("SELECT * FROM ai_backends WHERE name = $1", backend))
+            .bind(name).fetch_optional(pool).await
+    }
+
+    pub async fn create_ai_backend(&self, c: AiBackendCreate) -> Result<AiBackend, sqlx::Error> {
+        let pool = self.pool().ok_or(
+            sqlx::Error::Configuration("NSBC_DB_DSN not set".into())
+        )?;
+        let sql = "INSERT INTO ai_backends
+            (name, description, nsb_web_url, nsb_web_token, transport, insecure,
+             llm_provider, llm_api_key, llm_model, llm_endpoint,
+             asr_provider, asr_addr,
+             tts_provider, tts_addr,
+             transfer_dest, barge_in, vad_threshold, record_dir,
+             enabled)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+         RETURNING *";
+        sqlx::query_as::<_, AiBackend>(sql)
+            .bind(&c.name).bind(&c.description)
+            .bind(&c.nsb_web_url).bind(&c.nsb_web_token)
+            .bind(&c.transport).bind(c.insecure as i64)
+            .bind(&c.llm_provider).bind(&c.llm_api_key)
+            .bind(&c.llm_model).bind(&c.llm_endpoint)
+            .bind(&c.asr_provider).bind(&c.asr_addr)
+            .bind(&c.tts_provider).bind(&c.tts_addr)
+            .bind(&c.transfer_dest)
+            .bind(c.barge_in as i64)
+            .bind(&c.vad_threshold).bind(&c.record_dir)
+            .bind(c.enabled as i64)
+            .fetch_one(pool).await
+    }
+
+    pub async fn update_ai_backend(
+        &self, id: i64, u: AiBackendUpdate,
+    ) -> Result<AiBackend, sqlx::Error> {
+        let pool = self.pool().ok_or(
+            sqlx::Error::Configuration("NSBC_DB_DSN not set".into())
+        )?;
+        let backend = self.backend();
+        let mut sets: Vec<String> = Vec::new();
+        let mut binds: Vec<String> = Vec::new();
+        let mut idx: u32 = 0;
+
+        macro_rules! set_s {
+            ($col:expr, $val:expr) => {{
+                if let Some(v) = $val { idx += 1; sets.push(format!("{} = ${idx}", $col)); binds.push(v); }
+            }};
+        }
+        macro_rules! set_b {
+            ($col:expr, $val:expr) => {{
+                if let Some(v) = $val { idx += 1; sets.push(format!("{} = CAST(${idx} AS INTEGER)", $col)); binds.push(if v { "1".into() } else { "0".into() }); }
+            }};
+        }
+
+        set_s!("name", u.name.clone());
+        set_s!("description", u.description.clone());
+        set_s!("nsb_web_url", u.nsb_web_url.clone());
+        set_s!("nsb_web_token", u.nsb_web_token.clone());
+        set_s!("transport", u.transport.clone());
+        set_b!("insecure", u.insecure);
+        set_s!("llm_provider", u.llm_provider.clone());
+        set_s!("llm_api_key", u.llm_api_key.clone());
+        set_s!("llm_model", u.llm_model.clone());
+        set_s!("llm_endpoint", u.llm_endpoint.clone());
+        set_s!("asr_provider", u.asr_provider.clone());
+        set_s!("asr_addr", u.asr_addr.clone());
+        set_s!("tts_provider", u.tts_provider.clone());
+        set_s!("tts_addr", u.tts_addr.clone());
+        set_s!("transfer_dest", u.transfer_dest.clone());
+        set_b!("barge_in", u.barge_in);
+        set_s!("vad_threshold", u.vad_threshold.clone());
+        set_s!("record_dir", u.record_dir.clone());
+        set_b!("enabled", u.enabled);
+
+        if sets.is_empty() {
+            return self.get_ai_backend(id).await.and_then(|r| r.ok_or_else(|| sqlx::Error::RowNotFound));
+        }
+        let ts = match backend {
+            "sqlite" => "datetime('now')",
+            "postgres" => "CAST(NOW() AS TEXT)",
+            _ => "CAST(CURRENT_TIMESTAMP(3) AS CHAR)",
+        };
+        sets.push(format!("updated_at = {ts}"));
+        let where_idx = idx + 1;
+        let sql = format!("UPDATE ai_backends SET {} WHERE id = ${where_idx} RETURNING *", sets.join(", "));
+        let mut q = sqlx::query_as::<_, AiBackend>(&sql);
+        for b in &binds { q = q.bind(b.as_str()); }
+        q = q.bind(id);
+        q.fetch_one(pool).await
+    }
+
+    pub async fn delete_ai_backend(&self, id: i64) -> Result<bool, sqlx::Error> {
+        let Some(pool) = self.pool() else { return Ok(false); };
+        let backend = self.backend();
+        let res = sqlx::query(&fix_ph("DELETE FROM ai_backends WHERE id = $1", backend))
+            .bind(id).execute(pool).await?;
+        Ok(res.rows_affected() > 0)
     }
 
     // ===== ha_groups =====

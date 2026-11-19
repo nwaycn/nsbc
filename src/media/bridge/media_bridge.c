@@ -903,8 +903,18 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
         }
 
         if (!is_rtcp && r->node && r->node->call) {
+            static __thread int mb_cnt = 0;
+            if (mb_cnt++ < 5 || mb_cnt % 1000 == 0)
+                llog(LOG_DEBUG, "relay", "MEDIA_BUG_DISPATCH side=%d call=%p n=%zu",
+                     side, r->node->call, (size_t)n);
             media_bug_dispatch_rtp_raw(r->node->call, side,
                 buf, (size_t)n, s_ip, s_port, d_ip, d_port);
+        } else {
+            static __thread int mb_skip = 0;
+            if (mb_skip++ < 5)
+                llog(LOG_WARN, "relay", "MEDIA_BUG_SKIP is_rtcp=%d node=%p call=%p",
+                     is_rtcp, (void*)r->node,
+                     r->node ? (void*)r->node->call : NULL);
         }
 
         if (!is_rtcp) {

@@ -100,7 +100,14 @@ static dp_layer_t dp_infer_layer_from_target(const char *target)
 
 /* Advisor 2026-10-12n: ${N} 变量替换 helper
  * 扫描 in，遇到 ${N} 时用 groups[N] 替换（N 支持 0-9，但只用到 PM_MAX_GROUPS-1）。
- * out 缓冲区大小 outsz，返回写入长度（不含 \0）或 -1 溢出。 */
+ * out 缓冲区大小 outsz，返回写入长度（不含 \0）或 -1 溢出。
+ *
+ * ★ 2026-11-19 修复 fallback 逻辑：
+ *   当 groups[N] 为空（regex 没有对应捕获组）时，自动 fallback 到 groups[0]（完整匹配）。
+ *   这样 target='sip:${1}@host' 不管 regex 有没有 () 捕获组都能工作：
+ *     regex='^(\d{4})$' → groups[1]="1007" → 正常替换 ✅
+ *     regex='^\d{4}$'   → groups[1]=""    → fallback groups[0]="1007" ✅（之前空了！）
+ */
 static int substitute_groups(const char *in, char *out, size_t outsz,
                              const char groups[PM_MAX_GROUPS][PM_GROUP_SZ])
 {
@@ -117,10 +124,18 @@ static int substitute_groups(const char *in, char *out, size_t outsz,
                     if (nl >= sizeof(numbuf)) nl = sizeof(numbuf) - 1;
                     memcpy(numbuf, in + i + 2, nl); numbuf[nl] = '\0';
                     int idx = (int)strtol(numbuf, NULL, 10);
+                    const char *val = NULL;
                     if (idx >= 0 && idx < PM_MAX_GROUPS && groups[idx][0]) {
-                        const char *val = groups[idx];
+                        val = groups[idx];
+                    } else if (idx >= 0 && idx < PM_MAX_GROUPS && !groups[idx][0] && groups[0][0]) {
+                        /* ★ fallback: groups[N] 空 → 用 groups[0]（完整匹配） */
+                        val = groups[0];
+                        llog(LOG_INFO, "dp", "  substitute_groups: ${%d} empty → fallback ${0}='%s'",
+                             idx, val);
+                    }
+                    if (val) {
                         size_t vl = strlen(val);
-                        if (o + vl >= outsz) return -1;  /* 溢出 */
+                        if (o + vl >= outsz) return -1;
                         memcpy(out + o, val, vl); o += vl;
                     }
                     i = j + 1;
@@ -135,8 +150,16 @@ static int substitute_groups(const char *in, char *out, size_t outsz,
                     idx = idx * 10 + (in[i+2] - '0');
                     advance = 3;
                 }
+                const char *val = NULL;
                 if (idx >= 0 && idx < PM_MAX_GROUPS && groups[idx][0]) {
-                    const char *val = groups[idx];
+                    val = groups[idx];
+                } else if (idx >= 0 && idx < PM_MAX_GROUPS && !groups[idx][0] && groups[0][0]) {
+                    /* ★ fallback */
+                    val = groups[0];
+                    llog(LOG_INFO, "dp", "  substitute_groups: $%d empty → fallback $0='%s'",
+                         idx, val);
+                }
+                if (val) {
                     size_t vl = strlen(val);
                     if (o + vl >= outsz) return -1;
                     memcpy(out + o, val, vl); o += vl;

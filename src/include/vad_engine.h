@@ -46,14 +46,14 @@ typedef enum {
 #define VAD_PREROLL_SAMPLES 960     /* 120ms pre-roll — 检测到 SPEECH 后向前回溯 */
 
 /* ===== 能量阈值（PCM sample avg abs 值，绝对基线）===== */
-#define VAD_SILENCE_VOLUME_THRESHOLD  60    /* 绝对噪声 floor */
-#define VAD_ACTIVE_VOLUME_THRESHOLD   700   /* 绝对阈值 ceiling（人声正常范围 100-3000）*/
+#define VAD_SILENCE_VOLUME_THRESHOLD  40    /* 绝对噪声 floor（更低，更灵敏）*/
+#define VAD_ACTIVE_VOLUME_THRESHOLD   400   /* 绝对阈值 ceiling（PCMA 8k 幅度范围 ±2048）*/
 
 /* 兼容旧名 —— 外部 OAM call_commands.c 还在用 VAD_DEFAULT_THRESHOLD */
 #define VAD_DEFAULT_THRESHOLD VAD_ACTIVE_VOLUME_THRESHOLD
 
 /* ===== 状态机持续时间下限（sample 单位，8kHz）===== */
-#define VAD_START_ACTIVE_MIN_SAMPLES  640   /* 80ms — SPEECH 必须持续 ≥80ms 才算有效说话 */
+#define VAD_START_ACTIVE_MIN_SAMPLES  320   /* 40ms — SPEECH 必须持续 ≥40ms 才算有效说话 */
 #define VAD_PAUSE_ACTIVE_MIN_SAMPLES  320   /* 40ms — HESITATION 恢复 SPEECH 的最短激活 */
 #define VAD_START_SILENCE_MIN_SAMPLES 1200  /* 150ms — SPEECH→SILENCE 的最短静默（断句判定）*/
 #define VAD_PAUSE_SILENCE_MIN_SAMPLES 320   /* 40ms — SPEECH→HESITATION 的最短静默 */
