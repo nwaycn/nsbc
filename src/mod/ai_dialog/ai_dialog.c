@@ -282,13 +282,13 @@ static void ai_rec_feed(void *ud, void *call_key,
      *   - ring buffer 每帧字节翻倍（20ms → 320B PCM16 vs 160B PCMA），256KB 够 16s
      *   - Go agent ai_get_rx_audio 直接拿 PCM16 喂 NASR，不用再转 */
     uint8_t tc_buf[2048];
-    const uint8_t *pcma_bytes = (const uint8_t *)payload;
-    size_t pcma_len = len;
+    size_t tc_len = 0;  /* transcode output len */
 
-    /* per-frame PCM16 栈缓冲（20ms @ 8kHz PCMA → 160 samples → 320B PCM16，留 1024 够 60ms） */
+    /* per-frame PCM16 栈缓冲（20ms @ 8kHz G.711 → 160 samples → 320B PCM16，留 1024 够 60ms） */
     int16_t pcm16_buf[1024];
     const uint8_t *ring_data = NULL;
     size_t ring_len = 0;
+    size_t pcm16_samples = 0;
 
     /* 写 ring buffer（持 s->lock 保护并发写）；转码+解码都在锁内完成 ——
      * rx_tc 是 per-session 会话，仅在媒体线程单线程访问，无并发。 */
@@ -299,7 +299,11 @@ static void ai_rec_feed(void *ud, void *call_key,
         if (s->tx_tc) { transcode_close(s->tx_tc); s->tx_tc = NULL; }
         if (s->tx_pcm16_enc) { codec_registry_find(in_codec)->fini(s->tx_pcm16_enc); s->tx_pcm16_enc = NULL; }
         s->in_codec = in_codec;
-        if (in_codec != CODEC_PCMA) {
+        if (in_codec != CODEC_PCMA && in_codec != CODEC_PCMU) {
+            /* 只有非 G.711 codec 才走 transcode（G729/G722/Opus → PCMA）
+             * G.711 我们直接原生 ulaw/alaw_decode，绕过 transcode 库的 PCMU↔PCMA 转换链
+             * —— 那条链在 e77e82e 引入，实测有 bug（PCMU payload 转 PCMA 后 alaw_decode 解歪）。
+             * 参考 vad_engine.c L591-593 也是这么做的。 */
             transcode_sess_t *rx = NULL, *tx = NULL;
             if (transcode_open(in_codec, CODEC_PCMA, &rx) == NSBC_OK) s->rx_tc = rx;
             if (transcode_open(CODEC_PCMA, in_codec, &tx) == NSBC_OK) s->tx_tc = tx;
@@ -313,22 +317,34 @@ static void ai_rec_feed(void *ud, void *call_key,
             }
             llog(LOG_INFO, "ai", "transcode init call=%p in=%d→PCMA rx=%p PCMA→in tx=%p pcm16_enc=%p",
                  call_key, (int)in_codec, (void*)s->rx_tc, (void*)s->tx_tc, (void*)s->tx_pcm16_enc);
+        } else {
+            llog(LOG_INFO, "ai", "rec_feed direct g711 decode codec=%d(%s) call=%p (no transcode)",
+                 (int)in_codec, ops->name, call_key);
         }
     }
-    if (s->rx_tc) {
-        /* codec != PCMA → transcode 先转到 PCMA，再 decode */
+
+    if (in_codec == CODEC_PCMU) {
+        /* PCMU (pt=0) — 直接原生 ulaw_decode，绕 transcode */
+        pcm16_samples = g711_ulaw_decode(payload, len, pcm16_buf);
+    } else if (in_codec == CODEC_PCMA) {
+        /* PCMA (pt=8) — 直接原生 alaw_decode */
+        pcm16_samples = g711_alaw_decode(payload, len, pcm16_buf);
+    } else if (s->rx_tc) {
+        /* 非 G.711 codec (G729/G722/Opus) — 先走 transcode → PCMA → alaw_decode */
         size_t out_len = 0;
         int rc = transcode_process(s->rx_tc, payload, len, tc_buf, sizeof(tc_buf), &out_len);
         if (rc != NSBC_OK) {
             pthread_mutex_unlock(&s->lock);
             return;  /* AGAIN/错误：本帧跳过 */
         }
-        pcma_bytes = tc_buf;
-        pcma_len = out_len;
+        tc_len = out_len;
+        pcm16_samples = g711_alaw_decode(tc_buf, tc_len, pcm16_buf);
+    } else {
+        llog(LOG_WARN, "ai", "⚠️ rec_feed codec=%d(%s) 既不是 G.711 也没 rx_tc → drop call=%p",
+             (int)in_codec, ops ? ops->name : "?", call_key);
+        pthread_mutex_unlock(&s->lock);
+        return;
     }
-
-    /* PCMA -> PCM16 LE 8kHz mono — AI internal unified format */
-    size_t pcm16_samples = g711_alaw_decode(pcma_bytes, pcma_len, pcm16_buf);
 
     /* P0: HPF strips DC offset and 50Hz mains hum
      * ring buffer previously had no HPF, so ASR fed slightly different audio than VAD detected

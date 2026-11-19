@@ -57,9 +57,16 @@ const welcomeText = "你好，我是 sbc 智能客服，请问有什么能为您
 
 var cachedGreeting []byte
 
-func sslTransport() *http.Transport {
-	return &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
-}
+// ★ 全局共享 http.Transport —— 复用 TCP 连接，避免 TIME_WAIT 爆炸
+var (
+	globalTransport = &http.Transport{
+		TLSClientConfig:    &tls.Config{InsecureSkipVerify: true},
+		MaxIdleConns:       32,
+		MaxIdleConnsPerHost: 32,
+		IdleConnTimeout:    90 * time.Second,
+	}
+	globalHTTPClient = &http.Client{Transport: globalTransport, Timeout: 30 * time.Second}
+)
 
 func cmd(apiBase, apiToken, command string, timeout time.Duration) (int, string) {
 	body, _ := json.Marshal(map[string]string{"cmd": command})
@@ -68,7 +75,10 @@ func cmd(apiBase, apiToken, command string, timeout time.Duration) (int, string)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/plain")
 	req.Header.Set("Authorization", "Bearer "+apiToken)
-	hc := &http.Client{Transport: sslTransport(), Timeout: timeout}
+	hc := globalHTTPClient
+	if timeout != 0 {
+		hc = &http.Client{Transport: globalTransport, Timeout: timeout}
+	}
 	resp, err := hc.Do(req)
 	if err != nil {
 		return -1, err.Error()

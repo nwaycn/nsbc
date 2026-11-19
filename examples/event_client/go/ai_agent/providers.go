@@ -1,9 +1,14 @@
 /* providers.go — Go AI Agent Provider 抽象 + 实现
  *
- * 设计：和 Python nsbc_ai.providers 完全对称
- *   ASRProvider  — PCMU 8kHz → 文字
+ * 音频格式约定（C 侧 e77e82e 大改后统一 PCM16 LE 8kHz mono）：
+ *   ASRProvider  — PCM16 LE 8kHz mono → 文字
  *   LLMProvider  — 文字 → LLMReply（结构化 action）
- *   TTSProvider  — 文字 → PCMU 8kHz
+ *   TTSProvider  — 文字 → PCM16 LE 8kHz mono
+ *
+ * C 侧 ai_rec_feed 现在 ring buffer 存 PCM16 LE 8kHz
+ *   (g711_alaw_decode + HPF)，ai_get_rx_audio 直接吐 PCM16。
+ * C 侧 ai_send_tx_audio(format=1) 期望 PCM16 LE，
+ *   内部用 tx_pcm16_enc.encode() 一次编码到对端 codec。
  *
  * 实现：mock + 三个真实 Provider，全部零第三方依赖（纯 net/http + encoding）
  */
@@ -38,7 +43,7 @@ type LLMReply struct {
 // =============================================================================
 
 type ASRProvider interface {
-	Transcribe(pcmu []byte) string
+	Transcribe(pcm16 []byte) string // PCM16 LE 8kHz mono → 文字
 }
 
 type LLMProvider interface {
@@ -46,7 +51,7 @@ type LLMProvider interface {
 }
 
 type TTSProvider interface {
-	Synthesize(text string) []byte // 返回 PCMU 8kHz
+	Synthesize(text string) []byte // 返回 PCM16 LE 8kHz mono
 }
 
 // =============================================================================
@@ -54,16 +59,18 @@ type TTSProvider interface {
 // =============================================================================
 
 type MockASR struct {
-	TriggerWord      string
-	EnergyThreshold  int
+	TriggerWord     string
+	EnergyThreshold int
 }
 
-func (a *MockASR) Transcribe(pcmu []byte) string {
-	if len(pcmu) == 0 {
+func (a *MockASR) Transcribe(pcm16 []byte) string {
+	if len(pcm16) < 2 {
 		return ""
 	}
-	for _, b := range pcmu {
-		if int(b) > a.EnergyThreshold {
+	// PCM16 LE — 按 2 字节解析 int16 样本，检查峰值是否超过阈值
+	samples := Pcm16LEToInt16(pcm16)
+	for _, s := range samples {
+		if int(s) > a.EnergyThreshold || int(-s) > a.EnergyThreshold {
 			return a.TriggerWord
 		}
 	}
@@ -71,9 +78,9 @@ func (a *MockASR) Transcribe(pcmu []byte) string {
 }
 
 type MockLLM struct {
-	TransferDest      string
-	TransferKeywords  []string
-	HangupKeywords    []string
+	TransferKeywords []string
+	HangupKeywords   []string
+	TransferDest     string
 }
 
 func (l *MockLLM) Chat(transcript string) LLMReply {
@@ -95,26 +102,27 @@ func (l *MockLLM) Chat(transcript string) LLMReply {
 }
 
 type MockTTS struct {
-	DurationMs int // 静音时长，PCMU 每 1ms 1 字节
+	DurationMs int // 静音时长，PCM16 LE 8kHz mono = 2 bytes/sample × 8000 Hz × DurationMs/1000
 }
 
 func (t *MockTTS) Synthesize(text string) []byte {
 	if text == "" {
 		return nil
 	}
-	return make([]byte, t.DurationMs)
+	// 8kHz × 2 bytes × DurationMs/1000 = 16 * DurationMs bytes
+	return make([]byte, 16*t.DurationMs)
 }
 
 // =============================================================================
-// ElevenLabsTTS — text-to-speech REST → PCMU 8kHz
+// ElevenLabsTTS — text-to-speech REST → PCM16 LE 8kHz mono
 // =============================================================================
 
 type ElevenLabsTTS struct {
-	APIKey    string
-	VoiceID   string
-	ModelID   string
-	Endpoint  string
-	TimeoutS  int
+	APIKey   string
+	VoiceID  string
+	ModelID  string
+	Endpoint string
+	TimeoutS int
 }
 
 func (t *ElevenLabsTTS) Synthesize(text string) []byte {
@@ -148,11 +156,14 @@ func (t *ElevenLabsTTS) Synthesize(text string) []byte {
 		return nil
 	}
 
-	pcm16, _ := io.ReadAll(resp.Body)
-	if len(pcm16) < 2 {
+	pcm16_16k, _ := io.ReadAll(resp.Body)
+	if len(pcm16_16k) < 4 {
 		return nil
 	}
-	return pcm16ToPcmu(pcm16)
+	// ElevenLabs 返回 PCM16 16kHz → downsample 到 8kHz → PCM16 LE 8kHz
+	samples_16k := Pcm16LEToInt16(pcm16_16k)
+	samples_8k := Downsample16kTo8k(samples_16k)
+	return Int16ToPcm16LE(samples_8k)
 }
 
 // =============================================================================
@@ -160,19 +171,20 @@ func (t *ElevenLabsTTS) Synthesize(text string) []byte {
 // =============================================================================
 
 type WhisperASR struct {
-	APIKey    string
-	Model     string
-	Endpoint  string
-	Language  string
-	TimeoutS  int
+	APIKey   string
+	Model    string
+	Endpoint string
+	Language string
+	TimeoutS int
 }
 
-func (a *WhisperASR) Transcribe(pcmu []byte) string {
-	if len(pcmu) == 0 || a.APIKey == "" {
+func (a *WhisperASR) Transcribe(pcm16 []byte) string {
+	if len(pcm16) == 0 || a.APIKey == "" {
 		return ""
 	}
 
-	wav := pcmuToWavPcm16(pcmu, 8000)
+	// 输入已经是 PCM16 LE 8kHz → 直接加 WAV header（44 bytes）
+	wav := pcm16BytesToWav(pcm16, 8000)
 
 	boundary := "----NSBCWhisperBoundary7MA4YWxkTrZu0gW"
 	var buf strings.Builder
@@ -226,13 +238,13 @@ func (a *WhisperASR) Transcribe(pcmu []byte) string {
 const defaultOllamaSystemPrompt = `你是一个电话客服 AI。所有回复必须是严格 JSON，不包含任何其他文字。JSON schema：{"action":"say|transfer|hangup|silence", "text":"...", "dest":"...", "reason":"..."} action=transfer 时 dest 必须填写目标分机号（如 1001）。action=say 时 text 必须是自然语言回复。action=silence 时不要 text。如果用户说'转人工'、'人工'、'找客服'，action=transfer。如果用户说'挂断'、'再见'、'bye'，action=hangup。`
 
 type OllamaLLM struct {
-	Model           string
-	Endpoint        string
-	APIKey          string
-	SystemPrompt    string
-	TransferDest    string
+	Model            string
+	Endpoint         string
+	APIKey           string
+	SystemPrompt     string
+	TransferDest     string
 	TransferKeywords []string
-	TimeoutS        int
+	TimeoutS         int
 }
 
 func (l *OllamaLLM) Chat(transcript string) LLMReply {
@@ -322,53 +334,11 @@ func (l *OllamaLLM) keywordFallback(transcript string) LLMReply {
 }
 
 // =============================================================================
-// PCM16 ↔ PCMU + PCMU → WAV 辅助（G.711 μ-law，纯 stdlib）
+// WAV builder — PCM16 LE raw → 44 字节 header + data
 // =============================================================================
 
-// pcm16ToPcmu — 16-bit signed PCM16 LE → 8-bit unsigned PCMU (G.711 μ-law)
-// 16kHz PCM16 downsample 2x → 8kHz，同时量化
-func pcm16ToPcmu(pcm16 []byte) []byte {
-	nSamples := len(pcm16) / 4 // 每 4 字节 = 2 个 PCM16 样本（降采样）
-	out := make([]byte, 0, nSamples)
-	for i := 0; i < nSamples; i++ {
-		off := i * 4
-		s16 := int16(binary.LittleEndian.Uint16(pcm16[off:]))
-		out = append(out, pcm16ToUlaw(int(s16)))
-	}
-	return out
-}
-
-func pcm16ToUlaw(sample int) byte {
-	sign := byte(0)
-	if sample < 0 {
-		sign = 0x80
-		sample = -sample
-	}
-	if sample > 32635 {
-		sample = 32635
-	}
-	sample += 0x84
-	exponent := 7
-	for i := 0; i < 7; i++ {
-		if (sample & (0x4000 >> i)) != 0 {
-			exponent = 6 - i
-			break
-		}
-	}
-	mantissa := (sample >> (exponent + 3)) & 0x0F
-	ulaw := byte(^((sign) | (byte(exponent) << 4) | byte(mantissa)) & 0xFF)
-	return ulaw
-}
-
-// pcmuToWavPcm16 — PCMU 8kHz → 44 字节 WAV header + PCM16 LE 8kHz raw
-func pcmuToWavPcm16(pcmu []byte, sampleRate int) []byte {
-	nSamples := len(pcmu)
-	pcm16 := make([]byte, nSamples*2)
-	for i, u := range pcmu {
-		s16 := ulawToPcm16(u)
-		binary.LittleEndian.PutUint16(pcm16[i*2:], uint16(int16(s16)))
-	}
-
+// pcm16BytesToWav — PCM16 LE 8kHz raw → WAV 文件字节
+func pcm16BytesToWav(pcm16 []byte, sampleRate int) []byte {
 	dataSize := len(pcm16)
 	buf := make([]byte, 44+dataSize)
 	copy(buf[0:4], "RIFF")
@@ -386,29 +356,6 @@ func pcmuToWavPcm16(pcmu []byte, sampleRate int) []byte {
 	binary.LittleEndian.PutUint32(buf[40:], uint32(dataSize))
 	copy(buf[44:], pcm16)
 	return buf
-}
-
-func ulawToPcm16(ulaw byte) int {
-	ulaw = ^ulaw
-	sign := int((ulaw & 0x80) >> 7)
-	exponent := int((ulaw >> 4) & 0x07)
-	mantissa := int(ulaw & 0x0F)
-	sample := (mantissa << 3) | 0x84
-	if exponent > 0 {
-		sample <<= exponent
-	}
-	sample -= 0x84
-	if sign != 0 {
-		sample = -sample
-	}
-	sample <<= 2
-	if sample > 32767 {
-		sample = 32767
-	}
-	if sample < -32768 {
-		sample = -32768
-	}
-	return sample
 }
 
 // =============================================================================
@@ -446,7 +393,7 @@ func randBytes(n int) []byte {
 }
 
 // =============================================================================
-// G.711 μ-law PCMU codec — NSBC B2BUA 用 PCMU 8kHz，ASR/TTS 用 PCM16
+// G.711 μ-law PCMU codec — NSBC B2BUA 传统 codec（保留做格式转换工具）
 // =============================================================================
 // 纯 Go 查表法，每个样例 O(1)，业界标准实现（ITU-T G.711）
 var muLawDecode = [256]int16{
@@ -472,65 +419,6 @@ var muLawDecode = [256]int16{
 	15484,  15996,  16764,  17788,  18812,  19836,  20860,  21884,
 	22908,  23932,  24956,  25980,  27004,  28028,  29052,  30076,
 	31100,  32124,
-}
-
-// PcmuToPcm16: 把 G.711 PCMU 字节流转成 int16 PCM 样本
-func PcmuToPcm16(pcmu []byte) []int16 {
-	out := make([]int16, len(pcmu))
-	for i, b := range pcmu {
-		out[i] = muLawDecode[b]
-	}
-	return out
-}
-
-// Pcm16ToPcmu: 把 int16 PCM 样本编成 G.711 PCMU 字节流
-func Pcm16ToPcmu(pcm []int16) []byte {
-	out := make([]byte, len(pcm))
-	for i, s := range pcm {
-		// G.711 μ-law 编码（ITU-T G.711）
-		var sign byte
-		var n int
-		if s < 0 {
-			sign = 0x80
-			n = int(-s)
-		} else {
-			sign = 0
-			n = int(s)
-		}
-		n += 0x84
-		if n > 32767 {
-			n = 32767
-		}
-		// 找最高位 set 的位置 —— 确定 segment
-		var seg int
-		if n >= 0x1000 {
-			seg = 7
-		} else if n >= 0x800 {
-			seg = 6
-		} else if n >= 0x400 {
-			seg = 5
-		} else if n >= 0x200 {
-			seg = 4
-		} else if n >= 0x100 {
-			seg = 3
-		} else if n >= 0x80 {
-			seg = 2
-		} else if n >= 0x40 {
-			seg = 1
-		} else {
-			seg = 0
-		}
-		// 取 segment 内 4 个 bit 的量化值
-		var q int
-		if seg == 0 {
-			q = (n >> 1) & 0x0F
-		} else {
-			q = (n >> (seg + 3)) & 0x0F
-		}
-		// 组装：sgn(1) + segment(3 反相) + quantization(4 反相)
-		out[i] = byte(sign | (byte(^seg&0x07) << 4) | byte(^q&0x0F))
-	}
-	return out
 }
 
 // Pcm16LEToInt16: 小端 PCM16 字节流 → int16 slice
@@ -582,8 +470,8 @@ func Downsample16kTo8k(in []int16) []int16 {
 // =============================================================================
 // NWAYASR — 本地 nway-asr-tcp 服务（10.0.0.80:8089）
 //   协议 v1.0：4B_LE(samples) + PCM16_LE → 4B_LE(text_len) + UTF-8
-//   输入：NSBC 给的 PCMU 8kHz → 解码 → 8k→16k → 发服务端
-//   输出：服务端返回 transcript 文本
+//   输入：C 侧 ring buffer 存 PCM16 LE 8kHz mono（g711_alaw_decode + HPF）
+//   处理：8kHz → 16kHz upsampling（服务端 Whisper 期望 16k）→ TCP 发送
 // =============================================================================
 
 type NWAYASR struct {
@@ -591,18 +479,22 @@ type NWAYASR struct {
 	NasrClient string // nasr-client 可执行文件路径（备用，当前走 TCP 直接转）
 }
 
-func (a *NWAYASR) Transcribe(pcmu []byte) string {
+func (a *NWAYASR) Transcribe(pcm16 []byte) string {
 	if a.Addr == "" {
 		a.Addr = "10.0.0.80:8089"
 	}
 
-	// 1. PCMU 8kHz → PCM16 8kHz int16
-	pcm8k := PcmuToPcm16(pcmu)
+	if len(pcm16) < 4 {
+		return ""
+	}
+
+	// 1. PCM16 LE 8kHz → int16 slice
+	pcm8k := Pcm16LEToInt16(pcm16)
 	if len(pcm8k) == 0 {
 		return ""
 	}
 
-	// 2. 重采样 8k → 16k
+	// 2. 重采样 8k → 16k（NASR/Whisper 服务端期望 16kHz）
 	pcm16k := Upsample8kTo16k(pcm8k)
 
 	// 3. TCP 连接 nway-asr-tcp
@@ -650,8 +542,8 @@ func (a *NWAYASR) Transcribe(pcmu []byte) string {
 	}
 
 	result := string(text)
-	fmt.Fprintf(stderr, "[NWAYASR] transcript=%q (%d bytes input → %d chars)\n",
-		result, len(pcmu), len(result))
+	fmt.Fprintf(stderr, "[NWAYASR] transcript=%q (%d bytes input PCM16 → %d chars)\n",
+		result, len(pcm16), len(result))
 	return result
 }
 
@@ -661,12 +553,7 @@ func (a *NWAYASR) Transcribe(pcmu []byte) string {
 //            循环包 { 1B type | 4B LE payload_len | payload }
 //            type 0x01 HEAD(sample_rate u32 LE), 0x02 DATA(PCM16_LE),
 //                 0x03 END, 0xFF ERR
-//   输入：文本 → 发服务端
-//   输出：PCM16_LE (通常 8kHz 8k) → 直接 PCMU 8kHz
-//   ★ 服务端 HEAD 里的 sample_rate 决定是否需要重采样：
-//     8000 Hz → 直接 PCM16→PCMU，无需重采样（最常见）
-//     16000 Hz → 先 downsample 到 8k 再 PCMU
-//     其他 → 报错让用户改 nway-asr config.ini
+//   ★ 返回 PCM16 LE 8kHz mono —— C 侧 ai_send_tx_audio(format=1) 直接 encode 到对端 codec
 // =============================================================================
 
 type NWAYTTS struct {
@@ -758,11 +645,8 @@ done:
 		return nil
 	}
 
-	// 4. 直接返回 raw PCM16_LE —— 让 C 侧 ai_send_tx_audio(format=1) 用
-	//    G.711 encoder.encode() 一次编码到对端 codec（PCMA/PCMU/G729），
-	//    跳过 Go 侧 PCM16→PCMU（8bit 有损）+ C 侧 transcode（8bit 有损）的两次编码叠加。
+	// 4. 重采样到 8kHz（C 侧 ai_send_tx_audio format=1 固定 8kHz）
 	if sampleRate != 8000 {
-		// 非 8k 重采样：downsample 16k→8k，其他采样率报错
 		switch sampleRate {
 		case 16000:
 			pcm16Samples = Downsample16kTo8k(pcm16Samples)
@@ -777,27 +661,3 @@ done:
 		len(pcm16Bytes), len(pcm16Samples), sampleRate)
 	return pcm16Bytes
 }
-
-// pcm16BytesToWav — PCM16 LE 8kHz raw → WAV 文件字节（44 字节 header + data）
-func pcm16BytesToWav(pcm16 []byte, sampleRate int) []byte {
-	nSamples := len(pcm16) / 2
-	dataSize := len(pcm16)
-	buf := make([]byte, 44+dataSize)
-	copy(buf[0:4], "RIFF")
-	binary.LittleEndian.PutUint32(buf[4:], uint32(dataSize+36))
-	copy(buf[8:12], "WAVE")
-	copy(buf[12:16], "fmt ")
-	binary.LittleEndian.PutUint32(buf[16:], 16) // fmt chunk size
-	binary.LittleEndian.PutUint16(buf[20:], 1)  // audio format PCM
-	binary.LittleEndian.PutUint16(buf[22:], 1)  // channels
-	binary.LittleEndian.PutUint32(buf[24:], uint32(sampleRate))
-	binary.LittleEndian.PutUint32(buf[28:], uint32(sampleRate*2))
-	binary.LittleEndian.PutUint16(buf[32:], 2)  // block align
-	binary.LittleEndian.PutUint16(buf[34:], 16) // bits per sample
-	copy(buf[36:40], "data")
-	binary.LittleEndian.PutUint32(buf[40:], uint32(dataSize))
-	copy(buf[44:], pcm16)
-	_ = nSamples
-	return buf
-}
-
