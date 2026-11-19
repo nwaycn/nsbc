@@ -116,7 +116,11 @@ typedef struct {
     int      in_use;    /* 1=某业务线程占用等待中 */
     int      done;      /* 1=RSP 已填入 */
     uint32_t ticket;
-    char     resp[8192];
+    /* 堆分配按需扩容：RSP 可能远超 8KB（cfg.pull_all 含全量 dprules +
+     * security 规则，实测 15~30KB）。固定 8KB 会截断 → cJSON_Parse 失败
+     * → C 侧报 "DB tables NOT loaded from web"。 */
+    char    *resp;
+    size_t   resp_cap;
     size_t   resp_len;
 } uds_reqslot_t;
 
@@ -392,10 +396,21 @@ static void dispatch_rsp(uint32_t ticket, const uint8_t *payload, size_t len)
         uds_reqslot_t *s = &g.slots[i];
         pthread_mutex_lock(&s->mtx);
         if (s->in_use && s->ticket == ticket) {
-            size_t n = len < sizeof(s->resp) ? len : sizeof(s->resp) - 1;
-            memcpy(s->resp, payload, n);
-            s->resp[n] = '\0';
-            s->resp_len = n;
+            size_t need = len + 1;
+            if (need > s->resp_cap) {
+                char *nb = (char *)realloc(s->resp, need);
+                if (!nb) {
+                    llog(LOG_WARN, "uds", "rsp ticket=%u realloc %zuB failed, dropped",
+                         ticket, need);
+                    pthread_mutex_unlock(&s->mtx);
+                    return;
+                }
+                s->resp = nb;
+                s->resp_cap = need;
+            }
+            memcpy(s->resp, payload, len);
+            s->resp[len] = '\0';
+            s->resp_len = len;
             s->done = 1;
             pthread_cond_signal(&s->cv);
             pthread_mutex_unlock(&s->mtx);
@@ -1457,6 +1472,11 @@ void uds_client_shutdown(void)
     for (int i = 0; i < UDS_REQ_SLOTS; ++i) {
         pthread_mutex_destroy(&g.slots[i].mtx);
         pthread_cond_destroy(&g.slots[i].cv);
+        if (g.slots[i].resp) {
+            free(g.slots[i].resp);
+            g.slots[i].resp = NULL;
+            g.slots[i].resp_cap = 0;
+        }
     }
     if (g.wake_cmd_rd >= 0) { close(g.wake_cmd_rd); g.wake_cmd_rd = -1; }
     if (g.wake_cmd_wr >= 0) { close(g.wake_cmd_wr); g.wake_cmd_wr = -1; }

@@ -1,60 +1,39 @@
-/* REQ-AI-001：AI 对话模块（可选加载，DYNAMIC 组）
+/* AI dialog module (optional, MOD_F_DYNAMIC)
  *
- * 三阶段管道：
- *   [1] 媒体抓流    —— bridge_add_rec_feed_hook 挂 B 腿原始 PCMU/G.711 帧
- *                      → per-call ring buffer (64KB)
- *   [2] ASR          —— 凑 2s 音频块落临时文件（.wav）
- *                      → curl multipart POST OpenAI Whisper → transcript text
- *   [3] LLM + TTS    —— transcript → OpenAI Chat / Ollama (可选) → reply text
- *                      → GET ElevenLabs TTS → PCM16 raw stream
- *                      → g711_pcm16_to_ulaw → PCMU
- *                      → bridge_send_raw 注入 A 腿
+ * 纯媒体桥接层（passthrough）：
+ *   [1] 媒体抓流    —— bridge_add_rec_feed_hook 挂 B 腿原始 G.711 帧
+ *                      → per-call ring buffer (256KB)
+ *   [2] 跨 codec 转码 —— 内部统一 PCMA；in_codec 由首帧 RX 动态确定，
+ *                      transcode_open/process 跨 PCMA/G729/G722/... 转码
+ *   [3] 注入 + 转人工 —— bridge_send_raw 注入 A 腿；b2b_transfer_call 转人工座席
+ *
+ * ASR / LLM / TTS 全部由外部 ai_agent 承担（经 pass-through API 读写音频流）。
  *
  * 模块分层：
  *   MOD_L_WORKER_READY  —— 早于 signaling FINAL（桥接层已就绪）
  *   非 REQUIRED          —— DYNAMIC 组 dlopen
  *   deps = {"signaling"} —— 桥接层必须先 init
  *
- * 依赖编译开关：NSBC_WITH_CURL=1（-lcurl）
- * 无 cURL 时编译跳过走 mock 模式（见 ai_session_thread 里 #ifdef）
- *
  * nsbc.yaml 配置：
  *   ai_dialog:
  *     enabled: 1
- *     asr:
- *       endpoint: https://api.openai.com/v1/audio/transcriptions
- *       api_key: sk-...
- *       model: whisper-1
- *       language: zh         # 可空自动检测
- *     llm:
- *       endpoint: https://api.openai.com/v1/chat/completions
- *       api_key: sk-...
- *       model: gpt-4o-mini
- *       system_prompt: "你是一个友好的电话客服..."
- *       # 可选本地 ollama: endpoint=http://localhost:11434/api/chat, api_key=空
- *     tts:
- *       endpoint: https://api.elevenlabs.io/v1/text-to-speech
- *       api_key: ...
- *       voice_id: 21m00Tcm4TlvDq8ikWAM   # ElevenLabs demo voice
- *     # 音频参数（默认 PCMU 8kHz 20ms 帧）
- *     chunk_ms: 2000        # 每 2s 做一次 ASR
- *     target_pt: 0          # 0=PCMU, 8=PCMA
  */
 
 #include "module.h"
 #include "cfg.h"
 #include "log.h"
 #include "media_bridge.h"
-#include "g711_codec.h"
-#include "b2bua.h"        /* P0-1: b2b_call_destroy_add */
+#include "media_codec.h"   /* codec layer: transcode_open/process cross-codec transcode (PCMA/PCMU/G729/G722/...) */
+#include "g711.h"          /* AI internal format: PCMU/PCMA <-> PCM16 LE 8kHz */
+#include "b2bua.h"        /* P0-1: b2b_call_destroy_add + REQ-AI-TRANSFER-001: b2b_transfer_call */
+#include "sdp.h"          /* AI_SESSION_OPENED 的 pt_in 需从 A 腿 SDP offer 解析真实 codec PT */
+#include "callctrl.h"     /* REQ-AI-TRANSFER-001: CCF_XFER_BLIND */
 #include "dp_sleep.h"     /* P0-2: dp_sleep_app_reg() */
 #include "app_registry.h" /* P0-2: app_register / app_desc_t */
 #include "app_ctx.h"      /* struct nsbc_ctx 完整定义（ctx->cfg）*/
-
-#ifdef NSBC_WITH_CURL
-#define HAVE_REAL_ASR_TTS 1
-#include "ai_http.h"
-#endif
+#include "vad_engine.h"   /* REQ-AI-VAD-001: vad_start_for_call / vad_stop_for_call + HPF API */
+#include "obs.h"          /* obs_event (redundant for AI_SESSION — see uDS_client.h below) */
+#include "uDS_client.h"   /* ★ AI_SESSION_OPENED/CLOSED go through UDS 'session' topic → calls_tx → /calls/stream SSE */
 
 #include "ai_backend_registry.h"
 
@@ -62,6 +41,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>     /* ENODEV — bridge_send_raw relay 未 latch 时返回此值 */
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -74,33 +54,24 @@ extern bridge_mgr_t *sig_bridge_instance(void);
 
 typedef struct ai_cfg {
     int enabled;
-    char asr_endpoint[256];
-    char asr_api_key[256];
-    char asr_model[64];
-    char asr_language[16];
-    char llm_endpoint[256];
-    char llm_api_key[256];
-    char llm_model[64];
-    char llm_system_prompt[512];
-    int  llm_enabled;
-    char tts_endpoint[256];
-    char tts_api_key[256];
-    char tts_voice_id[128];
-    int  chunk_ms;
-    int  target_pt;    /* 0=PCMU, 8=PCMA */
 } ai_cfg_t;
 
 /* ================================================================== */
 /* per-call 会话                                                       */
 /* ================================================================== */
 
-#define AI_RING_CAP (256 * 1024)   /* 256KB 足够 ~32s @ 8kHz PCMU */
-#define AI_MAX_CHUNKS 16           /* 最多累计 16 个 chunk（≈ 32s） */
+#define AI_RING_CAP (512 * 1024)   /* 512KB ~16s @ 8kHz PCM16 LE (AI unified format) */
 
 typedef struct ai_session {
     void     *call_key;
     int       b_leg;
-    int       pt_in;                /* 抓进来的 PT（通常 0=PCMU） */
+    int       pt_in;                /* 抓进来的 PT（通常 8=PCMA） */
+    /* codec layer: internal baseline is PCMA. in_codec resolved from first RX frame
+     * （默认 CODEC_PCMA）；rx_tc/tx_tc 是cross-codec transcode sessions, rebuilt on codec change. */
+    codec_id_t     in_codec;        /* 主叫实际 codec（CODEC_PCMA/G729/...）*/
+    transcode_sess_t *rx_tc;        /* in_codec → PCMA（收流转码）*/
+    transcode_sess_t *tx_tc;        /* PCMA → in_codec（发流转码，format=0 用）*/
+    codec_sess_t     *tx_pcm16_enc; /* in_codec encoder（format=1，PCM16 raw → in_codec 一次编码）*/
     uint32_t  ssrc;                 /* 自己注入用的 SSRC */
     uint16_t  seq;
     uint32_t  ts;
@@ -111,16 +82,17 @@ typedef struct ai_session {
     size_t    r_head;
     size_t    r_tail;
     time_t    opened_at;
-    int       enabled;   /* 1 = 已被 dp "ai" app 显式启用；全局 hook 也能启 session 但 enabled=0 */
+    int       producer;  /* 外部 producer 模式（第三方 AI 直接喂 tx_audio / 拉 rx_audio）*/
 
-    /* ASR chunk 临时文件路径（每个 chunk 落一个 .pcm） */
-    char      chunk_paths[AI_MAX_CHUNKS][64];
-    int       n_chunks;
-    int       chunk_bytes_target;  /* = chunk_ms * 8000 / 1000 字节（PCMU 8k） */
+    /* per-leg HPF — same butterworth filter as vad_engine, strips DC + 50Hz mains hum
+     * ring buffer previously had no HPF, so ASR fed slightly different audio than VAD detected */
+    vad_hpf_t hpf[2];       /* leg 0 + leg 1 独立 HPF 状态 */
 
-    int16_t  *pcm_buf;              /* 累计的 PCM16 缓冲（ASR 和 LLM 之后 TTS 用）*/
-    size_t    pcm_samples;          /* 累计的 16bit 样本数（不是字节）*/
-    size_t    pcm_cap;
+    /* external request to transfer AI session to human agent (blind transfer)
+     * 设 transfer_dest + transfer_pending=1 → ai_session_thread 下次循环调
+     * b2b_transfer_call 发 REFER + 设置 running=0 让线程退出。 */
+    char      transfer_dest[256];
+    int       transfer_pending;
 
     struct ai_session *next;
 } ai_session_t;
@@ -143,6 +115,32 @@ static void ai_on_call_destroy(void *call_key, int a_final, void *ud);
 static app_rc_t ai_app_exec(app_ctx_t *c, const char *data, void *ud);
 
 /* P0-2: 给 dp app 或全局 hook 共用的 session 查找/创建辅助 */
+
+/*  从 A 腿 SDP offer 解析第一个 audio codec 的 PT。
+ * local:ai 模式下 A 腿自答，AI_SESSION_OPENED 事件的 pt_in 不能硬编码 0（PCMU）——
+ * 否则 microsip 配 PCMA（pt=8）时，Go agent 会把 PCMA 误判成 PCMU，
+ * 导致 TX 编码错乱 / ASR 精度下降。offer 里首个 audio 段的首个 codec 即真实 PT。 */
+static int ai_first_audio_pt(b2b_call_t *call)
+{
+    if (!call) return 0;
+    b2b_leg_t *a = &call->leg[0];
+    if (!a->offer_len || !a->offer[0]) return 0;
+
+    sdp_t s;
+    memset(&s, 0, sizeof(s));
+    if (sdp_parse(&s, a->offer, a->offer_len) != NSBC_OK)
+        return 0;
+
+    for (int i = 0; i < s.nmedia; ++i) {
+        sdp_media_t *m = &s.media[i];
+        if (m->port == 0 || m->rejected) continue;
+        if (m->type != SDP_M_AUDIO) continue;
+        if (sdp_media_build_codecs(&s, m) == NSBC_OK && m->ncodecs > 0)
+            return m->codecs[0].pt;
+    }
+    return 0;
+}
+
 static ai_session_t *ai_session_find_or_create(ai_store_t *st, void *call_key,
                                                int pt_in, const char *src)
 {
@@ -157,37 +155,73 @@ static ai_session_t *ai_session_find_or_create(ai_store_t *st, void *call_key,
         s->call_key = call_key;
         s->b_leg = 1;
         s->pt_in = pt_in;
+        s->in_codec = CODEC_PCMA;  /* 默认 PCMA；首帧 RX 到达后动态修正为实际 codec */
         s->ssrc = 0x4E534243 ^ ((uintptr_t)call_key & 0xFFFFFFFFu);
         s->seq = (uint16_t)(rand() & 0xFFFF);
         s->ts = 0;
-        s->chunk_bytes_target = st->cfg.chunk_ms * 8000 / 1000;
         s->opened_at = time(NULL);
-        s->enabled = (strcmp(src, "dp_ai") == 0);  /* 只走 dp app 才显式启用 */
         pthread_mutex_init(&s->lock, NULL);
+
+        /* per-leg HPF init, 50Hz cutoff / 8kHz mono — same coefficients as vad_engine*/
+        vad_hpf_init(&s->hpf[0], 50.0f, 8000.0f);
+        vad_hpf_init(&s->hpf[1], 50.0f, 8000.0f);
+
         st->head = s;
-        llog(LOG_INFO, "ai", "session opened call=%p pt=%d via=%s enabled=%d chunk_ms=%d",
-             call_key, pt_in, src, s->enabled, st->cfg.chunk_ms);
+        llog(LOG_INFO, "ai", "session opened call=%p pt=%d via=%s HPF init",
+             call_key, pt_in, src);
+
+        /* emit AI_SESSION_OPENED via uds_send_session('session' topic)
+         * → UDS data.sock → uds_server.rs → calls_tx.send()
+         * → /calls/stream (SSE) → Go SseEventToFrame fallback:
+         *   payload["event"]="ai_session_opened" → strings.ToUpper → Domain="AI_SESSION_OPENED" ✅
+         * Go agent's aiSessionTracker.markOpened(callID) on receive.
+         * Must NOT use obs_event here — obs_event writes to C-internal g_ev ring,
+         * web/src has zero subscribers, Go agent would never see it (confirmed
+         * by poller.rs comment + grep for calls_tx.send = only uds_server.rs). */
+        {
+            b2b_call_t *b2b = (b2b_call_t *)call_key;
+            const char *cid = (b2b && b2b->leg[0].callid[0])
+                              ? b2b->leg[0].callid : "unknown";
+            /* in_codec 字段用 pt_in 解析真实 codec_id（PCMA=8 → CODEC_PCMA），
+             * 不能直接报 s->in_codec（默认 PCMA，首帧才动态修正）——否则 Go agent
+             * 会在 AI_SESSION_OPENED 阶段把 PCMA 误判成 PCMU。 */
+            const codec_ops_t *opsc = (pt_in > 0) ? codec_registry_find_pt(pt_in, 8000) : NULL;
+            int in_codec_report = opsc ? (int)opsc->id : (int)s->in_codec;
+            char sess[384];
+            snprintf(sess, sizeof(sess),
+                "{\"event\":\"ai_session_opened\",\"call_id\":\"%s\","
+                "\"pt_in\":%d,\"in_codec\":%d}",
+                cid, pt_in, in_codec_report);
+            uds_send_session(sess);
+        }
         s->running = 1;
-        pthread_create(&s->th, NULL, ai_session_thread_stub, s);
+        int prc = pthread_create(&s->th, NULL, ai_session_thread_stub, s);
+        if (prc != 0) {
+            llog(LOG_ERR, "ai", "session opened but pthread_create failed rc=%d (EAGAIN=%d)! thread NOT started", prc, 11);
+            s->running = 0;
+        } else {
+            llog(LOG_INFO, "ai", "pthread_create OK thread started call=%p tid=%lu", call_key, (unsigned long)s->th);
+        }
+    } else {
+        /* 复用旧 session —— 如果 thread 已退出（running=0 或 th=0），重新启动 */
+        llog(LOG_INFO, "ai", "session found (reuse) call=%p pt=%d running=%d → check thread state",
+             call_key, pt_in, s->running);
+        pthread_mutex_lock(&s->lock);
+        int need_restart = (s->running == 0);
+        pthread_mutex_unlock(&s->lock);
+        if (need_restart) {
+            s->running = 1;
+            int prc = pthread_create(&s->th, NULL, ai_session_thread_stub, s);
+            if (prc != 0) {
+                llog(LOG_ERR, "ai", "reuse session pthread_create failed rc=%d (EAGAIN=%d)! running=0", prc, 11);
+                s->running = 0;
+            } else {
+                llog(LOG_INFO, "ai", "reuse pthread_create OK call=%p tid=%lu", call_key, (unsigned long)s->th);
+            }
+        }
     }
     pthread_mutex_unlock(&st->lock);
     return s;
-}
-
-/* ================================================================== */
-/* 工具：从 nsbc.yaml 读字符串 / int（统一空串默认）                    */
-/* ================================================================== */
-
-static void cfg_str(const char *key, char *out, size_t outsz, const char *def)
-{
-    const char *v = NULL;
-    if (cfg_get_str(g_cfg_ptr, key, &v, NULL) == NSBC_OK && v && v[0]) {
-        snprintf(out, outsz, "%s", v);
-    } else if (def) {
-        snprintf(out, outsz, "%s", def);
-    } else {
-        out[0] = '\0';
-    }
 }
 
 /* ================================================================== */
@@ -201,31 +235,125 @@ static void ai_rec_feed(void *ud, void *call_key,
     ai_store_t *st = (ai_store_t *)ud;
     if (!st || !st->cfg.enabled || !call_key) return;
 
-    /* 只抓 B 腿（被叫方语音），PCMU/PCMA */
-    if (leg != 1) return;
-    if (pt != 0 && pt != 8) return;
+    /*  2026-11-17 修复：两边都抓（leg=0 主叫 + leg=1 被叫）。
+     * previously only leg=1 (B side), but SIPp UAS B side sends no RTP -> zero hook invocations.
+     * 用户可能在主叫也可能在被叫 —— 两边都进 ring buffer，thread 做 ASR 时拿到完整对话。
+     * 注：后续可加 per-leg ring 分区避免 AI 听到自己 TTS 回复，但 demo 模式 ASR 返回空不影响。*/
+    (void)leg;  /* 两边都抓 —— 不做 leg 过滤 */
 
-    /* P0-2: session 查找/创建统一走 helper（ai_app_exec 会提前创建；
-     * 没走 dp app 的 fallback 全局 hook 路径也能自动建）*/
-    ai_session_t *s = ai_session_find_or_create(st, call_key, pt, "hook");
-    if (!s) return;
+    /*  核心修复（2026-11-17）：全局 hook 只负责喂数据，不自动创建 session。
+     * 只有 dialplan 配了 "ai" app（如拨 9999）时 ai_app_exec 才显式创建 session，
+     * 避免分机对打、落地呼叫等误进入 AI 管道。
+     * 找不到 session → 说明这个 call 没走 AI dialplan → 直接 return，零开销。*/
+    pthread_mutex_lock(&st->lock);
+    ai_session_t *s = NULL;
+    for (s = st->head; s; s = s->next) {
+        if (s->call_key == call_key) break;
+    }
+    pthread_mutex_unlock(&st->lock);
+    if (!s) return;   /* 没有 dialplan ai app 触发 → 跳过 */
 
-    /* 写 ring buffer（持 s->lock 保护并发写） */
+    /*   codec layer: static PT maps to codec_id. Dynamic PT (>=96, e.g. Opus) needs SDP rtpmap
+     * 建立 per-session 映射（见 media_codec.h），暂不支持 → drop，不污染 ring。 */
+    const codec_ops_t *ops = codec_registry_find_pt(pt, 8000);
+    if (!ops) {
+        llog(LOG_DEBUG, "ai", "rec_feed pt=%d 未注册/动态PT → drop call=%p", pt, call_key);
+        return;
+    }
+    codec_id_t in_codec = ops->id;
+
+    /* P1 defense: clock_rate must be 8kHz (AI internal format is PCM16 LE 8kHz mono)
+     * codec_registry_find_pt 完全忽略 clock_rate 参数（被 (void) 吃掉），
+     * 所以非 8kHz codec 可能会被误命中 —— 这里显式检查。
+     * 允许非 8kHz 但必须走 transcode（transcode 内部做重采样）；
+     * 禁止非 8kHz 且 codec 本身就是 G.711 的（不存在，G.711 永远 8kHz）。*/
+    if (ops->clock_rate != 8000) {
+        /* 非 8kHz：transcode 应该会做重采样，但我们在首次确定 codec 时
+         * 打一条 WARN 提醒运维 —— 避免 silent bug（半速/倍速 decode 歪音）*/
+        llog(LOG_WARN, "ai", "⚠️ codec %s(pt=%d) clock_rate=%d ≠ 8000 → 依赖 transcode 重采样 call=%p",
+             ops->name, pt, ops->clock_rate, call_key);
+    }
+
+    /*  AI internal format: PCM16 LE 8kHz mono (NASR ASR / NWAYTTS intermediate)
+     * 入站路径：RTP payload → (transcode 非PCMA→PCMA) → g711_alaw_decode → PCM16 → ring buffer
+     * 为什么 PCM16？
+     *   - PCMA 是 8bit 有损压缩，NASR ASR 喂 PCMA 识别精度差
+     *   - PCM16 是完整 16bit 无损，后续 DSP（高通/降噪）也在 PCM16 域做
+     *   - ring buffer 每帧字节翻倍（20ms → 320B PCM16 vs 160B PCMA），256KB 够 16s
+     *   - Go agent ai_get_rx_audio 直接拿 PCM16 喂 NASR，不用再转 */
+    uint8_t tc_buf[2048];
+    const uint8_t *pcma_bytes = (const uint8_t *)payload;
+    size_t pcma_len = len;
+
+    /* per-frame PCM16 栈缓冲（20ms @ 8kHz PCMA → 160 samples → 320B PCM16，留 1024 够 60ms） */
+    int16_t pcm16_buf[1024];
+    const uint8_t *ring_data = NULL;
+    size_t ring_len = 0;
+
+    /* 写 ring buffer（持 s->lock 保护并发写）；转码+解码都在锁内完成 ——
+     * rx_tc 是 per-session 会话，仅在媒体线程单线程访问，无并发。 */
     pthread_mutex_lock(&s->lock);
+    if (in_codec != s->in_codec) {
+        /* first resolution / codec change (re-INVITE) -> rebuild RX+TX transcode sessions + PCM16 encoder */
+        if (s->rx_tc) { transcode_close(s->rx_tc); s->rx_tc = NULL; }
+        if (s->tx_tc) { transcode_close(s->tx_tc); s->tx_tc = NULL; }
+        if (s->tx_pcm16_enc) { codec_registry_find(in_codec)->fini(s->tx_pcm16_enc); s->tx_pcm16_enc = NULL; }
+        s->in_codec = in_codec;
+        if (in_codec != CODEC_PCMA) {
+            transcode_sess_t *rx = NULL, *tx = NULL;
+            if (transcode_open(in_codec, CODEC_PCMA, &rx) == NSBC_OK) s->rx_tc = rx;
+            if (transcode_open(CODEC_PCMA, in_codec, &tx) == NSBC_OK) s->tx_tc = tx;
+            /* format=1/2 优化：raw PCM16 直接 encode 到 in_codec，跳过中间 PCMA 有损编码 */
+            const codec_ops_t *enc_ops = codec_registry_find(in_codec);
+            if (enc_ops) {
+                codec_sess_t *enc = NULL;
+                if (enc_ops->encoder_init) enc_ops->encoder_init(NULL, &enc);
+                else if (enc_ops->init)    enc_ops->init(NULL, &enc);
+                s->tx_pcm16_enc = enc;
+            }
+            llog(LOG_INFO, "ai", "transcode init call=%p in=%d→PCMA rx=%p PCMA→in tx=%p pcm16_enc=%p",
+                 call_key, (int)in_codec, (void*)s->rx_tc, (void*)s->tx_tc, (void*)s->tx_pcm16_enc);
+        }
+    }
+    if (s->rx_tc) {
+        /* codec != PCMA → transcode 先转到 PCMA，再 decode */
+        size_t out_len = 0;
+        int rc = transcode_process(s->rx_tc, payload, len, tc_buf, sizeof(tc_buf), &out_len);
+        if (rc != NSBC_OK) {
+            pthread_mutex_unlock(&s->lock);
+            return;  /* AGAIN/错误：本帧跳过 */
+        }
+        pcma_bytes = tc_buf;
+        pcma_len = out_len;
+    }
+
+    /* PCMA -> PCM16 LE 8kHz mono — AI internal unified format */
+    size_t pcm16_samples = g711_alaw_decode(pcma_bytes, pcma_len, pcm16_buf);
+
+    /* P0: HPF strips DC offset and 50Hz mains hum
+     * ring buffer previously had no HPF, so ASR fed slightly different audio than VAD detected
+     * 现在两边都用同一份 HPF 系数，ASR 吃到干净音频 */
+    if (pcm16_samples > 0 && leg >= 0 && leg < 2) {
+        vad_hpf_process(&s->hpf[leg], pcm16_buf, pcm16_samples);
+    }
+
+    ring_data = (const uint8_t *)pcm16_buf;
+    ring_len = pcm16_samples * 2;  /* int16_t → 2 bytes each */
+
     size_t space = (s->r_head >= s->r_tail)
         ? (AI_RING_CAP - s->r_head + s->r_tail - 1)
         : (s->r_tail - s->r_head - 1);
-    if (space < len) {
+    if (space < ring_len) {
         /* ring 满：丢最旧（不阻塞媒体线程） */
-        s->r_tail = (s->r_tail + (len - space) + 1) % AI_RING_CAP;
+        s->r_tail = (s->r_tail + (ring_len - space) + 1) % AI_RING_CAP;
         /* 然后算正确新 space */
         space = AI_RING_CAP - 1 - ((s->r_head >= s->r_tail)
               ? (s->r_head - s->r_tail)
               : (s->r_tail - s->r_head));
     }
-    if (space >= len) {
-        for (size_t i = 0; i < len; ++i) {
-            s->ring[s->r_head++] = ((const uint8_t *)payload)[i];
+    if (space >= ring_len) {
+        for (size_t i = 0; i < ring_len; ++i) {
+            s->ring[s->r_head++] = ring_data[i];
             if (s->r_head >= AI_RING_CAP) s->r_head = 0;
         }
     }
@@ -233,433 +361,258 @@ static void ai_rec_feed(void *ud, void *call_key,
 }
 
 /* ================================================================== */
-/* ASR → transcript（openai whisper multipart）                         */
+/* Pass-through public API for third-party AI to read/write audio     */
 /* ================================================================== */
 
-static char *do_asr(ai_cfg_t *cfg, const char *pcm_path, size_t pcm_len)
+/* AI 模块架构分层：
+ *   ┌──────────────────────────────────────────────────────────┐
+ *   │ ai_dialog 模块（本文件，C 核心媒体管道层）                  │
+ *   │   • ai_rec_feed hook → ring buffer 入队                   │
+ *   │   • ring buffer ← ai_get_rx_audio（第三方 AI 读用户语音）    │
+ *   │   • ai_send_tx_audio（第三方 AI 写回复） → bridge_send_raw → A 腿 │
+ *   │   • ai_request_transfer → b2b_transfer_call（转人工座席）     │
+ *   │   • 纯媒体桥接：抓流 + ring buffer + 跨 codec 转码 + 注入 + 转人工     │
+ *   └──────────────────────────────────────────────────────────┘
+ *   ┌──────────────────────────────────────────────────────────┐
+ *   │ 外部 AI（第三方 Python/Go/Rust agent，跑在 nsbc-web 侧车或独立进程） │
+ *   │   • HTTP / UDS 订阅 nsbc 事件 → 知道哪通电话要接管            │
+ *   │   • ai_get_rx_audio 拉用户语音 → ASR（本地 Whisper/云端）      │
+ *   │   • LLM 对话管理（function call / 多轮上下文 / 知识库检索）      │
+ *   │   • TTS（云或本地 VITS/GPT-SoVITS）                         │
+ *   │   • ai_send_tx_audio 推回复 → 用户听                         │
+ *   │   • ai_request_transfer → b2b_transfer_call（复杂意图识别到转人工）│
+ *   └──────────────────────────────────────────────────────────┘
+ *
+ * 为什么这么分：
+ *   - C 核心只做媒体桥接（ring buffer + bridge_send_raw），ASR/LLM/TTS 都在外部
+ *   - 第三方 AI 想用什么 ASR/LLM/TTS 都能接（OpenAI / 本地 Ollama / 火山引擎 / 腾讯云）
+ *   - 转人工座席是 B2BUA 业务层能力，留在 C 核心（b2b_transfer_call 已实现）
+ *
+ * 音频格式约定：
+ *   - RX（用户→AI）：PCMA 8kHz，每次 ai_rec_feed 入队的是完整 RTP 载荷（通常 160 字节 / 20ms）
+ *   - TX（AI→用户）：PCMA 8kHz 原始字节（**调用方必须喂 PCMA，本模块不管 codec 转换**），
+ *     bridge_send_raw 按 RTP 节奏注入 —— codec 转换已模块化嵌入（media_bridge 只管 RTP 封装 + sendto）
+ *   - 缓冲区大小：256KB（≈32s @ 8kHz PCMA）
+ */
+
+/* 外部 producer 模式启动 session（绕过 dp ai app，直接让外部 AI 接管音频）
+ *
+ * call_key:   b2b_call_t*（不透明指针）
+ * producer:   1 = 外部 AI 喂 tx_audio（producer 模式，直接接管音频）
+ *             0 = 默认（纯媒体桥接，无内部管道）
+ * 返回：NSBC_OK / NSBC_NOENT（没 session）/ NSBC_INVAL */
+int ai_set_producer(void *call_key, int producer)
 {
-    (void)cfg;
-    (void)pcm_len;
-    /* 把 PCMU 临时文件转成 16kHz WAV（Whisper 偏好）——P1 简化：
-     * 直接 POST raw PCM16（8kHz mono）；或者落一个最小 .wav 头。
-     * 这里选落 .wav 头：44字节 header + PCMU → PCM16 → 写文件
-     * 更兼容 Whisper。 */
-    char wav_path[256];
-    snprintf(wav_path, sizeof(wav_path), "%s.wav", pcm_path);
-
-    /* 写 .wav：44 字节 header + 8kHz mono PCMU → PCM16 */
-    FILE *fin = fopen(pcm_path, "rb");
-    FILE *fout = fopen(wav_path, "wb");
-    if (!fin || !fout) {
-        if (fin) fclose(fin);
-        if (fout) fclose(fout);
-        return NULL;
+    if (!call_key) return NSBC_INVAL;
+    pthread_mutex_lock(&g_ai.lock);
+    ai_session_t *s = NULL;
+    for (s = g_ai.head; s; s = s->next) {
+        if (s->call_key == call_key) break;
     }
-    static const char wav_hdr[44] = {
-        /* RIFF + WAVE fmt */
-        'R','I','F','F', 0,0,0,0, 'W','A','V','E',
-        'f','m','t',' ', 16,0,0,0, 1,0, 1,0,
-        0x40,0x1F, 0,0, 0x80,0x3E, 0,0, 2,0, 16,0,
-        'd','a','t','a', 0,0,0,0,
-    };
-    fwrite(wav_hdr, 44, 1, fout);
+    if (!s) { pthread_mutex_unlock(&g_ai.lock); return NSBC_NOENT; }
+    pthread_mutex_lock(&s->lock);
+    int old_producer = s->producer;
+    s->producer = producer ? 1 : 0;
+    pthread_mutex_unlock(&s->lock);
+    pthread_mutex_unlock(&g_ai.lock);
+    llog(LOG_INFO, "ai", "ai_set_producer call=%p producer=%d", call_key, producer);
 
-    uint8_t pcmu_buf[4096];
-    int16_t pcm16_buf[4096];
-    while (1) {
-        size_t n = fread(pcmu_buf, 1, sizeof(pcmu_buf), fin);
-        if (n == 0) break;
-        g711_ulaw_to_pcm16(pcmu_buf, pcm16_buf, n);
-        fwrite(pcm16_buf, 2, n, fout);
+    /* producer mode auto-starts/stops VAD monitoring
+     * producer=1 → 对 A 腿（被叫用户腿）启动 VAD，Go 侧按 VAD 边界切句
+     * producer=0 → 停止 VAD，call_destroy 时也会停 */
+    if (producer && !old_producer) {
+        int rc = vad_start_for_call(call_key, 2 /* leg_mask=A+B */, 0 /* 默认阈值 */);
+        llog(rc == 0 ? LOG_INFO : LOG_WARN, "ai",
+             "vad_start_for_call call=%p (auto by producer=1) rc=%d", call_key, rc);
+    } else if (!producer && old_producer) {
+        int rc = vad_stop_for_call(call_key);
+        llog(LOG_INFO, "ai", "vad_stop_for_call call=%p (auto by producer=0) rc=%d",
+             call_key, rc);
     }
-    /* 回填 data chunk 长度：filesize - 44 */
-    long sz = ftell(fout);
-    int32_t data_len = (int32_t)(sz - 44);
-    fseek(fout, 4, SEEK_SET);
-    int32_t riff_len = data_len + 36;
-    fwrite(&riff_len, 4, 1, fout);
-    fseek(fout, 40, SEEK_SET);
-    fwrite(&data_len, 4, 1, fout);
-    fclose(fin);
-    fclose(fout);
-
-#ifdef HAVE_REAL_ASR_TTS
-    /* Phase R-14: 通过 ai_backend_registry 调用 whisper_openai ASR
-     * registry 签名是 (pcm_in, pcm_len, sample_rate, ...) —— 这里 PCMU 刚转成的 PCM16 就是 pcm_in
-     * 原来的 PCMU→PCM16→WAV 转换挪到 whisper_openai_ops.asr wrapper 里了 */
-    FILE *fr = fopen(wav_path, "rb");
-    if (!fr) { unlink(wav_path); return NULL; }
-    fseek(fr, 0, SEEK_END);
-    long sz = ftell(fr);
-    fseek(fr, 44, SEEK_SET);  /* 跳过 44 字节 WAV header，后面的就是 PCM16 raw */
-    size_t pcm16_len = (sz > 44) ? (size_t)(sz - 44) : 0;
-    if (pcm16_len == 0) { fclose(fr); unlink(wav_path); return NULL; }
-    char *pcm16_buf = (char *)malloc(pcm16_len);
-    if (!pcm16_buf) { fclose(fr); unlink(wav_path); return NULL; }
-    fread(pcm16_buf, 1, pcm16_len, fr);
-    fclose(fr);
-    unlink(wav_path);
-
-    int slot = -1;
-    const ai_backend_ops_t *ops = ai_backend_registry_find_inc("whisper_openai", &slot);
-    if (!ops || !ops->asr) {
-        llog(LOG_WARN, "ai", "whisper_openai backend not registered");
-        free(pcm16_buf);
-        return NULL;
-    }
-    char *text = NULL;
-    int rc = ops->asr(pcm16_buf, pcm16_len, 8000, &text, ops->ud);
-    ai_backend_registry_dec(slot);
-    free(pcm16_buf);
-    if (rc == NSBC_OK && text) return text;
-    return NULL;
-#else
-    /* mock：没 cURL —— 返回占位文本让后续 TTS 管道有数据 */
-    unlink(wav_path);
-    return strdup("(mock ASR) 我想查询账单");
-#endif
+    return NSBC_OK;
 }
 
-/* ================================================================== */
-/* LLM（chat completion）→ reply text                                   */
-/* ================================================================== */
-
-static char *do_llm(ai_cfg_t *cfg, const char *transcript)
+/* 第三方 AI 拉取用户语音 —— AI 内部统一 PCM16 LE 8kHz mono
+ *
+ * call_key:    b2b_call_t*
+ * out_buf:     调用方缓冲区（至少 out_max_len 字节）
+ * out_max_len: 最多读多少字节（建议 320 的整数倍 = 20ms PCM16 @ 8kHz）
+ * 返回：实际读取的字节数（0 = ring buffer 空 / 无 session / session 未启动）
+ *
+ * ring buffer 存 PCM16 LE 8kHz mono（由 ai_rec_feed 的 g711_alaw_decode 入队），
+ * 每 20ms 帧 = 160 samples = 320 bytes。NASR ASR 直接喂此 PCM16，
+ * 不再走 PCMA→PCM16 有损转换。 */
+size_t ai_get_rx_audio(void *call_key, uint8_t *out_buf, size_t out_max_len)
 {
-    if (!cfg->llm_enabled) return strdup(transcript); /* 没配 LLM —— transcript 直接当回复 */
-
-#ifdef HAVE_REAL_ASR_TTS
-    /* Phase R-14: 通过 ai_backend_registry 调用 openai_chat LLM */
-    int slot = -1;
-    const ai_backend_ops_t *ops = ai_backend_registry_find_inc("openai_chat", &slot);
-    if (!ops || !ops->llm) {
-        llog(LOG_WARN, "ai", "openai_chat backend not registered");
-        return strdup(transcript);
+    if (!call_key || !out_buf || out_max_len == 0) return 0;
+    pthread_mutex_lock(&g_ai.lock);
+    ai_session_t *s = NULL;
+    for (s = g_ai.head; s; s = s->next) {
+        if (s->call_key == call_key) break;
     }
-    char *reply = NULL;
-    int rc = ops->llm(transcript, &reply, ops->ud);
-    ai_backend_registry_dec(slot);
-    if (rc == NSBC_OK && reply) return reply;
-    return strdup(transcript);
-#else
-    return strdup(transcript);
-#endif
+    if (!s || !s->running) { pthread_mutex_unlock(&g_ai.lock); return 0; }
+
+    pthread_mutex_lock(&s->lock);
+    pthread_mutex_unlock(&g_ai.lock);   /* 避免死锁：g_ai.lock → s->lock 已按顺序 */
+
+    size_t n = 0;
+    while (n < out_max_len && s->r_head != s->r_tail) {
+        out_buf[n++] = s->ring[s->r_tail];
+        s->r_tail = (s->r_tail + 1) % AI_RING_CAP;
+    }
+    pthread_mutex_unlock(&s->lock);
+    return n;
 }
 
-/* ================================================================== */
-/* TTS → PCM16 raw → bridge_send_raw 注入                               */
-/* ================================================================== */
-
-#ifdef HAVE_REAL_ASR_TTS
-/* 简化 JSON escape（只转义 ElevenLabs POST body 里 text 可能含的字符） */
-static char *json_escape_simple(const char *s)
+/* 第三方 AI 推送回复音频给用户 —— REQ-AI-MEDIA-001 Pass-through
+ *
+ * call_key:  b2b_call_t*（不透明指针）
+ * data:      按 format 解释（见下）
+ * len:       字节数
+ * format:    音频格式标识
+ *   0 = PCMA 8kHz（legacy，经 transcode PCMA→in_codec）
+ *   1 =  PCM16 LE 8kHz mono（AI 内部统一格式，一次 encode 到 in_codec）
+ *   2 = PCMA 8kHz（legacy）
+ * 返回：NSBC_OK / NSBC_NOENT / NSBC_INVAL / NSBC_AGAIN
+ *
+ * AI 内部统一格式 = PCM16 LE 8kHz mono：
+ *   RX：ai_rec_feed → g711_alaw_decode → ring buffer 存 PCM16 → ai_get_rx_audio 拿 PCM16
+ *   TX：外部 AI agent 喂 PCM16 (format=1) → C 侧 codec.encode() 一次 → bridge_send_raw
+ * 为什么 PCM16？NASR ASR / NWAYTTS 都是 16bit 中间格式，PCMA 8bit 有损编码会直接降低识别精度。
+ * Go agent ai_agent_daemon 所有音频传递用 format=1，cross-codec encoding handled by C side codec layer. */
+int ai_send_tx_audio(void *call_key, const uint8_t *data, size_t len, int format)
 {
-    if (!s) return NULL;
-    size_t n = strlen(s);
-    /* 最坏：每个 UTF-8 字节变 \uXXXX（不过 ElevenLabs 只需要 \"\\\b\f\n\r\t 8 种）*/
-    char *out = (char *)malloc(n * 2 + 4);
-    if (!out) return NULL;
-    size_t j = 0;
-    for (size_t i = 0; i < n; ++i) {
-        unsigned char c = (unsigned char)s[i];
-        switch (c) {
-            case '"':  out[j++] = '\\'; out[j++] = '"';  break;
-            case '\\': out[j++] = '\\'; out[j++] = '\\'; break;
-            case '\n': out[j++] = '\\'; out[j++] = 'n';  break;
-            case '\r': out[j++] = '\\'; out[j++] = 'r';  break;
-            case '\t': out[j++] = '\\'; out[j++] = 't';  break;
-            case '\b': out[j++] = '\\'; out[j++] = 'b';  break;
-            case '\f': out[j++] = '\\'; out[j++] = 'f';  break;
-            default:   out[j++] = (char)c;                break;
+    if (!call_key || !data || len == 0) return NSBC_INVAL;
+
+    pthread_mutex_lock(&g_ai.lock);
+    ai_session_t *s = NULL;
+    for (s = g_ai.head; s; s = s->next) {
+        if (s->call_key == call_key) break;
+    }
+    if (!s) { pthread_mutex_unlock(&g_ai.lock); return NSBC_NOENT; }
+    pthread_mutex_unlock(&g_ai.lock);
+
+    /* 读 session 字段用 s->lock —— 与 ai_rec_feed 更新 in_codec/rx_tc/tx_tc 同一把锁，
+     * 避免 codec 重建（re-INVITE）与 TX 转码的并发竞态。 */
+    pthread_mutex_lock(&s->lock);
+    if (!s->running) { pthread_mutex_unlock(&s->lock); return NSBC_NOENT; }
+
+    codec_id_t in_codec = s->in_codec;
+    uint8_t   pt       = 8;  /* 默认 PCMA */
+    if (in_codec != CODEC_PCMA && in_codec != CODEC_NONE) {
+        const codec_ops_t *cops = codec_registry_find(in_codec);
+        if (cops && cops->default_pt >= 0) pt = (uint8_t)cops->default_pt;
+    }
+    transcode_sess_t *tx_tc       = s->tx_tc;
+    codec_sess_t     *tx_pcm16_enc = s->tx_pcm16_enc;
+    uint32_t  ssrc     = s->ssrc;
+    uint16_t *seq_ptr  = &s->seq;
+    uint32_t *ts_ptr   = &s->ts;
+    pthread_mutex_unlock(&s->lock);
+
+    /* format=1 (PCM16 raw) -> one-shot encode to in_codec, no intermediate PCMA loss
+     * format=0（PCMA）→ 走 transcode PCMA→in_codec（旧路径，兼容） */
+    const uint8_t *tx_data = data;
+    size_t tx_len = len;
+    uint8_t tc_buf[2048];
+
+    if (format == 1) {
+        /* --- format=1：PCM16 raw → in_codec（一次 encode）---
+         * Go agent NWAYTTS 合成的是 8kHz 16bit mono PCM16_LE，
+         * 我们跳过 Go 侧 PCM16→PCMA（8bit 有损编码），直接在 C 侧
+         * 用 G.711 encoder.encode() 一次编码到 in_codec。
+         * 对比原来两次编码（Go PCM16→PCMA + C PCMA→in_codec），
+         * 现在只编码 1 次 = 和用户说话链路同保真度。 */
+        const codec_ops_t *enc_ops = codec_registry_find(
+            in_codec != CODEC_NONE ? in_codec : CODEC_PCMA);
+        if (!enc_ops || !enc_ops->encode) return NSBC_NOENT;
+
+        /* 懒创建 encoder sess（欢迎语阶段 in_codec 可能还是默认 CODEC_PCMA）*/
+        codec_sess_t *enc = tx_pcm16_enc;
+        if (!enc) {
+            if (enc_ops->encoder_init) enc_ops->encoder_init(NULL, &enc);
+            else if (enc_ops->init)    enc_ops->init(NULL, &enc);
+            /* 赋值回 session（下次就懒不到了）*/
+            pthread_mutex_lock(&s->lock);
+            if (!s->tx_pcm16_enc) s->tx_pcm16_enc = enc;
+            pthread_mutex_unlock(&s->lock);
         }
-    }
-    out[j] = '\0';
-    return out;
-}
-#endif /* HAVE_REAL_ASR_TTS */
 
-static void do_tts_and_inject(ai_store_t *st, ai_session_t *s, const char *text)
-{
-    (void)st;
-    (void)s;
-    (void)text;
-#ifdef HAVE_REAL_ASR_TTS
-    if (!text || !text[0]) return;
+        /* dynamic sample rate from codec_ops->clock_rate instead of hardcoded 8000
+         * 硬编码 8kHz 会导致 G.722(16k) 等非 8k codec 半速快放 */
+        int codec_rate = enc_ops->clock_rate > 0 ? enc_ops->clock_rate : 8000;
+        int input_rate = 8000;  /* Go TTS 喂的固定 8kHz PCM16（format=1 约定）*/
 
-    /* Phase R-14: 通过 ai_backend_registry 调用 elevenlabs TTS
-     * wrapper 返回 malloc 的 PCM16 raw —— 下面 PCM16→PCMU + bridge 注入逻辑保持不变 */
-    int slot = -1;
-    const ai_backend_ops_t *ops = ai_backend_registry_find_inc("elevenlabs", &slot);
-    if (!ops || !ops->tts) {
-        llog(LOG_WARN, "ai", "elevenlabs backend not registered");
-        return;
-    }
-    char *pcm_out = NULL;
-    size_t pcm_len = 0;
-    int rc = ops->tts(text, 16000, &pcm_out, &pcm_len, ops->ud);
-    ai_backend_registry_dec(slot);
-    if (rc != NSBC_OK || !pcm_out || pcm_len == 0) {
-        llog(LOG_WARN, "ai", "elevenlabs ops->tts rc=%d", rc);
-        return;
-    }
-    llog(LOG_INFO, "ai", "TTS %zu bytes PCM16", pcm_len);
-
-    /* PCM16 raw → PCMU (bridge 注入用 leg=0 的 codec) */
-    size_t n_samples = pcm_len / 2;
-    const int16_t *pcm = (const int16_t *)pcm_out;
-    uint8_t *pcmu = (uint8_t *)malloc(n_samples);
-    if (!pcmu) { free(pcm_out); return; }
-    g711_pcm16_to_ulaw(pcm, pcmu, n_samples);
-
-    /* 20ms 帧注入：160 字节 PCMU × 8000Hz × 0.02s = 320 样本
-     * ENODEV 单次 retry：relay 刚创建时 peer 地址可能还没 comedia 学到
-     * （ICE / DTLS-SRTP setup 后才 latch），delay 50ms 再试一次；再失败丢帧。*/
-    size_t i = 0;
-    int enodev_seen = 0;
-    while (i + 160 <= n_samples) {
-        int n = bridge_send_raw(st->bridge, s->call_key, 0, /* 朝 A 腿注入 */
-                                pcmu + i, 160,
-                                st->cfg.target_pt,
-                                s->ssrc, &s->seq, &s->ts, 160);
-        if (n < 0) {
-            if (n == -ENODEV && !enodev_seen) {
-                /* 首次 ENODEV：一次 retry（50ms 媒体管线还在 settle）*/
-                enodev_seen = 1;
-                llog(LOG_INFO, "ai", "bridge_send_raw -ENODEV → retry after 50ms");
-                nanosleep(&(struct timespec){.tv_sec = 0, .tv_nsec = 50000000}, NULL);
-                continue; /* 同一帧重试 */
+        /* P3 defense: resample gap when codec_rate != 8000
+         * 当前 resample.c 只有骨架（resampler_process 返回 NOTSUP），
+         * 所以非 8kHz codec 的 TX 路径暂时不通 —— 打 WARN 提醒运维
+         * （RX 侧 codec_registry_find_pt 已修复 clock_rate 过滤，
+         * 16kHz static PT codec 会被 drop；动态 PT 需要 SDP rtpmap）*/
+        if (codec_rate != input_rate) {
+            static __thread int rate_mismatch_warned = 0;
+            if (!rate_mismatch_warned++) {
+                llog(LOG_WARN, "ai",
+                    "⚠️ TX path: input PCM16 rate=%d ≠ codec rate=%d (codec=%s) → "
+                    "resample skeleton NOTSUP, encode 可能歪音",
+                    input_rate, codec_rate, enc_ops->name);
             }
-            if (n == -ENODEV && enodev_seen) {
-                /* retry 仍失败：整条 TTS 注入链路终止，后续帧也不会成功 */
-                llog(LOG_WARN, "ai", "bridge_send_raw -ENODEV retry still fail → drop");
-                break;
-            }
-            llog(LOG_WARN, "ai", "bridge_send_raw rc=%d", n);
         }
-        enodev_seen = 0;
-        i += 160;
-    }
 
-    free(pcmu);
-    free(pcm_out);
-#else
-    /* mock：构造 3 帧静音 PCMU 注入 —— 证明 bridge_send_raw 通 */
-    static uint8_t silence[160];
-    memset(silence, 0x7F, sizeof(silence));
-    for (int j = 0; j < 3; ++j) {
-        bridge_send_raw(st->bridge, s->call_key, 0, silence, sizeof(silence),
-                        st->cfg.target_pt, s->ssrc, &s->seq, &s->ts, 160);
-    }
-#endif
-}
+        /* 按 codec ptime_ms + 真实 clock_rate 动态算帧长
+         * G.711 ptime=20ms, 8kHz → 160 samples → ts_inc=160
+         * G.722 ptime=20ms, 16kHz → 320 samples → ts_inc=320 */
+        int ptime_ms = enc_ops->ptime_ms > 0 ? enc_ops->ptime_ms : 20;
+        size_t samples_per_frame = (size_t)ptime_ms * (size_t)codec_rate / 1000;
+        size_t bytes_per_frame   = samples_per_frame * 2; /* 16bit → bytes */
+        uint32_t ts_inc = (uint32_t)ptime_ms * (uint32_t)codec_rate / 1000;
 
-/* ================================================================== */
-/* Phase R-14: 三个 ai_backend_ops wrapper —— 注册到 ai_backend_registry  */
-/* 每个 wrapper 内部复用 ai_dialog 已有的 HTTP + JSON parse 逻辑          */
-/* ================================================================== */
+        for (size_t off = 0; off < len; off += bytes_per_frame) {
+            size_t frame_bytes = (off + bytes_per_frame > len)
+                                 ? (len - off) : bytes_per_frame;
+            media_frame_t mf = {
+                .pcm      = (int16_t *)(data + off),
+                .samples  = frame_bytes / 2,
+                .rate     = codec_rate,   /*  动态采样率，不再硬编码 8000 */
+                .channels = 1,
+            };
+            size_t out_len = 0;
+            int rc = enc_ops->encode(enc, &mf, tc_buf, sizeof(tc_buf), &out_len);
+            if (rc != NSBC_OK || out_len == 0) continue;
 
-#ifdef HAVE_REAL_ASR_TTS
-
-/* ---- whisper_openai: asr ----
- * pcm_in 是 int16 PCM16 raw 字节流（sample_rate=8000，PCMU 转码产物）
- * wrapper 内部：pcm_in → 写 44 字节 WAV header + pcm_in → temp .wav
- * → ai_http_post_multipart → JSON parse .text → *text_out */
-static int whisper_openai_asr(const char *pcm_in, size_t pcm_len,
-                              int sample_rate, char **text_out, void *ud)
-{
-    ai_cfg_t *cfg = (ai_cfg_t *)ud;
-    if (!cfg || !pcm_in || pcm_len == 0 || !text_out) return NSBC_INVAL;
-
-    /* 1. mkstemp 临时 WAV 文件 */
-    char wav_path[] = "/tmp/nsbc-asr-XXXXXX.wav";
-    int fd = mkstemps(wav_path, 4); /* 后缀 ".wav" 共 4 字符 */
-    if (fd < 0) {
-        llog(LOG_WARN, "ai", "whisper_openai_asr: mkstemps failed");
-        return NSBC_ERR;
-    }
-    FILE *fout = fdopen(fd, "wb");
-    if (!fout) { close(fd); return NSBC_ERR; }
-
-    /* 2. 写 44 字节 WAV header（PCM16, mono, sample_rate 由调用方传）
-     *    fmt chunk 布局：
-     *      AudioFormat(2) | NumChannels(2) | SampleRate(4) | ByteRate(4) | BlockAlign(2) | BitsPerSample(2) */
-    int32_t sr32 = sample_rate;
-    int16_t bits  = 16;
-    int16_t chs   = 1;
-    int32_t byte_rate = sample_rate * 2;
-    int16_t block_align = 2;
-    int32_t data_len = (int32_t)pcm_len;
-    int32_t riff_len = data_len + 36;
-
-    fwrite("RIFF", 1, 4, fout);
-    fwrite(&riff_len, 4, 1, fout);
-    fwrite("WAVE", 1, 4, fout);
-    fwrite("fmt ", 1, 4, fout);
-    int32_t fmt_size = 16;
-    fwrite(&fmt_size, 4, 1, fout);
-    int16_t fmt_tag = 1; /* PCM */
-    fwrite(&fmt_tag, 2, 1, fout);
-    fwrite(&chs, 2, 1, fout);
-    fwrite(&sr32, 4, 1, fout);
-    fwrite(&byte_rate, 4, 1, fout);
-    fwrite(&block_align, 2, 1, fout);
-    fwrite(&bits, 2, 1, fout);
-    fwrite("data", 1, 4, fout);
-    fwrite(&data_len, 4, 1, fout);
-
-    /* 3. 写 PCM16 数据 + close */
-    fwrite(pcm_in, 1, pcm_len, fout);
-    fclose(fout);
-
-    /* 4. HTTP multipart POST */
-    ai_http_resp_t resp = {0};
-    char model_json[256];
-    snprintf(model_json, sizeof(model_json),
-             "{\"model\":\"%s\"}", cfg->asr_model[0] ? cfg->asr_model : "whisper-1");
-    int rc = ai_http_post_multipart(cfg->asr_endpoint, cfg->asr_api_key,
-                                    wav_path, model_json, &resp);
-    unlink(wav_path);
-
-    if (rc != NSBC_OK) {
-        llog(LOG_WARN, "ai", "whisper_openai_asr rc=%d HTTP %ld", rc, resp.http_code);
-        ai_http_resp_free(&resp);
-        return rc;
-    }
-
-    /* 5. JSON parse .text 字段（和 do_asr 里完全一样的解析逻辑）*/
-    const char *p = strstr(resp.memory, "\"text\"");
-    if (!p) { ai_http_resp_free(&resp); return NSBC_ERR; }
-    const char *q = strchr(p + 7, '"');
-    if (!q) { ai_http_resp_free(&resp); return NSBC_ERR; }
-    char *text = (char *)malloc((q - p - 7) + 1);
-    if (!text) { ai_http_resp_free(&resp); return NSBC_ERR; }
-    size_t ti = 0;
-    for (const char *c = p + 7; c < q; ++c) {
-        if (*c == '\\' && c + 1 < q && (c[1] == '"' || c[1] == '\\')) {
-            text[ti++] = c[1];
-            ++c;
-        } else {
-            text[ti++] = *c;
+            int n = bridge_send_raw(g_ai.bridge, call_key, 0,
+                                    tc_buf, out_len, pt, ssrc, seq_ptr, ts_ptr, ts_inc);
+            if (n < 0 && n == -ENODEV) return NSBC_AGAIN;
         }
+        return NSBC_OK;
     }
-    text[ti] = '\0';
-    ai_http_resp_free(&resp);
-    llog(LOG_INFO, "ai", "whisper_openai transcript: %s", text);
-    *text_out = text;
+
+    /* --- format=0：PCMA → in_codec（transcode 一次或直通）---
+     * 内部统一 PCMA，如果 in_codec == PCMA 则不转码直接注入 */
+    if (tx_tc) {
+        size_t out_len = 0;
+        int rc = transcode_process(tx_tc, data, len, tc_buf, sizeof(tc_buf), &out_len);
+        if (rc != NSBC_OK) {
+            if (rc == NSBC_AGAIN) return NSBC_OK;
+            return NSBC_NOENT;
+        }
+        if (out_len == 0) return NSBC_OK;
+        tx_data = tc_buf;
+        tx_len = out_len;
+    }
+
+    /* bridge_send_raw 签名：
+     *   int bridge_send_raw(bridge_mgr_t *m, void *call_key, int leg,
+     *                       const void *payload, size_t len, uint8_t pt,
+     *                       uint32_t ssrc, uint16_t *seq, uint32_t *ts, uint32_t ts_inc);
+     * 返回实际 send 字节数（含 RTP 头），<0 表示失败 */
+    int n = bridge_send_raw(g_ai.bridge, call_key, 0,
+                            tx_data, tx_len, pt, ssrc, seq_ptr, ts_ptr, 160);
+    if (n < 0) {
+        if (n == -ENODEV) return NSBC_AGAIN;
+        return NSBC_NOENT;
+    }
     return NSBC_OK;
 }
-
-static const ai_backend_ops_t whisper_openai_ops = {
-    .name = "whisper_openai",
-    .asr  = whisper_openai_asr,
-    .ud   = NULL,  /* init 时填 &g_ai.cfg */
-};
-
-/* ---- openai_chat: llm ---- */
-static int openai_chat_llm(const char *prompt, char **text_out, void *ud)
-{
-    ai_cfg_t *cfg = (ai_cfg_t *)ud;
-    if (!cfg || !prompt || !text_out) return NSBC_INVAL;
-    if (!cfg->llm_enabled) return NSBC_INVAL;
-
-    /* body 构造 + HTTP POST（和 do_llm 里完全一样的逻辑）*/
-    char body[8192];
-    snprintf(body, sizeof(body),
-        "{\"model\":\"%s\","
-        "\"messages\":["
-        "{\"role\":\"system\",\"content\":\"%s\"},"
-        "{\"role\":\"user\",\"content\":\"%s\"}"
-        "]}",
-        cfg->llm_model[0] ? cfg->llm_model : "gpt-4o-mini",
-        cfg->llm_system_prompt[0] ? cfg->llm_system_prompt : "你是一个友好的电话客服，简短回答。",
-        prompt);
-
-    ai_http_resp_t resp = {0};
-    int rc = ai_http_post_json(cfg->llm_endpoint, cfg->llm_api_key,
-                               body, strlen(body), &resp);
-    if (rc != NSBC_OK) {
-        llog(LOG_WARN, "ai", "openai_chat_llm rc=%d HTTP %ld", rc, resp.http_code);
-        ai_http_resp_free(&resp);
-        return rc;
-    }
-
-    /* JSON parse choices[0].message.content（和 do_llm 里完全一样）*/
-    const char *p = strstr(resp.memory, "\"content\"");
-    if (!p) { ai_http_resp_free(&resp); return NSBC_ERR; }
-    const char *q = strchr(p + 10, '"');
-    if (!q) { ai_http_resp_free(&resp); return NSBC_ERR; }
-    char *reply = (char *)malloc((q - p - 10) + 1);
-    if (!reply) { ai_http_resp_free(&resp); return NSBC_ERR; }
-    size_t ti = 0;
-    for (const char *c = p + 10; c < q; ++c) {
-        if (*c == '\\' && c + 1 < q && (c[1] == '"' || c[1] == '\\' || c[1] == 'n')) {
-            reply[ti++] = (c[1] == 'n') ? '\n' : c[1];
-            ++c;
-        } else {
-            reply[ti++] = *c;
-        }
-    }
-    reply[ti] = '\0';
-    ai_http_resp_free(&resp);
-    llog(LOG_INFO, "ai", "openai_chat reply: %s", reply);
-    *text_out = reply;
-    return NSBC_OK;
-}
-
-static const ai_backend_ops_t openai_chat_ops = {
-    .name = "openai_chat",
-    .llm  = openai_chat_llm,
-    .ud   = NULL,
-};
-
-/* ---- elevenlabs: tts ---- */
-static int elevenlabs_tts(const char *text, int sample_rate,
-                          char **pcm_out, size_t *pcm_len, void *ud)
-{
-    ai_cfg_t *cfg = (ai_cfg_t *)ud;
-    if (!cfg || !text || !text[0] || !pcm_out || !pcm_len) return NSBC_INVAL;
-
-    /* 和 do_tts_and_inject 里完全一样的 ElevenLabs POST 逻辑 */
-    char url[512];
-    snprintf(url, sizeof(url), "%s/%s?output_format=pcm_16000",
-             cfg->tts_endpoint, cfg->tts_voice_id);
-
-    char *escaped = json_escape_simple(text);
-    if (!escaped) {
-        llog(LOG_WARN, "ai", "elevenlabs_tts json_escape failed");
-        return NSBC_ERR;
-    }
-    char body[4096];
-    snprintf(body, sizeof(body),
-             "{\"text\":\"%s\",\"model_id\":\"eleven_monolingual_v1\"}", escaped);
-    free(escaped);
-
-    ai_http_resp_t resp = {0};
-    int rc = ai_http_post_json(url, cfg->tts_api_key, body, strlen(body), &resp);
-    if (rc != NSBC_OK || resp.size == 0) {
-        llog(LOG_WARN, "ai", "elevenlabs_tts rc=%d HTTP %ld size=%zu",
-             rc, resp.http_code, resp.size);
-        ai_http_resp_free(&resp);
-        return NSBC_ERR;
-    }
-
-    /* resp.memory 就是 PCM16 raw —— malloc 拷贝给调用方 */
-    *pcm_out = (char *)malloc(resp.size);
-    if (!*pcm_out) { ai_http_resp_free(&resp); return NSBC_ERR; }
-    memcpy(*pcm_out, resp.memory, resp.size);
-    *pcm_len = resp.size;
-    ai_http_resp_free(&resp);
-    llog(LOG_INFO, "ai", "elevenlabs_tts %zu bytes PCM16", resp.size);
-    return NSBC_OK;
-}
-
-static const ai_backend_ops_t elevenlabs_ops = {
-    .name = "elevenlabs",
-    .tts  = elevenlabs_tts,
-    .ud   = NULL,
-};
-
-#endif /* HAVE_REAL_ASR_TTS */
 
 /* ================================================================== */
 /* per-call 处理线程 stub（pthread_create 只收一个 (void*)）              */
@@ -669,90 +622,54 @@ static void *ai_session_thread_stub(void *arg)
 {
     ai_session_t *s = (ai_session_t *)arg;
     ai_store_t *st = &g_ai;
-    llog(LOG_INFO, "ai", "thread start call=%p target_pt=%d chunk_bytes=%d",
-         s->call_key, st->cfg.target_pt, s->chunk_bytes_target);
-
-    uint8_t pcmu_chunk[4096]; /* 4KB ≈ 512ms @ 8k */
-    FILE *chunk_fp = NULL;
-    int chunk_written = 0;
+    llog(LOG_INFO, "ai", "thread start call=%p", s->call_key);
 
     while (s->running) {
-        /* 如果还没被 dp "ai" app 显式启用（enabled=0），只等 enable 或 exit；
-         * ring buffer 继续被全局 hook 写着，但 thread 空转不做 ASR/TTS */
-        if (!s->enabled) {
-            nanosleep(&(struct timespec){.tv_sec = 0, .tv_nsec = 20000000}, NULL);
-            continue;
-        }
-
-        /* 从 ring buffer 凑 chunk_bytes_target 字节 */
-        int did_something = 0;
+        /* transfer 触发（移到最前，producer 与任何模式都能触发，修复原 bug）*/
         pthread_mutex_lock(&s->lock);
-        while (chunk_written < s->chunk_bytes_target) {
-            size_t avail = (s->r_head >= s->r_tail)
-                ? (s->r_head - s->r_tail)
-                : (AI_RING_CAP - s->r_tail + s->r_head);
-            if (avail == 0) break;
-            size_t take = avail < sizeof(pcmu_chunk) ? avail : sizeof(pcmu_chunk);
-            size_t i = 0;
-            while (i < take && s->r_tail < AI_RING_CAP) {
-                pcmu_chunk[i++] = s->ring[s->r_tail++];
-                if (s->r_tail >= AI_RING_CAP) s->r_tail = 0;
-            }
-            while (i < take) { pcmu_chunk[i++] = s->ring[s->r_tail++]; }
+        if (s->transfer_pending && s->transfer_dest[0]) {
+            char dest[256];
+            snprintf(dest, sizeof(dest), "%s", s->transfer_dest);
+            s->transfer_pending = 0;
+            pthread_mutex_unlock(&s->lock);
 
-            if (!chunk_fp) {
-                if (s->n_chunks >= AI_MAX_CHUNKS) {
-                    /* 清太老的 chunk 文件 */
-                    for (int k = 0; k < s->n_chunks; ++k)
-                        unlink(s->chunk_paths[k]);
-                    s->n_chunks = 0;
-                }
-                snprintf(s->chunk_paths[s->n_chunks], sizeof(s->chunk_paths[0]),
-                         "/tmp/ai_chunk_%p_%d.pcm", s->call_key, s->n_chunks);
-                chunk_fp = fopen(s->chunk_paths[s->n_chunks], "wb");
-                chunk_written = 0;
-            }
-            fwrite(pcmu_chunk, 1, take, chunk_fp);
-            chunk_written += (int)take;
-            did_something = 1;
+            llog(LOG_INFO, "ai", "ai_session transfer trigger call=%p dest=%s",
+                 s->call_key, dest);
+            int trc = b2b_transfer_call((b2b_call_t *)s->call_key,
+                                        -1, dest,
+                                        CCF_XFER_BLIND, NULL, NULL);
+            llog(trc == NSBC_OK ? LOG_INFO : LOG_WARN, "ai",
+                 "ai_session transfer rc=%d call=%p dest=%s", trc, s->call_key, dest);
+
+            s->running = 0;
+            break;
         }
         pthread_mutex_unlock(&s->lock);
-
-        if (!did_something) {
-            nanosleep(&(struct timespec){.tv_sec = 0, .tv_nsec = 10000000}, NULL); /* 10ms */
-            continue;
-        }
-
-        if (chunk_written >= s->chunk_bytes_target) {
-            fclose(chunk_fp);
-            chunk_fp = NULL;
-            s->n_chunks++;
-
-            /* === 三阶段管道 === */
-            char *transcript = do_asr(&st->cfg, s->chunk_paths[s->n_chunks - 1], chunk_written);
-            if (transcript && transcript[0]) {
-                char *reply = do_llm(&st->cfg, transcript);
-                if (reply && reply[0])
-                    do_tts_and_inject(st, s, reply);
-                free(reply);
-            }
-            free(transcript);
-            chunk_written = 0;
-        }
+        nanosleep((const struct timespec[]){{0, 20 * 1000 * 1000}}, NULL);
     }
+
+    /* ★ transfer 或其他原因退出线程前，必须先停 producer → 停 VAD 引擎 + 通知 ai_agent。
+     * VAD 是独立注册在媒体桥的回调，session free 不会自动停它，
+     * 会继续把音频转发给 ai_agent → 出现几百条 "grace DONE" 刷屏。 */
+    llog(LOG_INFO, "ai", "thread exit cleanup call=%p (producer→0, vad_stop)", s->call_key);
+    ai_set_producer(s->call_key, 0);
 
     /* 线程退出清理 */
     pthread_mutex_lock(&st->lock);
     pthread_mutex_lock(&s->lock);
-    /* 从链表摘除 */
     ai_session_t **pp = &st->head;
     while (*pp && *pp != s) pp = &(*pp)->next;
     if (*pp) *pp = s->next;
     pthread_mutex_unlock(&s->lock);
     pthread_mutex_unlock(&st->lock);
 
-    /* 清理 chunk 文件 */
-    for (int k = 0; k < s->n_chunks; ++k) unlink(s->chunk_paths[k]);
+    if (s->rx_tc) { transcode_close(s->rx_tc); s->rx_tc = NULL; }
+    if (s->tx_tc) { transcode_close(s->tx_tc); s->tx_tc = NULL; }
+    if (s->tx_pcm16_enc) {
+        const codec_ops_t *ops = codec_registry_find(s->in_codec != CODEC_NONE ? s->in_codec : CODEC_PCMA);
+        if (ops && ops->fini) ops->fini(s->tx_pcm16_enc);
+        s->tx_pcm16_enc = NULL;
+    }
 
     llog(LOG_INFO, "ai", "thread exit call=%p", s->call_key);
     pthread_mutex_destroy(&s->lock);
@@ -761,7 +678,7 @@ static void *ai_session_thread_stub(void *arg)
 }
 
 /* P0-1: b2b_call_destroy 回调 —— 主动关 per-call session 线程
- * 在 call_destroy 末尾（mem_obj_release 之前）调，必须尽快返回（禁阻塞）。
+ * 在 call_destroy 末尾（mem_obj_release 之前）调，must return quickly (no blocking).
  * 这里只做 running=0 + 异步 pthread_join（timeout 1s，超时 log 但不阻塞 call_destroy）。
  * 线程退出时会从链表摘除 session 并 free。*/
 static void ai_on_call_destroy(void *call_key, int a_final, void *ud)
@@ -780,26 +697,95 @@ static void ai_on_call_destroy(void *call_key, int a_final, void *ud)
     llog(LOG_INFO, "ai", "call_destroy call=%p a_final=%d → stop session",
          call_key, a_final);
 
+    /* emit AI_SESSION_CLOSED via uds_send_session (same 'session' topic path as OPENED) */
+    {
+        b2b_call_t *b2b = (b2b_call_t *)call_key;
+        const char *cid = (b2b && b2b->leg[0].callid[0])
+                          ? b2b->leg[0].callid : "unknown";
+        char sess[256];
+        snprintf(sess, sizeof(sess),
+            "{\"event\":\"ai_session_closed\",\"call_id\":\"%s\",\"a_final\":%d}",
+            cid, a_final);
+        uds_send_session(sess);
+    }
+
     /* 告诉线程该退出了 */
     victim->running = 0;
 
-    /* 最多等 1s pthread_join —— ai_session_thread_stub 里 nanosleep 10ms，
-     * 最慢 1s 内会响应 running=0 */
-    struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+    /* 最多等 10s pthread_join —— transfer 触发 + 线程清理可能耗时，
+     * 加长到 10s 避免 call_destroy 还没等完 AI 请求就释放 call 对象。
+     *  pthread_timedjoin_np 的 timespec 是**绝对时间**（CLOCK_REALTIME），
+     * old code wrote {10,0} = year 1970, immediate timeout -> call_destroy releases call early
+     * 对象，空转线程随后解引用已释放内存（延时崩溃/段错误）。 */
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += 10;
     if (pthread_timedjoin_np(victim->th, NULL, &ts) != 0) {
-        llog(LOG_WARN, "ai", "call_destroy join timeout — thread may still run (leak)");
+        llog(LOG_WARN, "ai", "call_destroy join timeout (10s) — thread may still run (leak)");
     }
     /* 线程自己会 free session —— 如果 join 成功线程退出时已经 free 了；
      * 如果 timeout，我们在这里兜底 free（但要先从链表摘——可能线程也在 free，
      * 简单起见 timeout 时不 free，让进程退出时 fini 统一清）*/
 }
 
+/* ================================================================== */
+/* public API — request AI session blind transfer to agent           */
+/* ================================================================== */
+
+/* 外部（OAM CLI / LLM function call / Webhook / IVR）可调用此 API
+ * 让 AI session 在下次 ASR→LLM→TTS 管道跑完后（或立即如果管道空闲）
+ * 调 b2b_transfer_call(call, -1, dest, CCF_XFER_BLIND) 发 REFER。
+ *
+ * 非阻塞：只设 session->transfer_dest + transfer_pending=1，
+ * 实际 transfer 由 ai_session_thread 自己做（避免跨线程碰 b2b_call_t）。
+ *
+ * 返回：NSBC_OK=设置成功；NSBC_NOENT=call_key 没 session；NSBC_INVAL=dest 非法 */
+int ai_request_transfer(void *call_key, const char *dest)
+{
+    if (!call_key || !dest || !dest[0]) return NSBC_INVAL;
+    size_t dl = strlen(dest);
+    if (dl > 256) return NSBC_INVAL;
+    for (size_t i = 0; i < dl; ++i) {
+        unsigned char ch = (unsigned char)dest[i];
+        if (ch < 0x21 || ch > 0x7e) return NSBC_INVAL; /* 白名单校验 */
+    }
+
+    pthread_mutex_lock(&g_ai.lock);
+    ai_session_t *s = NULL;
+    for (s = g_ai.head; s; s = s->next) {
+        if (s->call_key == call_key) break;
+    }
+    if (!s) {
+        pthread_mutex_unlock(&g_ai.lock);
+        llog(LOG_WARN, "ai", "ai_request_transfer: no session for call=%p", call_key);
+        return NSBC_NOENT;
+    }
+
+    /* dest 格式兜底：如果只给了分机号（如 "1001"），补成 SIP URI。
+     * 含 "sip:" 前缀或 "@" 视为已完整。domain 优先用 call 的 orig_host（b2b_call 里有），
+     * 拿不到就用默认 "nsbc.local"。 */
+    char full_dest[300];
+    if (strstr(dest, "sip:") || strchr(dest, '@')) {
+        snprintf(full_dest, sizeof(full_dest), "%s", dest);
+    } else {
+        snprintf(full_dest, sizeof(full_dest), "sip:%s@nsbc.local", dest);
+    }
+
+    pthread_mutex_lock(&s->lock);
+    snprintf(s->transfer_dest, sizeof(s->transfer_dest), "%s", full_dest);
+    s->transfer_pending = 1;
+    pthread_mutex_unlock(&s->lock);
+    pthread_mutex_unlock(&g_ai.lock);
+    llog(LOG_INFO, "ai", "ai_request_transfer call=%p dest=%s", call_key, full_dest);
+    llog(LOG_INFO, "ai", "ai_request_transfer call=%p dest=%s (pending)", call_key, dest);
+    return NSBC_OK;
+}
+
+/* ================================================================== */
 /* P0-2: dp app "ai" 执行 —— 在 INVITE resolve 命中 dialplan ai app_chain 时调
  * 创建 per-call ai_session（早于 ai_rec_feed 全局 hook 创建的时间点）。
- * 立即返回 APP_RC_OK（per-call 线程异步处理媒体 → ASR → LLM → TTS 注入，
- * 不阻塞 dialplan 执行器）。
- * 如果全局 hook 已经先启了 session（enabled=0），这里置 enabled=1 →
- * thread 检测 enabled=1 后才真正启动 ASR/TTS 管道（之前只攒 ring buffer）。*/
+ * 立即返回 APP_RC_OK（per-call 线程异步处理媒体桥接：抓流/转码/注入/转人工，
+ * 不阻塞 dialplan 执行器）。session 由 dp "ai" app 创建即启用。*/
 static app_rc_t ai_app_exec(app_ctx_t *c, const char *data, void *ud)
 {
     (void)data;
@@ -812,14 +798,15 @@ static app_rc_t ai_app_exec(app_ctx_t *c, const char *data, void *ud)
     for (s = st->head; s; s = s->next) {
         if (s->call_key == c->call_key) break;
     }
-    if (s) {
-        if (!s->enabled) {
-            s->enabled = 1;
-            llog(LOG_INFO, "ai", "dp ai: existing session call=%p → enabled=1", c->call_key);
-        }
-    } else {
+    if (!s) {
         pthread_mutex_unlock(&st->lock);
-        s = ai_session_find_or_create(st, c->call_key, 0, "dp_ai");
+        /* ★ 修复 payload 误判：pt_in 不能硬编码 0（PCMU）。
+         * 从 A 腿 SDP offer 解析真实 codec PT（microsip 配 PCMA 时 = 8），
+         * AI_SESSION_OPENED 事件带正确的 pt_in/in_codec，Go agent 才能正确编码 TX 音频。 */
+        int real_pt = ai_first_audio_pt((b2b_call_t *)c->call_key);
+        llog(LOG_INFO, "ai", "ai_app_exec: A-leg offer first audio pt=%d (was hardcoded 0)",
+             real_pt);
+        s = ai_session_find_or_create(st, c->call_key, real_pt, "dp_ai");
         if (!s) {
             llog(LOG_WARN, "ai", "ai_app_exec: session create failed");
             return APP_RC_FAILED;
@@ -828,8 +815,8 @@ static app_rc_t ai_app_exec(app_ctx_t *c, const char *data, void *ud)
     }
     pthread_mutex_unlock(&st->lock);
 
-    llog(LOG_INFO, "ai", "dp ai app fired call=%p target=%s enabled=%d",
-         c->call_key, c->dp_target ? c->dp_target : "", s->enabled);
+    llog(LOG_INFO, "ai", "dp ai app fired call=%p target=%s",
+         c->call_key, c->dp_target ? c->dp_target : "");
     return APP_RC_OK;
 }
 
@@ -843,49 +830,22 @@ static int ai_init(struct nsbc_ctx *ctx)
     pthread_mutex_init(&g_ai.lock, NULL);
     g_cfg_ptr = ctx->cfg;
 
-    /* 读配置（cfg_get_int 第3参数是 long *，第4参数是 cfg_layer_t * 或 NULL）*/
-    g_ai.cfg.enabled   = 0;      /* 默认禁用 */
-    g_ai.cfg.target_pt = 0;      /* 默认 PCMU */
-    g_ai.cfg.chunk_ms  = 2000;   /* 默认 2s ASR chunk */
-    g_ai.cfg.llm_enabled = 0;
+    /* 读配置 —— cfg_get_int 第3参数 long*, 第4参数 cfg_layer_t* 或 NULL
+     * 默认值 1 作 fallback；cfg_get_int 成功（返回 0）则用 yaml 值覆盖。
+     * 带 layer 诊断：如果被更高优先级层 overlay，log 会揭示来源。*/
+    g_ai.cfg.enabled   = 1;      /* 默认启用 */
 
     long tmp = 0;
-    if (cfg_get_int(g_cfg_ptr, "ai_dialog.enabled",   &tmp, NULL) == 0) g_ai.cfg.enabled = (int)tmp;
-    tmp = g_ai.cfg.target_pt;
-    if (cfg_get_int(g_cfg_ptr, "ai_dialog.target_pt", &tmp, NULL) == 0) g_ai.cfg.target_pt = (int)tmp;
-    tmp = g_ai.cfg.chunk_ms;
-    if (cfg_get_int(g_cfg_ptr, "ai_dialog.chunk_ms",  &tmp, NULL) == 0) g_ai.cfg.chunk_ms = (int)tmp;
-
-    cfg_str("ai_dialog.asr.endpoint",  g_ai.cfg.asr_endpoint,  sizeof(g_ai.cfg.asr_endpoint),
-            "https://api.openai.com/v1/audio/transcriptions");
-    cfg_str("ai_dialog.asr.api_key",   g_ai.cfg.asr_api_key,   sizeof(g_ai.cfg.asr_api_key), "");
-    cfg_str("ai_dialog.asr.model",     g_ai.cfg.asr_model,     sizeof(g_ai.cfg.asr_model), "whisper-1");
-    cfg_str("ai_dialog.asr.language",  g_ai.cfg.asr_language,  sizeof(g_ai.cfg.asr_language), "");
-
-    cfg_str("ai_dialog.llm.endpoint",  g_ai.cfg.llm_endpoint,  sizeof(g_ai.cfg.llm_endpoint),
-            "https://api.openai.com/v1/chat/completions");
-    cfg_str("ai_dialog.llm.api_key",   g_ai.cfg.llm_api_key,   sizeof(g_ai.cfg.llm_api_key), "");
-    cfg_str("ai_dialog.llm.model",     g_ai.cfg.llm_model,     sizeof(g_ai.cfg.llm_model), "gpt-4o-mini");
-    cfg_str("ai_dialog.llm.system_prompt", g_ai.cfg.llm_system_prompt, sizeof(g_ai.cfg.llm_system_prompt),
-            "你是一个友好的电话客服，简短回答。");
-    tmp = g_ai.cfg.llm_enabled;
-    if (cfg_get_int(g_cfg_ptr, "ai_dialog.llm.enabled", &tmp, NULL) == 0) g_ai.cfg.llm_enabled = (int)tmp;
-
-    cfg_str("ai_dialog.tts.endpoint",  g_ai.cfg.tts_endpoint,  sizeof(g_ai.cfg.tts_endpoint),
-            "https://api.elevenlabs.io/v1/text-to-speech");
-    cfg_str("ai_dialog.tts.api_key",   g_ai.cfg.tts_api_key,   sizeof(g_ai.cfg.tts_api_key), "");
-    cfg_str("ai_dialog.tts.voice_id",  g_ai.cfg.tts_voice_id,  sizeof(g_ai.cfg.tts_voice_id),
-            "21m00Tcm4TlvDq8ikWAM");
-
-#ifdef HAVE_REAL_ASR_TTS
-    llog(LOG_INFO, "ai", "ai_dialog enabled=%d target_pt=%d chunk_ms=%d llm=%s",
-         g_ai.cfg.enabled, g_ai.cfg.target_pt, g_ai.cfg.chunk_ms,
-         g_ai.cfg.llm_enabled ? "on" : "off(mode=passthrough)");
-    llog(LOG_INFO, "ai", "ASR endpoint=%s model=%s", g_ai.cfg.asr_endpoint, g_ai.cfg.asr_model);
-    llog(LOG_INFO, "ai", "TTS endpoint=%s voice=%s", g_ai.cfg.tts_endpoint, g_ai.cfg.tts_voice_id);
-#else
-    llog(LOG_INFO, "ai", "ai_dialog enabled=%d [mock mode — no libcurl at build time]", g_ai.cfg.enabled);
-#endif
+    cfg_layer_t got_layer = CFG_L__COUNT;
+    int rc = cfg_get_int(g_cfg_ptr, "ai_dialog.enabled", &tmp, &got_layer);
+    if (rc == 0) {
+        g_ai.cfg.enabled = (int)tmp;
+        llog(LOG_INFO, "ai", "cfg_get_int ai_dialog.enabled=%ld (layer=%s, rc=%d)",
+             tmp, cfg_layer_name(got_layer), rc);
+    } else {
+        llog(LOG_WARN, "ai", "cfg_get_int ai_dialog.enabled: rc=%d → keep default %d",
+             rc, g_ai.cfg.enabled);
+    }
 
     if (!g_ai.cfg.enabled) {
         llog(LOG_INFO, "ai", "disabled by config");
@@ -914,7 +874,7 @@ static int ai_init(struct nsbc_ctx *ctx)
     if (reg) {
         app_desc_t ai_desc = {
             .name = "ai",
-            .help = "启动 AI 对话 session（捕获 B 腿语音 → ASR → LLM → TTS → 注入 A 腿）",
+            .help = "启动 AI 对话 session（纯媒体桥接：抓流/转码/注入/转人工）",
             .fn   = ai_app_exec,
             .ud   = &g_ai,
         };
@@ -931,26 +891,22 @@ static int ai_init(struct nsbc_ctx *ctx)
     llog(hrc == NSBC_OK ? LOG_INFO : LOG_WARN, "ai",
          "b2b_call_destroy_add rc=%d", hrc);
 
-    /* cURL global init —— 进程一次就行（ai_http.c 每次 curl_easy_init 前也会 init，但
-     * 进程级 init 更规范，SSL/全局锁等一次初始化好） */
-#ifdef HAVE_REAL_ASR_TTS
-    curl_global_init(CURL_GLOBAL_DEFAULT);
-
-    /* Phase R-14: 注册内置 AI backend ops —— ai_dialog 自己封装 whisper/openai/elevenlabs */
+    /* register pass-through public API function pointers
+     *
+     * 为什么需要：ai_dialog 编译成 mod_ai_dialog.so，主二进制链接器看不到 .so 里的符号。
+     * 主二进制的 ai_backend_registry.c 里有 wrapper ai_set_producer/ai_get_rx_audio/
+     * ai_send_tx_audio/ai_request_transfer，内部通过这里注册的函数指针转发。 */
     {
-        ai_backend_ops_t *wr = (ai_backend_ops_t *)&whisper_openai_ops;
-        wr->ud = &g_ai.cfg;
-        ai_backend_registry_register(wr);
-
-        ai_backend_ops_t *cr = (ai_backend_ops_t *)&openai_chat_ops;
-        cr->ud = &g_ai.cfg;
-        ai_backend_registry_register(cr);
-
-        ai_backend_ops_t *el = (ai_backend_ops_t *)&elevenlabs_ops;
-        el->ud = &g_ai.cfg;
-        ai_backend_registry_register(el);
+        ai_passthrough_fns_t fns = {
+            .set_producer     = ai_set_producer,
+            .get_rx_audio     = ai_get_rx_audio,
+            .send_tx_audio    = ai_send_tx_audio,
+            .request_transfer = ai_request_transfer,
+        };
+        int prc = ai_passthrough_register_fns(&fns);
+        llog(prc == NSBC_OK ? LOG_INFO : LOG_WARN, "ai",
+             "passthrough_register rc=%d", prc);
     }
-#endif
 
     return NSBC_OK;
 }
@@ -959,6 +915,9 @@ static void ai_fini(struct nsbc_ctx *ctx)
 {
     (void)ctx;
     llog(LOG_INFO, "ai", "ai_dialog fini");
+
+    /* unregister passthrough fns first to avoid late calls during fini*/
+    ai_passthrough_unregister();
 
     /* P0-1: 卸载 call_destroy hook */
     b2b_call_destroy_rm(ai_on_call_destroy, &g_ai);
@@ -984,17 +943,13 @@ static void ai_fini(struct nsbc_ctx *ctx)
     pthread_mutex_unlock(&g_ai.lock);
     pthread_mutex_destroy(&g_ai.lock);
 
-#ifdef HAVE_REAL_ASR_TTS
-    curl_global_cleanup();
-#endif
-
     memset(&g_ai, 0, sizeof(g_ai));
 }
 
 /* deps：signaling 必须先 init（桥接层） */
 static const char *ai_deps[] = { "signaling", NULL };
 
-NSBC_MOD_CAT(ai_dialog, 1, MOD_L_WORKER_READY, 0, MOD_CAT_AI, ai_deps, ai_init, NULL, NULL, ai_fini);
+NSBC_MOD_CAT(ai_dialog, 1, MOD_L_FINAL, 0, MOD_CAT_AI, ai_deps, ai_init, NULL, NULL, ai_fini);
 
 /*
     Author:       李浩 (Li Hao)

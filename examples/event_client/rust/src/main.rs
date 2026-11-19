@@ -29,6 +29,9 @@ struct Args {
     caller_id:   Option<String>,
     caller_name: Option<String>,
     timeout:     Option<i64>,
+    /* REQ-DP-TIMEOUT-001 */
+    sched_hangup:            Option<i64>,
+    originate_call_timeout:  Option<i64>,
     video:       bool,
     audio:       bool,
     api_token:   Option<String>,
@@ -53,6 +56,8 @@ fn parse_args() -> Args {
         caller_id:   None,
         caller_name: None,
         timeout:     None,
+        sched_hangup:            None,
+        originate_call_timeout:  None,
         video:       true,
         audio:       true,
         api_token:   None,
@@ -77,6 +82,8 @@ fn parse_args() -> Args {
             "--caller-id"   => { a.caller_id = it.next(); }
             "--caller-name" => { a.caller_name = it.next(); }
             "--timeout"     => { a.timeout = it.next().and_then(|s| s.parse().ok()); }
+            "--sched-hangup"  => { a.sched_hangup = it.next().and_then(|s| s.parse().ok()); }
+            "--originate-call-timeout" => { a.originate_call_timeout = it.next().and_then(|s| s.parse().ok()); }
             "--video"       => { a.video = true; }
             "--no-video"    => { a.video = false; }
             "--audio"       => { a.audio = true; }
@@ -179,6 +186,8 @@ fn build_opts(args: &Args) -> OriginateOpts<'_> {
     if let Some(id) = &args.caller_id   { o.caller_id   = Some(id.as_str()); }
     if let Some(nm) = &args.caller_name { o.caller_name = Some(nm.as_str()); }
     o.timeout = args.timeout;
+    o.sched_hangup = args.sched_hangup;
+    o.originate_call_timeout = args.originate_call_timeout;
     if args.audio { o.audio = Some(vec!["PCMU","PCMA","G722","OPUS"]); }
     if args.video { o.video = Some(vec!["H264","VP8"]); }
     o

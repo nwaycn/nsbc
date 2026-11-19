@@ -1,8 +1,12 @@
 //! NSBC UDS Data Service — C core→Web direction UDS Server (REQ-DATA-SVC-002 P0, unified
 //! frame protocol).
 //!
-//! Transport: 2 × AF_UNIX SOCK_DGRAM (Linux reliable datagram, no fragmentation, one
-//! datagram = one frame — natural message boundary, no half-frame reassembly needed).
+//! NOTE: This module is a **reserved framework** — all frame constants, FragState,
+//! build/decode helpers, and dispatch stubs are prepared for P0 but not yet wired
+//! into production. `#[allow(dead_code)]` is intentional; the code IS compiled and
+//! type-checked, just not invoked yet.
+#![allow(dead_code)]
+#![allow(unused_imports)]
 //!
 //!   data_push.sock — C→Rust only, carries FT_DATA_PUSH (CDR/register/runtime/audit/
 //!                    session/vad/billing_settle). Fire-and-forget — NO ACK back.

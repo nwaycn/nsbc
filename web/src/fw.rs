@@ -32,10 +32,12 @@ pub const NFT_CHAIN: &str = "inet nsbc_ban input";
 pub const NFT_SET_V4: &str = "inet nsbc_ban banned_ips";
 pub const NFT_SET_V6: &str = "inet nsbc_ban banned_ips6";
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub enum FwError {
     NftMissing(String),
     NftFailed { cmd: String, stderr: String },
+    #[allow(dead_code)]
     Parse(String),
     Core(CoreError),
 }

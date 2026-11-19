@@ -52,6 +52,31 @@ static inline route_table_t *b2b_rt(b2b_core_t *co)
     return ctx ? ctx->rt : NULL;
 }
 
+/* JSON 字符串转义：只处理会破坏 JSON 的字符（" \ \\ 和 <0x20 控制字符）。
+ * uds_push → nsbc-web submit_session 用 cJSON_Parse 解析 payload；
+ * 未转义的 From 头（如 "1006" <sip:...>）会让 parse 失败 → payload 退化成
+ * 字符串 → web 报 "missing call_id"，SSE 订阅端收不到 CALL_ANSWERED。 */
+static void b2b_json_esc(const char *in, char *out, size_t outsz)
+{
+    size_t j = 0;
+    if (!out || outsz == 0) return;
+    if (!in) in = "";
+    for (size_t i = 0; in[i] && j + 2 < outsz; i++) {
+        unsigned char ch = (unsigned char)in[i];
+        switch (ch) {
+        case '"':  out[j++] = '\\'; out[j++] = '"';  break;
+        case '\\': out[j++] = '\\'; out[j++] = '\\'; break;
+        case '\n': out[j++] = '\\'; out[j++] = 'n';  break;
+        case '\r': out[j++] = '\\'; out[j++] = 'r';  break;
+        case '\t': out[j++] = '\\'; out[j++] = 't';  break;
+        default:
+            if (ch < 0x20) break; /* 丢弃其他控制字符 */
+            out[j++] = (char)ch;
+        }
+    }
+    out[j] = '\0';
+}
+
 /* ---------- reactor 线程内 local port 传递 ----------
  * transport rx callback（b2b_on_rx）拿到入向 local 端口，但 handle_new_invite
  * 在 txn_server_input 更深层调用，签名没有 local 参数。用 __thread 临时变量
@@ -114,6 +139,13 @@ static pthread_mutex_t g_mv_hook_lock = PTHREAD_MUTEX_INITIALIZER;
 /* b2b_leg_t / call_link_t / struct b2b_call 已在 b2bua.h 完整定义 */
 
 static void disarm_noanswer_timer(b2b_call_t *c); /* 前置声明 */
+static void arm_call_limit_timer(b2b_call_t *c);
+static void disarm_call_limit_timer(b2b_call_t *c);
+/* REQ-DP-TIMEOUT-001：sched_hangup timer 三函数 + 决策链 */
+static void arm_sched_hangup_timer(b2b_call_t *c);
+static void disarm_sched_hangup_timer(b2b_call_t *c);
+static void sched_hangup_expire_cb(uint64_t cb_now, void *arg);
+static void call_limit_expire_cb(uint64_t cb_now, void *arg);
 static void b2b_emit_cdr(b2b_call_t *c, cdr_phase_t phase);
 
 /* nsbc_sa_t → 纯 IP 字符串（无端口；nsbc_sa_fmt 带 ":port" 不能喂 CIDR 匹配）。
@@ -496,6 +528,8 @@ static void call_ctor(void *obj, void *ud)
     b2b_call_t *c = obj;
     pthread_mutex_init(&c->lock, NULL);
     tw_node_init(&c->noanswer_node);
+    tw_node_init(&c->call_limit_node);
+    tw_node_init(&c->sched_hangup_node);
     c->prof = NULL;
     c->out_prof = NULL;
 }
@@ -1030,6 +1064,8 @@ static void call_destroy(b2b_call_t *c)
         __sync_fetch_and_sub(&c->prof->active_calls, 1u);
     }
     disarm_noanswer_timer(c); /* catch-all：所有终止路径最终走到这里 */
+    disarm_call_limit_timer(c); /* REQ-ORIGINATE-005：通话时长上限 timer */
+    disarm_sched_hangup_timer(c); /* REQ-DP-TIMEOUT-001：应用层硬上限 timer */
     /* Session Timer: disarm all timer nodes */
     if (c->core->cfg.tw) {
         tw_del(c->core->cfg.tw, &c->leg[0].refresh_node);
@@ -1429,13 +1465,23 @@ static int build_dlg_req(b2b_core_t *co, b2b_leg_t *l,
         rt[0] = '\0';
     else
         route_block(l, rt, sizeof(rt));
-    /* REQ-NAT-001：dialog 内请求（BYE/PRACK/UPDATE 等）Via host 也走 external_sip_ip */
-    /* REQ-NAT-002：优先 per-call profile 的 external_sip_ip，fallback cfg */
-    /* build_dlg_req 只有 b2b_core_t*co、b2b_leg_t*l——通过 l->dlg->ud 反查 b2b_call_t */
+    /* REQ-NAT-001：dialog 内请求（BYE/PRACK/UPDATE 等）Via host 也走 external_sip_ip
+     * REQ-NAT-002：优先 per-call profile 的 external_sip_ip，fallback cfg
+     * ★ 2026-11-19 FIX：只有 call_ref->out_prof 是 "external" profile 才用 external_sip_ip，
+     *   否则一律 local_host（EXT 层 dialog 内请求不应宣告公网 IP） */
     b2b_call_t *call_ref = (l && l->dlg) ? (b2b_call_t *)l->dlg->ud : NULL;
-    const char *prof_ext = (call_ref && call_ref->prof && call_ref->prof->external_sip_ip[0])
-                           ? call_ref->prof->external_sip_ip : co->cfg.external_sip_ip;
-    const char *adv_host = (prof_ext && prof_ext[0]) ? prof_ext : co->cfg.local_host;
+    struct sip_profile *dlg_op = (call_ref && call_ref->out_prof)
+                                 ? call_ref->out_prof
+                                 : (call_ref ? call_ref->prof : NULL);
+    int dlg_is_ext = (dlg_op && dlg_op->name[0] && strcasecmp(dlg_op->name, "external") == 0);
+    const char *adv_host;
+    if (dlg_is_ext) {
+        const char *prof_ext = (dlg_op && dlg_op->external_sip_ip[0])
+                               ? dlg_op->external_sip_ip : co->cfg.external_sip_ip;
+        adv_host = (prof_ext && prof_ext[0]) ? prof_ext : co->cfg.local_host;
+    } else {
+        adv_host = co->cfg.local_host;
+    }
     const char *ex = extra ? extra : rt;
     /* REQ-ORIGINATE-WS-003：Via transport 动态选择（包含 WS/WSS）
      * 之前只有 TCP/TLS/UDP 三分支，WS/WSS 会 fallthrough 到 "UDP"
@@ -1711,11 +1757,25 @@ static sip_txn_t *send_invite_b(b2b_call_t *c, int leg_idx,
      * FreeSWITCH ext-sip-ip 等效。Call-ID 后缀不改（标识符非寻址）。
      * REQ-NAT-002：优先 per-call profile 的 external_sip_ip，fallback cfg
      * ★ 2026-10-19：用 out_prof（B 腿出站 profile，resolve 按 dp_layer 设），
-     *   OUT 层自动走 external profile；EXT/BIZ 走 c->prof */
+     *   OUT 层自动走 external profile；EXT/BIZ 走 c->prof
+     *
+     * ★ 2026-11-19 FIX：只有 out_prof 是 "external" profile 时才宣告公网 IP，
+     *   否则一律 local_host！之前 fallback 到全局 cfg.external_sip_ip，导致
+     *   EXT 层（内部分机互打）INVITE 的 Via/Contact 被写成公网 IP → MicroSIP
+     *   收到后直接丢弃（认为是未知来源）。FreeSWITCH 只在 trunk 路由时用
+     *   ext-sip-ip，内部分机路由永远用内网 IP。 */
     struct sip_profile *op = c->out_prof ? c->out_prof : c->prof;
-    const char *prof_ext = (op && op->external_sip_ip[0])
-                           ? op->external_sip_ip : co->cfg.external_sip_ip;
-    const char *adv_host = (prof_ext && prof_ext[0]) ? prof_ext : co->cfg.local_host;
+    int is_ext_profile = (op && op->name[0] && strcasecmp(op->name, "external") == 0);
+    const char *adv_host;
+    if (is_ext_profile) {
+        /* OUT 层（trunk/公网）：优先 profile external_sip_ip，fallback cfg */
+        const char *prof_ext = (op && op->external_sip_ip[0])
+                               ? op->external_sip_ip : co->cfg.external_sip_ip;
+        adv_host = (prof_ext && prof_ext[0]) ? prof_ext : co->cfg.local_host;
+    } else {
+        /* EXT/BIZ/LOCAL 层（内部分机/队列/AI）：一律 local_host */
+        adv_host = co->cfg.local_host;
+    }
 
     char rt[DLG_URI_MAX * DLG_ROUTE_MAX + 64];
     route_block(b, rt, sizeof(rt));
@@ -2102,10 +2162,18 @@ static void respond_a(b2b_call_t *c, int status, const char *body,
         return;
     txn_ref(t); /* ★ 防竞态：respond_a 可能被 Timer 回调触发，call_destroy 可并发释放 txn */
     /* REQ-NAT-001：respond_a 里构造的 Contact 也走 external_sip_ip
-     * REQ-NAT-002：优先 per-call profile，fallback cfg */
-    const char *prof_ext = (c->prof && c->prof->external_sip_ip[0])
-                           ? c->prof->external_sip_ip : co->cfg.external_sip_ip;
-    const char *adv_host = (prof_ext && prof_ext[0]) ? prof_ext : co->cfg.local_host;
+     * REQ-NAT-002：优先 per-call profile，fallback cfg
+     * ★ 2026-11-19 FIX：只有 c->prof 是 "external" profile（主叫来自公网 trunk）
+     *   才用 external_sip_ip，否则一律 local_host（主叫在内网，回内网 IP） */
+    int a_is_ext = (c->prof && c->prof->name[0] && strcasecmp(c->prof->name, "external") == 0);
+    const char *adv_host;
+    if (a_is_ext) {
+        const char *prof_ext = (c->prof && c->prof->external_sip_ip[0])
+                               ? c->prof->external_sip_ip : co->cfg.external_sip_ip;
+        adv_host = (prof_ext && prof_ext[0]) ? prof_ext : co->cfg.local_host;
+    } else {
+        adv_host = co->cfg.local_host;
+    }
     /* extra 头块：Content-Type(28) + History-Info(≤1024) + Diversion(≤130) → 1300 够装 */
     char extra[1300];
     size_t used = 0;
@@ -2249,6 +2317,8 @@ static void maybe_start_media(b2b_call_t *c)
         co->cfg.media(c, c->leg[0].offer, c->leg[0].offer_len,
                       c->leg[1].answer, c->leg[1].answer_len,
                       co->cfg.media_ud);
+        arm_call_limit_timer(c); /* REQ-ORIGINATE-005：originate 创建的 call 自动 arm */
+        arm_sched_hangup_timer(c); /* REQ-DP-TIMEOUT-001：统一 arm（入站+originate 都可能 arm） */
         return;
     }
 
@@ -2259,6 +2329,8 @@ static void maybe_start_media(b2b_call_t *c)
                       c->leg[1].answer, c->leg[1].answer_len,
                       co->cfg.media_ud);
         llog(LOG_INFO, "media", "maybe_start_media: originate mode confirmed");
+        arm_call_limit_timer(c); /* REQ-ORIGINATE-005 */
+        arm_sched_hangup_timer(c); /* REQ-DP-TIMEOUT-001 */
     }
 }
 
@@ -2517,12 +2589,22 @@ static void arm_noanswer_timer(b2b_call_t *c)
         return;
     if (c->dead || c->a_final)
         return;
-    /* REQ-ORIGINATE-001：per-call override 优先（>0），否则走全局。
-     * 注意 memset 初始化后 noanswer_ms_override=0，入站 INVITE 路径
-     * 自然走全局 ring_noanswer_ms，originate 显式设 >0 才覆盖。 */
-    uint32_t ms = (c->noanswer_ms_override > 0)
-                  ? (uint32_t)c->noanswer_ms_override
-                  : co->cfg.ring_noanswer_ms;
+    /* REQ-ORIGINATE-001 + REQ-DP-TIMEOUT-001：五层决策链
+     * 优先级从高到低：
+     *   1) noanswer_ms_override (>0)              — FS originate_timeout brace var（既有，最高优先）
+     *   2) originate_call_timeout_ms_override (>0) — dialplan rule / 新 brace var（仅 originate）
+     *   3) cfg.originate_call_timeout_ms (>0)      — 全局默认 50s（仅 originate）
+     *   4) cfg.ring_noanswer_ms                     — 全局 60s（入站 + fallback） */
+    uint32_t ms;
+    if (c->noanswer_ms_override > 0) {
+        ms = (uint32_t)c->noanswer_ms_override;
+    } else if (c->originate_created && c->originate_call_timeout_ms_override > 0) {
+        ms = (uint32_t)c->originate_call_timeout_ms_override;
+    } else if (c->originate_created && co->cfg.originate_call_timeout_ms > 0) {
+        ms = co->cfg.originate_call_timeout_ms;
+    } else {
+        ms = co->cfg.ring_noanswer_ms;
+    }
     if (ms == 0)
         return;
     tw_del(co->cfg.tw, &c->noanswer_node); /* 续约先摘再挂（幂等） */
@@ -2537,6 +2619,131 @@ static void disarm_noanswer_timer(b2b_call_t *c)
     if (!co->cfg.tw)
         return;
     tw_del(co->cfg.tw, &c->noanswer_node);
+}
+
+/* REQ-ORIGINATE-005：originate 呼出通话时长上限 — arm/disarm/expire 三函数。
+ * 仅对 originate 创建的 call 生效：cfg.originate_caller_timeout_ms > 0 才 arm。
+ * 入站 INVITE 不走此逻辑（cfg 为 0 + call 没主动 arm）。 */
+static void arm_call_limit_timer(b2b_call_t *c)
+{
+    b2b_core_t *co = c->core;
+    if (!co->cfg.tw)
+        return;
+    if (!c->originate_created)
+        return; /* 仅 originate 创建的 call 走此路径 */
+    if (c->dead || c->a_final)
+        return;
+    uint32_t ms = co->cfg.originate_caller_timeout_ms;
+    if (ms == 0)
+        return;
+    tw_del(co->cfg.tw, &c->call_limit_node);
+    tw_add(co->cfg.tw, &c->call_limit_node,
+           now_ms() + ms,
+           call_limit_expire_cb, c);
+    llog(LOG_NOTICE, "b2b", "call_limit armed callid=%s timeout_ms=%u",
+         c->leg[0].callid, ms);
+}
+
+static void disarm_call_limit_timer(b2b_call_t *c)
+{
+    b2b_core_t *co = c->core;
+    if (!co->cfg.tw)
+        return;
+    tw_del(co->cfg.tw, &c->call_limit_node);
+}
+
+static void call_limit_expire_cb(uint64_t cb_now, void *arg)
+{
+    b2b_call_t *c = (b2b_call_t *)arg;
+    (void)cb_now;
+    call_lock(c);
+    if (c->dead) { call_unlock(c); return; }
+    if (!c->leg[0].st.active && !c->leg[1].st.active) { call_unlock(c); return; }
+    uint64_t dur_ms = c->answer_ms ? (now_ms() - c->answer_ms) : 0;
+    llog(LOG_WARN, "b2b",
+         "call_limit EXPIRED callid=%s dur_ms=%llu → terminate cause=486",
+         c->leg[0].callid, (unsigned long long)dur_ms);
+    disarm_call_limit_timer(c);
+    call_unlock(c);
+    b2b_terminate(c, 486);
+}
+
+/* ====================================================================
+ * REQ-DP-TIMEOUT-001：sched_hangup — 接通后应用层硬上限 timer
+ *
+ * 设计原则：
+ *   - 任何 call（入站 + originate）双腿 confirm 后都可 arm
+ *   - 优先级链：call->sched_hangup_ms_override > cfg.originate_caller_timeout_ms（仅 originate）
+ *   - 入站 INVITE：默认不 arm（Session Timer 继续生效），dialplan rule 设了 override 才 arm
+ *   - originate：cfg.originate_caller_timeout_ms 作为兜底（已有 call_limit_node 也会独立 arm）
+ *   - 到期 cause=486 Busy Here — 语义最接近（系统强制挂断）
+ *
+ * 与 call_limit_node 的关系：
+ *   call_limit_node 是 originate 专属的旧 timer（cfg.originate_caller_timeout_ms 驱动）；
+ *   sched_hangup_node 是新的统一 timer（入站+originate 都可 arm）。
+ *   两者并存不冲突——call_limit_node 只看 cfg，sched_hangup_node 优先看 override。
+ *   如果 originate 路径 cfg.originate_caller_timeout_ms=3600 且 dialplan rule 也没设 override，
+ *   则 call_limit_node 会 arm（走 3600s），sched_hangup_node 不会 arm（因为没 override）。
+ *   如果 dialplan rule 设了 sched_hangup_s=1800，则 sched_hangup_node 会 arm（走 1800s），
+ *   call_limit_node 仍然会 arm（走 cfg 3600s）。两者先到先挂。
+ * ====================================================================*/
+
+/* REQ-DP-TIMEOUT-001：sched_hangup 决策链 — 返回 0=不限，>0=毫秒数 */
+static uint32_t decide_sched_hangup_ms(const b2b_call_t *c)
+{
+    const b2b_core_t *co = c->core;
+    /* 1) per-call override（dialplan rule / OAM brace var） */
+    if (c->sched_hangup_ms_override > 0)
+        return (uint32_t)c->sched_hangup_ms_override;
+    /* 2) originate 路径：走 cfg.originate_caller_timeout_ms 兜底 */
+    if (c->originate_created && co->cfg.originate_caller_timeout_ms > 0)
+        return co->cfg.originate_caller_timeout_ms;
+    /* 3) 入站 INVITE：默认 0=不限（Session Timer 继续生效） */
+    return 0;
+}
+
+static void arm_sched_hangup_timer(b2b_call_t *c)
+{
+    b2b_core_t *co = c->core;
+    if (!co->cfg.tw)
+        return;
+    if (c->dead || c->a_final)
+        return;
+    uint32_t ms = decide_sched_hangup_ms(c);
+    if (ms == 0)
+        return;
+    tw_del(co->cfg.tw, &c->sched_hangup_node);
+    tw_add(co->cfg.tw, &c->sched_hangup_node,
+           now_ms() + ms,
+           sched_hangup_expire_cb, c);
+    llog(LOG_NOTICE, "b2b",
+         "sched_hangup armed callid=%s timeout_ms=%u (override=%d originate=%d)",
+         c->leg[0].callid, ms, c->sched_hangup_ms_override, c->originate_created);
+}
+
+static void disarm_sched_hangup_timer(b2b_call_t *c)
+{
+    b2b_core_t *co = c->core;
+    if (!co->cfg.tw)
+        return;
+    tw_del(co->cfg.tw, &c->sched_hangup_node);
+}
+
+static void sched_hangup_expire_cb(uint64_t cb_now, void *arg)
+{
+    b2b_call_t *c = (b2b_call_t *)arg;
+    b2b_core_t *co = c->core;
+    (void)cb_now; (void)co;
+    call_lock(c);
+    if (c->dead) { call_unlock(c); return; }
+    if (!c->leg[0].st.active && !c->leg[1].st.active) { call_unlock(c); return; }
+    uint64_t dur_ms = c->answer_ms ? (now_ms() - c->answer_ms) : 0;
+    llog(LOG_WARN, "b2b",
+         "sched_hangup EXPIRED callid=%s dur_ms=%llu override=%d → terminate cause=486",
+         c->leg[0].callid, (unsigned long long)dur_ms, c->sched_hangup_ms_override);
+    disarm_sched_hangup_timer(c);
+    call_unlock(c);
+    b2b_terminate(c, 486);
 }
 
 /* ==================================================================== */
@@ -3240,13 +3447,20 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                             tw_add(co->cfg.tw, &al->expire_node, nm + (uint64_t)na.interval_s * 1000u + SESS_TIMER_GRACE_MS, sess_timer_expire_cb, c);
                         }
                     }
-                    /* B-leg arm（从 Bob 200 OK） */
+                    /* B-leg arm（从 Bob 200 OK）
+                     * ★ 必须用 cfg 上限裁剪 —— Bob 200 OK 里的 Session-Expires 可能超过
+                     *   B2BUA 同意的上限（典型：WebRTC UA 自报 6000s），不裁剪会导致
+                     *   B2BUA arm 一个 100 分钟级的 expire timer → 100min 后 EXPIRED 断话。
+                     *   A-leg 协商已在 sess_timer_uas_negotiate 里做了 max_se_s 裁剪，
+                     *   B-leg arm 也要保持对称。 */
                     sip_hdr_t *bose = sip_hdr_get(m, SIP_H_SESSION_EXPIRES);
                     if (bose) {
                         nb.interval_s = atoi(bose->value.p);
                         nb.refresher = SIP_REF_NONE;
                         const char *rp = strstr(bose->value.p, "refresher=");
                         if (rp) { rp += 10; if (!strncmp(rp, "uac", 3)) nb.refresher = SIP_REF_UAC; else if (!strncmp(rp, "uas", 3)) nb.refresher = SIP_REF_UAS; }
+                        if (nb.interval_s > co->cfg.sess_timer_cfg.max_se_s)
+                            nb.interval_s = co->cfg.sess_timer_cfg.max_se_s;
                         if (nb.interval_s >= co->cfg.sess_timer_cfg.min_se_s) {
                             /* B-leg: B2BUA=UAC → 仅当 refresher=uac 时 B2BUA 是刷新方 */
                             if (nb.refresher == SIP_REF_UAC) {
@@ -4189,8 +4403,14 @@ static void b2b_emit_cdr(b2b_call_t *c, cdr_phase_t phase)
         return;
     cdr_event_t ev; memset(&ev, 0, sizeof(ev));
     snprintf(ev.call_id, sizeof(ev.call_id), "%s", c->leg[0].callid);
-    if (c->leg[0].from[0]) {
-        char user[128]; sip_uri_extract_user(user, sizeof(user), c->leg[0].from);
+    {
+        char user[128] = {0};
+        if (c->leg[0].from[0])
+            sip_uri_extract_user(user, sizeof(user), c->leg[0].from);
+        /* inbound 场景 leg[0].from 为空或解析不出 user（From 头未存完整 URI），
+         * 回退到 INVITE From 提取的 orig_number，避免话单/事件 from 一直为空 */
+        if (!user[0] && c->orig_number[0])
+            snprintf(user, sizeof(user), "%s", c->orig_number);
         snprintf(ev.from, sizeof(ev.from), "%s", user);
     }
     /* leg[1].to 在 CDR_PHASE_START 时尚未赋值（send_invite_b 在 emit 之后），
@@ -5091,6 +5311,66 @@ void handle_new_invite(b2b_core_t *co, sip_txn_t *t,
         a->state = LEG_TERMINATED;
         add_atomic(&co->failed, 1);
         call_destroy(c);
+        return;
+    }
+
+    /* ★ 单腿本地媒体（AI 内循环）：dialplan target="local:..." 命中 →
+     * 不建 B 腿，直接对 A 腿回 200 OK（SDP 指向 media_bridge 单腿 relay 的
+     * A 侧端口）。之后 ai/ai_dialog 在 A 腿上消费媒体、注入 TTS；ai_agent
+     * 通过 SSE CALL_ANSWERED 接管对话。 */
+    if (c->local_media) {
+        char ans[B2B_SDP_MAX];
+        int n = -1;
+        if (a->offer_len && co->cfg.media_ud)
+            n = bridge_local_start(c, a->offer, a->offer_len,
+                                   ans, sizeof(ans), co->cfg.media_ud);
+        if (n <= 0) {
+            llog(LOG_WARN, "b2b",
+                 "local_media: bridge_local_start failed rc=%d callid=%s → 488",
+                 n, a->callid);
+            c->a_final = 488;
+            respond_txn(co, t, 488, NULL, NULL, NULL, 0);
+            a->state = LEG_TERMINATED;
+            add_atomic(&co->failed, 1);
+            call_destroy(c);
+            return;
+        }
+        if ((size_t)n < sizeof(a->answer)) {
+            memcpy(a->answer, ans, (size_t)n);
+            a->answer[(size_t)n] = '\0';
+            a->answer_len = (size_t)n;
+        }
+        respond_a(c, 200, ans, (size_t)n);
+        c->a_final = 200;
+        c->media_done = 1;
+        if (!c->active) {
+            c->active = 1;
+            add_atomic(&co->active, 1);
+        }
+        arm_call_limit_timer(c);
+        arm_sched_hangup_timer(c);
+        {
+            /* from=主叫 user（orig_number，INVITE From 提取）；
+             * to=被叫号码（A 腿 To/R-URI 的 user part）。local:ai 场景
+             * dst_number 会被拨号规则改写成 "local:ai"，不能直接展示。 */
+            char sess[640], fesc[256], tesc[256], to_user[128] = {0};
+            const char *from_num = c->orig_number[0] ? c->orig_number : "";
+            const char *to_src   = c->leg[0].to[0] ? c->leg[0].to : c->leg[0].ruri;
+            sip_uri_extract_user(to_user, sizeof(to_user), to_src);
+            if (!to_user[0])
+                snprintf(to_user, sizeof(to_user), "%s", c->dst_number);
+            b2b_json_esc(from_num, fesc, sizeof(fesc));
+            b2b_json_esc(to_user, tesc, sizeof(tesc));
+            snprintf(sess, sizeof(sess),
+                     "{\"event\":\"answer\",\"call_id\":\"%s\",\"state\":\"confirmed\","
+                     "\"from\":\"%s\",\"orig\":\"%s\",\"to\":\"%s\",\"dir\":\"inbound\",\"cause\":0}",
+                     c->leg[0].callid, fesc, fesc, tesc);
+            uds_send_session(sess);
+        }
+        llog(LOG_INFO, "b2b",
+             "local_media: answered A directly (no B leg) callid=%s sdp=%dB",
+             a->callid, n);
+        call_unlock(c);
         return;
     }
 
@@ -7144,6 +7424,7 @@ int b2b_originate(b2b_core_t *co, const b2b_orig_t *o, b2b_call_t **out)
     }
     memset(c, 0, sizeof(*c));
     c->core = co;
+    c->originate_created = 1; /* REQ-ORIGINATE-005：标记 originate 创建的 call */
     sip_upd_guard_init(&c->leg[0].guard);
     sip_upd_guard_init(&c->leg[1].guard);
 
@@ -7200,6 +7481,11 @@ int b2b_originate(b2b_core_t *co, const b2b_orig_t *o, b2b_call_t **out)
     /* REQ-ORIGINATE-001：per-call noanswer override（>0 覆盖全局，否则走全局）
      * 在 alloc 之后立即设，方便 bridge 模式两次 arm_noanswer_timer 复用 */
     c->noanswer_ms_override = o->timeout_ms;
+    /* REQ-DP-TIMEOUT-001：OAM brace var 新支持的两个 per-call override */
+    if (o->sched_hangup_s > 0)
+        c->sched_hangup_ms_override = o->sched_hangup_s * 1000;
+    if (o->originate_call_timeout_s > 0)
+        c->originate_call_timeout_ms_override = o->originate_call_timeout_s * 1000;
     /* REQ-ORIGINATE-003 待补：携带尾随 app（&park/&hangup/&echo）到呼叫上下文 */
     c->post_app = o->post_app;
 
@@ -8834,14 +9120,24 @@ static int b2b_send_refer(b2b_call_t *c, int leg,
     b2b_core_t *co = c->core;
     b2b_leg_t *l = &c->leg[leg];
     if (!l->dlg || l->state != LEG_CONFIRMED) return NSBC_NOENT;
+    /* ★ local:ai (local_media) 模式 A-腿直接 200 OK，不走标准 B2BUA INVITE→200→dialog confirmed→BYE 清 inv_txn 流程，
+     * inv_txn 永远残留。此函数入口已确认 leg.state=CONFIRMED，inv_txn 是 stale 指针，安全清掉即可。 */
     if (l->inv_txn) {
-        llog(LOG_WARN, "b2b", "REFER leg=%d conflict (inv_txn active)", leg);
-        return NSBC_ERR;
+        llog(LOG_INFO, "b2b", "REFER leg=%d clearing stale inv_txn (local_media/ai passthrough)", leg);
+        l->inv_txn = NULL;
     }
     /* extra 头块：Refer-To + Replaces（可选） */
     char extra[512];
     size_t used = 0;
-    int n = snprintf(extra, sizeof(extra), "Refer-To: <sip:%s>\r\n", refer_to);
+    /* refer_to 可能是纯号码 ("1007") 或完整 SIP URI ("sip:1007@host")。
+     * 若已经带 sip: 前缀则直接用，否则补 sip: — 避免双 sip: 前缀导致
+     * 下游 INVITE 变成 sip:sip:user@host 被解析成 user="sip"。 */
+    int n;
+    if (refer_to && strncmp(refer_to, "sip:", 4) == 0) {
+        n = snprintf(extra, sizeof(extra), "Refer-To: <%s>\r\n", refer_to);
+    } else {
+        n = snprintf(extra, sizeof(extra), "Refer-To: <sip:%s>\r\n", refer_to);
+    }
     if (n > 0 && (size_t)n < sizeof(extra)) used = (size_t)n;
     if (replaces && replaces[0]) {
         int m = snprintf(extra + used, sizeof(extra) - used,
@@ -8899,13 +9195,44 @@ int b2b_transfer_call(b2b_call_t *call, int b_leg, const char *dest,
      * dialog（A hold + 拨 C → A 确认接通 → REFER 让 B 和 C 对话）。 */
     int rc = NSBC_OK;
     if (kind == CCF_XFER_BLIND) {
-        if (b_leg == -1 || b_leg == 1) {
-            int lr = b2b_send_refer(call, 1, dest, NULL);
-            if (lr != NSBC_OK) rc = lr;
-        }
+        /* Blind transfer：优先给 A-腿（用户侧 leg[0]）发 REFER。
+         * 原因：passthrough/AI 模式下 B-腿（leg[1]）可能 dlg=NULL 或非 CONFIRMED
+         * （llog L9090: !l->dlg || state != LEG_CONFIRMED → NSBC_NOENT=-6）。
+         * 原版先试 B-腿，失败后 rc=-6 导致 A-腿根本不被尝试（rc==NSBC_OK 条件不满足）。
+         * 修复：先 A 后 B，只要有一条腿成功就算 OK，B 腿失败只打 warning。 */
+        int any_ok = 0;
         if (b_leg == -1 || b_leg == 0) {
             int lr = b2b_send_refer(call, 0, dest, NULL);
-            if (lr != NSBC_OK && rc == NSBC_OK) rc = lr;
+            if (lr == NSBC_OK) { any_ok = 1; }
+            else if (b_leg != -1) rc = lr;  /* 指定只 A 腿时失败才算失败 */
+        }
+        if (b_leg == -1 || b_leg == 1) {
+            int lr = b2b_send_refer(call, 1, dest, NULL);
+            if (lr == NSBC_OK) { any_ok = 1; }
+            else {
+                llog(LOG_WARN, "b2b",
+                     "transfer B-leg refer rc=%d (expected in passthrough/AI mode)", lr);
+                if (b_leg == 1) rc = lr;  /* 指定只 B 腿时失败才算失败 */
+            }
+        }
+        if (b_leg == -1) {
+            /* 双腿自动：只要有一条腿 OK 就算 OK */
+            rc = any_ok ? NSBC_OK : NSBC_NOENT;
+        }
+        /* ★ Blind transfer 成功后，主动向所有有 dialog 的腿发 BYE 清理旧 dialog。
+         * 否则 MicroSIP 会同时维护 "A→dest 新 dialog" 和 "A→nsbc 旧 dialog" →
+         * 用户挂断要挂两次。RFC 3515 虽然规定 UAC 负责 dialog 清理，但
+         * passthrough/AI 模式下 nsbc 作为 dialog owner 主动清理最可靠。 */
+        if (rc == NSBC_OK) {
+            for (int li = 0; li < 2; li++) {
+                b2b_leg_t *lg = &call->leg[li];
+                if (lg->dlg && lg->state == LEG_CONFIRMED) {
+                    llog(LOG_INFO, "b2b", "transfer OK → send_bye_leg leg=%d cleanup old dialog", li);
+                    pthread_mutex_unlock(&call->lock);
+                    send_bye_leg(call, li);
+                    pthread_mutex_lock(&call->lock);
+                }
+            }
         }
     } else {
         /* CONSULTED：Replaces 头已经由调用方（REFER 入站）从 SIP 消息里解析好。

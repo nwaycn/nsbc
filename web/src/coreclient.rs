@@ -80,6 +80,7 @@ pub enum CoreError {
     /// Core returned an ERR line
     CoreRejected(String),
     /// Current build target does not support this transport (Windows has no UDS control socket)
+    #[allow(dead_code)]  /* reserved for non-Unix targets; keep enum exhaustive */
     Unsupported(&'static str),
 }
 

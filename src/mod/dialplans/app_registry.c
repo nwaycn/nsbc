@@ -13,6 +13,7 @@
 #include "app_registry.h"
 #include "app_ctx.h"
 #include "b2bua.h"
+#include "callctrl.h"     /* REQ-AI-TRANSFER-001：CCF_XFER_BLIND 枚举 */
 #include "dialplan.h"
 #include "dp_sleep.h"
 
@@ -266,9 +267,20 @@ int dp_rule_set_app_chain(dp_rule_t *rule,
                           const dp_app_action_t *chain, size_t n)
 {
     if (!rule) return NSBC_INVAL;
-    /* 清空旧 chain（reload 时旧表由 RCU 宽限期后统一回收，
-     * 这里调用方已保证指针归属——P0 简化：不 free，依赖 RCU） */
-    rule->app_chain = (struct dp_app_action *)chain;
+    if (rule->app_chain) {
+        free(rule->app_chain);
+        rule->app_chain = NULL;
+        rule->app_chain_n = 0;
+    }
+    if (n == 0 || !chain)
+        return NSBC_OK;
+    /* ★ 统一所有权：calloc + memcpy，让 rule 永远持有自己的独立副本。
+     * 调用侧的 chain 可以是 static 数组（signaling.c 默认规则）或 calloc（stub_mods.c reload），
+     * 但 rule->app_chain 永远指向 calloc 内存 → dp_table_free 里 free() 不会崩。 */
+    dp_app_action_t *copy = (dp_app_action_t *)calloc(n, sizeof(*copy));
+    if (!copy) return NSBC_NOMEM;
+    memcpy(copy, chain, n * sizeof(*copy));
+    rule->app_chain = copy;
     rule->app_chain_n = n;
     return NSBC_OK;
 }
@@ -678,13 +690,48 @@ static app_rc_t app_record(app_ctx_t *c, const char *data, void *ud)
     return APP_RC_FAILED;
 }
 
-/* ---- 5. transfer（P1 接 b2b_transfer_call）---- */
+/* ---- 5. transfer（REQ-AI-TRANSFER-001 P0 实装：blind transfer via REFER）----
+ *
+ * data 格式："<dest>"（纯目标 SIP URI 或分机号）
+ *   例：transfer 1001          → blind transfer 到分机 1001
+ *       transfer sip:1001@10.0.0.1 → blind transfer 到完整 URI
+ *
+ * 语义：
+ *   向双腿都发 REFER（b_leg=-1），REFER 里 Refer-To 指向 dest。
+ *   B-腿收到 REFER 后会重新 INVITE dest，B2BUA 把 REFER 也转发给 A-腿。
+ *   两个腿完成 REFER 握手后，原 dialog 自动 BYE 清场。
+ *
+ * 调用链：app_transfer → b2b_transfer_call(call, -1, dest, CCF_XFER_BLIND, NULL, NULL)
+ * 复用 b2bua.c 里已经实现好的 blind transfer（含 dest 白名单校验、REFER 拼装）。
+ *
+ * AI 场景典型用法：
+ *   dialplan.rules: "ai,transfer 1001" —— AI app 跑完后自动转人工座席 1001 */
 static app_rc_t app_transfer(app_ctx_t *c, const char *data, void *ud)
 {
     (void)ud;
     if (!cv_call_alive(c)) return APP_RC_FAILED;
-    /* data: <dest> [XML default] */
-    if (!data || data[0] == '\0' || strlen(data) > 256) return APP_RC_FAILED;
+    /* data: <dest>（纯目标，最长 256） */
+    if (!data || data[0] == '\0') {
+        llog(LOG_WARN, "app", "transfer: empty dest");
+        return APP_RC_FAILED;
+    }
+    if (strlen(data) > 256) {
+        llog(LOG_WARN, "app", "transfer: dest too long (%zu)", strlen(data));
+        return APP_RC_FAILED;
+    }
+
+    /* blind transfer：双腿都发 REFER（b_leg=-1） */
+    int rc = b2b_transfer_call((b2b_call_t *)c->call_key,
+                               /*b_leg=*/-1,
+                               data,
+                               /*kind=*/CCF_XFER_BLIND,
+                               /*consult_call=*/NULL,
+                               /*replaces_hdr=*/NULL);
+    if (rc == NSBC_OK) {
+        llog(LOG_INFO, "app", "transfer OK call=%p dest=%s (blind)", c->call_key, data);
+        return APP_RC_OK;
+    }
+    llog(LOG_WARN, "app", "transfer rc=%d call=%p dest=%s", rc, c->call_key, data);
     return APP_RC_FAILED;
 }
 

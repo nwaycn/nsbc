@@ -1,5 +1,6 @@
 //! Route aggregation (REQ-WEB-004 MVP subset).
 
+pub mod ai_backends;
 pub mod auth;
 pub mod billing;
 pub mod calls;

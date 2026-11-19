@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use md5::{Md5, Digest};
 use sqlx::{Any, Pool, Row};
-use tokio::sync::{mpsc, Mutex};
-use tracing::{info, warn, error, debug};
+use tokio::sync::mpsc;
+use tracing::{info, warn, error};
 
 // sqlx Any driver reads SQLite INTEGER as i64, but the business layer needs bool.
 // Solution: the FromRow struct stores as i64; serde output auto-converts to bool.
@@ -1185,7 +1185,9 @@ pub enum DbBatchItem {
 ///   - 队满：submit 侧 try_send → 同步 fallback 单条写（保证不丢）
 pub struct DbBatch {
     tx: mpsc::Sender<DbBatchItem>,
+    #[allow(dead_code)]
     pool: Arc<Pool<Any>>,
+    #[allow(dead_code)]
     backend: &'static str,
 }
 
@@ -1639,7 +1641,7 @@ async fn flush_cdrs(
 
 async fn flush_runtimes(
     pool: &Arc<Pool<Any>>,
-    backend: &'static str,
+    _backend: &'static str,
     bucket: &mut Vec<DbBatchItem>,
 ) {
     let n = bucket.len();
@@ -1903,7 +1905,7 @@ async fn connect_and_migrate(dsn: &str) -> Result<Pool<Any>, sqlx::Error> {
             // busy_timeout / foreign_keys 都是 connection-level，
             // 必须在 after_connect 里设才能对所有 Acquire Guard 生效。
             // journal_mode=WAL 是 database-level（持久化到 sqlite_master），这里重复设无副作用。
-            .after_connect(move |mut conn, _meta| Box::pin(async move {
+            .after_connect(move |conn, _meta| Box::pin(async move {
                 // after_connect: 每个 SQLite 新连接建立时强制执行 PRAGMA。
                 // busy_timeout / foreign_keys 是 connection-level，
                 // WAL 等是 database-level（持久化但重复设无害）。
@@ -3040,6 +3042,9 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
                 force_precondition INTEGER NOT NULL DEFAULT 0,
                 force_timer        INTEGER NOT NULL DEFAULT 0,
                 force_gruu         INTEGER NOT NULL DEFAULT 0,
+                /* REQ-DP-TIMEOUT-001：dialplan 规则级 per-call timeout override（秒，0=不限/走全局） */
+                sched_hangup_s           INTEGER NOT NULL DEFAULT 0,
+                originate_call_timeout_s INTEGER NOT NULL DEFAULT 0,
                 action_json   TEXT    NOT NULL DEFAULT '{}',
                 app_chain     TEXT    NOT NULL DEFAULT '[]',  /* REQ-DP-APP-001: Application chain JSON array */
                 enabled       INTEGER NOT NULL DEFAULT 1,
@@ -3072,6 +3077,9 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
                 force_precondition INTEGER NOT NULL DEFAULT 0,
                 force_timer        INTEGER NOT NULL DEFAULT 0,
                 force_gruu         INTEGER NOT NULL DEFAULT 0,
+                /* REQ-DP-TIMEOUT-001：dialplan 规则级 per-call timeout override（秒，0=不限/走全局） */
+                sched_hangup_s           INTEGER NOT NULL DEFAULT 0,
+                originate_call_timeout_s INTEGER NOT NULL DEFAULT 0,
                 action_json   TEXT   NOT NULL DEFAULT '{}',
                 app_chain     TEXT   NOT NULL DEFAULT '[]',  /* REQ-DP-APP-001: Application chain JSON array */
                 enabled       INTEGER NOT NULL DEFAULT 1,
@@ -3104,6 +3112,9 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
                 force_precondition TINYINT NOT NULL DEFAULT 0,
                 force_timer        TINYINT NOT NULL DEFAULT 0,
                 force_gruu         TINYINT NOT NULL DEFAULT 0,
+                /* REQ-DP-TIMEOUT-001：dialplan 规则级 per-call timeout override（秒，0=不限/走全局） */
+                sched_hangup_s           INT NOT NULL DEFAULT 0,
+                originate_call_timeout_s INT NOT NULL DEFAULT 0,
                 action_json   JSON         NOT NULL,
                 app_chain     JSON         NOT NULL,  /* REQ-DP-APP-001: Application chain JSON array */
                 enabled       TINYINT(1)   NOT NULL DEFAULT 1,
@@ -3146,6 +3157,8 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
                     ADD COLUMN force_precondition TINYINT NOT NULL DEFAULT 0 AFTER force_prack, \
                     ADD COLUMN force_timer        TINYINT NOT NULL DEFAULT 0 AFTER force_precondition, \
                     ADD COLUMN force_gruu         TINYINT NOT NULL DEFAULT 0 AFTER force_timer, \
+                    ADD COLUMN sched_hangup_s           INT NOT NULL DEFAULT 0 AFTER force_gruu, \
+                    ADD COLUMN originate_call_timeout_s INT NOT NULL DEFAULT 0 AFTER sched_hangup_s, \
                     ADD COLUMN app_chain  JSON NOT NULL AFTER action_json",
         _ => {
             // SQLite / PostgreSQL each get their own statements
@@ -3166,6 +3179,11 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
                 .execute(pool).await.ok();
             sqlx::query("ALTER TABLE dialplan_rules ADD COLUMN force_gruu INTEGER NOT NULL DEFAULT 0")
                 .execute(pool).await.ok();
+            /* REQ-DP-TIMEOUT-001：dialplan 规则级 per-call timeout override */
+            sqlx::query("ALTER TABLE dialplan_rules ADD COLUMN sched_hangup_s INTEGER NOT NULL DEFAULT 0")
+                .execute(pool).await.ok();
+            sqlx::query("ALTER TABLE dialplan_rules ADD COLUMN originate_call_timeout_s INTEGER NOT NULL DEFAULT 0")
+                .execute(pool).await.ok();
             /* REQ-DP-APP-001: Application chain column (backfill for existing DBs) */
             sqlx::query("ALTER TABLE dialplan_rules ADD COLUMN app_chain TEXT NOT NULL DEFAULT '[]'")
                 .execute(pool).await.ok();
@@ -3181,48 +3199,109 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
                  ON dialplan_rules(profile_name, prio)")
         .execute(pool).await.ok();
 
-    // ================ ha_groups (high-availability groups) ================
+    // ================ ha_groups (high-availability groups — 双机主备 Active-Standby) ================
+    // 字段对齐 conf/ha配置.md 中的 yaml 配置模型
     let ha_ddl = match backend {
         "sqlite" => r#"
             CREATE TABLE IF NOT EXISTS ha_groups (
-                id                INTEGER PRIMARY KEY AUTOINCREMENT,
-                name              TEXT    NOT NULL UNIQUE,
-                enabled           INTEGER NOT NULL DEFAULT 1,
-                node_list_json    TEXT    NOT NULL DEFAULT '[]',
-                quorum            INTEGER NOT NULL DEFAULT 2,
-                election_timeout  INTEGER NOT NULL DEFAULT 5000,
-                state             TEXT    NOT NULL DEFAULT 'initializing',
-                description       TEXT    NOT NULL DEFAULT '',
-                created_at        TEXT    NOT NULL DEFAULT (datetime('now')),
-                updated_at        TEXT    NOT NULL DEFAULT (datetime('now'))
+                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                name                    TEXT    NOT NULL UNIQUE,
+                enabled                 INTEGER NOT NULL DEFAULT 0,
+                peer                    TEXT    NOT NULL DEFAULT '',
+                heartbeat_ms            INTEGER NOT NULL DEFAULT 500,
+                failover_ms             INTEGER NOT NULL DEFAULT 3000,
+                priority                INTEGER NOT NULL DEFAULT 100,
+                evlag_warn_ms           INTEGER NOT NULL DEFAULT 200,
+                evlag_fail_ms           INTEGER NOT NULL DEFAULT 1000,
+                cpu_warn_pct            INTEGER NOT NULL DEFAULT 80,
+                cpu_fail_pct            INTEGER NOT NULL DEFAULT 95,
+                replica_enabled         INTEGER NOT NULL DEFAULT 0,
+                replica_port            INTEGER NOT NULL DEFAULT 5071,
+                replica_ring_cap        INTEGER NOT NULL DEFAULT 8192,
+                replica_payload_max     INTEGER NOT NULL DEFAULT 4096,
+                replica_lag_warn        INTEGER NOT NULL DEFAULT 10000,
+                replica_full_resync_interval INTEGER NOT NULL DEFAULT 0,
+                bfd_enabled             INTEGER NOT NULL DEFAULT 0,
+                bfd_local_disc          INTEGER NOT NULL DEFAULT 1,
+                bfd_tx_interval         INTEGER NOT NULL DEFAULT 200,
+                bfd_rx_interval         INTEGER NOT NULL DEFAULT 200,
+                bfd_detect_mult         INTEGER NOT NULL DEFAULT 3,
+                hitless_enabled         INTEGER NOT NULL DEFAULT 0,
+                hitless_shm_prefix      TEXT    NOT NULL DEFAULT 'nsbc_ha_',
+                hitless_freeze_ms       INTEGER NOT NULL DEFAULT 1000,
+                hitless_timeout_ms      INTEGER NOT NULL DEFAULT 10000,
+                state                   TEXT    NOT NULL DEFAULT 'standby',
+                description             TEXT    NOT NULL DEFAULT '',
+                created_at              TEXT    NOT NULL DEFAULT (datetime('now')),
+                updated_at              TEXT    NOT NULL DEFAULT (datetime('now'))
             )
         "#,
         "postgres" => r#"
             CREATE TABLE IF NOT EXISTS ha_groups (
-                id                BIGSERIAL PRIMARY KEY,
-                name              TEXT    NOT NULL UNIQUE,
-                enabled           INTEGER NOT NULL DEFAULT 1,
-                node_list_json    TEXT   NOT NULL DEFAULT '[]',
-                quorum            INTEGER NOT NULL DEFAULT 2,
-                election_timeout  INTEGER NOT NULL DEFAULT 5000,
-                state             TEXT    NOT NULL DEFAULT 'initializing',
-                description       TEXT    NOT NULL DEFAULT '',
-                created_at        TEXT NOT NULL DEFAULT (to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD') || 'T' || to_char(NOW() AT TIME ZONE 'UTC', 'HH24:MI:SS.MS') || 'Z'),
-                updated_at        TEXT NOT NULL DEFAULT (to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD') || 'T' || to_char(NOW() AT TIME ZONE 'UTC', 'HH24:MI:SS.MS') || 'Z')
+                id                      BIGSERIAL PRIMARY KEY,
+                name                    TEXT    NOT NULL UNIQUE,
+                enabled                 INTEGER NOT NULL DEFAULT 0,
+                peer                    TEXT    NOT NULL DEFAULT '',
+                heartbeat_ms            INTEGER NOT NULL DEFAULT 500,
+                failover_ms             INTEGER NOT NULL DEFAULT 3000,
+                priority                INTEGER NOT NULL DEFAULT 100,
+                evlag_warn_ms           INTEGER NOT NULL DEFAULT 200,
+                evlag_fail_ms           INTEGER NOT NULL DEFAULT 1000,
+                cpu_warn_pct            INTEGER NOT NULL DEFAULT 80,
+                cpu_fail_pct            INTEGER NOT NULL DEFAULT 95,
+                replica_enabled         INTEGER NOT NULL DEFAULT 0,
+                replica_port            INTEGER NOT NULL DEFAULT 5071,
+                replica_ring_cap        INTEGER NOT NULL DEFAULT 8192,
+                replica_payload_max     INTEGER NOT NULL DEFAULT 4096,
+                replica_lag_warn        INTEGER NOT NULL DEFAULT 10000,
+                replica_full_resync_interval INTEGER NOT NULL DEFAULT 0,
+                bfd_enabled             INTEGER NOT NULL DEFAULT 0,
+                bfd_local_disc          INTEGER NOT NULL DEFAULT 1,
+                bfd_tx_interval         INTEGER NOT NULL DEFAULT 200,
+                bfd_rx_interval         INTEGER NOT NULL DEFAULT 200,
+                bfd_detect_mult         INTEGER NOT NULL DEFAULT 3,
+                hitless_enabled         INTEGER NOT NULL DEFAULT 0,
+                hitless_shm_prefix      TEXT    NOT NULL DEFAULT 'nsbc_ha_',
+                hitless_freeze_ms       INTEGER NOT NULL DEFAULT 1000,
+                hitless_timeout_ms      INTEGER NOT NULL DEFAULT 10000,
+                state                   TEXT    NOT NULL DEFAULT 'standby',
+                description             TEXT    NOT NULL DEFAULT '',
+                created_at              TEXT NOT NULL DEFAULT (to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD') || 'T' || to_char(NOW() AT TIME ZONE 'UTC', 'HH24:MI:SS.MS') || 'Z'),
+                updated_at              TEXT NOT NULL DEFAULT (to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD') || 'T' || to_char(NOW() AT TIME ZONE 'UTC', 'HH24:MI:SS.MS') || 'Z')
             )
         "#,
         _ => r#"
             CREATE TABLE IF NOT EXISTS ha_groups (
-                id                BIGINT AUTO_INCREMENT PRIMARY KEY,
-                name              VARCHAR(128) NOT NULL,
-                enabled           TINYINT(1)   NOT NULL DEFAULT 1,
-                node_list_json    JSON         NOT NULL,
-                quorum            INT          NOT NULL DEFAULT 2,
-                election_timeout  INT          NOT NULL DEFAULT 5000,
-                state             VARCHAR(32)  NOT NULL DEFAULT 'initializing',
-                description       VARCHAR(512) NOT NULL DEFAULT '',
-                created_at        DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-                updated_at        DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+                id                      BIGINT AUTO_INCREMENT PRIMARY KEY,
+                name                    VARCHAR(128) NOT NULL,
+                enabled                 TINYINT(1)   NOT NULL DEFAULT 0,
+                peer                    VARCHAR(128) NOT NULL DEFAULT '',
+                heartbeat_ms            INT          NOT NULL DEFAULT 500,
+                failover_ms             INT          NOT NULL DEFAULT 3000,
+                priority                INT          NOT NULL DEFAULT 100,
+                evlag_warn_ms           INT          NOT NULL DEFAULT 200,
+                evlag_fail_ms           INT          NOT NULL DEFAULT 1000,
+                cpu_warn_pct            INT          NOT NULL DEFAULT 80,
+                cpu_fail_pct            INT          NOT NULL DEFAULT 95,
+                replica_enabled         TINYINT(1)   NOT NULL DEFAULT 0,
+                replica_port            INT          NOT NULL DEFAULT 5071,
+                replica_ring_cap        INT          NOT NULL DEFAULT 8192,
+                replica_payload_max     INT          NOT NULL DEFAULT 4096,
+                replica_lag_warn        INT          NOT NULL DEFAULT 10000,
+                replica_full_resync_interval INT   NOT NULL DEFAULT 0,
+                bfd_enabled             TINYINT(1)   NOT NULL DEFAULT 0,
+                bfd_local_disc          INT          NOT NULL DEFAULT 1,
+                bfd_tx_interval         INT          NOT NULL DEFAULT 200,
+                bfd_rx_interval         INT          NOT NULL DEFAULT 200,
+                bfd_detect_mult         INT          NOT NULL DEFAULT 3,
+                hitless_enabled         TINYINT(1)   NOT NULL DEFAULT 0,
+                hitless_shm_prefix      VARCHAR(64)  NOT NULL DEFAULT 'nsbc_ha_',
+                hitless_freeze_ms       INT          NOT NULL DEFAULT 1000,
+                hitless_timeout_ms      INT          NOT NULL DEFAULT 10000,
+                state                   VARCHAR(32)  NOT NULL DEFAULT 'standby',
+                description             VARCHAR(512) NOT NULL DEFAULT '',
+                created_at              DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+                updated_at              DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
                 UNIQUE KEY uq_ha_name (name)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         "#,
@@ -4611,6 +4690,170 @@ sqlx::query(acct_ddl).execute(pool).await?;
              Rotate via nsbc-web API Key management page after first login.",
             raw_key,
         );
+    }
+
+    // ================================================================
+    //  AI backend registry — 2026-11-19 NEW TABLE
+    //  Stores per-AI-provider configuration. Dialplan rules reference
+    //  ai_backends by name (e.g. target='local:ai:default'). The Go
+    //  ai_agent_daemon reads this table via nsbc-web HTTP API so operators
+    //  can change ASR/TTS/LLM endpoints + credentials without restarting.
+    // ================================================================
+    let ai_backend_ddl = match backend {
+        "sqlite" =>
+            "CREATE TABLE IF NOT EXISTS ai_backends (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                name             TEXT    NOT NULL UNIQUE,
+                description      TEXT,
+
+                -- nsbc-web connection (ai_agent reads this to talk back)
+                nsb_web_url      TEXT    NOT NULL DEFAULT 'https://127.0.0.1:443',
+                nsb_web_token    TEXT,
+                transport        TEXT    NOT NULL DEFAULT 'https',
+                insecure         INTEGER NOT NULL DEFAULT 1,
+
+                -- LLM
+                llm_provider     TEXT    NOT NULL DEFAULT 'mock',
+                llm_api_key      TEXT,
+                llm_model        TEXT    DEFAULT 'gpt-4o-mini',
+                llm_endpoint     TEXT,
+
+                -- ASR
+                asr_provider     TEXT    NOT NULL DEFAULT 'nway',
+                asr_addr         TEXT    DEFAULT '127.0.0.1:8089',
+
+                -- TTS
+                tts_provider     TEXT    NOT NULL DEFAULT 'nway',
+                tts_addr         TEXT    DEFAULT '127.0.0.1:8090',
+
+                -- Agent behaviour
+                transfer_dest    TEXT,
+                barge_in         INTEGER NOT NULL DEFAULT 1,
+                vad_threshold    TEXT    DEFAULT 'default',
+                record_dir       TEXT    DEFAULT 'records',
+
+                enabled          INTEGER NOT NULL DEFAULT 1,
+                updated_at       TEXT    NOT NULL DEFAULT (datetime('now'))
+            )",
+        "postgres" =>
+            "CREATE TABLE IF NOT EXISTS ai_backends (
+                id               BIGSERIAL PRIMARY KEY,
+                name             VARCHAR(64) NOT NULL UNIQUE,
+                description      TEXT,
+
+                nsb_web_url      VARCHAR(512) NOT NULL DEFAULT 'https://127.0.0.1:443',
+                nsb_web_token    TEXT,
+                transport        VARCHAR(16) NOT NULL DEFAULT 'https',
+                insecure         INTEGER NOT NULL DEFAULT 1,
+
+                llm_provider     VARCHAR(32) NOT NULL DEFAULT 'mock',
+                llm_api_key      TEXT,
+                llm_model        VARCHAR(128) DEFAULT 'gpt-4o-mini',
+                llm_endpoint     VARCHAR(512),
+
+                asr_provider     VARCHAR(32) NOT NULL DEFAULT 'nway',
+                asr_addr         VARCHAR(128) DEFAULT '127.0.0.1:8089',
+
+                tts_provider     VARCHAR(32) NOT NULL DEFAULT 'nway',
+                tts_addr         VARCHAR(128) DEFAULT '127.0.0.1:8090',
+
+                transfer_dest    VARCHAR(64),
+                barge_in         INTEGER NOT NULL DEFAULT 1,
+                vad_threshold    VARCHAR(16) DEFAULT 'default',
+                record_dir       VARCHAR(256) DEFAULT 'records',
+
+                enabled          INTEGER NOT NULL DEFAULT 1,
+                updated_at       TEXT NOT NULL DEFAULT (to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD') || 'T' || to_char(NOW() AT TIME ZONE 'UTC', 'HH24:MI:SS.MS') || 'Z')
+            )",
+        _ =>  /* mysql */
+            "CREATE TABLE IF NOT EXISTS ai_backends (
+                id               BIGINT AUTO_INCREMENT PRIMARY KEY,
+                name             VARCHAR(64) NOT NULL UNIQUE,
+                description      TEXT,
+
+                nsb_web_url      VARCHAR(512) NOT NULL DEFAULT 'https://127.0.0.1:443',
+                nsb_web_token    TEXT,
+                transport        VARCHAR(16) NOT NULL DEFAULT 'https',
+                insecure         TINYINT(1)   NOT NULL DEFAULT 1,
+
+                llm_provider     VARCHAR(32) NOT NULL DEFAULT 'mock',
+                llm_api_key      TEXT,
+                llm_model        VARCHAR(128) DEFAULT 'gpt-4o-mini',
+                llm_endpoint     VARCHAR(512),
+
+                asr_provider     VARCHAR(32) NOT NULL DEFAULT 'nway',
+                asr_addr         VARCHAR(128) DEFAULT '127.0.0.1:8089',
+
+                tts_provider     VARCHAR(32) NOT NULL DEFAULT 'nway',
+                tts_addr         VARCHAR(128) DEFAULT '127.0.0.1:8090',
+
+                transfer_dest    VARCHAR(64),
+                barge_in         TINYINT(1)   NOT NULL DEFAULT 1,
+                vad_threshold    VARCHAR(16) DEFAULT 'default',
+                record_dir       VARCHAR(256) DEFAULT 'records',
+
+                enabled          TINYINT(1)   NOT NULL DEFAULT 1,
+                updated_at       DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )",
+    };
+    sqlx::query(ai_backend_ddl).execute(pool).await?;
+
+    // 种子：ai_backends 为空时自动插入一条 name='default' 的默认配置
+    // 这样 dialplan 规则 target='local:ai' 或 'local:ai:default' 立即可用
+    let ai_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM ai_backends")
+        .fetch_one(pool).await.unwrap_or((0,));
+    if ai_count.0 == 0 {
+        let seed_sql = match backend {
+            "postgres" =>
+                "INSERT INTO ai_backends (name, description, llm_provider, transfer_dest) \
+                 VALUES ('default', '默认 AI 后端 — 首次启动自动创建，可在 AI 配置页修改', 'mock', '1007') \
+                 ON CONFLICT (name) DO NOTHING",
+            _ =>
+                "INSERT OR IGNORE INTO ai_backends (name, description, llm_provider, transfer_dest) \
+                 VALUES ('default', '默认 AI 后端 — 首次启动自动创建，可在 AI 配置页修改', 'mock', '1007')",
+        };
+        let _ = sqlx::query(seed_sql).execute(pool).await;
+        tracing::info!("🤖 ai_backends: seeded default backend (name='default', llm=mock, transfer=1007)");
+    }
+
+    // 种子：dialplan_rules 为空时自动插入 9999 → local:ai 默认入口
+    // ★ prio 必须=0（全局最高优先级）——C 端 dp_execute 排序是 prio 升序，
+    //   命中第一条就 return。若 9999 规则 prio 比通配 ^\d{4}$ 大，9999 永远被通配先抢。
+    // ★ app_chain 必须是 [{"app":"ai","data":""}] — 空数组 ai_dialog 不执行。
+    // 迁移 UPDATE 同时修已有 DB 的 prio 和 app_chain。
+    let dp_fix = sqlx::query(
+        "UPDATE dialplan_rules SET prio=0, app_chain='[{\"app\":\"ai\",\"data\":\"\"}]' \
+         WHERE match_expr='^9999$' AND target='local:ai'"
+    ).execute(pool).await;
+    if let Ok(ur) = dp_fix {
+        if ur.rows_affected() > 0 {
+            tracing::info!("📞 dialplan_rules: fixed {} AI rule rows (prio→0, app_chain→ai)", ur.rows_affected());
+        }
+    }
+
+    let dp_count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM dialplan_rules WHERE match_expr='^9999$' AND target='local:ai'"
+    ).fetch_one(pool).await.unwrap_or((0,));
+    if dp_count.0 == 0 {
+        let seed_dp = match backend {
+            "postgres" =>
+                "INSERT INTO dialplan_rules
+                    (tenant_id, name, profile_name, match_expr, caller_match, prio, strip, target,
+                     action_json, app_chain, enabled, description)
+                 VALUES
+                    (1, '默认 AI 入口 9999', 'internal', '^9999$', '', 0, 0, 'local:ai',
+                     '{}', '[{\"app\":\"ai\",\"data\":\"\"}]', 1, '首次启动自动创建 — 分机拨 9999 进入 AI 对话（依赖 ai_backends 表 default 行）')
+                 ON CONFLICT (tenant_id, name) DO NOTHING",
+            _ =>
+                "INSERT OR IGNORE INTO dialplan_rules
+                    (tenant_id, name, profile_name, match_expr, caller_match, prio, strip, target,
+                     action_json, app_chain, enabled, description)
+                 VALUES
+                    (1, '默认 AI 入口 9999', 'internal', '^9999$', '', 0, 0, 'local:ai',
+                     '{}', '[{\"app\":\"ai\",\"data\":\"\"}]', 1, '首次启动自动创建 — 分机拨 9999 进入 AI 对话（依赖 ai_backends 表 default 行）')",
+        };
+        let _ = sqlx::query(seed_dp).execute(pool).await;
+        tracing::info!("📞 dialplan_rules: seeded default AI entry (9999 → local:ai, app_chain=[ai], prio=0)");
     }
 
     Ok(())
@@ -6130,6 +6373,9 @@ pub struct DialplanRule {
     pub force_precondition: i64,
     pub force_timer:       i64,
     pub force_gruu:        i64,
+    /* REQ-DP-TIMEOUT-001：dialplan 规则级 per-call timeout override（秒，0=不限/走全局） */
+    pub sched_hangup_s:           i64,
+    pub originate_call_timeout_s: i64,
     #[serde(with = "json_text_as_value")]
     pub action_json:    String,
     /* REQ-DP-APP-001: Application chain JSON array — pushed to C side dp_json_parse_one on reload.
@@ -6179,6 +6425,11 @@ pub struct DialplanRuleCreate {
     pub force_timer:       i64,
     #[serde(default)]
     pub force_gruu:        i64,
+    /* REQ-DP-TIMEOUT-001：dialplan 规则级 per-call timeout override（秒，0=不限/走全局） */
+    #[serde(default)]
+    pub sched_hangup_s:           i64,
+    #[serde(default)]
+    pub originate_call_timeout_s: i64,
     #[serde(default = "default_empty_json")]
     pub action_json:    String,
     /* REQ-DP-APP-001: default empty array (skip when no app_chain) */
@@ -6211,12 +6462,137 @@ pub struct DialplanRuleUpdate {
     pub force_precondition: Option<i64>,
     pub force_timer:       Option<i64>,
     pub force_gruu:        Option<i64>,
+    /* REQ-DP-TIMEOUT-001：dialplan 规则级 per-call timeout override */
+    pub sched_hangup_s:           Option<i64>,
+    pub originate_call_timeout_s: Option<i64>,
     pub action_json:    Option<String>,
     /* REQ-DP-APP-001 */
     pub app_chain:      Option<String>,
     pub enabled:        Option<bool>,
     pub description:    Option<String>,
 }
+
+// ===== ai_backends =====  (2026-11-19 NEW)
+
+#[derive(Clone, Debug, Default, sqlx::FromRow, serde::Serialize)]
+pub struct AiBackend {
+    pub id: i64,
+    pub name: String,
+    pub description: Option<String>,
+
+    pub nsb_web_url: String,
+    pub nsb_web_token: Option<String>,
+    pub transport: String,
+    #[serde(serialize_with = "bool_i64::serialize")]
+    pub insecure: i64,
+
+    pub llm_provider: String,
+    pub llm_api_key: Option<String>,
+    pub llm_model: Option<String>,
+    pub llm_endpoint: Option<String>,
+
+    pub asr_provider: String,
+    pub asr_addr: Option<String>,
+
+    pub tts_provider: String,
+    pub tts_addr: Option<String>,
+
+    pub transfer_dest: Option<String>,
+    #[serde(serialize_with = "bool_i64::serialize")]
+    pub barge_in: i64,
+    pub vad_threshold: Option<String>,
+    pub record_dir: Option<String>,
+
+    #[serde(serialize_with = "bool_i64::serialize")]
+    pub enabled: i64,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct AiBackendCreate {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+
+    #[serde(default = "default_https_url")]
+    pub nsb_web_url: String,
+    #[serde(default)]
+    pub nsb_web_token: Option<String>,
+    #[serde(default = "default_https")]
+    pub transport: String,
+    #[serde(default = "default_true")]
+    pub insecure: bool,
+
+    #[serde(default = "default_mock")]
+    pub llm_provider: String,
+    #[serde(default)]
+    pub llm_api_key: Option<String>,
+    #[serde(default = "default_gpt_model")]
+    pub llm_model: Option<String>,
+    #[serde(default)]
+    pub llm_endpoint: Option<String>,
+
+    #[serde(default = "default_nway")]
+    pub asr_provider: String,
+    #[serde(default = "default_asr_addr")]
+    pub asr_addr: Option<String>,
+
+    #[serde(default = "default_nway")]
+    pub tts_provider: String,
+    #[serde(default = "default_tts_addr")]
+    pub tts_addr: Option<String>,
+
+    #[serde(default)]
+    pub transfer_dest: Option<String>,
+    #[serde(default = "default_true")]
+    pub barge_in: bool,
+    #[serde(default = "default_vad")]
+    pub vad_threshold: Option<String>,
+    #[serde(default = "default_record_dir")]
+    pub record_dir: Option<String>,
+
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct AiBackendUpdate {
+    pub name: Option<String>,
+    pub description: Option<String>,
+
+    pub nsb_web_url: Option<String>,
+    pub nsb_web_token: Option<String>,
+    pub transport: Option<String>,
+    pub insecure: Option<bool>,
+
+    pub llm_provider: Option<String>,
+    pub llm_api_key: Option<String>,
+    pub llm_model: Option<String>,
+    pub llm_endpoint: Option<String>,
+
+    pub asr_provider: Option<String>,
+    pub asr_addr: Option<String>,
+
+    pub tts_provider: Option<String>,
+    pub tts_addr: Option<String>,
+
+    pub transfer_dest: Option<String>,
+    pub barge_in: Option<bool>,
+    pub vad_threshold: Option<String>,
+    pub record_dir: Option<String>,
+
+    pub enabled: Option<bool>,
+}
+
+fn default_https_url() -> String { "https://127.0.0.1:443".to_string() }
+fn default_https() -> String { "https".to_string() }
+fn default_mock() -> String { "mock".to_string() }
+fn default_gpt_model() -> Option<String> { Some("gpt-4o-mini".to_string()) }
+fn default_nway() -> String { "nway".to_string() }
+fn default_asr_addr() -> Option<String> { Some("127.0.0.1:8089".to_string()) }
+fn default_tts_addr() -> Option<String> { Some("127.0.0.1:8090".to_string()) }
+fn default_vad() -> Option<String> { Some("default".to_string()) }
+fn default_record_dir() -> Option<String> { Some("records".to_string()) }
 
 fn default_priority() -> String { "priority".to_string() }
 fn default_empty_json() -> String { "{}".to_string() }
@@ -6234,36 +6610,99 @@ fn default_ext() -> String { "ext".to_string() }
 /* §15 RFC1918 intranet subnets default IP admission (toll fraud prevention) */
 fn default_rfc1918() -> String { RFC1918_CIDR_DEFAULT.to_string() }
 
-// ---------- ha_groups CRUD ----------
+// ---------- ha_groups CRUD (对齐 conf/ha配置.md 双机主备 Active-Standby 模型) ----------
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct HaGroup {
-    pub id:              i64,
-    pub name:            String,
+    pub id:                     i64,
+    pub name:                   String,
     #[serde(serialize_with = "bool_i64::serialize")]
-    pub enabled:         i64,
-    pub node_list_json:  String,
-    pub quorum:          i64,
-    pub election_timeout: i64,
-    pub state:           String,
-    pub description:     String,
-    pub created_at:      String,
-    pub updated_at:      String,
+    pub enabled:                i64,
+    pub peer:                   String,
+    pub heartbeat_ms:           i64,
+    pub failover_ms:            i64,
+    pub priority:               i64,
+    pub evlag_warn_ms:          i64,
+    pub evlag_fail_ms:          i64,
+    pub cpu_warn_pct:           i64,
+    pub cpu_fail_pct:           i64,
+    #[serde(serialize_with = "bool_i64::serialize")]
+    pub replica_enabled:        i64,
+    pub replica_port:           i64,
+    pub replica_ring_cap:       i64,
+    pub replica_payload_max:    i64,
+    pub replica_lag_warn:       i64,
+    pub replica_full_resync_interval: i64,
+    #[serde(serialize_with = "bool_i64::serialize")]
+    pub bfd_enabled:            i64,
+    pub bfd_local_disc:         i64,
+    pub bfd_tx_interval:        i64,
+    pub bfd_rx_interval:        i64,
+    pub bfd_detect_mult:        i64,
+    #[serde(serialize_with = "bool_i64::serialize")]
+    pub hitless_enabled:        i64,
+    pub hitless_shm_prefix:     String,
+    pub hitless_freeze_ms:      i64,
+    pub hitless_timeout_ms:     i64,
+    pub state:                  String,
+    pub description:            String,
+    pub created_at:             String,
+    pub updated_at:             String,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HaGroupCreate {
     pub name:             String,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub enabled:          bool,
-    #[serde(default = "default_empty_json")]
-    pub node_list_json:   String,
-    #[serde(default = "default_2")]
-    pub quorum:           i64,
-    #[serde(default = "default_5000")]
-    pub election_timeout: i64,
-    #[serde(default = "default_initializing")]
+    #[serde(default)]
+    pub peer:             String,
+    #[serde(default = "default_500")]
+    pub heartbeat_ms:     i64,
+    #[serde(default = "default_3000")]
+    pub failover_ms:      i64,
+    #[serde(default = "default_100")]
+    pub priority:         i64,
+    #[serde(default = "default_evlag_warn")]
+    pub evlag_warn_ms:    i64,
+    #[serde(default = "default_evlag_fail")]
+    pub evlag_fail_ms:    i64,
+    #[serde(default = "default_cpu_warn")]
+    pub cpu_warn_pct:     i64,
+    #[serde(default = "default_cpu_fail")]
+    pub cpu_fail_pct:     i64,
+    #[serde(default)]
+    pub replica_enabled:  bool,
+    #[serde(default = "default_5071")]
+    pub replica_port:     i64,
+    #[serde(default = "default_8192")]
+    pub replica_ring_cap: i64,
+    #[serde(default = "default_payload_max")]
+    pub replica_payload_max: i64,
+    #[serde(default = "default_10000")]
+    pub replica_lag_warn: i64,
+    #[serde(default)]
+    pub replica_full_resync_interval: i64,
+    #[serde(default)]
+    pub bfd_enabled:      bool,
+    #[serde(default = "default_ha_disc")]
+    pub bfd_local_disc:   i64,
+    #[serde(default = "default_ha_tx")]
+    pub bfd_tx_interval:  i64,
+    #[serde(default = "default_ha_rx")]
+    pub bfd_rx_interval:  i64,
+    #[serde(default = "default_ha_mult")]
+    pub bfd_detect_mult:  i64,
+    #[serde(default)]
+    pub hitless_enabled:  bool,
+    #[serde(default = "default_shm_prefix")]
+    pub hitless_shm_prefix: String,
+    #[serde(default = "default_ha_freeze")]
+    pub hitless_freeze_ms:   i64,
+    #[serde(default = "default_ha_timeout")]
+    pub hitless_timeout_ms:  i64,
+    #[serde(default = "default_standby")]
     pub state:            String,
     #[serde(default)]
     pub description:      String,
@@ -6272,17 +6711,54 @@ pub struct HaGroupCreate {
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HaGroupUpdate {
-    pub enabled:          Option<bool>,
-    pub node_list_json:   Option<String>,
-    pub quorum:           Option<i64>,
-    pub election_timeout: Option<i64>,
-    pub state:            Option<String>,
-    pub description:      Option<String>,
+    pub enabled:           Option<bool>,
+    pub peer:              Option<String>,
+    pub heartbeat_ms:      Option<i64>,
+    pub failover_ms:       Option<i64>,
+    pub priority:          Option<i64>,
+    pub evlag_warn_ms:     Option<i64>,
+    pub evlag_fail_ms:     Option<i64>,
+    pub cpu_warn_pct:      Option<i64>,
+    pub cpu_fail_pct:      Option<i64>,
+    pub replica_enabled:   Option<bool>,
+    pub replica_port:      Option<i64>,
+    pub replica_ring_cap:  Option<i64>,
+    pub replica_payload_max: Option<i64>,
+    pub replica_lag_warn:  Option<i64>,
+    pub replica_full_resync_interval: Option<i64>,
+    pub bfd_enabled:       Option<bool>,
+    pub bfd_local_disc:    Option<i64>,
+    pub bfd_tx_interval:   Option<i64>,
+    pub bfd_rx_interval:   Option<i64>,
+    pub bfd_detect_mult:   Option<i64>,
+    pub hitless_enabled:   Option<bool>,
+    pub hitless_shm_prefix: Option<String>,
+    pub hitless_freeze_ms:    Option<i64>,
+    pub hitless_timeout_ms:   Option<i64>,
+    pub state:             Option<String>,
+    pub description:       Option<String>,
 }
 
-fn default_2() -> i64 { 2 }
-fn default_5000() -> i64 { 5000 }
-fn default_initializing() -> String { "initializing".to_string() }
+fn default_evlag_warn() -> i64 { 200 }
+fn default_evlag_fail() -> i64 { 1000 }
+fn default_cpu_warn() -> i64 { 80 }
+fn default_cpu_fail() -> i64 { 95 }
+fn default_payload_max() -> i64 { 4096 }
+fn default_ha_rx() -> i64 { 200 }
+fn default_shm_prefix() -> String { "nsbc_ha_".to_string() }
+
+fn default_500() -> i64 { 500 }
+fn default_3000() -> i64 { 3000 }
+fn default_100() -> i64 { 100 }
+fn default_5071() -> i64 { 5071 }
+fn default_8192() -> i64 { 8192 }
+fn default_10000() -> i64 { 10000 }
+fn default_ha_disc() -> i64 { 1 }
+fn default_ha_tx() -> i64 { 200 }
+fn default_ha_mult() -> i64 { 3 }
+fn default_ha_freeze() -> i64 { 1000 }
+fn default_ha_timeout() -> i64 { 10000 }
+fn default_standby() -> String { "standby".to_string() }
 
 // ---------- time_groups CRUD ----------
 
@@ -6824,6 +7300,7 @@ pub struct BillingTransaction {
     pub created_at:     String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct BillingTransactionCreate {
     pub account_id:  i64,
@@ -7024,14 +7501,16 @@ impl Db {
                 (tenant_id, name, layer, profile_name, src_ip_cidr, match_expr, caller_match,
                  prio, strip, target, rec_action, rec_path_template, rec_fmt,
                  force_prack, force_precondition, force_timer, force_gruu,
+                 sched_hangup_s, originate_call_timeout_s,
                  action_json, app_chain, enabled, description)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
              RETURNING *"
         )
         .bind(c.tenant_id).bind(&c.name).bind(&c.layer).bind(&c.profile_name).bind(&c.src_ip_cidr)
         .bind(&c.match_expr).bind(&c.caller_match)
         .bind(c.prio).bind(c.strip).bind(&c.target).bind(c.rec_action).bind(&c.rec_path_template).bind(&c.rec_fmt)
         .bind(c.force_prack).bind(c.force_precondition).bind(c.force_timer).bind(c.force_gruu)
+        .bind(c.sched_hangup_s).bind(c.originate_call_timeout_s)
         .bind(&act).bind(&ac)
         .bind(c.enabled as i64).bind(&c.description)
         .fetch_one(pool).await
@@ -7065,6 +7544,8 @@ impl Db {
             }};
         }
 
+        set_ir!("tenant_id", u.tenant_id);
+        set_sr!("name", u.name.clone());
         set_sr!("layer", u.layer.clone());
         set_sr!("profile_name", u.profile_name.clone());
         set_sr!("src_ip_cidr", u.src_ip_cidr.clone());
@@ -7081,6 +7562,9 @@ impl Db {
         set_ir!("force_precondition", u.force_precondition);
         set_ir!("force_timer", u.force_timer);
         set_ir!("force_gruu", u.force_gruu);
+        /* REQ-DP-TIMEOUT-001：dialplan 规则级 per-call timeout override */
+        set_ir!("sched_hangup_s", u.sched_hangup_s);
+        set_ir!("originate_call_timeout_s", u.originate_call_timeout_s);
         set_sr!("action_json", u.action_json.clone());
         set_sr!("app_chain", u.app_chain.clone());  /* REQ-DP-APP-001 */
         set_br!("enabled", u.enabled);
@@ -7136,6 +7620,182 @@ impl Db {
         Ok(rows)
     }
 
+    // ===== ai_backends CRUD =====  (2026-11-19 NEW)
+
+    pub async fn list_ai_backends(
+        &self, enabled: Option<bool>, keyword: Option<&str>,
+    ) -> Result<Vec<AiBackend>, sqlx::Error> {
+        let Some(pool) = self.pool() else { return Ok(Vec::new()); };
+        let backend = self.backend();
+        let mut clauses: Vec<String> = Vec::new();
+        let mut binds: Vec<String> = Vec::new();
+        let mut idx: u32 = 0;
+
+        if let Some(v) = enabled {
+            idx += 1; clauses.push(format!("enabled = ${idx}"));
+            binds.push(if v { "1".into() } else { "0".into() });
+        }
+        if let Some(kw) = keyword {
+            let kw = kw.trim();
+            if !kw.is_empty() {
+                idx += 1;
+                clauses.push(format!("(name LIKE ${idx} OR description LIKE ${idx} OR llm_provider LIKE ${idx} OR asr_provider LIKE ${idx} OR tts_provider LIKE ${idx})"));
+                binds.push(format!("%{}%", kw));
+            }
+        }
+        let where_sql = if clauses.is_empty() { String::new() } else { "WHERE ".to_string() + &clauses.join(" AND ") };
+        let sql = fix_ph(&format!("SELECT * FROM ai_backends {where_sql} ORDER BY name"), backend);
+        let mut q = sqlx::query_as::<_, AiBackend>(&sql);
+        for b in &binds { q = q.bind(b.as_str()); }
+        q.fetch_all(pool).await
+    }
+
+    pub async fn get_ai_backend(&self, id: i64) -> Result<Option<AiBackend>, sqlx::Error> {
+        let Some(pool) = self.pool() else { return Ok(None); };
+        let backend = self.backend();
+        sqlx::query_as::<_, AiBackend>(&fix_ph("SELECT * FROM ai_backends WHERE id = $1", backend))
+            .bind(id).fetch_optional(pool).await
+    }
+
+    pub async fn get_ai_backend_by_name(&self, name: &str) -> Result<Option<AiBackend>, sqlx::Error> {
+        let Some(pool) = self.pool() else { return Ok(None); };
+        let backend = self.backend();
+        sqlx::query_as::<_, AiBackend>(&fix_ph("SELECT * FROM ai_backends WHERE name = $1", backend))
+            .bind(name).fetch_optional(pool).await
+    }
+
+    pub async fn create_ai_backend(&self, c: AiBackendCreate) -> Result<AiBackend, sqlx::Error> {
+        let pool = self.pool().ok_or(
+            sqlx::Error::Configuration("NSBC_DB_DSN not set".into())
+        )?;
+        let backend = self.backend();
+        let raw_sql = "INSERT INTO ai_backends
+            (name, description, nsb_web_url, nsb_web_token, transport, insecure,
+             llm_provider, llm_api_key, llm_model, llm_endpoint,
+             asr_provider, asr_addr,
+             tts_provider, tts_addr,
+             transfer_dest, barge_in, vad_threshold, record_dir,
+             enabled)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+         RETURNING *";
+
+        if backend == "mysql" {
+            let exec_sql = fix_ph(&strip_returning(raw_sql), backend);
+            sqlx::query(&exec_sql)
+                .bind(&c.name).bind(&c.description)
+                .bind(&c.nsb_web_url).bind(&c.nsb_web_token)
+                .bind(&c.transport).bind(c.insecure as i64)
+                .bind(&c.llm_provider).bind(&c.llm_api_key)
+                .bind(&c.llm_model).bind(&c.llm_endpoint)
+                .bind(&c.asr_provider).bind(&c.asr_addr)
+                .bind(&c.tts_provider).bind(&c.tts_addr)
+                .bind(&c.transfer_dest)
+                .bind(c.barge_in as i64)
+                .bind(&c.vad_threshold).bind(&c.record_dir)
+                .bind(c.enabled as i64)
+                .execute(pool).await?;
+            let row = sqlx::query_as::<_, AiBackend>(
+                "SELECT * FROM ai_backends WHERE id = LAST_INSERT_ID()"
+            ).fetch_one(pool).await?;
+            Ok(row)
+        } else {
+            let exec_sql = fix_ph(raw_sql, backend);
+            Ok(sqlx::query_as::<_, AiBackend>(&exec_sql)
+                .bind(&c.name).bind(&c.description)
+                .bind(&c.nsb_web_url).bind(&c.nsb_web_token)
+                .bind(&c.transport).bind(c.insecure as i64)
+                .bind(&c.llm_provider).bind(&c.llm_api_key)
+                .bind(&c.llm_model).bind(&c.llm_endpoint)
+                .bind(&c.asr_provider).bind(&c.asr_addr)
+                .bind(&c.tts_provider).bind(&c.tts_addr)
+                .bind(&c.transfer_dest)
+                .bind(c.barge_in as i64)
+                .bind(&c.vad_threshold).bind(&c.record_dir)
+                .bind(c.enabled as i64)
+                .fetch_one(pool).await?)
+        }
+    }
+
+    pub async fn update_ai_backend(
+        &self, id: i64, u: AiBackendUpdate,
+    ) -> Result<AiBackend, sqlx::Error> {
+        let pool = self.pool().ok_or(
+            sqlx::Error::Configuration("NSBC_DB_DSN not set".into())
+        )?;
+        let backend = self.backend();
+        let mut sets: Vec<String> = Vec::new();
+        let mut binds: Vec<String> = Vec::new();
+        let mut idx: u32 = 0;
+
+        macro_rules! set_s {
+            ($col:expr, $val:expr) => {{
+                if let Some(v) = $val { idx += 1; sets.push(format!("{} = ${idx}", $col)); binds.push(v); }
+            }};
+        }
+        macro_rules! set_b {
+            ($col:expr, $val:expr) => {{
+                if let Some(v) = $val { idx += 1; sets.push(format!("{} = CAST(${idx} AS INTEGER)", $col)); binds.push(if v { "1".into() } else { "0".into() }); }
+            }};
+        }
+
+        set_s!("name", u.name.clone());
+        set_s!("description", u.description.clone());
+        set_s!("nsb_web_url", u.nsb_web_url.clone());
+        set_s!("nsb_web_token", u.nsb_web_token.clone());
+        set_s!("transport", u.transport.clone());
+        set_b!("insecure", u.insecure);
+        set_s!("llm_provider", u.llm_provider.clone());
+        set_s!("llm_api_key", u.llm_api_key.clone());
+        set_s!("llm_model", u.llm_model.clone());
+        set_s!("llm_endpoint", u.llm_endpoint.clone());
+        set_s!("asr_provider", u.asr_provider.clone());
+        set_s!("asr_addr", u.asr_addr.clone());
+        set_s!("tts_provider", u.tts_provider.clone());
+        set_s!("tts_addr", u.tts_addr.clone());
+        set_s!("transfer_dest", u.transfer_dest.clone());
+        set_b!("barge_in", u.barge_in);
+        set_s!("vad_threshold", u.vad_threshold.clone());
+        set_s!("record_dir", u.record_dir.clone());
+        set_b!("enabled", u.enabled);
+
+        if sets.is_empty() {
+            return self.get_ai_backend(id).await.and_then(|r| r.ok_or_else(|| sqlx::Error::RowNotFound));
+        }
+        let ts = match backend {
+            "sqlite" => "datetime('now')",
+            "postgres" => "CAST(NOW() AS TEXT)",
+            _ => "CAST(CURRENT_TIMESTAMP(3) AS CHAR)",
+        };
+        sets.push(format!("updated_at = {ts}"));
+        let where_idx = idx + 1;
+        let raw_sql = format!("UPDATE ai_backends SET {} WHERE id = ${where_idx} RETURNING *", sets.join(", "));
+
+        if backend == "mysql" {
+            let exec_sql = fix_ph(&strip_returning(&raw_sql), backend);
+            let mut q = sqlx::query(&exec_sql);
+            for b in &binds { q = q.bind(b.as_str()); }
+            q = q.bind(id);
+            q.execute(pool).await?;
+            let row_sql = fix_ph("SELECT * FROM ai_backends WHERE id = $1", backend);
+            let row = sqlx::query_as::<_, AiBackend>(&row_sql).bind(id).fetch_one(pool).await?;
+            Ok(row)
+        } else {
+            let exec_sql = fix_ph(&raw_sql, backend);
+            let mut q = sqlx::query_as::<_, AiBackend>(&exec_sql);
+            for b in &binds { q = q.bind(b.as_str()); }
+            q = q.bind(id);
+            q.fetch_one(pool).await
+        }
+    }
+
+    pub async fn delete_ai_backend(&self, id: i64) -> Result<bool, sqlx::Error> {
+        let Some(pool) = self.pool() else { return Ok(false); };
+        let backend = self.backend();
+        let res = sqlx::query(&fix_ph("DELETE FROM ai_backends WHERE id = $1", backend))
+            .bind(id).execute(pool).await?;
+        Ok(res.rows_affected() > 0)
+    }
+
     // ===== ha_groups =====
 
     pub async fn list_ha_groups(
@@ -7186,17 +7846,25 @@ impl Db {
         let pool = self.pool().ok_or(sqlx::Error::Configuration("NSBC_DB_DSN not set".into()))?;
         let backend = self.backend();
         let is_mysql = backend == "mysql";
-        let nodes = if c.node_list_json.is_empty() { "[]".to_string() } else { c.node_list_json };
         let raw_sql = "INSERT INTO ha_groups
-                (name, enabled, node_list_json, quorum, election_timeout, state, description)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+                (name, enabled, peer, heartbeat_ms, failover_ms, priority,
+                 evlag_warn_ms, evlag_fail_ms, cpu_warn_pct, cpu_fail_pct,
+                 replica_enabled, replica_port, replica_ring_cap, replica_payload_max, replica_lag_warn, replica_full_resync_interval,
+                 bfd_enabled, bfd_local_disc, bfd_tx_interval, bfd_rx_interval, bfd_detect_mult,
+                 hitless_enabled, hitless_shm_prefix, hitless_freeze_ms, hitless_timeout_ms,
+                 state, description)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
              RETURNING *";
         if is_mysql {
             let plain_sql = strip_returning(raw_sql);
             let sql = fix_ph(&plain_sql, backend);
             let res = sqlx::query(&sql)
-                .bind(&c.name).bind(c.enabled as i64).bind(&nodes)
-                .bind(c.quorum).bind(c.election_timeout)
+                .bind(&c.name).bind(c.enabled as i64).bind(&c.peer)
+                .bind(c.heartbeat_ms).bind(c.failover_ms).bind(c.priority)
+                .bind(c.evlag_warn_ms).bind(c.evlag_fail_ms).bind(c.cpu_warn_pct).bind(c.cpu_fail_pct)
+                .bind(c.replica_enabled as i64).bind(c.replica_port).bind(c.replica_ring_cap).bind(c.replica_payload_max).bind(c.replica_lag_warn).bind(c.replica_full_resync_interval)
+                .bind(c.bfd_enabled as i64).bind(c.bfd_local_disc).bind(c.bfd_tx_interval).bind(c.bfd_rx_interval).bind(c.bfd_detect_mult)
+                .bind(c.hitless_enabled as i64).bind(&c.hitless_shm_prefix).bind(c.hitless_freeze_ms).bind(c.hitless_timeout_ms)
                 .bind(&c.state).bind(&c.description)
                 .execute(pool).await?;
             let id = res.last_insert_id();
@@ -7205,8 +7873,12 @@ impl Db {
         }
         let sql = fix_ph(raw_sql, backend);
         sqlx::query_as::<_, HaGroup>(&sql)
-        .bind(&c.name).bind(c.enabled as i64).bind(&nodes)
-        .bind(c.quorum).bind(c.election_timeout)
+        .bind(&c.name).bind(c.enabled as i64).bind(&c.peer)
+        .bind(c.heartbeat_ms).bind(c.failover_ms).bind(c.priority)
+        .bind(c.evlag_warn_ms).bind(c.evlag_fail_ms).bind(c.cpu_warn_pct).bind(c.cpu_fail_pct)
+        .bind(c.replica_enabled as i64).bind(c.replica_port).bind(c.replica_ring_cap).bind(c.replica_payload_max).bind(c.replica_lag_warn).bind(c.replica_full_resync_interval)
+        .bind(c.bfd_enabled as i64).bind(c.bfd_local_disc).bind(c.bfd_tx_interval).bind(c.bfd_rx_interval).bind(c.bfd_detect_mult)
+        .bind(c.hitless_enabled as i64).bind(&c.hitless_shm_prefix).bind(c.hitless_freeze_ms).bind(c.hitless_timeout_ms)
         .bind(&c.state).bind(&c.description)
         .fetch_one(pool).await
     }
@@ -7236,9 +7908,29 @@ impl Db {
         }
 
         set_br!("enabled", u.enabled);
-        set_sr!("node_list_json", u.node_list_json.clone());
-        set_ir!("quorum", u.quorum);
-        set_ir!("election_timeout", u.election_timeout);
+        set_sr!("peer", u.peer.clone());
+        set_ir!("heartbeat_ms", u.heartbeat_ms);
+        set_ir!("failover_ms", u.failover_ms);
+        set_ir!("priority", u.priority);
+        set_ir!("evlag_warn_ms", u.evlag_warn_ms);
+        set_ir!("evlag_fail_ms", u.evlag_fail_ms);
+        set_ir!("cpu_warn_pct", u.cpu_warn_pct);
+        set_ir!("cpu_fail_pct", u.cpu_fail_pct);
+        set_br!("replica_enabled", u.replica_enabled);
+        set_ir!("replica_port", u.replica_port);
+        set_ir!("replica_ring_cap", u.replica_ring_cap);
+        set_ir!("replica_payload_max", u.replica_payload_max);
+        set_ir!("replica_lag_warn", u.replica_lag_warn);
+        set_ir!("replica_full_resync_interval", u.replica_full_resync_interval);
+        set_br!("bfd_enabled", u.bfd_enabled);
+        set_ir!("bfd_local_disc", u.bfd_local_disc);
+        set_ir!("bfd_tx_interval", u.bfd_tx_interval);
+        set_ir!("bfd_rx_interval", u.bfd_rx_interval);
+        set_ir!("bfd_detect_mult", u.bfd_detect_mult);
+        set_br!("hitless_enabled", u.hitless_enabled);
+        set_sr!("hitless_shm_prefix", u.hitless_shm_prefix.clone());
+        set_ir!("hitless_freeze_ms", u.hitless_freeze_ms);
+        set_ir!("hitless_timeout_ms", u.hitless_timeout_ms);
         set_sr!("state", u.state.clone());
         set_sr!("description", u.description.clone());
 
@@ -8464,7 +9156,7 @@ pub async fn settle_billing(&self, account_id: i64, call_id: &str, charge_uc: i6
     let new_balance = acct.balance_uc - charge_uc;
 
     // Update account (deduct charge)
-    let is_mysql = backend == "mysql";
+    let _is_mysql = backend == "mysql";  /* 预留（PostgreSQL 用 $1/$2，MySQL 用 ?） */
     let update_sql_raw = format!(
         "UPDATE accounts SET balance_uc = balance_uc - $1, updated_at = {ts} WHERE id = $2"
     );

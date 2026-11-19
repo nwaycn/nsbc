@@ -71,6 +71,7 @@ impl ApiKeyScope {
 /// 通过 request extension 向下游 handler 传递已鉴权的 key 信息
 #[derive(Debug, Clone)]
 pub struct ExtKeyClaims {
+    #[allow(dead_code)]
     pub label: String,
     pub scope: ApiKeyScope,
 }
@@ -162,6 +163,7 @@ pub async fn require_ext_key<C: crate::coreclient::CoreApi + Clone + 'static>(
     Ok(next.run(req).await)
 }
 
+#[allow(dead_code)]
 /// 辅助：从 Request extensions 取 scope，不够权限则 403
 pub fn check_scope<B>(req: &Request<B>, need: ApiKeyScope) -> Result<(), ApiError> {
     let claims = req

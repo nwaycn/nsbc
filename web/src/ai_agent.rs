@@ -80,7 +80,7 @@ where
 ///   uuid_mute command expects a b2b_leg.callid string — they are different. We need to maintain
 ///   a mapping table on the Rust side.
 async fn handle_vad_event<C>(
-    state: &Arc<AppState<C>>,
+    _state: &Arc<AppState<C>>,
     raw: &str,
 ) -> Result<(), String>
 where

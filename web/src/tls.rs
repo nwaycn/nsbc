@@ -379,7 +379,7 @@ fn read_cert_meta(cert_path: &Path) -> Result<Option<f64>, String> {
 #[cfg(feature = "acme")]
 async fn init_public_acme(
     tls: &TlsSection,
-    bind: SocketAddr,
+    _bind: SocketAddr,
 ) -> Result<TlsSource, String> {
     if tls.domain.is_empty() {
         return Err("tls.domain must be set when public=true".into());
@@ -536,6 +536,7 @@ async fn init_public_acme(
     Ok(TlsSource::Public { rustls_config: Arc::new(rustls_config) })
 }
 
+#[allow(dead_code)]
 fn fnv1a(data: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for &b in data {

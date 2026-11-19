@@ -1,5 +1,11 @@
 //! Web DB → C core full configuration push (REQ-DATA-SVC-003, hybrid sync S4/S5).
 //!
+//! NOTE: All public fn in this module are **reserved API surface** — they are
+//! compiled, type-checked, and ready for the S4/S5 wiring, but currently only
+//! `spawn_push_single` is called from route handlers. `#[allow(dead_code)]` is
+//! intentional, not accidental.
+#![allow(dead_code)]
+//!
 //! Data flow: Web database (sqlite/postgres/mysql) is the single source of truth →
 //! control.sock `*.reload <json>` command → C-side in-memory table whole-table replacement.
 //!

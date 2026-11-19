@@ -170,6 +170,14 @@ struct b2b_call {
     int hangup_by;
     uint32_t dump_mark;
     tw_node_t noanswer_node;
+    /* REQ-ORIGINATE-005：originate 呼出通话时长上限 timer。
+     * 仅 originate 创建的 call 会 arm 这个节点（co->cfg.originate_caller_timeout_ms > 0）。
+     * call_destroy catch-all 里 disarm。 */
+    tw_node_t call_limit_node;
+    /* REQ-DP-TIMEOUT-001：接通后应用层硬上限 timer（无论入站还是 originate 都可 arm）。
+     * 优先级链：call->sched_hangup_ms_override > cfg fallback（originate 走 cfg.originate_caller_timeout_ms，
+     * 入站走 0=不限制，Session Timer 继续生效）。 */
+    tw_node_t sched_hangup_node;
     uint64_t start_ms;
     uint64_t answer_ms;
     int redirect_count;
@@ -198,6 +206,10 @@ struct b2b_call {
     /* REQ-MEDIA-DP-001：拨号规则级媒体模式 override（0=auto,1=bypass,2=relay）
      * media_bridge 在 bridge_decide 时从 call 里读，WebRTC 强制 SRTP_RELAY 不受影响 */
     uint8_t media_mode;
+    /* ★ 单腿本地媒体（AI 内循环）：dialplan target="local:..." 时置 1。
+     * b2bua 见 1 → 不建 B 腿，直接对 A 腿 200 OK（SDP 由 media_bridge 单腿
+     * relay 生成），媒体由 ai/ai_dialog app 在 A 腿上消费/注入。 */
+    uint8_t local_media;
     /* ★ 拨号规则级 3GPP IMS 强制覆盖（从 dp_result_t 透传，三态：0=auto/1=开/2=关）
      * 优先级链：call->force_* (dialplan route) → call->prof->enable_* (profile) → 默认
      * 例：IMS 中继 route 强制 force_precondition=1，老 PSTN 中继强制 force_precondition=2 */
@@ -269,6 +281,17 @@ struct b2b_call {
     /* REQ-ORIGINATE-001：per-call noanswer timer override（毫秒）。
      * >0 覆盖 co->cfg.ring_noanswer_ms；<=0 走全局（memset 默认 0 不影响入站 INVITE）。 */
     int noanswer_ms_override;
+    /* REQ-DP-TIMEOUT-001：B-leg ringing 期 per-call override（毫秒）。
+     * 仅对 originate 创建的 call 有意义；>0 时 arm_noanswer_timer 优先使用此值，
+     * 否则走 cfg.originate_call_timeout_ms（默认 50s），入站 INVITE 不受影响。 */
+    int originate_call_timeout_ms_override;
+    /* REQ-DP-TIMEOUT-001：接通后 sched_hangup per-call override（毫秒）。
+     * >0 → 强制 arm sched_hangup_node；<=0 走 decide_sched_hangup_ms 决策链。 */
+    int sched_hangup_ms_override;
+    /* REQ-ORIGINATE-005：originate 创建的 call 标志。
+     * 0=入站 INVITE 创建（Session Timer 控制通话时长）；
+     * 1=b2b_originate 创建（走 co->cfg.originate_caller_timeout_ms 控制）。 */
+    uint8_t originate_created;
     /* REQ-ORIGINATE-003 待补：originate 尾随 app（&park/&hangup/&echo）。
      * 取值 B2B_APP_*；B2B_APP_NONE 表示普通外呼（无后置动作）。 */
     int post_app;
@@ -391,6 +414,14 @@ typedef struct {
      * cdr_emit / media_view —— 都从 cfg 单槽改成了 b2bua.c 全局 hook 链 */
     /* PBX 基础 */
     uint32_t ring_noanswer_ms;
+    /* REQ-DP-TIMEOUT-001：originate 发起 B-leg 等待接通的默认超时（毫秒）。
+     * 默认 50s（比全局 ring_noanswer_timeout_s=60s 短，外呼更积极失败）；
+     * 0=回退用 ring_noanswer_ms；dialplan rule 或 OAM brace var 可覆盖。 */
+    uint32_t originate_call_timeout_ms;
+    /* REQ-ORIGINATE-005：originate 呼出后的最长通话时长（毫秒）。
+     * 默认 0 = 不限制；>0 则 originate 的双腿都 answer 后 arm 一个 timer，
+     * 到期自动 b2b_terminate(c, 486)。入站 INVITE 不受此值影响。 */
+    uint32_t originate_caller_timeout_ms;
     int auto_redirect_302;
     int max_redirects;
     /* 并发硬限制 */
@@ -466,6 +497,14 @@ typedef struct {
      * 正数 = 覆盖全局）。arm_noanswer_timer() 会自动读 call->noanswer_ms_override。
      * 对应 FS 变量 originate_timeout（秒，我们自动 ×1000）。 */
     int timeout_ms;
+    /* REQ-DP-TIMEOUT-001：OAM brace var 新支持 — 接通后最大通话时长（秒）。
+     * brace {sched_hangup=3600} → 3600s；0=走全局默认（originate 走 cfg.originate_caller_timeout_ms，
+     * 入站走 0=不限）。最终 ×1000 写进 call->sched_hangup_ms_override。 */
+    int sched_hangup_s;
+    /* REQ-DP-TIMEOUT-001：OAM brace var 新支持 — B-leg 等待接通超时（秒）。
+     * brace {originate_call_timeout=30} → 30s；0=走 cfg.originate_call_timeout_ms（默认 50s）。
+     * 最终 ×1000 写进 call->originate_call_timeout_ms_override。 */
+    int originate_call_timeout_s;
     /* REQ-ORIGINATE-001：可选主叫号覆盖（替换 from_user）。
      * 空串/NULL = 用 from_user。仅影响 originate 构造的 From/Contact 头。
      * 对应 FS 变量 origination_caller_id_number / effective_caller_id_number。

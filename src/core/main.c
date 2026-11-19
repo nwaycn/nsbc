@@ -235,9 +235,15 @@ static void on_cfg_event(cfg_event_t ev, const char *detail, void *ud)
      * 有订阅者）。 */
     if ((ev == CFG_EV_RELOAD_SUCCESS || ev == CFG_EV_CHANGED ||
          ev == CFG_EV_ROLLBACK) && c && c->cfg) {
-        long lv = 4; /* LOG_WARN：生产环境默认 WARN（>=4），避免每 INVITE 一条 INFO 打爆 IO */
-        cfg_get_int(c->cfg, "log.level", &lv, NULL);
-        log_set_level((log_level_t)lv);
+        /* ★ P0 FIX: 只有 cfg_get_int 真正找到 log.level key 才生效。
+         * 之前 lv=4(LOG_WARN) 做默认值，找不到 key 时 cfg_get_int 返回
+         * NSBC_NOENT 但 lv 已经是 4 —— 每次 reload 把日志级别压到 WARN。
+         * 2026-11-16 现场：启动 INFO → reload → WARN → media_bridge FWD
+         * 诊断 (LOG_INFO) 全停 → 看起来像"日志断流"，实际只是级别不够。 */
+        long lv;
+        if (cfg_get_int(c->cfg, "log.level", &lv, NULL) == NSBC_OK) {
+            log_set_level((log_level_t)lv);
+        }
     }
     if (c && c->event_fn)
         c->event_fn(5, name, "%s", detail ? detail : "-");  /* NOTICE 级：配置变更值得留意 */
@@ -295,7 +301,7 @@ static int build_arenas(nsbc_ctx_t *c)
         mem_domain_t dom;
         size_t dflt_mb;
     } map[] = {
-        {"mem.signal_mb", MEM_DOMAIN_SIGNAL, 512},
+        {"mem.signal_mb", MEM_DOMAIN_SIGNAL, 4096},
         {"mem.packet_mb", MEM_DOMAIN_PACKET, 1024},
         {"mem.media_mb", MEM_DOMAIN_MEDIA, 512},
         {"mem.transcode_mb", MEM_DOMAIN_TRANSCODE, 256},
@@ -859,20 +865,32 @@ int main(int argc, char **argv)
      * 解法：reload_extensions 成功后置 sat_write(g_ep_loaded, 1)，
      * reactor_mgr_start_threads() 之前 sat_read 等这个标志。
      * 超时 60s：extensions reload 90K entries 实测 ~43s (单线程 poll)。
+     *
+     * 可通过 yaml db.reload_timeout_ms 配置（默认 60000）；
+     * 设 0 或负数则直接跳过等待——适合 standalone demo / 没 web 的测试场景。
      * ================================================================ */
     {
-        llog(LOG_INFO, "core", "dbmode=0: 等 reload_extensions（让 L1 热了再开 reactor）...");
-        int waited_ms = 0;
-        for (int i = 0; i < 600; ++i) {
+        long reload_timeout_ms = 60000;
+        int cfg_rc = cfg_get_int(cfg, "db.reload_timeout_ms", &reload_timeout_ms, NULL);
+        int poll_iters = (cfg_rc == NSBC_OK && reload_timeout_ms > 0)
+                         ? (int)(reload_timeout_ms / 100) : 0;
+
+        if (poll_iters > 0) {
+            llog(LOG_INFO, "core", "dbmode=0: 等 reload_extensions（让 L1 热了再开 reactor）... timeout=%ldms", reload_timeout_ms);
+            int waited_ms = 0;
+            for (int i = 0; i < poll_iters; ++i) {
+                if (sat_read(g_ep_loaded))
+                    break;
+                usleep(100 * 1000);  /* 100ms */
+                waited_ms += 100;
+            }
             if (sat_read(g_ep_loaded))
-                break;
-            usleep(100 * 1000);  /* 100ms */
-            waited_ms += 100;
+                llog(LOG_NOTICE, "core", "dbmode=0 ready: reload 完成（等了 %dms），开 reactor", waited_ms);
+            else
+                llog(LOG_WARN, "core", "dbmode=0: %ldms 超时没等到 reload（L1 冷，部分 REGISTER 会打 L2）", reload_timeout_ms);
+        } else {
+            llog(LOG_INFO, "core", "dbmode=0: reload_timeout_ms<=0 — 跳过等待（standalone 模式）");
         }
-        if (sat_read(g_ep_loaded))
-            llog(LOG_NOTICE, "core", "dbmode=0 ready: reload 完成（等了 %dms），开 reactor", waited_ms);
-        else
-            llog(LOG_WARN, "core", "dbmode=0: 60s 超时没等到 reload（L1 冷，部分 REGISTER 会打 L2）");
     }
 
     /* P3: 启动 reactor[1..n-1] 的 pthread。

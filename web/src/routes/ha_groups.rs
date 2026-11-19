@@ -84,7 +84,7 @@ pub async fn create<C: CoreApi + Clone + Send + Sync + 'static>(
     })?;
     let _ = st.db.insert_config_history(
         "api", "create", &format!("ha-groups/{}", row.id),
-        None, &format!("ha_group={} quorum={}", row.name, row.quorum),
+        None, &format!("ha_group={} peer={} prio={}", row.name, row.peer, row.priority),
     ).await;
     sync::spawn_push(st.clone(), sync::Kind::HaGroups);
     Ok((StatusCode::CREATED, Json(row)))

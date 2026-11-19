@@ -30,18 +30,17 @@ mod routes;
 mod static_files;
 mod sync;
 mod uds_server;
+mod ws;                          // REQ-AI-WS-001: Self-implemented WebSocket
 use std::io::IsTerminal;
 use std::io::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::atomic::AtomicBool;
 
 use axum::{middleware as axmw, Router};
 use axum::http::{HeaderName, HeaderValue};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
-use rustls::ServerConfig;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tracing_subscriber::EnvFilter;
@@ -174,6 +173,7 @@ fn api_router<C: CoreApi + Clone + 'static>(st: Arc<AppState<C>>) -> Router {
         .merge(routes::route_groups::router())
         .merge(routes::dialplan_rules::router())
         .merge(routes::dialplan_apps::router())
+        .merge(routes::ai_backends::router())
         .merge(routes::codecs::router())
         .merge(routes::ha_groups::router())
         .merge(routes::time_groups::router())
@@ -245,6 +245,7 @@ fn app_router<C: CoreApi + Clone + 'static>(state: Arc<AppState<C>>) -> Router {
     let app = Router::new()
         .nest("/api/v1", api_router(state.clone()))
         .nest("/ext/v1", ext_router(state.clone()))
+        .nest("/ws", ws::router::<C>(state.clone()))  // REQ-AI-WS-001: /ws/ai-media/:call_id — 内部自验 token
         .merge(routes::recordings::public_file_router(state.clone()))  // ← 顶层直挂 /recordings/*，不走 /api/v1 前缀
         .route("/health", axum::routing::get(routes::system::health))
         .merge(static_files::router());

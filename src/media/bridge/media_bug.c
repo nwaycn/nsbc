@@ -294,7 +294,13 @@ void media_bug_dispatch_rtp_raw(void *call_key, int side,
     uint32_t gc = __atomic_load_n(&g_global_consumers_count, __ATOMIC_RELAXED);
     uint32_t nb = __atomic_load_n(&g_bug_count, __ATOMIC_RELAXED);
     uint32_t ops = __atomic_load_n(&g_mb_ops_count, __ATOMIC_RELAXED);  /* Phase 2 */
-    if (__builtin_expect(gc == 0 && ops == 0 && nb == 0, 1)) return;
+    if (__builtin_expect(gc == 0 && ops == 0 && nb == 0, 1)) {
+        static __thread int zc = 0;
+        if (zc++ < 5)
+            llog(LOG_WARN, "media_bug", "dispatch_rtp_raw ZERO_CONSUMERS gc=%u nb=%u ops=%u call=%p",
+                 gc, nb, ops, call_key);
+        return;
+    }
     dispatch_common(call_key, side, BUG_RAW_RTP,
                     buf, n,
                     src_ip, src_port, dst_ip, dst_port,

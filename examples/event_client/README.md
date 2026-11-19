@@ -1,5 +1,8 @@
 # NSBC Event Client — Multi-Language SDK
 
+**单一事实源**：API 协议、字段字典、Frame schema → **[PROTOCOL.md](PROTOCOL.md)**。
+所有语言 SDK 必须对齐 PROTOCOL.md，新字段先改 PROTOCOL 再改各语言 builder。
+
 Reference client libraries and CLI demos for NSBC realtime event/CDR
 subscription + originate.
 
@@ -103,12 +106,14 @@ java/                     # HTTP/SSE ONLY (Java 8 stdlib; UDS needs jnr-unixsock
 
 | Python | Go | Rust | C |
 |--------|----|------|---|
-| `build_call_url(orig_to="7gja30rf", app="echo", audio=["PCMU",…], video=["H264",…])` | `BuildCallUrl(OriginateOpts{…})` | `build_call_url(OriginateOpts{…})` | `char *cu = nsbc_build_call_url(&(nsbc_orig_opts_t){…}); free(cu);` |
+| `build_call_url(orig_to="7gja30rf", app="echo", audio=["PCMU",…], video=["H264",…], sched_hangup=3600, originate_call_timeout=30)` | `BuildCallUrl(OriginateOpts{SchedHangup: 3600, OriginateCallTimeout: 30})` | `build_call_url(OriginateOpts{sched_hangup: Some(3600), originate_call_timeout: Some(30)})` | `nsbc_build_call_url(&(nsbc_orig_opts_t){.sched_hangup=3600, .originate_call_timeout=30})` |
 
 Output:
 ```
-{audio_codecs=PCMU,PCMA,G722,OPUS,video_codecs=H264,VP8}user/7gja30rf &echo
+{audio_codecs=PCMU,PCMA,G722,OPUS,video_codecs=H264,VP8,sched_hangup=3600,originate_call_timeout=30}user/7gja30rf &echo
 ```
+
+**完整 brace var 字段字典见 [PROTOCOL.md §1.4](PROTOCOL.md)**。
 
 ### 4. Originate (dual path — UDS preferred, HTTP fallback)
 
@@ -312,18 +317,98 @@ wh.send(frame);
 wh.stop();
 ```
 
+## 新增字段流程（REQ-XXX-NNN）
+
+当需要给 call_url / Frame / CDR 加新字段时，按此顺序：
+
+```
+1. PROTOCOL.md 加字段字典行（带 REQ-XXX-NNN 编号 + 类型 + 默认 + 说明）  ← 必须先写单一事实源
+2. Python reference impl：nsbc_client.py builder struct + parse_frame 字段字典
+3. Go / Rust / C / Java builder struct + BuildCallUrl 对齐
+4. C 核心：如果是 brace var → parse_fs_brace_vars 加 key + b2b_call_t override 字段
+5. README 本文件同步 BuildCallUrl 示例 + Known Limits（如有新约束）
+```
+
+**破坏性变更（删字段、改类型）bumps PROTOCOL.md 版本号 + 全语言同步**。
+
+## HTTP-only 语言最小示例（PHP / JS / C#）
+
+> 这些语言**不需要完整 SDK 目录**——直接贴在 PROTOCOL.md / README 里的代码片段够用。
+> Python / Go / Rust 保持完整 SDK（UDS + HTTP 双路径 + CallCorrelator + WebhookSink）。
+
+### PHP — HTTP-only (零依赖，`curl` + `fgets`)
+```php
+<?php
+// Originate
+$ch = curl_init("$api_base/ext/v1/originate");
+curl_setopt_array($ch, [
+    CURLOPT_POST       => true,
+    CURLOPT_HTTPHEADER => ["Authorization: Bearer $token", "Content-Type: application/json"],
+    CURLOPT_POSTFIELDS => json_encode(["call_url" => "{sched_hangup=3600}user/1001 &hangup"]),
+    CURLOPT_RETURNTRANSFER => true,
+    CURLOPT_SSL_VERIFYPEER => false, // self-signed 开发环境
+]);
+$resp = curl_exec($ch); curl_close($ch);
+
+// Subscribe SSE
+$fp = fopen("$api_base/calls/stream", 'r', false,
+    stream_context_create(['http' => ['header' => "Authorization: Bearer $token\r\n",
+                                      'verify_peer' => false]]));
+while (!feof($fp)) { $line = fgets($fp); echo $line; }
+```
+
+### JS / TypeScript — 浏览器或 Node (fetch + EventSource, 零依赖)
+```typescript
+// Originate
+const r = await fetch(`${api_base}/ext/v1/originate`, {
+  method: 'POST',
+  headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+  body: JSON.stringify({ call_url: '{sched_hangup=3600}user/1001 &hangup' }),
+});
+console.log(await r.json());
+
+// Subscribe SSE (浏览器)
+const es = new EventSource(`${api_base}/calls/stream`, { headers: { Authorization: `Bearer ${token}` } });
+es.onmessage = ev => console.log(ev.data);
+```
+
+### C# — HttpClient (System.Net.Http, NuGet 仅 `System.Text.Json`)
+```csharp
+using System.Net.Http.Json;
+
+// Originate
+using var client = new HttpClient { DefaultRequestHeaders = { { "Authorization", $"Bearer {token}" } } };
+var resp = await client.PostAsJsonAsync($"{api_base}/ext/v1/originate",
+    new { call_url = "{sched_hangup=3600}user/1001 &hangup" });
+Console.WriteLine(await resp.Content.ReadAsStringAsync());
+
+// Subscribe SSE — ServerSentEventsReader (.NET 8+) 或手动逐行读取
+```
+
+### Ruby — Net::HTTP (内置 curl)
+```ruby
+require 'net/http'
+http = Net::HTTP.new(api_host, 443).tap { |h| h.use_ssl = true; h.verify_mode = OpenSSL::SSL::VERIFY_NONE }
+req  = Net::HTTP::Post.new('/ext/v1/originate', { 'Authorization' => "Bearer #{token}", 'Content-Type' => 'application/json' })
+req.body = { call_url: '{sched_hangup=3600}user/1001 &hangup' }.to_json
+puts http.request(req).body
+```
+
+**这些语言不走 UDS**——90% 的外部集成场景只需要 HTTP + SSE，不需要同一台主机跑 nsbcd。
+需要 UDS（低延迟、同机部署）的场景用 Python/Go/Rust 完整 SDK。
+
 ## Known Limits
 
 | Item                   | Python | Go    | Rust | C                      | Java  | Root cause                                    |
 |------------------------|--------|-------|------|------------------------|-------|-----------------------------------------------|
-| UDS subscribe + iter  | ✅      | ✅     | ✅    | ✅                       | ❌     | Java 8 stdlib has no Unix Socket API            |
-| Originate dual-path    | ✅      | ✅     | ✅    | ⚠️ conditional          | ⚠️ HTTP only | C: HTTP path needs -DNSBC_WITH_CURL             |
-| CallCorrelator         | ✅      | ✅     | ✅    | ✅                       | ✅     | C: pure data structure, zero-dep, common path |
-| WebhookSink (HTTP)     | ✅      | ✅     | ✅    | ✅ conditional          | ✅     | C: needs -DNSBC_WITH_CURL -lcurl              |
-| SSE transport (remote) | ✅      | ✅     | ✅    | ✅ conditional           | ✅     | C: needs -DNSBC_WITH_CURL -lcurl              |
-| TLS verify toggle      | ✅      | ✅     | ✅    | ✅ conditional           | ✅     | C: TLS via libcurl, skip with nsbc_set_ssl_verify(0) |
-| Non-Unix (Windows)     | ✅      | ✅ stub | stub | stub (no AF_UNIX)       | ✅     | UnixStream / AF_UNIX are platform-only; C libcurl path works on Windows |
-| Third-party deps       | 0       | 0      | reqwest+serde_json | 0 / libcurl (opt-in) | 0 | Rust opts into reqwest for HTTP/TLS; C opts into libcurl via -DNSBC_WITH_CURL |
+| **UDS subscribe + iter** | ✅      | ✅     | ✅    | ✅                       | ❌     | Java 8 stdlib 无 Unix Socket API；Java SDK 仅 HTTP-only |
+| **Originate dual-path**  | ✅      | ✅     | ✅    | ⚠️ conditional          | ⚠️ HTTP only | C: HTTP path needs `-DNSBC_WITH_CURL`; Java: 设计上只走 HTTP |
+| **CallCorrelator**      | ✅      | ✅     | ✅    | ✅                       | ✅     | C: pure data structure, zero-dep; Java: HTTP-only 参考实现 |
+| **WebhookSink (HTTP)**  | ✅      | ✅     | ✅    | ⚠️ conditional          | ✅     | C: needs `-DNSBC_WITH_CURL -lcurl`            |
+| **SSE transport (remote)** | ✅   | ✅     | ✅    | ⚠️ conditional           | ✅     | C: needs `-DNSBC_WITH_CURL -lcurl`            |
+| **TLS verify toggle**   | ✅      | ✅     | ✅    | ⚠️ conditional          | ✅     | C: TLS via libcurl, skip with `nsbc_set_ssl_verify(0)` |
+| **Non-Unix (Windows)**  | ✅      | ✅ stub | stub | stub (no AF_UNIX)       | ✅     | UDS 是 Unix kernel feature；C libcurl/Java HTTP path works on Windows |
+| **Third-party deps**    | 0       | 0      | reqwest+serde_json | 0 / libcurl (opt-in) | 0 | Rust opts into reqwest for HTTP/TLS; C opts into libcurl via `-DNSBC_WITH_CURL` |
 
 ### Root-cause legend
 

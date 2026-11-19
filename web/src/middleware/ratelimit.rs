@@ -55,11 +55,15 @@ pub async fn enforce<C: CoreApi + Clone + 'static>(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     let peer = PeerCtx::new(Some(ip), ua.as_deref());
-    let path = req
-        .uri()
-        .path()
-        .trim_start_matches("/api/v1")
-        .to_string();
+    // ★ 不能只用 req.uri().path()：axum 的 Router::nest 会把前缀从 URI 里剥掉，
+    // /ext/v1/cmd 在 ext_router 内看到的是 "/cmd"，会被误判成 Api 桶（120/min），
+    // AI agent 的媒体轮询立刻 429。MatchedPath 保留完整路由（含 nest 前缀）。
+    let raw_path = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_else(|| req.uri().path().to_string());
+    let path = raw_path.trim_start_matches("/api/v1").to_string();
     let bucket = Bucket::for_path(&path);
     let now = now_secs();
     if let Err(retry_after) = st.auth.guard.rate.check(bucket, &peer.ip, now) {

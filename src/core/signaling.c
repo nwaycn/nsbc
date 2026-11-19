@@ -12,6 +12,7 @@
 #include "cdr_event.h"
 #include "cfg.h"
 #include "dialplan.h"
+#include "app_registry.h"   /* dp_app_action_t + dp_rule_set_app_chain — fallback 默认规则挂 AI app */
 #include "endpoint_registry.h"  /* Phase 5 XL: SIP endpoint ops 注册 */
 #include "endpoints.h"
 #include "location_db.h"
@@ -196,7 +197,11 @@ static int uri_to_sa(const char *uri, size_t len, nsbc_sa_t *dst)
 /* binding 的 name-addr contact（<sip:...>）→ 裸 R-URI：剥最外层尖括号。
  * Request-URI 语法（RFC 3261 §25.1 Request-Line）不允许 name-addr 的 <>，
  * 严格 UA（SIP.js Grammar）解析首行失败直接丢弃整条 INVITE。
- * URI 本体参数（;transport=ws 等）原样保留。 */
+ * URI 本体参数（;transport=ws 等）原样保留。
+ *
+ * ★ 2026-11-19 FIX：原版只检查 contact 开头是 '<' 的情况，漏掉了
+ *   "\"display\" <sip:...>" 格式（MicroSIP/PJSIP 常见）。
+ *   现在统一用 strrchr 找最后一对 <>，不管前面有没有 display name。 */
 static void ruri_from_contact(const char *contact, char *out, size_t outsz)
 {
     if (!out || outsz == 0)
@@ -204,16 +209,23 @@ static void ruri_from_contact(const char *contact, char *out, size_t outsz)
     out[0] = '\0';
     if (!contact)
         return;
-    const char *p = contact;
-    size_t n = strlen(p);
-    if (n >= 2 && p[0] == '<' && p[n - 1] == '>') {
-        ++p;
-        n -= 2;
+    const char *lt = strrchr(contact, '<');
+    const char *gt = strrchr(contact, '>');
+    if (lt && gt && gt > lt) {
+        /* name-addr 格式："xxx" <sip:user@host> 或 <sip:user@host> */
+        size_t n = (size_t)(gt - lt - 1);
+        if (n >= outsz)
+            n = outsz - 1;
+        memcpy(out, lt + 1, n);
+        out[n] = '\0';
+    } else {
+        /* 纯 URI 格式：sip:user@host  — 直接拷贝 */
+        size_t n = strlen(contact);
+        if (n >= outsz)
+            n = outsz - 1;
+        memcpy(out, contact, n);
+        out[n] = '\0';
     }
-    if (n >= outsz)
-        n = outsz - 1;
-    memcpy(out, p, n);
-    out[n] = '\0';
 }
 
 /* Phase 0: rec_feed_wrapper 已删除 —— recording 模块 init 时通过
@@ -659,6 +671,11 @@ static int resolve_cb(b2b_call_t *call, const char *ruri, size_t ruri_len,
         call->force_precondition = dres.force_precondition;
         call->force_timer        = dres.force_timer;
         call->force_gruu         = dres.force_gruu;
+        /* REQ-DP-TIMEOUT-001：dialplan 规则级 timeout override → b2b_call */
+        if (dres.sched_hangup_s > 0)
+            call->sched_hangup_ms_override = (int)dres.sched_hangup_s * 1000;
+        if (dres.originate_call_timeout_s > 0)
+            call->originate_call_timeout_ms_override = (int)dres.originate_call_timeout_s * 1000;
     }
     /* FreeSWITCH 风格精细化主叫覆盖：origination_caller_id_number/name 透传
      * orig_caller_id_num 只填 user part，host 在 b2bua.c From 构造时根据 trunk 自动补 */
@@ -716,6 +733,22 @@ static int resolve_cb(b2b_call_t *call, const char *ruri, size_t ruri_len,
                      dres.target, s->realm);
         }
         /* OUT 层 b_key 在 OUT resolve 路径里 rt_select 成功后填 tr->name */
+    }
+    /* ★ 单腿本地媒体（AI 内循环）：dialplan target="local:..." 命中 →
+     * 不查注册、不建 B 腿，A 腿本地接通；b2bua 见 call->local_media 走
+     * "直接 200 OK + media_bridge 单腿 relay" 分支。
+     * 典型：app_chain=[{"app":"ai"}]，target="local:ai"。 */
+    if (dp_ok && !strncmp(dres.target, "local:", 6)) {
+        if (call) call->local_media = 1;
+        if (out_ruri && outsz)
+            snprintf(out_ruri, outsz, "%s", dres.target);
+        if (out_to && out_to_sz)
+            snprintf(out_to, out_to_sz, "%s",
+                     dres.dst_number[0] ? dres.dst_number : dres.target);
+        llog(LOG_INFO, "sig",
+             "resolve: local_media target=%s → A 腿本地接通（无 B 腿）",
+             dres.target);
+        return NSBC_OK;
     }
     if (dp_ok && dres.layer == DP_LAYER_EXT) {
         /* target 空 = 不改写被叫（Internal 分机对打场景，变换后号码直达）；
@@ -953,16 +986,39 @@ static int resolve_cb(b2b_call_t *call, const char *ruri, size_t ruri_len,
                 llog(LOG_WARN, "sig", "dp out literal: bad sip URI '%s'", dres.target);
                 return NSBC_INVAL;
             }
-            /* out_ruri：sip:<变换后被叫>@<host:port> */
+            /* out_ruri：dp target 已经是完整 SIP URI（sip:user@host:port），
+             * 直接拷贝即可。如果有 dst_number 变换，替换 user part */
             if (out_ruri && outsz) {
-                const char *uri_body = dres.target;
-                if (!strncmp(uri_body, "sip:", 4)) uri_body += 4;
-                else if (!strncmp(uri_body, "sips:", 5)) uri_body += 5;
-                /* uri_body 现在可能是 user@host:port / host:port / [ipv6]:port */
-                int n = snprintf(out_ruri, outsz, "sip:%s@%s",
-                                 dres.dst_number[0] ? dres.dst_number : user,
-                                 uri_body);
-                if (n < 0 || (size_t)n >= outsz) return NSBC_NOMEM;
+                /* 找 dres.target 里 scheme 之后的 @ 位置 */
+                const char *body_start = dres.target;
+                const char *scheme_end = NULL;
+                if (!strncmp(body_start, "sip:", 4)) { scheme_end = body_start + 4; }
+                else if (!strncmp(body_start, "sips:", 5)) { scheme_end = body_start + 5; }
+                if (scheme_end) {
+                    const char *at = strchr(scheme_end, '@');
+                    /* ★ 2026-11-17 修复：dialplan 可能把完整 target URI 作为 dst_number，
+                     * 此时 dst_number 包含 ':' 或 '@'，不是纯 user part —— 直接 memcpy target。 */
+                    int dst_is_pure_user = dres.dst_number[0] &&
+                        !strchr(dres.dst_number, ':') && !strchr(dres.dst_number, '@');
+                    if (at && dst_is_pure_user) {
+                        /* 有 dst_number 变换 → 替换 user part */
+                        size_t user_len = strlen(dres.dst_number);
+                        size_t rest_len = strlen(at);  /* @host:port */
+                        size_t prefix_len = (size_t)(scheme_end - dres.target);
+                        size_t total = prefix_len + user_len + rest_len;
+                        if (total >= outsz) return NSBC_NOMEM;
+                        memcpy(out_ruri, dres.target, prefix_len);
+                        memcpy(out_ruri + prefix_len, dres.dst_number, user_len);
+                        memcpy(out_ruri + prefix_len + user_len, at, rest_len + 1); /* +1 含 NUL */
+                    } else {
+                        /* 无有效 dst_number 变换 → 直接拷贝完整 target */
+                        if (tlen >= outsz) return NSBC_NOMEM;
+                        memcpy(out_ruri, dres.target, tlen + 1);
+                    }
+                } else {
+                    if (tlen >= outsz) return NSBC_NOMEM;
+                    memcpy(out_ruri, dres.target, tlen + 1);
+                }
             }
             /* out_to：<sip:<变换后被叫>@<host>> */
             if (out_to && out_to_sz) {
@@ -972,8 +1028,12 @@ static int resolve_cb(b2b_call_t *call, const char *ruri, size_t ruri_len,
                     char host[128];
                     if (hlen >= sizeof(host)) return NSBC_INVAL;
                     memcpy(host, h, hlen); host[hlen] = '\0';
+                    /* ★ 同样用纯 user 判断 */
+                    const char *pure_user = dres.dst_number;
+                    if (pure_user[0] && (strchr(pure_user, ':') || strchr(pure_user, '@')))
+                        pure_user = user;  /* dst_number 是完整 URI 不是 user */
                     int n = snprintf(out_to, out_to_sz, "<sip:%s@%s>",
-                                     dres.dst_number[0] ? dres.dst_number : user, host);
+                                     pure_user[0] ? pure_user : user, host);
                     if (n < 0 || (size_t)n >= out_to_sz) return NSBC_NOMEM;
                 }
             }
@@ -1483,6 +1543,8 @@ static int sig_init(struct nsbc_ctx *ctx)
                                * 内存估算：~200MB slab + ~200MB pktbuf ≈ 400MB
                                * 机器 < 4GB 内存请下调，或设 core.max_calls 覆盖 */
     cfg_get_int(ctx->cfg, "core.max_calls", &max_calls, NULL);
+    /* Hard clamp: 20K × 500B/txn ≈ 10MB, safe for signal arena */
+    if (max_calls > 20000) max_calls = 20000;
     long port_lo = 10000, port_hi = 59999;
     cfg_get_int(ctx->cfg, "rtp.port_start", &port_lo, NULL);
     cfg_get_int(ctx->cfg, "rtp.port_end", &port_hi, NULL);
@@ -1791,6 +1853,8 @@ static int sig_start(struct nsbc_ctx *ctx)
     bc.pkt_arena = ctx->arena[MEM_DOMAIN_PACKET];
     long cap = 100000;
     cfg_get_int(cfg, "core.max_calls", &cap, NULL);
+    /* Cap b2b to 3000 — each call ~48KB, 3K × 48KB = 144MB, fits arena */
+    if (cap > 3000) cap = 3000;
     bc.capacity = (int)cap;
     bc.local_host = s->local_host;
     bc.local_udp_port = (int)udp_port;
@@ -1822,6 +1886,15 @@ static int sig_start(struct nsbc_ctx *ctx)
     long rna_s = 60;
     cfg_get_int(cfg, "sip.ring_noanswer_timeout_s", &rna_s, NULL);
     bc.ring_noanswer_ms = (uint32_t)rna_s * 1000u;
+    /* REQ-DP-TIMEOUT-001：originate B-leg 等待接通的默认超时（秒→ms；默认 50s）。
+     * 0=回退 ring_noanswer_ms（后面 arm_noanswer_timer 决策链里处理）。 */
+    long octo_s = 50;
+    cfg_get_int(cfg, "sip.originate_call_timeout_s", &octo_s, NULL);
+    bc.originate_call_timeout_ms = (uint32_t)((octo_s > 0) ? octo_s * 1000u : 0);
+    /* REQ-ORIGINATE-005：originate 呼出通话时长上限（秒→ms；默认 0=不限） */
+    long oct_s = 0;
+    cfg_get_int(cfg, "sip.originate_caller_timeout_s", &oct_s, NULL);
+    bc.originate_caller_timeout_ms = (uint32_t)((oct_s > 0) ? oct_s * 1000u : 0);
     /* REQ-SIP-DIV-001 P0：302/380 自动重定向 */
     int ar = 1;
     cfg_get_bool(cfg, "sip.auto_redirect_302", &ar, NULL);
@@ -1954,34 +2027,83 @@ static int sig_start(struct nsbc_ctx *ctx)
 
     llog(LOG_INFO, "sig", "dialplan pre-check: active=%p", (void*)s->dp_ctx.active);
 
-    /* §15 Fallback：两条路径都没加载（active 仍 NULL）→ 注入默认 internal 规则表。
-     * 规则含义：所有 INVITE → extension:<called>，profile=internal。
-     * 保证 C 侧启动后 dp_execute 永不为空，nsbc-web 手动 reload 会 RCU 原子替换掉。 */
+    /* §15 Fallback：两条路径都没加载（active 仍 NULL）→ 注入默认规则表。
+     * ★ 2026-11-17：加入拨号计划 ai_dialog 触发 — 只有显式匹配
+     * 9999 才挂 "answer+ai" app_chain，所有其他分机对打不再误进 AI 管道。 */
     if (s->dp_ctx.active == NULL) {
         llog(LOG_NOTICE, "sig", "dialplan fallback: active was NULL, building default rules");
         dp_table_t *tbl = calloc(1, sizeof(*tbl));
-        if (tbl && dp_table_init(tbl, 2) == NSBC_OK) {
-            dp_rule_t r;
-            memset(&r, 0, sizeof(r));
-            r.enabled = 1;
-            r.prio = 100;
-            r.perm = 0;
-            snprintf(r.profile_name, sizeof(r.profile_name), "internal");
-            snprintf(r.target, sizeof(r.target), "extension:${called}");
-            pm_init(&r.match, PM_RANGE, "", 1, 32);
-            dp_rule_add(tbl, &r);
+        if (tbl && dp_table_init(tbl, 6) == NSBC_OK) {
+            /* rule 1: 9999 → AI agent（最高优先级 prio=0）
+             * target="local:ai" 触发单腿本地媒体（A 腿本地接通、无 B 腿），
+             * app_chain 只有 "ai"（由 ai_dialog 内循环 + ai_agent 接管对话），
+             * 其他任何分机对打都不会误进 ai_dialog。与 DB dialplan_rules 一致。*/
+            dp_rule_t r_ai;
+            memset(&r_ai, 0, sizeof(r_ai));
+            r_ai.enabled = 1;
+            r_ai.prio = 0;       /* 最高优先级 */
+            r_ai.perm = 0;
+            snprintf(r_ai.profile_name, sizeof(r_ai.profile_name), "internal");
+            snprintf(r_ai.target, sizeof(r_ai.target), "local:ai");
+            pm_init(&r_ai.match, PM_EXACT, "9999", 0, 0);
+            /* app_chain: 仅 ai（local_media 分支自行回 200 OK） */
+            static dp_app_action_t ai_chain[] = {
+                { "ai", "" },
+            };
+            dp_rule_set_app_chain(&r_ai, ai_chain, sizeof(ai_chain)/sizeof(ai_chain[0]));
+            dp_rule_add(tbl, &r_ai);
+
+            /* rule 2: [123]XX → 内部分机（prio=100，常规分机号）
+             * 挂 answer app（自动 200 OK） */
+            dp_rule_t r_ext;
+            memset(&r_ext, 0, sizeof(r_ext));
+            r_ext.enabled = 1;
+            r_ext.prio = 100;
+            r_ext.perm = 0;
+            snprintf(r_ext.profile_name, sizeof(r_ext.profile_name), "internal");
+            snprintf(r_ext.target, sizeof(r_ext.target), "extension:${called}");
+            pm_init(&r_ext.match, PM_DIGIT, "_[123]XX", 0, 0);
+            static dp_app_action_t ext_chain[] = {
+                { "answer", "" },
+            };
+            dp_rule_set_app_chain(&r_ext, ext_chain, 1);
+            dp_rule_add(tbl, &r_ext);
+
+            /* rule 3: external → SIPp UAS 直连 */
+            dp_rule_t r_ext2;
+            memset(&r_ext2, 0, sizeof(r_ext2));
+            r_ext2.enabled = 1;
+            r_ext2.prio = 100;
+            r_ext2.perm = 0;
+            snprintf(r_ext2.profile_name, sizeof(r_ext2.profile_name), "internal");
+            snprintf(r_ext2.target, sizeof(r_ext2.target), "extension:${called}");
+            pm_init(&r_ext2.match, PM_RANGE, "", 1, 32);
+            dp_rule_add(tbl, &r_ext2);
+
+            /* rule 4: external profile → SIPp UAS 直连 */
+            dp_rule_t r_sipp;
+            memset(&r_sipp, 0, sizeof(r_sipp));
+            r_sipp.enabled = 1;
+            r_sipp.prio = 100;
+            r_sipp.perm = 0;
+            snprintf(r_sipp.profile_name, sizeof(r_sipp.profile_name), "external");
+            snprintf(r_sipp.target, sizeof(r_sipp.target), "sip:${called}@10.0.0.120:5090");
+            pm_init(&r_sipp.match, PM_RANGE, "", 1, 32);
+            dp_rule_add(tbl, &r_sipp);
 
             dp_table_sort(tbl);
-            llog(LOG_INFO, "sig", "dialplan fallback table ready: count=%zu rules[0].profile='%s' type=%d min_len=%d max_len=%d",
-                 tbl->count, tbl->rules[0].profile_name, tbl->rules[0].match.type,
-                 tbl->rules[0].match.min_len, tbl->rules[0].match.max_len);
+            llog(LOG_INFO, "sig",
+                 "dialplan fallback table: count=%zu "
+                 "[9999→AI(prio=0), [123]XX→ext(prio=100), all→ext, external→sipp]",
+                 tbl->count);
             dp_table_t *old = NULL;
             dp_ctx_publish(&s->dp_ctx, tbl, &old);
             dp_table_free(old);
-            llog(LOG_NOTICE, "sig", "dialplan fallback: published active=%p", (void*)s->dp_ctx.active);
+            llog(LOG_NOTICE, "sig", "dialplan fallback: published active=%p (AI route ready)",
+                 (void*)s->dp_ctx.active);
         } else {
             llog(LOG_ERR, "sig", "dialplan fallback FAILED: tbl=%p init_rc=%d",
-                 (void*)tbl, tbl ? dp_table_init(tbl, 2) : -999);
+                 (void*)tbl, tbl ? dp_table_init(tbl, 6) : -999);
             if (tbl) dp_table_free(tbl);
         }
     } else {

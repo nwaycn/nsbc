@@ -225,6 +225,8 @@ def run_originate_and_subscribe(args):
         audio=args.audio, video=args.video,
         timeout=args.timeout,
         caller_id=args.caller_id, caller_name=args.caller_name,
+        sched_hangup=getattr(args, "sched_hangup", None),
+        originate_call_timeout=getattr(args, "originate_call_timeout", None),
         call_url=getattr(args, "call_url", None),
     )
 
@@ -298,6 +300,8 @@ def run_originate_only(args):
         audio=args.audio, video=args.video,
         timeout=args.timeout,
         caller_id=args.caller_id, caller_name=args.caller_name,
+        sched_hangup=getattr(args, "sched_hangup", None),
+        originate_call_timeout=getattr(args, "originate_call_timeout", None),
         call_url=getattr(args, "call_url", None),
     )
 
@@ -365,7 +369,12 @@ Examples:
                     help="Post-originate app (default: echo)")
     ap.add_argument("--caller-id", default=None, help="Origination caller ID number")
     ap.add_argument("--caller-name", default=None, help="Origination caller ID name")
-    ap.add_argument("--timeout", type=int, default=None, help="Ringing timeout seconds")
+    ap.add_argument("--timeout", type=int, default=None, help="Ringing timeout seconds (originate_timeout)")
+    # REQ-DP-TIMEOUT-001：per-call timeout overrides
+    ap.add_argument("--sched-hangup", type=int, default=None,
+                    help="接通后最大通话时长（秒）。>0 强制 arm sched_hangup timer；0/None = 不限（走 dialplan rule / 全局）")
+    ap.add_argument("--originate-call-timeout", type=int, default=None,
+                    help="B-leg 等待接通超时（秒）。>0 覆盖 arm_noanswer_timer 决策链；0/None = 走全局默认 50s")
 
     # Codec control (REQ-ORIGINATE-004 — WebRTC defaults)
     ap.add_argument("--video", dest="video", action="store_true", default=True,

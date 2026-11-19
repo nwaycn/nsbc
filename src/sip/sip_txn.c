@@ -312,9 +312,12 @@ int txn_mgr_create(const txn_mgr_cfg_t *cfg, txn_mgr_t **out)
     for (int i = 0; i < TXN_SHARDS; ++i)
         pthread_mutex_init(&m->sh[i].lock, NULL);
     if (!m->cfg.slab) {
+        int sl_cap = cfg->capacity > 0 ? cfg->capacity : 50000;
+        /* Cap slab to 20000 — each txn ~500 bytes, 20K × 500B = ~10MB, safe */
+        if (sl_cap > 20000) sl_cap = 20000;
         mem_slab_cfg_t sc = {
             "sip_txn", sizeof(struct sip_txn),
-            cfg->capacity > 0 ? cfg->capacity : 50000, 8,
+            sl_cap, 8,
             cfg->sig_arena, NULL, NULL};
         fprintf(stderr, "[txn] creating slab name=%s obj_size=%zu capacity=%d arena=%p\n",
                 sc.name, sc.obj_size, sc.capacity, (void *)sc.arena);

@@ -10,7 +10,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
+    routing::{get},
     Json, Router,
 };
 use serde::Deserialize;
@@ -19,7 +19,7 @@ use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 
 use crate::coreclient::CoreApi;
-use crate::db::{Db, TenantCreate, TenantUpdate};
+use crate::db::{TenantCreate, TenantUpdate};
 use crate::error::ApiError;
 use crate::AppState;
 

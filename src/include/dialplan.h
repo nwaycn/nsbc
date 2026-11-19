@@ -115,6 +115,10 @@ typedef struct dp_rule {
     uint8_t force_precondition;  /* 覆盖 profile.enable_precondition */
     uint8_t force_timer;         /* 覆盖 profile.enable_timer */
     uint8_t force_gruu;          /* 覆盖 profile.enable_gruu */
+
+    /* REQ-DP-TIMEOUT-001：dialplan 规则级 per-call timeout override（秒，0=不限/走全局） */
+    uint32_t sched_hangup_s;           /* 接通后最大通话时长（秒，0=不限） */
+    uint32_t originate_call_timeout_s; /* B-leg 发起等待接通超时（秒，0=走默认 50s） */
 } dp_rule_t;
 
 typedef struct dp_table {
@@ -177,6 +181,10 @@ typedef struct {
     uint8_t force_precondition;
     uint8_t force_timer;
     uint8_t force_gruu;
+
+    /* REQ-DP-TIMEOUT-001：从命中规则透传，signaling 装配进 b2b_call */
+    uint32_t sched_hangup_s;
+    uint32_t originate_call_timeout_s;
 } dp_result_t;
 
 int dp_ctx_init(dp_ctx_t *ctx);
