@@ -107,6 +107,11 @@ func main() {
 		http.Redirect(w, r, "/opensips", http.StatusMovedPermanently)
 	})
 	mux.HandleFunc("GET /opensips/{slug}", func(w http.ResponseWriter, r *http.Request) { s.handleOpenSIPSPost(w, r, "zh") })
+	mux.HandleFunc("GET /nip", func(w http.ResponseWriter, r *http.Request) { s.handleNIP(w, r, "zh") })
+	mux.HandleFunc("GET /nip/{$}", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/nip", http.StatusMovedPermanently)
+	})
+	mux.HandleFunc("GET /nip/{slug}", func(w http.ResponseWriter, r *http.Request) { s.handleNIPPost(w, r, "zh") })
 
 	// 英文路由（/en/ 前缀，剥掉前缀后复用同一套 handler，Lang 设为 en）
 	enMux := http.NewServeMux()
@@ -141,6 +146,11 @@ func main() {
 		http.Redirect(w, r, "/en/opensips", http.StatusMovedPermanently)
 	})
 	enMux.HandleFunc("GET /opensips/{slug}", func(w http.ResponseWriter, r *http.Request) { s.handleOpenSIPSPost(w, r, "en") })
+	enMux.HandleFunc("GET /nip", func(w http.ResponseWriter, r *http.Request) { s.handleNIP(w, r, "en") })
+	enMux.HandleFunc("GET /nip/{$}", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/en/nip", http.StatusMovedPermanently)
+	})
+	enMux.HandleFunc("GET /nip/{slug}", func(w http.ResponseWriter, r *http.Request) { s.handleNIPPost(w, r, "en") })
 	mux.Handle("GET /en/", http.StripPrefix("/en", enMux))
 
 	// /en 裸路径 → /en/
@@ -392,6 +402,9 @@ func (s *Server) handleFreeswitch(w http.ResponseWriter, r *http.Request, lang s
 func (s *Server) handleOpenSIPS(w http.ResponseWriter, r *http.Request, lang string) {
 	s.handleList(w, r, "opensips", "OpenSIPS / Kamailio 专栏", "OpenSIPS", "opensips", lang)
 }
+func (s *Server) handleNIP(w http.ResponseWriter, r *http.Request, lang string) {
+	s.handleList(w, r, "nip", "NIP 抓包与实时质检平台", "NIP", "nip", lang)
+}
 
 // handleList 通用列表 handler — 复用 blog/freeswitch/opensips 三栏。
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request, kind, labelZh, labelEn, active, lang string) {
@@ -402,6 +415,8 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, kind, labelZ
 		items, err = s.store.ListFreeswitch()
 	case "opensips":
 		items, err = s.store.ListOpenSIPS()
+	case "nip":
+		items, err = s.store.ListNIP()
 	default:
 		items, err = s.store.ListBlog()
 	}
@@ -437,6 +452,9 @@ func (s *Server) handleFreeswitchPost(w http.ResponseWriter, r *http.Request, la
 }
 func (s *Server) handleOpenSIPSPost(w http.ResponseWriter, r *http.Request, lang string) {
 	s.handleDetail(w, r, "opensips", "opensips", lang)
+}
+func (s *Server) handleNIPPost(w http.ResponseWriter, r *http.Request, lang string) {
+	s.handleDetail(w, r, "nip", "nip", lang)
 }
 
 // handleDetail 通用详情 handler。

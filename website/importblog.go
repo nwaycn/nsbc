@@ -304,12 +304,6 @@ func classContains(needle string) func(*html.Node) bool {
 
 // renderMarkdown 把 article 转成最终 .md 文件内容。
 func renderMarkdown(doc *article, id int, srcURL string) string {
-	// 确保标题有 # 前缀
-	title := doc.title
-	if !strings.HasPrefix(title, "# ") {
-		title = "# " + title
-	}
-
 	front := fmt.Sprintf(`---
 title: %s
 date: %s
@@ -327,16 +321,37 @@ slug: %d
 	)
 
 	body := doc.body
-	// 把正文里残留的导航/日期 meta 行过滤掉
 	body = stripMetaLine(body)
+	body = polishMarkdown(body)
 
-	return front + title + "\n\n" + body + "\n"
+	return front + body + "\n"
 }
 
 // stripMetaLine 去掉源站那种 "tags：xxx 创建时间：yyyy-mm-dd" 的一行 meta。
 func stripMetaLine(html string) string {
 	re := regexp.MustCompile(`(?i)(tags?|标签)[：:][^\n]{0,80}(创建时间|发布时间|日期)[：:][^\n]{0,40}[\n]?`)
 	return re.ReplaceAllString(html, "")
+}
+
+// polishMarkdown 最终润色：
+//   - 去掉孤立的空格式化标记（**、*、`）
+//   - 去掉多余的 ---（孤立 hr 一般来自页面分隔，不是正文）
+//   - 去掉正文首行与 front matter title 重复的 H1
+//   - 去掉尾部孤立联系信息（QQ群、作者署名）前后的空白
+func polishMarkdown(s string) string {
+	// 去掉孤立空格式化标记（行首/行尾只有 ** 或 * 或 `）
+	s = regexp.MustCompile(`(?m)^\*\*\s*$`).ReplaceAllString(s, "")
+	s = regexp.MustCompile(`(?m)^\*\s*$`).ReplaceAllString(s, "")
+	s = regexp.MustCompile(`(?m)^` + "`" + `\s*$`).ReplaceAllString(s, "")
+	// 孤立 --- 行（上下文空）
+	s = regexp.MustCompile(`\n\n---\n\n`).ReplaceAllString(s, "\n\n")
+	s = regexp.MustCompile(`(?m)^---\s*$\n`).ReplaceAllString(s, "")
+	// 重复 H1 相邻
+	s = regexp.MustCompile(`\n# [^\n]+\n\n# ([^\n]+)\n`).ReplaceAllString(s, "\n# $1\n")
+	// 压缩空行
+	s = regexp.MustCompile(`\n{3,}`).ReplaceAllString(s, "\n\n")
+	s = strings.TrimSpace(s)
+	return s
 }
 
 func escapeYAML(s string) string {
@@ -367,25 +382,125 @@ func normalizeTags(raw string) string {
 // cleanHTML 清洗抓取到的正文 HTML：
 //   1. 剥 script/style/iframe/noscript 标签块
 //   2. 剥 HTML 注释 <!-- ... -->
-//   3. 剥 <br> <hr> 这类无意义标签
-//   4. 剥源站残留的内部导航 <a href="NNN.html"> 包装（保留链接文本）
+//   3. <br> → \n，<hr> → \n\n---\n\n
+//   4. 内部文章链接 <a href="NNN.html"> → 保留文本；其余 <a href> 转 md 链接
+//   5. <img src=url alt=text> → ![text](url)
+//   6. <h1-6>、<blockquote>、<ul>/<ol>/<li>、<strong>/<b>、<em>/<i>、<code>/<pre> → md 语法
+//   7. 剥剩余 HTML 标签，还原实体
+//
+// 结果：纯 Markdown 正文，段落间有正确空行，可直接喂 goldmark。
 func cleanHTML(s string) string {
+	// 1. script/style/iframe/noscript
 	for _, tag := range []string{"script", "style", "iframe", "noscript"} {
 		re := regexp.MustCompile(`(?is)<` + tag + `[^>]*>.*?</` + tag + `>`)
 		s = re.ReplaceAllString(s, "")
 	}
-	// HTML 注释
+	// 2. 注释
 	commentRe := regexp.MustCompile(`(?s)<!--.*?-->`)
 	s = commentRe.ReplaceAllString(s, "")
-	// <br> / <hr>
-	breakRe := regexp.MustCompile(`<(br|hr)\s*/?>`, regexp.IgnoreCase)
-	s = breakRe.ReplaceAllString(s, "")
-	// 内部文章链接 <a href="123.html">...</a> → 保留文本
+
+	// 3. <br> → \n，<hr> → md hr
+	s = regexp.MustCompile(`(?i)<br\s*/?>`).ReplaceAllString(s, "\n")
+	s = regexp.MustCompile(`(?i)<hr\s*/?>`).ReplaceAllString(s, "\n\n---\n\n")
+
+	// 4. 内部文章链接 → 保留文本（站外链接也要保留）
 	linkRe := regexp.MustCompile(`(?is)<a\s+href="\d+\.html"[^>]*>(.*?)</a>`)
 	s = linkRe.ReplaceAllString(s, "$1")
-	// 空 <a> 包装
-	aRe := regexp.MustCompile(`(?is)<a\s+[^>]*>(.*?)</a>`)
-	s = aRe.ReplaceAllString(s, "$1")
+
+	// 5. <img> → ![alt](src)
+	imgRe := regexp.MustCompile(`(?is)<img\s+([^>]*)>`)
+	s = imgRe.ReplaceAllStringFunc(s, func(m string) string {
+		src := regexp.MustCompile(`(?is)src=["']([^"']+)["']`).FindStringSubmatch(m)
+		alt := regexp.MustCompile(`(?is)alt=["']([^"']*)["']`).FindStringSubmatch(m)
+		if len(src) < 2 {
+			return ""
+		}
+		altText := ""
+		if len(alt) >= 2 {
+			altText = alt[1]
+		}
+		return "![" + altText + "](" + src[1] + ")"
+	})
+
+	// 6. 块级元素 → md 段落分隔
+	s = regexp.MustCompile(`(?i)</p>`).ReplaceAllString(s, "\n\n")
+	s = regexp.MustCompile(`(?i)</div>`).ReplaceAllString(s, "\n\n")
+	s = regexp.MustCompile(`(?i)</li>`).ReplaceAllString(s, "\n")
+	s = regexp.MustCompile(`(?i)</ul>`).ReplaceAllString(s, "\n\n")
+	s = regexp.MustCompile(`(?i)</ol>`).ReplaceAllString(s, "\n\n")
+	s = regexp.MustCompile(`(?i)</blockquote>`).ReplaceAllString(s, "\n\n")
+
+	s = regexp.MustCompile(`(?i)<h1[^>]*>`).ReplaceAllString(s, "\n\n# ")
+	s = regexp.MustCompile(`(?i)</h1>`).ReplaceAllString(s, "\n\n")
+	s = regexp.MustCompile(`(?i)<h2[^>]*>`).ReplaceAllString(s, "\n\n## ")
+	s = regexp.MustCompile(`(?i)</h2>`).ReplaceAllString(s, "\n\n")
+	s = regexp.MustCompile(`(?i)<h3[^>]*>`).ReplaceAllString(s, "\n\n### ")
+	s = regexp.MustCompile(`(?i)</h3>`).ReplaceAllString(s, "\n\n")
+	s = regexp.MustCompile(`(?i)<h4[^>]*>`).ReplaceAllString(s, "\n\n#### ")
+	s = regexp.MustCompile(`(?i)</h4>`).ReplaceAllString(s, "\n\n")
+
+	// 6a. 列表项 → "- "（不管原 ul/ol，先统一）
+	s = regexp.MustCompile(`(?is)<li[^>]*>`).ReplaceAllString(s, "- ")
+
+	// 6b. 内联格式化
+	s = regexp.MustCompile(`(?is)<strong[^>]*>`).ReplaceAllString(s, "**")
+	s = regexp.MustCompile(`(?i)</strong>`).ReplaceAllString(s, "**")
+	s = regexp.MustCompile(`(?is)<b[^>]*>`).ReplaceAllString(s, "**")
+	s = regexp.MustCompile(`(?i)</b>`).ReplaceAllString(s, "**")
+	s = regexp.MustCompile(`(?is)<em[^>]*>`).ReplaceAllString(s, "*")
+	s = regexp.MustCompile(`(?i)</em>`).ReplaceAllString(s, "*")
+	s = regexp.MustCompile(`(?is)<i[^>]*>`).ReplaceAllString(s, "*")
+	s = regexp.MustCompile(`(?i)</i>`).ReplaceAllString(s, "*")
+	s = regexp.MustCompile(`(?is)<code[^>]*>`).ReplaceAllString(s, "`")
+	s = regexp.MustCompile(`(?i)</code>`).ReplaceAllString(s, "`")
+	s = regexp.MustCompile(`(?is)<pre[^>]*>`).ReplaceAllString(s, "\n\n```\n")
+	s = regexp.MustCompile(`(?i)</pre>`).ReplaceAllString(s, "\n```\n\n")
+
+	// 6c. <blockquote> 开头加 >
+	s = regexp.MustCompile(`(?is)<blockquote[^>]*>`).ReplaceAllString(s, "\n\n> ")
+
+	// 7. 所有剩余 <a href="...">text</a> → [text](url)
+	s = regexp.MustCompile(`(?is)<a\s+href=["']([^"']+)["'][^>]*>(.*?)</a>`).ReplaceAllStringFunc(s, func(m string) string {
+		sub := regexp.MustCompile(`(?is)<a\s+href=["']([^"']+)["'][^>]*>(.*?)</a>`).FindStringSubmatch(m)
+		if len(sub) < 3 {
+			return m
+		}
+		url := sub[1]
+		text := regexp.MustCompile(`<[^>]+>`).ReplaceAllString(sub[2], "")
+		text = strings.TrimSpace(text)
+		if text == "" {
+			text = url
+		}
+		return "[" + text + "](" + url + ")"
+	})
+
+	// 8. 剥剩余标签，还原实体
+	s = regexp.MustCompile(`(?s)<[^>]+>`).ReplaceAllString(s, "")
+	s = htmlUnescape(s)
+
+	// 9. 压缩多余空行
+	s = regexp.MustCompile(`\n{3,}`).ReplaceAllString(s, "\n\n")
+	s = regexp.MustCompile(`[ \t]+\n`).ReplaceAllString(s, "\n")
+	s = strings.TrimSpace(s) + "\n"
+	return s
+}
+
+func htmlUnescape(s string) string {
+	// 不引入额外包：自己处理常见实体
+	repl := map[string]string{
+		"&nbsp;": " ",
+		"&amp;":  "&",
+		"&lt;":   "<",
+		"&gt;":   ">",
+		"&quot;": "\"",
+		"&#39;":  "'",
+		"&#34;":  "\"",
+		"&middot;": "·",
+		"&hellip;": "…",
+	}
+	for k, v := range repl {
+		s = strings.ReplaceAll(s, k, v)
+	}
 	return s
 }
 
