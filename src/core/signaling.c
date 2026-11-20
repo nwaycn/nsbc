@@ -51,6 +51,20 @@
  * resolve_cb（前部）用它把被叫路由到 WS 注册连接 */
 static int sa_hide_ws_conn(nsbc_sa_t *sa, void *conn);
 
+/* resolve_cb 重构辅助：统一 loc_binding → meta 填充（消除 3 处重复的 proto/reliable/nat_detected/ext_rtp_ip 赋值）。
+ *   meta != NULL 时总是填（originate 模式 call=NULL 也要返回完整元数据）。
+ *   call != NULL 时还顺便填 call->leg[1] 对应字段（向后兼容旧路径）。
+ *   target_leg=NULL 时跳过直接 leg 赋值（meta 已由调用方消费）。 */
+static void sig_fill_meta_from_binding(b2b_resolve_meta_t *meta,
+                                       b2b_leg_t *target_leg,
+                                       const loc_binding_t *b,
+                                       b2b_call_t *call);
+
+/* resolve_cb 重构辅助：统一 loc_binding → dst 路由决策（消除 3 处重复的 ws_conn_alive/sa_hide_ws_conn/uri_to_sa 判断）。
+ * 返回 NSBC_OK=成功填了 dst（要么是 AF_UNSPEC+ws_conn，要么是 sockaddr_in），
+ *        NSBC_NOENT=没有可用的 route（ws_conn 死了且 contact 解析失败）。 */
+static int sig_deliver_via_binding(nsbc_sa_t *dst, const loc_binding_t *b);
+
 /* CDR END 时从 answer SDP 提取 codec 名 + peer IP:port。
  * 返回 0=ok（两个 out 字段都填了），非 0 表示没找到/解析失败——调用方把 out 当空字符串。
  * 非 static：b2bua.c 通过 extern 声明跨文件调用，签名不入公共头。 */
@@ -355,10 +369,101 @@ static const endpoint_ops_t sip_endpoint_ops = {
 };
 
 /* ================================================================== */
+/* resolve_cb 统一辅助函数                                            */
+/* ================================================================== */
+
+/* loc_binding → meta + leg 字段填充
+ * meta != NULL 总是填（out_meta 模式 / originate 模式）
+ * target_leg != NULL 额外填 b2b_leg_t 对应字段（call 模式，向后兼容）
+ * ext_rtp_ip 从 call 的 out_prof → prof 链取；call=NULL 时跳过（保持空串） */
+static void sig_fill_meta_from_binding(b2b_resolve_meta_t *meta,
+                                       b2b_leg_t *target_leg,
+                                       const loc_binding_t *b,
+                                       b2b_call_t *call)
+{
+    if (meta) {
+        memset(meta, 0, sizeof(*meta));
+        meta->proto = b->transport_proto;
+        meta->reliable =
+            (b->transport_proto == SIP_TR_TCP || b->transport_proto == SIP_TR_TLS
+             || b->transport_proto == SIP_TR_WS || b->transport_proto == SIP_TR_WSS)
+            ? 1 : 0;
+        meta->nat_detected = b->nat_detected;
+        if (b->service_route[0])
+            snprintf(meta->service_route, sizeof(meta->service_route),
+                     "%s", b->service_route);
+    }
+
+    /* 从 sip_profile 取 external_rtp_ip —— 需要 call 指针拿 prof 链 */
+    const sip_profile_t *prof = NULL;
+    if (call) {
+        prof = call->out_prof ? call->out_prof : call->prof;
+    }
+    const char *ext_ip = (prof && prof->external_rtp_ip[0])
+                         ? prof->external_rtp_ip : NULL;
+
+    if (meta) {
+        if (ext_ip)
+            snprintf(meta->ext_rtp_ip, sizeof(meta->ext_rtp_ip), "%s", ext_ip);
+    }
+
+    /* legacy 直接填 leg（call 模式） —— 和 meta 字段 1:1 对齐 */
+    if (target_leg) {
+        target_leg->proto = b->transport_proto;
+        target_leg->reliable = meta ? meta->reliable :
+            (b->transport_proto == SIP_TR_TCP || b->transport_proto == SIP_TR_TLS
+             || b->transport_proto == SIP_TR_WS || b->transport_proto == SIP_TR_WSS)
+            ? 1 : 0;
+        target_leg->nat_detected = b->nat_detected;
+        if (ext_ip)
+            snprintf(target_leg->ext_rtp_ip, sizeof(target_leg->ext_rtp_ip), "%s", ext_ip);
+        else
+            target_leg->ext_rtp_ip[0] = '\0';
+        if (b->service_route[0])
+            snprintf(target_leg->service_route, sizeof(target_leg->service_route),
+                     "%s", b->service_route);
+    }
+}
+
+/* loc_binding → dst 路由决策
+ * 统一 WS vs 传统 SIP 发送路径（消除 3 处重复的 ws_conn_alive 判断）
+ * 返回 NSBC_OK=dst 已填（WS: AF_UNSPEC+ws_conn; 传统: sockaddr_in），
+ *        NSBC_NOENT=不可达（ws_conn 断开且 contact 解析失败） */
+static int sig_deliver_via_binding(nsbc_sa_t *dst, const loc_binding_t *b)
+{
+    /* REQ-NAT-001：优先 NAT 改写后的 public_contact（可达）
+     * NAT 场景 public_contact != b.contact；公网直连两者相同 */
+    const char *route_contact =
+        (b->nat_detected && b->public_contact[0])
+        ? b->public_contact : b->contact;
+
+    /* WS 注册（RFC 7118）：.invalid Contact 无法 sockaddr 路由 ——
+     * binding 存有 ws_conn*，直接走 WS 通道；alive 校验防 UAF */
+    if (b->ws_conn && ws_conn_alive(b->ws_conn)) {
+        if (sa_hide_ws_conn(dst, b->ws_conn) == NSBC_OK) {
+            return NSBC_OK;
+        }
+    }
+
+    /* 传统 SIP（UDP/TCP/TLS）：contact → sockaddr */
+    if (uri_to_sa(route_contact, strlen(route_contact), dst) == NSBC_OK) {
+        if (b->nat_detected)
+            llog(LOG_INFO, "sig", "resolve: NAT route contact=%s → %s",
+                 b->contact, route_contact);
+        return NSBC_OK;
+    }
+
+    llog(LOG_WARN, "sig", "resolve: no route — ws_conn dead and contact '%s' → sa fail",
+         route_contact);
+    return NSBC_NOENT;
+}
+
+/* ================================================================== */
 
 static int resolve_cb(b2b_call_t *call, const char *ruri, size_t ruri_len,
                       nsbc_sa_t *dst, char *out_ruri, size_t outsz,
-                      char *out_to, size_t out_to_sz, void *ud)
+                      char *out_to, size_t out_to_sz,
+                      b2b_resolve_meta_t *out_meta, void *ud)
 {
     (void)call;
     sig_runtime_t *s = (sig_runtime_t *)ud;
@@ -764,67 +869,24 @@ static int resolve_cb(b2b_call_t *call, const char *ruri, size_t ruri_len,
                 llog(LOG_INFO, "sig", "resolve: dp_ext target=%s aor=%s loc_n=%d contact=%s",
                      ext_user, aor, n, n > 0 ? b.contact : "(none)");
                 if (n > 0) {
-                    /* IMS Service-Route：存到 B 腿（后续 send_invite_b → route_block 自动 prepend） */
-                    if (call && b.service_route[0])
-                        snprintf(call->leg[1].service_route,
-                                 sizeof(call->leg[1].service_route),
-                                 "%s", b.service_route);
-                    /* REQ-NAT-002：loc_binding → call->leg[1] transport/NAT 元数据
-                     * 全链路统一：send_invite_b Via transport / build_dlg_req / nat_sdp_rewrite 都从 leg 读
-                     *
-                     * proto = transport_proto（UDP/TCP/TLS/WS/WSS）
-                     *   resolve_cb 之前只靠 AF_UNSPEC 判断 WS，遗漏 TCP/TLS/WSS
-                     *   现在直接用 registrar 存的 binding.transport_proto
-                     * reliable = 传输层是否可靠
-                     *   TCP/TLS/WS/WSS 可靠（ICT 不该 Timer A 重发 INVITE）
-                     *   UDP 不可靠
-                     * nat_detected = loc_binding.nat_detected（Contact host 私网 or Via received 与 Contact 不同）
-                     *   1 → NAT rewrite SDP（o=/c=/a=candidate IP → ext_rtp_ip）
-                     *   0 → 跳过 rewrite（公网直连 Contact IP 本身可达；内网部署也不需要）
-                     * ext_rtp_ip = sip_profile.external_rtp_ip（SDP rewrite 目标 IP）
-                     *   从 call->out_prof 取（resolve 前面已经根据 dp_layer 算好了 B 腿 profile）
-                     *   out_prof=NULL fallback call->prof；prof=NULL（originate 无 ACL 场景）保持空串 */
-                    if (call) {
-                        call->leg[1].proto = b.transport_proto;
-                        call->leg[1].reliable =
-                            (b.transport_proto == SIP_TR_TCP || b.transport_proto == SIP_TR_TLS
-                             || b.transport_proto == SIP_TR_WS || b.transport_proto == SIP_TR_WSS)
-                            ? 1 : 0;
-                        call->leg[1].nat_detected = b.nat_detected;
-                        const sip_profile_t *prof = call->out_prof ? call->out_prof : call->prof;
-                        if (prof && prof->external_rtp_ip[0])
-                            snprintf(call->leg[1].ext_rtp_ip, sizeof(call->leg[1].ext_rtp_ip),
-                                     "%s", prof->external_rtp_ip);
-                        else
-                            call->leg[1].ext_rtp_ip[0] = '\0';
+                    /* 统一 loc_binding → meta + leg 字段（含 IMS Service-Route）
+                     * call != NULL → 直接填 call->leg[1]（向后兼容旧路径）
+                     * out_meta != NULL → 同时填 resolve_meta（originate 模式必需） */
+                    b2b_leg_t *target_leg = call ? &call->leg[1] : NULL;
+                    sig_fill_meta_from_binding(out_meta, target_leg, &b, call);
+
+                    /* 统一 loc_binding → dst 路由决策（消除 WS vs 传统 SIP 重复） */
+                    if (sig_deliver_via_binding(dst, &b) == NSBC_OK) {
+                        const char *route_contact =
+                            (b.nat_detected && b.public_contact[0])
+                            ? b.public_contact : b.contact;
+                        ruri_from_contact(route_contact, out_ruri, outsz);
+                        if (out_to && out_to_sz)
+                            snprintf(out_to, out_to_sz, "<sip:%s@%s>",
+                                     ext_user, s->realm);
+                        return NSBC_OK;
                     }
-                    /* REQ-NAT-001：优先 NAT 改写后的 public_contact（可达）
-                     * NAT 场景 public_contact != b.contact；公网直连两者相同 */
-                    const char *route_contact =
-                        (b.nat_detected && b.public_contact[0])
-                        ? b.public_contact : b.contact;
-                    /* WS 注册（RFC 7118）：.invalid Contact 无法 sockaddr
-                     * 路由 — binding 存有 ws_conn*，直接走 WS 通道 */
-                    if (b.ws_conn && ws_conn_alive(b.ws_conn)) {
-                        if (sa_hide_ws_conn(dst, b.ws_conn) == NSBC_OK) {
-                            ruri_from_contact(route_contact, out_ruri, outsz);
-                            if (out_to && out_to_sz)
-                                snprintf(out_to, out_to_sz, "<sip:%s@%s>",
-                                         ext_user, s->realm);
-                            return NSBC_OK;
-                        }
-                    } else {
-                        if (uri_to_sa(route_contact, strlen(route_contact), dst) == NSBC_OK) {
-                            ruri_from_contact(route_contact, out_ruri, outsz);
-                            if (out_to && out_to_sz)
-                                snprintf(out_to, out_to_sz, "<sip:%s@%s>",
-                                         ext_user, s->realm);
-                            if (b.nat_detected)
-                                llog(LOG_INFO, "sig", "resolve: NAT route contact=%s → %s",
-                                     b.contact, route_contact);
-                            return NSBC_OK;
-                        }
-                    }
+                    /* deliver 失败 → fall through 到 dp_ext 失败分支 */
                 }
             }
         }
@@ -935,44 +997,21 @@ static int resolve_cb(b2b_call_t *call, const char *ruri, size_t ruri_len,
             llog(LOG_WARN, "sig", "resolve: queue member '%s' (internal) not registered", ext_user);
             return NSBC_NOENT;
         }
-        /* REQ-NAT-002：同 dp_ext 主路径一致 — loc_binding → call->leg[1] 元数据 */
-        if (call) {
-            call->leg[1].proto = b.transport_proto;
-            call->leg[1].reliable =
-                (b.transport_proto == SIP_TR_TCP || b.transport_proto == SIP_TR_TLS
-                 || b.transport_proto == SIP_TR_WS || b.transport_proto == SIP_TR_WSS)
-                ? 1 : 0;
-            call->leg[1].nat_detected = b.nat_detected;
-            const sip_profile_t *prof = call->out_prof ? call->out_prof : call->prof;
-            if (prof && prof->external_rtp_ip[0])
-                snprintf(call->leg[1].ext_rtp_ip, sizeof(call->leg[1].ext_rtp_ip),
-                         "%s", prof->external_rtp_ip);
-            else
-                call->leg[1].ext_rtp_ip[0] = '\0';
-        }
-        const char *contact = (b.nat_detected && b.public_contact[0])
-                              ? b.public_contact : b.contact;
-        if (b.ws_conn && ws_conn_alive(b.ws_conn)) {
-            if (sa_hide_ws_conn(dst, b.ws_conn) == NSBC_OK) {
-                if (out_ruri && outsz)
-                    snprintf(out_ruri, outsz, "sip:%s@%s", ext_user, s->realm);
-                if (out_to && out_to_sz)
-                    snprintf(out_to, out_to_sz, "<sip:%s@%s>", ext_user, s->realm);
-                return NSBC_OK;
+        /* 统一 loc_binding → meta + leg 字段 + dst 路由决策 */
+        {
+            b2b_leg_t *target_leg = call ? &call->leg[1] : NULL;
+            sig_fill_meta_from_binding(out_meta, target_leg, &b, call);
+            if (sig_deliver_via_binding(dst, &b) != NSBC_OK) {
+                llog(LOG_WARN, "sig", "resolve: queue member '%s' contact → no route", ext_user);
+                return NSBC_NOENT;
             }
-        }
-        size_t cl = strlen(contact);
-        if (uri_to_sa(contact, cl, dst) != NSBC_OK) {
-            llog(LOG_WARN, "sig", "resolve: queue member '%s' contact '%s' → sa fail",
-                 ext_user, contact);
-            return NSBC_NOENT;
         }
         if (out_ruri && outsz)
             snprintf(out_ruri, outsz, "sip:%s@%s", ext_user, s->realm);
         if (out_to && out_to_sz)
             snprintf(out_to, out_to_sz, "<sip:%s@%s>", ext_user, s->realm);
-        llog(LOG_INFO, "sig", "resolve: queue '%s' member '%s' INTERNAL → contact=%s",
-             qname, ext_user, contact);
+        llog(LOG_INFO, "sig", "resolve: queue '%s' member '%s' INTERNAL → resolved",
+             qname, ext_user);
         return NSBC_OK;
     }
 
@@ -1151,85 +1190,57 @@ static int resolve_cb(b2b_call_t *call, const char *ruri, size_t ruri_len,
         }
     }
     if (n > 0) {
-        /* IMS Service-Route：存到 B 腿 */
-        if (call && b.service_route[0])
-            snprintf(call->leg[1].service_route,
-                     sizeof(call->leg[1].service_route),
-                     "%s", b.service_route);
-        /* REQ-NAT-002：同 dp_ext 主路径一致 — loc_binding → call->leg[1] 元数据 */
-        if (call) {
-            call->leg[1].proto = b.transport_proto;
-            call->leg[1].reliable =
-                (b.transport_proto == SIP_TR_TCP || b.transport_proto == SIP_TR_TLS
-                 || b.transport_proto == SIP_TR_WS || b.transport_proto == SIP_TR_WSS)
-                ? 1 : 0;
-            call->leg[1].nat_detected = b.nat_detected;
-            const sip_profile_t *prof = call->out_prof ? call->out_prof : call->prof;
-            if (prof && prof->external_rtp_ip[0])
-                snprintf(call->leg[1].ext_rtp_ip, sizeof(call->leg[1].ext_rtp_ip),
-                         "%s", prof->external_rtp_ip);
-            else
-                call->leg[1].ext_rtp_ip[0] = '\0';
+        /* 统一 loc_binding → meta + leg 字段（含 IMS Service-Route） */
+        {
+            b2b_leg_t *target_leg = call ? &call->leg[1] : NULL;
+            sig_fill_meta_from_binding(out_meta, target_leg, &b, call);
         }
         /* Loop detection（用原始 contact 看——NAT 改写后的 public_contact 不可能等于 local_host） */
-        size_t cl = strlen(b.contact);
-        nsbc_sa_t contact_sa;
-        if (uri_to_sa(b.contact, cl, &contact_sa) == NSBC_OK) {
-            char contact_host[INET6_ADDRSTRLEN] = "";
-            void *addrp = NULL;
-            if (contact_sa.ss.ss_family == AF_INET6)
-                addrp = &((struct sockaddr_in6 *)&contact_sa.ss)->sin6_addr;
-            else if (contact_sa.ss.ss_family == AF_INET)
-                addrp = &((struct sockaddr_in *)&contact_sa.ss)->sin_addr;
-            if (addrp)
-                inet_ntop(contact_sa.ss.ss_family, addrp, contact_host,
-                          sizeof(contact_host));
-            uint16_t cport = nsbc_sa_port(&contact_sa);
-            if ((strcmp(contact_host, s->local_host) == 0 ||
-                 strcmp(contact_host, "127.0.0.1") == 0 ||
-                 strcmp(contact_host, "localhost") == 0 ||
-                 strcmp(contact_host, "::1") == 0) &&
-                cport == 5060) {
-                llog(LOG_WARN, "sig", "resolve: Contact %s:%u matches local SIP "
-                     "listener — loop detected, treat as unavailable",
-                     contact_host, cport);
-                n = 0; /* 强制走 NOENT → 404，避免 B2BUA 递归 */
+        {
+            size_t cl = strlen(b.contact);
+            nsbc_sa_t contact_sa;
+            if (uri_to_sa(b.contact, cl, &contact_sa) == NSBC_OK) {
+                char contact_host[INET6_ADDRSTRLEN] = "";
+                void *addrp = NULL;
+                if (contact_sa.ss.ss_family == AF_INET6)
+                    addrp = &((struct sockaddr_in6 *)&contact_sa.ss)->sin6_addr;
+                else if (contact_sa.ss.ss_family == AF_INET)
+                    addrp = &((struct sockaddr_in *)&contact_sa.ss)->sin_addr;
+                if (addrp)
+                    inet_ntop(contact_sa.ss.ss_family, addrp, contact_host,
+                              sizeof(contact_host));
+                uint16_t cport = nsbc_sa_port(&contact_sa);
+                if ((strcmp(contact_host, s->local_host) == 0 ||
+                     strcmp(contact_host, "127.0.0.1") == 0 ||
+                     strcmp(contact_host, "localhost") == 0 ||
+                     strcmp(contact_host, "::1") == 0) &&
+                    cport == 5060) {
+                    llog(LOG_WARN, "sig", "resolve: Contact %s:%u matches local SIP "
+                         "listener — loop detected, treat as unavailable",
+                         contact_host, cport);
+                    n = 0; /* 强制走 NOENT → 404，避免 B2BUA 递归 */
+                }
             }
         }
     }
     if (n > 0) {
-        /* REQ-NAT-001：优先 NAT 改写后的 public_contact（可达） */
-        const char *route_contact =
-            (b.nat_detected && b.public_contact[0])
-            ? b.public_contact : b.contact;
-
-        /* WS 注册（RFC 7118）：.invalid Contact 无法 sockaddr 路由，
-         * binding 存有 ws_conn* → 直接走 WS 通道（防 UAF：alive 校验）
-         * WS 场景一般无 NAT（浏览器用 WebSocket 本来就是直连），
-         * 但仍用 route_contact 统一逻辑 */
-        if (b.ws_conn && ws_conn_alive(b.ws_conn) &&
-            sa_hide_ws_conn(dst, b.ws_conn) == NSBC_OK) {
+        /* 统一 loc_binding → dst 路由决策（消除 WS vs 传统 SIP 重复） */
+        if (sig_deliver_via_binding(dst, &b) == NSBC_OK) {
+            const char *route_contact =
+                (b.nat_detected && b.public_contact[0])
+                ? b.public_contact : b.contact;
             ruri_from_contact(route_contact, out_ruri, outsz);
             if (out_to && out_to_sz)
                 snprintf(out_to, out_to_sz, "<sip:%s@%s>", user, s->realm);
             return NSBC_OK;
         }
-        /* 用 route_contact 覆盖目的与 R-URI */
-        size_t cl = strlen(route_contact);
-        if (uri_to_sa(route_contact, cl, dst) != NSBC_OK) {
-            llog(LOG_WARN, "sig",
-                 "resolve: %s@%s route_contact unreachable (%s, %s) → 404",
-                 user, s->realm, route_contact,
-                 b.ws_conn ? "ws_conn dead" : "host unresolvable");
-            return NSBC_NOENT;
-        }
-        ruri_from_contact(route_contact, out_ruri, outsz);
-        if (out_to && out_to_sz)
-            snprintf(out_to, out_to_sz, "<sip:%s@%s>", user, s->realm);
-        if (b.nat_detected)
-            llog(LOG_INFO, "sig", "resolve: NAT route contact=%s → %s",
-                 b.contact, route_contact);
-        return NSBC_OK;
+        /* deliver 失败 — 详细日志保留（sig_deliver 已打 WARN，但这里保留 resolve 上下文） */
+        llog(LOG_WARN, "sig",
+             "resolve: %s@%s route_contact unreachable (%s, %s) → 404",
+             user, s->realm,
+             b.nat_detected && b.public_contact[0] ? b.public_contact : b.contact,
+             b.ws_conn ? "ws_conn dead" : "host unresolvable");
+        return NSBC_NOENT;
     }
     /* 域外：字面量地址直连（主机名经 DNS 缓存为 P1） */
     if (in_domain) {

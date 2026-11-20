@@ -38,6 +38,9 @@
 #include "outbound_reg.h"  /* P2-14 outreg_find_by_auth_user 层 1 register 反向关联 */
 #include "app_ctx.h"       /* nsbc_get_ctx() —— 每次取最新 ctx->rt（RCU reload 原子换表） */
 #include "uDS_client.h"    /* REQ-UDS-002: uds_send_session（精确大小写，Linux 编译区分） */
+#include "ws_listener.h"   /* ws_conn_alive — WS conn dead 检查（pong miss 防 UAF） */
+/* 从 AF_UNSPEC nsbc_sa_t padding 提取 ws_conn* — signaling.c 定义 */
+void *sig_ws_bridge_conn_from_sa(const nsbc_sa_t *sa);
 #include <unistd.h>        /* usleep — _GNU_SOURCE 已在上部定义，此处显式 include 声明 */
 
 /* ---------- rt 访问 helper ----------
@@ -2882,6 +2885,7 @@ static int uac_invite_follow_redirect(b2b_call_t *c, int lg,
     if (co->cfg.resolve) {
         int rr = co->cfg.resolve(c, new_target, strlen(new_target), &b->dst,
                                  b->ruri, sizeof(b->ruri), b->to, sizeof(b->to),
+                                 NULL /* out_meta: call 模式下 resolve_cb 自己填 leg */,
                                  co->cfg.resolve_ud);
         if (rr != NSBC_OK) {
             snprintf(b->target, sizeof(b->target), "%s", new_target);
@@ -3700,6 +3704,7 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                         int rr = co->cfg.resolve(c, new_target, strlen(new_target),
                                                  &b->dst, b->ruri, sizeof(b->ruri),
                                                  b->to, sizeof(b->to),
+                                                 NULL /* out_meta */,
                                                  co->cfg.resolve_ud);
                         if (rr != NSBC_OK) {
                             /* resolve 失败 → 退回原始 URI（假设 Contact 已可直连） */
@@ -4243,6 +4248,24 @@ static void send_bye_leg(b2b_call_t *c, int leg)
         g_rx_local_port = (op && op->sip_udp_port)
                           ? op->sip_udp_port
                           : (uint16_t)co->cfg.local_udp_port;
+    }
+
+    /* ★ 根因修复：pong miss 会 close fd 并置 ws_conn.closed=1，但
+     * leg[].dst 里存的 ws_conn 指针不会主动清理 → 后续 BYE/CANCEL
+     * 转发时拿 dead conn 创建 NICT txn → ws_conn_send → -1 →
+     * BYE 发不到对端。这里拦截 dead conn → warn + skip。
+     *
+     * call_destroy 在外层 BYE handler 里已经紧跟 send_bye_leg 调用，
+     * 不依赖 BYE 发送成功——所以 skip 发送是安全的（best-effort）。 */
+    if (l->dst.ss.ss_family == AF_UNSPEC) {
+        void *conn = sig_ws_bridge_conn_from_sa(&l->dst);
+        if (!conn || !ws_conn_alive(conn)) {
+            llog(LOG_WARN, "b2b",
+                 "send_bye_leg: leg=%d WS conn=%p DEAD (pong miss/closed=1) — "
+                 "skip BYE send, 对端已掉线，call_destroy 继续",
+                 leg, conn);
+            return;
+        }
     }
 
     sip_txn_t *t = txn_client_new(co->cfg.txn, TXN_NICT, branch,
@@ -5281,6 +5304,7 @@ void handle_new_invite(b2b_core_t *co, sip_txn_t *t,
     int resolve_rc = co->cfg.resolve
         ? co->cfg.resolve(c, a->ruri, strlen(a->ruri), &bd, nruri,
                           sizeof(nruri), bto, sizeof(bto),
+                          NULL /* out_meta */,
                           co->cfg.resolve_ud)
         : NSBC_NOTSUP;
     if (resolve_rc == NSBC_OK) {
@@ -7391,12 +7415,13 @@ void b2b_on_rx(void *ud, sip_tr_proto_t proto, const nsbc_sa_t *src,
 /* ------------------------------------------------------------------ */
 int b2b_resolve_dst(b2b_core_t *co, const char *ruri, size_t ruri_len,
                     nsbc_sa_t *dst, char *out_ruri, size_t outsz,
-                    char *out_to, size_t out_to_sz)
+                    char *out_to, size_t out_to_sz,
+                    b2b_resolve_meta_t *out_meta)
 {
     if (!co || !ruri || !dst) return NSBC_INVAL;
     if (!co->cfg.resolve) return NSBC_ERR;
     return co->cfg.resolve(NULL, ruri, ruri_len, dst, out_ruri, outsz,
-                           out_to, out_to_sz, co->cfg.resolve_ud);
+                           out_to, out_to_sz, out_meta, co->cfg.resolve_ud);
 }
 
 int b2b_originate(b2b_core_t *co, const b2b_orig_t *o, b2b_call_t **out)
@@ -7520,12 +7545,39 @@ int b2b_originate(b2b_core_t *co, const b2b_orig_t *o, b2b_call_t **out)
         b->dst = o->dst;
         if (nsbc_sa_port(&b->dst) == 0)
             nsbc_sa_set_port(&b->dst, 5060);
-        if (b->proto == 0) {
-            /* resolve 没填 proto（非 loc_binding 路径）→ 从 dst.ss_family 兜底 */
+
+        /* ★ REQ-ARCH-NAT-001：优先用调用方传入的 resolve_meta 填 leg 元数据
+         *
+         * 调用方（cmd_originate / API bridge）先调 b2b_resolve_dst(&meta)
+         * 再调 b2b_originate，meta 里已经是 resolve_cb 从 loc_binding 拿到的
+         * transport_proto / nat_detected / service_route 等完整信息。
+         *
+         * 如果 meta.proto != 0 → 说明调用方正确解析过了，直接从 meta 拷到 leg
+         * 否则 → 走旧的 fallback（从 dst.ss_family 猜 WS/UDP，兼容历史调用方） */
+        if (o->resolve_meta.proto != 0) {
+            b->proto = o->resolve_meta.proto;
+            b->reliable = o->resolve_meta.reliable;
+            b->nat_detected = o->resolve_meta.nat_detected;
+            if (o->resolve_meta.ext_rtp_ip[0])
+                snprintf(b->ext_rtp_ip, sizeof(b->ext_rtp_ip), "%s",
+                         o->resolve_meta.ext_rtp_ip);
+            else
+                b->ext_rtp_ip[0] = '\0';
+            if (o->resolve_meta.service_route[0])
+                snprintf(b->service_route, sizeof(b->service_route), "%s",
+                         o->resolve_meta.service_route);
+            if (o->resolve_meta.b_key[0])
+                snprintf(c->b_key, sizeof(c->b_key), "%s", o->resolve_meta.b_key);
+            llog(LOG_INFO, "b2b", "originate: leg[1] meta from resolve: proto=%d reliable=%d nat=%d",
+                 (int)b->proto, b->reliable, b->nat_detected);
+        } else if (b->proto == 0) {
+            /* legacy fallback：resolve_meta 未传 → 从 dst.ss_family 猜 */
             b->proto = (o->dst.ss.ss_family == AF_UNSPEC)
                        ? SIP_TR_WS : SIP_TR_UDP;
             b->reliable = (b->proto == SIP_TR_WS || b->proto == SIP_TR_WSS
                            || b->proto == SIP_TR_TLS || b->proto == SIP_TR_TCP) ? 1 : 0;
+            llog(LOG_INFO, "b2b", "originate: leg[1] proto from legacy ss_family guess (%d)",
+                 (int)b->proto);
         }
         /* REQ-NAT-003：从 auto-linked profile 填 leg[1].ext_rtp_ip
          *
@@ -7547,7 +7599,11 @@ int b2b_originate(b2b_core_t *co, const b2b_orig_t *o, b2b_call_t **out)
          *       1) 从 profile 拿 external_rtp_ip（NAT rewrite 目标）
          *       2) CALL_END 事件里 prof/oprof 不再是 -（日志可读性）
          */
-        if (c->prof) {
+        /* REQ-NAT-003：ext_rtp_ip 兜底
+         *
+         * meta 优先（resolve_cb 从 loc_binding.out_prof 拿到的精确值），
+         * profile auto-link 作为 fallback（非 loc_binding 路径如 trunk 外呼） */
+        if (b->ext_rtp_ip[0] == '\0' && c->prof) {
             if (c->prof->external_rtp_ip[0])
                 snprintf(b->ext_rtp_ip, sizeof(b->ext_rtp_ip), "%s",
                          c->prof->external_rtp_ip);
@@ -7949,7 +8005,27 @@ int b2b_originate(b2b_core_t *co, const b2b_orig_t *o, b2b_call_t **out)
 
     /* ---- A 腿（主 dest） ---- */
     a->state = LEG_CALLING;
-    a->proto = SIP_TR_UDP;
+
+    /* ★ 优先用 resolve_meta（cmd_originate 已解析过），否则 ss_family fallback */
+    if (o->resolve_meta.proto != 0) {
+        a->proto = o->resolve_meta.proto;
+        a->reliable = o->resolve_meta.reliable;
+        a->nat_detected = o->resolve_meta.nat_detected;
+        if (o->resolve_meta.ext_rtp_ip[0])
+            snprintf(a->ext_rtp_ip, sizeof(a->ext_rtp_ip), "%s",
+                     o->resolve_meta.ext_rtp_ip);
+        if (o->resolve_meta.service_route[0])
+            snprintf(a->service_route, sizeof(a->service_route), "%s",
+                     o->resolve_meta.service_route);
+        llog(LOG_INFO, "b2b", "bridge A leg meta: proto=%d reliable=%d",
+             (int)a->proto, a->reliable);
+    } else {
+        a->proto = (o->dst.ss.ss_family == AF_UNSPEC) ? SIP_TR_WS : SIP_TR_UDP;
+        a->reliable = (a->proto == SIP_TR_WS || a->proto == SIP_TR_WSS
+                       || a->proto == SIP_TR_TLS || a->proto == SIP_TR_TCP) ? 1 : 0;
+        llog(LOG_INFO, "b2b", "bridge A leg proto from ss_family: %d", (int)a->proto);
+    }
+
     a->dst = o->dst;
     if (nsbc_sa_port(&a->dst) == 0)
         nsbc_sa_set_port(&a->dst, 5060);
@@ -8015,7 +8091,29 @@ int b2b_originate(b2b_core_t *co, const b2b_orig_t *o, b2b_call_t **out)
 
     /* ---- B 腿（bridge_url）—— 复用 A 腿 From 头 ---- */
     b->state = LEG_CALLING;
-    b->proto = a->proto;
+
+    /* ★ 优先用 bridge_resolve_meta（cmd_originate 已解析过），否则从 A 腿抄 */
+    if (o->bridge_resolve_meta.proto != 0) {
+        b->proto = o->bridge_resolve_meta.proto;
+        b->reliable = o->bridge_resolve_meta.reliable;
+        b->nat_detected = o->bridge_resolve_meta.nat_detected;
+        if (o->bridge_resolve_meta.ext_rtp_ip[0])
+            snprintf(b->ext_rtp_ip, sizeof(b->ext_rtp_ip), "%s",
+                     o->bridge_resolve_meta.ext_rtp_ip);
+        if (o->bridge_resolve_meta.service_route[0])
+            snprintf(b->service_route, sizeof(b->service_route), "%s",
+                     o->bridge_resolve_meta.service_route);
+        llog(LOG_INFO, "b2b", "bridge B leg meta: proto=%d reliable=%d",
+             (int)b->proto, b->reliable);
+    } else {
+        b->proto = a->proto;   /* legacy fallback：用 A 腿 proto */
+        b->reliable = a->reliable;
+        b->nat_detected = a->nat_detected;
+        b->ext_rtp_ip[0] = '\0';
+        b->service_route[0] = '\0';
+        llog(LOG_INFO, "b2b", "bridge B leg proto from A leg: %d", (int)b->proto);
+    }
+
     b->dst = o->bridge_dst;
     if (nsbc_sa_port(&b->dst) == 0)
         nsbc_sa_set_port(&b->dst, 5060);

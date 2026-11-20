@@ -322,11 +322,33 @@ struct b2b_call {
 };
 typedef struct b2b_call b2b_call_t;
 
-/* 号码解析：由 dialplan 模块注册；成功填 dst(网络地址) 与新 R-URI */
+/* 号码解析结果的 transport/NAT 元数据 —— 与 b2b_leg_t 中对应字段 1:1 对齐，
+ * 让 resolve_cb 在 call=NULL（originate 模式）时也能返回完整的 leg 元信息。
+ * 所有字段在 resolve 成功时填充；resolve 失败时保持 memset 初始零值。
+ *
+ * 调用方可选填 out_meta=NULL 表示只关心 dst/out_ruri/out_to（兼容旧签名）。
+ * 填了的话：resolve 会填 proto/reliable/nat_detected/ext_rtp_ip/service_route，
+ * 调用方再 memcpy 到 call->leg[1] 对应字段。 */
+typedef struct {
+    sip_tr_proto_t proto;               /* UDP/TCP/TLS/WS/WSS */
+    int reliable;                       /* 1=可靠传输（TCP/TLS/WS/WSS），0=不可靠（UDP） */
+    int nat_detected;                   /* 1=检测到 NAT（Contact host 私网或 Via received 不同） */
+    char ext_rtp_ip[INET6_ADDRSTRLEN];  /* sip_profile.external_rtp_ip（NAT rewrite 目标） */
+    char service_route[256];             /* IMS Service-Route（RFC 3608），可能为空 */
+    char b_key[128];                     /* per-key 并发限制键（如 "1001@nsbc.local"） */
+    /* 注意：dst/out_ruri/out_to 不在这里——它们是独立 out 参数（为了不破坏 ABI） */
+} b2b_resolve_meta_t;
+
+/* 号码解析：由 dialplan 模块注册
+ *   call=NULL 表示 originate 模式（OAM/API 发起，无入站 INVITE）；
+ *             此时 resolve_cb 仍需正确填 dst + out_meta，调用方从 meta 复制到 leg。
+ *   out_meta=NULL 表示调用方只关心 dst/out_ruri/out_to（旧行为），
+ *             resolve_cb 内部填 call->leg[1] 对应字段。 */
 typedef int (*b2b_resolve_fn)(b2b_call_t *call, const char *ruri,
                               size_t ruri_len, nsbc_sa_t *dst,
                               char *out_ruri, size_t outsz,
-                              char *out_to, size_t out_to_sz, void *ud);
+                              char *out_to, size_t out_to_sz,
+                              b2b_resolve_meta_t *out_meta, void *ud);
 
 /* 媒体决策：两侧 SDP 齐备时调用一次，返回模式（见 media/bridge） */
 typedef enum { B2B_M_BYPASS = 0, B2B_M_RELAY, B2B_M_TRANSCODE }
@@ -493,6 +515,18 @@ typedef struct {
     const char *sdp;
     size_t sdp_len;
     nsbc_sa_t dst;
+    /* 与 dst 成对：resolve_cb 返回的完整 transport/NAT/IMS Service-Route 元数据。
+     *
+     * 由 cmd_originate / API bridge 先调 b2b_resolve_dst(&meta) 拿到，再填到这里。
+     * proto=0 时 b2b_originate 内部用 AF_UNSPEC fallback（旧兼容路径）；
+     * proto 非 0 时直接用 meta 填 leg[1]，彻底消除脆弱的传输猜测。
+     *
+     * bridge 模式（bridge_url 非空）：
+     *   resolve_meta       → leg[0]（主 dest）
+     *   bridge_resolve_meta → leg[1]（bridge_dst） */
+    b2b_resolve_meta_t resolve_meta;
+    /* bridge 模式第二腿对应 meta（同 bridge_dst 成对）。proto=0 表示没解析过。 */
+    b2b_resolve_meta_t bridge_resolve_meta;
     /* REQ-ORIGINATE-001：per-call 超时（毫秒，0 或负数 = 用全局 ring_noanswer_ms，
      * 正数 = 覆盖全局）。arm_noanswer_timer() 会自动读 call->noanswer_ms_override。
      * 对应 FS 变量 originate_timeout（秒，我们自动 ×1000）。 */
@@ -544,10 +578,15 @@ int b2b_originate(b2b_core_t *c, const b2b_orig_t *o, b2b_call_t **out);
 
 /* originate 目标解析（REQ-SIP-012）：经核心装配的 cfg.resolve 把
  * call-url 解析为网络地址 + 改写后 R-URI/To；resolve 未装配返回
- * NSBC_ERR。b2b_core 对 oam 层不透明，call_commands 经此口路由。 */
+ * NSBC_ERR。b2b_core 对 oam 层不透明，call_commands 经此口路由。
+ *
+ * out_meta=NULL 时只返回 dst/out_ruri/out_to；填了则同时返回完整 transport/NAT 元数据
+ * —— 调用方（cmd_originate / API bridge）可以直接把 meta 复制到 call->leg 上，
+ * 不再依赖 b2b_originate 内部脆弱的 AF_UNSPEC → SIP_TR_WS fallback。 */
 int b2b_resolve_dst(b2b_core_t *c, const char *ruri, size_t ruri_len,
                     nsbc_sa_t *dst, char *out_ruri, size_t outsz,
-                    char *out_to, size_t out_to_sz);
+                    char *out_to, size_t out_to_sz,
+                    b2b_resolve_meta_t *out_meta);
 
 /* 主动挂断（REQ-OAM 呼叫控制） */
 int b2b_terminate(b2b_call_t *call, int cause_code);

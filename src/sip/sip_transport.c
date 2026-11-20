@@ -1272,9 +1272,24 @@ int sip_tr_send(sip_transport_t *t, sip_tr_proto_t proto,
             llog(LOG_WARN, "ws", "send: no ws_conn in dst sa");
             return NSBC_NOTSUP;
         }
+        /* ★ 根因修复：pong miss 会 close fd 并置 c->closed=1，但
+         * leg[].dst 里存的 ws_conn 指针不会主动清理 → 后续 BYE/
+         * CANCEL 转发时拿 dead conn 调用 ws_conn_send → 返回 -1 →
+         * BYE 发不到对端。这里提前检查 alive，报更清晰的 WARN 日志。 */
+        if (!ws_conn_alive(conn)) {
+            llog(LOG_WARN, "sip-tr",
+                 "WS send: conn=%p DEAD (pong miss/closed=1) — 对端已掉线，丢弃",
+                 conn);
+            return NSBC_ERR;
+        }
         int rc = ws_conn_send(conn, buf, len);
         llog(LOG_INFO, "sip-tr", "WS send rc=%d", rc);
-        if (rc < 0) return NSBC_ERR;
+        if (rc < 0) {
+            llog(LOG_WARN, "sip-tr",
+                 "WS send FAIL conn=%p rc=%d (conn may have closed between alive check and send)",
+                 conn, rc);
+            return NSBC_ERR;
+        }
         return NSBC_OK;
     }
     /* TCP/TLS：仅复用入向连接（P0；主动外呼连接管理 P1） */

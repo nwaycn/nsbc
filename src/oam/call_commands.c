@@ -1381,12 +1381,15 @@ static int cmd_originate(cmd_ctx_t *c, int argc, char **argv, void *ud)
     o.to_uri = ruri;
 
     nsbc_sa_t dst;
+    b2b_resolve_meta_t res_meta;
     char out_ruri[256];
     char out_to[256];
     memset(&dst, 0, sizeof(dst));
+    memset(&res_meta, 0, sizeof(res_meta));
     rc = b2b_resolve_dst(b, ruri, rlen, &dst,
                              out_ruri, sizeof(out_ruri),
-                             out_to, sizeof(out_to));
+                             out_to, sizeof(out_to),
+                             &res_meta);
     if (rc != NSBC_OK) {
         c->io_printf(c->io_ud, "ERR resolve failed rc=%d\n", rc);
         log_audit("oam", "originate", "url=%s result=resolve-fail rc=%d", argv[1], rc);
@@ -1394,6 +1397,7 @@ static int cmd_originate(cmd_ctx_t *c, int argc, char **argv, void *ud)
     }
     o.to_uri = out_ruri[0] ? out_ruri : ruri;
     o.dst = dst;
+    o.resolve_meta = res_meta;  /* ★ 把 resolve 拿到的 transport/NAT meta 直接传进 b2b_originate */
 
     /* ---- 5. bridge URL 路由解析（如有） ---- */
     if (bridge_url_saved && bridge_url_buf[0]) {
@@ -1423,11 +1427,14 @@ static int cmd_originate(cmd_ctx_t *c, int argc, char **argv, void *ud)
         }
 
         nsbc_sa_t br_dst;
+        b2b_resolve_meta_t br_meta;
         char br_out_ruri[256], br_out_to[256];
         memset(&br_dst, 0, sizeof(br_dst));
+        memset(&br_meta, 0, sizeof(br_meta));
         rc = b2b_resolve_dst(b, br_ruri, br_len, &br_dst,
                                 br_out_ruri, sizeof(br_out_ruri),
-                                br_out_to, sizeof(br_out_to));
+                                br_out_to, sizeof(br_out_to),
+                                &br_meta);
         if (rc != NSBC_OK) {
             c->io_printf(c->io_ud, "ERR bridge resolve failed rc=%d\n", rc);
             log_audit("oam", "originate", "bridge=%s result=resolve-fail rc=%d", bridge_url_buf, rc);
@@ -1435,6 +1442,7 @@ static int cmd_originate(cmd_ctx_t *c, int argc, char **argv, void *ud)
         }
         o.bridge_url = bridge_url_buf;
         o.bridge_dst = br_dst;
+        o.bridge_resolve_meta = br_meta;
     }
 
     /* ---- 6. 传递参数 ---- */
