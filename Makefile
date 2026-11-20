@@ -88,6 +88,8 @@ override NSBC_WITH_SRTP     := 1   # DTLS-SRTP media encryption, pairing OpenSSL
 #     do not depend on whether later ifeq ($(NSBC_WITH_OPENSSL),1) conditional block triggers
 override CPPFLAGS := $(strip $(filter-out -DNSBC_WITH_SQLITE,$(CPPFLAGS)))
 override CPPFLAGS += -I src/include -I3rd/include
+# WebRTC NS（mod_ai_dialog 上行降噪）
+override CPPFLAGS += -I3rd/webrtc
 override CPPFLAGS += -I3rd/bcg729/include -I3rd/bcg729/src
 override CPPFLAGS += -DHAVE_BCG729
 override CPPFLAGS += -DNSBC_WITH_OPENSSL -DNSBC_WITH_SRTP
@@ -303,6 +305,49 @@ all: $(TARGET) $(CLI_TARGET)
 endif
 
 # ================================================================
+# WebRTC 第三方 DSP 源码（AECM / AGC / NS / VAD）
+#
+# 统一规则：-fPIC（要链进 .so）+ -fvisibility=hidden + -w（不满足本项目
+# -Wall -Wextra -Werror）+ -DNDEBUG（第三方 assert 不进 abort 路径）。
+#
+# ⚠ 不要编 spl_init.c / min_max_operations.c —— 它们把
+#   WebRtcSpl_MaxAbsValueW16 定义成函数指针变量，会导致符号错绑到 BSS 段并 segfault。
+# ================================================================
+WEBRTC_DSP_DIR := 3rd/webrtc
+
+# ---- 上行降噪/回声/增益 → 编进 mod_ai_dialog.so ----
+# aecm.c 只 extern 依赖 WebRtcSpl_DivW32W16 / DivU32U16（division_operations.c 提供）
+WEBRTC_DSP_SRC := $(WEBRTC_DSP_DIR)/noise_suppression.c \
+                  $(WEBRTC_DSP_DIR)/aecm.c \
+                  $(WEBRTC_DSP_DIR)/agc.c \
+                  $(WEBRTC_DSP_DIR)/common_audio/signal_processing/division_operations.c
+WEBRTC_DSP_OBJ := $(patsubst $(WEBRTC_DSP_DIR)/%.c,$(BUILD)/3rd/webrtc/%.o,$(WEBRTC_DSP_SRC))
+
+# ---- WebRTC VAD（core vad_engine.c 的二级语音判据）→ 编进 nsbcd ----
+# 依赖：5 个 vad 源 + energy/get_scaling_square + division + 48k 重采样三件套
+# （WebRtcVad_InitCore 会调 WebRtcSpl_ResetResample48khzTo8khz，必须一起链）
+WEBRTC_VAD_SRC := $(WEBRTC_DSP_DIR)/common_audio/vad/webrtc_vad.c \
+                  $(WEBRTC_DSP_DIR)/common_audio/vad/vad_core.c \
+                  $(WEBRTC_DSP_DIR)/common_audio/vad/vad_filterbank.c \
+                  $(WEBRTC_DSP_DIR)/common_audio/vad/vad_gmm.c \
+                  $(WEBRTC_DSP_DIR)/common_audio/vad/vad_sp.c \
+                  $(WEBRTC_DSP_DIR)/common_audio/signal_processing/energy.c \
+                  $(WEBRTC_DSP_DIR)/common_audio/signal_processing/get_scaling_square.c \
+                  $(WEBRTC_DSP_DIR)/common_audio/signal_processing/division_operations.c \
+                  $(WEBRTC_DSP_DIR)/common_audio/signal_processing/resample_48khz.c \
+                  $(WEBRTC_DSP_DIR)/common_audio/signal_processing/resample_by_2_internal.c \
+                  $(WEBRTC_DSP_DIR)/common_audio/signal_processing/resample_fractional.c
+WEBRTC_VAD_OBJ := $(patsubst $(WEBRTC_DSP_DIR)/%.c,$(BUILD)/3rd/webrtc/%.o,$(WEBRTC_VAD_SRC))
+
+$(BUILD)/3rd/webrtc/%.o: $(WEBRTC_DSP_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -fPIC -fvisibility=hidden -w -DNDEBUG \
+	      -I$(WEBRTC_DSP_DIR)/common_audio/signal_processing/include \
+	      $(CPPFLAGS) -c -o $@ $<
+
+OBJS += $(WEBRTC_VAD_OBJ)
+
+# ================================================================
 # dynamic module build rule: each mod_xxx.so independently built with -shared -fPIC
 #
 # 关键：pattern rule 里不能用 ifeq ($(MOD_STEM),xxx) —— $* 在解析阶段还没绑定，
@@ -323,6 +368,10 @@ $(BUILD)/mod/mod_av.so: MOD_EXTRA_LDLIBS = $(AV_LDLIBS) \
     -Wl,-rpath,$(shell pkg-config --variable=libdir libavcodec 2>/dev/null || echo /usr/lib/x86_64-linux-gnu)
 $(BUILD)/mod/mod_ai_dialog.so: MOD_EXTRA_LDLIBS   = $(AI_DIALOG_LDLIBS)
 $(BUILD)/mod/mod_ai_dialog.so: MOD_EXTRA_CPPFLAGS = $(AI_DIALOG_CPPFLAGS)
+
+# ---- WebRTC DSP（第三方 AECM / AGC / NS）→ 编进 mod_ai_dialog.so ----
+# 源码清单与编译规则在上方（与 VAD 共用），这里只声明模块依赖
+MOD_SRC_ai_dialog += $(WEBRTC_DSP_OBJ)
 $(BUILD)/mod/mod_codecs.so: MOD_EXTRA_CFLAGS     = -Wno-error -Wno-unused-parameter -Wno-maybe-uninitialized
 
 # ---- defaults ----

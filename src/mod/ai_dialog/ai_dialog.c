@@ -32,6 +32,7 @@
 #include "app_registry.h" /* P0-2: app_register / app_desc_t */
 #include "app_ctx.h"      /* struct nsbc_ctx 完整定义（ctx->cfg）*/
 #include "vad_engine.h"   /* REQ-AI-VAD-001: vad_start_for_call / vad_stop_for_call + HPF API */
+#include "noise_suppression.h" /* WebRTC NS：上行固定 8kHz，10ms(80样本) 一块 */
 #include "obs.h"          /* obs_event (redundant for AI_SESSION — see uDS_client.h below) */
 #include "uDS_client.h"   /* ★ AI_SESSION_OPENED/CLOSED go through UDS 'session' topic → calls_tx → /calls/stream SSE */
 
@@ -62,6 +63,71 @@ typedef struct ai_cfg {
 
 #define AI_RING_CAP (512 * 1024)   /* 512KB ~16s @ 8kHz PCM16 LE (AI unified format) */
 
+/* ===== per-leg WebRTC DSP（AECM + NS + AGC，固定 8kHz / 10ms=80 样本）=====
+ *
+ * 只用到 3rd/webrtc 下 aecm.c / agc.c / noise_suppression.c 三个实现。
+ * 这里不 include aecm.h / agc.h：那两个头文件会带入 FRAME_LEN / PART_LEN /
+ * MAX_DELAY 等宏和一批 static const 表，在 -Wall -Wextra -Werror 下会触发
+ * -Wunused-const-variable 直接编译失败。只声明实际用到的符号。 */
+extern void    *WebRtcAecm_Create(void);
+extern void     WebRtcAecm_Free(void *aecmInst);
+extern int32_t  WebRtcAecm_Init(void *aecmInst, int32_t sampFreq);
+extern int32_t  WebRtcAecm_BufferFarend(void *aecmInst, const int16_t *farend,
+                                        size_t nrOfSamples);
+extern int32_t  WebRtcAecm_Process(void *aecmInst, const int16_t *nearendNoisy,
+                                   const int16_t *nearendClean, int16_t *out,
+                                   size_t nrOfSamples, int16_t msInSndCardBuf);
+
+/* 与 agc.h 的 WebRtcAgcConfig 布局完全一致（int16 / int16 / uint8）*/
+typedef struct ai_agc_cfg {
+    int16_t targetLevelDbfs;
+    int16_t compressionGaindB;
+    uint8_t limiterEnable;
+} ai_agc_cfg_t;
+
+extern void *WebRtcAgc_Create(void);
+extern void  WebRtcAgc_Free(void *agcInst);
+extern int   WebRtcAgc_Init(void *agcInst, int32_t minLevel, int32_t maxLevel,
+                            int16_t agcMode, uint32_t fs);
+extern int   WebRtcAgc_set_config(void *agcInst, ai_agc_cfg_t config);
+extern int   WebRtcAgc_AddMic(void *agcInst, int16_t *const *inMic,
+                              size_t num_bands, size_t samples);
+extern int   WebRtcAgc_Process(void *agcInst, const int16_t *const *inNear,
+                               size_t num_bands, size_t samples,
+                               int16_t *const *out, int32_t inMicLevel,
+                               int32_t *outMicLevel, int16_t echo,
+                               uint8_t *saturationWarning);
+
+#define AI_DSP_FRAME      80    /* 10ms @8kHz —— AECM/NS/AGC 统一块长 */
+#define AI_NOISE_GATE     80    /* 噪声门阈值（样本绝对值），放在 AGC 之前：
+                                 * 静音样本 ±8 直接归零，避免 30~50 残噪被 AGC 放大成 200+ 嘶声 */
+#define AI_GATE_PREROLL   1600  /* 200ms @8kHz：静音期预录，VAD 判 SPEECH 时补发（防丢字头）*/
+#define AI_GATE_HANGOVER  1600  /* 200ms @8kHz：SPEECH 结束后继续放行（防丢字尾）*/
+/* AECM 启动门限提示：AECM 启动阶段要求 farend 缓冲达到
+ * bufSizeStart = 3*(delay+10)/40 块（80 样本/块）才结束 startup。
+ * 我们的 farend 是「发一包 TTS 补一块」的实时流，缓冲深度 = TX 分包长度
+ * （Go 侧 640B/40ms → 4 块）。取 20ms → bufSizeStart=2，20ms/40ms 分包都
+ * 能过启动门限；调大反而可能永远进不了回声消除。真实回声延迟由 AECM
+ * 内部的二进制延迟估计器（最长 100×PART_LEN ≈ 800ms）自己搜。*/
+#define AI_AECM_DELAY_MS  20
+
+typedef struct ai_dsp {
+    void     *aecm;         /* WebRtcAecm 实例（8kHz）；NULL = 不可用 */
+    void     *agc;          /* WebRtcAgc 实例（8kHz adaptive digital）；NULL = 不可用 */
+    NsHandle *ns;           /* WebRTC NS 实例（8kHz）；NULL = 不可用 */
+    int32_t   mic_level;    /* AGC 虚拟 mic 电平（adaptive digital 初值 127）*/
+    int       far_ever;     /* 是否收到过下行 TTS（没收到过就不跑 AECM）*/
+    int       far_pending;  /* 已 BufferFarend 但尚未被 near 消费的 80 样本块数 */
+    uint32_t  far_blocks;   /* DIAG：累计喂入 AECM 的 far 块数（0 = 本通没跑过 AECM）*/
+    /* DIAG：逐级能量累计（avg|sample|），用于分别量化 AECM / NS / 噪声门 / AGC 的作用 */
+    uint64_t  st_aec_sum;   /* AECM 之后 */
+    uint64_t  st_ns_sum;    /* NS 之后 */
+    uint64_t  st_gate_sum;  /* 噪声门之后（AGC 之前）*/
+    uint64_t  st_samples;   /* 累计样本数 */
+    uint64_t  st_far_sum;   /* DIAG：far 参考累计 |sample| */
+    uint64_t  st_far_samples;
+} ai_dsp_t;
+
 typedef struct ai_session {
     void     *call_key;
     int       b_leg;
@@ -87,6 +153,20 @@ typedef struct ai_session {
     /* per-leg HPF — same butterworth filter as vad_engine, strips DC + 50Hz mains hum
      * ring buffer previously had no HPF, so ASR fed slightly different audio than VAD detected */
     vad_hpf_t hpf[2];       /* leg 0 + leg 1 独立 HPF 状态 */
+    ai_dsp_t  dsp[2];       /* per-leg AECM + NS + AGC（两腿音频状态不能混）*/
+    /* DIAG：DSP 前后能量统计（每秒汇总一条，判断敲击/噪声是否被压掉）*/
+    uint32_t  dsp_frames[2];
+    uint32_t  dsp_pre_sum[2];
+    uint32_t  dsp_post_sum[2];
+    uint32_t  dsp_pre_max[2];
+    uint32_t  dsp_post_max[2];
+    /* VAD 门控：非语音不写 ring（不送 ai_agent），带 200ms pre-roll + 200ms hangover */
+    int16_t   gate_pre[2][AI_GATE_PREROLL]; /* 静音期预录环形缓冲 */
+    size_t    gate_pre_pos[2];
+    size_t    gate_pre_fill[2];
+    int       gate_hang[2];                 /* 剩余 hangover 样本数 */
+    int       gate_on[2];                   /* 1 = 当前放行 */
+    uint32_t  gate_drop[2];                 /* DIAG：本秒被门控丢掉的帧数 */
 
     /* external request to transfer AI session to human agent (blind transfer)
      * 设 transfer_dest + transfer_pending=1 → ai_session_thread 下次循环调
@@ -113,6 +193,11 @@ static void *ai_session_thread_stub(void *arg);
 /* P0-1 / P0-2: ai_init 里注册的两个函数，本文件底部定义 */
 static void ai_on_call_destroy(void *call_key, int a_final, void *ud);
 static app_rc_t ai_app_exec(app_ctx_t *c, const char *data, void *ud);
+/* per-leg WebRTC DSP：session 创建处要调 ai_dsp_init，定义在 bridge hook 段 */
+static void ai_dsp_init(ai_dsp_t *d);
+static void ai_dsp_free(ai_dsp_t *d);
+static void ai_dsp_far(ai_dsp_t *d, const int16_t *buf, size_t n);
+static void ai_dsp_near(ai_dsp_t *d, int16_t *buf, size_t n);
 
 /* P0-2: 给 dp app 或全局 hook 共用的 session 查找/创建辅助 */
 
@@ -166,9 +251,18 @@ static ai_session_t *ai_session_find_or_create(ai_store_t *st, void *call_key,
         vad_hpf_init(&s->hpf[0], 50.0f, 8000.0f);
         vad_hpf_init(&s->hpf[1], 50.0f, 8000.0f);
 
+        /* per-leg WebRTC DSP：AECM(回声消除) + NS(降噪 Mild 6dB) + AGC(数字增益)。
+         * 两腿音频状态不能混，各一套实例；某一级创建失败只降级该级，不影响通话 */
+        for (int i = 0; i < 2; i++) {
+            ai_dsp_init(&s->dsp[i]);
+        }
         st->head = s;
-        llog(LOG_INFO, "ai", "session opened call=%p pt=%d via=%s HPF init",
-             call_key, pt_in, src);
+        llog(LOG_INFO, "ai",
+             "session opened call=%p pt=%d via=%s HPF init AECM=%s NS=%s AGC=%s",
+             call_key, pt_in, src,
+             (s->dsp[0].aecm && s->dsp[1].aecm) ? "on(8k)" : "off",
+             (s->dsp[0].ns && s->dsp[1].ns) ? "on(8k,mild)" : "off",
+             (s->dsp[0].agc && s->dsp[1].agc) ? "on(8k,+12dB)" : "off");
 
         /* emit AI_SESSION_OPENED via uds_send_session('session' topic)
          * → UDS data.sock → uds_server.rs → calls_tx.send()
@@ -228,6 +322,262 @@ static ai_session_t *ai_session_find_or_create(ai_store_t *st, void *call_key,
 /* bridge 动态 hook 回调（媒体线程）                                    */
 /* ================================================================== */
 
+/* ===== per-leg DSP 生命周期与处理 ===== */
+
+static void ai_dsp_init(ai_dsp_t *d)
+{
+    memset(d, 0, sizeof(*d));
+    d->mic_level = 127;   /* WebRtcAgc_Init 在 adaptive digital 下的 mid-point */
+
+    /* AECM：8kHz 窄带回声消除 */
+    d->aecm = WebRtcAecm_Create();
+    if (d->aecm && WebRtcAecm_Init(d->aecm, 8000) != 0) {
+        WebRtcAecm_Free(d->aecm);
+        d->aecm = NULL;
+    }
+
+    /* AGC：adaptive digital，目标 -3dBFS / 压缩增益 12dB / 开 limiter */
+    d->agc = WebRtcAgc_Create();
+    if (d->agc) {
+        ai_agc_cfg_t cfg = { 3, 12, 1 };
+        if (WebRtcAgc_Init(d->agc, 0, 255, 2 /* kAgcModeAdaptiveDigital */, 8000) != 0 ||
+            WebRtcAgc_set_config(d->agc, cfg) != 0) {
+            WebRtcAgc_Free(d->agc);
+            d->agc = NULL;
+        }
+    }
+
+    /* NS：8kHz / Mild(6dB) */
+    d->ns = WebRtcNs_Create();
+    if (d->ns && (WebRtcNs_Init(d->ns, 8000) != 0 ||
+                  WebRtcNs_set_policy(d->ns, 0) != 0)) {
+        WebRtcNs_Free(d->ns);
+        d->ns = NULL;
+    }
+}
+
+static void ai_dsp_free(ai_dsp_t *d)
+{
+    if (d->aecm) { WebRtcAecm_Free(d->aecm); d->aecm = NULL; }
+    if (d->agc)  { WebRtcAgc_Free(d->agc);   d->agc  = NULL; }
+    if (d->ns)   { WebRtcNs_Free(d->ns);     d->ns   = NULL; }
+}
+
+/* 求和 |sample|（DIAG 用）*/
+static uint64_t ai_sum_abs(const int16_t *b, size_t n)
+{
+    uint64_t s = 0;
+    for (size_t i = 0; i < n; i++) s += (uint64_t)(b[i] < 0 ? -b[i] : b[i]);
+    return s;
+}
+
+/* 下行（我们发给话机的 TTS）作为 AECM 远端参考，只在注入腿（leg 0）调用。
+ * AECM 只接受 80/160 样本块，不足一块的尾巴丢弃（G.711 帧恒为 160 样本）。*/
+static void ai_dsp_far(ai_dsp_t *d, const int16_t *buf, size_t n)
+{
+    if (!d->aecm || !buf) return;
+    for (size_t off = 0; off + AI_DSP_FRAME <= n; off += AI_DSP_FRAME) {
+        if (WebRtcAecm_BufferFarend(d->aecm, buf + off, AI_DSP_FRAME) >= 0) {
+            d->far_pending++;
+            d->far_blocks++;
+            d->far_ever = 1;
+            d->st_far_sum += ai_sum_abs(buf + off, AI_DSP_FRAME);
+            d->st_far_samples += AI_DSP_FRAME;
+        }
+    }
+}
+
+/* 上行 DSP 链：AECM（回声消除）→ NS（降噪）→ 噪声门 → AGC（增益），原地 10ms 一块。 */
+static void ai_dsp_near(ai_dsp_t *d, int16_t *buf, size_t n)
+{
+    static const int16_t silence[AI_DSP_FRAME] = { 0 };
+
+    for (size_t off = 0; off + AI_DSP_FRAME <= n; off += AI_DSP_FRAME) {
+        int16_t *frame = buf + off;
+
+        /* AECM：收到过下行 TTS 才启用；没有待消费的远端块时补静音，
+         * 保证 far/near 两条流按同一时间轴推进（否则延迟估计会失准）。*/
+        if (d->aecm && d->far_ever) {
+            if (d->far_pending > 0) d->far_pending--;
+            else WebRtcAecm_BufferFarend(d->aecm, silence, AI_DSP_FRAME);
+
+            int16_t aec_out[AI_DSP_FRAME];
+            if (WebRtcAecm_Process(d->aecm, frame, NULL, aec_out,
+                                   AI_DSP_FRAME, AI_AECM_DELAY_MS) >= 0) {
+                memcpy(frame, aec_out, sizeof(aec_out));
+            }
+        }
+        d->st_aec_sum += ai_sum_abs(frame, AI_DSP_FRAME);
+
+        /* NS：Analyze 必须先喂同一块（噪声底估计在 Analyze 内）*/
+        if (d->ns) {
+            int16_t *band[1] = { frame };
+            WebRtcNs_Analyze(d->ns, frame);
+            WebRtcNs_Process(d->ns, (const int16_t *const *)band, 1, band);
+        }
+        d->st_ns_sum += ai_sum_abs(frame, AI_DSP_FRAME);
+
+        /* Noise gate：必须在 AGC 之前 —— 否则 30~50 的残噪会被 AGC 放大到 200+
+         * 变成嘶声（实测 pre_max=41 → post_max=257）。*/
+        for (size_t i = 0; i < AI_DSP_FRAME; i++) {
+            if (frame[i] < AI_NOISE_GATE && frame[i] > -AI_NOISE_GATE) {
+                frame[i] = 0;
+            }
+        }
+        d->st_gate_sum += ai_sum_abs(frame, AI_DSP_FRAME);
+        d->st_samples += AI_DSP_FRAME;
+
+        /* AGC：AddMic 先统计包络，Process 再按增益表输出（in/out 可同缓冲）*/
+        if (d->agc) {
+            int16_t *mic[1] = { frame };
+            int32_t out_level = d->mic_level;
+            uint8_t saturation = 0;
+            WebRtcAgc_AddMic(d->agc, mic, 1, AI_DSP_FRAME);
+            if (WebRtcAgc_Process(d->agc, (const int16_t *const *)mic, 1,
+                                  AI_DSP_FRAME, mic, d->mic_level, &out_level,
+                                  (int16_t)(d->aecm && d->far_ever), &saturation) == 0) {
+                d->mic_level = out_level;
+            }
+        }
+    }
+}
+
+/* DIAG：avg|sample|，口径与 vad_engine 的 rms 一致（0..32767）*/
+static int32_t ai_rms16(const int16_t *buf, size_t n)
+{
+    if (!buf || n == 0) return 0;
+    uint64_t sum = 0;
+    for (size_t i = 0; i < n; i++) {
+        int32_t v = buf[i];
+        sum += (uint64_t)(v < 0 ? -v : v);
+    }
+    return (int32_t)(sum / n);
+}
+
+/* DIAG：DSP 前后能量对比，每腿每秒一条（50 帧 @20ms）。
+ * 判定方法：
+ *   pre_max 有尖峰、post_max 明显下降 → 被 AECM/NS 压掉了；
+ *   post_max ≈ pre_max               → 原样进了 ring buffer（即被 ASR 录进去）。
+ * 注意：AECM 只消 TTS 回声、NS 是频谱减法，对敲桌子这类宽带瞬态基本无效，
+ *       AGC 还会把未被压掉的低电平内容再放大 —— 这条日志就是用来量化这个的。*/
+static void ai_dsp_diag(ai_session_t *s, void *call_key, int leg,
+                        int32_t pre, int32_t post)
+{
+    s->dsp_frames[leg]++;
+    s->dsp_pre_sum[leg]  += (uint32_t)pre;
+    s->dsp_post_sum[leg] += (uint32_t)post;
+    if ((uint32_t)pre  > s->dsp_pre_max[leg])  s->dsp_pre_max[leg]  = (uint32_t)pre;
+    if ((uint32_t)post > s->dsp_post_max[leg]) s->dsp_post_max[leg] = (uint32_t)post;
+
+    if (s->dsp_frames[leg] < 50) return;
+
+    uint32_t n = s->dsp_frames[leg];
+    uint64_t sm = s->dsp[leg].st_samples;
+    uint32_t aec_avg  = sm ? (uint32_t)(s->dsp[leg].st_aec_sum  / sm) : 0;
+    uint32_t ns_avg   = sm ? (uint32_t)(s->dsp[leg].st_ns_sum   / sm) : 0;
+    uint32_t gate_avg = sm ? (uint32_t)(s->dsp[leg].st_gate_sum / sm) : 0;
+    uint64_t fsm = s->dsp[leg].st_far_samples;
+    uint32_t far_avg = fsm ? (uint32_t)(s->dsp[leg].st_far_sum / fsm) : 0;
+    llog(LOG_INFO, "ai",
+         "DIAG dsp call=%p leg=%d pre_avg=%u aec_avg=%u ns_avg=%u gate_avg=%u post_avg=%u"
+         " pre_max=%u post_max=%u far=%u far_avg=%u gate=%d drop=%u frames=%u",
+         call_key, leg,
+         s->dsp_pre_sum[leg] / n, aec_avg, ns_avg, gate_avg,
+         s->dsp_post_sum[leg] / n, s->dsp_pre_max[leg], s->dsp_post_max[leg],
+         s->dsp[leg].far_blocks, far_avg, s->gate_on[leg], s->gate_drop[leg], n);
+    s->dsp_frames[leg]    = 0;
+    s->dsp_pre_sum[leg]   = 0;
+    s->dsp_post_sum[leg]  = 0;
+    s->dsp_pre_max[leg]   = 0;
+    s->dsp_post_max[leg]  = 0;
+    s->gate_drop[leg]     = 0;
+    s->dsp[leg].st_aec_sum  = 0;
+    s->dsp[leg].st_ns_sum   = 0;
+    s->dsp[leg].st_gate_sum = 0;
+    s->dsp[leg].st_samples  = 0;
+    s->dsp[leg].st_far_sum  = 0;
+    s->dsp[leg].st_far_samples = 0;
+}
+
+/* ring buffer 写入（持 s->lock 由调用方负责）*/
+static void ai_ring_put(ai_session_t *s, const int16_t *pcm, size_t n)
+{
+    size_t ring_len = n * 2;
+    const uint8_t *ring_data = (const uint8_t *)pcm;
+
+    size_t space = (s->r_head >= s->r_tail)
+        ? (AI_RING_CAP - s->r_head + s->r_tail - 1)
+        : (s->r_tail - s->r_head - 1);
+    if (space < ring_len) {
+        /* ring 满：丢最旧（不阻塞媒体线程） */
+        s->r_tail = (s->r_tail + (ring_len - space) + 1) % AI_RING_CAP;
+        space = AI_RING_CAP - 1 - ((s->r_head >= s->r_tail)
+              ? (s->r_head - s->r_tail)
+              : (s->r_tail - s->r_head));
+    }
+    if (space >= ring_len) {
+        for (size_t i = 0; i < ring_len; ++i) {
+            s->ring[s->r_head++] = ring_data[i];
+            if (s->r_head >= AI_RING_CAP) s->r_head = 0;
+        }
+    }
+}
+
+/* VAD 门控：VAD_STATE_SILENCE 不写 ring（非人声不送 ai_agent）。
+ *  - pre-roll：静音期最近 200ms 留在 gate_pre，VAD 判 SPEECH 时按时间顺序补发 → 不丢字头
+ *  - hangover：SPEECH 结束后继续放行 200ms → 不丢字尾
+ *  - VAD 不可用（未 start / 该 leg 无槽位）→ fail-open 全放行，不影响业务 */
+static void ai_gate_push(ai_session_t *s, void *call_key, int leg,
+                         const int16_t *pcm, size_t n)
+{
+    if (n == 0) return;
+    if (leg < 0 || leg >= 2) { ai_ring_put(s, pcm, n); return; }
+
+    vad_state_t st = VAD_STATE_SILENCE;
+    uint16_t rms = 0;
+    int have_vad = (vad_query_for_call(call_key, leg, &st, &rms) == 0);
+
+    if (!have_vad || st != VAD_STATE_SILENCE) {
+        if (!s->gate_on[leg]) {
+            /* 静音 → 语音：先补发 pre-roll（环形，分两段保持时序）*/
+            size_t fill = s->gate_pre_fill[leg];
+            if (fill > 0) {
+                size_t start = (s->gate_pre_pos[leg] + AI_GATE_PREROLL - fill)
+                               % AI_GATE_PREROLL;
+                if (start + fill <= AI_GATE_PREROLL) {
+                    ai_ring_put(s, &s->gate_pre[leg][start], fill);
+                } else {
+                    size_t first = AI_GATE_PREROLL - start;
+                    ai_ring_put(s, &s->gate_pre[leg][start], first);
+                    ai_ring_put(s, &s->gate_pre[leg][0], fill - first);
+                }
+            }
+            s->gate_pre_fill[leg] = 0;
+            s->gate_on[leg] = 1;
+        }
+        s->gate_hang[leg] = AI_GATE_HANGOVER;
+        ai_ring_put(s, pcm, n);
+        return;
+    }
+
+    /* SILENCE：hangover 内继续放行 */
+    if (s->gate_on[leg] && s->gate_hang[leg] > 0) {
+        s->gate_hang[leg] -= (int)n;
+        if (s->gate_hang[leg] < 0) s->gate_hang[leg] = 0;
+        ai_ring_put(s, pcm, n);
+        return;
+    }
+    s->gate_on[leg] = 0;
+    s->gate_drop[leg]++;
+
+    /* 继续收集 pre-roll（覆盖最旧）*/
+    for (size_t i = 0; i < n; i++) {
+        s->gate_pre[leg][s->gate_pre_pos[leg]] = pcm[i];
+        s->gate_pre_pos[leg] = (s->gate_pre_pos[leg] + 1) % AI_GATE_PREROLL;
+        if (s->gate_pre_fill[leg] < AI_GATE_PREROLL) s->gate_pre_fill[leg]++;
+    }
+}
+
 static void ai_rec_feed(void *ud, void *call_key,
                         const void *payload, size_t len,
                         int leg, int pt)
@@ -286,8 +636,6 @@ static void ai_rec_feed(void *ud, void *call_key,
 
     /* per-frame PCM16 栈缓冲（20ms @ 8kHz G.711 → 160 samples → 320B PCM16，留 1024 够 60ms） */
     int16_t pcm16_buf[1024];
-    const uint8_t *ring_data = NULL;
-    size_t ring_len = 0;
     size_t pcm16_samples = 0;
 
     /* 写 ring buffer（持 s->lock 保护并发写）；转码+解码都在锁内完成 ——
@@ -353,73 +701,28 @@ static void ai_rec_feed(void *ud, void *call_key,
         vad_hpf_process(&s->hpf[leg], pcm16_buf, pcm16_samples);
     }
 
-    /* ★ RX 音量低修复：peak-normalization AGC + noise gate
-     *
-     * G.711 A-law 线性范围 ±16383（13bit 有效位），用户实际说话幅度可能只有
-     * peak ~2000-5000（远低于编码满幅）→ 录音回放听起来音量很低。
-     *
-     * AGC：per-frame peak normalization
-     *   - 算当前帧 peak；如果 peak < target_peak(12000) 则增益 = target/peak
-     *   - gain 上限 4x（64/16），防止纯静音帧被放大成数字噪声
-     *   - peak ≤ 60（接近静音）跳过增益 → 让 noise gate 处理
-     * Noise gate：abs(sample) < 30 → 置零（干掉环境底噪和 AGC 放大的噪声底）
-     *
-     * 这两个 DSP 作用于 PCM16 域（G.711 decode 后、ring buffer 前），
-     * ASR 和录音都受益。零 malloc、零锁、纯栈上 —— 媒体线程热路径 OK。 */
-    if (pcm16_samples > 0) {
-        int32_t frame_peak = 0;
-        for (size_t i = 0; i < pcm16_samples; i++) {
-            int32_t av = pcm16_buf[i] < 0 ? -pcm16_buf[i] : pcm16_buf[i];
-            if (av > frame_peak) frame_peak = av;
-        }
-
-        /* AGC：peak normalization
-         * 目标 peak = 12000（约 int16 max 的 37%，G.711 线性范围内不削波）
-         * gain 上限 4x（64/16），避免把底噪放大成可听噪声 */
-        #define AGC_TARGET_PEAK  12000
-        #define AGC_MAX_GAIN_X16 64   /* 64/16 = 4x */
-        #define AGC_NOISE_FLOOR  60   /* peak ≤ 60 视为静音 → 不放大 */
-        if (frame_peak > AGC_NOISE_FLOOR && frame_peak < AGC_TARGET_PEAK) {
-            int32_t gain_x16 = (AGC_TARGET_PEAK * 16) / frame_peak;
-            if (gain_x16 > AGC_MAX_GAIN_X16) gain_x16 = AGC_MAX_GAIN_X16;
-            for (size_t i = 0; i < pcm16_samples; i++) {
-                int32_t v = (int32_t)pcm16_buf[i] * gain_x16 / 16;
-                if (v > 32767) v = 32767;
-                if (v < -32768) v = -32768;
-                pcm16_buf[i] = (int16_t)v;
-            }
-        }
-
-        /* Noise gate：干掉 near-zero 样本
-         * 30 ≈ AGC 放大后的底噪 floor（G.711 解码固有量化底噪 + 环境噪声）*/
-        #define RX_NOISE_GATE 30
-        for (size_t i = 0; i < pcm16_samples; i++) {
-            if (pcm16_buf[i] < RX_NOISE_GATE && pcm16_buf[i] > -RX_NOISE_GATE) {
-                pcm16_buf[i] = 0;
-            }
-        }
+    /* 上行 DSP：AECM 回声消除 → NS 降噪 → AGC 数字增益（per-leg，8kHz/10ms 一块）
+     * 放在 HPF 之后，让 AEC/AGC 处理的是已去直流和工频干扰的信号。
+     * 原先手写的 peak-normalization AGC 已由 WebRTC AGC 取代（避免双重增益）。 */
+    int32_t dsp_pre = 0, dsp_post = 0;
+    if (pcm16_samples > 0) dsp_pre = ai_rms16(pcm16_buf, pcm16_samples);
+    if (pcm16_samples > 0 && leg >= 0 && leg < 2) {
+        ai_dsp_near(&s->dsp[leg], pcm16_buf, pcm16_samples);
     }
 
-    ring_data = (const uint8_t *)pcm16_buf;
-    ring_len = pcm16_samples * 2;  /* int16_t → 2 bytes each */
+    /* DIAG：DSP 前后能量（每秒一条）——判断敲击/环境噪声是真被压掉还是原样进了 ASR */
+    if (pcm16_samples > 0 && leg >= 0 && leg < 2) {
+        dsp_post = ai_rms16(pcm16_buf, pcm16_samples);
+    }
 
-    size_t space = (s->r_head >= s->r_tail)
-        ? (AI_RING_CAP - s->r_head + s->r_tail - 1)
-        : (s->r_tail - s->r_head - 1);
-    if (space < ring_len) {
-        /* ring 满：丢最旧（不阻塞媒体线程） */
-        s->r_tail = (s->r_tail + (ring_len - space) + 1) % AI_RING_CAP;
-        /* 然后算正确新 space */
-        space = AI_RING_CAP - 1 - ((s->r_head >= s->r_tail)
-              ? (s->r_head - s->r_tail)
-              : (s->r_tail - s->r_head));
+    /* VAD 门控：非人声（SILENCE）不写 ring → 不送 ai_agent；
+     * 200ms pre-roll 防丢字头，200ms hangover 防丢字尾 */
+    ai_gate_push(s, call_key, leg, pcm16_buf, pcm16_samples);
+
+    if (pcm16_samples > 0 && leg >= 0 && leg < 2) {
+        ai_dsp_diag(s, call_key, leg, dsp_pre, dsp_post);
     }
-    if (space >= ring_len) {
-        for (size_t i = 0; i < ring_len; ++i) {
-            s->ring[s->r_head++] = ring_data[i];
-            if (s->r_head >= AI_RING_CAP) s->r_head = 0;
-        }
-    }
+
     pthread_mutex_unlock(&s->lock);
 }
 
@@ -484,7 +787,7 @@ int ai_set_producer(void *call_key, int producer)
      * producer=1 → 对 A 腿（被叫用户腿）启动 VAD，Go 侧按 VAD 边界切句
      * producer=0 → 停止 VAD，call_destroy 时也会停 */
     if (producer && !old_producer) {
-        int rc = vad_start_for_call(call_key, 2 /* leg_mask=A+B */, 0 /* 默认阈值 */);
+        int rc = vad_start_for_call(call_key, 3 /* leg_mask=3 双腿：bit0=A, bit1=B */, 0 /* 默认阈值 */);
         llog(rc == 0 ? LOG_INFO : LOG_WARN, "ai",
              "vad_start_for_call call=%p (auto by producer=1) rc=%d", call_key, rc);
     } else if (!producer && old_producer) {
@@ -655,6 +958,15 @@ int ai_send_tx_audio(void *call_key, const uint8_t *data, size_t len, int format
                        bytes_per_frame - frame_bytes);
             }
 
+            /* AECM 远端参考：我们发给话机的 TTS 就是回声来源。
+             * 只支持窄带 8kHz；只喂注入腿（leg 0）。AECM 内部 farend 环形缓冲
+             * 与 ai_rec_feed 的 near 处理同受 s->lock 保护。 */
+            if (codec_rate == 8000) {
+                pthread_mutex_lock(&s->lock);
+                ai_dsp_far(&s->dsp[0], pcm_frame_buf, samples_per_frame);
+                pthread_mutex_unlock(&s->lock);
+            }
+
             media_frame_t mf = {
                 .pcm      = pcm_frame_buf,
                 .samples  = samples_per_frame,   /* 始终整帧 → ts_inc 严格对齐 */
@@ -674,6 +986,18 @@ int ai_send_tx_audio(void *call_key, const uint8_t *data, size_t len, int format
 
     /* --- format=0：PCMA → in_codec（transcode 一次或直通）---
      * 内部统一 PCMA，如果 in_codec == PCMA 则不转码直接注入 */
+    /* format=0 的 data 是 PCMA 字节流：AECM farend 需要 PCM16，先解一份喂 far */
+    {
+        int16_t far_pcm[1024];
+        size_t  far_n = (len < sizeof(far_pcm) / 2) ? len : sizeof(far_pcm) / 2;
+        size_t  got = g711_alaw_decode(data, far_n, far_pcm);
+        if (got > 0) {
+            pthread_mutex_lock(&s->lock);
+            ai_dsp_far(&s->dsp[0], far_pcm, got);
+            pthread_mutex_unlock(&s->lock);
+        }
+    }
+
     if (tx_tc) {
         size_t out_len = 0;
         int rc = transcode_process(tx_tc, data, len, tc_buf, sizeof(tc_buf), &out_len);
@@ -755,6 +1079,9 @@ static void *ai_session_thread_stub(void *arg)
         const codec_ops_t *ops = codec_registry_find(s->in_codec != CODEC_NONE ? s->in_codec : CODEC_PCMA);
         if (ops && ops->fini) ops->fini(s->tx_pcm16_enc);
         s->tx_pcm16_enc = NULL;
+    }
+    for (int i = 0; i < 2; i++) {
+        ai_dsp_free(&s->dsp[i]);
     }
 
     llog(LOG_INFO, "ai", "thread exit call=%p", s->call_key);
@@ -1020,6 +1347,9 @@ static void ai_fini(struct nsbc_ctx *ctx)
         if (s->running) {
             s->running = 0;
             pthread_join(s->th, NULL);
+        }
+        for (int i = 0; i < 2; i++) {
+            ai_dsp_free(&s->dsp[i]);
         }
         pthread_mutex_destroy(&s->lock);
         free(s);

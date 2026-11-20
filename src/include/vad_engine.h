@@ -43,7 +43,7 @@ typedef enum {
 #define VAD_NEAR_SAMPLES    80      /* 近窗 = 10ms @8kHz — 当前能量 */
 #define VAD_FAR_SAMPLES     800     /* 远窗 = 100ms @8kHz — 背景噪声基线 */
 #define VAD_TRACE_SIZE      8000    /* 1s @8kHz 环形缓冲 — 回溯 pre-roll */
-#define VAD_PREROLL_SAMPLES 960     /* 120ms pre-roll — 检测到 SPEECH 后向前回溯 */
+#define VAD_PREROLL_SAMPLES 1600    /* 200ms pre-roll — 检测到 SPEECH 后向前回溯（覆盖 160ms 起判延迟）*/
 
 /* ===== 能量阈值（PCM sample avg abs 值，绝对基线）===== */
 #define VAD_SILENCE_VOLUME_THRESHOLD  40    /* 绝对噪声 floor（更低，更灵敏）*/
@@ -53,7 +53,9 @@ typedef enum {
 #define VAD_DEFAULT_THRESHOLD VAD_ACTIVE_VOLUME_THRESHOLD
 
 /* ===== 状态机持续时间下限（sample 单位，8kHz）===== */
-#define VAD_START_ACTIVE_MIN_SAMPLES  320   /* 40ms — SPEECH 必须持续 ≥40ms 才算有效说话 */
+#define VAD_START_ACTIVE_MIN_SAMPLES  1280  /* 160ms — SPEECH 必须持续 ≥160ms 才算有效说话
+                                             * （40ms 太短，单次敲击/敲桌子 20~80ms 的瞬态会被误判；
+                                             *   160ms 由 200ms pre-roll 覆盖，不丢字头）*/
 #define VAD_PAUSE_ACTIVE_MIN_SAMPLES  320   /* 40ms — HESITATION 恢复 SPEECH 的最短激活 */
 #define VAD_START_SILENCE_MIN_SAMPLES 1200  /* 150ms — SPEECH→SILENCE 的最短静默（断句判定）*/
 #define VAD_PAUSE_SILENCE_MIN_SAMPLES 320   /* 40ms — SPEECH→HESITATION 的最短静默 */

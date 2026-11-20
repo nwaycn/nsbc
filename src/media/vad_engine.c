@@ -3,7 +3,7 @@
  * v2: production VAD algorithm ported from na_stream/VadWord
  *   旧：单 RMS 固定阈值 + 二态 FSM → 噪音环境下漏检/误报
  *   Butterworth HPF (DC+mains) + dual-window energy (NEAR vs FAR background)
- *       + 自适应阈值 + 三态表驱动 FSM + 1s trace ring + 120ms pre-roll
+ *       + 自适应阈值 + 三态表驱动 FSM + 1s trace ring + 200ms pre-roll
  *
  * 热路径约束：vad_on_rtp_frame 是 media_bug global consumer 回调
  *   —— 必须无锁、无阻塞、无 I/O、无 malloc。
@@ -26,6 +26,7 @@
 #include "g711.h"           /* g711_ulaw_decode, g711_alaw_decode */
 #include "uDS_client.h"     /* uds_send_vad —— 推 JSON VAD_EVENT 到 data.sock */
 #include "log.h"
+#include "common_audio/vad/include/webrtc_vad.h"  /* 二级判据：WebRTC VAD（频谱 GMM，压制敲击类瞬态）*/
 
 #include <math.h>
 #include <pthread.h>
@@ -36,6 +37,12 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+/* WebRTC VAD 激进等级（0..3）：2 = 较激进，能压掉敲门/敲桌子的宽带瞬态，
+ * 同时保留正常语音；调到 3 更严格但可能漏掉轻声字。 */
+#define VAD_WEBRTC_MODE     2
+#define VAD_WEBRTC_RATE     8000
+#define VAD_WEBRTC_FRAME    80      /* 10ms @8kHz —— WebRTC VAD 只接受 10/20/30ms */
 
 /* ============================================================================
  * ===== HPF：二阶 Butterworth 高通滤波器（RBJ Cookbook 系数）=====
@@ -125,6 +132,9 @@ typedef struct {
 
     /* --- HPF 状态（每 leg 独立）--- */
     vad_hpf_t    hpf[VAD_LEGS_PER_CALL];
+
+    /* --- WebRTC VAD 二级判据（每 leg 独立实例，NULL = 创建失败 → fail-open）--- */
+    VadInst     *wvad[VAD_LEGS_PER_CALL];
 
     /* --- 1s Trace ring（每 leg 独立环形缓冲）--- */
     int          trace_wpos[VAD_LEGS_PER_CALL];
@@ -276,6 +286,7 @@ typedef struct {
     int    act_got_start;  /* active_count >= START_ACTIVE_MIN_SAMPLES → 有效说话 */
     double threshold_val;  /* 当前自适应 threshold */
     double custom_thr;     /* 可配置的 active_begin_far 阈值覆盖 */
+    int    wvad_speech;    /* WebRTC VAD 投票结果：1=本帧过半 10ms 子帧判为语音 */
 } fsm_input_t;
 
 /* 动作函数 —— 只做副作用，不写 cs->state[leg] */
@@ -363,18 +374,21 @@ enum {
  *   只要 near_a（最近 10ms 能量）超过 threshold * 0.6，且 active_count >= MIN_SAMPLES，就触发。
  *   原版条件（far_a > 背景 2-3 倍）在低噪声环境下永远不成立 —— 这里彻底简化。*/
 static int cond_sil_to_speech(vad_call_state_t *cs, int leg, const fsm_input_t *in) {
-    /* 核心条件：能量显著上升 near > threshold*0.6，且持续 >= START_ACTIVE_MIN_SAMPLES */
-    if (in->near_a > (double)cs->threshold[leg] * 0.6
+    /* 核心条件：能量显著上升 near > threshold*0.6，且持续 >= START_ACTIVE_MIN_SAMPLES；
+     * WebRTC VAD 必须确认是语音（敲击/敲桌子的宽带瞬态会被判非语音 → 不进入 SPEECH）*/
+    if (in->wvad_speech
+        && in->near_a > (double)cs->threshold[leg] * 0.6
         && cs->active_count[leg] >= VAD_START_ACTIVE_MIN_SAMPLES)
         return 1;
     return 0;
 }
 
-/* SILENCE → SPEECH（突发）：near 突然跳到大值 —— 保持原有逻辑（但用简化 threshold 比较）*/
+/* SILENCE → SPEECH（突发）：near 突然跳到大值 —— 保持原有逻辑（但用简化 threshold 比较）。
+ * 注意：持续时间要求与普通入口一致（不能用 /2，否则敲击 80ms 就能绕过 160ms 门槛）。*/
 static int cond_sil_to_speech_burst(vad_call_state_t *cs, int leg, const fsm_input_t *in) {
-    (void)in;
-    /* near 超过 threshold * 1.5 且 active_count 够长 */
-    if (cs->active_count[leg] >= VAD_START_ACTIVE_MIN_SAMPLES / 2
+    /* near 超过 threshold * 1.5 且 active_count 够长；同样要求 WebRTC VAD 确认 */
+    if (in->wvad_speech
+        && cs->active_count[leg] >= VAD_START_ACTIVE_MIN_SAMPLES
         && in->near_a > (double)cs->threshold[leg] * 1.5)
         return 1;
     return 0;
@@ -392,10 +406,12 @@ static int cond_speech_to_hesit(vad_call_state_t *cs, int leg, const fsm_input_t
     return (in->below_near_thr && in->sil_got_pause && !in->sil_got_start);
 }
 
-/* HESITATION → SPEECH：near 又上来了 */
+/* HESITATION → SPEECH：near 又上来了。
+ * 必须同时满足：WebRTC VAD 确认 + 近端能量恢复到 threshold*0.8 以上。
+ * 只判 above_near_far 会被敲击尾巴（rms 16~35）拉回 SPEECH，继续放行给 ai_agent。*/
 static int cond_hesit_to_speech(vad_call_state_t *cs, int leg, const fsm_input_t *in) {
-    (void)cs; (void)leg;
-    return (in->above_near_far > 0 && in->act_got_pause);
+    return (in->wvad_speech && in->above_near_far > 0 && in->act_got_pause
+            && in->near_a > (double)cs->threshold[leg] * 0.8);
 }
 
 /* HESITATION → SILENCE：歇气太久（>=150ms）*/
@@ -444,7 +460,7 @@ static const int FSM_TABLE_SIZE = (int)(sizeof(FSM_TABLE) / sizeof(FSM_TABLE[0])
 /* dispatch：从 from_state 开始扫表，第一个匹配条件的 transition 执行 */
 static inline void fsm_step(vad_call_state_t *cs, int leg, uint16_t rms,
                             double near_a, double far_a, double custom_thr,
-                            int frame_samples) {
+                            int frame_samples, int wvad_speech) {
     const vad_state_t from = cs->state[leg];
 
     /* === 背景噪声 EMA 更新（far_power 重定义：真正的背景基线）===
@@ -477,6 +493,7 @@ static inline void fsm_step(vad_call_state_t *cs, int leg, uint16_t rms,
     /* 自适应 threshold —— 取背景噪声的 3 倍 vs 600 上限 vs active_begin_far 的 2 倍 */
     in.threshold_val = (double)cs->threshold[leg];  /* 先用旧值，下面更新 */
     in.custom_thr    = custom_thr;
+    in.wvad_speech   = wvad_speech;
 
     /* 自适应 threshold 动态更新（只在 SPEECH 状态更新）*/
     if (from == VAD_STATE_SPEECH) {
@@ -629,6 +646,22 @@ void vad_on_rtp_frame(media_bug_frame_t *frame, void *ud) {
         /* 5a) HPF 处理 */
         vad_hpf_process(&cs->hpf[leg], pcm, samples);
 
+        /* 5a.5) WebRTC VAD 二级判据：按 10ms 子帧投票（过半才算语音）。
+         *       没有实例（创建失败）→ fail-open，退化为纯能量 VAD。
+         *       作用：敲桌子/敲门是宽带瞬态，能量判据会误判，频谱 GMM 判据能压掉。*/
+        int wvad_speech = 1;
+        if (cs->wvad[leg]) {
+            int votes = 0, total = 0;
+            for (size_t off = 0; off + VAD_WEBRTC_FRAME <= samples; off += VAD_WEBRTC_FRAME) {
+                if (WebRtcVad_Process(cs->wvad[leg], VAD_WEBRTC_RATE,
+                                      pcm + off, VAD_WEBRTC_FRAME) > 0) {
+                    votes++;
+                }
+                total++;
+            }
+            wvad_speech = (total == 0) ? 1 : (votes * 2 >= total);
+        }
+
         /* 5b) 双窗口能量更新（滑窗 + trace ring）*/
         power_update_sliding(cs, leg, pcm, samples);
 
@@ -638,18 +671,19 @@ void vad_on_rtp_frame(media_bug_frame_t *frame, void *ud) {
 
         /* 5d) FSM step —— 可能推 ring（状态变化时）
          * samples = 本帧实际 PCM 样本数（G.711 默认 160，异常时可能不同）*/
-        fsm_step(cs, leg, rms, near_a, far_a, (double)cs->threshold[leg], (int)samples);
+        fsm_step(cs, leg, rms, near_a, far_a, (double)cs->threshold[leg], (int)samples,
+                 wvad_speech);
 
         /* 5e) 每 50 帧打一次诊断（1s @20ms/frame）—— 观察 near/far/active_count 关系 */
         static __thread int diag_cnt = 0;
         if ((diag_cnt++ % 50) == 0) {
             llog(LOG_INFO, "vad",
                  "DIAG call=%p leg=%d state=%d rms=%u thr=%u "
-                 "near=%.1f far=%.1f above_nf=%d "
+                 "near=%.1f far=%.1f above_nf=%d wvad=%d "
                  "act_cnt=%d sil_cnt=%d act_begin_far=%.1f",
                  frame->call_key, leg, cs->state[leg],
                  (unsigned)rms, (unsigned)cs->threshold[leg],
-                 near_a, far_a, (near_a > far_a) ? 1 : 0,
+                 near_a, far_a, (near_a > far_a) ? 1 : 0, wvad_speech,
                  cs->active_count[leg], cs->silence_count[leg],
                  cs->active_begin_far[leg]);
         }
@@ -760,6 +794,14 @@ void vad_engine_shutdown(void) {
     media_bug_unregister_global_consumer(&kVadConsumer);
 
     pthread_mutex_lock(&g_states_lock);
+    for (int i = 0; i < VAD_MAX_CALLS; ++i) {
+        for (int leg = 0; leg < VAD_LEGS_PER_CALL; ++leg) {
+            if (g_states[i].wvad[leg]) {
+                WebRtcVad_Free(g_states[i].wvad[leg]);
+                g_states[i].wvad[leg] = NULL;
+            }
+        }
+    }
     memset(g_states, 0, sizeof(g_states));
     pthread_mutex_unlock(&g_states_lock);
     pthread_mutex_destroy(&g_states_lock);
@@ -796,11 +838,26 @@ int vad_start_for_call(void *call_key, int leg_mask, uint16_t threshold) {
         g_states[idx].trace_wpos[leg] = 0;
         memset(g_states[idx].trace_data[leg], 0, sizeof(g_states[idx].trace_data[leg]));
         vad_hpf_init(&g_states[idx].hpf[leg], (float)VAD_HPF_CUTOFF_HZ, 8000.0f);
+
+        /* WebRTC VAD 二级判据实例（每 leg 独立）。失败只降级为纯能量 VAD，不影响业务。 */
+        if (g_states[idx].wvad[leg]) {
+            WebRtcVad_Free(g_states[idx].wvad[leg]);
+            g_states[idx].wvad[leg] = NULL;
+        }
+        VadInst *vi = WebRtcVad_Create();
+        if (vi && WebRtcVad_Init(vi) == 0 && WebRtcVad_set_mode(vi, VAD_WEBRTC_MODE) == 0) {
+            g_states[idx].wvad[leg] = vi;
+        } else {
+            if (vi) WebRtcVad_Free(vi);
+            llog(LOG_WARN, "vad", "WebRTC VAD create/init failed leg=%d → 退化为纯能量 VAD", leg);
+        }
     }
     g_states[idx].active = 1;
 
-    llog(LOG_NOTICE, "vad", "vad_start call=%p leg_mask=%d threshold=%u slot=%d",
-         call_key, leg_mask, g_states[idx].threshold[0], idx);
+    llog(LOG_NOTICE, "vad", "vad_start call=%p leg_mask=%d threshold=%u slot=%d wvad=%s(mode=%d)",
+         call_key, leg_mask, g_states[idx].threshold[0], idx,
+         (g_states[idx].wvad[0] || g_states[idx].wvad[1]) ? "on" : "off",
+         VAD_WEBRTC_MODE);
     pthread_mutex_unlock(&g_states_lock);
     return 0;
 }
@@ -810,6 +867,12 @@ int vad_stop_for_call(void *call_key) {
     pthread_mutex_lock(&g_states_lock);
     int idx = find_slot(call_key);
     if (idx >= 0) {
+        for (int leg = 0; leg < VAD_LEGS_PER_CALL; ++leg) {
+            if (g_states[idx].wvad[leg]) {
+                WebRtcVad_Free(g_states[idx].wvad[leg]);
+                g_states[idx].wvad[leg] = NULL;
+            }
+        }
         g_states[idx].active = 0;
         g_states[idx].call_key = NULL;
     }
@@ -832,6 +895,12 @@ void vad_stop_all(void) {
     pthread_mutex_lock(&g_states_lock);
     for (int i = 0; i < VAD_MAX_CALLS; ++i) {
         if (g_states[i].active) {
+            for (int leg = 0; leg < VAD_LEGS_PER_CALL; ++leg) {
+                if (g_states[i].wvad[leg]) {
+                    WebRtcVad_Free(g_states[i].wvad[leg]);
+                    g_states[i].wvad[leg] = NULL;
+                }
+            }
             g_states[i].active = 0;
             g_states[i].call_key = NULL;
         }
@@ -839,10 +908,10 @@ void vad_stop_all(void) {
     pthread_mutex_unlock(&g_states_lock);
 }
 
-/* v2 新增：取 pre-roll 数据（从 trace ring 向前回溯 120ms）
+/* v2 新增：取 pre-roll 数据（从 trace ring 向前回溯 200ms）
  * out_ring_ptr → trace_data[leg] 起始指针（环形）
  * out_start_idx → pre-roll 起始索引（0..VAD_TRACE_SIZE-1）
- * out_samples → pre-roll 样本数（最多 960 = 120ms @8kHz）
+ * out_samples → pre-roll 样本数（最多 1600 = 200ms @8kHz）
  *
  * 外部使用：先读 out_ring_ptr[out_start_idx..TRACE_SIZE-1]，
  *   若不够再读 out_ring_ptr[0..剩余数-1]（环形回绕）。
@@ -863,7 +932,7 @@ int vad_get_preroll(void *call_key, int leg,
     short *ring = g_states[idx].trace_data[leg];
     int wpos    = g_states[idx].trace_wpos[leg];
 
-    /* 最多回溯 VAD_PREROLL_SAMPLES = 960 samples = 120ms */
+    /* 最多回溯 VAD_PREROLL_SAMPLES = 1600 samples = 200ms（覆盖 160ms 起判延迟）*/
     int pr = VAD_PREROLL_SAMPLES;
     if (pr > wpos) pr = wpos;
 
