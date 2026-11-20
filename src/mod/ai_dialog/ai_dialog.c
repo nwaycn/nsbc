@@ -353,6 +353,53 @@ static void ai_rec_feed(void *ud, void *call_key,
         vad_hpf_process(&s->hpf[leg], pcm16_buf, pcm16_samples);
     }
 
+    /* ★ RX 音量低修复：peak-normalization AGC + noise gate
+     *
+     * G.711 A-law 线性范围 ±16383（13bit 有效位），用户实际说话幅度可能只有
+     * peak ~2000-5000（远低于编码满幅）→ 录音回放听起来音量很低。
+     *
+     * AGC：per-frame peak normalization
+     *   - 算当前帧 peak；如果 peak < target_peak(12000) 则增益 = target/peak
+     *   - gain 上限 4x（64/16），防止纯静音帧被放大成数字噪声
+     *   - peak ≤ 60（接近静音）跳过增益 → 让 noise gate 处理
+     * Noise gate：abs(sample) < 30 → 置零（干掉环境底噪和 AGC 放大的噪声底）
+     *
+     * 这两个 DSP 作用于 PCM16 域（G.711 decode 后、ring buffer 前），
+     * ASR 和录音都受益。零 malloc、零锁、纯栈上 —— 媒体线程热路径 OK。 */
+    if (pcm16_samples > 0) {
+        int32_t frame_peak = 0;
+        for (size_t i = 0; i < pcm16_samples; i++) {
+            int32_t av = pcm16_buf[i] < 0 ? -pcm16_buf[i] : pcm16_buf[i];
+            if (av > frame_peak) frame_peak = av;
+        }
+
+        /* AGC：peak normalization
+         * 目标 peak = 12000（约 int16 max 的 37%，G.711 线性范围内不削波）
+         * gain 上限 4x（64/16），避免把底噪放大成可听噪声 */
+        #define AGC_TARGET_PEAK  12000
+        #define AGC_MAX_GAIN_X16 64   /* 64/16 = 4x */
+        #define AGC_NOISE_FLOOR  60   /* peak ≤ 60 视为静音 → 不放大 */
+        if (frame_peak > AGC_NOISE_FLOOR && frame_peak < AGC_TARGET_PEAK) {
+            int32_t gain_x16 = (AGC_TARGET_PEAK * 16) / frame_peak;
+            if (gain_x16 > AGC_MAX_GAIN_X16) gain_x16 = AGC_MAX_GAIN_X16;
+            for (size_t i = 0; i < pcm16_samples; i++) {
+                int32_t v = (int32_t)pcm16_buf[i] * gain_x16 / 16;
+                if (v > 32767) v = 32767;
+                if (v < -32768) v = -32768;
+                pcm16_buf[i] = (int16_t)v;
+            }
+        }
+
+        /* Noise gate：干掉 near-zero 样本
+         * 30 ≈ AGC 放大后的底噪 floor（G.711 解码固有量化底噪 + 环境噪声）*/
+        #define RX_NOISE_GATE 30
+        for (size_t i = 0; i < pcm16_samples; i++) {
+            if (pcm16_buf[i] < RX_NOISE_GATE && pcm16_buf[i] > -RX_NOISE_GATE) {
+                pcm16_buf[i] = 0;
+            }
+        }
+    }
+
     ring_data = (const uint8_t *)pcm16_buf;
     ring_len = pcm16_samples * 2;  /* int16_t → 2 bytes each */
 
@@ -582,13 +629,36 @@ int ai_send_tx_audio(void *call_key, const uint8_t *data, size_t len, int format
         size_t bytes_per_frame   = samples_per_frame * 2; /* 16bit → bytes */
         uint32_t ts_inc = (uint32_t)ptime_ms * (uint32_t)codec_rate / 1000;
 
+        /* ★ TX 噪声根因修复：尾帧 zero-padding
+         *
+         * Go sendAudioPaced 每包 640B (40ms)，C 按 320B (20ms) 分帧。
+         * 最后一包如果不是整倍数（如 TTS 总长度 6410B → 最后一包 10B），
+         * 原来直接 encode 非整帧 → bridge_send_raw 仍然 ts+=160（按整帧）
+         * → RTP timestamp 跳跃 → 接收端解码器 concealment/interpolate → 噼啪噪声！
+         *
+         * 修复：所有帧都 zero-pad 到 bytes_per_frame，确保 encode 输入和
+         * ts_inc 严格对齐。尾帧静音 padding 不影响音质（G.711 每 sample 独立编码）。
+         *
+         * 注：曾考虑 silence gate（跳过 near-zero 帧），但跳过帧会让 ts 不推进，
+         * 连续跳过 N 帧后 ts 跳跃 N*ts_inc → 同样产生解码噪声 → 放弃。
+         * G.711 编码静音成本极低（每帧 160B），不值得冒 timestamp gap 的风险。 */
+        int16_t pcm_frame_buf[1024];  /* 栈上局部缓冲（最多 1024 samples ≈ 64ms @8k）*/
+
         for (size_t off = 0; off < len; off += bytes_per_frame) {
-            size_t frame_bytes = (off + bytes_per_frame > len)
-                                 ? (len - off) : bytes_per_frame;
+            size_t remaining = len - off;
+            size_t frame_bytes = (remaining > bytes_per_frame) ? bytes_per_frame : remaining;
+
+            /* 拷贝到局部缓冲 + zero-pad 剩余字节 */
+            memcpy(pcm_frame_buf, data + off, frame_bytes);
+            if (frame_bytes < bytes_per_frame) {
+                memset((uint8_t *)pcm_frame_buf + frame_bytes, 0,
+                       bytes_per_frame - frame_bytes);
+            }
+
             media_frame_t mf = {
-                .pcm      = (int16_t *)(data + off),
-                .samples  = frame_bytes / 2,
-                .rate     = codec_rate,   /*  动态采样率，不再硬编码 8000 */
+                .pcm      = pcm_frame_buf,
+                .samples  = samples_per_frame,   /* 始终整帧 → ts_inc 严格对齐 */
+                .rate     = codec_rate,
                 .channels = 1,
             };
             size_t out_len = 0;
