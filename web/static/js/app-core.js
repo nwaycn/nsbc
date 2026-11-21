@@ -1275,7 +1275,7 @@ function crudTable(entity, path, columns, formSchema, asyncLoaders = null) {
         </div>
 
         <el-dialog v-model="showModal" :title="editingId ? 'Edit' : 'Create New'" width="720px" destroy-on-close>
-          <el-form :model="form" label-position="top">
+          <el-form tag="div" :model="form" label-position="top">
             <el-form-item v-for="f in formSchema" :key="f.key" :label="f.label">
               <template v-if="f.type === 'select'">
                 <el-select v-model="form[f.key]" placeholder="Please select" style="width:100%" clearable>
@@ -1310,7 +1310,7 @@ function crudTable(entity, path, columns, formSchema, asyncLoaders = null) {
                 </div>
               </template>
               <el-input v-else-if="f.type === 'textarea'" v-model="form[f.key]" type="textarea" :rows="3" resize="vertical"></el-input>
-              <el-input v-else-if="f.type === 'password'" v-model="form[f.key]" type="password" show-password placeholder="••••••••"></el-input>
+              <el-input v-else-if="f.type === 'password'" v-model="form[f.key]" type="password" form="nsbc-f" show-password placeholder="••••••••"></el-input>
               <el-input v-else v-model="form[f.key]" placeholder="••••••••"></el-input>
               <div v-if="f.help" class="text-xs text-slate-400 mt-1">{{ f.help }}</div>
             </el-form-item>

@@ -397,6 +397,10 @@
   </style>
 </head>
 <body class="bg-white text-slate-900">
+  <!-- Chrome DOM 规则：页面只允许一个 <form>，所有密码框必须在其中。
+       这个隐藏 form 是 Chrome happy-path 的唯一真 form；
+       各 dialog 里的密码框通过 HTML5 form="nsbc-f" 属性逻辑挂载进来。 -->
+  <form id="nsbc-f" style="display:none" tabindex="-1"></form>
 <div id="app" v-cloak>
 
   <!-- Login — Linear 风深紫渐变 -->
@@ -418,7 +422,7 @@
         </div>
         <div class="flex items-center gap-3">
           <label class="field-label w-16 flex-shrink-0 text-right mb-0">{{ t('Password') }}</label>
-          <input v-model="loginForm.password" type="password" class="field-input flex-1" placeholder="••••••••" autocomplete="current-password" @keyup.enter.prevent="login">
+          <input v-model="loginForm.password" type="password" form="nsbc-f" class="field-input flex-1" placeholder="••••••••" autocomplete="current-password" @keyup.enter.prevent="login">
         </div>
         <div class="flex items-center gap-3">
           <label class="field-label w-16 flex-shrink-0 text-right mb-0">{{ t('Captcha') }}</label>
@@ -564,13 +568,13 @@
       <el-dialog v-model="showPwdDialog" :title="t('Change Password')" width="420px" :close-on-click-modal="false">
         <el-form :model="pwdForm" :rules="pwdRules" ref="pwdFormRef" label-width="110px">
           <el-form-item :label="t('Current Password')" prop="old_password">
-            <el-input v-model="pwdForm.old_password" type="password" show-password autocomplete="current-password"></el-input>
+            <el-input v-model="pwdForm.old_password" type="password" form="nsbc-f" show-password autocomplete="current-password"></el-input>
           </el-form-item>
           <el-form-item :label="t('New Password')" prop="new_password">
-            <el-input v-model="pwdForm.new_password" type="password" show-password autocomplete="new-password"></el-input>
+            <el-input v-model="pwdForm.new_password" type="password" form="nsbc-f" show-password autocomplete="new-password"></el-input>
           </el-form-item>
           <el-form-item :label="t('Confirm New Password')" prop="confirm_password">
-            <el-input v-model="pwdForm.confirm_password" type="password" show-password autocomplete="new-password"></el-input>
+            <el-input v-model="pwdForm.confirm_password" type="password" form="nsbc-f" show-password autocomplete="new-password"></el-input>
           </el-form-item>
         </el-form>
         <template #footer>

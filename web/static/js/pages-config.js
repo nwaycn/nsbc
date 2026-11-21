@@ -56,7 +56,7 @@ app.component('config-editor', {
         :title="t('Hot-Set Config')"
         width="520px"
       >
-        <el-form label-width="120px">
+        <el-form tag="div" label-width="120px">
           <el-form-item :label="t('Key')">
             <el-input v-model="editKey" disabled />
           </el-form-item>

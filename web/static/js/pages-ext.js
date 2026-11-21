@@ -82,7 +82,7 @@ app.component('ext-keys', {
 
       <!-- 创建表单 -->
       <el-dialog v-model="formVisible" title="创建新 API Key" width="440px">
-        <el-form :model="form" label-width="80px">
+        <el-form tag="div" :model="form" label-width="80px">
           <el-form-item label="标签">
             <el-input v-model="form.label" placeholder="如: Acme Call Center CRM" maxlength="128"/>
           </el-form-item>
@@ -224,7 +224,7 @@ app.component('ext-webhooks', {
       </el-table>
 
       <el-dialog v-model="formVisible" title="注册 Webhook" width="480px">
-        <el-form :model="form" label-width="100px">
+        <el-form tag="div" :model="form" label-width="100px">
           <el-form-item label="回调 URL">
             <el-input v-model="form.url" placeholder="https://your-cc.example.com/api/nsbc-events"
               type="textarea" :rows="2"/>

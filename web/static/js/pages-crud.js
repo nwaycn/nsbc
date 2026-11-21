@@ -621,7 +621,7 @@ app.component('dialplan-rules', {
   setup() {
     const API_PATH = '/dialplan-rules';
     const RFC1918 = '0.0.0.0/0';
-    const { ref, computed, onMounted } = Vue;
+    const { ref, onMounted } = Vue;
 
     const items = ref([]);
     const page = ref(1);
@@ -1159,7 +1159,7 @@ app.component('ai-backends', {
                 </el-form-item>
               </div>
               <el-form-item label="API Token">
-                <el-input v-model="form.nsb_web_token" type="password" show-password placeholder="nsb-web /api/v1/login 登录获取"></el-input>
+                <el-input v-model="form.nsb_web_token" type="password" form="nsbc-f" show-password placeholder="nsb-web /api/v1/login 登录获取"></el-input>
               </el-form-item>
             </el-tab-pane>
 
@@ -1180,7 +1180,7 @@ app.component('ai-backends', {
                 </el-form-item>
               </div>
               <el-form-item label="API Key">
-                <el-input v-model="form.llm_api_key" type="password" show-password placeholder="sk-..."></el-input>
+                <el-input v-model="form.llm_api_key" type="password" form="nsbc-f" show-password placeholder="sk-..."></el-input>
               </el-form-item>
               <el-form-item label="Endpoint (可选，自定义 URL)">
                 <el-input v-model="form.llm_endpoint" placeholder="https://api.openai.com/v1"></el-input>
@@ -1227,7 +1227,7 @@ app.component('ai-backends', {
               <div class="grid grid-cols-2 gap-4">
                 <el-form-item label="转人工目标">
                   <div class="flex gap-2 w-full">
-                    <el-select v-model="transferKind" style="width:130px">
+                    <el-select v-model="transferKind" style="width:130px" @change="onTransferKindChange">
                       <el-option value="ext" label="分机号"></el-option>
                       <el-option value="queue" label="分机队列"></el-option>
                       <el-option value="uri" label="SIP URI"></el-option>
@@ -1280,7 +1280,7 @@ app.component('ai-backends', {
   `,
   setup() {
     const API_PATH = '/ai-backends';
-    const { ref, computed, onMounted } = Vue;
+    const { ref, onMounted } = Vue;
 
     const items = ref([]);
     const keyword = ref('');
@@ -1291,24 +1291,27 @@ app.component('ai-backends', {
     const saving = ref(false);
     const queueOptions = ref([]);   // [{ value: 'queue:xxx', label }]
 
-    /* 转人工目标类型：从 transfer_dest 反推，切换类型时清掉不兼容的旧值，
-     * 避免“分机号”被当成队列名或 URI 存下去。 */
-    const transferKind = computed({
-      get() {
-        const v = (form.value.transfer_dest || '').trim();
-        if (v.startsWith('queue:')) return 'queue';
-        if (v.startsWith('sip:') || v.startsWith('sips:') || v.includes('@')) return 'uri';
-        return 'ext';
-      },
-      set(kind) {
-        const v = (form.value.transfer_dest || '').trim();
-        const isQueue = v.startsWith('queue:');
-        const isUri = v.startsWith('sip:') || v.startsWith('sips:') || v.includes('@');
-        if (kind === 'queue' && !isQueue) form.value.transfer_dest = '';
-        else if (kind === 'uri' && !isUri) form.value.transfer_dest = '';
-        else if (kind === 'ext' && (isQueue || isUri)) form.value.transfer_dest = '';
+    /* 转人工目标类型：普通 ref + syncTransferKind() 初始化。
+     * 不用 computed getter/setter——setter 清空旧值后 getter 立刻推回 ext，
+     * 会造成 el-select 看起来"切换不过去"的死循环。 */
+    const transferKind = ref('ext');
+    function syncTransferKind() {
+      const v = (form.value.transfer_dest || '').trim();
+      if (v.startsWith('queue:')) transferKind.value = 'queue';
+      else if (v.startsWith('sip:') || v.startsWith('sips:') || v.includes('@')) transferKind.value = 'uri';
+      else transferKind.value = 'ext';
+    }
+    function onTransferKindChange(kind) {
+      if (kind === 'queue') {
+        if (!(form.value.transfer_dest || '').startsWith('queue:')) form.value.transfer_dest = '';
+      } else if (kind === 'uri') {
+        const v = form.value.transfer_dest || '';
+        if (!v.startsWith('sip:') && !v.startsWith('sips:')) form.value.transfer_dest = '';
+      } else {
+        const v = form.value.transfer_dest || '';
+        if (v.startsWith('queue:') || v.startsWith('sip:') || v.startsWith('sips:')) form.value.transfer_dest = '';
       }
-    });
+    }
 
     async function fetchQueueOptions() {
       try {
@@ -1357,8 +1360,9 @@ app.component('ai-backends', {
       form.value = defaultForm();
       activeTab.value = 'basic';
       editingId.value = null;
+      syncTransferKind();
       showModal.value = true;
-      fetchQueueOptions();   // 打开弹窗时刷新，避免新建队列后需整页刷新
+      fetchQueueOptions();
     }
 
     function openEdit(row) {
@@ -1371,8 +1375,9 @@ app.component('ai-backends', {
       editingId.value = row.id;
       form.value = f;
       activeTab.value = 'basic';
+      syncTransferKind();
       showModal.value = true;
-      fetchQueueOptions();   // 同上
+      fetchQueueOptions();
     }
 
     async function save() {

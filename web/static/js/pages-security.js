@@ -310,7 +310,7 @@ app.component('security-center', {
 
           <!-- New Rule dialog -->
           <el-dialog v-model="dlgVisible" title="New Fence Rule" width="480px">
-            <el-form label-width="90px">
+            <el-form tag="div" label-width="90px">
               <el-form-item label="Mode">
                 <el-radio-group v-model="form.kind">
                   <el-radio label="deny">Blacklist (match → drop)</el-radio>
