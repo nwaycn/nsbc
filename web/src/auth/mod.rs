@@ -135,11 +135,38 @@ impl AuthSvc {
 
     /// Construct from WebConfig::AuthSection (env > file > cfg > fail-closed).
     pub fn from_config(cfg: &super::config::AuthSection) -> Result<AuthSvc, String> {
-        // JWT secret: env/file > cfg.jwt_secret (YAML) > fail-closed
-        // Production: prefer env NSBC_JWT_SECRET; YAML value acceptable but don't commit it.
+        Self::from_config_inner(cfg, false)
+    }
+
+    /// 无持久化存储（`db.pool()` 为 None）时的降级构造。
+    ///
+    /// 未通过 env/file 显式提供密钥时，生成进程内随机密钥并忽略 YAML 中的
+    /// 内置默认值（开源仓库里的值是公共的，不应作为实际签名密钥）。
+    /// 代价：进程重启后所有 token 失效。有 DB 时仍走 [`from_config`]。
+    pub fn from_config_ephemeral(cfg: &super::config::AuthSection) -> Result<AuthSvc, String> {
+        Self::from_config_inner(cfg, true)
+    }
+
+    fn from_config_inner(
+        cfg: &super::config::AuthSection,
+        ephemeral_secret: bool,
+    ) -> Result<AuthSvc, String> {
+        // JWT secret: env/file 始终优先；无 DB 时忽略 YAML 默认值，改用随机密钥
         let secret = env_bytes_or_file("NSBC_JWT_SECRET", "NSBC_JWT_SECRET_FILE")?
             .or_else(|| {
-                if !cfg.jwt_secret.trim().is_empty() {
+                if ephemeral_secret {
+                    let mut s = vec![0u8; 32];
+                    if getrandom::getrandom(&mut s).is_ok() {
+                        tracing::warn!(
+                            "no database configured — generated an ephemeral JWT secret; \
+                             all sessions will be invalidated on restart. \
+                             Set NSBC_JWT_SECRET for stable logins."
+                        );
+                        Some(s)
+                    } else {
+                        None
+                    }
+                } else if !cfg.jwt_secret.trim().is_empty() {
                     Some(cfg.jwt_secret.as_bytes().to_vec())
                 } else {
                     None
