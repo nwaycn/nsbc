@@ -23,6 +23,7 @@
 #include "srtp_session.h"   /* ★ HA P3-3: nsbc_srtp_session_create / get_material */
 #include "media_codec.h"    /* codec_registry_find_name — codec 名称 → PT/CR 映射 */
 #include "playback_engine.h"  /* ringback app：LEG_CONFIRMED 接通点自动停放音 */
+#include "queue.h"            /* 3.3：队列等待派发失败 → cq_requeue 退回等待 */
 #include "metric_reg.h"
 #include "nsbc_id.h"
 #include "recorder.h"
@@ -1776,8 +1777,29 @@ static sip_txn_t *send_invite_b(b2b_call_t *c, int leg_idx,
                                ? op->external_sip_ip : co->cfg.external_sip_ip;
         adv_host = (prof_ext && prof_ext[0]) ? prof_ext : co->cfg.local_host;
     } else {
-        /* EXT/BIZ/LOCAL 层（内部分机/队列/AI）：一律 local_host */
-        adv_host = co->cfg.local_host;
+        /* EXT/BIZ/LOCAL 层（内部分机/队列/AI）：默认 local_host。
+         * ★2026-11-21：若对端是公网地址（如公网注册的 SIP 分机），
+         * INVITE 的 Contact 仍必须宣告公网 IP；否则对端挂断时 BYE 会发到
+         * 私网 Contact 而丢失（表现为一侧挂了、另一侧一直不挂）。 */
+        const nsbc_sa_t *peer = &b->dst;
+        char peer_ip[INET6_ADDRSTRLEN] = "";
+        int peer_public = 0;
+        if (peer && peer->ss.ss_family == AF_INET) {
+            inet_ntop(AF_INET, &((const struct sockaddr_in *)&peer->ss)->sin_addr,
+                      peer_ip, sizeof(peer_ip));
+            peer_public = !b2b_is_private_ip(peer_ip);
+        }
+        if (peer_public) {
+            const char *ext =
+                (op && op->external_sip_ip[0]) ? op->external_sip_ip
+              : (op && op->external_rtp_ip[0]) ? op->external_rtp_ip
+              : (co->cfg.external_sip_ip && co->cfg.external_sip_ip[0]) ? co->cfg.external_sip_ip
+              : (co->cfg.external_rtp_ip && co->cfg.external_rtp_ip[0]) ? co->cfg.external_rtp_ip
+              : NULL;
+            adv_host = ext ? ext : co->cfg.local_host;
+        } else {
+            adv_host = co->cfg.local_host;
+        }
     }
 
     char rt[DLG_URI_MAX * DLG_ROUTE_MAX + 64];
@@ -2167,7 +2189,13 @@ static void respond_a(b2b_call_t *c, int status, const char *body,
     /* REQ-NAT-001：respond_a 里构造的 Contact 也走 external_sip_ip
      * REQ-NAT-002：优先 per-call profile，fallback cfg
      * ★ 2026-11-19 FIX：只有 c->prof 是 "external" profile（主叫来自公网 trunk）
-     *   才用 external_sip_ip，否则一律 local_host（主叫在内网，回内网 IP） */
+     *   才用 external_sip_ip，否则一律 local_host（主叫在内网，回内网 IP）
+     * ★ 2026-11-21 FIX：profile 名只代表拨号路由分区，不能代表主叫的网络位置。
+     *   外部 SIP 分机直连公网入口时同样会命中 "internal" profile，此时若 Contact
+     *   仍写 local_host（如 172.27.102.160），UA 的 ACK/BYE 会发往私网地址永远
+     *   到不了，2xx 无法被 ACK → leg0 停在 LEG_CALLING，B 腿挂断时不会向 A 转发
+     *   BYE（表现为 WebRTC 已挂断、SIP 侧一直不挂）。这里按主叫源 IP 是否私网
+     *   来选：公网源 → external_sip_ip；内网源/WS → local_host。 */
     int a_is_ext = (c->prof && c->prof->name[0] && strcasecmp(c->prof->name, "external") == 0);
     const char *adv_host;
     if (a_is_ext) {
@@ -2175,7 +2203,35 @@ static void respond_a(b2b_call_t *c, int status, const char *body,
                                ? c->prof->external_sip_ip : co->cfg.external_sip_ip;
         adv_host = (prof_ext && prof_ext[0]) ? prof_ext : co->cfg.local_host;
     } else {
-        adv_host = co->cfg.local_host;
+        const nsbc_sa_t *peer = txn_peer(t);
+        char peer_ip[INET6_ADDRSTRLEN] = "";
+        int peer_public = 0;
+        if (peer && peer->ss.ss_family == AF_INET) {
+            inet_ntop(AF_INET, &((const struct sockaddr_in *)&peer->ss)->sin_addr,
+                      peer_ip, sizeof(peer_ip));
+            /* 只对 IPv4 判定公网；IPv6 场景保守回 local_host，避免拼出
+             * 协议族不匹配的 Contact。 */
+            peer_public = !b2b_is_private_ip(peer_ip);
+        } else if (peer && peer->ss.ss_family == AF_INET6) {
+            inet_ntop(AF_INET6, &((const struct sockaddr_in6 *)&peer->ss)->sin6_addr,
+                      peer_ip, sizeof(peer_ip));
+        }
+        if (peer_public) {
+            /* ★2026-11-21 修复：优先 per-call profile 的公网地址。
+             * 现场部署只配了 profile.external_sip_ip（SDP/Call-ID 已是公网 IP），
+             * 全局 cfg.external_sip_ip 为空，导致上一版仍回落 local_host，
+             * 公网 SIP 分机把 ACK/BYE 发到私网，呼叫无法确认/挂断。
+             * 顺序：prof.sip → prof.rtp → cfg.sip → cfg.rtp → local_host。 */
+            const char *ext =
+                (c->prof && c->prof->external_sip_ip[0]) ? c->prof->external_sip_ip
+              : (c->prof && c->prof->external_rtp_ip[0]) ? c->prof->external_rtp_ip
+              : (co->cfg.external_sip_ip && co->cfg.external_sip_ip[0]) ? co->cfg.external_sip_ip
+              : (co->cfg.external_rtp_ip && co->cfg.external_rtp_ip[0]) ? co->cfg.external_rtp_ip
+              : NULL;
+            adv_host = ext ? ext : co->cfg.local_host;
+        } else {
+            adv_host = co->cfg.local_host;
+        }
     }
     /* extra 头块：Content-Type(28) + History-Info(≤1024) + Diversion(≤130) → 1300 够装 */
     char extra[1300];
@@ -2468,6 +2524,39 @@ static void send_ack_non2xx(b2b_call_t *c, int leg)
     }
 }
 
+/* 3.3：队列等待中的 B 腿未接通（4xx/5xx/6xx、Timer B、无应答）→ 退回队列。
+ * 保留 A 腿 183 与 hold relay，主叫继续听 MoH；清理 B 腿残影，
+ * 由 cq tick 的下一次派发重新走 b2b_start_b_leg。
+ * 调用约定：reactor 线程、已持 call_lock。 */
+static void b2b_queue_requeue(b2b_call_t *c, int cause)
+{
+    nsbc_ctx_t *ctx = nsbc_get_ctx();
+    cc_mgr_t *mgr = (ctx && ctx->cq_mgr) ? (cc_mgr_t *)ctx->cq_mgr : NULL;
+    b2b_leg_t *b = &c->leg[1];
+
+    if (b->dlg && c->core->cfg.dlg) {
+        dlg_close(c->core->cfg.dlg, b->dlg);
+        b->dlg = NULL;
+    }
+    b->inv_txn = NULL;
+    b->out_txn = NULL;
+    b->state = LEG_IDLE;
+    b->reinv = 0;
+    b->auth_attempts = 0;
+    b->last_prov_status = 0;
+    b->rem_tag[0] = '\0';
+    b->peer_tag[0] = '\0';
+    /* 释放本次派发占用的 per-key 并发槽（AoR/trunk），否则重试会重复累加 */
+    if (c->key_held) {
+        perkey_dec(c->core, c->b_key);
+        c->key_held = 0;
+    }
+    if (mgr)
+        cq_requeue(mgr, c);   /* 同时释放本次派发占用的座席忙线（slot 0） */
+    llog(LOG_NOTICE, "queue", "requeue call=%p %s/%s cause=%d → wait again",
+         (void *)c, c->queue_tenant, c->queue_name, cause);
+}
+
 /* ------------------------------------------------------------------ */
 /* Ring NoAnswer 定时器（P0 PBX 基础）                                  */
 /*                                                                    */
@@ -2495,6 +2584,13 @@ static void noanswer_cb(uint64_t now_ms, void *arg)
         return;
     }
     llog(LOG_INFO, "b2b", "ring_noanswer: call timed out, send 480 + CANCEL B-leg");
+    /* 3.3：队列等待中的呼叫不结束——CANCEL 当前成员后重新排队等下一个空闲座席 */
+    if (c->queue_wait) {
+        send_cancel_req(c, 1);
+        b2b_queue_requeue(c, 480);
+        call_unlock(c);
+        return;
+    }
     /* ★ 同时终止两腿：
      *   A 腿（leg[0]，主叫/WebRTC）：我们是 server → respond_a(480)
      *   B 腿（leg[1]，被叫/WebRTC）：我们是 client → send_cancel_req 发 CANCEL
@@ -3489,6 +3585,7 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
 
                 if (!reinv) {
                     /* 向 A 透传 2xx，等 A 腿 ACK 后确认 */
+                    c->queue_wait = 0;   /* 3.3：已接起，后续 B 腿异常不再退回排队 */
                     respond_a(c, st, c->leg[1].answer,
                               c->leg[1].answer_len);
                     c->a_final = st;
@@ -3801,6 +3898,12 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                 llog(LOG_WARN, "b2b", "302 redirect: Contact parse failed");
             }
             if (!reinv) {
+                /* 3.3：等待中被派发的成员拒接/不可达 → 退回队列，A 腿保持 183 */
+                if (c->queue_wait && !c->a_final && !c->dead) {
+                    b2b_queue_requeue(c, st);
+                    call_unlock(c);
+                    return;
+                }
                 c->leg[1].state = LEG_TERMINATED;
                 {
                     char sess[384];
@@ -3846,7 +3949,12 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                     c->leg[0].srv_txn = NULL;
                 }
             } else {
-                finish_with_a_response(c, 408, NULL, 0);
+                if (c->queue_wait && !c->a_final && !c->dead) {
+                    /* 3.3：等待中派发的成员无最终响应 → 退回队列继续等待 */
+                    b2b_queue_requeue(c, 408);
+                } else {
+                    finish_with_a_response(c, 408, NULL, 0);
+                }
             }
         }
         call_unlock(c);
@@ -4150,7 +4258,9 @@ static void send_bye_leg(b2b_call_t *c, int leg)
 {
     b2b_core_t *co = c->core;
     b2b_leg_t *l = &c->leg[leg];
-    if (l->state != LEG_CONFIRMED)
+    /* A 腿已回过 200 OK 但 ACK 尚未到时（典型：Contact 地址不对/NAT 丢 ACK），
+     * 也要允许 best-effort 发 BYE，否则 B 腿挂断后 A 侧 dialog 会一直挂着。 */
+    if (l->state != LEG_CONFIRMED && !(leg == 0 && c->a_final == 200))
         return;
 
     /* ★ BYE 转发诊断日志：在 build_dlg_req 之前把所有关键 tag 打出来，
@@ -4702,6 +4812,401 @@ static void msg_callee_copy(const sip_msg_t *m, char *out, size_t outsz)
 }
 
 /* ------------------------------------------------------------------ */
+/* REQ-PBX-CC-002 3.3: resolve 成功后的 B 腿构建与 INVITE 派发。
+ * 从 handle_new_invite 抽出，供两条入口复用：
+ *   1) 入站 INVITE 同步 resolve 成功（原路径）
+ *   2) 队列 tick 派发（b2b_queue_dispatch：A 腿已回 183，等成员空闲）
+ * 线程/锁约定与抽出前一致：reactor 线程调用，不持 call_lock。 */
+static void b2b_start_b_leg(b2b_call_t *c, sip_txn_t *t, nsbc_sa_t bd,
+                            const char *nruri, const char *bto)
+{
+    b2b_core_t *co = c->core;
+    b2b_leg_t *a = &c->leg[0];
+
+    /* REQ-ARCH-015 per-key 并发硬限制：b_key 由 resolve_cb（signaling.c）预填
+     * EXT 层 → AoR，OUT 层 → trunk_name；空 b_key 不限制。
+     * 超限返回 486 Busy Here（SIP 标准，语义比 503 更准确）。 */
+    if (c->b_key[0] && !perkey_try_inc(co, c->b_key)) {
+        llog(LOG_WARN, "b2b", "perkey_concurrent_limit reached (%u) for %s, 486",
+             co->cfg.max_inflight_per_aor, c->b_key);
+        c->a_final = 486;
+        respond_txn(co, t, 486, NULL, NULL, NULL, 0);
+        a->state = LEG_TERMINATED;
+        add_atomic(&co->failed, 1);
+        call_destroy(c);
+        return;
+    }
+    if (c->b_key[0]) c->key_held = 1; /* AoR/trunk key 已占槽，call_destroy 时释放 */
+
+    /* 构造 B 腿 */
+    b2b_leg_t *b = &c->leg[1];
+    b->state = LEG_CALLING;
+    /* proto 按 resolve 结果推断（tr_send_cb 同款约定）：WS/WSS 注册的
+     * dst 是 AF_UNSPEC（padding 藏 ws_conn*），必须用 WS/WSS proto —
+     * 否则 send_ack_leg/tr_send_leg 直调 sip_tr_send 会走 UDP 分支，
+     * 无法寻址 .invalid Contact 的 WS 连接 */
+    if (bd.ss.ss_family == AF_UNSPEC) {
+        extern sip_tr_proto_t g_ws_bridge_proto; /* signaling.c */
+        b->proto = g_ws_bridge_proto;
+        b->reliable = 1;   /* WS 可靠传输 */
+    } else {
+        b->proto = SIP_TR_UDP;
+        b->reliable = 0;
+    }
+    b->dst = bd;
+    if (nsbc_sa_port(&bd) == 0)
+        nsbc_sa_set_port(&b->dst, 5060);
+    nsbc_rand_token(b->loc_tag, sizeof(b->loc_tag), 16);
+
+    /* ==============================================================
+     * REQ-DP-SIP-001：统一 B-leg INVITE 头构建
+     *
+     * 所有 DP 命中的 SIP 头 override 都在 c->hdr_rw 里，统一在此处合成最终值。
+     * 优先级（从高到低）：
+     *   privacy_id → sip_invite_from → sip_invite_from_uri → (sip_from_uri 可选 + sip_from_display) → sip_from_uri
+     *   → origination_caller_id_number + origination_caller_id_name（FreeSWITCH 风格，纯 user+name，host 自动）
+     *   → trunk 默认构造（P2-16，trunk resolve_from_user/host 回退链 + caller_id_in_from）
+     *   → clip(legacy CLIP，已预填 sip_from_uri) → 透传 A-腿 From
+     *   To / R-URI / Contact 各自独立覆盖 + params 追加
+     *   sip_invite_domain 强制覆盖所有 URI 的 host:port（最后一步）
+     *   sip_invite_pid_params + sip_invite_params → 拼入 extra 头块
+     * ============================================================== */
+    const sip_hdr_rewrite_t *rw = &c->hdr_rw;
+
+    /* --- 1. From 头构建 --- */
+    char from_base[B2B_HDR_MAX];
+    int from_has_tag = 0;
+    if (c->privacy_id) {
+        snprintf(from_base, sizeof(from_base), "Anonymous");
+    } else if (rw->sip_invite_from[0]) {
+        /* 完整 From 值覆盖（可能自带 tag） */
+        snprintf(from_base, sizeof(from_base), "%s", rw->sip_invite_from);
+        from_has_tag = !!strstr(from_base, ";tag=");
+    } else if (rw->sip_invite_from_uri[0]) {
+        /* 纯 URI 覆盖（FS sip_invite_from_uri）→ 叠加 display name（若有） */
+        if (rw->sip_from_display[0])
+            snprintf(from_base, sizeof(from_base), "\"%s\" <%s>",
+                     rw->sip_from_display, rw->sip_invite_from_uri);
+        else
+            snprintf(from_base, sizeof(from_base), "<%s>", rw->sip_invite_from_uri);
+    } else if (rw->sip_from_uri[0]) {
+        /* 组件级覆盖 → 叠加 display name（若有）；
+         * REQ-PBX-CLIP-001：legacy clip 已由 DP 预填到 rw->sip_from_uri */
+        if (rw->sip_from_display[0])
+            snprintf(from_base, sizeof(from_base), "\"%s\" <%s>",
+                     rw->sip_from_display, rw->sip_from_uri);
+        else
+            snprintf(from_base, sizeof(from_base), "<%s>", rw->sip_from_uri);
+    /* === FreeSWITCH 层 4.5：origination_caller_id_number + origination_caller_id_name ===
+     * 纯 user part（host 自动填 trunk.resolve_from_host 或 local_host），
+     * 比 sip_from_uri（完整 URI）更灵活——DP 只设 user，host 由系统/运营商域保证。
+     * 优先级：低于 sip_invite_from/_uri/sip_from_uri，高于 trunk 默认构造 */
+    } else if (c->orig_caller_id_num[0]) {
+        const char *u = c->orig_caller_id_num;
+        const char *h = co->cfg.local_host;
+        if (c->rt_name[0] && b2b_rt(co)) {
+            const trunk_t *tr = rt_trunk_get((route_table_t *)b2b_rt(co), c->rt_name);
+            if (tr && tr->enabled) h = p216_resolve_from_host(tr);
+        }
+        const char *disp = c->orig_caller_id_name[0] ? c->orig_caller_id_name : u;
+        snprintf(from_base, sizeof(from_base), "\"%s\" <sip:%s@%s>", disp, u, h);
+        llog(LOG_INFO, "b2b",
+             "origination_caller_id: num=%s name=%s host=%s disp=%s",
+             u, c->orig_caller_id_name, h, disp);
+    /* === P2-16：层 5 trunk 默认构造（文档 §4.1.1 + §4.1.3） ===
+     * 优先级：低于 DP 显式 override（sip_invite_from/_uri/sip_from_uri[含clip]），
+     *        高于纯透传 A-腿 From。
+     * 前置条件：c->rt_name 已填（呼入 P2-14 或呼出 OUT resolve）
+     *        + trunk 存在且 enabled 且 kind != TRUNK_EXT
+     * 效果：From: "<caller>" <sip:<from_user>@<from_host>>;tag=...
+     * 其中 from_user / from_host 走完整回退链（p216_resolve_from_user/host）
+     * caller_id_in_from=1 → URI user + Display name 都用 c->orig_number（主叫号码）
+     * host 始终用 resolve_from_host(tr) 保留运营商域（专家 2.4 明确）
+     * trunk 不可用 → 继续下一行 fallback 透传 A-腿 From */
+    } else if (c->rt_name[0] && b2b_rt(co)) {
+        const trunk_t *tr = rt_trunk_get((route_table_t *)b2b_rt(co), c->rt_name);
+        if (tr && tr->enabled) {
+            const char *u = p216_resolve_from_user(tr, tr->caller_id_in_from, c->orig_number);
+            const char *h = p216_resolve_from_host(tr);
+            /* 专家 2.4：caller_id_in_from=1 时 Display name 也用主叫号码（FS 行为） */
+            const char *disp = tr->caller_id_in_from ? c->orig_number : u;
+            snprintf(from_base, sizeof(from_base), "\"%s\" <sip:%s@%s>",
+                     disp, u, h);
+            llog(LOG_INFO, "b2b",
+                 "P2-16 trunk From default: trunk=%s user=%s host=%s caller_id_in_from=%d disp=%s",
+                 tr->name, u, h, tr->caller_id_in_from, disp);
+        } else {
+            strip_tag_str(from_base, sizeof(from_base), a->from);
+        }
+    } else {
+        strip_tag_str(from_base, sizeof(from_base), a->from);
+    }
+    /* From params：在 ;tag= 之前插入 */
+    {
+        if (from_has_tag) {
+            /* 已有 tag，拆 body 和 tag，params 加在 body 后 */
+            char tag_bak[64] = {0};
+            char *p = strstr(from_base, ";tag=");
+            if (p) {
+                strncpy(tag_bak, p + 5, sizeof(tag_bak) - 1);
+                *p = '\0';
+            }
+            if (rw->sip_invite_from_params[0])
+                snprintf(b->from, sizeof(b->from), "%s;%s;tag=%s",
+                         from_base, rw->sip_invite_from_params, tag_bak);
+            else
+                snprintf(b->from, sizeof(b->from), "%s;tag=%s", from_base, tag_bak);
+        } else {
+            if (rw->sip_invite_from_params[0])
+                snprintf(b->from, sizeof(b->from), "%s;%s;tag=%s",
+                         from_base, rw->sip_invite_from_params, b->loc_tag);
+            else
+                snprintf(b->from, sizeof(b->from), "%s;tag=%s", from_base, b->loc_tag);
+        }
+    }
+
+    /* === FreeSWITCH effective_caller_id_*：运行时合成值 ===
+     * 优先级链全部跑完后，从 from_base 提取最终 user part + display name
+     * 供 CDR emit 记录"真正生效的主叫号/名"（不是 DP 原始配置值）
+     *
+     * 提取规则：
+     *   from_base = "\"Display\" <sip:user@host>"  → effective_num=user, effective_name=Display
+     *   from_base = "<sip:user@host>"              → effective_num=user, effective_name=""
+     *   from_base = "Anonymous"                   → effective_num="Anonymous", effective_name=""
+     * effective 值与 DP 配置值（orig_caller_id_*）独立：
+     *   - orig_caller_id_* 是"我想要"
+     *   - effective_caller_id_* 是"最终拿到"
+     *   - 两者不同意味着优先级链有更高层覆盖了（sip_invite_from/_uri/sip_from_uri/privacy_id） */
+    {
+        /* 先找 Display name（尖括号之前的 "xxx" 部分） */
+        const char *disp_start = NULL;
+        const char *disp_end = NULL;
+        const char *angle = strchr(from_base, '<');
+        if (angle) {
+            /* "Display" <sip:...> 模式 */
+            disp_start = strchr(from_base, '"');
+            if (disp_start && disp_start < angle) {
+                disp_end = strchr(disp_start + 1, '"');
+                if (disp_end && disp_end < angle) {
+                    size_t dlen = (size_t)(disp_end - disp_start - 1);
+                    if (dlen >= sizeof(c->effective_caller_id_name))
+                        dlen = sizeof(c->effective_caller_id_name) - 1;
+                    memcpy(c->effective_caller_id_name, disp_start + 1, dlen);
+                    c->effective_caller_id_name[dlen] = '\0';
+                }
+            }
+            /* 提取 <sip:user@host> 中的 user part */
+            const char *sip = strstr(angle, "sip:");
+            if (sip) {
+                const char *user_start = sip + 4;
+                const char *at = strchr(user_start, '@');
+                const char *user_end = at ? at : strchr(user_start, '>');
+                if (at || user_end) {
+                    size_t ulen = (size_t)((user_end ? user_end : at) - user_start);
+                    if (ulen >= sizeof(c->effective_caller_id_num))
+                        ulen = sizeof(c->effective_caller_id_num) - 1;
+                    memcpy(c->effective_caller_id_num, user_start, ulen);
+                    c->effective_caller_id_num[ulen] = '\0';
+                }
+            }
+        } else {
+            /* 无尖括号（privacy_id=1 → "Anonymous"） */
+            snprintf(c->effective_caller_id_num, sizeof(c->effective_caller_id_num),
+                     "%s", from_base);
+            c->effective_caller_id_name[0] = '\0';
+        }
+    }
+
+    /* --- 2. To 头构建 --- */
+    if (rw->sip_invite_to_uri[0]) {
+        snprintf(b->to, sizeof(b->to), "%s", rw->sip_invite_to_uri);
+    } else if (bto[0]) {
+        snprintf(b->to, sizeof(b->to), "%s", bto);
+    } else {
+        snprintf(b->to, sizeof(b->to), "%s", a->to);
+    }
+    if (rw->sip_invite_to_params[0]) {
+        /* snprintf 源/目标同缓冲区会触发 -Werror=restrict，用 tmp 串接 */
+        char tmp[B2B_HDR_MAX];
+        snprintf(tmp, sizeof(tmp), "%s;%s", b->to, rw->sip_invite_to_params);
+        snprintf(b->to, sizeof(b->to), "%s", tmp);
+    }
+    /* REQ-SIP-DIV-001：保存 B 腿初始被叫 URI（供 Diversion RFC 5806） */
+    snprintf(c->orig_to, sizeof(c->orig_to), "%s", b->to);
+
+    /* --- 3. Request-URI 构建 --- */
+    if (rw->sip_invite_req_uri[0]) {
+        snprintf(b->ruri, sizeof(b->ruri), "%s", rw->sip_invite_req_uri);
+        snprintf(b->target, sizeof(b->target), "%s", rw->sip_invite_req_uri);
+    } else {
+        snprintf(b->ruri, sizeof(b->ruri), "%s", nruri);
+        snprintf(b->target, sizeof(b->target), "%s", nruri);
+    }
+    if (rw->sip_invite_tel_params[0] && strncmp(b->ruri, "tel:", 4) == 0) {
+        /* snprintf 源/目标同缓冲区会触发 -Werror=restrict */
+        char tmp[B2B_HDR_MAX];
+        snprintf(tmp, sizeof(tmp), "%s;%s", b->ruri, rw->sip_invite_tel_params);
+        snprintf(b->ruri, sizeof(b->ruri), "%s", tmp);
+    }
+
+    /* --- 4/5. Contact 头构建 + Domain override 统一移到 send_invite_b 里处理 --- */
+
+    /* REQ-ORIGINATE-WS-004：Call-ID host_tag 统一用 profile external_sip_ip（bridge 模式）
+     * 和 originate 模式一样的 fallback 链 */
+    {
+        const char *cid_host =
+            (c->prof && c->prof->external_sip_ip[0]) ? c->prof->external_sip_ip
+            : co->cfg.local_host;
+        nsbc_callid_make(b->callid, sizeof(b->callid), cid_host);
+    }
+    b->cseq = 1;
+    sip_upd_guard_init(&b->guard);
+    b->dlg = dlg_uac_new(co->cfg.dlg, b->callid, strlen(b->callid),
+                         b->loc_tag, strlen(b->loc_tag), b->target,
+                         b->cseq, SIP_M_INVITE);
+    if (b->dlg)
+        b->dlg->ud = c;
+    tbl_link(co, c, 1);
+
+    /* 媒体出口重写（多槽 SDP offer hook 链 + NAT 改写） */
+    const char *out_sdp = a->offer;
+    size_t out_sdp_len = a->offer_len;
+    char rewritten[B2B_SDP_MAX]; rewritten[0] = '\0';
+    /* offer_hook 多槽链：各模块（media_bridge/security/...）依次改写
+     * ★ DEADLOCK-FIX (2026-11-02): 锁只保护回调数组快照，释放锁后再调。
+     *   根因：g_sdp_hook_lock 跨 bridge_offer_hook → reactor_call(cond_wait)
+     *   持有，目标 reactor 线程也在等同一锁 → ABBA 死锁。详见 answer_hook。 */
+    if (a->offer_len && g_sdp_hook_n[B2B_SDP_OFFER] > 0) {
+        b2b_sdp_hook_slot_t hsnap[B2B_SDP_HOOK_MAX];
+        int hn;
+        pthread_mutex_lock(&g_sdp_hook_lock);
+        hn = g_sdp_hook_n[B2B_SDP_OFFER];
+        if (hn > B2B_SDP_HOOK_MAX) hn = B2B_SDP_HOOK_MAX;
+        for (int i = 0; i < hn; ++i) hsnap[i] = g_sdp_hooks[B2B_SDP_OFFER][i];
+        pthread_mutex_unlock(&g_sdp_hook_lock);
+        for (int i = 0; i < hn; ++i) {
+            char buf[B2B_SDP_MAX]; buf[0] = '\0';
+            const char *in = (rewritten[0] ? rewritten : a->offer);
+            size_t inlen = rewritten[0] ? strlen(rewritten) : a->offer_len;
+            int n = hsnap[i].fn(c, in, inlen, buf, sizeof(buf), hsnap[i].ud);
+            if (n >= 0) {
+                memcpy(rewritten, buf, (size_t)n);
+                rewritten[n] = '\0';
+            }
+        }
+        if (rewritten[0]) {
+            out_sdp = rewritten;
+            out_sdp_len = strlen(rewritten);
+        }
+    }
+    /* REQ-NAT-002：NAT rewrite
+     *
+     * bridge 模式：B 腿出站 INVITE 带的是 A 腿收到的 offer SDP，
+     * 需要 rewrite 的是 B 腿目标视角下的公网 IP（resolve_cb 填进
+     * c->leg[1].ext_rtp_ip 的 out_prof.external_rtp_ip）。
+     *
+     * 触发条件和 originate 模式一致：
+     *   leg[1].nat_detected == 1 → loc_binding 说目标 behind NAT
+     *   或 leg[1].ext_rtp_ip 配了（防御性）
+     *
+     * 目标 IP：leg[1].ext_rtp_ip（resolve 时从 out_prof 取）
+     *
+     * 注意：变量 b 在上方 L3994 已定义为 &c->leg[1]，直接复用 */
+    /* REQ-NAT-002：NAT rewrite
+     *
+     * 触发条件：nat_rtp_ip 非空即 rewrite（不看 nat_detected！）
+     *   nat_sdp_rewrite 本身是安全的——只改私网 IP，公网 IP 不动
+     *   所以：profile 配了 ext_rtp_ip → SBC behind NAT → 应该 rewrite
+     *        profile 没配 → SBC 可能直连 → cfg 兜底 → 保守
+     *
+     * 目标 IP fallback 链（从最精确到最保守）：
+     *   leg[1].ext_rtp_ip       → resolve_cb 或 originate 自动关联 profile 填的
+     *   → c->prof->external_rtp_ip  → per-call SIP profile
+     *   → cfg.external_rtp_ip       → 全局 b2b_core.cfg（兼容老配置）
+     *   → cfg.external_sip_ip       → 全局 ext-sip-ip（兼容配置） */
+    const char *nat_rtp_ip =
+        (b->ext_rtp_ip[0]) ? b->ext_rtp_ip
+        : (c->prof && c->prof->external_rtp_ip[0]) ? c->prof->external_rtp_ip
+        : (co->cfg.external_rtp_ip && co->cfg.external_rtp_ip[0]) ? co->cfg.external_rtp_ip
+        : co->cfg.external_sip_ip;  /* 允许 NULL */
+    if (nat_rtp_ip && nat_rtp_ip[0] && a->offer_len) {
+        /* 确保 rewritten 有当前 out_sdp 的完整拷贝（offer_hook 可能没写 rewritten） */
+        if (out_sdp != rewritten)
+            memcpy(rewritten, out_sdp, out_sdp_len);
+        rewritten[out_sdp_len] = '\0';
+        out_sdp_len = nat_sdp_rewrite(rewritten, out_sdp_len, sizeof(rewritten),
+                                      nat_rtp_ip, NULL);
+        out_sdp = rewritten;
+        llog(LOG_INFO, "b2b",
+             "bridge: NAT rewrite nat=[%s] detected=%d out_len=%zu",
+             nat_rtp_ip, b->nat_detected, out_sdp_len);
+    }
+
+    /* --- 6. 拼 extra 头块（PID + invite_params + CLIR Privacy） --- */
+    /* 2026-10-14 扩到 2048：3GPP IMS 场景 sip_invite_params 装 PAI+PPID+PANI+PCPI
+     * 多行头块 ≈ 350 字节，加 pid_params(256) + privacy_id(14) + 留足余量 */
+    char b_extra[2048]; b_extra[0] = '\0';
+    size_t eo = 0;
+    if (c->privacy_id) {
+        eo += (size_t)snprintf(b_extra + eo, sizeof(b_extra) - eo,
+                                "Privacy: id\r\n");
+    }
+    if (rw->sip_invite_pid_params[0]) {
+        /* sip_invite_pid_params 允许完整头行 "P-Asserted-Identity: <sip:...>"
+         * 或简写 "sip:user@host"（自动包 P-Asserted-Identity 头） */
+        const char *pid = rw->sip_invite_pid_params;
+        if (strstr(pid, ": ")) {
+            eo += (size_t)snprintf(b_extra + eo, sizeof(b_extra) - eo, "%s\r\n", pid);
+        } else {
+            eo += (size_t)snprintf(b_extra + eo, sizeof(b_extra) - eo,
+                                    "P-Asserted-Identity: <%s>\r\n", pid);
+        }
+    }
+    if (rw->sip_invite_params[0]) {
+        /* sip_invite_params：已格式化头块，每行自带 \r\n */
+        size_t remain = sizeof(b_extra) - eo;
+        strncat(b_extra + eo, rw->sip_invite_params, remain - 1);
+        eo = strlen(b_extra);
+        /* 确保结尾有 \r\n */
+        if (eo >= 2 && (b_extra[eo-2] != '\r' || b_extra[eo-1] != '\n'))
+            eo += (size_t)snprintf(b_extra + eo, sizeof(b_extra) - eo, "\r\n");
+    }
+    const char *b_extra_ptr = b_extra[0] ? b_extra : NULL;
+    /* ★ 存 offer 到 leg —— 407 challenge 重发 / 302 follow 路径会用
+     * 之前只靠 send_invite_b 栈上 buffer，txn 回调回来后已失效 */
+    if (out_sdp_len > 0 && out_sdp_len <= B2B_SDP_MAX) {
+        memcpy(b->offer, out_sdp, out_sdp_len);
+        b->offer_len = out_sdp_len;
+    } else {
+        b->offer_len = 0;
+    }
+    b->inv_txn = send_invite_b(c, 1, out_sdp, out_sdp_len, 0, b_extra_ptr);
+    char dstbuf[128];
+    nsbc_sa_fmt(&b->dst, dstbuf, sizeof(dstbuf));
+    llog(LOG_INFO, "b2b", "send_invite_b rc=%p dst=%s", b->inv_txn, dstbuf);
+    if (!b->inv_txn) {
+        respond_txn(co, t, 500, NULL, NULL, NULL, 0);
+        call_destroy(c);
+    } else {
+        char sess[512];
+        snprintf(sess, sizeof(sess),
+                 "{\"event\":\"create\",\"call_id\":\"%s\",\"from\":\"%s\",\"to\":\"%s\","
+                 "\"dir\":\"inbound\",\"state\":\"calling\"}",
+                 c->leg[0].callid,
+                 c->leg[0].from,
+                 c->dst_number[0] ? c->dst_number : c->leg[0].to);
+        uds_send_session(sess);
+
+        /* REQ-DP-APP-001：app_chain 登记的 early media（ringback/playback）
+         * 此刻执行 —— send_invite_b 内 offer_hook 已建 relay、A 侧 peer 已
+         * 解析：183+SDP answer 发 A 腿 → pb_start 放音（A 从此可收 RTP）。
+         * 注意必须 dispatch B 腿 INVITE 之后再发 183，保证 A 收 183 时
+         * B 腿呼叫已同时发起（标准 Early Media 并行时序）。 */
+        if (c->em_pending)
+            b2b_early_media_start(c);
+    }
+}
+
 /* Phase 5 XL: 去掉 static，暴露为 public（signaling endpoint_registry
  * 分发路径会调它，ctx 构造好所有参数后内部委托） */
 void handle_new_invite(b2b_core_t *co, sip_txn_t *t,
@@ -5043,6 +5548,9 @@ void handle_new_invite(b2b_core_t *co, sip_txn_t *t,
     llog(LOG_INFO, "b2b", "new_invite: from_user=%s ruri_user=%.*s",
          c->orig_number,
          (int)m->ruri.user.len, m->ruri.user.p ? m->ruri.user.p : "");
+    /* A 腿主叫号通知（callcenter 用于登记主叫分机忙线；非分机号由回调自行过滤） */
+    if (co->cfg.on_caller && c->orig_number[0])
+        co->cfg.on_caller(c, c->orig_number, co->cfg.caller_ud);
     sip_hdr_t *cseq = sip_hdr_get(m, SIP_H_CSEQ);
     if (cseq && sip_hdr_parse_cseq(cseq) == NSBC_OK)
         a->cseq = cseq->u.cseq.number;
@@ -5329,6 +5837,37 @@ void handle_new_invite(b2b_core_t *co, sip_txn_t *t,
         call_destroy(c);
         return;
     }
+    if (resolve_rc == NSBC_QUEUED) {
+        /* 3.3：全忙已入队（signaling 写入 queue_tenant/name/moh）→ A 腿 183 等待。
+         * 不建 B 腿、不销毁呼叫；后续由 cq tick 派发 → b2b_queue_dispatch
+         * 复用同一 b2b_start_b_leg 流程。 */
+        int hrc = b2b_queue_hold(c, c->queue_tenant, c->queue_name,
+                                 c->queue_moh);
+        if (hrc != NSBC_OK) {
+            llog(LOG_WARN, "b2b",
+                 "new_invite queue hold failed rc=%d callid=%s → 480",
+                 hrc, a->callid);
+            c->a_final = 480;
+            respond_txn(co, t, 480, NULL, NULL, NULL, 0);
+            a->state = LEG_TERMINATED;
+            add_atomic(&co->failed, 1);
+            call_destroy(c);
+        }
+        return;
+    }
+    if (resolve_rc == NSBC_BUSY) {
+        /* 队列无空闲成员（全部忙线/置忙）：回 486 而不是 404，
+         * 让主叫侧 PBX 能识别“忙”并排队重试。 */
+        llog(LOG_NOTICE, "b2b",
+             "new_invite resolve BUSY callid=%s → 486 (no available queue member)",
+             a->callid);
+        c->a_final = 486;
+        respond_txn(co, t, 486, NULL, NULL, NULL, 0);
+        a->state = LEG_TERMINATED;
+        add_atomic(&co->failed, 1);
+        call_destroy(c);
+        return;
+    }
     if (resolve_rc != NSBC_OK) {
         c->a_final = 404;
         respond_txn(co, t, 404, NULL, NULL, NULL, 0);
@@ -5398,388 +5937,9 @@ void handle_new_invite(b2b_core_t *co, sip_txn_t *t,
         return;
     }
 
-    /* REQ-ARCH-015 per-key 并发硬限制：b_key 由 resolve_cb（signaling.c）预填
-     * EXT 层 → AoR，OUT 层 → trunk_name；空 b_key 不限制。
-     * 超限返回 486 Busy Here（SIP 标准，语义比 503 更准确）。 */
-    if (c->b_key[0] && !perkey_try_inc(co, c->b_key)) {
-        llog(LOG_WARN, "b2b", "perkey_concurrent_limit reached (%u) for %s, 486",
-             co->cfg.max_inflight_per_aor, c->b_key);
-        c->a_final = 486;
-        respond_txn(co, t, 486, NULL, NULL, NULL, 0);
-        a->state = LEG_TERMINATED;
-        add_atomic(&co->failed, 1);
-        call_destroy(c);
-        return;
-    }
-    if (c->b_key[0]) c->key_held = 1; /* AoR/trunk key 已占槽，call_destroy 时释放 */
-
-    /* 构造 B 腿 */
-    b2b_leg_t *b = &c->leg[1];
-    b->state = LEG_CALLING;
-    /* proto 按 resolve 结果推断（tr_send_cb 同款约定）：WS/WSS 注册的
-     * dst 是 AF_UNSPEC（padding 藏 ws_conn*），必须用 WS/WSS proto —
-     * 否则 send_ack_leg/tr_send_leg 直调 sip_tr_send 会走 UDP 分支，
-     * 无法寻址 .invalid Contact 的 WS 连接 */
-    if (bd.ss.ss_family == AF_UNSPEC) {
-        extern sip_tr_proto_t g_ws_bridge_proto; /* signaling.c */
-        b->proto = g_ws_bridge_proto;
-        b->reliable = 1;   /* WS 可靠传输 */
-    } else {
-        b->proto = SIP_TR_UDP;
-        b->reliable = 0;
-    }
-    b->dst = bd;
-    if (nsbc_sa_port(&bd) == 0)
-        nsbc_sa_set_port(&b->dst, 5060);
-    nsbc_rand_token(b->loc_tag, sizeof(b->loc_tag), 16);
-
-    /* ==============================================================
-     * REQ-DP-SIP-001：统一 B-leg INVITE 头构建
-     *
-     * 所有 DP 命中的 SIP 头 override 都在 c->hdr_rw 里，统一在此处合成最终值。
-     * 优先级（从高到低）：
-     *   privacy_id → sip_invite_from → sip_invite_from_uri → (sip_from_uri 可选 + sip_from_display) → sip_from_uri
-     *   → origination_caller_id_number + origination_caller_id_name（FreeSWITCH 风格，纯 user+name，host 自动）
-     *   → trunk 默认构造（P2-16，trunk resolve_from_user/host 回退链 + caller_id_in_from）
-     *   → clip(legacy CLIP，已预填 sip_from_uri) → 透传 A-腿 From
-     *   To / R-URI / Contact 各自独立覆盖 + params 追加
-     *   sip_invite_domain 强制覆盖所有 URI 的 host:port（最后一步）
-     *   sip_invite_pid_params + sip_invite_params → 拼入 extra 头块
-     * ============================================================== */
-    const sip_hdr_rewrite_t *rw = &c->hdr_rw;
-
-    /* --- 1. From 头构建 --- */
-    char from_base[B2B_HDR_MAX];
-    int from_has_tag = 0;
-    if (c->privacy_id) {
-        snprintf(from_base, sizeof(from_base), "Anonymous");
-    } else if (rw->sip_invite_from[0]) {
-        /* 完整 From 值覆盖（可能自带 tag） */
-        snprintf(from_base, sizeof(from_base), "%s", rw->sip_invite_from);
-        from_has_tag = !!strstr(from_base, ";tag=");
-    } else if (rw->sip_invite_from_uri[0]) {
-        /* 纯 URI 覆盖（FS sip_invite_from_uri）→ 叠加 display name（若有） */
-        if (rw->sip_from_display[0])
-            snprintf(from_base, sizeof(from_base), "\"%s\" <%s>",
-                     rw->sip_from_display, rw->sip_invite_from_uri);
-        else
-            snprintf(from_base, sizeof(from_base), "<%s>", rw->sip_invite_from_uri);
-    } else if (rw->sip_from_uri[0]) {
-        /* 组件级覆盖 → 叠加 display name（若有）；
-         * REQ-PBX-CLIP-001：legacy clip 已由 DP 预填到 rw->sip_from_uri */
-        if (rw->sip_from_display[0])
-            snprintf(from_base, sizeof(from_base), "\"%s\" <%s>",
-                     rw->sip_from_display, rw->sip_from_uri);
-        else
-            snprintf(from_base, sizeof(from_base), "<%s>", rw->sip_from_uri);
-    /* === FreeSWITCH 层 4.5：origination_caller_id_number + origination_caller_id_name ===
-     * 纯 user part（host 自动填 trunk.resolve_from_host 或 local_host），
-     * 比 sip_from_uri（完整 URI）更灵活——DP 只设 user，host 由系统/运营商域保证。
-     * 优先级：低于 sip_invite_from/_uri/sip_from_uri，高于 trunk 默认构造 */
-    } else if (c->orig_caller_id_num[0]) {
-        const char *u = c->orig_caller_id_num;
-        const char *h = co->cfg.local_host;
-        if (c->rt_name[0] && b2b_rt(co)) {
-            const trunk_t *tr = rt_trunk_get((route_table_t *)b2b_rt(co), c->rt_name);
-            if (tr && tr->enabled) h = p216_resolve_from_host(tr);
-        }
-        const char *disp = c->orig_caller_id_name[0] ? c->orig_caller_id_name : u;
-        snprintf(from_base, sizeof(from_base), "\"%s\" <sip:%s@%s>", disp, u, h);
-        llog(LOG_INFO, "b2b",
-             "origination_caller_id: num=%s name=%s host=%s disp=%s",
-             u, c->orig_caller_id_name, h, disp);
-    /* === P2-16：层 5 trunk 默认构造（文档 §4.1.1 + §4.1.3） ===
-     * 优先级：低于 DP 显式 override（sip_invite_from/_uri/sip_from_uri[含clip]），
-     *        高于纯透传 A-腿 From。
-     * 前置条件：c->rt_name 已填（呼入 P2-14 或呼出 OUT resolve）
-     *        + trunk 存在且 enabled 且 kind != TRUNK_EXT
-     * 效果：From: "<caller>" <sip:<from_user>@<from_host>>;tag=...
-     * 其中 from_user / from_host 走完整回退链（p216_resolve_from_user/host）
-     * caller_id_in_from=1 → URI user + Display name 都用 c->orig_number（主叫号码）
-     * host 始终用 resolve_from_host(tr) 保留运营商域（专家 2.4 明确）
-     * trunk 不可用 → 继续下一行 fallback 透传 A-腿 From */
-    } else if (c->rt_name[0] && b2b_rt(co)) {
-        const trunk_t *tr = rt_trunk_get((route_table_t *)b2b_rt(co), c->rt_name);
-        if (tr && tr->enabled) {
-            const char *u = p216_resolve_from_user(tr, tr->caller_id_in_from, c->orig_number);
-            const char *h = p216_resolve_from_host(tr);
-            /* 专家 2.4：caller_id_in_from=1 时 Display name 也用主叫号码（FS 行为） */
-            const char *disp = tr->caller_id_in_from ? c->orig_number : u;
-            snprintf(from_base, sizeof(from_base), "\"%s\" <sip:%s@%s>",
-                     disp, u, h);
-            llog(LOG_INFO, "b2b",
-                 "P2-16 trunk From default: trunk=%s user=%s host=%s caller_id_in_from=%d disp=%s",
-                 tr->name, u, h, tr->caller_id_in_from, disp);
-        } else {
-            copy_strip_tag(from_base, sizeof(from_base), from->value);
-        }
-    } else {
-        copy_strip_tag(from_base, sizeof(from_base), from->value);
-    }
-    /* From params：在 ;tag= 之前插入 */
-    {
-        if (from_has_tag) {
-            /* 已有 tag，拆 body 和 tag，params 加在 body 后 */
-            char tag_bak[64] = {0};
-            char *p = strstr(from_base, ";tag=");
-            if (p) {
-                strncpy(tag_bak, p + 5, sizeof(tag_bak) - 1);
-                *p = '\0';
-            }
-            if (rw->sip_invite_from_params[0])
-                snprintf(b->from, sizeof(b->from), "%s;%s;tag=%s",
-                         from_base, rw->sip_invite_from_params, tag_bak);
-            else
-                snprintf(b->from, sizeof(b->from), "%s;tag=%s", from_base, tag_bak);
-        } else {
-            if (rw->sip_invite_from_params[0])
-                snprintf(b->from, sizeof(b->from), "%s;%s;tag=%s",
-                         from_base, rw->sip_invite_from_params, b->loc_tag);
-            else
-                snprintf(b->from, sizeof(b->from), "%s;tag=%s", from_base, b->loc_tag);
-        }
-    }
-
-    /* === FreeSWITCH effective_caller_id_*：运行时合成值 ===
-     * 优先级链全部跑完后，从 from_base 提取最终 user part + display name
-     * 供 CDR emit 记录"真正生效的主叫号/名"（不是 DP 原始配置值）
-     *
-     * 提取规则：
-     *   from_base = "\"Display\" <sip:user@host>"  → effective_num=user, effective_name=Display
-     *   from_base = "<sip:user@host>"              → effective_num=user, effective_name=""
-     *   from_base = "Anonymous"                   → effective_num="Anonymous", effective_name=""
-     * effective 值与 DP 配置值（orig_caller_id_*）独立：
-     *   - orig_caller_id_* 是"我想要"
-     *   - effective_caller_id_* 是"最终拿到"
-     *   - 两者不同意味着优先级链有更高层覆盖了（sip_invite_from/_uri/sip_from_uri/privacy_id） */
-    {
-        /* 先找 Display name（尖括号之前的 "xxx" 部分） */
-        const char *disp_start = NULL;
-        const char *disp_end = NULL;
-        const char *angle = strchr(from_base, '<');
-        if (angle) {
-            /* "Display" <sip:...> 模式 */
-            disp_start = strchr(from_base, '"');
-            if (disp_start && disp_start < angle) {
-                disp_end = strchr(disp_start + 1, '"');
-                if (disp_end && disp_end < angle) {
-                    size_t dlen = (size_t)(disp_end - disp_start - 1);
-                    if (dlen >= sizeof(c->effective_caller_id_name))
-                        dlen = sizeof(c->effective_caller_id_name) - 1;
-                    memcpy(c->effective_caller_id_name, disp_start + 1, dlen);
-                    c->effective_caller_id_name[dlen] = '\0';
-                }
-            }
-            /* 提取 <sip:user@host> 中的 user part */
-            const char *sip = strstr(angle, "sip:");
-            if (sip) {
-                const char *user_start = sip + 4;
-                const char *at = strchr(user_start, '@');
-                const char *user_end = at ? at : strchr(user_start, '>');
-                if (at || user_end) {
-                    size_t ulen = (size_t)((user_end ? user_end : at) - user_start);
-                    if (ulen >= sizeof(c->effective_caller_id_num))
-                        ulen = sizeof(c->effective_caller_id_num) - 1;
-                    memcpy(c->effective_caller_id_num, user_start, ulen);
-                    c->effective_caller_id_num[ulen] = '\0';
-                }
-            }
-        } else {
-            /* 无尖括号（privacy_id=1 → "Anonymous"） */
-            snprintf(c->effective_caller_id_num, sizeof(c->effective_caller_id_num),
-                     "%s", from_base);
-            c->effective_caller_id_name[0] = '\0';
-        }
-    }
-
-    /* --- 2. To 头构建 --- */
-    if (rw->sip_invite_to_uri[0]) {
-        snprintf(b->to, sizeof(b->to), "%s", rw->sip_invite_to_uri);
-    } else if (bto[0]) {
-        snprintf(b->to, sizeof(b->to), "%s", bto);
-    } else {
-        snprintf(b->to, sizeof(b->to), "%s", a->to);
-    }
-    if (rw->sip_invite_to_params[0]) {
-        /* snprintf 源/目标同缓冲区会触发 -Werror=restrict，用 tmp 串接 */
-        char tmp[B2B_HDR_MAX];
-        snprintf(tmp, sizeof(tmp), "%s;%s", b->to, rw->sip_invite_to_params);
-        snprintf(b->to, sizeof(b->to), "%s", tmp);
-    }
-    /* REQ-SIP-DIV-001：保存 B 腿初始被叫 URI（供 Diversion RFC 5806） */
-    snprintf(c->orig_to, sizeof(c->orig_to), "%s", b->to);
-
-    /* --- 3. Request-URI 构建 --- */
-    if (rw->sip_invite_req_uri[0]) {
-        snprintf(b->ruri, sizeof(b->ruri), "%s", rw->sip_invite_req_uri);
-        snprintf(b->target, sizeof(b->target), "%s", rw->sip_invite_req_uri);
-    } else {
-        snprintf(b->ruri, sizeof(b->ruri), "%s", nruri);
-        snprintf(b->target, sizeof(b->target), "%s", nruri);
-    }
-    if (rw->sip_invite_tel_params[0] && strncmp(b->ruri, "tel:", 4) == 0) {
-        /* snprintf 源/目标同缓冲区会触发 -Werror=restrict */
-        char tmp[B2B_HDR_MAX];
-        snprintf(tmp, sizeof(tmp), "%s;%s", b->ruri, rw->sip_invite_tel_params);
-        snprintf(b->ruri, sizeof(b->ruri), "%s", tmp);
-    }
-
-    /* --- 4/5. Contact 头构建 + Domain override 统一移到 send_invite_b 里处理 --- */
-
-    /* REQ-ORIGINATE-WS-004：Call-ID host_tag 统一用 profile external_sip_ip（bridge 模式）
-     * 和 originate 模式一样的 fallback 链 */
-    {
-        const char *cid_host =
-            (c->prof && c->prof->external_sip_ip[0]) ? c->prof->external_sip_ip
-            : co->cfg.local_host;
-        nsbc_callid_make(b->callid, sizeof(b->callid), cid_host);
-    }
-    b->cseq = 1;
-    sip_upd_guard_init(&b->guard);
-    b->dlg = dlg_uac_new(co->cfg.dlg, b->callid, strlen(b->callid),
-                         b->loc_tag, strlen(b->loc_tag), b->target,
-                         b->cseq, SIP_M_INVITE);
-    if (b->dlg)
-        b->dlg->ud = c;
-    tbl_link(co, c, 1);
-
-    /* 媒体出口重写（多槽 SDP offer hook 链 + NAT 改写） */
-    const char *out_sdp = a->offer;
-    size_t out_sdp_len = a->offer_len;
-    char rewritten[B2B_SDP_MAX]; rewritten[0] = '\0';
-    /* offer_hook 多槽链：各模块（media_bridge/security/...）依次改写
-     * ★ DEADLOCK-FIX (2026-11-02): 锁只保护回调数组快照，释放锁后再调。
-     *   根因：g_sdp_hook_lock 跨 bridge_offer_hook → reactor_call(cond_wait)
-     *   持有，目标 reactor 线程也在等同一锁 → ABBA 死锁。详见 answer_hook。 */
-    if (a->offer_len && g_sdp_hook_n[B2B_SDP_OFFER] > 0) {
-        b2b_sdp_hook_slot_t hsnap[B2B_SDP_HOOK_MAX];
-        int hn;
-        pthread_mutex_lock(&g_sdp_hook_lock);
-        hn = g_sdp_hook_n[B2B_SDP_OFFER];
-        if (hn > B2B_SDP_HOOK_MAX) hn = B2B_SDP_HOOK_MAX;
-        for (int i = 0; i < hn; ++i) hsnap[i] = g_sdp_hooks[B2B_SDP_OFFER][i];
-        pthread_mutex_unlock(&g_sdp_hook_lock);
-        for (int i = 0; i < hn; ++i) {
-            char buf[B2B_SDP_MAX]; buf[0] = '\0';
-            const char *in = (rewritten[0] ? rewritten : a->offer);
-            size_t inlen = rewritten[0] ? strlen(rewritten) : a->offer_len;
-            int n = hsnap[i].fn(c, in, inlen, buf, sizeof(buf), hsnap[i].ud);
-            if (n >= 0) {
-                memcpy(rewritten, buf, (size_t)n);
-                rewritten[n] = '\0';
-            }
-        }
-        if (rewritten[0]) {
-            out_sdp = rewritten;
-            out_sdp_len = strlen(rewritten);
-        }
-    }
-    /* REQ-NAT-002：NAT rewrite
-     *
-     * bridge 模式：B 腿出站 INVITE 带的是 A 腿收到的 offer SDP，
-     * 需要 rewrite 的是 B 腿目标视角下的公网 IP（resolve_cb 填进
-     * c->leg[1].ext_rtp_ip 的 out_prof.external_rtp_ip）。
-     *
-     * 触发条件和 originate 模式一致：
-     *   leg[1].nat_detected == 1 → loc_binding 说目标 behind NAT
-     *   或 leg[1].ext_rtp_ip 配了（防御性）
-     *
-     * 目标 IP：leg[1].ext_rtp_ip（resolve 时从 out_prof 取）
-     *
-     * 注意：变量 b 在上方 L3994 已定义为 &c->leg[1]，直接复用 */
-    /* REQ-NAT-002：NAT rewrite
-     *
-     * 触发条件：nat_rtp_ip 非空即 rewrite（不看 nat_detected！）
-     *   nat_sdp_rewrite 本身是安全的——只改私网 IP，公网 IP 不动
-     *   所以：profile 配了 ext_rtp_ip → SBC behind NAT → 应该 rewrite
-     *        profile 没配 → SBC 可能直连 → cfg 兜底 → 保守
-     *
-     * 目标 IP fallback 链（从最精确到最保守）：
-     *   leg[1].ext_rtp_ip       → resolve_cb 或 originate 自动关联 profile 填的
-     *   → c->prof->external_rtp_ip  → per-call SIP profile
-     *   → cfg.external_rtp_ip       → 全局 b2b_core.cfg（兼容老配置）
-     *   → cfg.external_sip_ip       → 全局 ext-sip-ip（兼容配置） */
-    const char *nat_rtp_ip =
-        (b->ext_rtp_ip[0]) ? b->ext_rtp_ip
-        : (c->prof && c->prof->external_rtp_ip[0]) ? c->prof->external_rtp_ip
-        : (co->cfg.external_rtp_ip && co->cfg.external_rtp_ip[0]) ? co->cfg.external_rtp_ip
-        : co->cfg.external_sip_ip;  /* 允许 NULL */
-    if (nat_rtp_ip && nat_rtp_ip[0] && a->offer_len) {
-        /* 确保 rewritten 有当前 out_sdp 的完整拷贝（offer_hook 可能没写 rewritten） */
-        if (out_sdp != rewritten)
-            memcpy(rewritten, out_sdp, out_sdp_len);
-        rewritten[out_sdp_len] = '\0';
-        out_sdp_len = nat_sdp_rewrite(rewritten, out_sdp_len, sizeof(rewritten),
-                                      nat_rtp_ip, NULL);
-        out_sdp = rewritten;
-        llog(LOG_INFO, "b2b",
-             "bridge: NAT rewrite nat=[%s] detected=%d out_len=%zu",
-             nat_rtp_ip, b->nat_detected, out_sdp_len);
-    }
-
-    /* --- 6. 拼 extra 头块（PID + invite_params + CLIR Privacy） --- */
-    /* 2026-10-14 扩到 2048：3GPP IMS 场景 sip_invite_params 装 PAI+PPID+PANI+PCPI
-     * 多行头块 ≈ 350 字节，加 pid_params(256) + privacy_id(14) + 留足余量 */
-    char b_extra[2048]; b_extra[0] = '\0';
-    size_t eo = 0;
-    if (c->privacy_id) {
-        eo += (size_t)snprintf(b_extra + eo, sizeof(b_extra) - eo,
-                                "Privacy: id\r\n");
-    }
-    if (rw->sip_invite_pid_params[0]) {
-        /* sip_invite_pid_params 允许完整头行 "P-Asserted-Identity: <sip:...>"
-         * 或简写 "sip:user@host"（自动包 P-Asserted-Identity 头） */
-        const char *pid = rw->sip_invite_pid_params;
-        if (strstr(pid, ": ")) {
-            eo += (size_t)snprintf(b_extra + eo, sizeof(b_extra) - eo, "%s\r\n", pid);
-        } else {
-            eo += (size_t)snprintf(b_extra + eo, sizeof(b_extra) - eo,
-                                    "P-Asserted-Identity: <%s>\r\n", pid);
-        }
-    }
-    if (rw->sip_invite_params[0]) {
-        /* sip_invite_params：已格式化头块，每行自带 \r\n */
-        size_t remain = sizeof(b_extra) - eo;
-        strncat(b_extra + eo, rw->sip_invite_params, remain - 1);
-        eo = strlen(b_extra);
-        /* 确保结尾有 \r\n */
-        if (eo >= 2 && (b_extra[eo-2] != '\r' || b_extra[eo-1] != '\n'))
-            eo += (size_t)snprintf(b_extra + eo, sizeof(b_extra) - eo, "\r\n");
-    }
-    const char *b_extra_ptr = b_extra[0] ? b_extra : NULL;
-    /* ★ 存 offer 到 leg —— 407 challenge 重发 / 302 follow 路径会用
-     * 之前只靠 send_invite_b 栈上 buffer，txn 回调回来后已失效 */
-    if (out_sdp_len > 0 && out_sdp_len <= B2B_SDP_MAX) {
-        memcpy(b->offer, out_sdp, out_sdp_len);
-        b->offer_len = out_sdp_len;
-    } else {
-        b->offer_len = 0;
-    }
-    b->inv_txn = send_invite_b(c, 1, out_sdp, out_sdp_len, 0, b_extra_ptr);
-    char dstbuf[128];
-    nsbc_sa_fmt(&b->dst, dstbuf, sizeof(dstbuf));
-    llog(LOG_INFO, "b2b", "send_invite_b rc=%p dst=%s", b->inv_txn, dstbuf);
-    if (!b->inv_txn) {
-        respond_txn(co, t, 500, NULL, NULL, NULL, 0);
-        call_destroy(c);
-    } else {
-        char sess[512];
-        snprintf(sess, sizeof(sess),
-                 "{\"event\":\"create\",\"call_id\":\"%s\",\"from\":\"%s\",\"to\":\"%s\","
-                 "\"dir\":\"inbound\",\"state\":\"calling\"}",
-                 c->leg[0].callid,
-                 c->leg[0].from,
-                 c->dst_number[0] ? c->dst_number : c->leg[0].to);
-        uds_send_session(sess);
-
-        /* REQ-DP-APP-001：app_chain 登记的 early media（ringback/playback）
-         * 此刻执行 —— send_invite_b 内 offer_hook 已建 relay、A 侧 peer 已
-         * 解析：183+SDP answer 发 A 腿 → pb_start 放音（A 从此可收 RTP）。
-         * 注意必须 dispatch B 腿 INVITE 之后再发 183，保证 A 收 183 时
-         * B 腿呼叫已同时发起（标准 Early Media 并行时序）。 */
-        if (c->em_pending)
-            b2b_early_media_start(c);
-    }
+    /* REQ-PBX-CC-002 3.3: resolve 完成后的 B 腿构建 / INVITE 派发。
+     * 队列 tick 派发复用（A 腿已 183 等待），bd/nruri/bto 由派发线程 resolve 填入。 */
+    b2b_start_b_leg(c, t, bd, nruri, bto);
 }
 
 /* 对话内 re-INVITE/UPDATE */
@@ -6194,10 +6354,12 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
         /* ★ 记录谁发起的挂断：leg=0→A腿(主叫)发BYE，leg=1→B腿(被叫)发BYE */
         c->hangup_by = leg + 1;
         int other = leg ^ 1;
-        if (c->leg[other].state == LEG_CONFIRMED) {
+        int other_ready = (c->leg[other].state == LEG_CONFIRMED) ||
+                          (other == 0 && c->a_final == 200);
+        if (other_ready) {
             llog(LOG_INFO, "b2b",
-                 "★BYE_FWD: leg=%d other=%d (state=%d) → send_bye_leg(other)",
-                 leg, other, c->leg[other].state);
+                 "★BYE_FWD: leg=%d other=%d (state=%d a_final=%d) → send_bye_leg(other)",
+                 leg, other, c->leg[other].state, c->a_final);
             send_bye_leg(c, other);
             /* ★ 关键：send_bye_leg 返回后立即 call_destroy，
              * 不等待另一腿的 BYE 200 OK 响应。
@@ -8234,6 +8396,68 @@ int b2b_terminate_callid(b2b_core_t *co, const char *callid, size_t len,
     return b2b_terminate(c, cause_code);
 }
 
+/* 取出 leg 绑定的 ws_conn（与 signaling.c sa_hide_ws_conn 的约定一致：
+ * AF_UNSPEC + sockaddr_storage 尾部藏 void*）。无日志，热路径可用。 */
+static void *leg_ws_conn_of(const b2b_leg_t *l)
+{
+    void *conn = NULL;
+    if (!l || l->dst.ss.ss_family != AF_UNSPEC)
+        return NULL;
+    memcpy(&conn,
+           ((const char *)&l->dst.ss) + sizeof(struct sockaddr_storage) - sizeof(void *),
+           sizeof(void *));
+    return conn;
+}
+
+int b2b_terminate_ws_conn(b2b_core_t *co, void *conn)
+{
+    if (!co || !conn)
+        return NSBC_INVAL;
+
+    /* 先收集 callid（最多 8 条：一个 WS 连接同时承载的正常呼叫数），
+     * 解锁后再按 callid 走 b2b_terminate_callid —— 避免持锁发送 + 悬垂指针。 */
+    char ids[8][DLG_CALLID_MAX];
+    size_t lens[8];
+    int n = 0;
+    uint32_t gen = (uint32_t)__sync_add_and_fetch(&co->dump_gen, 1);
+
+    for (int si = 0; si < B2B_CALL_SHARDS && n < 8; ++si) {
+        call_shard_t *sh = &co->sh[si];
+        pthread_mutex_lock(&sh->lock);
+        for (call_link_t *p = sh->head; p && n < 8; p = p->next) {
+            b2b_call_t *c = p->call;
+            call_lock(c);
+            if (c->dead || c->dump_mark == gen) {
+                call_unlock(c);
+                continue;
+            }
+            if (leg_ws_conn_of(&c->leg[0]) == conn ||
+                leg_ws_conn_of(&c->leg[1]) == conn) {
+                c->dump_mark = gen;   /* 一个 call 在 A/B 两个分片各有一条 link */
+                const char *id = c->leg[0].callid[0] ? c->leg[0].callid
+                                                     : c->leg[1].callid;
+                size_t len = strlen(id);
+                if (len > 0 && len < DLG_CALLID_MAX) {
+                    memcpy(ids[n], id, len);
+                    ids[n][len] = '\0';
+                    lens[n] = len;
+                    ++n;
+                }
+            }
+            call_unlock(c);
+        }
+        pthread_mutex_unlock(&sh->lock);
+    }
+
+    for (int i = 0; i < n; ++i) {
+        llog(LOG_WARN, "b2b",
+             "ws conn=%p closed → terminate callid=%s (WebRTC transport lost)",
+             conn, ids[i]);
+        b2b_terminate_callid(co, ids[i], lens[i], 503);
+    }
+    return n;
+}
+
 leg_state_t b2b_leg_state(b2b_call_t *c, int b_leg)
 {
     if (!c || b_leg < 0 || b_leg > 1)
@@ -8984,6 +9208,169 @@ static void b2b_early_media_start(b2b_call_t *c)
     else
         llog(LOG_WARN, "b2b", "early_media: pb_start rc=%d call=%p pt=%d wav=%s",
              rc, (void *)c, play_pt, wav);
+}
+
+/* ==================================================================
+ * REQ-PBX-CC-002 3.3：队列等待（全忙入队）+ MoH + tick 派发
+ * ================================================================== */
+
+/* 全部成员忙线/置忙/未注册 → A 腿进入队列等待。
+ *
+ * 与 local_media（AI 单腿）同一套本地 relay：bridge_local_start 建 relay，
+ * 回 183 + SDP（A 腿媒体指向 relay A 侧），再 pb_start 循环放 MoH。之后由
+ * cq tick 选到成员 → b2b_queue_dispatch 走与同步路径相同的建 B 腿流程；
+ * offer_hook 检测到 relay 已存在会复用（端口与 183 一致），200 OK 的 SDP
+ * 因此与 183 保持一致，媒体不断流。
+ *
+ * 降级路径（无 MoH / WebRTC A 腿 / 无 offer）：回 183 无 SDP，主叫收听
+ * 自己 PBX 的本地回铃，其余排队逻辑不变。
+ * 调用约定：reactor 线程、未持 call_lock。 */
+int b2b_queue_hold(b2b_call_t *call, const char *tenant, const char *name,
+                   const char *moh_wav)
+{
+    b2b_call_t *c = call;
+    nsbc_ctx_t *ctx;
+    bridge_mgr_t *bm;
+    char sdp[B2B_SDP_MAX];
+    char wav[256];
+    int sdp_len = -1;
+    int play_pt = -1;
+    int started = 0;
+
+    if (!c) return NSBC_INVAL;
+    if (c->dead) return NSBC_NOENT;
+    if (c->queue_wait) return NSBC_OK;   /* 幂等 */
+
+    snprintf(c->queue_tenant, sizeof(c->queue_tenant), "%s", tenant ? tenant : "");
+    snprintf(c->queue_name, sizeof(c->queue_name), "%s", name ? name : "");
+    /* moh_sound 为空或 "default" → 内置默认素材 ./sounds/default/moh.wav。
+     * 素材不可读时降级为"183 无 SDP"（听本地回铃），避免主叫听到静音。 */
+    {
+        const char *moh = (moh_wav && moh_wav[0] &&
+                           strcmp(moh_wav, "default") != 0)
+                              ? moh_wav : CQ_DEFAULT_MOH_WAV;
+        if (access(moh, R_OK) != 0) {
+            llog(LOG_WARN, "queue", "hold: moh '%s' not readable → ringback",
+                 moh);
+            moh = "";
+        }
+        snprintf(wav, sizeof(wav), "%s", moh);
+    }
+    snprintf(c->queue_moh, sizeof(c->queue_moh), "%s", wav);
+    c->queue_wait = 1;
+
+    ctx = nsbc_get_ctx();
+    bm = (ctx && ctx->bridge) ? (bridge_mgr_t *)ctx->bridge : NULL;
+
+    /* ① 建本地 relay + 生成回给 A 的 183 SDP（明文 A 腿 + 可放音 codec 才走） */
+    if (bm && c->leg[0].offer_len > 0 && wav[0] &&
+        !strstr(c->leg[0].offer, "UDP/TLS/RTP/") &&
+        !strstr(c->leg[0].offer, "a=fingerprint")) {
+        play_pt = em_pick_play_pt(c->leg[0].offer);
+        if (play_pt >= 0) {
+            sdp_len = bridge_local_start(c, c->leg[0].offer,
+                                         c->leg[0].offer_len,
+                                         sdp, sizeof(sdp), bm);
+            if (sdp_len > 0) {
+                char pt_sdp[B2B_SDP_MAX];
+                int plen = em_sdp_single_pt(sdp, sdp_len, pt_sdp,
+                                            sizeof(pt_sdp), play_pt);
+                if (plen > 0) {
+                    memcpy(sdp, pt_sdp, (size_t)plen);
+                    sdp_len = plen;
+                }
+            }
+        }
+    }
+
+    /* ② 183：带 SDP（有等待音）或降级无 SDP（听本地回铃） */
+    call_lock(c);
+    if (!c->dead && c->leg[0].inv_txn &&
+        c->leg[0].state != LEG_TERMINATED &&
+        c->leg[0].state != LEG_TERMINATING) {
+        const char *a_sdp = (sdp_len > 0 && play_pt >= 0) ? sdp : NULL;
+        respond_a(c, 183, a_sdp, a_sdp ? (size_t)sdp_len : 0);
+        c->leg[0].state = LEG_EARLY;
+        c->early_183_ms = now_ms();
+        started = 1;
+        llog(LOG_NOTICE, "queue",
+             "hold call=%p %s/%s 183%s pt=%d moh='%s'",
+             (void *)c, c->queue_tenant, c->queue_name,
+             a_sdp ? "+SDP" : "(no sdp)", play_pt, wav);
+    } else {
+        llog(LOG_WARN, "queue",
+             "hold call=%p dead=%d inv_txn=%p state=%d — skip 183",
+             (void *)c, c->dead, (void *)c->leg[0].inv_txn,
+             (int)c->leg[0].state);
+    }
+    call_unlock(c);
+
+    if (!started) {
+        /* 未能回 183：relay 若已建则释放，避免泄漏（后续也不会再派发） */
+        if (bm && sdp_len > 0) bridge_release_call(bm, c);
+        return NSBC_NOENT;
+    }
+
+    /* ③ MoH：锁外放音（pb_start_ex 内部 tw_add + player 打开） */
+    if (sdp_len > 0 && play_pt >= 0) {
+        int rc = pb_start_ex(c, wav, 0 /* side 0 = A 腿 */, 1 /* loop */,
+                             play_pt, 1 /* stop_on_answer */, NULL);
+        if (rc == NSBC_OK)
+            llog(LOG_INFO, "queue", "hold MoH OK call=%p pt=%d wav=%s",
+                 (void *)c, play_pt, wav);
+        else
+            llog(LOG_WARN, "queue", "hold MoH rc=%d call=%p pt=%d wav=%s",
+                 rc, (void *)c, play_pt, wav);
+    }
+    return NSBC_OK;
+}
+
+/* cq tick 派发到空闲成员后调用：使用与同步路径完全相同的建 B 腿流程。
+ * bd/ruri/to 由组合根在派发前 resolve 填入；此时 A 腿已 183，
+ * b2b_start_b_leg 里的 offer_hook 会复用 hold 期 relay。
+ * 调用约定：reactor 线程（由 disp_cb 经 reactor_call 投递）。 */
+int b2b_queue_dispatch(b2b_call_t *call, const nsbc_sa_t *dst,
+                       const char *ruri, const char *to)
+{
+    b2b_call_t *c = call;
+    nsbc_sa_t bd;
+    sip_txn_t *t;
+    int ok;
+
+    if (!c || !dst) return NSBC_INVAL;
+    call_lock(c);
+    ok = (!c->dead && c->queue_wait);
+    bd = *dst;
+    t = c->leg[0].inv_txn;   /* A 腿 INVITE server txn（183 后仍有效） */
+    call_unlock(c);
+    if (!ok) return NSBC_NOENT;
+
+    llog(LOG_NOTICE, "queue", "dispatch call=%p %s/%s → %s",
+         (void *)c, c->queue_tenant, c->queue_name, ruri ? ruri : "");
+    b2b_start_b_leg(c, t, bd, ruri, to);
+    return NSBC_OK;
+}
+
+/* max_wait 超时 / 溢出：给 A 腿回最终错误响应并销毁呼叫。
+ * 调用约定：ticker 线程（cq_tick 回调），内部自行加锁。 */
+int b2b_queue_abort(b2b_call_t *call, int status)
+{
+    b2b_call_t *c = call;
+    int dead;
+    if (!c) return NSBC_INVAL;
+    call_lock(c);
+    dead = c->dead;
+    if (!dead && c->leg[0].inv_txn) {
+        respond_a(c, status > 0 ? status : 480, NULL, 0);
+        c->leg[0].state = LEG_TERMINATED;
+    }
+    call_unlock(c);
+    if (!dead) {
+        llog(LOG_NOTICE, "queue", "abort call=%p %s/%s status=%d (timeout/overflow)",
+             (void *)c, c->queue_tenant, c->queue_name, status);
+        call_destroy(c);
+    }
+    return NSBC_OK;
 }
 
 /* ==================================================================

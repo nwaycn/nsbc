@@ -28,7 +28,8 @@ typedef enum {
     NSBC_EOF = -13,
     NSBC_SHUTDOWN = -14,  /* 正在优雅退出，拒绝新工作 */
     NSBC_EXPIRED = -15,   /* nonce/会话等已过期（Digest 据此回 stale=true） */
-    NSBC_BUSY = -16       /* 模块忙：unload_wait 超时（refcnt 未归零，Fail-Safe 泄漏）*/
+    NSBC_BUSY = -16,      /* 模块忙：unload_wait 超时（refcnt 未归零，Fail-Safe 泄漏）*/
+    NSBC_QUEUED = -17     /* 已入队等待（b2bua 回 183 + MoH，等 tick 派发） */
 } nsbc_rc_t;
 
 #define NSBC_ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))

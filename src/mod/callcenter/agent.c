@@ -6,8 +6,7 @@
  *   选中  IDLE → RESERVED
  *   应答  RESERVED → ONCALL（计 answered_total）
  *   挂机  ONCALL → WRAP（wrap_time_s>0）否则直接 IDLE
- *   整理到 由 agent_release 在时间轮回调再切 IDLE——本批 release 直接
- *   完成 WRAP→IDLE 落位（定时器在接线批挂）。
+ *   整理到 WRAP 到期由 agent_tick() 周期扫描切回 IDLE（队列 tick 驱动）
  *
  * 并发模型（P1 修复）：
  *   agent_pool_t 内部加 pthread_mutex_t pool_lock，保护 agents[] 数组
@@ -17,6 +16,11 @@
  */
 #include "agent.h"
 #include <pthread.h>
+
+/* Phase 2：RESERVED 保护超时。派发后座席进入 RESERVED 等接听，
+ * 若 B 腿始终无应答又没有回调释放，座席会永久卡在 RESERVED；
+ * agent_tick 超过该时长仍未接起则收回 IDLE，由队列 tick 重新派发。 */
+#define AGENT_RESERVE_TIMEOUT_MS 30000u
 
 struct agent_pool {
     agent_t agents[AGENT_CAP];
@@ -65,9 +69,11 @@ int agent_upsert(agent_pool_t *p, const agent_t *a)
     if (e != NULL) {
         agent_state_t st = e->state; /* 配置更新不改登录态 */
         uint64_t since = e->state_since_ms;
+        uint64_t wrap_until = e->wrap_until_ms; /* 保留 WRAP 到期时间 */
         *e = *a;
         e->state = st;
         e->state_since_ms = since;
+        e->wrap_until_ms = wrap_until;
         pthread_mutex_unlock(&p->pool_lock);
         return NSBC_OK;
     }
@@ -107,6 +113,7 @@ static int to_idle(agent_t *a, uint64_t now_ms)
     a->state = AGENT_IDLE;
     a->pause_reason = AGENT_PAUSE_NONE;
     a->state_since_ms = now_ms;
+    a->wrap_until_ms = 0;
     return NSBC_OK;
 }
 
@@ -137,6 +144,7 @@ int agent_logout(agent_pool_t *p, const char *tenant, const char *ext)
     a->state = AGENT_OFFLINE;
     a->pause_reason = AGENT_PAUSE_NONE;
     a->state_since_ms = 0;
+    a->wrap_until_ms = 0;
     pthread_mutex_unlock(&p->pool_lock);
     return NSBC_OK;
 }
@@ -155,6 +163,7 @@ int agent_pause(agent_pool_t *p, const char *tenant, const char *ext,
     }
     a->state = AGENT_PAUSED;
     a->pause_reason = reason;
+    a->wrap_until_ms = 0;
     pthread_mutex_unlock(&p->pool_lock);
     return NSBC_OK;
 }
@@ -224,13 +233,44 @@ int agent_release(agent_pool_t *p, const char *tenant, const char *ext,
     a->last_call_end_ms = now_ms;
     if (wrap_time_s > 0) {
         a->state = AGENT_WRAP;
-        /* TODO：时间轮 wrap_time_s 后自动 to_idle（队列定时器装配） */
+        a->state_since_ms = now_ms;
+        /* 到期由 agent_tick() 在周期 tick 里切回 IDLE（见下） */
+        a->wrap_until_ms = now_ms + (uint64_t)wrap_time_s * 1000u;
     } else {
         a->state = AGENT_IDLE;
         a->state_since_ms = now_ms;
+        a->wrap_until_ms = 0;
     }
     pthread_mutex_unlock(&p->pool_lock);
     return NSBC_OK;
+}
+
+int agent_tick(agent_pool_t *p, uint64_t now_ms)
+{
+    int moved = 0;
+    if (p == NULL) return 0;
+    pthread_mutex_lock(&p->pool_lock);
+    for (int i = 0; i < p->n; ++i) {
+        agent_t *a = &p->agents[i];
+        if (a->state == AGENT_WRAP && a->wrap_until_ms != 0 &&
+            now_ms >= a->wrap_until_ms) {
+            a->state = AGENT_IDLE;
+            a->pause_reason = AGENT_PAUSE_NONE;
+            a->state_since_ms = now_ms;
+            a->wrap_until_ms = 0;
+            ++moved;
+            continue;
+        }
+        /* RESERVED 超时回收：振铃太久未接起，交回 IDLE 让 ACD 重新派发 */
+        if (a->state == AGENT_RESERVED &&
+            now_ms - a->state_since_ms >= AGENT_RESERVE_TIMEOUT_MS) {
+            a->state = AGENT_IDLE;
+            a->state_since_ms = now_ms;
+            ++moved;
+        }
+    }
+    pthread_mutex_unlock(&p->pool_lock);
+    return moved;
 }
 
 int agent_has_skill(const agent_t *a, const char *skill)

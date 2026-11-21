@@ -3112,6 +3112,17 @@ int bridge_offer_hook(void *call, const char *in, size_t inlen,
     llog(LOG_INFO, "media", "offer_hook: parse_media_addr done, a_ip=%s a_port=%u",
          e->a_ip[0] ? e->a_ip : "(null)", (unsigned)e->a_port);
 
+    /* 3.3：队列 hold 期已由 bridge_local_start 建 relay，A 腿 183 SDP 已通告
+     * 该 relay 的 A 侧端口。此时建 B 腿必须复用同一 relay；若降级 BYPASS，
+     * B 会拿到 A 的原始地址，与 183 通告不一致 → 媒体断流。 */
+    if (e->relay && mode == MB_BYPASS) {
+        llog(LOG_WARN, "media",
+             "offer_hook: hold relay exists → force RELAY (bypass disabled) call=%p",
+             call);
+        mode = MB_RELAY;
+        e->mode = mode;
+    }
+
     if (mode == MB_BYPASS) {
         if (inlen >= outsz)
             return NSBC_NOSPC;
@@ -3129,15 +3140,27 @@ int bridge_offer_hook(void *call, const char *in, size_t inlen,
          (unsigned)rlo, (unsigned)rhi, (void *)m->cfg.call_port_range);
 
     relay_ports_t ports;
-    llog(LOG_INFO, "media", "offer_hook: about to rtp_relay_start");
-    if (rtp_relay_start(m, &e->relay, &ports, rlo, rhi) != NSBC_OK &&
-        (rlo != 0 || rhi != 0)) {
-        llog(LOG_WARN, "media",
-             "offer_hook: profile port range %u-%u exhausted, "
-             "fallback to default range", rlo, rhi);
-        if (rtp_relay_start(m, &e->relay, &ports, 0, 0) != NSBC_OK) {
-            llog(LOG_WARN, "media", "offer_hook: relay_start FAIL");
-            return NSBC_NOSPC;
+    if (e->relay) {
+        /* 3.3：复用 hold 期 relay（端口已在 183 SDP 中通告给 A 腿） */
+        ports.a_rtp  = rtp_relay_port(e->relay, 0);
+        ports.b_rtp  = rtp_relay_port(e->relay, 1);
+        ports.a_rtcp = (uint16_t)(ports.a_rtp ? ports.a_rtp + 1 : 0);
+        ports.b_rtcp = (uint16_t)(ports.b_rtp ? ports.b_rtp + 1 : 0);
+        e->local_media = 0;   /* 交接给 B 腿：不再按单腿 AI/discard 处理 */
+        llog(LOG_INFO, "media",
+             "offer_hook: reuse hold relay call=%p a_rtp=%u b_rtp=%u",
+             call, (unsigned)ports.a_rtp, (unsigned)ports.b_rtp);
+    } else {
+        llog(LOG_INFO, "media", "offer_hook: about to rtp_relay_start");
+        if (rtp_relay_start(m, &e->relay, &ports, rlo, rhi) != NSBC_OK &&
+            (rlo != 0 || rhi != 0)) {
+            llog(LOG_WARN, "media",
+                 "offer_hook: profile port range %u-%u exhausted, "
+                 "fallback to default range", rlo, rhi);
+            if (rtp_relay_start(m, &e->relay, &ports, 0, 0) != NSBC_OK) {
+                llog(LOG_WARN, "media", "offer_hook: relay_start FAIL");
+                return NSBC_NOSPC;
+            }
         }
     }
     if (!e->relay) {

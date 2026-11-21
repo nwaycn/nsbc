@@ -86,6 +86,7 @@ typedef struct ws_conn {
 
     /* ── 内部私有（状态机 + 发送队列） ──────────────────── */
     int            worker_idx;   /* 所属 worker 下标 */
+    int            close_notified; /* REQ-CALL-HANGUP-001：关闭回调只发一次 */
     ws_conn_state_t state;
 
     /* 统一 per-conn 读缓冲 — 动态分配（按需扩到 WS_MAX_PAYLOAD + 128）
@@ -196,6 +197,8 @@ typedef struct {
     void        *tls_ctx;
     ws_rx_fn     rx_fn;
     void        *rx_ud;
+    ws_close_fn  close_fn;      /* REQ-CALL-HANGUP-001：conn 关闭 → 终止绑定呼叫 */
+    void        *close_ud;
     pthread_mutex_t conn_mtx;
     ws_conn_t   *conn_head;
     int          conn_count;    /* __atomic_* 操作保护 */
@@ -610,6 +613,7 @@ static int ws_conn_step(ws_conn_t *c, int events)
                  * (covers PING from remote, PONG to our ping, TEXT/BINARY SIP, etc.) */
                 c->last_rx_ms = ws_now_ms();
                 c->pongs_missed = 0;
+                c->last_ping_ms = 0;   /* 已有流量，作废本轮 ping 等待，避免误计 miss */
 
                 /* PING — 回 PONG (already reset pongs_missed above) */
                 if (opcode == WS_OP_PING) {
@@ -700,6 +704,11 @@ static int ws_epoll_update(int epfd, ws_conn_t *c, uint32_t events)
  * ⚠️ 不 free(c) — registrar 可能持有指针，留 shutdown 统一释放 */
 static void ws_close_conn(int epfd, ws_conn_t *c)
 {
+    /* 防重入：同一 conn 只清理/通知一次（shutdown 路径不经过这里） */
+    if (c->close_notified)
+        return;
+    c->close_notified = 1;
+
     epoll_ctl(epfd, EPOLL_CTL_DEL, c->fd, NULL);
     if (c->ssl) {
 #ifdef NSBC_WITH_OPENSSL
@@ -719,6 +728,11 @@ static void ws_close_conn(int epfd, ws_conn_t *c)
     }
     pthread_mutex_unlock(&c->send_mtx);
     WS_ATOMIC_FETCH_SUB(&g_ws.conn_count, 1);
+
+    /* 通知上层连接已死（REQ-CALL-HANGUP-001）。此处已不持任何锁，
+     * 回调内可安全调用 b2b_terminate_*（仅做非阻塞发送）。 */
+    if (g_ws.close_fn)
+        g_ws.close_fn(g_ws.close_ud, c);
 }
 
 /* ==== Worker 主循环 ==== */
@@ -798,7 +812,9 @@ static void *ws_worker_thread(void *ud)
                         uint64_t ping_age = now - c->last_ping_ms;
                         if (ping_age >= WS_PING_TIMEOUT_MS) {
                             c->pongs_missed++;
-                            c->last_ping_ms = now;  /* reset for next cycle */
+                            /* 置 0 让下一轮 idle pass 重发 ping（15s 一次），
+                             * 否则单个 ping 丢失会连续 3 个周期无探测机会。 */
+                            c->last_ping_ms = 0;
                             llog(LOG_DEBUG, "ws",
                                  "worker[%d] pong miss #%d fd=%d",
                                  w->idx, c->pongs_missed, c->fd);
@@ -814,8 +830,10 @@ static void *ws_worker_thread(void *ud)
                         }
                     }
 
-                    /* 2) Idle long enough — send ping */
+                    /* 2) Idle long enough — send ping（last_ping_ms==0 表示当前不在等 pong，
+                     *    否则每 500ms 会重复灌一个 ping 帧） */
                     if (c->pongs_missed < WS_PING_MAX_MISSED &&
+                        c->last_ping_ms == 0 &&
                         idle >= WS_PING_INTERVAL_MS) {
                         uint8_t ping_frame[2];
                         size_t plen = ws_build_ping_frame(ping_frame, sizeof(ping_frame));
@@ -838,6 +856,16 @@ static void *ws_worker_thread(void *ud)
                                     free(item.data);
                                 }
                                 pthread_mutex_unlock(&c->send_mtx);
+                                /* ★ 关键：idle pass 不是 epoll 事件回调，仅入队不会触发
+                                 * EPOLLOUT；worker 的 epoll_wait 超时分支也不 flush 队列，
+                                 * 结果 ping 永远发不出去 → 对端不回 pong → 误判断线。
+                                 * 与 ws_conn_send 一致，直接 epoll_ctl MOD 唤醒本 worker。 */
+                                if (c->fd >= 0) {
+                                    struct epoll_event ee;
+                                    ee.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP;
+                                    ee.data.ptr = c;
+                                    (void)epoll_ctl(w->epfd, EPOLL_CTL_MOD, c->fd, &ee);
+                                }
                             }
                         }
                     }
@@ -1034,6 +1062,12 @@ int ws_listener_init(uint16_t port, int tls_enabled, int enabled,
     g_ws.workers = NULL;
     pthread_mutex_init(&g_ws.conn_mtx, NULL);
     return NSBC_OK;
+}
+
+void ws_listener_set_close_cb(ws_close_fn cb, void *ud)
+{
+    g_ws.close_fn = cb;
+    g_ws.close_ud = ud;
 }
 
 /* TLS 证书热重载：nsbc-web 更新 cert.pem 后 kill SIGHUP → nsbcd reload → 调此函数 */

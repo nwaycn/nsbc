@@ -1207,3 +1207,156 @@ app.component('codecs-live', livePanel(t('Codec Registry'), 'fa-solid fa-code', 
   { key: 'media_type',   label: t('Media Type') },
 ], '/codecs', { refreshMs: 10000 }));
 
+// ===== Queue Agent State（忙线 / 置忙）=====
+// 数据源：GET /queues/agents → C 侧 cc.agent_list（已跟踪的分机）
+// 置忙/恢复：POST /queues/agents/{pause,resume} → C 侧 cc.agent_* 命令
+// 说明：分机只有在“通话中/振铃”或“已置忙”后才会进入跟踪表，因此空闲且
+// 从未通话的座席不在表格里；顶部手动区可直接指定分机置忙。
+app.component('queue-agents', {
+  template: `
+    <div>
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-lg font-semibold"><i class="fa-solid fa-user-clock"></i> 队列座席状态
+          <span v-if="rows.length" class="text-sm text-gray-500">({{ shownRows.length }}/{{ rows.length }})</span>
+        </h2>
+        <div class="flex items-center gap-2 text-xs text-gray-500">
+          <span>{{ t('Last updated:') }} {{ lastUpdated }}</span>
+          <button @click="load()" class="px-2 py-1 border rounded hover:bg-gray-50">
+            <i class="fa-solid fa-rotate"></i> {{ t('Refresh') }}
+          </button>
+        </div>
+      </div>
+
+      <div class="flex flex-wrap items-center gap-2 mb-3">
+        <el-input v-model="ext" size="small" style="width:140px" :placeholder="t('Extension')" clearable />
+        <el-input v-model="tenant" size="small" style="width:200px" placeholder="租户（如 nsbc.local）" clearable />
+        <el-select v-model="reason" size="small" style="width:150px">
+          <el-option :value="1" label="小休 / 午餐" />
+          <el-option :value="2" label="培训" />
+          <el-option :value="3" label="其他" />
+        </el-select>
+        <button :disabled="acting" @click="pauseExt"
+          class="px-3 py-1.5 text-sm bg-amber-600 hover:bg-amber-700 text-white rounded disabled:opacity-50">置忙</button>
+        <button :disabled="acting" @click="resumeExt"
+          class="px-3 py-1.5 text-sm bg-green-600 hover:bg-green-700 text-white rounded disabled:opacity-50">恢复</button>
+        <el-input v-model="filter" size="small" style="width:160px" placeholder="过滤分机" clearable />
+      </div>
+
+      <div v-if="loading" class="text-gray-400">{{ t('Loading...') }}</div>
+      <div v-else-if="error" class="text-red-500">⚠ {{ error }}</div>
+      <div v-else-if="!shownRows.length" class="text-center text-gray-400 py-10">
+        暂无已跟踪分机（通话中或置忙后才会出现在这里；也可在上方直接指定分机置忙）
+      </div>
+      <table v-else class="live-table w-full text-sm border-collapse">
+        <thead><tr class="bg-gray-50 border-b">
+          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Tenant') }}</th>
+          <th class="px-3 py-2 text-left font-medium text-gray-600">{{ t('Extension') }}</th>
+          <th class="px-3 py-2 text-left font-medium text-gray-600">忙线</th>
+          <th class="px-3 py-2 text-left font-medium text-gray-600">置忙</th>
+          <th class="px-3 py-2 text-left font-medium text-gray-600">原因</th>
+          <th class="px-3 py-2 text-left font-medium text-gray-600">最近变更</th>
+          <th class="px-3 py-2 text-left font-medium text-gray-600">操作</th>
+        </tr></thead>
+        <tbody>
+          <tr v-for="r in shownRows" :key="(r.tenant || '') + ':' + r.ext" class="border-b hover:bg-blue-50/50">
+            <td class="px-3 py-2 text-xs text-gray-600">{{ r.tenant || '-' }}</td>
+            <td class="px-3 py-2 font-mono text-sm font-semibold text-blue-700">{{ r.ext }}</td>
+            <td class="px-3 py-2 text-xs">
+              <span v-if="r.busy" class="text-amber-600 font-medium">通话中 ×{{ r.busy }}</span>
+              <span v-else class="text-gray-400">空闲</span>
+            </td>
+            <td class="px-3 py-2 text-xs">
+              <span v-if="r.paused" class="inline-block px-1.5 py-0.5 rounded text-white bg-amber-500 font-semibold">置忙</span>
+              <span v-else class="text-green-600">就绪</span>
+            </td>
+            <td class="px-3 py-2 text-xs text-gray-600">{{ reasonText(r.reason) }}</td>
+            <td class="px-3 py-2 text-xs text-gray-500">{{ fmtTime(r.since_ms) }}</td>
+            <td class="px-3 py-2">
+              <button v-if="!r.paused" :disabled="acting" @click="pauseRow(r)"
+                class="px-2 py-1 text-xs text-amber-600 border border-amber-300 rounded hover:bg-amber-50 disabled:opacity-50">置忙</button>
+              <button v-else :disabled="acting" @click="resumeRow(r)"
+                class="px-2 py-1 text-xs text-green-600 border border-green-300 rounded hover:bg-green-50 disabled:opacity-50">恢复</button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  `,
+  setup() {
+    const rows = ref([]), loading = ref(false), error = ref(null);
+    const lastUpdated = ref('');
+    const ext = ref(''), tenant = ref(''), reason = ref(1), filter = ref('');
+    const acting = ref(false);
+    let timer = null, inflight = false;
+
+    const shownRows = computed(() => {
+      const k = filter.value.trim();
+      if (!k) return rows.value;
+      return rows.value.filter(r => String(r.ext || '').includes(k));
+    });
+
+    function reasonText(n) {
+      return n === 1 ? '小休/午餐' : n === 2 ? '培训' : n === 3 ? '其他' : '-';
+    }
+
+    async function load(silent) {
+      if (inflight) return;
+      inflight = true;
+      if (silent !== true) loading.value = true;
+      try {
+        const r = await API.get('/queues/agents');
+        rows.value = Array.isArray(r.items) ? r.items : [];
+        error.value = null;
+        lastUpdated.value = new Date().toLocaleTimeString();
+      } catch (e) {
+        // Core 未启动（502/503）时保留上次数据，不刷红条
+        if (silent !== true) error.value = e.message;
+      } finally {
+        inflight = false;
+        if (silent !== true) loading.value = false;
+      }
+    }
+
+    async function act(kind, tn, ex, rs) {
+      acting.value = true;
+      try {
+        const body = { tenant: tn, ext: ex };
+        if (kind === 'pause') body.reason = rs;
+        await API.post('/queues/agents/' + kind, body);
+        window.ElMessage.success(`分机 ${ex} ${kind === 'pause' ? '已置忙' : '已恢复'}`);
+        await load(true);
+      } catch (e) {
+        window.ElMessage.error(e.message || '操作失败');
+      } finally {
+        acting.value = false;
+      }
+    }
+
+    function pauseRow(r) { return act('pause', r.tenant || '', r.ext, reason.value); }
+    function resumeRow(r) { return act('resume', r.tenant || '', r.ext, 0); }
+
+    function pauseExt() {
+      const ex = ext.value.trim(), tn = tenant.value.trim();
+      if (!ex) return window.ElMessage.warning('请输入分机号');
+      if (!tn) return window.ElMessage.warning('请输入租户（如 nsbc.local）');
+      return act('pause', tn, ex, reason.value);
+    }
+    function resumeExt() {
+      const ex = ext.value.trim(), tn = tenant.value.trim();
+      if (!ex) return window.ElMessage.warning('请输入分机号');
+      if (!tn) return window.ElMessage.warning('请输入租户（如 nsbc.local）');
+      return act('resume', tn, ex, 0);
+    }
+
+    onMounted(() => {
+      load();
+      timer = setInterval(() => load(true), 5000);
+    });
+    onBeforeUnmount(() => { if (timer) clearInterval(timer); });
+
+    return { rows, shownRows, loading, error, lastUpdated, ext, tenant, reason, filter,
+             acting, reasonText, fmtTime, load, pauseRow, resumeRow, pauseExt, resumeExt };
+  },
+});
+
+

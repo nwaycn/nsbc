@@ -30,8 +30,10 @@
 #include "ivr.h"
 #include "route_table.h"   /* rt_trunk_count / rt_trunk_at — trunks.list */
 #include "dialplan.h"      /* dp_oam_get_active — dialplan.show */
+#include "queue.h"         /* cq_ext_pause/resume/get/list_json — 座席置忙 */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ---- 模块 reload 函数签名（假期回来各模块实现） ----
@@ -289,6 +291,154 @@ static int cmd_reload_noop(cmd_ctx_t *c, int argc, char **argv, void *ud) {
     return NSBC_OK;
 }
 
+/* ---- 座席置忙 / 状态查询（cc.*）----
+ * 置忙后该分机立即从队列选路候选中排除；忙线中的通话不受影响。
+ * tenant 传 "*" 表示不限定租户（仅 list 有效）。
+ */
+static const char *cc_tenant_arg(const char *a)
+{
+    return (a == NULL || strcmp(a, "*") == 0) ? "" : a;
+}
+
+static int cmd_cc_agent_pause(cmd_ctx_t *c, int argc, char **argv, void *ud)
+{
+    nsbc_ctx_t *ctx;
+    int reason = CQ_EXT_REASON_BREAK;
+    int rc;
+    (void)ud;
+    if (!c || !c->io_printf) return NSBC_INVAL;
+    if (argc < 3) {
+        c->io_printf(c->io_ud,
+            "ERR usage: cc.agent_pause <tenant|*> <ext> [reason 1=break 2=training 3=other]\n");
+        return NSBC_INVAL;
+    }
+    if (argc >= 4) reason = atoi(argv[3]);
+    if (reason <= CQ_EXT_REASON_NONE) reason = CQ_EXT_REASON_BREAK;
+    /* 置忙必须落到具体租户：队列选路按 q->tenant 查状态，tenant 为空/通配
+     * 只会写进 "" 条目，永远匹配不上，成为静默无效操作。 */
+    if (argv[1][0] == '\0' || strcmp(argv[1], "*") == 0) {
+        c->io_printf(c->io_ud, "ERR tenant required for pause (got '%s')\n",
+                     argv[1]);
+        return NSBC_INVAL;
+    }
+    ctx = nsbc_get_ctx();
+    if (!ctx || !ctx->cq_mgr) {
+        c->io_printf(c->io_ud, "ERR callcenter not ready\n");
+        return NSBC_AGAIN;
+    }
+    rc = cq_ext_pause((cc_mgr_t *)ctx->cq_mgr, cc_tenant_arg(argv[1]),
+                      argv[2], reason);
+    if (rc != NSBC_OK) {
+        c->io_printf(c->io_ud, "ERR cc.agent_pause rc=%d (tenant=%s ext=%s)\n",
+                     rc, argv[1], argv[2]);
+        return rc;
+    }
+    c->io_printf(c->io_ud, "OK ext %s paused reason=%d\n", argv[2], reason);
+    log_audit("oam", "cc-agent-pause", "tenant=%s ext=%s reason=%d result=ok",
+              argv[1], argv[2], reason);
+    return NSBC_OK;
+}
+
+static int cmd_cc_agent_resume(cmd_ctx_t *c, int argc, char **argv, void *ud)
+{
+    nsbc_ctx_t *ctx;
+    int rc;
+    (void)ud;
+    if (!c || !c->io_printf) return NSBC_INVAL;
+    if (argc < 3) {
+        c->io_printf(c->io_ud, "ERR usage: cc.agent_resume <tenant|*> <ext>\n");
+        return NSBC_INVAL;
+    }
+    if (argv[1][0] == '\0' || strcmp(argv[1], "*") == 0) {
+        c->io_printf(c->io_ud, "ERR tenant required for resume (got '%s')\n",
+                     argv[1]);
+        return NSBC_INVAL;
+    }
+    ctx = nsbc_get_ctx();
+    if (!ctx || !ctx->cq_mgr) {
+        c->io_printf(c->io_ud, "ERR callcenter not ready\n");
+        return NSBC_AGAIN;
+    }
+    rc = cq_ext_resume((cc_mgr_t *)ctx->cq_mgr, cc_tenant_arg(argv[1]), argv[2]);
+    if (rc != NSBC_OK) {
+        c->io_printf(c->io_ud, "ERR cc.agent_resume rc=%d (tenant=%s ext=%s)\n",
+                     rc, argv[1], argv[2]);
+        return rc;
+    }
+    c->io_printf(c->io_ud, "OK ext %s resumed\n", argv[2]);
+    log_audit("oam", "cc-agent-resume", "tenant=%s ext=%s result=ok",
+              argv[1], argv[2]);
+    return NSBC_OK;
+}
+
+static int cmd_cc_agent_state(cmd_ctx_t *c, int argc, char **argv, void *ud)
+{
+    nsbc_ctx_t *ctx;
+    cq_ext_state_t st;
+    int rc;
+    (void)ud;
+    if (!c || !c->io_printf) return NSBC_INVAL;
+    if (argc < 3) {
+        c->io_printf(c->io_ud, "ERR usage: cc.agent_state <tenant|*> <ext>\n");
+        return NSBC_INVAL;
+    }
+    ctx = nsbc_get_ctx();
+    if (!ctx || !ctx->cq_mgr) {
+        c->io_printf(c->io_ud, "ERR callcenter not ready\n");
+        return NSBC_AGAIN;
+    }
+    rc = cq_ext_get((cc_mgr_t *)ctx->cq_mgr, cc_tenant_arg(argv[1]), argv[2], &st);
+    if (rc != NSBC_OK) {
+        c->io_printf(c->io_ud, "ERR ext %s not tracked\n", argv[2]);
+        return rc;
+    }
+    c->io_printf(c->io_ud,
+                 "OK tenant=%s ext=%s busy=%d paused=%d reason=%d since_ms=%llu\n",
+                 cc_tenant_arg(argv[1]), argv[2], st.busy, st.paused,
+                 st.pause_reason, (unsigned long long)st.since_ms);
+    return NSBC_OK;
+}
+
+static int cmd_cc_agent_list(cmd_ctx_t *c, int argc, char **argv, void *ud)
+{
+    nsbc_ctx_t *ctx;
+    char *buf;
+    int n;
+    (void)ud;
+    if (!c || !c->io_printf) return NSBC_INVAL;
+    ctx = nsbc_get_ctx();
+    if (!ctx || !ctx->cq_mgr) {
+        c->io_printf(c->io_ud, "ERR callcenter not ready\n");
+        return NSBC_AGAIN;
+    }
+    /* 32768 个分机 × ~150B（含 tenant/ext/数字）≈ 5MB；OAM 低频命令，
+     * 允许一次性分配。取 6MB 给最坏情况留余量。 */
+    buf = (char *)malloc(6 * 1024 * 1024);
+    if (!buf) {
+        c->io_printf(c->io_ud, "ERR OOM\n");
+        return NSBC_NOMEM;
+    }
+    n = cq_ext_list_json((cc_mgr_t *)ctx->cq_mgr,
+                         argc >= 2 ? cc_tenant_arg(argv[1]) : "",
+                         buf, 6 * 1024 * 1024);
+    if (n < 0) {
+        c->io_printf(c->io_ud, "ERR cc.agent_list rc=%d (too many agents)\n", n);
+        free(buf);
+        return n;
+    }
+    /* ctl_io_printf 每次 vsnprintf 只有 4096B，大 JSON 一次输出会被静默截断
+     * （Web 侧 JSON 解析失败）。按 3KB 分块顺序写，客户端按帧重组。 */
+    c->io_printf(c->io_ud, "OK ");
+    for (int off = 0; off < n; off += 3072) {
+        int chunk = n - off;
+        if (chunk > 3072) chunk = 3072;
+        c->io_printf(c->io_ud, "%.*s", chunk, buf + off);
+    }
+    c->io_printf(c->io_ud, "\n");
+    free(buf);
+    return NSBC_OK;
+}
+
 /* ---- 模块 init：注册到 cmd_reg（obs_control.c 持有） ---- */
 
 void reload_commands_register(cmd_reg_t *reg)
@@ -318,6 +468,12 @@ void reload_commands_register(cmd_reg_t *reg)
         { "profiles.list",         "List loaded SIP profiles",                        "show", CMD_L1_MONITOR, cmd_profiles_list,    NULL },
         { "trunks.list",           "List loaded trunks and groups from route_table",  "show", CMD_L1_MONITOR, cmd_trunks_list,      NULL },
         { "dialplan.show",         "List active dialplan rules",                      "show", CMD_L1_MONITOR, cmd_dialplan_show,    NULL },
+
+        /* ---- 座席置忙 / 状态（队列选路过滤）---- */
+        { "cc.agent_pause",        "Pause a queue agent (break/training/other)",      "control", CMD_L2_ADMIN, cmd_cc_agent_pause,  NULL },
+        { "cc.agent_resume",       "Resume a paused queue agent",                     "control", CMD_L2_ADMIN, cmd_cc_agent_resume, NULL },
+        { "cc.agent_state",        "Show one extension busy/pause state",             "show", CMD_L1_MONITOR, cmd_cc_agent_state,  NULL },
+        { "cc.agent_list",         "List tracked extension states (JSON)",            "show", CMD_L1_MONITOR, cmd_cc_agent_list,   NULL },
     };
     for (size_t i = 0; i < sizeof(descs)/sizeof(descs[0]); ++i)
         cmd_register(reg, &descs[i]);

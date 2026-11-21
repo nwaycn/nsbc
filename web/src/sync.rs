@@ -58,6 +58,39 @@ impl From<&crate::db::Extension> for ExtSyncDto {
     }
 }
 
+/// members_json 归一化：DB 里有两种历史格式
+///   1) ["1000","1001"]（API/旧数据直接写入）
+///   2) [{"extension":"1000","weight":10,"enabled":true}]（Web 队列成员编辑器）
+/// C 侧协议只认字符串数组，这里统一成 Vec<String> 并跳过 enabled=false / 空值。
+/// 所有向 C 推送队列的入口（启动全量同步 / Kind::Queues 增量 / /queues/reload）
+/// 必须共用本函数，否则对象格式会被解析成空成员 → C 侧 "no members, skip" → 队列不可用。
+pub fn normalize_queue_members(members_json: &str) -> Vec<String> {
+    match serde_json::from_str::<Vec<serde_json::Value>>(members_json) {
+        Ok(vals) => vals
+            .into_iter()
+            .filter_map(|v| match v {
+                serde_json::Value::String(s) if !s.is_empty() => Some(s),
+                serde_json::Value::Object(o) => {
+                    let on = o
+                        .get("enabled")
+                        .and_then(|x| x.as_bool())
+                        .unwrap_or(true);
+                    if !on {
+                        return None;
+                    }
+                    o.get("extension")
+                        .or_else(|| o.get("ext"))
+                        .and_then(|x| x.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                }
+                _ => None,
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Queue sync DTO: DB Queue → C queue_table_reload_json.
 /// Field names/types strictly match C-side parsing schema (the reload handler in queue.c).
 ///
@@ -68,8 +101,10 @@ impl From<&crate::db::Extension> for ExtSyncDto {
 /// | enabled          | json_truthy bool    | enabled:i64 != 0             |
 /// | strategy         | CQ_STRATEGY_* parsing | ring_strategy: String      |
 /// | max_wait_s       | Timeout overflow (s) | max_wait_sec: i64            |
-/// | wrap_time_s      | Agent after-call wrap-up (s) | currently hardcoded 30
-/// | require_skill    | Skill routing filter | currently "" (Rust-side field TBD) |
+/// | wrap_time_s      | Agent after-call wrap-up (s) | wrap_time_s: i64 |
+/// | require_skill    | Skill routing filter | require_skill: String |
+/// | overflow         | Overflow target after max wait | overflow: String |
+/// | moh_sound        | Hold music WAV path ("default"/empty → ./sounds/default/moh.wav) | moh_sound: String |
 /// | members          | Member extension list | members_json: String → parse Vec<String> |
 #[derive(Debug, serde::Serialize)]
 pub struct QueueSyncDto {
@@ -80,6 +115,8 @@ pub struct QueueSyncDto {
     pub max_wait_s:   i64,
     pub wrap_time_s:  i64,
     pub require_skill: String,
+    pub overflow:     String,
+    pub moh_sound:    String,
     pub members:      Vec<String>,
 }
 
@@ -214,15 +251,17 @@ async fn snapshot<C: CoreApi + Clone + Send + Sync>(
                 .map_err(|e| format!("db: {e}"))?;
             // rows is Vec<(Queue, tenant_name)> — realm from JOIN with tenants
             let dtos: Vec<QueueSyncDto> = rows.into_iter().map(|(q, tenant_name)| {
-                let members: Vec<String> = serde_json::from_str(&q.members_json).unwrap_or_default();
+                let members = normalize_queue_members(&q.members_json);
                 QueueSyncDto {
                     tenant:       tenant_name,
                     name:         q.name.clone(),
                     enabled:      q.enabled != 0,
                     strategy:     q.ring_strategy.clone(),
                     max_wait_s:   q.max_wait_sec,
-                    wrap_time_s:  30,
-                    require_skill: String::new(),
+                    wrap_time_s:  q.wrap_time_s,
+                    require_skill: q.require_skill.clone(),
+                    overflow:     q.overflow.clone(),
+                    moh_sound:    q.moh_sound.clone(),
                     members,
                 }
             }).collect();

@@ -421,6 +421,9 @@ app.component('dialplan-rules', {
               <el-option-group v-if="trunkOptions.length" label="— TRUNK —">
                 <el-option v-for="o in trunkOptions" :key="o.value" :value="o.value" :label="o.label"></el-option>
               </el-option-group>
+              <el-option-group v-if="queueOptions.length" label="— QUEUE 分机队列 —">
+                <el-option v-for="o in queueOptions" :key="o.value" :value="o.value" :label="o.label"></el-option>
+              </el-option-group>
               <el-option-group v-if="trunkApiOk && !trunkOptions.length && !gatewayOptions.length" label="— OUT —">
                 <el-option disabled value="" label="(none available)"></el-option>
               </el-option-group>
@@ -436,7 +439,8 @@ app.component('dialplan-rules', {
             </el-select>
             <div class="text-xs text-slate-400 mt-1">
               <b>★ 设计解耦</b>：<b>{{ t('Target资源只管路由') }}</b>{{ t('，Callee号码变换（strip/\${N}/dst_override）在下面「拨号Action」里独立Config。避免笛卡尔积爆炸。') }}<br>
-              <b>{{ t('e.g.') }}</b>：match=<code>^(\\d{3,6})(\\d{11})$</code>，target=gateway:all_trunks，<b>dst_override=\${2}</b> → 外呼 捕获组2@all_trunks ✅
+              <b>{{ t('e.g.') }}</b>：match=<code>^(\\d{3,6})(\\d{11})$</code>，target=gateway:all_trunks，<b>dst_override=\${2}</b> → 外呼 捕获组2@all_trunks ✅<br>
+              <b>队列</b>：target=<code>queue:队列名</code>，按队列策略选成员振铃；strip/dst_override 不参与队列选路。
             </div>
           </el-form-item>
           <div class="grid grid-cols-2 gap-4">
@@ -763,6 +767,7 @@ app.component('dialplan-rules', {
     // 外呼下拉选项（纯路由，不再自动拼 |${N} 组合——与 dst_override 解耦）
     const trunkOptions = ref([]);     // [{ value: 'trunk:xxx', label }]
     const gatewayOptions = ref([]);    // [{ value: 'gateway:xxx', label }]
+    const queueOptions = ref([]);      // [{ value: 'queue:xxx', label }]
     const trunkApiOk = ref(false);
     // Tenant下拉（tenant_id 外Key）
     const tenantOptions = ref([]);    // [{ id, tenant_name, enabled }]
@@ -804,6 +809,20 @@ app.component('dialplan-rules', {
           value: 'gateway:' + g.name, label: `组: ${g.name}`,
         }));
       } catch (e) { /* 静默 */ }
+    }
+
+    /* 分机队列下拉（BIZ 路由：queue:<name>）。
+     * 队列成员存在 members_json 字符串里，这里解析成数量仅用于展示。 */
+    async function fetchQueueOptions() {
+      try {
+        const r = await API.get('/queues?limit=500&offset=0');
+        const enabled = (r.items || []).filter(q => q.enabled !== 0 && q.enabled !== false);
+        queueOptions.value = enabled.map(q => {
+          let n = 0;
+          try { n = (JSON.parse(q.members_json || '[]') || []).length; } catch (e) { n = 0; }
+          return { value: 'queue:' + q.name, label: `队列 ${q.name}（${n} 成员）` };
+        });
+      } catch (e) { /* 静默——/queues 503 时后端还没配 DB */ }
     }
 
     /* 本地按 profile 过滤 + 分 */
@@ -1020,9 +1039,9 @@ app.component('dialplan-rules', {
       } catch (e) { ElMessage.error('Delete失败: ' + e.message); }
     }
 
-    onMounted(() => { load(); fetchTrunkOptions(); fetchGatewayOptions(); fetchTenants(); });
+    onMounted(() => { load(); fetchTrunkOptions(); fetchGatewayOptions(); fetchQueueOptions(); fetchTenants(); });
     return { items, page, limit, activeProfile, showModal, editingId, form, saving, rawMode,
-             trunkOptions, gatewayOptions, trunkApiOk, tenantOptions,
+             trunkOptions, gatewayOptions, queueOptions, trunkApiOk, tenantOptions,
              filteredItems, filteredTotal, pagedItems,
              matchValid, matchError, matchTestNum, matchTestResult, validateMatchExpr,
              ruleJson, ruleJsonValid, ruleJsonError, ruleJsonUserEdited,
@@ -1206,9 +1225,31 @@ app.component('ai-backends', {
             <!-- Tab 6: 呼叫控制 -->
             <el-tab-pane label="呼叫控制" name="call">
               <div class="grid grid-cols-2 gap-4">
-                <el-form-item label="转人工目标分机">
-                  <el-input v-model="form.transfer_dest" placeholder="例：1007"></el-input>
-                  <div class="text-xs text-slate-400 mt-1">用户说「帮我转人工」时，REFER 发到这个分机</div>
+                <el-form-item label="转人工目标">
+                  <div class="flex gap-2 w-full">
+                    <el-select v-model="transferKind" style="width:130px">
+                      <el-option value="ext" label="分机号"></el-option>
+                      <el-option value="queue" label="分机队列"></el-option>
+                      <el-option value="uri" label="SIP URI"></el-option>
+                    </el-select>
+                    <el-select v-if="transferKind === 'queue'" v-model="form.transfer_dest"
+                      filterable allow-create default-first-option style="flex:1"
+                      placeholder="选择队列（queue:<name>）">
+                      <el-option v-for="o in queueOptions" :key="o.value" :value="o.value" :label="o.label"></el-option>
+                      <template #empty>
+                        <div class="p-3 text-xs text-slate-400">
+                          暂无启用的分机队列，请先在「分机队列」页面创建并启用。
+                        </div>
+                      </template>
+                    </el-select>
+                    <el-input v-else v-model="form.transfer_dest" style="flex:1"
+                      :placeholder="transferKind === 'uri' ? 'sip:1007@example.com' : '例：1007 或 extension:1007'"></el-input>
+                  </div>
+                  <div class="text-xs text-slate-400 mt-1">
+                    <b>分机号</b>：转给单个分机（1007 / <code>extension:1007</code>）；<br>
+                    <b>分机队列</b>：按队列策略选一个当前可振铃成员后转接（直接转给该座席，不排队等待）；<br>
+                    <b>SIP URI</b>：完整 URI 原样透传。<code>trunk:</code> / <code>gateway:</code> / <code>ivr:</code> 暂不支持。
+                  </div>
                 </el-form-item>
                 <el-form-item label="VAD 静音阈值">
                   <el-select v-model="form.vad_threshold" style="width:100%" clearable>
@@ -1239,7 +1280,7 @@ app.component('ai-backends', {
   `,
   setup() {
     const API_PATH = '/ai-backends';
-    const { ref, onMounted } = Vue;
+    const { ref, computed, onMounted } = Vue;
 
     const items = ref([]);
     const keyword = ref('');
@@ -1248,6 +1289,38 @@ app.component('ai-backends', {
     const activeTab = ref('basic');
     const form = ref({});
     const saving = ref(false);
+    const queueOptions = ref([]);   // [{ value: 'queue:xxx', label }]
+
+    /* 转人工目标类型：从 transfer_dest 反推，切换类型时清掉不兼容的旧值，
+     * 避免“分机号”被当成队列名或 URI 存下去。 */
+    const transferKind = computed({
+      get() {
+        const v = (form.value.transfer_dest || '').trim();
+        if (v.startsWith('queue:')) return 'queue';
+        if (v.startsWith('sip:') || v.startsWith('sips:') || v.includes('@')) return 'uri';
+        return 'ext';
+      },
+      set(kind) {
+        const v = (form.value.transfer_dest || '').trim();
+        const isQueue = v.startsWith('queue:');
+        const isUri = v.startsWith('sip:') || v.startsWith('sips:') || v.includes('@');
+        if (kind === 'queue' && !isQueue) form.value.transfer_dest = '';
+        else if (kind === 'uri' && !isUri) form.value.transfer_dest = '';
+        else if (kind === 'ext' && (isQueue || isUri)) form.value.transfer_dest = '';
+      }
+    });
+
+    async function fetchQueueOptions() {
+      try {
+        const r = await API.get('/queues?limit=500&offset=0');
+        const enabled = (r.items || []).filter(q => q.enabled !== 0 && q.enabled !== false);
+        queueOptions.value = enabled.map(q => {
+          let n = 0;
+          try { n = (JSON.parse(q.members_json || '[]') || []).length; } catch (e) { n = 0; }
+          return { value: 'queue:' + q.name, label: `队列 ${q.name}（${n} 成员）` };
+        });
+      } catch (e) { /* 静默——/queues 503 时后端还没配 DB */ }
+    }
 
     function defaultForm() {
       return {
@@ -1285,6 +1358,7 @@ app.component('ai-backends', {
       activeTab.value = 'basic';
       editingId.value = null;
       showModal.value = true;
+      fetchQueueOptions();   // 打开弹窗时刷新，避免新建队列后需整页刷新
     }
 
     function openEdit(row) {
@@ -1298,6 +1372,7 @@ app.component('ai-backends', {
       form.value = f;
       activeTab.value = 'basic';
       showModal.value = true;
+      fetchQueueOptions();   // 同上
     }
 
     async function save() {
@@ -1309,6 +1384,12 @@ app.component('ai-backends', {
         }
         const payload = { ...form.value };
         payload.name = payload.name.trim();
+
+        // 队列模式下允许只输入队列名，保存时补 queue: 前缀（C 侧按前缀识别）
+        if (transferKind.value === 'queue' && payload.transfer_dest &&
+            !String(payload.transfer_dest).startsWith('queue:')) {
+          payload.transfer_dest = 'queue:' + String(payload.transfer_dest).trim();
+        }
 
         // 空字符串 → null（后端 Option<String>）
         for (const k of ['description','nsb_web_token','llm_api_key','llm_model','llm_endpoint','asr_addr','tts_addr','transfer_dest','vad_threshold','record_dir']) {
@@ -1340,10 +1421,11 @@ app.component('ai-backends', {
       } catch (e) { ElMessage.error('Delete 失败: ' + (e.message || e)); }
     }
 
-    onMounted(load);
+    onMounted(() => { load(); fetchQueueOptions(); });
 
     return {
       items, keyword, showModal, editingId, activeTab, form, saving,
+      queueOptions, transferKind,
       load, openCreate, openEdit, save, del,
     };
   },
@@ -1390,10 +1472,14 @@ app.component('queues', crudTable(
       { value: 'ringall', label: t('ringall (全Ringing)') },
       { value: 'leastrecent', label: t('leastrecent (最近Idle)') },
       { value: 'roundrobin', label: 'roundrobin (轮询)' },
-      { value: 'random', label: 'random (随机)' },
       { value: 'fewestcalls', label: t('fewestcalls (最少Call)') },
     ], default: 'ringall' },
     { key: 'max_wait_sec', label: t('最大等待 (s)'), type: 'number', default: 600 },
+    { key: 'wrap_time_s', label: t('话后整理 (s)'), type: 'number', default: 30 },
+    { key: 'require_skill', label: t('技能要求'), type: 'text', default: '',
+      help: t('空=不筛技能；座席需具备该技能才会被派发') },
+    { key: 'overflow', label: t('溢出目标'), type: 'text', default: '',
+      help: t('等待超时后的去向，如 queue:sales2 / ivr:main / voicemail') },
     { key: 'moh_sound', label: t('Hold音乐'), type: 'text', default: 'default' },
     { key: 'members_json', label: '队列成员', type: 'json', editor: 'queue-members',
       default: '[{"extension":"2000","weight":10,"enabled":true}]' },

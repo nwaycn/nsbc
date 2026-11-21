@@ -25,9 +25,18 @@ extern "C" {
 typedef void (*ws_rx_fn)(void *ud, const char *buf, size_t len,
                          void *conn);   /* conn=ws_conn_t* 发送时用 */
 
+/* 连接关闭通知（REQ-CALL-HANGUP-001）：
+ * 在 ws worker 线程里、conn 已从 epoll 摘除且发送队列清空后调用一次。
+ * 上层据此终止绑定在该 WS 连接上的呼叫（否则 WebRTC 掉线时对端 SIP 腿会一直挂着）。
+ * 回调内允许调用 b2b_terminate_*（内部只做非阻塞发送），但不得再次关闭同一 conn。 */
+typedef void (*ws_close_fn)(void *ud, void *conn);
+
 int  ws_listener_init(uint16_t port, int tls_enabled, int enabled,
                       void *tls_ctx,   /* tls_ctx_server_new 产物；tls_enabled 时必填 */
                       ws_rx_fn rx, void *rx_ud);
+
+/* 注册连接关闭回调（可在 init 前后任意时刻调用；传 NULL 注销）。 */
+void ws_listener_set_close_cb(ws_close_fn cb, void *ud);
 int  ws_listener_start(void);
 void ws_listener_stop(void);
 void ws_listener_shutdown(void);

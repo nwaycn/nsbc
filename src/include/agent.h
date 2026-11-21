@@ -46,6 +46,7 @@ typedef struct {
     agent_state_t state;
     agent_pause_reason_t pause_reason;
     uint64_t state_since_ms;
+    uint64_t wrap_until_ms;     /* WRAP 到期时间；0=非 WRAP */
     uint64_t last_call_end_ms;  /* LEAST-RECENT 选路 */
     uint32_t answered_total;
 } agent_t;
@@ -73,6 +74,12 @@ int  agent_answer(agent_pool_t *p, const char *tenant, const char *ext,
                   uint64_t now_ms);
 int  agent_release(agent_pool_t *p, const char *tenant, const char *ext,
                    uint64_t now_ms, int wrap_time_s);
+
+/* 周期 tick（时间轮/队列 tick 调用）：
+ *   - wrap_until_ms 已到期的 WRAP 座席 → IDLE；
+ *   - RESERVED 超时（振铃始终未接起）→ 回收 IDLE，避免永久占用。
+ * 返回本次迁移数量；无待处理座席时为廉价的空扫描。 */
+int  agent_tick(agent_pool_t *p, uint64_t now_ms);
 
 int  agent_has_skill(const agent_t *a, const char *skill);
 const char *agent_state_name(agent_state_t st);

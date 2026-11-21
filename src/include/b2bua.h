@@ -242,6 +242,14 @@ struct b2b_call {
     uint8_t em_stop_on_answer; /* 1=B 腿 LEG_CONFIRMED 时自动停（ringback），
                                   * 0=不受接通影响（playback / endless_playback） */
     char em_wav[256];         /* 放音 WAV 路径 */
+    /* === REQ-PBX-CC-002 3.3：队列等待（全忙入队）===
+     * queue_wait=1：A 腿已回 183、尚未建 B 腿，等待 cq tick 派发；
+     * 派发时由 b2b_queue_dispatch 用本结构记录的队列归属重排/结算。 */
+    uint8_t queue_wait;
+    char    queue_tenant[64];
+    char    queue_name[32];
+    char    queue_moh[192];   /* 等待音乐 WAV（空/"default" → ./sounds/default/moh.wav；
+                               * 素材不可读时回 183 无 SDP，听本地回铃） */
     char b_key[128];
     int key_held;
     char rt_name[32];
@@ -405,6 +413,10 @@ typedef int (*b2b_register_fn)(sip_tr_proto_t proto, const nsbc_sa_t *src,
                                sip_msg_t *msg, const char *raw, size_t rawlen,
                                sip_txn_t *txn, void *ud);
 
+/* 呼叫创建通知（A 腿主叫号）：signaling 用它登记主叫分机忙线。
+ * call_key 即 b2b_call_t*，与 on_end 的 call_key 一致。 */
+typedef void (*b2b_caller_fn)(void *call_key, const char *number, void *ud);
+
 typedef struct {
     sip_transport_t *tr;
     dlg_mgr_t *dlg;
@@ -431,6 +443,10 @@ typedef struct {
      * + 多槽链 b2b_call_destroy_add 供其他模块 */
     b2b_end_hook_fn on_end;
     void *end_ud;
+    /* 呼叫创建通知（可选）：入站 INVITE 解析出 A 腿主叫号后回调，
+     * 供 callcenter 判定“主叫分机正在通话”并登记忙线。 */
+    b2b_caller_fn on_caller;
+    void *caller_ud;
     /* === 以下全部为全局多槽 hook 链，模块 init 时调 b2b_*_add 注册 ===
      * offer_hook / answer_hook / on_register / on_unmatched_resp /
      * cdr_emit / media_view —— 都从 cfg 单槽改成了 b2bua.c 全局 hook 链 */
@@ -597,6 +613,12 @@ int b2b_terminate(b2b_call_t *call, int cause_code);
 int b2b_terminate_callid(b2b_core_t *c, const char *callid, size_t len,
                          int cause_code);
 
+/* WS 连接被动挂断（REQ-CALL-HANGUP-001）：
+ * WebRTC 客户端异常掉线（关页面/断网/pong 超时）时，ws_listener 关闭连接后
+ * 调用本函数：找出 dst 绑定该 ws_conn 的呼叫，向对端腿发 BYE/CANCEL 并清理。
+ * 返回被终止的呼叫数；可跨线程调用（内部按 callid 重新查表）。 */
+int b2b_terminate_ws_conn(b2b_core_t *c, void *conn);
+
 /* CANCEL 早期 INVITE（uuid_cancel）：
  *   leg=-1 双腿都取消；0=仅 A；1=仅 B。
  *   腿状态为 CALLING/EARLY 才发 CANCEL，已 CONFIRMED/TERMINATED 返回 NOENT。
@@ -676,6 +698,20 @@ int b2b_pre_answer_call(b2b_call_t *call);
  * 返回 NSBC_OK（已登记或已启动）/ NSBC_NOENT（call 已 dead）/ NSBC_INVAL。 */
 int b2b_request_early_media(b2b_call_t *call, const char *wav, int loop,
                             int stop_on_answer);
+
+/* ---- REQ-PBX-CC-002 3.3：队列等待（全忙入队）----
+ * resolve 返回 NSBC_QUEUED 后由 handle_new_invite 调用：
+ *   b2b_queue_hold     —— 建本地 relay、回 183(+SDP)、放 MoH，置 queue_wait。
+ *                         必须在 reactor 线程、未持 call_lock 时调用。
+ *   b2b_queue_dispatch —— cq tick 派发到成员后调用：用已 resolve 的 bd/ruri/to
+ *                         走与同步路径完全相同的建 B 腿流程（复用 hold relay）。
+ *   b2b_queue_abort    —— max_wait 超时 / 溢出：给 A 腿回 status 并销毁呼叫。
+ * 返回 NSBC_OK / NSBC_INVAL / NSBC_NOENT（call 已 dead 或未处于等待态）。 */
+int b2b_queue_hold(b2b_call_t *call, const char *tenant, const char *name,
+                   const char *moh_wav);
+int b2b_queue_dispatch(b2b_call_t *call, const nsbc_sa_t *dst,
+                       const char *ruri, const char *to);
+int b2b_queue_abort(b2b_call_t *call, int status);
 
 /* ---- Call-Destroy 多槽 Hook（REQ-MEDIA-SEC-004 扩展）----
  *

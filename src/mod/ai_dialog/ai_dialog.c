@@ -31,6 +31,9 @@
 #include "dp_sleep.h"     /* P0-2: dp_sleep_app_reg() */
 #include "app_registry.h" /* P0-2: app_register / app_desc_t */
 #include "app_ctx.h"      /* struct nsbc_ctx 完整定义（ctx->cfg）*/
+#include "queue.h"        /* REQ-AI-TRANSFER-002: queue:<name> → 选员分机 */
+#include "endpoints.h"    /* ep_lookup：判断队列成员是否内部分机 */
+#include "location_db.h"  /* loc_query：判断成员当前是否有注册 */
 #include "vad_engine.h"   /* REQ-AI-VAD-001: vad_start_for_call / vad_stop_for_call + HPF API */
 #include "noise_suppression.h" /* WebRTC NS：上行固定 8kHz，10ms(80样本) 一块 */
 #include "obs.h"          /* obs_event (redundant for AI_SESSION — see uDS_client.h below) */
@@ -183,6 +186,7 @@ typedef struct ai_store {
     bridge_mgr_t   *bridge;
     void           *bridge_hook;
     ai_cfg_t        cfg;
+    struct nsbc_ctx *ctx;   /* 转队列选员需要 ctx->cq_mgr / ctx->loc_db */
 } ai_store_t;
 
 static ai_store_t g_ai;
@@ -1145,6 +1149,59 @@ static void ai_on_call_destroy(void *call_key, int a_final, void *ud)
 /* public API — request AI session blind transfer to agent           */
 /* ================================================================== */
 
+/* 从 A 腿请求 URI / To 头提取 SIP domain（租户 realm）。
+ * 入站 INVITE 的 leg[0].ruri 形如 "sip:1001@acme.com" / "sip:1001@acme.com:5080"。
+ * 顺序：先 ruri 后 to；都取不到回退 "nsbc.local"（保持旧行为可跑通）。
+ * 为什么不用 core->cfg.realm：b2b_core_t 在 b2bua.h 中是不透明类型，
+ * ai_dialog 拿不到 cfg；从呼叫本身提取还能天然跟随多租户。 */
+static void ai_realm_of_call(b2b_call_t *b2b, char *out, size_t outsz)
+{
+    out[0] = '\0';
+    if (!b2b || outsz == 0) return;
+    const char *cands[2] = { b2b->leg[0].ruri, b2b->leg[0].to };
+    for (int i = 0; i < 2 && !out[0]; ++i) {
+        const char *s = cands[i];
+        if (!s || !s[0]) continue;
+        const char *at = strchr(s, '@');
+        if (!at) continue;
+        at++;
+        size_t n = 0;
+        while (at[n] && at[n] != ';' && at[n] != '>' && at[n] != '?' &&
+               at[n] != ' ' && at[n] != '\r' && at[n] != '\n' &&
+               n + 1 < outsz)
+            n++;
+        if (n > 0) {
+            memcpy(out, at, n);
+            out[n] = '\0';
+        }
+    }
+    if (!out[0]) snprintf(out, outsz, "%s", "nsbc.local");
+}
+
+/* AI 转队列选员：只接受“当前有注册绑定的内部分机”。
+ * 外部分机靠 trunk 外呼，无法用 sip:<ext>@<realm> 表达，直接排除；
+ * 没有可用成员时由调用方返回失败，避免 REFER 到永远接不通的分机。 */
+typedef struct {
+    struct nsbc_ctx *ctx;
+    const char    *realm;
+} ai_qavail_t;
+
+static int ai_queue_member_avail(const char *ext, void *ud)
+{
+    ai_qavail_t *av = (ai_qavail_t *)ud;
+    const ep_ext_t *ep;
+    char aor[256];
+    loc_binding_t b;
+    if (!av || !av->ctx || !ext || !ext[0]) return 0;
+    ep = ep_lookup(ext, av->realm);
+    if (!ep) return 0;
+    if (strcmp(ep->ext_type, "external") == 0) return 0;
+    snprintf(aor, sizeof(aor), "%s@%s", ext, av->realm);
+    return av->ctx->loc_db
+        ? (loc_query((loc_db_t *)av->ctx->loc_db, aor, &b, 1, nsbc_now_ms()) > 0)
+        : 0;
+}
+
 /* 外部（OAM CLI / LLM function call / Webhook / IVR）可调用此 API
  * 让 AI session 在下次 ASR→LLM→TTS 管道跑完后（或立即如果管道空闲）
  * 调 b2b_transfer_call(call, -1, dest, CCF_XFER_BLIND) 发 REFER。
@@ -1163,6 +1220,21 @@ int ai_request_transfer(void *call_key, const char *dest)
         if (ch < 0x21 || ch > 0x7e) return NSBC_INVAL; /* 白名单校验 */
     }
 
+    /* 不支持的 target 前缀：b2b_transfer_call 只会向对端发 REFER，语义是
+     * “让对端去拨这个 URI”。对端拨不了 ACD 队列，也无法从 URI 表达
+     * “走哪条中继”。这些目标需要 C 核心内部改呼叫目标 + 重建 B 腿
+     * （Phase 3 b2b_retarget_call），当前明确拒绝，避免拼出
+     * sip:queue:sales@realm 这种坏 URI 静默下沉。
+     * 例外：queue:<name> 由本函数先按队列策略选出一个可振铃成员分机，
+     * 再转成 sip:<member>@<realm>（直接转给该座席，非排队等待）。 */
+    if (!strncmp(dest, "trunk:", 6) ||
+        !strncmp(dest, "gateway:", 8) || !strncmp(dest, "route:", 6) ||
+        !strncmp(dest, "ivr:", 4)     || !strcmp(dest, "hangup")) {
+        llog(LOG_WARN, "ai",
+             "ai_request_transfer: dest='%s' 需要内部改目标能力（未实现），拒绝", dest);
+        return NSBC_PERM_DENIED;
+    }
+
     pthread_mutex_lock(&g_ai.lock);
     ai_session_t *s = NULL;
     for (s = g_ai.head; s; s = s->next) {
@@ -1174,14 +1246,59 @@ int ai_request_transfer(void *call_key, const char *dest)
         return NSBC_NOENT;
     }
 
-    /* dest 格式兜底：如果只给了分机号（如 "1001"），补成 SIP URI。
-     * 含 "sip:" 前缀或 "@" 视为已完整。domain 优先用 call 的 orig_host（b2b_call 里有），
-     * 拿不到就用默认 "nsbc.local"。 */
+    /* dest 归一化：
+     *   - 含 "sip:"/"sips:" 前缀或 "@" → 已是完整 SIP URI，原样使用
+     *   - "extension:<num>" → 剥前缀后按分机号补全本呼叫 realm
+     *   - 其它（纯分机号）→ 按分机号补全本呼叫 realm
+     * realm 从 A 腿 ruri/to 提取，不再写死 nsbc.local（多租户下会拨错域）。 */
     char full_dest[300];
-    if (strstr(dest, "sip:") || strchr(dest, '@')) {
+    if (!strncmp(dest, "queue:", 6)) {
+        /* queue:<name>：按队列策略选一个当前可振铃的内部分机，再转给它。
+         * 这是“转到队列的可用座席”，不是排队等待的完整 ACD；没有可用
+         * 成员时明确失败，避免 REFER 到一个永远接不通的目标。 */
+        const char *qname = dest + 6;
+        cc_mgr_t *mgr = (g_ai.ctx && g_ai.ctx->cq_mgr)
+                        ? (cc_mgr_t *)g_ai.ctx->cq_mgr : NULL;
+        char realm[128];
+        char member[AGENT_EXT_MAX];
+        ai_qavail_t av;
+        int prc;
+        if (!qname[0] || mgr == NULL) {
+            pthread_mutex_unlock(&g_ai.lock);
+            return NSBC_NOENT;
+        }
+        ai_realm_of_call((b2b_call_t *)call_key, realm, sizeof(realm));
+        av.ctx = g_ai.ctx;
+        av.realm = realm;
+        prc = cq_pick_member(mgr, realm, qname, 0,
+                             ai_queue_member_avail, &av, call_key,
+                             member, sizeof(member));
+        if (prc != 0) {
+            pthread_mutex_unlock(&g_ai.lock);
+            llog(LOG_WARN, "ai", "transfer queue '%s': no available agent (rc=%d)",
+                 qname, prc);
+            return NSBC_NOENT;
+        }
+        snprintf(full_dest, sizeof(full_dest), "sip:%s@%s", member, realm);
+        llog(LOG_INFO, "ai", "transfer queue '%s' → agent '%s'@'%s'",
+             qname, member, realm);
+    } else if (strstr(dest, "sip:") || strchr(dest, '@')) {
         snprintf(full_dest, sizeof(full_dest), "%s", dest);
     } else {
-        snprintf(full_dest, sizeof(full_dest), "sip:%s@nsbc.local", dest);
+        const char *user = (!strncmp(dest, "extension:", 10)) ? dest + 10 : dest;
+        if (!user[0]) {
+            pthread_mutex_unlock(&g_ai.lock);
+            return NSBC_INVAL;
+        }
+        char realm[128];
+        ai_realm_of_call((b2b_call_t *)call_key, realm, sizeof(realm));
+        snprintf(full_dest, sizeof(full_dest), "sip:%s@%s", user, realm);
+    }
+    /* b2b_transfer_call 对 refer_to 有 256 字节上限，超长在此提前拒绝，
+     * 避免设置成功后在 session 线程里才失败、调用方却收到 OK。 */
+    if (strlen(full_dest) > 256) {
+        pthread_mutex_unlock(&g_ai.lock);
+        return NSBC_INVAL;
     }
 
     pthread_mutex_lock(&s->lock);
@@ -1189,8 +1306,8 @@ int ai_request_transfer(void *call_key, const char *dest)
     s->transfer_pending = 1;
     pthread_mutex_unlock(&s->lock);
     pthread_mutex_unlock(&g_ai.lock);
-    llog(LOG_INFO, "ai", "ai_request_transfer call=%p dest=%s", call_key, full_dest);
-    llog(LOG_INFO, "ai", "ai_request_transfer call=%p dest=%s (pending)", call_key, dest);
+    llog(LOG_INFO, "ai", "ai_request_transfer call=%p dest=%s → %s (pending)",
+         call_key, dest, full_dest);
     return NSBC_OK;
 }
 
@@ -1242,6 +1359,7 @@ static int ai_init(struct nsbc_ctx *ctx)
     memset(&g_ai, 0, sizeof(g_ai));
     pthread_mutex_init(&g_ai.lock, NULL);
     g_cfg_ptr = ctx->cfg;
+    g_ai.ctx = ctx;
 
     /* 读配置 —— cfg_get_int 第3参数 long*, 第4参数 cfg_layer_t* 或 NULL
      * 默认值 1 作 fallback；cfg_get_int 成功（返回 0）则用 yaml 值覆盖。

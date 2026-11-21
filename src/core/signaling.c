@@ -45,6 +45,7 @@
 #include <string.h>
 
 #define SWEEP_INTERVAL_MS 60000
+#define CC_TICK_INTERVAL_MS 1000   /* Phase 2：ACD/座席状态机周期（WRAP、溢出、派发） */
 #define URI_MAX 512
 
 /* 前向声明：定义在本文件尾部（sig_ws_bridge_conn_from_sa 旁），
@@ -86,9 +87,11 @@ typedef struct sig_runtime {
     char *digest_secret;
     dp_ctx_t dp_ctx; /* Dialplan 规则集（热加载） */
     tw_node_t sweep_node;
+    tw_node_t cc_tick_node;   /* Phase 2：1s ACD/座席状态机 tick */
     char local_host[128]; /* 监听/SDP 广告地址 */
     char realm[128];
     int force_register_ok; /* 调试开关拷贝：force_register_ok=1 时 INVITE 主叫验证跳过 ep_lookup+loc_query */
+    int cc_cb_bound;       /* 3.3：cq 派发/溢出回调是否已绑定（queue 模块可能晚于 signaling 就绪） */
 } sig_runtime_t;
 
 /* ------------------------------------------------------------------ */
@@ -460,6 +463,131 @@ static int sig_deliver_via_binding(nsbc_sa_t *dst, const loc_binding_t *b)
 
 /* ================================================================== */
 
+/* Phase 1：队列成员“可振铃”判定 —— 供 cq_pick_member 选路时过滤。
+ * 外部分机：ext 表存在且配了 trunk 即视为可路由；
+ * 内部分机：必须当前有注册绑定，否则选中也会 404。
+ * 忙线/置忙过滤在 cq_pick_member 内用队列自己的 tenant 做（与本回调解耦）。 */
+static int q_member_avail_cb(const char *ext, void *ud)
+{
+    sig_runtime_t *s = (sig_runtime_t *)ud;
+    const struct ep_ext *ep;
+    char aor[256];
+    loc_binding_t b;
+    if (!s || !ext || !ext[0]) return 0;
+    ep = ep_lookup(ext, s->realm);
+    if (!ep) return 0;
+    if (strcmp(ep->ext_type, "external") == 0 && ep->trunk_name[0])
+        return 1;
+    snprintf(aor, sizeof(aor), "%s@%s", ext, s->realm);
+    return s->loc ? (loc_query(s->loc, aor, &b, 1, nsbc_now_ms()) > 0) : 0;
+}
+
+/* A 腿主叫忙线登记：入站 INVITE 解析出主叫号后由 b2bua 回调。
+ * 只跟踪本域已配置分机（外部号码/中继主叫忽略），避免撑爆分机状态表。
+ * 用 slot=1（A 腿），与 B 腿被叫分机（slot=0）互不覆盖。 */
+static void sig_on_caller_cb(void *call_key, const char *number, void *ud)
+{
+    sig_runtime_t *s = (sig_runtime_t *)ud;
+    if (!s || !s->ctx || !s->ctx->cq_mgr || !number || !number[0])
+        return;
+    if (ep_lookup(number, s->realm) == NULL)
+        return;
+    (void)cq_ext_mark_busy_slot((cc_mgr_t *)s->ctx->cq_mgr, call_key,
+                                s->realm, number, 1);
+}
+
+/* 3.3：队列成员地址解析（内部 loc_query / 外部 trunk）。
+ * 同步 resolve 与 tick 异步派发共用，保证两条路径 target/ruri 完全一致。
+ * ext_user 已由 cq_pick_member 原子占位，这里只做地址解析。 */
+static int sig_route_queue_member(sig_runtime_t *s, b2b_call_t *call,
+                                  const char *ext_user, const char *fallback_num,
+                                  nsbc_sa_t *dst, char *out_ruri, size_t outsz,
+                                  char *out_to, size_t out_to_sz,
+                                  b2b_resolve_meta_t *out_meta,
+                                  const char *qname)
+{
+    const struct ep_ext *ep = ep_lookup(ext_user, s->realm);
+    if (!ep) {
+        llog(LOG_WARN, "sig", "resolve: queue member '%s' not in ext table", ext_user);
+        return NSBC_NOENT;
+    }
+
+    if (strcmp(ep->ext_type, "external") == 0 && ep->trunk_name[0]) {
+        /* --- 外部分机：走 trunk 外呼 --- */
+        route_table_t *rt = s->ctx ? s->ctx->rt : NULL;
+        const trunk_t *tr;
+        const char *caller_display;
+        const char *dst_num;
+        if (!rt) return NSBC_NOENT;
+        tr = rt_trunk_get(rt, ep->trunk_name);
+        if (!tr || !tr->enabled) {
+            llog(LOG_WARN, "sig", "resolve: external ext '%s' trunk '%s' not found",
+                 ext_user, ep->trunk_name);
+            return NSBC_NOENT;
+        }
+        caller_display = ep->display_number[0] ? ep->display_number
+                       : (ep->clip[0] ? ep->clip : "");
+        dst_num = ep->external_number[0] ? ep->external_number
+                : (fallback_num ? fallback_num : ext_user);
+        if (tr->cached_sa.len > 0) {
+            *dst = tr->cached_sa;
+        } else if (nsbc_sa_from(dst, tr->host, tr->port, AF_UNSPEC) != NSBC_OK) {
+            llog(LOG_WARN, "sig", "resolve: external ext '%s' trunk '%s' resolve fail",
+                 ext_user, ep->trunk_name);
+            return NSBC_NOENT;
+        }
+        if (out_ruri && outsz)
+            snprintf(out_ruri, outsz, "sip:%s@%s:%u", dst_num, tr->host, tr->port);
+        if (out_to && out_to_sz) {
+            const char *dom = tr->realm[0] ? tr->realm : tr->host;
+            if (caller_display[0])
+                snprintf(out_to, out_to_sz, "\"%s\" <sip:%s@%s>",
+                         caller_display, dst_num, dom);
+            else
+                snprintf(out_to, out_to_sz, "<sip:%s@%s>", dst_num, dom);
+        }
+        rt_acquire(rt, tr->name);
+        if (call) {
+            snprintf(call->rt_name, sizeof(call->rt_name), "%s", tr->name);
+            if (caller_display[0])
+                snprintf(call->effective_caller_id_num,
+                         sizeof(call->effective_caller_id_num), "%s", caller_display);
+        }
+        llog(LOG_INFO, "sig", "resolve: queue '%s' member '%s' EXTERNAL → "
+             "trunk '%s' dst=%s display='%s'",
+             qname, ext_user, tr->name, dst_num, caller_display);
+        return NSBC_OK;
+    }
+
+    /* --- 内部分机：loc_query 走注册地址 --- */
+    {
+        char aor[256];
+        loc_binding_t b;
+        b2b_leg_t *target_leg = call ? &call->leg[1] : NULL;
+        int n;
+        snprintf(aor, sizeof(aor), "%s@%s", ext_user, s->realm);
+        n = s->loc ? loc_query(s->loc, aor, &b, 1, nsbc_now_ms()) : 0;
+        if (n <= 0) {
+            llog(LOG_WARN, "sig", "resolve: queue member '%s' (internal) not registered",
+                 ext_user);
+            return NSBC_NOENT;
+        }
+        sig_fill_meta_from_binding(out_meta, target_leg, &b, call);
+        if (sig_deliver_via_binding(dst, &b) != NSBC_OK) {
+            llog(LOG_WARN, "sig", "resolve: queue member '%s' contact → no route",
+                 ext_user);
+            return NSBC_NOENT;
+        }
+    }
+    if (out_ruri && outsz)
+        snprintf(out_ruri, outsz, "sip:%s@%s", ext_user, s->realm);
+    if (out_to && out_to_sz)
+        snprintf(out_to, out_to_sz, "<sip:%s@%s>", ext_user, s->realm);
+    llog(LOG_INFO, "sig", "resolve: queue '%s' member '%s' INTERNAL → resolved",
+         qname, ext_user);
+    return NSBC_OK;
+}
+
 static int resolve_cb(b2b_call_t *call, const char *ruri, size_t ruri_len,
                       nsbc_sa_t *dst, char *out_ruri, size_t outsz,
                       char *out_to, size_t out_to_sz,
@@ -573,6 +701,34 @@ static int resolve_cb(b2b_call_t *call, const char *ruri, size_t ruri_len,
         return NSBC_NOENT;
     memcpy(rhost, h, hlen2);
     rhost[hlen2] = '\0';
+
+    /* ---- 座席特征码：*70 置忙（小休）/ *71 恢复 ----
+     * 仅当主叫是本域已配置分机时生效，避免外部号码误触。
+     * 命中后不建 B 腿：置 local_media 让 A 腿本地接通（听到本地媒体/静音），
+     * 座席挂机即可完成操作。状态立即生效，后续队列派发跳过该分机。 */
+    if ((strcmp(user, "*70") == 0 || strcmp(user, "*71") == 0) &&
+        call != NULL && call->orig_number[0] &&
+        s->ctx && s->ctx->cq_mgr) {
+        const char *caller = call->orig_number;
+        if (ep_lookup(caller, s->realm) != NULL) {
+            int is_pause = (strcmp(user, "*70") == 0);
+            int frc = is_pause
+                ? cq_ext_pause((cc_mgr_t *)s->ctx->cq_mgr, s->realm, caller,
+                               CQ_EXT_REASON_BREAK)
+                : cq_ext_resume((cc_mgr_t *)s->ctx->cq_mgr, s->realm, caller);
+            llog(LOG_INFO, "sig", "feature %s caller=%s rc=%d",
+                 is_pause ? "*70(pause)" : "*71(resume)", caller, frc);
+            /* *71 对“从未置忙”的分机是幂等成功，不向话机回 404 */
+            if (!is_pause && frc == NSBC_NOENT)
+                frc = NSBC_OK;
+            call->local_media = 1;
+            if (out_ruri && outsz)
+                snprintf(out_ruri, outsz, "local:feature");
+            if (out_to && out_to_sz)
+                snprintf(out_to, out_to_sz, "<sip:%s@%s>", caller, s->realm);
+            return frc == NSBC_OK ? NSBC_OK : NSBC_NOENT;
+        }
+    }
 
     /* 本域？ host 命中监听地址或 realm 时查 Location DB */
     int in_domain = (strcmp(rhost, s->realm) == 0 ||
@@ -884,6 +1040,10 @@ static int resolve_cb(b2b_call_t *call, const char *ruri, size_t ruri_len,
                         if (out_to && out_to_sz)
                             snprintf(out_to, out_to_sz, "<sip:%s@%s>",
                                      ext_user, s->realm);
+                        /* 直呼分机：登记忙线，队列派发时跳过正在振铃/通话的分机 */
+                        if (call && s->ctx && s->ctx->cq_mgr)
+                            cq_ext_mark_busy((cc_mgr_t *)s->ctx->cq_mgr, call,
+                                             s->realm, ext_user);
                         return NSBC_OK;
                     }
                     /* deliver 失败 → fall through 到 dp_ext 失败分支 */
@@ -897,10 +1057,12 @@ static int resolve_cb(b2b_call_t *call, const char *ruri, size_t ruri_len,
     }
 
     /* ---- DP_LAYER_BIZ queue:（REQ-PBX-CC-002 外部分机振铃）----
-     * target="queue:xxx" → 剥前缀拿 queue name → cq_get 取成员 ext 列表
-     * → 逐个成员 ep_lookup 判断 internal/external 分别路由。
+     * target="queue:xxx" → 剥前缀拿 queue name → 按策略选一个成员
+     * → ep_lookup 判断 internal/external 分别路由。
      *
-     * 最简版本（可跑通）：取第一个成员 ext（暂不接 cq_dispatch 策略），
+     * Phase 1：cq_pick_member 选路（leastrecent/roundrobin/fewestcalls），
+     *   过滤未注册/忙线/置忙成员并在选中瞬间原子占位；全部不可用时回
+     *   NSBC_BUSY（b2bua 回 486），不回退 members[0]。
      *   internal → loc_query → 注册地址
      *   external → rt_trunk_get → trunk 外呼
      * agent_pool / cc_mgr 可能未初始化（NULL）时返回 NOENT。 */
@@ -920,99 +1082,91 @@ static int resolve_cb(b2b_call_t *call, const char *ruri, size_t ruri_len,
         const char *caller_tenant = (s && s->realm[0]) ? s->realm : "";
         const cq_queue_t *q = cq_get(mgr, caller_tenant, qname);
         if (!q || !q->enabled || q->n_members <= 0) {
-            llog(LOG_WARN, "sig", "resolve: queue '%s' not found/disabled/empty", qname);
+            llog(LOG_WARN, "sig",
+                 "resolve: queue '%s' (tenant='%s') not found/disabled/empty "
+                 "[mgr=%s q=%s enabled=%d members=%d]",
+                 qname, caller_tenant, mgr ? "ok" : "null",
+                 q ? "found" : "missing",
+                 q ? (int)q->enabled : -1, q ? q->n_members : -1);
             return NSBC_NOENT;
         }
-        /* 取第一个成员——以后接 cq_dispatch 做策略选路 */
-        const char *ext_user = q->members[0];
-        llog(LOG_INFO, "sig", "resolve: queue '%s' → first member '%s' (total=%d)",
-             qname, ext_user, q->n_members);
-
-        /* ep_lookup 判断 internal / external */
-        const struct ep_ext *ep = ep_lookup(ext_user, s->realm);
-        if (!ep) {
-            llog(LOG_WARN, "sig", "resolve: queue member '%s' not in ext table", ext_user);
-            return NSBC_NOENT;
-        }
-
-        if (strcmp(ep->ext_type, "external") == 0 && ep->trunk_name[0]) {
-            /* --- 外部分机：走 trunk 外呼 ---
-             * trunk_name → rt_trunk_get → 外呼 external_number */
-            route_table_t *rt = s->ctx ? s->ctx->rt : NULL;
-            if (!rt) return NSBC_NOENT;
-            const trunk_t *tr = rt_trunk_get(rt, ep->trunk_name);
-            if (!tr || !tr->enabled) {
-                llog(LOG_WARN, "sig", "resolve: external ext '%s' trunk '%s' not found",
-                     ext_user, ep->trunk_name);
-                return NSBC_NOENT;
+        /* Phase 1：按队列策略选成员（leastrecent/roundrobin/fewestcalls），
+         * 过滤未注册/忙线/置忙成员，并在选中瞬间原子占位（防止并发重复派发）。
+         * 呼叫结束时在 sig_on_end_cb 结算统计并释放占用。 */
+        char picked_ext[AGENT_EXT_MAX];
+        memset(picked_ext, 0, sizeof(picked_ext));
+        int prc = cq_pick_member(mgr, caller_tenant, qname,
+                                 (uint32_t)(nsbc_now_ms() & 0xffffffffu),
+                                 q_member_avail_cb, s, call,
+                                 picked_ext, sizeof(picked_ext));
+        if (prc != 0) {
+            /* 3.3：全部成员忙线/置忙/未注册 → 入队等待，不再直接 486。
+             * max_wait_s<=0 表示该队列关闭排队，保持原 486 语义。 */
+            cq_waiter_t w;
+            char moh[192];
+            int erc;
+            /* 无呼叫上下文（originate）或已入队（重复 resolve）不能入队：
+             * waiter 以 call_key 定位，NULL/重复会产生无法派发的僵尸项。 */
+            if (call == NULL) {
+                llog(LOG_WARN, "sig",
+                     "resolve: queue '%s' all busy, no call ctx → 486", qname);
+                return NSBC_BUSY;
             }
-            /* 外呼目标号码：display_number（主叫显示）用 clip 字段或 ext.clip */
-            const char *caller_display =
-                ep->display_number[0] ? ep->display_number
-                : (ep->clip[0] ? ep->clip : "");
-            const char *dst_num =
-                ep->external_number[0] ? ep->external_number : dres.dst_number;
-            /* 构造 dst_sa */
-            if (tr->cached_sa.len > 0) {
-                *dst = tr->cached_sa;
-            } else if (nsbc_sa_from(dst, tr->host, tr->port, AF_UNSPEC) != NSBC_OK) {
-                llog(LOG_WARN, "sig", "resolve: external ext '%s' trunk '%s' resolve fail",
-                     ext_user, ep->trunk_name);
-                return NSBC_NOENT;
+            if (call->queue_wait)
+                return NSBC_QUEUED;
+            if (!mgr || !q || q->max_wait_s <= 0) {
+                llog(LOG_WARN, "sig",
+                     "resolve: queue '%s' (tenant='%s') no available member "
+                     "(all busy/paused/unregistered) → 486",
+                     qname, caller_tenant);
+                return NSBC_BUSY;
             }
-            /* out_ruri + out_to */
-            if (out_ruri && outsz) {
-                snprintf(out_ruri, outsz, "sip:%s@%s:%u", dst_num, tr->host, tr->port);
-            }
-            if (out_to && out_to_sz) {
-                const char *dom = tr->realm[0] ? tr->realm : tr->host;
-                if (caller_display[0]) {
-                    snprintf(out_to, out_to_sz, "\"%s\" <sip:%s@%s>",
-                             caller_display, dst_num, dom);
-                } else {
-                    snprintf(out_to, out_to_sz, "<sip:%s@%s>", dst_num, dom);
-                }
-            }
-            /* 占用 trunk + 存 rt_name → sig_on_end_cb rt_release */
-            rt_acquire(rt, tr->name);
+            memset(&w, 0, sizeof(w));
+            w.call_key = call;
+            w.priority = 0;
+            w.enqueue_ms = nsbc_now_ms();
             if (call) {
-                snprintf(call->rt_name, sizeof(call->rt_name), "%s", tr->name);
-                /* 外呼用 display_number 做主叫显示 → 写入 effective_caller_id_num */
-                if (caller_display[0])
-                    snprintf(call->effective_caller_id_num,
-                             sizeof(call->effective_caller_id_num), "%s", caller_display);
+                snprintf(w.cli, sizeof(w.cli), "%s",
+                         call->effective_caller_id_num[0]
+                             ? call->effective_caller_id_num : call->orig_number);
+                /* 跨线程派发用 callid 重查呼叫（call_key 可能在 tick 间被释放） */
+                snprintf(w.callid, sizeof(w.callid), "%s", call->leg[0].callid);
             }
-            llog(LOG_INFO, "sig", "resolve: queue '%s' member '%s' EXTERNAL → "
-                 "trunk '%s' dst=%s display='%s'",
-                 qname, ext_user, tr->name, dst_num, caller_display);
-            return NSBC_OK;
+            erc = cq_enqueue(mgr, caller_tenant, qname, w);
+            if (erc != NSBC_OK) {
+                llog(LOG_WARN, "sig",
+                     "resolve: queue '%s' enqueue failed rc=%d → 486", qname, erc);
+                return NSBC_BUSY;
+            }
+            snprintf(moh, sizeof(moh), "%s", q->moh_wav);
+            if (call) {
+                snprintf(call->queue_tenant, sizeof(call->queue_tenant), "%s",
+                         caller_tenant);
+                snprintf(call->queue_name, sizeof(call->queue_name), "%s", qname);
+                snprintf(call->queue_moh, sizeof(call->queue_moh), "%s", moh);
+                /* 注意：不要在这里置 queue_wait=1。b2b_queue_hold 以
+                 * queue_wait==0 作为“首次进入”条件，提前置位会让它幂等返回，
+                 * 183/MoH/relay 全部不会建立。由 b2b_queue_hold 内统一置位。 */
+            }
+            llog(LOG_INFO, "sig",
+                 "resolve: queue '%s' (tenant='%s') no available member → QUEUED "
+                 "(max_wait=%ds moh='%s')",
+                 qname, caller_tenant, q ? q->max_wait_s : 0, moh);
+            return NSBC_QUEUED;
         }
-
-        /* --- 内部分机：loc_query 走注册地址 --- */
-        char aor[256];
-        snprintf(aor, sizeof(aor), "%s@%s", ext_user, s->realm);
-        loc_binding_t b;
-        int n = s->loc ? loc_query(s->loc, aor, &b, 1, nsbc_now_ms()) : 0;
-        if (n <= 0) {
-            llog(LOG_WARN, "sig", "resolve: queue member '%s' (internal) not registered", ext_user);
-            return NSBC_NOENT;
-        }
-        /* 统一 loc_binding → meta + leg 字段 + dst 路由决策 */
         {
-            b2b_leg_t *target_leg = call ? &call->leg[1] : NULL;
-            sig_fill_meta_from_binding(out_meta, target_leg, &b, call);
-            if (sig_deliver_via_binding(dst, &b) != NSBC_OK) {
-                llog(LOG_WARN, "sig", "resolve: queue member '%s' contact → no route", ext_user);
-                return NSBC_NOENT;
-            }
+            const char *ext_user = picked_ext;
+            /* 忙线占位 + 归属登记已在 cq_pick_member 内原子完成（抢占失败会顺延），
+             * 呼叫结束由 sig_on_end_cb → cq_settle_call 释放。 */
+            llog(LOG_INFO, "sig", "resolve: queue '%s' → member '%s' "
+                 "(strategy=%d rc=%d total=%d)",
+                 qname, ext_user, q ? (int)q->strategy : -1, prc,
+                 q ? q->n_members : 0);
+            return sig_route_queue_member(s, call, ext_user,
+                                          dres.dst_number, dst,
+                                          out_ruri, outsz, out_to, out_to_sz,
+                                          out_meta, qname);
         }
-        if (out_ruri && outsz)
-            snprintf(out_ruri, outsz, "sip:%s@%s", ext_user, s->realm);
-        if (out_to && out_to_sz)
-            snprintf(out_to, out_to_sz, "<sip:%s@%s>", ext_user, s->realm);
-        llog(LOG_INFO, "sig", "resolve: queue '%s' member '%s' INTERNAL → resolved",
-             qname, ext_user);
-        return NSBC_OK;
     }
 
     if (dp_ok && dres.layer == DP_LAYER_OUT) {
@@ -1232,6 +1386,10 @@ static int resolve_cb(b2b_call_t *call, const char *ruri, size_t ruri_len,
             ruri_from_contact(route_contact, out_ruri, outsz);
             if (out_to && out_to_sz)
                 snprintf(out_to, out_to_sz, "<sip:%s@%s>", user, s->realm);
+            /* 直呼已注册分机：登记忙线（呼叫结束 sig_on_end_cb → cq_settle_call 释放） */
+            if (call && s->ctx && s->ctx->cq_mgr)
+                cq_ext_mark_busy((cc_mgr_t *)s->ctx->cq_mgr, call,
+                                 s->realm, user);
             return NSBC_OK;
         }
         /* deliver 失败 — 详细日志保留（sig_deliver 已打 WARN，但这里保留 resolve 上下文） */
@@ -1322,6 +1480,12 @@ static void sig_on_end_cb(void *call_key, void *ud)
 {
     sig_runtime_t *s = ud;
     b2b_call_t *c = (b2b_call_t *)call_key;
+
+    /* Phase 1：队列派发统计结算（未派发过的呼叫内部直接返回）。
+     * answer_ms>0 视为接起，用于 leastrecent/fewestcalls 选路历史。 */
+    if (s && s->ctx && s->ctx->cq_mgr && c)
+        cq_settle_call((cc_mgr_t *)s->ctx->cq_mgr, c, nsbc_now_ms(),
+                       c->answer_ms);
 
     /* 1) 采集媒体质量快照（必须在 bridge_release_call 之前！
      *    release 后 relay 被销毁，bridge_call_view 会找不到 call → mv 全零） */
@@ -1449,6 +1613,155 @@ static void sig_on_end_cb(void *call_key, void *ud)
 /* ------------------------------------------------------------------ */
 static void sweep_cb(uint64_t now_ms, void *arg);
 
+/* ------------------------------------------------------------------ */
+/* Phase 2：ACD 内核周期驱动                                            */
+/*   cq_tick 内部完成：逐队列超时溢出、有 waiter 且有可用座席时选路并   */
+/*   回调组合根建 B 腿（A 腿此时已 183 + MoH 等待中）。                  */
+/*   cq_tick 跑在时间轮线程，回调必须 reactor_call 投递到 SIP 线程再操作 */
+/*   呼叫对象（call_lock / respond_a / call_destroy 都要求 reactor 线程）。*/
+/* ------------------------------------------------------------------ */
+typedef struct {
+    sig_runtime_t *s;
+    b2b_call_t *call;                 /* 仅 task 内经 callid 重查后填写（SIP 线程内有效） */
+    char callid[CQ_CALLID_MAX];       /* 跨线程稳定标识：peek 时从 waiter 拷贝 */
+    char name[CQ_NAME_MAX];
+    char ext[AGENT_EXT_MAX];
+} sig_cc_disp_arg_t;
+
+/* SIP 线程内执行：resolve 成员地址 → 延迟建 B 腿。
+ * 失败（成员刚掉线/trunk 关闭/呼叫已结束）→ 退回等待，下一 tick 重试。
+ * 用 callid 重查而非直接解引用 call_key：ticker peek 到执行 task 之间
+ * 呼叫可能已被 call_destroy 释放。 */
+static int sig_cc_dispatch_task(void *arg)
+{
+    sig_cc_disp_arg_t *a = (sig_cc_disp_arg_t *)arg;
+    nsbc_ctx_t *ctx = a->s->ctx;
+    b2b_call_t *call;
+    nsbc_sa_t dst;
+    b2b_resolve_meta_t meta;
+    char ruri[256] = "";
+    char to[256] = "";
+    int rc;
+
+    call = b2b_find_callid((b2b_core_t *)ctx->b2b, a->callid, strlen(a->callid));
+    if (call == NULL)
+        return NSBC_OK;   /* 呼叫已结束：waiter 已由 cq_settle_call 清理 */
+    a->call = call;
+    memset(&dst, 0, sizeof(dst));
+    memset(&meta, 0, sizeof(meta));
+    /* 上一次派发若占了 trunk 槽（rt_acquire），重新选路前先归还，
+     * 否则重试到内部分机时旧 trunk 的 in_use 会一直挂到呼叫结束。 */
+    if (call->rt_name[0] && ctx->rt) {
+        rt_release(ctx->rt, call->rt_name);
+        call->rt_name[0] = '\0';
+    }
+    rc = sig_route_queue_member(a->s, call, a->ext, NULL, &dst,
+                                ruri, sizeof(ruri), to, sizeof(to),
+                                &meta, a->name);
+    if (rc == NSBC_OK &&
+        b2b_queue_dispatch(call, &dst, ruri, to) == NSBC_OK)
+        return NSBC_OK;
+
+    if (call->queue_wait && !call->dead) {
+        if (ctx->cq_mgr)
+            cq_requeue((cc_mgr_t *)ctx->cq_mgr, call);
+        llog(LOG_WARN, "sig",
+             "cc dispatch failed rc=%d call=%p ext=%s → requeue",
+             rc, (void *)call, a->ext);
+    }
+    return NSBC_ERR;
+}
+
+/* cq_tick 派发回调（时间轮线程）→ 投递到 SIP 线程 */
+static int sig_cc_dispatch_cb(void *call_key, const char *callid,
+                              const char *tenant, const char *name,
+                              const char *ext, void *ud)
+{
+    sig_runtime_t *s = (sig_runtime_t *)ud;
+    sig_cc_disp_arg_t a;
+    (void)tenant;
+    (void)call_key;
+    if (!s || !s->ctx || !s->ctx->re || !s->ctx->b2b ||
+        !callid || !callid[0] || !ext || !ext[0])
+        return NSBC_INVAL;
+    memset(&a, 0, sizeof(a));
+    a.s = s;
+    snprintf(a.callid, sizeof(a.callid), "%s", callid);
+    snprintf(a.name, sizeof(a.name), "%s", name ? name : "");
+    snprintf(a.ext, sizeof(a.ext), "%s", ext);
+    /* reactor_call 同步等待 owner 线程执行完并返回 task 的返回值；
+     * a 在栈上，仅在本函数返回前有效。 */
+    int rc = reactor_call(s->ctx->re, sig_cc_dispatch_task, &a);
+    if (rc != NSBC_OK)
+        llog(LOG_WARN, "sig", "cc dispatch failed callid=%s rc=%d", callid, rc);
+    return rc;
+}
+
+static int sig_cc_overflow_task(void *arg)
+{
+    sig_cc_disp_arg_t *a = (sig_cc_disp_arg_t *)arg;
+    b2b_call_t *call = b2b_find_callid((b2b_core_t *)a->s->ctx->b2b,
+                                       a->callid, strlen(a->callid));
+    if (call == NULL)
+        return NSBC_OK;   /* 已结束 */
+    b2b_queue_abort(call, 480);   /* max_wait 到期：A 腿回 480 并销毁 */
+    return NSBC_OK;
+}
+
+/* 排队超时回调（时间轮线程）→ 投递到 SIP 线程回 480 */
+static void sig_cc_overflow_cb(void *call_key, const char *callid,
+                               const char *tenant, const char *name, void *ud)
+{
+    sig_runtime_t *s = (sig_runtime_t *)ud;
+    sig_cc_disp_arg_t a;
+    (void)call_key;
+    (void)tenant;
+    (void)name;
+    if (!s || !s->ctx || !s->ctx->re || !s->ctx->b2b || !callid || !callid[0])
+        return;
+    memset(&a, 0, sizeof(a));
+    a.s = s;
+    snprintf(a.callid, sizeof(a.callid), "%s", callid);
+    if (reactor_call(s->ctx->re, sig_cc_overflow_task, &a) != NSBC_OK)
+        llog(LOG_WARN, "sig", "cc overflow failed callid=%s", callid);
+}
+
+static void cc_tick_cb(uint64_t now_ms, void *arg);
+
+static void cc_tick_arm(sig_runtime_t *s)
+{
+    /* 注意：queue 模块可能晚于 signaling 初始化，此时 ctx->cq_mgr 仍为 NULL；
+     * 因此这里只校验时间轮，cq_mgr 是否存在留到回调里判断并继续自续期。 */
+    if (s == NULL || s->ctx == NULL || s->ctx->tw == NULL)
+        return;
+    tw_node_init(&s->cc_tick_node);
+    int rc = tw_add(s->ctx->tw, &s->cc_tick_node,
+                    nsbc_now_ms() + CC_TICK_INTERVAL_MS, cc_tick_cb, s);
+    if (rc != NSBC_OK)
+        llog(LOG_WARN, "sig", "cc tick arm failed rc=%d", rc);
+}
+
+static void cc_tick_cb(uint64_t now_ms, void *arg)
+{
+    sig_runtime_t *s = (sig_runtime_t *)arg;
+    if (s != NULL && s->ctx != NULL && s->ctx->cq_mgr != NULL) {
+        cc_mgr_t *m = (cc_mgr_t *)s->ctx->cq_mgr;
+        if (!s->cc_cb_bound) {
+            /* 3.3：tick 派发/注册过滤/超时溢出三个回调绑定（懒注册，
+             * queue 模块晚于 signaling 就绪时也能在首次 tick 补上） */
+            cq_set_dispatch_cb(m, sig_cc_dispatch_cb, s);
+            cq_set_member_avail_cb(m, q_member_avail_cb, s);
+            cq_set_overflow_cb(m, sig_cc_overflow_cb, s);
+            s->cc_cb_bound = 1;
+            llog(LOG_INFO, "sig", "cc dispatch/overflow callbacks bound");
+        }
+        int acts = cq_tick(m, now_ms);
+        if (acts > 0)
+            llog(LOG_DEBUG, "sig", "cc tick: %d action(s)", acts);
+    }
+    cc_tick_arm(s);
+}
+
 /* loc_sweep expunge 回调：每清一条过期 binding → 推 Rust 侧 DELETE
  * Rust 侧 upsert_registration 收到 expires_sec=0 → DELETE registrations */
 static void sweep_expunge_notify(const loc_binding_t *b, void *ud)
@@ -1488,6 +1801,7 @@ static void sweep_cb(uint64_t now_ms, void *arg)
 static void sig_ws_bridge_init(sip_transport_t *tr, sip_tr_proto_t proto);
 static void sig_ws_bridge_shutdown(void);
 static void sig_ws_bridge_rx(void *ud, const char *buf, size_t len, void *conn);
+static void sig_ws_close_cb(void *ud, void *conn);
 void *sig_ws_bridge_conn_from_sa(const nsbc_sa_t *sa);
 
 static int sig_init(struct nsbc_ctx *ctx)
@@ -1893,6 +2207,8 @@ static int sig_start(struct nsbc_ctx *ctx)
      * b2bua.h L298-300 注释已声明这些字段移除，signaling 不再桥接它们。 */
     bc.on_end = sig_on_end_cb;
     bc.end_ud = s;  /* sig_on_end_cb 需要 s->bridge + s->ctx */
+    bc.on_caller = sig_on_caller_cb;
+    bc.caller_ud = s;
     /* Ring NoAnswer 超时（P0 PBX 基础）：配置单位秒，内部换算 ms；默认 60s */
     long rna_s = 60;
     cfg_get_int(cfg, "sip.ring_noanswer_timeout_s", &rna_s, NULL);
@@ -2124,6 +2440,7 @@ static int sig_start(struct nsbc_ctx *ctx)
     }
 
     sweep_arm(s);
+    cc_tick_arm(s);
     llog(LOG_NOTICE, "sig",
          "signaling up udp=%s:%ld tcp=%ld tls=%d realm=%s media=%s",
          listen_ip_cpy, en_udp ? udp_port : 0, en_tcp ? tcp_port : 0,
@@ -2156,6 +2473,9 @@ static int sig_start(struct nsbc_ctx *ctx)
         sig_ws_bridge_init(s->tr, ws_tls ? SIP_TR_WSS : SIP_TR_WS);
         ws_listener_init((uint16_t)ws_port, ws_tls, ws_enabled, ws_tls_ctx,
                          sig_ws_bridge_rx, ctx);
+        /* REQ-CALL-HANGUP-001：WS/WSS 异常掉线（TCP RST、半开、pong 超时）时
+         * 终止绑定在该 conn 上的呼叫，向 SIP 对端补发 BYE/CANCEL。 */
+        ws_listener_set_close_cb(sig_ws_close_cb, ctx);
         ws_listener_start();
     }
 
@@ -2168,9 +2488,13 @@ static void sig_stop(struct nsbc_ctx *ctx)
     if (!s)
         return;
     tw_del(ctx->tw, &s->sweep_node);
+    tw_del(ctx->tw, &s->cc_tick_node);
 
     /* Phase 0: 先卸载所有 hook（阻止新回调进来），再 destroy b2b/reg/bridge */
     {
+        /* REQ-CALL-HANGUP-001：b2b 销毁前先注销 WS 关闭回调，避免 worker 线程
+         * 在 b2b_destroy 期间拿着旧指针调用 b2b_terminate_ws_conn。 */
+        ws_listener_set_close_cb(NULL, NULL);
         b2b_register_hook_rm(reg_on_register, s->reg);
         b2b_sdp_hook_rm(B2B_SDP_OFFER, bridge_offer_hook, s->bridge);
         b2b_sdp_hook_rm(B2B_SDP_ANSWER, bridge_answer_hook, s->bridge);
@@ -2398,6 +2722,26 @@ static void sig_ws_bridge_rx(void *ud, const char *buf, size_t len, void *conn)
     sip_tr_rx_trace(g_ws_bridge_proto, NULL, 0, buf, len);
 
     b2b_on_rx(b2b, g_ws_bridge_proto, &src, &local, buf, len);
+}
+
+/* REQ-CALL-HANGUP-001：WS 连接异常关闭 → 终止绑定其上的呼叫。
+ * 由 ws_listener worker 线程在 conn 已从 epoll 摘除、发送队列清空后调用一次；
+ * ud = ctx（注册时传入）。b2b 已销毁时直接忽略（teardown 竞态）。 */
+static void sig_ws_close_cb(void *ud, void *conn)
+{
+    nsbc_ctx_t *ctx = (nsbc_ctx_t *)ud;
+    if (!conn)
+        return;
+    b2b_core_t *b2b = ctx ? (b2b_core_t *)ctx->b2b : NULL;
+    if (!b2b)
+        return;
+    int n = b2b_terminate_ws_conn(b2b, conn);
+    if (n > 0)
+        llog(LOG_WARN, "sig",
+             "ws conn=%p closed → terminated %d call(s) (send BYE toward SIP side)",
+             conn, n);
+    else
+        llog(LOG_DEBUG, "sig", "ws conn=%p closed (no active call bound)", conn);
 }
 
 /* ws_conn* → AF_UNSPEC nsbc_sa_t（藏指针进 padding，与 sig_ws_bridge_rx 对称）。

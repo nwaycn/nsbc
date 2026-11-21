@@ -3727,6 +3727,9 @@ sqlx::query(acct_ddl).execute(pool).await?;
                 enabled       INTEGER NOT NULL DEFAULT 1,
                 ring_strategy TEXT    NOT NULL DEFAULT 'ringall',
                 max_wait_sec  INTEGER NOT NULL DEFAULT 600,
+                wrap_time_s   INTEGER NOT NULL DEFAULT 30,
+                require_skill TEXT    NOT NULL DEFAULT '',
+                overflow      TEXT    NOT NULL DEFAULT '',
                 moh_sound     TEXT    NOT NULL DEFAULT 'default',
                 members_json  TEXT    NOT NULL DEFAULT '[]',
                 description   TEXT    NOT NULL DEFAULT '',
@@ -3743,6 +3746,9 @@ sqlx::query(acct_ddl).execute(pool).await?;
                 enabled       INTEGER NOT NULL DEFAULT 1,
                 ring_strategy TEXT    NOT NULL DEFAULT 'ringall',
                 max_wait_sec  INTEGER NOT NULL DEFAULT 600,
+                wrap_time_s   INT     NOT NULL DEFAULT 30,
+                require_skill VARCHAR(64)  NOT NULL DEFAULT '',
+                overflow      VARCHAR(128) NOT NULL DEFAULT '',
                 moh_sound     TEXT    NOT NULL DEFAULT 'default',
                 members_json  TEXT   NOT NULL DEFAULT '[]',
                 description   TEXT    NOT NULL DEFAULT '',
@@ -3759,6 +3765,9 @@ sqlx::query(acct_ddl).execute(pool).await?;
                 enabled       TINYINT(1)   NOT NULL DEFAULT 1,
                 ring_strategy VARCHAR(32)  NOT NULL DEFAULT 'ringall',
                 max_wait_sec  INT          NOT NULL DEFAULT 600,
+                wrap_time_s   INT          NOT NULL DEFAULT 30,
+                require_skill VARCHAR(64)  NOT NULL DEFAULT '',
+                overflow      VARCHAR(128) NOT NULL DEFAULT '',
                 moh_sound     VARCHAR(128) NOT NULL DEFAULT 'default',
                 members_json  JSON         NOT NULL,
                 description   VARCHAR(512) NOT NULL DEFAULT '',
@@ -3769,6 +3778,58 @@ sqlx::query(acct_ddl).execute(pool).await?;
         "#,
     };
     sqlx::query(q_ddl).execute(pool).await?;
+
+    // queues 表幂等升级：旧库缺少 C 侧 cq_queue_t 需要的字段
+    // （wrap_time_s / require_skill / overflow），reload 时不再硬编码默认值。
+    {
+        const QUEUE_REQUIRED_COLS: &[(&str, &str, &str, &str)] = &[
+            ("wrap_time_s",
+             "INTEGER NOT NULL DEFAULT 30",
+             "INT NOT NULL DEFAULT 30",
+             "INT NOT NULL DEFAULT 30"),
+            ("require_skill",
+             "TEXT NOT NULL DEFAULT ''",
+             "VARCHAR(64) NOT NULL DEFAULT ''",
+             "VARCHAR(64) NOT NULL DEFAULT ''"),
+            ("overflow",
+             "TEXT NOT NULL DEFAULT ''",
+             "VARCHAR(128) NOT NULL DEFAULT ''",
+             "VARCHAR(128) NOT NULL DEFAULT ''"),
+        ];
+
+        if backend == "sqlite" {
+            let cols: Vec<(i64, String)> = sqlx::query_as(
+                "PRAGMA table_info(queues)"
+            ).fetch_all(pool).await.unwrap_or_default();
+            let col_names: Vec<&str> = cols.iter().map(|(_, c)| c.as_str()).collect();
+            for (name, sql_type, _pg_type, _my_type) in QUEUE_REQUIRED_COLS {
+                if !col_names.contains(name) {
+                    let _ = sqlx::query(&format!(
+                        "ALTER TABLE queues ADD COLUMN {} {}", name, sql_type
+                    )).execute(pool).await;
+                }
+            }
+        } else if backend == "postgres" {
+            for (name, _sqlite, pg_type, _my) in QUEUE_REQUIRED_COLS {
+                let _ = sqlx::query(&format!(
+                    "ALTER TABLE queues ADD COLUMN IF NOT EXISTS {} {}", name, pg_type
+                )).execute(pool).await;
+            }
+        } else if backend == "mysql" {
+            let mut missing: Vec<String> = Vec::new();
+            for (name, _sq, _pg, my_type) in QUEUE_REQUIRED_COLS {
+                let cnt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.columns WHERE table_name='queues' AND column_name=?")
+                    .bind(name).fetch_one(pool).await.unwrap_or(0);
+                if cnt == 0 {
+                    missing.push(format!("ADD COLUMN {} {}", name, my_type));
+                }
+            }
+            if !missing.is_empty() {
+                let sql = format!("ALTER TABLE queues {}", missing.join(", "));
+                let _ = sqlx::query(&sql).execute(pool).await;
+            }
+        }
+    }
 
     // ================ ivr_menus (IVR menus) ================
     // 三层数据模型（REQ-PBX-IVR-001~006）：
@@ -6817,6 +6878,9 @@ pub struct Queue {
     pub enabled:       i64,
     pub ring_strategy: String,
     pub max_wait_sec:  i64,
+    pub wrap_time_s:   i64,
+    pub require_skill: String,
+    pub overflow:      String,
     pub moh_sound:     String,
     pub members_json:  String,
     pub description:   String,
@@ -6835,6 +6899,12 @@ pub struct QueueCreate {
     pub ring_strategy:   String,
     #[serde(default = "default_600")]
     pub max_wait_sec:    i64,
+    #[serde(default = "default_30")]
+    pub wrap_time_s:     i64,
+    #[serde(default)]
+    pub require_skill:   String,
+    #[serde(default)]
+    pub overflow:        String,
     #[serde(default = "default_moh")]
     pub moh_sound:       String,
     #[serde(default = "default_empty_json")]
@@ -6851,6 +6921,9 @@ pub struct QueueUpdate {
     pub enabled:         Option<bool>,
     pub ring_strategy:   Option<String>,
     pub max_wait_sec:    Option<i64>,
+    pub wrap_time_s:     Option<i64>,
+    pub require_skill:   Option<String>,
+    pub overflow:        Option<String>,
     pub moh_sound:       Option<String>,
     pub members_json:    Option<String>,
     pub description:     Option<String>,
@@ -6858,6 +6931,7 @@ pub struct QueueUpdate {
 
 fn default_ringall() -> String { "ringall".to_string() }
 fn default_600() -> i64 { 600 }
+fn default_30() -> i64 { 30 }
 fn default_moh() -> String { "default".to_string() }
 
 // ---------- ivr_menus CRUD ----------
@@ -8167,14 +8241,15 @@ impl Db {
         let backend = self.backend();
         let is_mysql = backend == "mysql";
         let members = if c.members_json.is_empty() { "[]".to_string() } else { c.members_json };
-        let raw_sql = "INSERT INTO queues (tenant_id, name, enabled, ring_strategy, max_wait_sec, moh_sound, members_json, description)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *";
+        let raw_sql = "INSERT INTO queues (tenant_id, name, enabled, ring_strategy, max_wait_sec, wrap_time_s, require_skill, overflow, moh_sound, members_json, description)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *";
         if is_mysql {
             let plain_sql = strip_returning(raw_sql);
             let sql = fix_ph(&plain_sql, backend);
             let res = sqlx::query(&sql)
                 .bind(c.tenant_id).bind(&c.name).bind(c.enabled as i64).bind(&c.ring_strategy)
-                .bind(c.max_wait_sec).bind(&c.moh_sound).bind(&members).bind(&c.description)
+                .bind(c.max_wait_sec).bind(c.wrap_time_s).bind(&c.require_skill).bind(&c.overflow)
+                .bind(&c.moh_sound).bind(&members).bind(&c.description)
                 .execute(pool).await?;
             let id = res.last_insert_id();
             let pick_sql = fix_ph("SELECT * FROM queues WHERE id = ?", backend);
@@ -8183,7 +8258,8 @@ impl Db {
         let sql = fix_ph(raw_sql, backend);
         sqlx::query_as::<_, Queue>(&sql)
         .bind(c.tenant_id).bind(&c.name).bind(c.enabled as i64).bind(&c.ring_strategy)
-        .bind(c.max_wait_sec).bind(&c.moh_sound).bind(&members).bind(&c.description)
+        .bind(c.max_wait_sec).bind(c.wrap_time_s).bind(&c.require_skill).bind(&c.overflow)
+        .bind(&c.moh_sound).bind(&members).bind(&c.description)
         .fetch_one(pool).await
     }
 
@@ -8214,6 +8290,9 @@ impl Db {
         set_bq!("enabled", u.enabled);
         set_srq!("ring_strategy", u.ring_strategy.clone());
         set_iq!("max_wait_sec", u.max_wait_sec);
+        set_iq!("wrap_time_s", u.wrap_time_s);
+        set_srq!("require_skill", u.require_skill.clone());
+        set_srq!("overflow", u.overflow.clone());
         set_srq!("moh_sound", u.moh_sound.clone());
         set_srq!("members_json", u.members_json.clone());
         set_srq!("description", u.description.clone());

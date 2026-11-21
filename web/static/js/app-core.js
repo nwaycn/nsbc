@@ -1045,6 +1045,7 @@ const app = createApp({
       { path: '/ai-backends',   label: t('AI Backends'), icon: 'fa-solid fa-robot' },
       { path: '/time-groups',  label: t('Time Groups'), icon: 'fa-solid fa-clock' },
       { path: '/queues',       label: t('Extension Queues'), icon: 'fa-solid fa-people-group' },
+      { path: '/queue-agents', label: '队列座席状态', icon: 'fa-solid fa-user-clock' },
       { path: '/ivr-menus',    label: t('IVR Menus'), icon: 'fa-solid fa-circle-question' },
       // 计费与Media
       { path: '/billing',      label: t('Billing'), icon: 'fa-solid fa-chart-line' },

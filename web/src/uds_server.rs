@@ -664,15 +664,17 @@ async fn dispatch_cmd_req<C: crate::coreclient::CoreApi + Clone + Send + Sync + 
             // --- queues: list_enabled_queues 返回 (Queue, tenant_name) tuple，展开 members_json ---
             let q_rows = state.db.list_enabled_queues().await.unwrap_or_default();
             let queues: Vec<crate::sync::QueueSyncDto> = q_rows.into_iter().map(|(q, tenant_name)| {
-                let members: Vec<String> = serde_json::from_str(&q.members_json).unwrap_or_default();
+                let members = crate::sync::normalize_queue_members(&q.members_json);
                 crate::sync::QueueSyncDto {
                     tenant: tenant_name,
                     name: q.name.clone(),
                     enabled: q.enabled != 0,
                     strategy: q.ring_strategy.clone(),
                     max_wait_s: q.max_wait_sec,
-                    wrap_time_s: 30,
-                    require_skill: String::new(),
+                    wrap_time_s: q.wrap_time_s,
+                    require_skill: q.require_skill.clone(),
+                    overflow: q.overflow.clone(),
+                    moh_sound: q.moh_sound.clone(),
                     members,
                 }
             }).collect();
