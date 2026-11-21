@@ -164,9 +164,10 @@ where C: CoreApi + Clone + 'static
     // 1. Admin scope 鉴权：复用 ext_key middleware 逻辑
     let db = st.db.pool().ok_or(ApiError::ServiceUnavailable("API key store".into()))?;
     let key_hash = hash_key(&q.token);
-    let row: Option<(String, String)> = sqlx::query_as(
+    let row: Option<(String, String)> = sqlx::query_as(&crate::db::fix_ph(
         "SELECT label, scope FROM ext_api_keys WHERE key_hash = ? AND revoked_at IS NULL LIMIT 1",
-    ).bind(&key_hash).fetch_optional(&*db).await
+        st.db.backend(),
+    )).bind(&key_hash).fetch_optional(&*db).await
         .map_err(|e| ApiError::Db(format!("key lookup: {}", e)))?;
     let (label, scope_str) = row.ok_or(ApiError::Unauthenticated)?;
     let scope = match scope_str.as_str() {

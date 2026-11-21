@@ -1520,17 +1520,23 @@ static void sig_on_end_cb(void *call_key, void *ud)
             }
             if (exp > 0) {
                 vq_loss_pct = (int32_t)((uint64_t)lost * 1000u / exp); /* 千分比 */
-                /* E-model 简化：R = 94.2 - Ie - Id - Ie*loss_pct/(loss_pct+Bpl)
-                 * codec=PCMU/G711 时 Ie=0, Bpl=19.0；简化 loss 影响：R_loss = loss_pct * 25.1 */
-                int32_t loss_q = vq_loss_pct; /* 千分比 → 直接用 */
-                int32_t r_factor = 942 - loss_q * 25 / 100; /* R×100，loss 千分→÷10 */
-                if (r_factor < 0)   r_factor = 0;
-                if (r_factor > 1000) r_factor = 1000;
-                /* R→MOS (ITU-T G.107 简化) */
-                if (r_factor > 640)
-                    vq_mos = (int32_t)(0.035f * r_factor + 7.0f * r_factor * (1000 - r_factor) * (r_factor - 640) * 1e-8f);
-                else
-                    vq_mos = (int32_t)(0.0001f * r_factor * r_factor * r_factor);
+                /* ITU-T G.113/G.107 E-model（G.711：Ie=0, Bpl=25.1）：
+                 *   Ie_eff = 95 * Ppl / (Ppl + 25.1)      Ppl=丢包百分比
+                 *   R      = 93.2 - Ie_eff                (0..100)
+                 *   MOS    = 1 + 0.035R + 7R(R-60)(100-R)×1e-6
+                 * 0% 丢包 → R=93.2 → MOS≈4.41；10% → R≈66.1 → MOS≈3.06。
+                 * 注意 R 必须用百分制：旧实现把千分制 R 直接代入，结果恒为
+                 * 0.03 量级（通话正常却显示 0.03）。 */
+                float ppl    = (float)vq_loss_pct / 10.0f; /* 千分比 → % */
+                float ie_eff = 95.0f * ppl / (ppl + 25.1f);
+                float r_val  = 93.2f - ie_eff;
+                if (r_val < 0.0f)   r_val = 0.0f;
+                if (r_val > 100.0f) r_val = 100.0f;
+                float mos_val = 1.0f + 0.035f * r_val
+                    + 7.0f * r_val * (r_val - 60.0f) * (100.0f - r_val) * 1e-6f;
+                if (mos_val < 1.0f) mos_val = 1.0f;
+                if (mos_val > 4.5f) mos_val = 4.5f;
+                vq_mos = (int32_t)(mos_val * 1000.0f + 0.5f); /* MOS×1000 */
                 /* RR jitter tick→ms：PCMU=8000Hz → 每个 tick=125us */
                 if (have_rr && jitter_ticks > 0)
                     vq_jitter_ms = jitter_ticks / (mv.have_rr[0] + mv.have_rr[1]) * 125 / 1000;

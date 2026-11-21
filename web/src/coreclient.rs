@@ -1802,12 +1802,14 @@ pub fn parse_call_list(body: &str) -> Result<CallList, CoreError> {
                 a_peer_ip: kv_opt(toks.iter().copied(), "a_peer_ip").filter(|v| v != "-"),
                 b_peer_ip: kv_opt(toks.iter().copied(), "b_peer_ip").filter(|v| v != "-"),
                 rtp_loss_pct: kv_opt(toks.iter().copied(), "rtp_loss_pct")
-                    .and_then(|v| if v == "-" || v == "0" { None } else { v.parse::<u32>().ok() }),
+                    .and_then(|v| if v == "-" { None } else { v.parse::<u32>().ok() }),
                 rtp_jitter_ms: kv_opt(toks.iter().copied(), "rtp_jitter_ms")
-                    .and_then(|v| if v == "-" || v == "0" { None } else { v.parse::<u32>().ok() }),
+                    .and_then(|v| if v == "-" { None } else { v.parse::<u32>().ok() }),
+                // 核心侧：-1 = 未采集（无 relay / 尚无 RTP 统计 / BYPASS），
+                // 0..5000 = 有效 MOS*1000（正常范围 1000..4500）。
                 mos_x1000: kv_opt(toks.iter().copied(), "mos_x1000")
-                    .and_then(|v| if v == "-" || v == "0" { None } else { v.parse::<i32>().ok() })
-                    .filter(|&v| v >= 0),
+                    .and_then(|v| if v == "-" || v == "-1" { None } else { v.parse::<i32>().ok() })
+                    .filter(|&v| v > 0),
             });
         } else if let Some(rest) = line.strip_prefix("channels=") {
             // channels=N truncated=T (two k=v on the same trailing line)

@@ -205,9 +205,9 @@ function fmtMos(v) {
   if (v == null || v < 0) return '-';
   return (v / 1000).toFixed(2);
 }
-// 丢包率 %（0-100）
+// 丢包率 %（0-100）；0 是有效值（无丢包），只有采集缺失(null)才显示 '-'
 function fmtLoss(v) {
-  if (v == null || v === 0) return '-';
+  if (v == null) return '-';
   return v + '%';
 }
 

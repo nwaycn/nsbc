@@ -121,9 +121,10 @@ pub async fn require_ext_key<C: crate::coreclient::CoreApi + Clone + 'static>(
         .db
         .pool()
         .ok_or_else(|| ApiError::ServiceUnavailable("API key store unavailable".into()))?;
-    let row: Option<(String, String)> = sqlx::query_as(
+    let row: Option<(String, String)> = sqlx::query_as(&crate::db::fix_ph(
         "SELECT label, scope FROM ext_api_keys WHERE key_hash = ? AND revoked_at IS NULL LIMIT 1",
-    )
+        st.db.backend(),
+    ))
     .bind(&key_hash)
     .fetch_optional(pool)
     .await
@@ -148,9 +149,16 @@ pub async fn require_ext_key<C: crate::coreclient::CoreApi + Clone + 'static>(
     let kh = key_hash.clone();
     tokio::spawn(async move {
         if let Some(pool) = db.pool() {
-            if let Err(e) = sqlx::query(
-                "UPDATE ext_api_keys SET last_used_at = CURRENT_TIMESTAMP WHERE key_hash = ?",
-            )
+            // last_used_at: PG/SQLite 是 TEXT，MySQL 是 DATETIME，各自用本地时间表达式
+            let now_expr = match db.backend() {
+                "postgres" => "NOW()::text",
+                "mysql" => "CURRENT_TIMESTAMP",
+                _ => "datetime('now')",
+            };
+            let sql = format!(
+                "UPDATE ext_api_keys SET last_used_at = {now_expr} WHERE key_hash = $1"
+            );
+            if let Err(e) = sqlx::query(&crate::db::fix_ph(&sql, db.backend()))
             .bind(&kh)
             .execute(pool)
             .await

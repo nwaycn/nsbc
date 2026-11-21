@@ -258,7 +258,8 @@ async fn revoke_ext_key<C: crate::coreclient::CoreApi + Clone + 'static>(
     let backend = st.db.backend();
 
     let now_expr = match backend {
-        "postgres" | "mysql" => "CURRENT_TIMESTAMP",
+        "postgres" => "NOW()::text",
+        "mysql" => "CURRENT_TIMESTAMP",
         _ => "datetime('now')",
     };
     let sql = crate::db::fix_ph(&format!(

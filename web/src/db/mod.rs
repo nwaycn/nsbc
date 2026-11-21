@@ -445,13 +445,19 @@ impl Db {
         new_value: &str,
     ) -> Result<(), sqlx::Error> {
         let Some(pool) = self.pool.as_ref() else { return Ok(()); };
-        // Note: config_history DDL column name is `key` (not cfg_key).
+        // Note: config_history DDL column name is `key` (not cfg_key). `key` is a MySQL
+        // reserved word, so the MySQL statement must backtick-quote it.
         // changed_at is auto-filled by column DEFAULT (SQLite datetime('now') / PG NOW() /
         // MySQL CURRENT_TIMESTAMP(3)); we do not pass it here.
-        sqlx::query(
-            "INSERT INTO config_history (actor, action, key, old_value, new_value) \
-             VALUES ($1, $2, $3, $4, $5)",
-        )
+        let sql = match self.backend() {
+            "mysql" =>
+                "INSERT INTO config_history (actor, action, `key`, old_value, new_value) \
+                 VALUES (?, ?, ?, ?, ?)",
+            _ =>
+                "INSERT INTO config_history (actor, action, key, old_value, new_value) \
+                 VALUES ($1, $2, $3, $4, $5)",
+        };
+        sqlx::query(&fix_ph(sql, self.backend()))
         .bind(actor)
         .bind(action)
         .bind(key)
@@ -553,7 +559,7 @@ impl Db {
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
                  ON CONFLICT DO NOTHING",
         };
-        sqlx::query(sql)
+        sqlx::query(&fix_ph(sql, self.backend()))
             .bind(call_id)
             .bind(from_num)
             .bind(to_num)
@@ -597,9 +603,10 @@ impl Db {
         // expires_sec == 0 → terminal deregistration: DELETE instead of UPSERT.
         // C-side registrar.c pushes expires_sec=0 on un-REGISTER / contact expiry.
         if expires_sec == 0 {
-            sqlx::query(
+            sqlx::query(&fix_ph(
                 "DELETE FROM registrations WHERE user_name = $1 AND instance_id = $2",
-            )
+                self.backend(),
+            ))
             .bind(user_name)
             .bind(instance_id)
             .execute(pool.as_ref())
@@ -643,7 +650,7 @@ impl Db {
                  nat_detected = excluded.nat_detected, public_contact = excluded.public_contact, \
                  transport = excluded.transport",
         };
-        sqlx::query(sql)
+        sqlx::query(&fix_ph(sql, self.backend()))
             .bind(user_name)
             .bind(contact)
             .bind(instance_id)
@@ -739,9 +746,10 @@ impl Db {
         detail: Option<&str>,
     ) -> Result<(), sqlx::Error> {
         let Some(pool) = self.pool.as_ref() else { return Ok(()); };
-        sqlx::query(
+        sqlx::query(&fix_ph(
             "INSERT INTO runtime_state (call_id, state, detail) VALUES ($1, $2, $3)",
-        )
+            self.backend(),
+        ))
         .bind(call_id)
         .bind(state)
         .bind(detail)
@@ -762,10 +770,11 @@ impl Db {
         detail: Option<&str>,
     ) -> Result<(), sqlx::Error> {
         let Some(pool) = self.pool.as_ref() else { return Ok(()); };
-        sqlx::query(
+        sqlx::query(&fix_ph(
             "INSERT INTO audit_log (event, actor, ip, target, status, detail) \
              VALUES ($1, $2, $3, $4, $5, $6)",
-        )
+            self.backend(),
+        ))
         .bind(event)
         .bind(actor)
         .bind(ip)
@@ -842,7 +851,7 @@ impl Db {
                      a_peer_ip = CASE WHEN excluded.a_peer_ip = '' THEN calls.a_peer_ip ELSE excluded.a_peer_ip END, \
                      b_peer_ip = CASE WHEN excluded.b_peer_ip = '' THEN calls.b_peer_ip ELSE excluded.b_peer_ip END",
         };
-        sqlx::query(sql)
+        sqlx::query(&fix_ph(sql, self.backend()))
             .bind(call_id)
             .bind(from_num)
             .bind(to_num)
@@ -902,21 +911,67 @@ impl Db {
         let a_peer_ip_fb = a_peer_ip.clone();
         let b_peer_ip_fb = b_peer_ip.clone();
         let pool_clone = self.pool.clone();
+        let backend_owned = self.backend().to_string();
         let fallback = move || {
             tokio::spawn(async move {
                 if let Some(pool) = pool_clone.as_ref() {
-                    let _ = sqlx::query(
-                        "INSERT INTO sessions \
-                         (call_id, from_num, to_num, dir, state, event, cause, \
-                          from_ip, codec_a, codec_b, a_peer_ip, b_peer_ip) \
-                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
-                    )
-                    .bind(&call_id_fb).bind(&from_num_fb).bind(&to_num_fb).bind(&dir_fb)
-                    .bind(&state_fb).bind(&event_fb).bind(cause)
-                    .bind(&from_ip_fb).bind(&codec_a_fb).bind(&codec_b_fb)
-                    .bind(&a_peer_ip_fb).bind(&b_peer_ip_fb)
-                    .execute(pool.as_ref())
-                    .await;
+                    // 队满兜底 = 单行版 flush_sessions：写 calls 表（不存在 sessions 表），
+                    // 13 列含 last_seen，空值保护 UPSERT，语义必须与批量路径完全一致。
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let last_seen = ms_to_iso(now_ms)
+                        .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".into());
+                    let sql = match backend_owned.as_str() {
+                        "mysql" =>
+                            "INSERT INTO calls (call_id, from_num, to_num, dir, state, event, cause, \
+                                 from_ip, codec_a, codec_b, a_peer_ip, b_peer_ip, last_seen) \
+                             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
+                             ON DUPLICATE KEY UPDATE \
+                                 state     = IF(VALUES(state) = '',     calls.state,     VALUES(state)), \
+                                 event     = IF(VALUES(event) = '',     calls.event,     VALUES(event)), \
+                                 cause     = VALUES(cause), \
+                                 last_seen = VALUES(last_seen), \
+                                 from_num  = IF(VALUES(from_num) = '',  calls.from_num,  VALUES(from_num)), \
+                                 to_num    = IF(VALUES(to_num)   = '',  calls.to_num,    VALUES(to_num)), \
+                                 dir       = IF(VALUES(dir)      = '',  calls.dir,       VALUES(dir)), \
+                                 from_ip   = IF(VALUES(from_ip)  = '',  calls.from_ip,   VALUES(from_ip)), \
+                                 codec_a   = IF(VALUES(codec_a)  = '',  calls.codec_a,   VALUES(codec_a)), \
+                                 codec_b   = IF(VALUES(codec_b)  = '',  calls.codec_b,   VALUES(codec_b)), \
+                                 a_peer_ip = IF(VALUES(a_peer_ip)= '',  calls.a_peer_ip, VALUES(a_peer_ip)), \
+                                 b_peer_ip = IF(VALUES(b_peer_ip)= '',  calls.b_peer_ip, VALUES(b_peer_ip))",
+                        _ =>
+                            "INSERT INTO calls (call_id, from_num, to_num, dir, state, event, cause, \
+                                 from_ip, codec_a, codec_b, a_peer_ip, b_peer_ip, last_seen) \
+                             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) \
+                             ON CONFLICT(call_id) DO UPDATE SET \
+                                 state     = CASE WHEN excluded.state    = '' THEN calls.state     ELSE excluded.state     END, \
+                                 event     = CASE WHEN excluded.event    = '' THEN calls.event     ELSE excluded.event     END, \
+                                 cause     = excluded.cause, \
+                                 last_seen = excluded.last_seen, \
+                                 from_num  = CASE WHEN excluded.from_num = '' THEN calls.from_num  ELSE excluded.from_num  END, \
+                                 to_num    = CASE WHEN excluded.to_num   = '' THEN calls.to_num    ELSE excluded.to_num    END, \
+                                 dir       = CASE WHEN excluded.dir      = '' THEN calls.dir       ELSE excluded.dir       END, \
+                                 from_ip   = CASE WHEN excluded.from_ip   = '' THEN calls.from_ip   ELSE excluded.from_ip   END, \
+                                 codec_a   = CASE WHEN excluded.codec_a   = '' THEN calls.codec_a   ELSE excluded.codec_a   END, \
+                                 codec_b   = CASE WHEN excluded.codec_b   = '' THEN calls.codec_b   ELSE excluded.codec_b   END, \
+                                 a_peer_ip = CASE WHEN excluded.a_peer_ip = '' THEN calls.a_peer_ip ELSE excluded.a_peer_ip END, \
+                                 b_peer_ip = CASE WHEN excluded.b_peer_ip = '' THEN calls.b_peer_ip ELSE excluded.b_peer_ip END",
+                    };
+                    let sql = fix_ph(sql, &backend_owned);
+                    if let Err(e) = sqlx::query(&sql)
+                        .bind(&call_id_fb).bind(&from_num_fb).bind(&to_num_fb).bind(&dir_fb)
+                        .bind(&state_fb).bind(&event_fb).bind(cause as i64)
+                        .bind(&from_ip_fb).bind(&codec_a_fb).bind(&codec_b_fb)
+                        .bind(&a_peer_ip_fb).bind(&b_peer_ip_fb)
+                        .bind(&last_seen)
+                        .execute(pool.as_ref())
+                        .await
+                    {
+                        warn!(call_id = %call_id_fb, error = %e,
+                              "session fallback write FAILED (batch channel full)");
+                    }
                 }
             });
         };
@@ -956,9 +1011,10 @@ impl Db {
             tokio::spawn(async move {
                 let Some(pool) = pool_clone.as_ref() else { return; };
                 if expires_sec == 0 {
-                    let _ = sqlx::query(
-                        "DELETE FROM registrations WHERE user_name = $1 AND instance_id = $2"
-                    )
+                    let _ = sqlx::query(&fix_ph(
+                        "DELETE FROM registrations WHERE user_name = $1 AND instance_id = $2",
+                        backend_clone.as_deref().unwrap_or("sqlite"),
+                    ))
                     .bind(&user_name_fb).bind(&instance_id_fb)
                     .execute(pool.as_ref()).await;
                     return;
@@ -1003,7 +1059,7 @@ impl Db {
                 };
                 let received_port_i64 = received_port.unwrap_or(0);
                 let nat_detected_i64  = nat_detected.unwrap_or(0);
-                let _ = sqlx::query(sql)
+                let _ = sqlx::query(&fix_ph(sql, backend_clone.as_deref().unwrap_or("sqlite")))
                     .bind(&user_name_fb).bind(contact_fb.as_deref()).bind(&instance_id_fb)
                     .bind(agent_fb.as_deref()).bind(&expires_at).bind(&updated_at)
                     .bind(received_ip).bind(received_port_i64).bind(nat_detected_i64)
@@ -1064,37 +1120,84 @@ impl Db {
         let b_peer_ip_fb = b_peer_ip.clone();
         let threat_reason_fb = threat_reason.clone();
         let pool_clone = self.pool.clone();
+        let backend_owned = self.backend().to_string();
         let fallback = move || {
             tokio::spawn(async move {
                 if let Some(pool) = pool_clone.as_ref() {
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64).unwrap_or(0);
-                    let phase_time = ms_to_iso(now_ms);
-                    let sql = "INSERT INTO cdrs \
-                        (call_id, tenant, from_num, to_num, trunk, rec_path, dir, phase, disposition, \
-                         start_time, answer_time, end_time, billsec, duration_s, cause, emergency, \
-                         from_ip, codec_a, codec_b, a_peer_ip, b_peer_ip, \
-                         is_malicious, threat_reason) \
-                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)";
-                    let _ = sqlx::query(sql)
-                        .bind(&call_id_fb).bind(tenant_fb.as_deref()).bind(&from_num_fb).bind(&to_num_fb)
-                        .bind(trunk_fb.as_deref()).bind(rec_path_fb.as_deref()).bind(&dir_fb)
-                        .bind(&phase_fb).bind(&disposition_fb)
-                        .bind(ms_to_iso(start_ms)).bind(ms_to_iso(answer_ms))
-                        .bind(ms_to_iso(end_ms)).bind(billsec as i64).bind(duration_s as i64)
-                        .bind(cause).bind(emergency as i32)
-                        .bind(from_ip_fb.as_deref())
-                        .bind(codec_a_fb.as_deref()).bind(codec_b_fb.as_deref())
-                        .bind(a_peer_ip_fb.as_deref()).bind(b_peer_ip_fb.as_deref())
-                        .bind(is_malicious as i32).bind(threat_reason_fb.as_deref())
-                        .execute(pool.as_ref()).await;
-                    let _ = sqlx::query(
-                        "INSERT INTO runtime_states (call_id, state, detail, phase_time) VALUES ($1,$2,$3,$4) \
-                         ON CONFLICT(call_id, state) DO UPDATE SET detail=excluded.detail, phase_time=excluded.phase_time"
-                    )
-                    .bind(&call_id_fb).bind("CDR").bind(&disposition_fb).bind(&phase_time)
-                    .execute(pool.as_ref()).await;
+                    // 队满兜底 = 单行版 flush_cdrs：写 cdr 表（11 列），
+                    // tenant/trunk/dir/phase 等无独立列，统一塞进 metadata JSON。
+                    // 注意：批量路径不写 runtime_state，兜底也不写，保持两条路径等价。
+                    let start_iso = ms_to_iso(start_ms);
+                    let answer_iso = if answer_ms > 0 { ms_to_iso(answer_ms) } else { None };
+                    let end_iso = if end_ms > 0 { ms_to_iso(end_ms) } else { None };
+
+                    let mut meta_obj = serde_json::json!({
+                        "tenant": &tenant_fb,
+                        "trunk": &trunk_fb,
+                        "rec_path": &rec_path_fb,
+                        "dir": &dir_fb,
+                        "phase": &phase_fb,
+                        "answer_ms": answer_ms,
+                        "billsec": billsec,
+                        "emergency": emergency,
+                        "is_malicious": is_malicious,
+                        "threat_reason": &threat_reason_fb,
+                        "from_ip": &from_ip_fb,
+                    });
+                    if let Some(s) = from_ip_fb.as_deref()   { if !s.is_empty() { meta_obj["from_ip"]   = serde_json::Value::String(s.to_string()); } }
+                    if let Some(s) = codec_a_fb.as_deref()   { if !s.is_empty() { meta_obj["codec_a"]   = serde_json::Value::String(s.to_string()); } }
+                    if let Some(s) = codec_b_fb.as_deref()   { if !s.is_empty() { meta_obj["codec_b"]   = serde_json::Value::String(s.to_string()); } }
+                    if let Some(s) = a_peer_ip_fb.as_deref() { if !s.is_empty() { meta_obj["a_peer_ip"] = serde_json::Value::String(s.to_string()); } }
+                    if let Some(s) = b_peer_ip_fb.as_deref() { if !s.is_empty() { meta_obj["b_peer_ip"] = serde_json::Value::String(s.to_string()); } }
+                    let metadata = meta_obj.to_string();
+
+                    let sql = match backend_owned.as_str() {
+                        "mysql" =>
+                            "INSERT INTO cdr \
+                             (call_id, caller, callee, start_time, answer_time, end_time, \
+                              duration_sec, billsec, cause_code, cause_text, metadata) \
+                             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
+                             ON DUPLICATE KEY UPDATE \
+                             answer_time = COALESCE(VALUES(answer_time), cdr.answer_time), \
+                             end_time    = COALESCE(VALUES(end_time),    cdr.end_time), \
+                             duration_sec = VALUES(duration_sec), \
+                             billsec     = VALUES(billsec), \
+                             cause_code  = VALUES(cause_code), \
+                             cause_text  = VALUES(cause_text), \
+                             metadata    = VALUES(metadata)",
+                        _ =>
+                            "INSERT INTO cdr \
+                             (call_id, caller, callee, start_time, answer_time, end_time, \
+                              duration_sec, billsec, cause_code, cause_text, metadata) \
+                             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) \
+                             ON CONFLICT(call_id) DO UPDATE SET \
+                             answer_time = COALESCE(excluded.answer_time, cdr.answer_time), \
+                             end_time    = COALESCE(excluded.end_time,    cdr.end_time), \
+                             duration_sec = excluded.duration_sec, \
+                             billsec     = excluded.billsec, \
+                             cause_code  = excluded.cause_code, \
+                             cause_text  = excluded.cause_text, \
+                             metadata    = excluded.metadata",
+                    };
+                    let sql = fix_ph(sql, &backend_owned);
+                    if let Err(e) = sqlx::query(&sql)
+                        .bind(&call_id_fb)
+                        .bind(&from_num_fb)
+                        .bind(&to_num_fb)
+                        .bind(start_iso)
+                        .bind(answer_iso)
+                        .bind(end_iso)
+                        .bind(duration_s as i64)
+                        .bind(billsec as i64)
+                        .bind(cause as i64)
+                        .bind(&disposition_fb)
+                        .bind(metadata)
+                        .execute(pool.as_ref())
+                        .await
+                    {
+                        warn!(call_id = %call_id_fb, error = %e,
+                              "cdr fallback write FAILED (batch channel full)");
+                    }
                 }
             });
         };
@@ -1119,19 +1222,24 @@ impl Db {
         let state_fb = state.clone();
         let detail_fb = detail.clone();
         let pool_clone = self.pool.clone();
+        let backend_owned = self.backend().to_string();
         let fallback = move || {
             tokio::spawn(async move {
                 if let Some(pool) = pool_clone.as_ref() {
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64).unwrap_or(0);
-                    let phase_time = ms_to_iso(now_ms);
-                    let _ = sqlx::query(
-                        "INSERT INTO runtime_states (call_id, state, detail, phase_time) VALUES ($1,$2,$3,$4) \
-                         ON CONFLICT(call_id, state) DO UPDATE SET detail=excluded.detail, phase_time=excluded.phase_time"
-                    )
-                    .bind(&call_id_fb).bind(&state_fb).bind(detail_fb.as_deref()).bind(&phase_time)
-                    .execute(pool.as_ref()).await;
+                    // 队满兜底 = 单行版 flush_runtimes：runtime_state 3 列纯 INSERT，
+                    // 没有 phase_time 列，也没有 (call_id, state) 唯一约束，故不带冲突子句。
+                    let sql = fix_ph(
+                        "INSERT INTO runtime_state (call_id, state, detail) VALUES ($1, $2, $3)",
+                        &backend_owned,
+                    );
+                    if let Err(e) = sqlx::query(&sql)
+                        .bind(&call_id_fb).bind(&state_fb).bind(detail_fb.as_deref())
+                        .execute(pool.as_ref())
+                        .await
+                    {
+                        warn!(call_id = %call_id_fb, state = %state_fb, error = %e,
+                              "runtime fallback write FAILED (batch channel full)");
+                    }
                 }
             });
         };
@@ -1397,7 +1505,8 @@ async fn flush_sessions(
         ),
     };
 
-    // 绑定参数 — sqlx 自动 $1..$N 编号
+    // 绑定参数 — 占位符先按后端方言归一化（必须落到具名变量，query 会借用它）
+    let sql = fix_ph(&sql, backend);
     let mut q = sqlx::query(&sql);
     for item in bucket.iter() {
         if let DbBatchItem::Session {
@@ -1491,6 +1600,7 @@ async fn flush_registers(
         ),
     };
 
+    let sql = fix_ph(&sql, backend);
     let mut q = sqlx::query(&sql);
     for (idx, item) in bucket.iter().enumerate() {
         if let DbBatchItem::Register {
@@ -1587,6 +1697,7 @@ async fn flush_cdrs(
         ),
     };
 
+    let sql = fix_ph(&sql, backend);
     let mut q = sqlx::query(&sql);
     for item in bucket.iter() {
         if let DbBatchItem::Cdr {
@@ -1641,7 +1752,7 @@ async fn flush_cdrs(
 
 async fn flush_runtimes(
     pool: &Arc<Pool<Any>>,
-    _backend: &'static str,
+    backend: &'static str,
     bucket: &mut Vec<DbBatchItem>,
 ) {
     let n = bucket.len();
@@ -1660,6 +1771,7 @@ async fn flush_runtimes(
         values_sql
     );
 
+    let sql = fix_ph(&sql, backend);
     let mut q = sqlx::query(&sql);
     for item in bucket.iter() {
         if let DbBatchItem::Runtime { call_id, state, detail } = item {
@@ -1726,47 +1838,159 @@ fn db_missing(e: &sqlx::Error) -> bool {
         || msg.contains("no such database")
 }
 
-/// Unified placeholder conversion — any SQL passes through this function before being handed to sqlx.
+/// Unified placeholder conversion — every SQL statement must pass through this before sqlx.
 /// Accepts both input styles and outputs the backend-required format:
 ///   postgres:  `?` → `$1, $2...`   `$N` kept as-is
-///   sqlite:    `?` → `$1, $2...`   `$N` kept as-is
-///   mysql:     `$N` → `?`           `?` kept as-is
-/// Rule: as soon as the SQL contains `?`, treat it as "native `?` style"; as soon as it contains `${digit}`,
-/// treat it as "pg style".
+///   sqlite:    `?` kept as-is       `$N` → `?`（SQLite 两种都收，统一成 ?）
+///   mysql:     `?` kept as-is       `$N` → `?`
+/// Quoted literals and comments are skipped, so `LIKE '%?%'` / `'$1'` are never rewritten.
 pub fn fix_ph(sql: &str, backend: &str) -> String {
-    let has_q = sql.contains('?');
-    let has_dollar = sql.chars().zip(sql.chars().skip(1))
-        .any(|(a, b)| a == '$' && b.is_ascii_digit());
-    // MySQL 和 SQLite 都用 `?` 占位符，Postgres 用 `$N`
-    if backend == "mysql" || backend == "sqlite" {
-        if has_dollar {
-            let mut out = String::with_capacity(sql.len());
-            let mut chars = sql.chars().peekable();
-            while let Some(c) = chars.next() {
-                if c == '$' {
+    // 单次扫描，跳过字符串字面量（'...' / "..." / `...`）与注释（-- / /* */），
+    // 只改写真正的占位符。这样 LIKE '%?%' 之类的内容不会被误改。
+    //   sqlite / mysql: `$N` → `?`（`?` 原样保留）
+    //   postgres:       `?`  → `$N`（已有 `$N` 原样保留并延续编号）
+    let chars: Vec<char> = sql.chars().collect();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0usize;
+    let mut next_n = 0u32;
+    // 0=normal 1='...' 2="..." 3=`...` 4=-- 5=/* */
+    let mut state = 0u8;
+    while i < chars.len() {
+        let c = chars[i];
+        match state {
+            0 => match c {
+                '\'' => { state = 1; out.push(c); i += 1; }
+                '"'  => { state = 2; out.push(c); i += 1; }
+                '`'  => { state = 3; out.push(c); i += 1; }
+                '-' if i + 1 < chars.len() && chars[i + 1] == '-' => {
+                    state = 4; out.push('-'); out.push('-'); i += 2;
+                }
+                '/' if i + 1 < chars.len() && chars[i + 1] == '*' => {
+                    state = 5; out.push('/'); out.push('*'); i += 2;
+                }
+                '$' if i + 1 < chars.len() && chars[i + 1].is_ascii_digit() => {
+                    let mut j = i + 1;
                     let mut num = String::new();
-                    while let Some(&nc) = chars.peek() {
-                        if nc.is_ascii_digit() { num.push(chars.next().unwrap()); }
-                        else { break; }
+                    while j < chars.len() && chars[j].is_ascii_digit() {
+                        num.push(chars[j]);
+                        j += 1;
                     }
-                    if !num.is_empty() { out.push('?'); } else { out.push(c); }
-                } else { out.push(c); }
+                    if backend == "mysql" || backend == "sqlite" {
+                        out.push('?');
+                    } else {
+                        if let Ok(v) = num.parse::<u32>() {
+                            if v > next_n { next_n = v; }
+                        }
+                        out.push('$');
+                        out.push_str(&num);
+                    }
+                    i = j;
+                }
+                '?' => {
+                    if backend == "mysql" || backend == "sqlite" {
+                        out.push('?');
+                    } else {
+                        next_n += 1;
+                        out.push('$');
+                        out.push_str(&next_n.to_string());
+                    }
+                    i += 1;
+                }
+                _ => { out.push(c); i += 1; }
+            },
+            1 => {
+                out.push(c);
+                i += 1;
+                if c == '\'' {
+                    // SQL 标准的 '' 转义
+                    if i < chars.len() && chars[i] == '\'' { out.push('\''); i += 1; }
+                    else { state = 0; }
+                }
             }
-            out
-        } else {
-            sql.to_string()
+            2 => { out.push(c); i += 1; if c == '"' { state = 0; } }
+            3 => { out.push(c); i += 1; if c == '`' { state = 0; } }
+            4 => { out.push(c); i += 1; if c == '\n' { state = 0; } }
+            _ => {
+                out.push(c);
+                if c == '*' && i + 1 < chars.len() && chars[i + 1] == '/' {
+                    out.push('/');
+                    i += 2;
+                    state = 0;
+                } else {
+                    i += 1;
+                }
+            }
         }
-    } else if has_q {
-        let mut out = String::with_capacity(sql.len());
-        let mut n = 0u32;
-        for chunk in sql.split('?') {
-            if n > 0 { out.push_str(&format!("${n}")); }
-            out.push_str(chunk);
-            n += 1;
+    }
+    out
+}
+
+/// 跨三库的幂等建索引。
+/// MySQL 不支持 `CREATE INDEX IF NOT EXISTS`，改用 information_schema.statistics
+/// （限定当前库，避免同名库/多 schema 误判）。
+async fn ensure_index(pool: &Pool<Any>, backend: &str, name: &str, table: &str, cols: &str) {
+    let sql = if backend == "mysql" {
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.statistics \
+             WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ?",
+        )
+        .bind(table)
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+        if exists > 0 {
+            return;
         }
-        out
+        format!("CREATE INDEX {} ON {}({})", name, table, cols)
     } else {
-        sql.to_string()
+        format!("CREATE INDEX IF NOT EXISTS {} ON {}({})", name, table, cols)
+    };
+    if let Err(e) = sqlx::query(&sql).execute(pool).await {
+        warn!("ensure_index {} on {} failed: {}", name, table, e);
+    }
+}
+
+/// 跨三库的幂等加列。
+/// MySQL 不支持 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`（那是 MariaDB 语法）。
+async fn ensure_column(
+    pool: &Pool<Any>,
+    backend: &str,
+    table: &str,
+    name: &str,
+    sqlite_def: &str,
+    pg_def: &str,
+    mysql_def: &str,
+) {
+    let sql = if backend == "mysql" {
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.columns \
+             WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?",
+        )
+        .bind(table)
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+        if exists > 0 {
+            return;
+        }
+        format!("ALTER TABLE {} ADD COLUMN {} {}", table, name, mysql_def)
+    } else if backend == "postgres" {
+        format!("ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} {}", table, name, pg_def)
+    } else {
+        let cols: Vec<(i64, String)> =
+            sqlx::query_as(&format!("PRAGMA table_info({})", table))
+                .fetch_all(pool)
+                .await
+                .unwrap_or_default();
+        if cols.iter().any(|(_, c)| c == name) {
+            return;
+        }
+        format!("ALTER TABLE {} ADD COLUMN {} {}", table, name, sqlite_def)
+    };
+    if let Err(e) = sqlx::query(&sql).execute(pool).await {
+        warn!("ensure_column {}.{} failed: {}", table, name, e);
     }
 }
 
@@ -2140,7 +2364,9 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
                 "INSERT INTO tenants (id, tenant_name, description, enabled) VALUES (1, 'nsbc.local', 'Default SIP realm', 1)"
             ).execute(pool).await;
             // Auto-increment ID alignment (PG uses setval, SQLite AUTOINCREMENT no-op, MySQL AUTO_INCREMENT no-op)
-            let _ = sqlx::query("SELECT setval(pg_get_serial_sequence('tenants','id'), GREATEST(COALESCE((SELECT MAX(id) FROM tenants),1),1), true)").execute(pool).await;
+            if backend == "postgres" {
+                let _ = sqlx::query("SELECT setval(pg_get_serial_sequence('tenants','id'), GREATEST(COALESCE((SELECT MAX(id) FROM tenants),1),1), true)").execute(pool).await;
+            }
         }
     }
 
@@ -2204,9 +2430,9 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
                 b_call_id    VARCHAR(127),
                 caller       VARCHAR(64),
                 callee       VARCHAR(64),
-                start_time   TEXT         NOT NULL,
-                answer_time  TEXT,
-                end_time     TEXT,
+                start_time   VARCHAR(40)  NOT NULL,
+                answer_time  VARCHAR(40),
+                end_time     VARCHAR(40),
                 duration_sec INT,
                 billsec      INT,
                 cause_code   INT,
@@ -2236,38 +2462,15 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
         ("idx_cdr_cause",  "cause_code"),
     ];
     for (idx, col) in cdr_single_indexes {
-        sqlx::query(&format!(
-            "CREATE INDEX IF NOT EXISTS {idx} ON cdr({col})"
-        )).execute(pool).await?;
+        ensure_index(pool, backend, idx, "cdr", col).await;
     }
-    // Composite indexes: full SQL, avoid double parentheses
-    let cdr_composite_indexes: &[&str] = &[
-        "CREATE INDEX IF NOT EXISTS idx_cdr_start_caller  ON cdr(start_time, caller)",
-        "CREATE INDEX IF NOT EXISTS idx_cdr_start_callee  ON cdr(start_time, callee)",
-        "CREATE INDEX IF NOT EXISTS idx_cdr_cause_start   ON cdr(cause_code, start_time)",
-    ];
-    for sql in cdr_composite_indexes {
-        sqlx::query(sql).execute(pool).await?;
-    }
+    ensure_index(pool, backend, "idx_cdr_start_caller", "cdr", "start_time, caller").await;
+    ensure_index(pool, backend, "idx_cdr_start_callee", "cdr", "start_time, callee").await;
+    ensure_index(pool, backend, "idx_cdr_cause_start", "cdr", "cause_code, start_time").await;
 
     // --- Upgrade migration: append answer_time / billsec to old tables (idempotent) ---
-    match backend {
-        "sqlite" => {
-            let cols: Vec<(i64, String)> = sqlx::query_as("PRAGMA table_info(cdr)")
-                .fetch_all(pool).await.unwrap_or_default();
-            let col_names: Vec<&str> = cols.iter().map(|(_, c)| c.as_str()).collect();
-            if !col_names.contains(&"answer_time") {
-                let _ = sqlx::query("ALTER TABLE cdr ADD COLUMN answer_time TEXT").execute(pool).await;
-            }
-            if !col_names.contains(&"billsec") {
-                let _ = sqlx::query("ALTER TABLE cdr ADD COLUMN billsec INTEGER").execute(pool).await;
-            }
-        }
-        _ => {
-            let _ = sqlx::query("ALTER TABLE cdr ADD COLUMN IF NOT EXISTS answer_time TEXT").execute(pool).await;
-            let _ = sqlx::query("ALTER TABLE cdr ADD COLUMN IF NOT EXISTS billsec INTEGER").execute(pool).await;
-        }
-    }
+    ensure_column(pool, backend, "cdr", "answer_time", "TEXT", "TEXT", "VARCHAR(40)").await;
+    ensure_column(pool, backend, "cdr", "billsec", "INTEGER", "INTEGER", "INT").await;
 
     // SQLite: enable WAL + auto_vacuum=INCREMENTAL (essential for multi-million-row data)
     // busy_timeout=5000: WAL 模式下多 reader 竞争 writer 时最多等 5s
@@ -2309,7 +2512,7 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
                 changed_at  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
                 actor       VARCHAR(64) NOT NULL,
                 action      VARCHAR(16) NOT NULL,
-                key         VARCHAR(256),
+                `key`       VARCHAR(256),
                 old_value   TEXT,
                 new_value   TEXT,
                 session_id  VARCHAR(128)
@@ -2351,7 +2554,7 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
                 ip          VARCHAR(64),
                 target      VARCHAR(256),
                 status      VARCHAR(16),
-                detail      JSON
+                detail      TEXT
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
         _ => unreachable!(),
     };
@@ -2412,7 +2615,7 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
                 received_ip    VARCHAR(64) NOT NULL DEFAULT '',
                 received_port  INT NOT NULL DEFAULT 0,
                 nat_detected   TINYINT(1) NOT NULL DEFAULT 0,
-                public_contact TEXT NOT NULL DEFAULT '',
+                public_contact VARCHAR(256) NOT NULL DEFAULT '',
                 transport      VARCHAR(16) NOT NULL DEFAULT '',
                 UNIQUE KEY uq_reg_user_inst (user_name, instance_id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
@@ -2451,18 +2654,16 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
                 )).execute(pool).await;
             }
         } else if backend == "mysql" {
-            let mut sql = String::from("ALTER TABLE registrations ");
-            for (i, (name, _, _)) in nat_cols.iter().enumerate() {
-                let comma = if i > 0 { ", " } else { "" };
+            // 逐列探测，避免任一列已存在导致整条多列 ALTER 失败
+            for (name, _, _) in nat_cols {
                 let def = match *name {
                     "received_port" => "INT NOT NULL DEFAULT 0",
                     "nat_detected"  => "TINYINT(1) NOT NULL DEFAULT 0",
                     "transport"     => "VARCHAR(16) NOT NULL DEFAULT ''",
                     _               => "VARCHAR(256) NOT NULL DEFAULT ''",
                 };
-                sql.push_str(&format!("{}ADD COLUMN {} {}", comma, name, def));
+                ensure_column(pool, backend, "registrations", name, "", "", def).await;
             }
-            let _ = sqlx::query(&sql).execute(pool).await;
         }
     }
 
@@ -2492,17 +2693,14 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
                 id       BIGINT AUTO_INCREMENT PRIMARY KEY,
                 call_id  VARCHAR(128) NOT NULL,
                 state    VARCHAR(32)  NOT NULL,
-                detail   JSON,
-                ts       VARCHAR(40)  NOT NULL,
+                detail   TEXT,
+                ts       VARCHAR(40)  NOT NULL DEFAULT '',
                 INDEX idx_rt_call (call_id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
         _ => unreachable!(),
     };
     sqlx::query(rt_ddl).execute(pool).await?;
-    if backend != "mysql" {
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_rt_call ON runtime_state(call_id)")
-            .execute(pool).await?;
-    }
+    ensure_index(pool, backend, "idx_rt_call", "runtime_state", "call_id").await;
 
     // --- calls (REQ-DATA-SVC-002 session.write target table) ---
     // Real-time session snapshot (UPDATE ON CONFLICT), call_id unique key; every session
@@ -2559,15 +2757,12 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
                 codec_b   VARCHAR(32)  NOT NULL DEFAULT '',
                 a_peer_ip VARCHAR(64)  NOT NULL DEFAULT '',
                 b_peer_ip VARCHAR(64)  NOT NULL DEFAULT '',
-                last_seen DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+                last_seen VARCHAR(40)  NOT NULL DEFAULT ''
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
         _ => unreachable!(),
     };
     sqlx::query(calls_ddl).execute(pool).await?;
-    if backend != "mysql" {
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_calls_state ON calls(state)")
-            .execute(pool).await?;
-    }
+    ensure_index(pool, backend, "idx_calls_state", "calls", "state").await;
 
     // --- Auto-migration: add new columns to existing calls table when missing
     // (SQLite ALTER TABLE ADD COLUMN is safe and idempotent) ---
@@ -2579,10 +2774,9 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
         ("a_peer_ip", "TEXT NOT NULL DEFAULT ''"),
         ("b_peer_ip", "TEXT NOT NULL DEFAULT ''"),
     ] {
-        // already present → silently ignored (sqlite / pg / mysql do not error on duplicate ADD)
-        let _ = sqlx::query(&format!(
-            "ALTER TABLE calls ADD COLUMN {} {}", col, def
-        )).execute(pool).await;
+        // 三库幂等加列；MySQL 的 TEXT 列不允许字面量 DEFAULT，故用 VARCHAR(64)
+        ensure_column(pool, backend, "calls", col, def, def,
+                      "VARCHAR(64) NOT NULL DEFAULT ''").await;
     }
 
     // --- extensions (REQ-WEB-016 extension management CRUD) ---
@@ -2644,14 +2838,14 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
                 tenant_id       BIGINT       NOT NULL DEFAULT 1,
                 extension       VARCHAR(64)  NOT NULL,
                 realm           VARCHAR(128) NOT NULL DEFAULT '',
-                password        TEXT         NOT NULL DEFAULT '',
+                password        VARCHAR(256) NOT NULL DEFAULT '',
                 ha1             VARCHAR(128) NOT NULL DEFAULT '',
                 ha1b            VARCHAR(128) NOT NULL DEFAULT '',
                 enabled         TINYINT(1)   NOT NULL DEFAULT 1,
                 clip            VARCHAR(64)  NOT NULL DEFAULT '',
                 clir            TINYINT(1)   NOT NULL DEFAULT 0,
                 max_contacts    INT          NOT NULL DEFAULT 10,
-                dialplan_match  TEXT         NOT NULL DEFAULT '{}',
+                dialplan_match  VARCHAR(2048) NOT NULL DEFAULT '{}',
                 description     VARCHAR(256) NOT NULL DEFAULT '',
                 ext_type        VARCHAR(16)  NOT NULL DEFAULT 'internal',
                 external_number VARCHAR(64)  NOT NULL DEFAULT '',
@@ -2714,9 +2908,7 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
         ("idx_ext_enabled", "enabled"),
         ("idx_ext_clip",    "clip"),
     ] {
-        sqlx::query(&format!(
-            "CREATE INDEX IF NOT EXISTS {idx} ON extensions({col})"
-        )).execute(pool).await?;
+        ensure_index(pool, backend, idx, "extensions", col).await;
     }
 
     // --- gateways (REQ-WEB-016 outbound gateway logical group, corresponds to route_group_t) ---
@@ -2973,9 +3165,7 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
         ("idx_tr_profile",     "profile_name"),
         ("idx_tr_priority",    "priority"),
     ] {
-        sqlx::query(&format!(
-            "CREATE INDEX IF NOT EXISTS {idx} ON trunks({col})"
-        )).execute(pool).await?;
+        ensure_index(pool, backend, idx, "trunks", col).await;
     }
 
     // ================ routes (strategy groups) ================
@@ -3133,9 +3323,7 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
         ("idx_dp_enabled", "enabled"),
         ("idx_dp_prio",    "prio"),
     ] {
-        sqlx::query(&format!(
-            "CREATE INDEX IF NOT EXISTS {idx} ON dialplan_rules({col})"
-        )).execute(pool).await?;
+        ensure_index(pool, backend, idx, "dialplan_rules", col).await;
     }
 
     /* ====== §15 incremental ALTER TABLE: profile_name + src_ip_cidr ======
@@ -3195,9 +3383,7 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
     }
     // §15 new: (profile_name, prio) compound index — high-frequency access point in
     //   the dialplan hot path
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_dp_profile_prio \
-                 ON dialplan_rules(profile_name, prio)")
-        .execute(pool).await.ok();
+    ensure_index(pool, backend, "idx_dp_profile_prio", "dialplan_rules", "profile_name, prio").await;
 
     // ================ ha_groups (high-availability groups — 双机主备 Active-Standby) ================
     // 字段对齐 conf/ha配置.md 中的 yaml 配置模型
@@ -3307,9 +3493,7 @@ async fn run_migrations(pool: &Pool<Any>, backend: &str) -> Result<(), sqlx::Err
         "#,
     };
     sqlx::query(ha_ddl).execute(pool).await?;
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_ha_enabled ON ha_groups(enabled)"
-    ).execute(pool).await?;
+    ensure_index(pool, backend, "idx_ha_enabled", "ha_groups", "enabled").await;
 
 // ================ rate_tables (REQ-OAM-009) ================
 let rt_ddl = match backend {
@@ -3363,7 +3547,7 @@ let rt_ddl = match backend {
     "#,
 };
 sqlx::query(rt_ddl).execute(pool).await?;
-sqlx::query("CREATE INDEX IF NOT EXISTS idx_rt_enabled ON rate_tables(enabled)").execute(pool).await?;
+    ensure_index(pool, backend, "idx_rt_enabled", "rate_tables", "enabled").await;
 
 // ================ accounts (REQ-OAM-009) ================
 let acct_ddl = match backend {
@@ -3506,8 +3690,8 @@ sqlx::query(acct_ddl).execute(pool).await?;
         "#,
     };
     sqlx::query(rpe_ddl).execute(pool).await?;
-    // index for sqlite & postgres
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_rpe_plan_prefix ON rate_plan_entries(plan_id, prefix)").execute(pool).await?;
+    // index for sqlite & postgres & mysql (idempotent)
+    ensure_index(pool, backend, "idx_rpe_plan_prefix", "rate_plan_entries", "plan_id, prefix").await;
 
     // ================ trunk_rate_overrides (trunk-dimension special rates, REQ-BILL-001) ================
     let tro_ddl = match backend {
@@ -3591,9 +3775,9 @@ sqlx::query(acct_ddl).execute(pool).await?;
     };
     sqlx::query(bt_ddl).execute(pool).await?;
     // indexes for sqlite & postgres
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_bt_account ON billing_transactions(account_id)").execute(pool).await?;
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_bt_call ON billing_transactions(call_id)").execute(pool).await?;
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_bt_created ON billing_transactions(created_at)").execute(pool).await?;
+    ensure_index(pool, backend, "idx_bt_account", "billing_transactions", "account_id").await;
+    ensure_index(pool, backend, "idx_bt_call", "billing_transactions", "call_id").await;
+    ensure_index(pool, backend, "idx_bt_created", "billing_transactions", "created_at").await;
 
     // --- accounts upgrade: add billing columns (idempotent, cross-backend) ---
     {
@@ -3623,7 +3807,7 @@ sqlx::query(acct_ddl).execute(pool).await?;
         } else if backend == "mysql" {
             let mut missing: Vec<String> = Vec::new();
             for (name, _sq, _pg, my_type) in ACCT_REQUIRED_COLS {
-                let cnt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.columns WHERE table_name='accounts' AND column_name=?")
+                let cnt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name='accounts' AND column_name=?")
                     .bind(name).fetch_one(pool).await.unwrap_or(0);
                 if cnt == 0 {
                     missing.push(format!("ADD COLUMN {} {}", name, my_type));
@@ -3662,7 +3846,7 @@ sqlx::query(acct_ddl).execute(pool).await?;
         } else if backend == "mysql" {
             let mut missing: Vec<String> = Vec::new();
             for (name, _sq, _pg, my_type) in RT_REQUIRED_COLS {
-                let cnt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.columns WHERE table_name='rate_tables' AND column_name=?")
+                let cnt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name='rate_tables' AND column_name=?")
                     .bind(name).fetch_one(pool).await.unwrap_or(0);
                 if cnt == 0 {
                     missing.push(format!("ADD COLUMN {} {}", name, my_type));
@@ -3818,7 +4002,7 @@ sqlx::query(acct_ddl).execute(pool).await?;
         } else if backend == "mysql" {
             let mut missing: Vec<String> = Vec::new();
             for (name, _sq, _pg, my_type) in QUEUE_REQUIRED_COLS {
-                let cnt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.columns WHERE table_name='queues' AND column_name=?")
+                let cnt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name='queues' AND column_name=?")
                     .bind(name).fetch_one(pool).await.unwrap_or(0);
                 if cnt == 0 {
                     missing.push(format!("ADD COLUMN {} {}", name, my_type));
@@ -3985,7 +4169,7 @@ sqlx::query(acct_ddl).execute(pool).await?;
             // 先查 information_schema 确认哪些列缺失，避免一次性 ALTER TABLE 里有已存在的列导致整批失败
             let mut missing: Vec<String> = Vec::new();
             for (name, _sq, _pg, my_type) in IVR_REQUIRED_COLS {
-                let cnt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.columns WHERE table_name='ivr_menus' AND column_name=?")
+                let cnt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name='ivr_menus' AND column_name=?")
                     .bind(name).fetch_one(pool).await.unwrap_or(0);
                 if cnt == 0 {
                     missing.push(format!("ADD COLUMN {} {}", name, my_type));
@@ -4126,21 +4310,22 @@ sqlx::query(acct_ddl).execute(pool).await?;
             }
         }
         _ => {
-            // PG/MySQL: ADD COLUMN IF NOT EXISTS for idempotency
-            let _ = sqlx::query("ALTER TABLE sip_profiles ADD COLUMN IF NOT EXISTS auth_calls INTEGER NOT NULL DEFAULT 0").execute(pool).await;
-            let _ = sqlx::query("ALTER TABLE sip_profiles ADD COLUMN IF NOT EXISTS ip_whitelist TEXT NOT NULL DEFAULT ''").execute(pool).await;
-            let _ = sqlx::query("ALTER TABLE sip_profiles ADD COLUMN IF NOT EXISTS ip_blacklist TEXT NOT NULL DEFAULT ''").execute(pool).await;
+            // MySQL 不支持 ADD COLUMN IF NOT EXISTS（MariaDB 扩展），改用 information_schema 探测
+            ensure_column(pool, backend, "sip_profiles", "auth_calls",
+                "INTEGER NOT NULL DEFAULT 0", "INTEGER NOT NULL DEFAULT 0", "TINYINT(1) NOT NULL DEFAULT 0").await;
+            ensure_column(pool, backend, "sip_profiles", "ip_whitelist",
+                "TEXT NOT NULL DEFAULT ''", "TEXT NOT NULL DEFAULT ''", "VARCHAR(512) NOT NULL DEFAULT ''").await;
+            ensure_column(pool, backend, "sip_profiles", "ip_blacklist",
+                "TEXT NOT NULL DEFAULT ''", "TEXT NOT NULL DEFAULT ''", "VARCHAR(512) NOT NULL DEFAULT ''").await;
             /* ★ 3GPP IMS 协议特性开关（与 C 端 sip_profile_t.enable_* 对齐） */
             for col in ["enable_t140", "enable_precondition", "enable_timer", "enable_gruu"] {
-                let sql = format!("ALTER TABLE sip_profiles ADD COLUMN IF NOT EXISTS {} INTEGER NOT NULL DEFAULT 0", col);
-                let _ = sqlx::query(&sql).execute(pool).await;
+                ensure_column(pool, backend, "sip_profiles", col,
+                    "INTEGER NOT NULL DEFAULT 0", "INTEGER NOT NULL DEFAULT 0", "TINYINT(1) NOT NULL DEFAULT 0").await;
             }
         }
     }
 
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_sp_enabled ON sip_profiles(enabled)"
-    ).execute(pool).await?;
+    ensure_index(pool, backend, "idx_sp_enabled", "sip_profiles", "enabled").await;
 
     // Default seed: internal (auth_calls=true, mandatory Digest auth) + external (auth_calls=false, FreeSWITCH external mode)
     // Only INSERT IF NOT EXISTS; do not overwrite user changes
@@ -4430,7 +4615,7 @@ sqlx::query(acct_ddl).execute(pool).await?;
             ).execute(pool).await.ok();
         }
         _ => {
-            // MySQL: ALTER TABLE ADD COLUMN IF NOT EXISTS (MySQL 8.0+ supports IF NOT EXISTS)
+            // MySQL: 不支持 ADD COLUMN IF NOT EXISTS，故依赖 ensure_column 的 information_schema 探测（此处列已存在时会被忽略）
             sqlx::query(
                 "ALTER TABLE security_blacklist ADD COLUMN kind VARCHAR(16) NOT NULL DEFAULT 'deny'"
             ).execute(pool).await.ok();
@@ -4579,7 +4764,7 @@ sqlx::query(acct_ddl).execute(pool).await?;
     // Old tables: only fence_mode + method_blocked columns. New fail2ban 6 dimensions added.
     // SQLite: ALTER TABLE does not support IF NOT EXISTS; try and ignore duplicate column errors
     // Postgres: 9.6+ supports ADD COLUMN IF NOT EXISTS
-    // MySQL: 8.0+ supports ADD COLUMN IF NOT EXISTS
+    // MySQL: 不支持 IF NOT EXISTS，走 ensure_column 的 information_schema 探测
     for (name, col_def) in [
         ("auto_ban",           "INTEGER NOT NULL DEFAULT 1"),
         ("authfail_threshold", "INTEGER NOT NULL DEFAULT 5"),
@@ -4620,10 +4805,7 @@ sqlx::query(acct_ddl).execute(pool).await?;
                         }
                     )
                 };
-                let _ = sqlx::query(&format!(
-                    "ALTER TABLE security_config ADD COLUMN IF NOT EXISTS {} {}",
-                    name, mysql_def
-                )).execute(pool).await;
+                ensure_column(pool, backend, "security_config", name, "", "", &mysql_def).await;
             }
         }
     }
@@ -5000,8 +5182,9 @@ pub async fn query_cdrs(
 ) -> Result<(Vec<CdrRow>, i64), sqlx::Error> {
     let q = q.clone().normalized();
 
-    // Build WHERE clause dynamically — ALWAYS use '?' placeholders so sqlx::Any
-    // adapts them to the actual backend (PostgreSQL $N / MySQL ? / SQLite ?).
+    // Build WHERE clause dynamically with `?` placeholders; the final SQL is passed
+    // through fix_ph() below so PostgreSQL receives `$N` while MySQL/SQLite keep `?`.
+    // (sqlx::Any does NOT rewrite placeholders by itself.)
     // Mixing '$N' and manually replaced LIMIT/OFFSET placeholders breaks Any's
     // per-backend mapping — on SQLite this can silently drop the LIMIT clause.
     let mut where_clauses: Vec<String> = Vec::new();
@@ -5104,7 +5287,7 @@ pub async fn query_cdrs(
     let binds_strs: Vec<&str> = binds.iter().map(|s| s.as_str()).collect();
 
     // Count and pagination use the same backend-aware metadata predicates.
-    let count_sql = format!("SELECT COUNT(*) FROM cdr {where_sql}");
+    let count_sql = fix_ph(&format!("SELECT COUNT(*) FROM cdr {where_sql}"), backend);
     let mut count_q = sqlx::query_scalar::<_, i64>(&count_sql);
     for b in &binds_strs { count_q = count_q.bind(b); }
     let total: i64 = count_q.fetch_one(pool).await?;
@@ -5125,12 +5308,12 @@ pub async fn query_cdrs(
     };
     let order_by = format!("ORDER BY {sort_col} {sort_dir}, start_time DESC");
 
-    let rows_sql = format!(
+    let rows_sql = fix_ph(&format!(
         "SELECT call_id, a_call_id, b_call_id, caller, callee, \
                 start_time, answer_time, end_time, duration_sec, billsec, \
                 cause_code, cause_text, leg_a_final, leg_b_final, metadata \
          FROM cdr {where_sql} {order_by} LIMIT ? OFFSET ?"
-    );
+    ), backend);
 
     let rows_raw: Vec<CdrRowRaw> = {
         let mut rows_q = sqlx::query_as::<_, CdrRowRaw>(&rows_sql);
@@ -5294,7 +5477,7 @@ pub async fn query_recordings(
     let where_sql = format!("WHERE {}", where_clauses.join(" AND "));
 
     // COUNT — reuse the same WHERE + binds (no extra placeholders)
-    let count_sql = format!("SELECT COUNT(*) FROM cdr {where_sql}");
+    let count_sql = fix_ph(&format!("SELECT COUNT(*) FROM cdr {where_sql}"), backend);
     let mut count_q = sqlx::query_scalar::<_, i64>(&count_sql);
     for b in &binds { count_q = count_q.bind(b.as_str()); }
     let total: i64 = count_q.fetch_one(pool).await.unwrap_or(0);
@@ -5302,14 +5485,14 @@ pub async fn query_recordings(
     // ROWS
     let last_l = idx + 1;  // LIMIT
     let last_o = idx + 2;  // OFFSET
-    let rows_sql = format!(
+    let rows_sql = fix_ph(&format!(
         "SELECT call_id, caller, callee, start_time, end_time, duration_sec, \
                 cause_code, cause_text, metadata, \
                 {rec_path_sql} AS rec_path \
          FROM cdr {where_sql} \
          ORDER BY start_time DESC \
          LIMIT ${last_l} OFFSET ${last_o}"
-    );
+    ), backend);
     let mut rows_q = sqlx::query::<sqlx::Any>(&rows_sql);
     for b in &binds { rows_q = rows_q.bind(b.as_str()); }
     rows_q = rows_q.bind(limit).bind(offset);
@@ -5495,16 +5678,16 @@ impl Db {
             "WHERE ".to_string() + &clauses.join(" AND ")
         };
 
-        let count_sql = format!("SELECT COUNT(*) FROM extensions {where_sql}");
+        let count_sql = fix_ph(&format!("SELECT COUNT(*) FROM extensions {where_sql}"), self.backend());
         let mut cq = sqlx::query_scalar::<_, i64>(&count_sql);
         for b in &binds { cq = cq.bind(b.as_str()); }
         let total = cq.fetch_one(pool).await.unwrap_or(0);
 
         let l = idx + 1;
         let o = idx + 2;
-        let rows_sql = format!(
+        let rows_sql = fix_ph(&format!(
             "SELECT id, tenant_id, extension, realm, password, ha1, ha1b, enabled, clip, clir, max_contacts, dialplan_match, description, ext_type, external_number, trunk_name, display_number, created_at, updated_at FROM extensions {where_sql} ORDER BY extension LIMIT ${l} OFFSET ${o}"
-        );
+        ), self.backend());
         let mut q = sqlx::query_as::<_, Extension>(&rows_sql);
         for b in &binds { q = q.bind(b.as_str()); }
         q = q.bind(limit).bind(offset);
@@ -6175,7 +6358,7 @@ impl Db {
 
         let where_sql = if clauses.is_empty() { String::new() } else { "WHERE ".to_string() + &clauses.join(" AND ") };
 
-        let count_sql = format!("SELECT COUNT(*) FROM trunks {where_sql}");
+        let count_sql = fix_ph(&format!("SELECT COUNT(*) FROM trunks {where_sql}"), backend);
         let mut cq = sqlx::query_scalar::<_, i64>(&count_sql);
         for b in &binds { cq = cq.bind(b.as_str()); }
         let total = cq.fetch_one(pool).await.unwrap_or(0);
@@ -8346,7 +8529,10 @@ impl Db {
             // Simple approach: query each one separately (queue count is typically <100, O(n) acceptable)
             for tid in &tenant_ids {
                 if map.contains_key(tid) { continue; }
-                let name: Option<String> = sqlx::query_scalar("SELECT tenant_name FROM tenants WHERE id = $1")
+                let name: Option<String> = sqlx::query_scalar(&fix_ph(
+                    "SELECT tenant_name FROM tenants WHERE id = $1",
+                    self.backend(),
+                ))
                     .bind(tid).fetch_optional(pool).await.unwrap_or(None);
                 let tn = name.unwrap_or_else(|| format!("{}", tid));
                 map.insert(*tid, tn);

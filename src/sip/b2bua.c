@@ -4467,20 +4467,30 @@ extern int sig_sdp_extract_cdr(const char *sdp_buf, size_t sdp_len,
                                char *codec_out, size_t codec_sz,
                                char *peer_out,  size_t peer_sz);
 
-/* 两腿 answer SDP → c->codec_a/b（peer 丢弃）。
+/* 两腿 answer SDP → c->codec_a/b（+ RTP peer）。
  * ANSWER 阶段调用：SESSION_ANSWER 实时推送（读 c->codec_a/b）与
- * END ev 兜底都能拿到 codec，Web 端"接通"状态即刻显示编码。 */
+ * END ev 兜底都能拿到 codec，Web 端"接通"状态即刻显示编码。
+ *
+ * A 腿兜底：初始 INVITE 阶段本机生成的 answer SDP 只存进 leg[1].answer
+ * （bridge_confirm 需要 leg[0].offer + leg[1].answer 两侧方向 SDP），
+ * leg[0].answer 仅在 re-INVITE 时写。因此普通呼叫 codec_a 会恒空 ——
+ * answer 提取失败时回退用 A 腿 offer 的首选 codec。offer 的 c= 地址
+ * 不作为 RTP peer（仅 answer 采 peer，避免把对端 offer 地址当媒体目标）。 */
 static void call_fill_codecs(b2b_call_t *c)
 {
-    char peer[CDR_IP_MAX];
-    if (c->leg[0].answer_len && !c->codec_a[0])
+    char peer[64];
+    if (c->leg[0].answer_len && (!c->codec_a[0] || !c->peer_a[0]))
         sig_sdp_extract_cdr(c->leg[0].answer, c->leg[0].answer_len,
                             c->codec_a, sizeof(c->codec_a),
+                            c->peer_a, sizeof(c->peer_a));
+    if (!c->codec_a[0] && c->leg[0].offer_len)
+        sig_sdp_extract_cdr(c->leg[0].offer, c->leg[0].offer_len,
+                            c->codec_a, sizeof(c->codec_a),
                             peer, sizeof(peer));
-    if (c->leg[1].answer_len && !c->codec_b[0])
+    if (c->leg[1].answer_len && (!c->codec_b[0] || !c->peer_b[0]))
         sig_sdp_extract_cdr(c->leg[1].answer, c->leg[1].answer_len,
                             c->codec_b, sizeof(c->codec_b),
-                            peer, sizeof(peer));
+                            c->peer_b, sizeof(c->peer_b));
 }
 
 static void b2b_emit_cdr(b2b_call_t *c, cdr_phase_t phase)
@@ -8665,6 +8675,70 @@ static int render_media(char *out, size_t outsz, size_t *pos, int leg,
         (unsigned long long)mv->ssrc_collision_drops);
 }
 
+/* REQ-OAM-007：在途呼叫 VQ 实时刷新。
+ * signaling.c 的 sig_on_end_cb 只在呼叫结束时算一次 VQ，在途时
+ * c->rtp_loss_pct/jitter/mos 恒为 0，show channels 因此永远看不到
+ * 丢包/MOS。这里按与 on_end 完全相同的公式从 bridge 视图重算并写回，
+ * 无 relay（bypass / 未桥接）或尚未产生 RTP 统计时保持未采集。 */
+static void call_refresh_vq(b2b_call_t *c, bridge_mgr_t *bm)
+{
+    if (!c || !bm)
+        return;
+    uint64_t now = nsbc_now_ms();
+    if (c->vq_refresh_ms && now - c->vq_refresh_ms < 1000)
+        return;
+    c->vq_refresh_ms = now;
+
+    mb_view_t mv;
+    memset(&mv, 0, sizeof(mv));
+    if (bridge_call_view(bm, c, &mv) != NSBC_OK || !mv.valid || !mv.gate_open[0])
+        return;
+
+    uint32_t exp = 0, lost = 0, jitter_ticks = 0;
+    int have_rr = 0;
+    for (int i = 0; i < 2; i++) {
+        if (mv.have_rr[i] && mv.rr_fraction[i]) {
+            uint32_t fe = mv.rr_fraction[i];
+            if (fe > 0 && mv.rr_lost[i] > 0) {
+                uint64_t e = (uint64_t)mv.rr_lost[i] * 256u / fe;
+                if (e > 0xFFFFFFFFu) e = 0xFFFFFFFFu;
+                exp += (uint32_t)e;
+                lost += mv.rr_lost[i];
+                jitter_ticks += mv.rr_jitter[i];
+                have_rr = 1;
+            }
+        }
+        exp += mv.rtp_expected[i];
+        lost += mv.rtp_lost[i];
+    }
+    if (exp == 0)
+        return;
+
+    int32_t loss_q = (int32_t)((uint64_t)lost * 1000u / exp); /* 千分比 0..1000 */
+    /* 与 signaling.c sig_on_end_cb 保持同一套 ITU-T G.113/G.107 E-model
+     * （G.711：Ie=0, Bpl=25.1）：
+     *   Ie_eff = 95 * Ppl / (Ppl + 25.1)，R = 93.2 - Ie_eff，
+     *   MOS = 1 + 0.035R + 7R(R-60)(100-R)×1e-6（R 为百分制）。
+     * 0% 丢包 → R=93.2 → MOS≈4.41。 */
+    float ppl    = (float)loss_q / 10.0f;
+    float ie_eff = 95.0f * ppl / (ppl + 25.1f);
+    float r_val  = 93.2f - ie_eff;
+    if (r_val < 0.0f)   r_val = 0.0f;
+    if (r_val > 100.0f) r_val = 100.0f;
+    float mos_val = 1.0f + 0.035f * r_val
+        + 7.0f * r_val * (r_val - 60.0f) * (100.0f - r_val) * 1e-6f;
+    if (mos_val < 1.0f) mos_val = 1.0f;
+    if (mos_val > 4.5f) mos_val = 4.5f;
+    c->mos_x1000 = (int32_t)(mos_val * 1000.0f + 0.5f);
+    c->rtp_loss_pct = (loss_q >= 0 && loss_q <= 1000)
+        ? (uint8_t)((loss_q + 5) / 10) : 0;
+    if (have_rr && jitter_ticks > 0) {
+        uint32_t n = mv.have_rr[0] + mv.have_rr[1];
+        if (n > 0)
+            c->rtp_jitter_ms = (uint16_t)(jitter_ticks / n * 125 / 1000);
+    }
+}
+
 int b2b_list_calls(b2b_core_t *co, char *out, size_t outsz)
 {
     if (!co || !out || outsz == 0)
@@ -8676,9 +8750,13 @@ int b2b_list_calls(b2b_core_t *co, char *out, size_t outsz)
      * 锁序恒为 shard→call（tbl_link/unlink 从不反向持锁）。 */
     uint32_t gen = (uint32_t)__sync_add_and_fetch(&co->dump_gen, 1);
     /* 单行上限：2×DLG_CALLID_MAX(80) + caller/callee(96) + start/ans/dur(60)
-     * + codec 成对(64) + VQ loss/jitter/mos + 键名/状态名/空白 ≈ 640；
-     * 预留 768，保证任何截断点之后尾行（≤32B）必能完整落帧。 */
-    const size_t row_reserve = 768;
+     * + codec 成对(64) + from_ip(45) + 两腿 RTP peer(2×64) + VQ
+     * loss/jitter/mos + 键名/状态名/空白 ≈ 860；预留 1024，保证任何截断点
+     * 之后尾行（≤32B）必能完整落帧。 */
+    const size_t row_reserve = 1024;
+    /* 在途 VQ 数据源：媒体桥。取不到（未启用媒体/BYPASS）时保持未采集。 */
+    nsbc_ctx_t *vq_ctx = nsbc_get_ctx();
+    bridge_mgr_t *vq_bm = vq_ctx ? (bridge_mgr_t *)vq_ctx->bridge : NULL;
     for (int si = 0; si < B2B_CALL_SHARDS; ++si) {
         call_shard_t *sh = &co->sh[si];
         pthread_mutex_lock(&sh->lock);
@@ -8696,6 +8774,9 @@ int b2b_list_calls(b2b_core_t *co, char *out, size_t outsz)
                 break;
             }
             c->dump_mark = gen;
+            /* 在途实时 VQ（节流 1s/呼叫）——on_end 才会算一次，这里补上
+             * 呼叫进行中的丢包/抖动/MOS，否则列表恒为未采集。 */
+            call_refresh_vq(c, vq_bm);
             const char *a_id = safe_tok(c->leg[0].callid);
             const char *b_id = safe_tok(c->leg[1].callid);
             const char *codec_a = c->codec_a[0] ? c->codec_a : "-";
@@ -8715,7 +8796,8 @@ int b2b_list_calls(b2b_core_t *co, char *out, size_t outsz)
                 "caller=%s callee=%s "
                 "start_ms=%llu answer_ms=%llu duration_ms=%llu "
                 "codec_a=%s codec_b=%s "
-                "rtp_loss_pct=%u rtp_jitter_ms=%u mos_x1000=%d\n",
+                "from_ip=%s a_peer_ip=%s b_peer_ip=%s "
+                "rtp_loss_pct=%d rtp_jitter_ms=%d mos_x1000=%d\n",
                 c->leg[0].callid[0] ? a_id : "-",
                 leg_state_name(c->leg[0].state),
                 c->leg[1].callid[0] ? b_id : "-",
@@ -8726,9 +8808,15 @@ int b2b_list_calls(b2b_core_t *co, char *out, size_t outsz)
                 (unsigned long long)ans_wall,
                 (unsigned long long)dur_ms,
                 codec_a, codec_b,
-                (unsigned)c->rtp_loss_pct,
-                (unsigned)c->rtp_jitter_ms,
-                (int)c->mos_x1000);
+                c->from_ip[0] ? c->from_ip : "-",
+                c->peer_a[0]  ? c->peer_a  : "-",
+                c->peer_b[0]  ? c->peer_b  : "-",
+                /* mos_x1000<=0 = 未采集（memset 初值 0，on_end 无数据为 -1）：
+                 * 此时 loss/jitter 同样无效，统一输出 -1 让 Web 显示 "-"，
+                 * 避免把"未采集"的 0 误显示成"零丢包 / 0ms 抖动"。 */
+                (c->mos_x1000 > 0) ? (int)c->rtp_loss_pct  : -1,
+                (c->mos_x1000 > 0) ? (int)c->rtp_jitter_ms : -1,
+                (c->mos_x1000 > 0) ? (int)c->mos_x1000     : -1);
             call_unlock(c);
             if (rc == NSBC_NOSPC) {
                 truncated = 1;

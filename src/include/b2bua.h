@@ -219,6 +219,16 @@ struct b2b_call {
     uint8_t force_gruu;
     char codec_a[32];
     char codec_b[32];
+    /* REQ-OAM-007：两腿 RTP peer（answer SDP c=IN IP4/6 + m= 端口，形如
+     * "1.2.3.4:8000"），由 call_fill_codecs 填充，供 show channels 输出
+     * a_peer_ip/b_peer_ip；未协商/无 SDP 时为空串（Web 显示 "-"）。
+     * 64B 覆盖 IPv6 地址(45) + ':' + 端口(5)。 */
+    char peer_a[64];
+    char peer_b[64];
+    /* REQ-OAM-007：在途 VQ 刷新节流时间戳（monotonic ms）。
+     * show channels 每 5s 拉一次，b2b_list_calls 对同一呼叫最多 1s
+     * 从 bridge 视图重算一次丢包/抖动/MOS。 */
+    uint64_t vq_refresh_ms;
     uint8_t rtp_loss_pct;
     uint16_t rtp_jitter_ms;
     int32_t mos_x1000;
