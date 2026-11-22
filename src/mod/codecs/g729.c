@@ -287,6 +287,14 @@ static const codec_ops_t G729_OPS = {
     .fini        = g729_fini,
     .decode      = g729_decode,
     .encode      = g729_encode,
+    /* Registry v2 元数据 */
+    .api_version = NSBC_CODEC_API_VERSION,
+    .sdp_name    = "G729",
+    .aliases     = "G.729,G729,G729A",
+    .kind        = CODEC_KIND_AUDIO,
+    .payload     = RTP_PAYLOAD_SIMPLE,
+    .priority    = 70,
+    .caps        = CODEC_CAP_DEC | CODEC_CAP_ENC | CODEC_CAP_STATEFUL,
 };
 
 int g729_register(void)

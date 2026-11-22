@@ -2,7 +2,7 @@
 name = "nsbc-web"
 version = "0.6.5"
 edition = "2021"
-description = "NSBC Web management sidecar (REQ-WEB-001~021, deployed separately from the core process)"
+description = "NSBC Web management sidecar"
 publish = false
 
 [[bin]]

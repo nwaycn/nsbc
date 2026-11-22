@@ -291,7 +291,7 @@ let dc = null, dcOpen = false;
 // 同时砍掉 RED/ULPFEC/FLEXFEC/OPUS/G722/PCMU/CN/AV1/VP8 等全部多余 codec
 
 const AUDIO_KEEP_MAIN = new Set(['pcma']);
-const VIDEO_KEEP_MAIN = new Set(['h264', 'vp9']);
+const VIDEO_KEEP_MAIN = new Set(['h264', 'vp9', 'vp8']);
 
 function sdpCodecWhitelist(description) {
   if (!description?.sdp) return description;

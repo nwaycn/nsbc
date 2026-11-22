@@ -106,14 +106,17 @@ typedef enum {
     MB_SDP_WS,
 } mb_sdp_dir_t;
 
-/* SDP c=/m= 地址端口重写（所有媒体段，每段端口递增 2）+ 方向相关的
- * proto/属性改写（见 mb_sdp_dir_t）。
+/* SDP c=/m= 地址端口重写 + 方向相关的 proto/属性改写（见 mb_sdp_dir_t）。
  * rtp_port==0 约定：BYPASS 直连透传——c= 和 m= 端口全部保留原值
  * （m= 端口写 0 会被对端按 RFC 3264 当"流被拒"）。
+ * video_port：视频 m-line 专用端口；0=沿用 rtp_port（WebRTC BUNDLE 腿
+ * 必须传 0，因为同一条 ICE/DTLS 传输上所有 m-line 共用一个端口）。
+ * 明文 SIP 腿必须传独立的 video_port，否则 audio/video 两个 m-line 同端口，
+ * 对端（如 linphone）会把 video 自行挪到 port+2 —— 正好落到对侧 socket 上。
  * 返回写出长度；NSBC_NOSPC 缓冲不足。 */
 int bridge_rewrite_sdp(const char *in, size_t in_len, char *out,
                        size_t outsz, const char *ip, uint16_t rtp_port,
-                       mb_sdp_dir_t dir);
+                       uint16_t video_port, mb_sdp_dir_t dir);
 
 /* 一个 relay 呼叫实例：两对端口、两条单向转发。
  * range_lo/hi：per-call RTP 端口段（REQ-SIP-PROFILE-001）；0,0=表默认段。
@@ -123,6 +126,14 @@ typedef struct rtp_relay rtp_relay_t;
 typedef struct {
     uint16_t a_rtp, a_rtcp; /* 朝 A 侧（入向主叫方） */
     uint16_t b_rtp, b_rtcp; /* 朝 B 侧（下游） */
+    /*  每 m-line 独立端口（明文 SIP 腿）：
+     *  WebRTC 腿一条 BUNDLE 传输共用一个端口，video 沿用 *_rtp；
+     *  明文腿 audio/video 是两个独立的 RTP 流，必须各自一个端口，
+     *  否则对端会自行把 video 挪到 port+2，正好落到对侧 socket 上。 */
+    uint16_t a_vrtp, a_vrtcp; /* A 腿视频（0=未分配） */
+    uint16_t b_vrtp, b_vrtcp; /* B 腿视频（0=未分配） */
+    /* 入参：需要独立视频端口的腿，bit0=A、bit1=B（0=不分配） */
+    uint8_t  want_video;
 } relay_ports_t;
 
 int rtp_relay_start(bridge_mgr_t *m, rtp_relay_t **out,
@@ -134,6 +145,8 @@ void rtp_relay_stop(rtp_relay_t *r);
  * 仅允许该地址首包锁定 */
 void rtp_relay_set_peer_a(rtp_relay_t *r, const nsbc_sa_t *sa);
 void rtp_relay_set_peer_b(rtp_relay_t *r, const nsbc_sa_t *sa);
+/* 视频 m-line 的对端地址（明文腿），与 audio 的 peer 分开记录 */
+void rtp_relay_set_peer_video(rtp_relay_t *r, int side, const nsbc_sa_t *sa);
 
 /* ★ HA P3-2: failover rebuild 预填 SSRC 重写映射。
  * 让 STANDBY→ACTIVE 新建的 relay 对同一路 UA 发同样的 out SSRC —
@@ -170,6 +183,14 @@ int bridge_local_start(void *call_key, const char *offer, size_t offer_len,
                        char *out, size_t outsz, void *ud);
 int bridge_answer_hook(void *call_key, const char *in, size_t inlen,
                        char *out, size_t outsz, void *ud);
+/* B 腿作为 offerer（B 发起 re-INVITE）的对称逐腿 SDP 终结：
+ *   bridge_offer_hook_rev  : B 的 offer → 发往 A（追加 SBC 可编解码静态音频 PT）
+ *   bridge_answer_hook_rev : A 的 answer → 发往 B（收敛到 B 侧最终 codec）
+ * 与正向 hook 参数一致：in = 收到的 SDP，out = 发出的 SDP；ud = bridge_mgr_t*。 */
+int bridge_offer_hook_rev(void *call_key, const char *in, size_t inlen,
+                          char *out, size_t outsz, void *ud);
+int bridge_answer_hook_rev(void *call_key, const char *in, size_t inlen,
+                           char *out, size_t outsz, void *ud);
 /* 呼叫结束释放（挂 b2b terminate；P0 由 media confirm 回调反注册兜底） */
 void bridge_release_call(bridge_mgr_t *m, void *call_key);
 
@@ -229,6 +250,14 @@ typedef struct {
 } mb_view_t;
 int bridge_call_view(bridge_mgr_t *m, void *call_key, mb_view_t *v);
 
+/*  取媒体层最终定型的音频 codec 名称（side 0=A 腿 / 1=B 腿），
+ *  成功返回 1 并写入 name，未协商/无会话返回 0。
+ *  用途：信令层的 leg[1].answer 在入呼场景存的是"SBC 回给 A 的 answer"，
+ *  直接解析会把 B 腿显示成 A 的 codec（实测 WebRTC 腿误显示 G729）。
+ *  真实协商结果（含转码两端）只有 bridge_confirm 的 neg_* 知道。 */
+int bridge_negotiated_codec_name(bridge_mgr_t *m, void *call_key, int side,
+                                 char *name, size_t cap);
+
 /* OAM 活跃会话遍历（REQ-OAM-010 "show transcode"）：
  * 回调参数：call_key（不透明指针，仅用于 Web 端映射 call-id）、
  * mode（bypass/relay/transcode）、relay 端口对（bypass 时为 0）、
@@ -258,6 +287,9 @@ int rtp_relay_fd(const rtp_relay_t *r, int side);
 /* REQ-DP-APP-001：relay 指定侧本地 RTP 端口（b2bua 合成 183 Session Progress
  * 的 SDP answer 时填 m=audio 端口用；side 0=A 腿侧，1=B 腿侧） */
 uint16_t rtp_relay_port(const rtp_relay_t *r, int side);
+/* relay 指定侧的独立视频 RTP 端口（明文腿）；0=该腿未分配（WebRTC BUNDLE
+ * 腿直接复用 rtp_relay_port 的端口，调用方传 0 给 bridge_rewrite_sdp）。 */
+uint16_t rtp_relay_video_port(const rtp_relay_t *r, int side);
 /* relay 某侧是否已 latch 到真实 peer（1=已 latch，0=未 latch） */
 int rtp_relay_latched(const rtp_relay_t *r, int side);
 /* relay 某侧已 latch 的 peer 地址（未 latch 返回空 nsbc_sa_t） */

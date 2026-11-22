@@ -791,7 +791,18 @@ void b2b_call_destroy_rm_all(void);
  * 各模块（media_bridge, security, ...）init 时自注册。
  * 返回 NSBC_OK / NSBC_NOSPC (满 B2B_SDP_HOOK_MAX) */
 #define B2B_SDP_HOOK_MAX  16
-typedef enum { B2B_SDP_OFFER = 0, B2B_SDP_ANSWER } b2b_sdp_hook_kind_t;
+/* kind 区分"谁是 offerer"：
+ *   OFFER / ANSWER        —— A 腿（leg0）作为 offerer（初始 INVITE、A 发起 re-INVITE）
+ *   OFFER_REV / ANSWER_REV —— B 腿（leg1）作为 offerer（B 发起 re-INVITE）的对称方向
+ * 回调参数始终是"入向 SDP → 出向 SDP"，注册模块按 kind 区分角色，
+ * 两腿各自终结，不把一腿的 PT 泄漏给另一腿。 */
+typedef enum {
+    B2B_SDP_OFFER = 0,      /* A 的 offer → 发往 B */
+    B2B_SDP_ANSWER,         /* B 的 answer → 发往 A */
+    B2B_SDP_OFFER_REV,      /* B 的 offer → 发往 A（B 发起 re-INVITE） */
+    B2B_SDP_ANSWER_REV,     /* A 的 answer → 发往 B（B 发起 re-INVITE） */
+    B2B_SDP_HOOK_KINDS
+} b2b_sdp_hook_kind_t;
 int  b2b_sdp_hook_add(b2b_sdp_hook_kind_t kind, b2b_sdp_hook_fn fn, void *ud);
 void b2b_sdp_hook_rm(b2b_sdp_hook_kind_t kind, b2b_sdp_hook_fn fn, void *ud);
 

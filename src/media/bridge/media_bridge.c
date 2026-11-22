@@ -26,6 +26,7 @@
 _Static_assert(MB_SRTP_MATERIAL_MAX == SRTP_KEY_MAX,
                "MB_SRTP_MATERIAL_MAX must equal SRTP_KEY_MAX");
 #include "media_codec.h"   /* codec registry + transcode engine */
+#include "video_xcode.h"   /* 视频转码会话（VP9↔H264） */
 #include "rtp_reasm.h"     /* M1: H.264 RTP 重组器（视频录制前置） */
 #include "media_video.h"   /* P0: video_build_pli — RTCP PLI 关键帧请求 */
 #include "recorder.h"      /* M1: rec_feed_video —— 视频帧喂录音 sess */
@@ -76,6 +77,26 @@ typedef struct cnode {
      * 截断到相同段数（offer_hook 为 WebRTC B 追加的 rejected video
      * 会被浏览器回显回来，多出的段不能发给只 offer 了 audio 的 A）。 */
     uint8_t a_mlcount;
+    /*  每腿独立 SDP 终结（第 1 项）：
+     *  a_offer_sdp 保存 A 的原始 offer，answer_hook 据此重建"回给 A 的 answer"，
+     *  只宣告 SBC 与 A 真正协商的音频 codec；neg_* 是定型后的双向音频对，
+     *  bridge_confirm 直接采用，避免再按启发式重新推导导致两腿不一致。
+     *  neg_* 在 offer/answer hook 中更新，媒体线程只读。 */
+    char              *a_offer_sdp;
+    size_t             a_offer_len;
+    /*  B 发起 re-INVITE 的对称终结：b_offer_sdp 保存 B 的原始 offer，
+     *  answer_rev_hook 据此重建"回给 B 的 answer"（只宣告 B 侧最终 codec），
+     *  neg_* 语义不变（side0=A / side1=B），bridge_confirm 直接采用。 */
+    char              *b_offer_sdp;
+    size_t             b_offer_len;
+    uint8_t            rev_pending;  /* 1=已收 B 的 offer，等待 A 的 answer 回 B */
+    uint8_t            neg_valid;   /* 1=音频 codec 已终结定型 */
+    uint8_t            neg_a_pt;    /* 朝 A（side 0）的音频 PT */
+    uint8_t            neg_b_pt;    /* 朝 B（side 1）的音频 PT */
+    codec_id_t         neg_a_cid;
+    codec_id_t         neg_b_cid;
+    uint8_t            neg_a_te;    /* A 侧 telephone-event PT（0=未协商） */
+    uint8_t            neg_b_te;    /* B 侧 telephone-event PT（0=未协商） */
     /* REQ-DTLS-001：DTLS-SRTP 终结器，按 relay 物理侧索引：
      * Phase C 后 SRTP_RELAY 模式双侧都创建（relay 做 DTLS demux），
      * 与端点类型无关。明文侧（BYPASS/双明文）恒 NULL。 */
@@ -90,9 +111,40 @@ typedef struct cnode {
     uint8_t            pt_allowed[2][8]; /* 每侧允许通过的 PT（从 answer SDP fmt-list） */
     int                pt_allowed_count[2];
 
+    /* 逐腿音频 codec 快照：side 0=offer(A)/1=answer(B)。
+     * 运行时用 audio_pt[side] 校验入包 PT 是否属于该腿音频 codec，
+     * 保证视频 PT / 未知 PT 永不进入音频转码器。 */
+    uint8_t            audio_pt[2][8];
+    codec_id_t         audio_cid[2][8];
+    int                audio_n[2];
+    /* 音频转码计划：入包 PT（源腿）/ 出包 PT（目标腿协商值）。
+     * xcode_dst_pt 取代 default_pt 猜测，保证多 PT 协商时输出正确。 */
+    uint8_t            xcode_src_pt[2];
+    uint8_t            xcode_dst_pt[2];
+    int                xcode_sig[2];   /* 计划签名，re-INVITE 变更检测 */
+    /* 被 re-INVITE 替换的旧会话：媒体线程可能仍在读，延迟到 release 释放 */
+    transcode_sess_t  *xcode_retired[8];
+    int                n_xcode_retired;
 
     uint8_t            video_pt_allowed[2][8];
     int                video_pt_allowed_count[2];
+    /*  视频逐腿终结（H264/VP8/VP9 互转，REQ-TRANS-VIDEO-002）：
+     *  neg_v_* 由 answer hook 写入，bridge_confirm 据此创建 video_xcode。
+     *  两条腿 codec 不同 → 转码；相同但 PT 不同 → 仅改 RTP 头 PT。 */
+    uint8_t            neg_v_valid;
+    uint8_t            neg_v_a_pt;
+    uint8_t            neg_v_b_pt;
+    codec_id_t         neg_v_a_cid;
+    codec_id_t         neg_v_b_cid;
+    video_xcode_t     *vxcode[2];       /* side 发来的视频 → 转码后发对侧 */
+    int                vxcode_sig[2];
+    uint8_t            vxcode_src_pt[2];
+    uint8_t            vxcode_dst_pt[2];
+    video_xcode_t     *vxcode_retired[8];
+    int                n_vxcode_retired;
+    uint8_t            video_rewrite_active[2];
+    uint8_t            video_rewrite_src_pt[2];
+    uint8_t            video_rewrite_dst_pt[2];
     /* M1 视频录制：H.264 RTP 重组器（bridge_confirm 检测到 H.264 时创建，
      * bridge_release_call 销毁）。side=0 = A 腿方向（录制 A→B 视频）。 */
     vid_reasm_t       *vid_reasm[2];
@@ -106,6 +158,9 @@ typedef struct cnode {
     /*  2026-10-16 诊断：transcode_seen 从 static __thread 改 per-call，
      * 避免长寿命媒体线程跨呼叫累积导致短通话（~400 包）永远碰不到 %1000 阈值。 */
     int transcode_seen_diag[2];
+    /*  诊断：入包 audio PT 不在该腿协商集合（信令与媒体 PT 不一致）。
+     *  典型：信令协商 PCMA(8)，浏览器实际发 PCMU(0)。只告警不丢包。 */
+    int audio_badpt_diag[2];
     /*  RFC 3312 Precondition 前提条件门控——offer_hook 解析 offer SDP 置位
      * precond_active（1=Require precondition 或 a=des:qos mandatory），
      * answer_hook 解析 answer SDP 置位 precond_met（1=a=curr 覆盖所有 mandatory des）。
@@ -219,10 +274,24 @@ struct rtp_relay {
     int fd_rtp[2];
     int fd_rtcp[2];
     uint16_t rtp_port[2]; /* 端口表回收凭据（不依赖 socket 名） */
+    /*  明文腿的独立视频 RTP/RTCP 通道（每 m-line 一个端口）。
+     *  WebRTC 腿一条 BUNDLE 传输共用 fd_rtp/fd_rtcp，这里恒 -1。
+     *  原因：audio/video 两个 m-line 若同端口，对端会自行把 video 挪到
+     *  port+2，正好落到对侧 socket 上被当成 SRTP 解密而丢弃。 */
+    int fd_vrtp[2];
+    int fd_vrtcp[2];
+    uint16_t vrtp_port[2];
     nsbc_sa_t peer[2];  /* 配置期望对端（可空：纯 latching） */
     int have_peer[2];
     nsbc_sa_t latch[2];
     int latched[2];
+    /*  明文腿视频流的独立 peer/latch。audio/video 是两个独立 m-line 端口，
+     *  共用一个 latch 会让视频源端口覆盖音频目标端口（反之亦然）——
+     *  表现为"音频发到视频端口/视频发到音频端口" → 单向无声、黑屏。 */
+    nsbc_sa_t vlatch[2];
+    int vlatched[2];
+    nsbc_sa_t vpeer[2];       /* SDP video m-line 的地址（NAT 前） */
+    int vhave_peer[2];
     ssrc_policy_t pol[2];
     smap_t map[2];
     uint64_t pkts, drops;
@@ -262,6 +331,18 @@ struct rtp_relay {
      * relay 在 relay_recv_one 内单线程访问，无需额外锁。 */
     int diag_any_seen[4];      /* 2 side × (rtp + rtcp) */
     uint64_t last_pli_ms[2];
+    /*  本侧入向视频流的原始 SSRC（重写前的值）。
+     *  用途：对端发来的 PLI 里的 media SSRC 是 SBC 出向后重写的值，
+     *  原样转发给源端会被忽略（源端不认识该 SSRC）→ 收不到关键帧。
+     *  这里记录原始 SSRC，收到 PLI 时用它重新生成一条发给源端。 */
+    uint32_t vid_ssrc[2];
+    /*  2026-11-22：SENDTO / SRTP 失败诊断改 per-call 计数（原来用
+     *  _Thread_local 前 5 条，长寿命媒体线程第二通电话就永远打不出日志，
+     *  导致无法判断"音频到底转发到哪"。 */
+    uint32_t diag_sendto[2];   /* 每侧已打印的 SENDTO 条数 */
+    uint32_t diag_srtp_fail[2];/* 每侧 SRTP unprotect 失败计数 */
+    uint32_t diag_vrx[2];      /* 每侧已打印的 VIDEO_RX 条数 */
+    uint32_t diag_vrx_nox[2];  /* 视频 PT 到了但没有 vxcode 的计数 */
 };
 
 static void relay_rtcp_observe(rtp_relay_t *r, int side, const uint8_t *buf,
@@ -483,6 +564,8 @@ static void bridge_video_frame_cb(void *ud, const uint8_t *frame,
  * 由 sdp_extract_audio_codecs 用 rtpmap enc name 二次映射。 */
 static codec_id_t pt_to_codec(int pt)
 {
+    const codec_ops_t *ops = codec_find_by_pt_kind(pt, CODEC_KIND_AUDIO);
+    if (ops) return ops->id;
     switch (pt) {
     case 0:  return CODEC_PCMU;
     case 8:  return CODEC_PCMA;
@@ -492,7 +575,115 @@ static codec_id_t pt_to_codec(int pt)
     }
 }
 
+/* 入包 PT → 该腿音频 codec_id（仅 audio_pt/audio_cid 快照命中才返回非 NONE）*/
+static codec_id_t leg_audio_pt_to_cid(const cnode_t *e, int side, int pt)
+{
+    int i;
+    if (e == NULL || side < 0 || side > 1) return CODEC_NONE;
+    for (i = 0; i < e->audio_n[side]; ++i) {
+        if (e->audio_pt[side][i] == (uint8_t)pt)
+            return e->audio_cid[side][i];
+    }
+    return CODEC_NONE;
+}
+
+/* 对端是否接受该 codec（按 codec 身份，而非 PT 数字——
+ * 两腿 PT 空间独立，动态 PT 相同不代表同一 codec）。 */
+static int peer_accepts_audio_cid(const cnode_t *e, int side, int pt)
+{
+    codec_id_t cid;
+    int other = 1 - side, i;
+    if (e == NULL) return 0;
+    cid = leg_audio_pt_to_cid(e, side, pt);
+    if (cid == CODEC_NONE) return 0;
+    for (i = 0; i < e->audio_n[other]; ++i) {
+        if (e->audio_cid[other][i] == cid) return 1;
+    }
+    return 0;
+}
+
 /* ---------- relay_recv_one ---------- */
+
+/* 视频转码输出回调上下文：把 video_xcode 产出的 RTP 包发往对侧 */
+typedef struct {
+    rtp_relay_t *r;
+    int          side;
+    int          other;
+} relay_video_ctx_t;
+
+static void relay_video_emit(void *ud, const uint8_t *pkt, size_t len)
+{
+    relay_video_ctx_t *c = (relay_video_ctx_t *)ud;
+    if (!c || !c->r || !pkt || len == 0) return;
+    rtp_relay_t *r = c->r;
+
+    /*  目标腿若拥有独立视频 socket，必须使用视频 latch/peer + 视频 fd；
+     *  WebRTC 腿视频与音频共用地址，回退到 audio latch/fd。 */
+    const int have_vfd = (r->fd_vrtp[c->other] >= 0);
+    const nsbc_sa_t *dst = (have_vfd && r->vlatched[c->other])
+                           ? &r->vlatch[c->other]
+                           : ((have_vfd && r->vhave_peer[c->other])
+                              ? &r->vpeer[c->other]
+                              : (r->latched[c->other]
+                                 ? &r->latch[c->other]
+                                 : (r->have_peer[c->other] ? &r->peer[c->other]
+                                                           : &r->latch[c->other])));
+    if (dst->ss.ss_family == AF_UNSPEC || dst->len == 0) return;
+
+    uint8_t sbuf[RELAY_BUF];
+    if (len + 128 > sizeof(sbuf)) return;
+    memcpy(sbuf, pkt, len);
+    size_t slen = len;
+    if (r->srtp[c->other] && r->node && r->node->dtls[c->other]) {
+        if (nsbc_srtp_protect_rtp(r->srtp[c->other], sbuf, &slen,
+                                  sizeof(sbuf)) != NSBC_OK)
+            return;
+    }
+    /*  明文腿有独立视频 socket 时从该端口发出（源端口与对端发送目标一致，
+     *  避免严格 symmetric-RTP 的 UA 丢弃源端口不匹配的视频）。 */
+    int ofd = (r->fd_vrtp[c->other] >= 0) ? r->fd_vrtp[c->other]
+                                          : r->fd_rtp[c->other];
+    (void)sendto(ofd, sbuf, slen, MSG_NOSIGNAL,
+                 (const struct sockaddr *)&dst->ss, dst->len);
+}
+
+/* 视频转码缺少关键帧时，向源侧请求 PLI（500ms 限频，与录制路径共享计时） */
+static void relay_video_request_pli(rtp_relay_t *r, int side, uint32_t media_ssrc)
+{
+    uint64_t now = nsbc_now_ms();
+    if (now - r->last_pli_ms[side] < 500) return;
+    r->last_pli_ms[side] = now;
+
+    uint8_t pli_buf[64];
+    size_t pli_len = 0;
+    const uint32_t pli_src_ssrc = 0x4E534243;  /* "NSBC" */
+    if (video_build_pli(media_ssrc, pli_src_ssrc, pli_buf, sizeof(pli_buf),
+                        &pli_len) != NSBC_OK)
+        return;
+
+    uint8_t pli_send[64];
+    size_t pli_send_len = pli_len;
+    memcpy(pli_send, pli_buf, pli_len);
+    if (r->srtp[side])
+        nsbc_srtp_protect_rtcp(r->srtp[side], pli_send, &pli_send_len,
+                               sizeof(pli_send));
+
+    /*  PLI 发回源腿：明文源腿要发到它的视频地址、从其视频 socket 发出，
+     *  WebRTC 源腿继续用共享 socket + audio latch。 */
+    const int have_vfd = (r->fd_vrtp[side] >= 0);
+    const nsbc_sa_t *dst = (have_vfd && r->vlatched[side])
+                           ? &r->vlatch[side]
+                           : ((have_vfd && r->vhave_peer[side])
+                              ? &r->vpeer[side]
+                              : (r->latched[side]
+                                 ? &r->latch[side]
+                                 : (r->have_peer[side] ? &r->peer[side]
+                                                       : &r->latch[side])));
+    if (dst->ss.ss_family == AF_UNSPEC || dst->len == 0) return;
+    int ofd = have_vfd ? r->fd_vrtp[side] : r->fd_rtp[side];
+    (void)sendto(ofd, pli_send, pli_send_len, MSG_NOSIGNAL,
+                 (const struct sockaddr *)&dst->ss, dst->len);
+}
 
 static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
                            int fd)
@@ -667,9 +858,39 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
                 for (size_t i = 0; i < hlen && i * 3 < sizeof(hex) - 1; ++i)
                     snprintf(hex + i * 3, sizeof(hex) - i * 3,
                              "%02x ", buf[i]);
-                llog(LOG_WARN, "relay", "SRTP RTP unprotect FAIL side=%d rc=%d "
-                     "n=%zd first16=[%s]",
-                     side, rc, n, hex);
+                /*  2026-11-22：加上来源地址/PT/seq/ssrc，并限流。
+                 *  之前一条 FAIL 只有 side，无法判断失败包到底来自哪一端
+                 *  （A 的明文 RTP 打到 B 的 SRTP socket 时，日志与"B 发坏包"
+                 *   完全无法区分）；1286 条同样的 WARN 也把现场淹掉了。 */
+                {
+                    char fipa[INET6_ADDRSTRLEN] = {0};
+                    uint16_t fport = 0;
+                    if (src.ss.ss_family == AF_INET) {
+                        inet_ntop(AF_INET, &((struct sockaddr_in *)&src)->sin_addr,
+                                  fipa, sizeof(fipa));
+                        fport = ntohs(((struct sockaddr_in *)&src)->sin_port);
+                    } else if (src.ss.ss_family == AF_INET6) {
+                        inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&src)->sin6_addr,
+                                  fipa, sizeof(fipa));
+                        fport = ntohs(((struct sockaddr_in6 *)&src)->sin6_port);
+                    }
+                    uint16_t fseq = 0;
+                    uint32_t fssrc = 0;
+                    if (n >= 12) {
+                        memcpy(&fseq, buf + 2, 2);
+                        fseq = ntohs(fseq);
+                        memcpy(&fssrc, buf + 8, 4);
+                        fssrc = ntohl(fssrc);
+                    }
+                    if (r->diag_srtp_fail[side] < 5 ||
+                        r->diag_srtp_fail[side] % 200 == 0) {
+                        llog(LOG_WARN, "relay", "SRTP RTP unprotect FAIL side=%d rc=%d "
+                             "n=%zd pt=%u seq=%u ssrc=0x%08x from=%s:%u first16=[%s]",
+                             side, rc, n, (unsigned)(n >= 2 ? (buf[1] & 0x7F) : 0),
+                             (unsigned)fseq, fssrc, fipa, (unsigned)fport, hex);
+                    }
+                    ++r->diag_srtp_fail[side];
+                }
                 ++r->drops;
                 continue;
             }
@@ -777,7 +998,14 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
             continue;
         }
 
-        if (r->have_peer[side] && !nsbc_sa_eq_addr(&src, &r->peer[side])) {
+        /*  本包是否来自视频专用 socket（RTP 或 RTCP）。
+         *  必须把 fd_vrtcp 也算进来：否则视频 RTCP 的源端口会被当作
+         *  audio comedia 学习，把 audio 的发送目标改到 A 的视频端口。 */
+        const int vid_fd = (fd == r->fd_vrtp[side] || fd == r->fd_vrtcp[side]);
+        /*  视频包校验视频 peer，音频包校验音频 peer —— 两套地址互不干扰。 */
+        const nsbc_sa_t *cur_peer = vid_fd ? &r->vpeer[side] : &r->peer[side];
+        int *cur_have = vid_fd ? &r->vhave_peer[side] : &r->have_peer[side];
+        if (*cur_have && !nsbc_sa_eq_addr(&src, cur_peer)) {
             /*  P0 修复：第一次 peer mismatch drop 后立即清 have_peer。
              * 原代码：have_peer[side] 是 SDP 预设的旧地址，NAT 后分机真实源不同，
              * 每次收到都触发 mismatch drop，永远走不到下面的 comedia 学习。
@@ -793,18 +1021,18 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
                               ipa, sizeof(ipa));
                     sp = ntohs(((struct sockaddr_in *)&src)->sin_port);
                 }
-                if (r->peer[side].ss.ss_family == AF_INET) {
-                    inet_ntop(AF_INET, &((struct sockaddr_in *)&r->peer[side])->sin_addr,
+                if (cur_peer->ss.ss_family == AF_INET) {
+                    inet_ntop(AF_INET, &((struct sockaddr_in *)cur_peer)->sin_addr,
                               ppa, sizeof(ppa));
-                    pp = ntohs(((struct sockaddr_in *)&r->peer[side])->sin_port);
+                    pp = ntohs(((struct sockaddr_in *)cur_peer)->sin_port);
                 }
                 llog(LOG_WARN, "relay",
-                     "PEER-MISMATCH side=%d drop#%d have_peer=1 "
+                     "PEER-MISMATCH side=%d vid=%d drop#%d have_peer=1 "
                      "src=%s:%u peer(SDP)=%s:%u → CLEAR have_peer, "
                      "letting next pkt comedia-learn",
-                     side, diag_mismatch[slot]++, ipa, sp, ppa, pp);
+                     side, vid_fd, diag_mismatch[slot]++, ipa, sp, ppa, pp);
             }
-            r->have_peer[side] = 0;  /*  立即清！让下次包走 comedia */
+            *cur_have = 0;  /*  立即清！让下次包走 comedia */
             ++r->drops;
             continue;
         }
@@ -824,7 +1052,25 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
          *   if (have_peer[side] && !sa_eq(src, peer[side])) → 每次收到 NAT 后的 RTP 都 drop！
          * 清除 have_peer 后，peer addr mismatch 检查恒为假，comedia 学到的真实
          * latch[side] 就成为唯一可信的源地址。 */
-        if (!r->latched[side]) {
+        /*  明文腿视频走独立 socket：迟到/首包学习必须与 audio 分开，
+         *  否则视频源端口会覆盖 audio 的目标端口。
+         *  且只从视频 RTP 学习：视频 RTCP 的源端口是 video+1，
+         *  用它当发送目标会把 RTP 发错端口。
+         *  ★ 音频同理（2026-11-22 现场日志）：对端 audio RTCP 源端口是
+         *  RTP+1（实测出向语音被打到 139.226.66.211:13193，而 RTP 端口是
+         *  13192）。一旦用 RTCP 源更新 audio latch，接下来所有出向语音都会
+         *  发到对端的 RTCP 端口被整段丢弃——表现为"能听到但对端声音断续/
+         *  偏小"。音频 latch 只允许 RTP 学习。 */
+        if (vid_fd) {
+            if (!is_rtcp &&
+                (!r->vlatched[side] || !nsbc_sa_eq(&src, &r->vlatch[side]))) {
+                r->vlatch[side] = src;
+                r->vlatched[side] = 1;
+                llog(LOG_DEBUG, "relay",
+                     " LATCH video side=%d latched[0]=%d latched[1]=%d",
+                     side, r->vlatched[0], r->vlatched[1]);
+            }
+        } else if (!is_rtcp && !r->latched[side]) {
             /* 首次：锁定 latch，标志 relay "已就绪" */
             r->latch[side] = src;
             r->latched[side] = 1;
@@ -832,7 +1078,7 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
             __atomic_store_n(&r->d_latched[side], 1, __ATOMIC_RELEASE);
             llog(LOG_DEBUG, "relay", " LATCH side=%d by RTP src_fam=%d latched[0]=%d latched[1]=%d",
                  side, src.ss.ss_family, r->latched[0], r->latched[1]);
-        } else if (!nsbc_sa_eq(&src, &r->latch[side])) {
+        } else if (!is_rtcp && !nsbc_sa_eq(&src, &r->latch[side])) {
             /* comedia：真实 RTP 源变化（NAT 穿透）→ 覆盖 latch，不丢弃
              * 非对称 NAT：首次 RTP 即从 NAT 后真实地址到达 → 覆盖 SDP 预设私网地址
              * 对称 NAT：src 每次都变 — 此处会反复覆盖，发回最新 src（尽力而为）
@@ -843,14 +1089,49 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
         }
 
         int other = side ^ 1;
+        /*  RTCP PLI/FIR 翻译：对端 PLI/FIR 里的 media SSRC 是 SBC 出向后
+         *  重写过的值，视频源端不认识 → 原样转发拿不到关键帧，
+         *  解码端只能等周期关键帧（表现为"视频第一帧很慢/久不出图"）。
+         *  这里用本侧记录的真实源 SSRC 重新生成一条 PLI 发给源腿；
+         *  原始 RTCP 仍照常转发，不改变既有行为。
+         *  FMT=1 是 PLI、FMT=4 是 FIR（linphone 出图前常发 FIR），
+         *  两者都统一翻译成 PLI——源端（Chrome/linphone）都认 PLI。 */
+        if (is_rtcp && n >= 8) {
+            size_t roff = 0;
+            while (roff + 8 <= (size_t)n) {
+                uint8_t rpt = buf[roff + 1];
+                uint8_t rfmt = (uint8_t)(buf[roff] & 0x1Fu);
+                size_t rlen = (((size_t)buf[roff + 2] << 8) |
+                               (size_t)buf[roff + 3]) + 1;
+                rlen *= 4;
+                if (rpt == 206 && (rfmt == 1 || rfmt == 4)) { /* PSFB PLI/FIR */
+                    /*  两侧 relay 回调可能在不同 reactor 线程，vid_ssrc
+                     *  用原子读避免跨线程读到撕裂值。 */
+                    uint32_t vssrc =
+                        __atomic_load_n(&r->vid_ssrc[other], __ATOMIC_RELAXED);
+                    if (vssrc)
+                        relay_video_request_pli(r, other, vssrc);
+                    break;
+                }
+                if (rlen < 4 || roff + rlen > (size_t)n) break;
+                roff += rlen;
+            }
+        }
         /* REQ-ORIGINATE-003 &echo：环回模式把包发回同一侧（side→side）。
          * 其余 latch 检查、peer 选择、sendto fd 下标全部复用 other 变量
          * —— 不引入新变量、不分支，零额外热路径开销。 */
         if (r->echo_mode)
             other = side;
         /* REQ-NAT-001 comedia：对侧是否就绪看 latched OR have_peer
-         * （have_peer 来自 SDP，可公网直达；latched 来自 comedia 学习） */
-        if (!r->latched[other] && !r->have_peer[other]) {
+         * （have_peer 来自 SDP，可公网直达；latched 来自 comedia 学习）。
+         *  只有对侧也是明文腿（有独立视频 socket）时才查视频 latch/peer；
+         *  WebRTC 腿没有视频通道，视频与音频共用地址，必须回退到 audio
+         *  就绪状态，否则 A→B 视频会被永久判"对侧未就绪"丢弃。 */
+        const int other_ready =
+            (vid_fd && r->fd_vrtp[other] >= 0)
+                ? (r->vlatched[other] || r->vhave_peer[other])
+                : (r->latched[other] || r->have_peer[other]);
+        if (!other_ready) {
             /* 对侧尚未就绪：丢弃早期突发 */
             if ((r->drops + r->pkts) % 100 == 0) {
                 llog(LOG_DEBUG, "relay", " DROP other latch not ready "
@@ -1061,6 +1342,101 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
                 continue;  /* 丢弃 DTMF RTP 包 — 对端不需要收到 RFC4733 */
             }
 
+            /*  视频转码（VP9↔H264）：本腿视频 PT 且已规划 video_xcode。
+             *  完全独立于音频转码器——video PT 永不进入 transcode_sess。
+             *  收齐完整帧后解码/重编码，按 mtu 分片发往对侧。 */
+            if (r->node) {
+                video_xcode_t *vx = __atomic_load_n(&r->node->vxcode[side],
+                                                    __ATOMIC_ACQUIRE);
+                int is_vpt = r->node->video_pt_allowed_count[side] > 0 &&
+                             pt_in_list((uint8_t)pkt.pt,
+                                        r->node->video_pt_allowed[side],
+                                        r->node->video_pt_allowed_count[side]);
+                /*  记录入向视频的原始 SSRC（SSRC 重写前），供 PLI 翻译：
+                 *  对端 PLI 引用的是 SBC 出向改写后的 SSRC，源端不认。
+                 *  WebRTC 腿视频与音频共用 socket（vid_fd=0），且浏览器常
+                 *  按自己的 PT（如 96）发视频而不是信令里的 97，is_vpt 也
+                 *  不成立——需用"动态 PT + 大 payload"兜底识别，否则
+                 *  vid_ssrc[1] 恒为 0，A→B 的 PLI 无法翻译。 */
+                const int looks_video =
+                    is_vpt || vid_fd ||
+                    (r->node->neg_v_valid && pkt.pt >= 96 &&
+                     pkt.pt != r->node->dtmf_pt[side] &&
+                     pkt.payload_len > 200);
+                if (looks_video && pkt.pt < 128)
+                    __atomic_store_n(&r->vid_ssrc[side], pkt.ssrc,
+                                     __ATOMIC_RELAXED);
+                if (!is_vpt && r->node->neg_v_valid && pkt.pt >= 96 &&
+                    pkt.pt != r->node->dtmf_pt[side] && pkt.payload_len > 200) {
+                    /*  信令 answer 与实际发送 PT 不一致时（浏览器客户端白名单
+                     *  删码但内部仍发原 PT），只做诊断计数，不贸然转码——
+                     *  把未知编码喂给固定编码的解码器会污染输出。
+                     *  根因修复在 web 端 VIDEO_KEEP_MAIN。
+                     *  注：这种情况下若对端也接受该 PT，包会按原 PT 透传
+                     *  （下方 out_vid 判定），并不是丢弃。 */
+                    if (r->diag_vrx_nox[side] < 3 ||
+                        r->diag_vrx_nox[side] % 500 == 0)
+                        llog(LOG_WARN, "relay",
+                             "VIDEO_PT_MISMATCH side=%d pt=%u len=%zu "
+                             "allowed_count=%d（信令与实际 PT 不一致，不转码/按原 PT 透传）",
+                             side, (unsigned)pkt.pt, pkt.payload_len,
+                             r->node->video_pt_allowed_count[side]);
+                    ++r->diag_vrx_nox[side];
+                }
+                if (vx && is_vpt) {
+                    if (r->diag_vrx[side] < 5 || r->diag_vrx[side] % 500 == 0)
+                        llog(LOG_INFO, "relay",
+                             "VIDEO_RX side=%d pt=%u len=%zu marker=%d ts=%u",
+                             side, (unsigned)pkt.pt, pkt.payload_len,
+                             pkt.marker, (unsigned)pkt.ts);
+                    ++r->diag_vrx[side];
+                    relay_video_ctx_t vc;
+                    vc.r = r;
+                    vc.side = side;
+                    vc.other = other;
+                    (void)video_xcode_input(vx, pkt.payload, pkt.payload_len,
+                                            pkt.marker, pkt.ts,
+                                            relay_video_emit, &vc);
+                    if (video_xcode_take_pli(vx))
+                        relay_video_request_pli(r, side, pkt.ssrc);
+                    ++r->pkts;
+                    continue;
+                }
+            }
+
+            /*  诊断（不丢包）：本腿 audio PT 既不在协商集合、也不是
+             *  DTMF / 视频 PT，且没走下面任何 PT-rewrite / 转码分支 →
+             *  原样转发会让对端收到未协商的 PT（对端通常直接丢弃 = 静音）。
+             *  典型场景：信令协商 PCMA(8)，浏览器实际发 PCMU(0)，
+             *  按 PCMA 建的转码器永远不命中。 */
+            if (r->node && r->node->audio_n[side] > 0 &&
+                pkt.pt != r->node->dtmf_pt[side] &&
+                !pt_in_list((uint8_t)pkt.pt, r->node->audio_pt[side],
+                            r->node->audio_n[side]) &&
+                !pt_in_list((uint8_t)pkt.pt, r->node->video_pt_allowed[side],
+                            r->node->video_pt_allowed_count[side])) {
+                int *bad = &r->node->audio_badpt_diag[side];
+                if (*bad < 3 || (*bad % 500) == 0) {
+                    llog(LOG_WARN, "relay",
+                         "AUDIO_PT_UNNEGOTIATED side=%d pt=%u len=%zu "
+                         "ssrc=0x%08x negotiated_n=%d pt0=%u pt1=%u "
+                         "— 信令与媒体不一致，已原样转发",
+                         side, (unsigned)pkt.pt, pkt.payload_len, pkt.ssrc,
+                         r->node->audio_n[side],
+                         (unsigned)r->node->audio_pt[side][0],
+                         (unsigned)r->node->audio_pt[side][1]);
+                }
+                ++(*bad);
+            }
+
+            /*  视频同 codec 不同 PT：只改 RTP header PT 字节（不转码）。 */
+            if (r->node && r->node->video_rewrite_active[side] &&
+                (uint8_t)pkt.pt == r->node->video_rewrite_src_pt[side]) {
+                uint8_t vnew = r->node->video_rewrite_dst_pt[side];
+                buf[1] = (uint8_t)((buf[1] & 0x80) | (vnew & 0x7F));
+                pkt.pt = vnew;
+            }
+
             /*  PT rewrite fast-path：同 codec 不同 PT
              * 例：WebRTC G729 PT=96 → SIP G729 PT=18
              * 只改 RTP header PT 字节，payload 不动，零开销。 */
@@ -1102,16 +1478,18 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
                     // }
                 }
             }
-            if (r->node && r->node->transcode[side] &&
+            transcode_sess_t *tc =
+                r->node ? __atomic_load_n(&r->node->transcode[side],
+                                          __ATOMIC_ACQUIRE) : NULL;
+            if (r->node && tc &&
+                !peer_accepts_audio_cid(r->node, side, pkt.pt) &&
+                /*  视频 PT 属于源腿 → 绝不能进音频转码器。 */
                 !pt_in_list((uint8_t)pkt.pt,
-                            r->node->pt_allowed[other],
-                            r->node->pt_allowed_count[other]) &&
-                /*  REQ-MEDIA-VIDEO-003：video PT 在 video_pt_allowed 里 → 跳过 transcode！
-                 * video codec registry 没注册 transcode，H.264 payload 喂给 G.711 session 会崩。 */
-                !pt_in_list((uint8_t)pkt.pt,
-                            r->node->video_pt_allowed[other],
-                            r->node->video_pt_allowed_count[other])) {
-                transcode_sess_t *tc = r->node->transcode[side];
+                            r->node->video_pt_allowed[side],
+                            r->node->video_pt_allowed_count[side]) &&
+                /*  入口校验：入包 PT 必须属于该腿音频 codec，且与转码源一致。 */
+                leg_audio_pt_to_cid(r->node, side, pkt.pt) ==
+                    transcode_src_codec_id(tc)) {
                 size_t new_out_len = 0;
                 uint8_t old_pt = (uint8_t)pkt.pt;
                 /* cap = relay buffer 剩余空间：sizeof(buf) - header_ext_len
@@ -1123,24 +1501,26 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
                                            pkt.payload, pkt.payload_len,
                                            (uint8_t *)pkt.payload, cap,
                                            &new_out_len);
+                if (rc == NSBC_OK && new_out_len == 0) {
+                    /* 编码器尚未产出（缓冲/DTX），保留原包不发送空载荷 */
+                    rc = NSBC_AGAIN;
+                }
                 if (rc == NSBC_OK) {
-                    /* 转码成功 — 更新 payload_len + 总包长 n
-                     * G.711 8k→8k 场景 new_out_len == 原 payload_len */
+                    /* 转码成功 — 更新 payload_len + 总包长 n */
                     pkt.payload_len = new_out_len;
                     n = (ssize_t)((pkt.payload - buf) + new_out_len);
                     /* RTP header byte 1：M(bit7) + PT(bit6-0)
-                     * 保留 marker bit，更新 PT */
+                     * 优先使用协商出的目标 PT（xcode_dst_pt），
+                     * 未设置时才退回 codec default_pt。 */
                     codec_id_t dst_id = transcode_dst_codec_id(tc);
-                    /*  用 registry 里的 default_pt — 任何 codec 都能正确映射
-                     * （G.729 default_pt=18, Opus default_pt=111 等） */
-                    uint8_t new_pt = 0;
-                    const codec_ops_t *ops_dst = codec_registry_find(dst_id);
-                    if (ops_dst && ops_dst->default_pt >= 0 && ops_dst->default_pt < 256)
-                        new_pt = (uint8_t)ops_dst->default_pt;
-                    else {
-                        /* fallback：如果 codec ops 没注册 default_pt，
-                         * 用 codec_id 本身（P0 过渡，后续 ops 注册完整后消失） */
-                        new_pt = (uint8_t)(dst_id >= 0 ? dst_id : 0);
+                    uint8_t new_pt = transcode_get_dst_pt(tc);
+                    if (new_pt == 0xFF) {
+                        const codec_ops_t *ops_dst = codec_registry_find(dst_id);
+                        if (ops_dst && ops_dst->default_pt >= 0 &&
+                            ops_dst->default_pt < 256)
+                            new_pt = (uint8_t)ops_dst->default_pt;
+                        else
+                            new_pt = (uint8_t)(dst_id & 0x7F);
                     }
                     /* 保留 marker bit (bit7)，替换低 7 位为新 PT */
                     buf[1] = (buf[1] & 0x80) | (new_pt & 0x7F);
@@ -1160,6 +1540,8 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
                                  (void *)(r->node ? r->node->call : NULL));
                         }
                     }
+                } else if (rc == NSBC_AGAIN) {
+                    /* 编码器缓冲中，尚未产出新载荷；不记错误 */
                 } else if (rc == NSBC_NOTSUP) {
                     /* codec registry 未注册目标 codec — 记一次 WARN，
                      * 继续转发原始包（让上层决定是否丢弃） */
@@ -1184,7 +1566,9 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
             if (r->m->cfg.rec_feed_fn && pkt.payload && pkt.payload_len &&
                 /*  video PT 不进录音 raw 通道（G.711 sidecar）——
                  * H.264 走 vid_reasm → rec_feed_video 专用链路，
-                 * 喂进来只会污染 raw 文件 + 触发无意义的 PT 告警 */
+                 * 喂进来只会污染 raw 文件 + 触发无意义的 PT 告警。
+                 * 独立视频 socket 上到达的包同样一律不喂。 */
+                !vid_fd &&
                 !(r->node && pt_in_list((uint8_t)pkt.pt,
                                         r->node->video_pt_allowed[side],
                                         r->node->video_pt_allowed_count[side]))) {
@@ -1282,13 +1666,32 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
                     buf, (size_t)n, s_ip, s_port, d_ip, d_port);
             }
         }
+        /*  出向流种类：改完 PT 后按"目标腿的视频 PT 表"判定。
+         *  不能直接用入向 socket 判断——B(WebRTC) 发来的视频收在共享
+         *  socket 上，却要发往 A(明文) 的独立视频端口。
+         *  但入向若是明文腿的独立视频 socket，包必为视频，直接放行，
+         *  不再受目标腿 PT 表收窄的影响。 */
+        int out_vid = !is_rtcp && r->node &&
+                      (vid_fd ||
+                       (r->node->video_pt_allowed_count[other] > 0 &&
+                        pt_in_list((uint8_t)(buf[1] & 0x7F),
+                                   r->node->video_pt_allowed[other],
+                                   r->node->video_pt_allowed_count[other])));
         /* === REQ-NAT-001 comedia：sendto 目标地址 ===
-         * 与上方 dst_hint 同逻辑：优先 comedia 学到的真实 latch。 */
-        const nsbc_sa_t *dst = r->latched[other]
-                               ? &r->latch[other]
-                               : (r->have_peer[other]
-                                  ? &r->peer[other]
-                                  : &r->latch[other]);
+         * 与上方 dst_hint 同逻辑：优先 comedia 学到的真实 latch。
+         *  只有目标腿拥有独立视频 socket 时才可用视频 latch——
+         *  WebRTC 腿的视频与音频共用同一地址，必须走 audio latch
+         *  （那是 ICE 打洞后学到的真实可达地址）。 */
+        const nsbc_sa_t *dst;
+        if (out_vid && r->fd_vrtp[other] >= 0) {
+            dst = r->vlatched[other]
+                  ? &r->vlatch[other]
+                  : (r->vhave_peer[other] ? &r->vpeer[other] : &r->latch[other]);
+        } else {
+            dst = r->latched[other]
+                  ? &r->latch[other]
+                  : (r->have_peer[other] ? &r->peer[other] : &r->latch[other]);
+        }
         /* REQ-DTLS-001：明文 RTP → WebRTC 侧（对侧有 dtls 终结器）前加密。
          * RTP/RTCP 按 PT 字节判（与入向对称，rtcp-mux 兼容）。
          * RELAY_BUF=2048 对 1500B 以太网包 + AEAD tag(~30B) 余量充足。 */
@@ -1309,10 +1712,9 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
         }
         /*  2026-10-13 诊断：sendto 目标地址（前 5 包 INFO，后续每 100 包 DEBUG）
          * 确认 SBC 把 SRTP 发到 Chrome ICE 候选的真实地址
-         *  2026-10-16 v2：加 SSRC 字段，确认 mixed-mode 下重写后的值 */
+         *  2026-11-22 per-call 计数 + 前 5 包/每 500 包 NOTICE */
         {
-            /* P2-1：诊断计数改为线程局部 */
-            static _Thread_local int diag_sendto_seen[2] = {0};
+            /* per-call 计数：前 5 包 + 每 500 包一条（短通话也可见） */
             char ipa[INET6_ADDRSTRLEN] = {0};
             uint16_t dport = 0;
             if (dst->ss.ss_family == AF_INET) {
@@ -1330,34 +1732,32 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
                 memcpy(&ssrc, buf + 8, 4);
                 ssrc = ntohl(ssrc);
             }
-            if (diag_sendto_seen[side] < 5) {
+            if (r->diag_sendto[side] < 5 || r->diag_sendto[side] % 500 == 0) {
                 llog(LOG_NOTICE, "relay",
-                     " SENDTO side=%d→%d pt=%u ssrc=0x%08x dst=%s:%u send_len=%zu "
+                     " SENDTO side=%d→%d pt=%u vid=%d rtcp=%d ssrc=0x%08x dst=%s:%u send_len=%zu "
                      "latched[other]=%d have_peer[other]=%d srtp_protect=%d",
-                     side, other, (unsigned)(buf[1] & 0x7F), ssrc,
+                     side, other, (unsigned)(buf[1] & 0x7F), out_vid, is_rtcp, ssrc,
                      ipa, (unsigned)dport, send_len,
                      r->latched[other], r->have_peer[other],
                      !!(r->node && r->node->dtls[other] && r->srtp[other]));
-                ++diag_sendto_seen[side];
-            } else if (r->pkts % 100 == 0) {
-                llog(LOG_DEBUG, "relay", "FWD side=%d→%d send_len=%zu "
-                     "dst=%s:%u dst_fam=%d",
-                     side, other, send_len, ipa, (unsigned)dport,
-                     dst->ss.ss_family);
             }
+            ++r->diag_sendto[side];
         }
-        ssize_t sret = sendto(r->fd_rtp[other], buf, send_len, MSG_NOSIGNAL,
+        /*  明文腿的视频必须从独立视频端口发出：源端口与对端发送目标一致，
+         *  避免严格 symmetric-RTP 的 UA 丢弃源端口不匹配的视频包。 */
+        int out_fd = (out_vid && r->fd_vrtp[other] >= 0)
+                     ? r->fd_vrtp[other] : r->fd_rtp[other];
+        ssize_t sret = sendto(out_fd, buf, send_len, MSG_NOSIGNAL,
                               (const struct sockaddr *)&dst->ss, dst->len);
         if (sret != (ssize_t)send_len) {
             llog(LOG_WARN, "relay", "sendto FAIL side=%d→%d ret=%zd errno=%d "
                  "expected=%zd dst=%s", side, other, sret, errno, send_len, "?");
         }
         ++r->pkts;
-        /*  诊断：每 100 包打一条 INFO，同时看两个方向转发量 */
+        /*  诊断：每 100 包打一条（NOTICE，短通话也可见，能看出双向转发量） */
         if (r->pkts % 100 == 0) {
-            llog(LOG_DEBUG, "relay", " FWD side=%d→%d pkts=%llu drops=%u "
+            llog(LOG_NOTICE, "relay", " FWD pkts=%llu drops=%u "
                  "latched[0]=%d latched[1]=%d srtp[0]=%p srtp[1]=%p",
-                 side, other,
                  (unsigned long long)r->pkts, (unsigned)r->drops,
                  r->latched[0], r->latched[1],
                  (void *)r->srtp[0], (void *)r->srtp[1]);
@@ -1459,6 +1859,15 @@ static void relay_cb(int fd, uint32_t ev, void *arg)
             return;
         }
         if (fd == r->fd_rtcp[side]) {
+            relay_recv_one(r, side, 1, fd);
+            return;
+        }
+        /* 明文腿独立视频通道（与 audio 同一套 PT 分流逻辑） */
+        if (fd == r->fd_vrtp[side]) {
+            relay_recv_one(r, side, 0, fd);
+            return;
+        }
+        if (fd == r->fd_vrtcp[side]) {
             relay_recv_one(r, side, 1, fd);
             return;
         }
@@ -2278,7 +2687,7 @@ static int sdp_truncate_mlines(char *sdp, size_t len, int max_m)
 
 int bridge_rewrite_sdp(const char *in, size_t in_len, char *out,
                        size_t outsz, const char *ip, uint16_t rtp_port,
-                       mb_sdp_dir_t dir)
+                       uint16_t video_port, mb_sdp_dir_t dir)
 {
     size_t used = 0;
     const char *p = in;
@@ -2376,9 +2785,9 @@ int bridge_rewrite_sdp(const char *in, size_t in_len, char *out,
 
             /* DEBUG: 每个 m= 段都打一条 */
             llog(LOG_INFO, "media",
-                 "REWRITE_MLINE: type=%.*s media_idx=%d media_port=%u dir=%d",
+                 "REWRITE_MLINE: type=%.*s media_idx=%d media_port=%u video_port=%u dir=%d",
                  (int)(mt_end - mt), mt, media_idx,
-                 (unsigned)media_port, dir);
+                 (unsigned)media_port, (unsigned)video_port, dir);
 
             /*  PLAIN 方向（发给硬 SIP 端）：
              *
@@ -2433,17 +2842,17 @@ int bridge_rewrite_sdp(const char *in, size_t in_len, char *out,
                          "REWRITE_BRANCH[%d]: orig_port=0 (media REJECTED/CLOSED) → keep port=0 (no rewrite)",
                          media_idx);
                 } else {
-                    /*  BUNDLE 规则（RFC 8843）：
-                     *   WS 方向（WebRTC answer）→ audio/video 共用同一 transport，
-                     *     所有 m= 段统一用 media_port，不加 idx 偏移。
-                     *     Browser offer 有 a=group:BUNDLE → 我们的 answer 也必须
-                     *     audio/video 同端口，否则 ICE connectivity check 只成功
-                     *     audio 那个端口，video 端口没 ICE → DTLS 不通 → 全丢。
-                     *   PLAIN/ASIS → 硬 SIP 端无 BUNDLE，audio/video 分端口独立 relay。 */
-                    if (dir == MB_SDP_WS)
-                        this_port = (uint16_t)media_port;
-                    else
-                        this_port = (uint16_t)(media_port + (uint16_t)(media_idx * 2));
+                    /*  明文腿：video m-line 用独立的 video_port（专用 socket）。
+                     *  WebRTC 腿（video_port==0）保持 BUNDLE 语义，所有 m-line
+                     *  共用第一条 ICE/DTLS 传输的端口。
+                     *  不能给明文腿 two m-lines 同端口——对端（linphone）会把
+                     *  video 自行挪到 port+2，正好落到对侧 socket 上被当 SRTP
+                     *  解密而全丢（音频正常、视频零流量）。 */
+                    this_port = (uint16_t)media_port;
+                    if (video_port != 0 &&
+                        mt_end - mt == 5 && memcmp(mt, "video", 5) == 0)
+                        this_port = video_port;
+                    (void)media_idx;
                 }
 
                 const char *ps = port_end;
@@ -2579,10 +2988,14 @@ int rtp_relay_start(bridge_mgr_t *m, rtp_relay_t **out,
     r->m = m;
     for (int i = 0; i < 2; ++i) {
         r->fd_rtp[i] = r->fd_rtcp[i] = -1;
+        r->fd_vrtp[i] = r->fd_vrtcp[i] = -1;
         ssrc_policy_cfg_t pc = {0};
         ssrc_policy_init(&r->pol[i], &pc);
     }
     uint16_t r0 = 0, c0 = 0, r1 = 0, c1 = 0;
+    uint16_t v0 = 0, vc0 = 0, v1 = 0, vc1 = 0;
+    int want_vid_a = (ports && (ports->want_video & 1)) != 0;
+    int want_vid_b = (ports && (ports->want_video & 2)) != 0;
     llog(LOG_INFO, "media", "relay_start: before alloc pair #0");
     if (ptable_alloc_pair_range(m->cfg.ptable, m->cfg.local_ip, r,
                                 range_lo, range_hi, &r0, &c0) != NSBC_OK) {
@@ -2591,17 +3004,42 @@ int rtp_relay_start(bridge_mgr_t *m, rtp_relay_t **out,
         return NSBC_NOSPC;
     }
     llog(LOG_INFO, "media", "relay_start: pair #0 r0=%u c0=%u", (unsigned)r0, (unsigned)c0);
+    /*  A 腿视频端口：紧跟在 A 腿 audio 后面分配，保持 r_audio+2 的连续性。
+     *  某些 UA（linphone）在 answer 里 audio/video 同端口时会把 video 自个
+     *  儿挪到 port+2；端口连续能让"按 SDP 发"和"挪到 +2"落到同一个 socket。 */
+    if (want_vid_a) {
+        if (ptable_alloc_pair_range(m->cfg.ptable, m->cfg.local_ip, r,
+                                    range_lo, range_hi, &v0, &vc0) != NSBC_OK) {
+            llog(LOG_WARN, "media", "relay_start: alloc video#0 FAILED (降级: 视频与音频同端口)");
+            want_vid_a = 0;
+        } else {
+            llog(LOG_INFO, "media", "relay_start: video#0 rv0=%u cv0=%u", (unsigned)v0, (unsigned)vc0);
+        }
+    }
     llog(LOG_INFO, "media", "relay_start: before alloc pair #1");
     if (ptable_alloc_pair_range(m->cfg.ptable, m->cfg.local_ip, r,
                                 range_lo, range_hi, &r1, &c1) != NSBC_OK) {
         llog(LOG_ERR, "media", "relay_start: alloc #1 FAILED, releasing #0");
         ptable_release_pair(m->cfg.ptable, m->cfg.local_ip, r0);
+        if (want_vid_a)
+            ptable_release_pair(m->cfg.ptable, m->cfg.local_ip, v0);
         free(r);
         return NSBC_NOSPC;
     }
     llog(LOG_INFO, "media", "relay_start: pair #1 r1=%u c1=%u", (unsigned)r1, (unsigned)c1);
+    if (want_vid_b) {
+        if (ptable_alloc_pair_range(m->cfg.ptable, m->cfg.local_ip, r,
+                                    range_lo, range_hi, &v1, &vc1) != NSBC_OK) {
+            llog(LOG_WARN, "media", "relay_start: alloc video#1 FAILED (降级: 视频与音频同端口)");
+            want_vid_b = 0;
+        } else {
+            llog(LOG_INFO, "media", "relay_start: video#1 rv1=%u cv1=%u", (unsigned)v1, (unsigned)vc1);
+        }
+    }
     r->rtp_port[0] = r0;
     r->rtp_port[1] = r1;
+    r->vrtp_port[0] = want_vid_a ? v0 : 0;
+    r->vrtp_port[1] = want_vid_b ? v1 : 0;
     /* P0 relay 纯 IPv4：dualstack=0 避免 v4-mapped family 不匹配
      * （recvfrom 返回 sockaddr_in6 但 peer 为 sockaddr_in → nsbc_sa_eq_addr
      * family 比较直接失败，所有 RTP 被 drop）。 */
@@ -2611,16 +3049,44 @@ int rtp_relay_start(bridge_mgr_t *m, rtp_relay_t **out,
     llog(LOG_INFO, "media", "relay_start: rtp0 fd=%d", r->fd_rtp[0]);
     r->fd_rtcp[0] = net_udp_open(m->cfg.local_ip, c0, &uc);
     llog(LOG_INFO, "media", "relay_start: rtcp0 fd=%d", r->fd_rtcp[0]);
+    if (want_vid_a) {
+        r->fd_vrtp[0] = net_udp_open(m->cfg.local_ip, v0, &uc);
+        r->fd_vrtcp[0] = net_udp_open(m->cfg.local_ip, vc0, &uc);
+        llog(LOG_INFO, "media", "relay_start: vrtp0 fd=%d vrtcp0 fd=%d",
+             r->fd_vrtp[0], r->fd_vrtcp[0]);
+    }
     r->fd_rtp[1] = net_udp_open(m->cfg.local_ip, r1, &uc);
     llog(LOG_INFO, "media", "relay_start: rtp1 fd=%d", r->fd_rtp[1]);
     r->fd_rtcp[1] = net_udp_open(m->cfg.local_ip, c1, &uc);
     llog(LOG_INFO, "media", "relay_start: rtcp1 fd=%d", r->fd_rtcp[1]);
+    if (want_vid_b) {
+        r->fd_vrtp[1] = net_udp_open(m->cfg.local_ip, v1, &uc);
+        r->fd_vrtcp[1] = net_udp_open(m->cfg.local_ip, vc1, &uc);
+        llog(LOG_INFO, "media", "relay_start: vrtp1 fd=%d vrtcp1 fd=%d",
+             r->fd_vrtp[1], r->fd_vrtcp[1]);
+    }
     if (r->fd_rtp[0] < 0 || r->fd_rtp[1] < 0) {
         llog(LOG_WARN, "media",
              "relay_start: UDP open FAIL rtp0=%d rtp1=%d",
              r->fd_rtp[0], r->fd_rtp[1]);
         rtp_relay_stop(r);
         return NSBC_ERR;
+    }
+    /*  视频 socket 打开失败 → 该腿降级为与音频共用端口，
+     *  绝不能广告一个没有 socket 的视频端口。 */
+    for (int i = 0; i < 2; ++i) {
+        int want = (i == 0) ? want_vid_a : want_vid_b;
+        if (want && r->fd_vrtp[i] < 0) {
+            llog(LOG_WARN, "media",
+                 "relay_start: video socket#%d open FAIL → 降级共用音频端口", i);
+            if (r->fd_vrtcp[i] >= 0) {
+                close(r->fd_vrtcp[i]);
+                r->fd_vrtcp[i] = -1;
+            }
+            ptable_release_pair(m->cfg.ptable, m->cfg.local_ip, r->vrtp_port[i]);
+            r->vrtp_port[i] = 0;
+            if (i == 0) want_vid_a = 0; else want_vid_b = 0;
+        }
     }
     llog(LOG_DEBUG, "media",
          "relay_start: OK r0=%d r1=%d fd0=%d fd1=%d local_ip=%s (defer arm)",
@@ -2637,6 +3103,10 @@ int rtp_relay_start(bridge_mgr_t *m, rtp_relay_t **out,
     ports->a_rtcp = c0;
     ports->b_rtp = r1; /* 对 B 广告（offer_hook 改写 offer 时用） */
     ports->b_rtcp = c1;
+    ports->a_vrtp = r->vrtp_port[0];
+    ports->a_vrtcp = want_vid_a ? vc0 : 0;
+    ports->b_vrtp = r->vrtp_port[1];
+    ports->b_vrtcp = want_vid_b ? vc1 : 0;
     *out = r;
     return NSBC_OK;
 }
@@ -2665,7 +3135,7 @@ static int relay_batch_arm_fn(void *arg)
 
     int rc;
     int ok_count = 0;
-    int ok_fds[4] = { -1, -1, -1, -1 };  /* 记录哪些 fd 注册成功用于回滚 */
+    int ok_fds[8] = { -1, -1, -1, -1, -1, -1, -1, -1 };  /* 记录哪些 fd 注册成功用于回滚 */
 
     rc = reactor_add(target, r->fd_rtp[0], EPOLLIN, relay_cb, r);
     llog(LOG_NOTICE, "media", "reactor_add rtp[0]=%d rc=%d", r->fd_rtp[0], rc);
@@ -2687,14 +3157,27 @@ static int relay_batch_arm_fn(void *arg)
         if (rc != NSBC_OK) goto rollback;
         ok_fds[ok_count++] = r->fd_rtcp[1];
     }
+    /* 明文腿的独立视频 RTP/RTCP 通道 */
+    for (int i = 0; i < 2; ++i) {
+        if (r->fd_vrtp[i] >= 0) {
+            rc = reactor_add(target, r->fd_vrtp[i], EPOLLIN, relay_cb, r);
+            if (rc != NSBC_OK) goto rollback;
+            ok_fds[ok_count++] = r->fd_vrtp[i];
+        }
+        if (r->fd_vrtcp[i] >= 0) {
+            rc = reactor_add(target, r->fd_vrtcp[i], EPOLLIN, relay_cb, r);
+            if (rc != NSBC_OK) goto rollback;
+            ok_fds[ok_count++] = r->fd_vrtcp[i];
+        }
+    }
 
     r->armed = 1;
     return NSBC_OK;
 
 rollback:
     llog(LOG_WARN, "media",
-         "relay_batch_arm: reactor_add failed rc=%d fd=%d — rolling back %d succeeded",
-         rc, ok_fds[ok_count], ok_count);
+         "relay_batch_arm: reactor_add failed rc=%d — rolling back %d succeeded",
+         rc, ok_count);
     for (int i = ok_count - 1; i >= 0; --i)
         reactor_del(target, ok_fds[i]);
     return rc;
@@ -2716,6 +3199,12 @@ static int relay_batch_stop_fn(void *arg)
         reactor_del(target, r->fd_rtcp[0]);
     if (r->fd_rtcp[1] >= 0)
         reactor_del(target, r->fd_rtcp[1]);
+    for (int i = 0; i < 2; ++i) {
+        if (r->fd_vrtp[i] >= 0)
+            reactor_del(target, r->fd_vrtp[i]);
+        if (r->fd_vrtcp[i] >= 0)
+            reactor_del(target, r->fd_vrtcp[i]);
+    }
     return NSBC_OK;
 }
 
@@ -2808,6 +3297,10 @@ void rtp_relay_stop(rtp_relay_t *r)
                 reactor_del(m->cfg.re, r->fd_rtp[i]);
             if (r->fd_rtcp[i] >= 0)
                 reactor_del(m->cfg.re, r->fd_rtcp[i]);
+            if (r->fd_vrtp[i] >= 0)
+                reactor_del(m->cfg.re, r->fd_vrtp[i]);
+            if (r->fd_vrtcp[i] >= 0)
+                reactor_del(m->cfg.re, r->fd_vrtcp[i]);
         }
     } else if (need_fallback && r->home_reactor) {
         /* reactor_call 失败但 home_reactor 还在 —— 直接调 reactor_del（非 owner
@@ -2817,6 +3310,10 @@ void rtp_relay_stop(rtp_relay_t *r)
                 reactor_del(r->home_reactor, r->fd_rtp[i]);
             if (r->fd_rtcp[i] >= 0)
                 reactor_del(r->home_reactor, r->fd_rtcp[i]);
+            if (r->fd_vrtp[i] >= 0)
+                reactor_del(r->home_reactor, r->fd_vrtp[i]);
+            if (r->fd_vrtcp[i] >= 0)
+                reactor_del(r->home_reactor, r->fd_vrtcp[i]);
         }
     }
 
@@ -2846,9 +3343,20 @@ void rtp_relay_stop(rtp_relay_t *r)
             close(r->fd_rtcp[i]);
             r->fd_rtcp[i] = -1;
         }
+        if (r->fd_vrtp[i] >= 0) {
+            close(r->fd_vrtp[i]);
+            r->fd_vrtp[i] = -1;
+        }
+        if (r->fd_vrtcp[i] >= 0) {
+            close(r->fd_vrtcp[i]);
+            r->fd_vrtcp[i] = -1;
+        }
         if (r->rtp_port[i])
             ptable_release_pair(m->cfg.ptable, m->cfg.local_ip,
                                 r->rtp_port[i]);
+        if (r->vrtp_port[i])
+            ptable_release_pair(m->cfg.ptable, m->cfg.local_ip,
+                                r->vrtp_port[i]);
     }
     free(r);
 }
@@ -2870,6 +3378,15 @@ void rtp_relay_set_peer_b(rtp_relay_t *r, const nsbc_sa_t *sa)
     r->latch[1] = *sa;
     r->have_peer[1] = 1;
     __atomic_store_n(&r->d_latched[1], 1, __ATOMIC_RELEASE);
+}
+
+/*  视频 m-line 的对端地址（明文腿专用）。与 set_peer_a/b 分开记录，
+ *  避免 audio 的端口被当成 video 的目标端口（反之亦然）。 */
+void rtp_relay_set_peer_video(rtp_relay_t *r, int side, const nsbc_sa_t *sa)
+{
+    if (!r || side < 0 || side > 1 || !sa) return;
+    r->vpeer[side] = *sa;
+    r->vhave_peer[side] = 1;
 }
 
 /*  HA P3-2: failover rebuild 预填 SSRC 重写映射
@@ -2969,10 +3486,705 @@ static cnode_t *entry_get(bridge_mgr_t *m, void *call)
     }
     e->call = call;
     e->mode = MB_RELAY;
+    e->xcode_src_pt[0] = e->xcode_src_pt[1] = 0xFF;
+    e->xcode_dst_pt[0] = e->xcode_dst_pt[1] = 0xFF;
+    e->neg_a_pt = e->neg_b_pt = 0xFF;
+    e->dir[0] = e->dir[1] = SDP_DIR_SENDRECV;
     e->next = s->head;
     s->head = e;
     pthread_mutex_unlock(&s->lock);
     return e;
+}
+
+/* ------------------------------------------------------------------ */
+/* 每腿独立 SDP 终结（第 1 项）                                          */
+/* ------------------------------------------------------------------ */
+/*  SBC 作为 B2BUA，对每条腿独立终结 SDP，而不是把一腿的 fmt-list 原样
+ *  丢给另一腿：
+ *   1) offer → B：在 A 的 m=audio fmt-list 尾部追加 SBC 注册表里
+ *      "既能解码又能编码"的静态 PT（A 未提供的），让 B 有选择 SBC 支持
+ *      codec 的机会（A=G729-only、B=PCMA-only 时转码才可能成立）；
+ *   2) answer → A：只向 A 宣告定型后的 A 侧音频 codec 与 A 自己的
+ *      telephone-event PT，绝不把 B 腿的 PT 泄漏给 A（否则 A 收到
+ *      未 offer 过的 PT 会拒绝 SDP → 488/BYE）。
+ *  视频：编码名与 PT 完全一致才保留；否则视频段 port=0 降级纯音频
+ *  （视频转码尚未实现，不能伪造 PT）。BYPASS 完全不改写。 */
+#define SDP_XC_MAXPT 16
+
+typedef struct {
+    int found;      /* 是否存在该类型媒体段 */
+    int port;       /* m= 端口（0=被拒绝） */
+    int n;
+    struct {
+        int  pt;
+        char enc[24];
+        char rate[12];
+        int  ch;
+        char fmtp[96];
+        int  te;    /* telephone-event */
+    } c[SDP_XC_MAXPT];
+} sdp_xc_mline_t;
+
+/* 前置声明：定义在文件后部（bridge_confirm 附近），此处终结逻辑复用 */
+static int sdp_extract_audio_codecs(const char *sdp, size_t len,
+                                    uint8_t *out_pts, codec_id_t *out_cids,
+                                    int out_cap);
+static uint8_t find_dtmf_pt(const char *sdp, size_t len);
+
+static void tok_copy(char *dst, size_t cap, sip_tok_t t)
+{
+    if (dst == NULL || cap == 0) return;
+    size_t n = t.p ? t.len : 0;
+    if (n >= cap) n = cap - 1;
+    if (n) memcpy(dst, t.p, n);
+    dst[n] = '\0';
+}
+
+/* 编码名归一化比较：忽略大小写与 '.'/'-'/'_'（G.722 == g722 等） */
+static char xc_norm_ch(char c)
+{
+    if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+    if (c == '.' || c == '-' || c == '_') return 0;
+    return c;
+}
+
+static int xc_enc_eq(const char *a, const char *b)
+{
+    if (a == NULL || b == NULL) return 0;
+    for (;;) {
+        char ca = 0, cb = 0;
+        while (*a && (ca = xc_norm_ch(*a)) == 0) ++a;
+        while (*b && (cb = xc_norm_ch(*b)) == 0) ++b;
+        if (ca != cb) return 0;
+        if (ca == '\0') return 1;
+        ++a;
+        ++b;
+    }
+}
+
+/* 解析指定类型的第一个媒体段（含 codecs 构建） */
+static void sdp_xc_parse(const char *sdp, size_t len, sdp_mtype_t type,
+                         sdp_xc_mline_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (sdp == NULL || len == 0) return;
+    sdp_t s;
+    memset(&s, 0, sizeof(s));
+    if (sdp_parse(&s, sdp, len) != NSBC_OK) return;
+    for (int i = 0; i < s.nmedia; ++i) {
+        sdp_media_t *m = &s.media[i];
+        if (m->type != type) continue;
+        out->found = 1;
+        out->port = m->port;
+        if (!m->codecs_built)
+            sdp_media_build_codecs(&s, m);
+        for (int j = 0; j < m->ncodecs && out->n < SDP_XC_MAXPT; ++j) {
+            sdp_codec_t *c = &m->codecs[j];
+            int k = out->n++;
+            out->c[k].pt = c->pt;
+            tok_copy(out->c[k].enc, sizeof(out->c[k].enc), c->enc);
+            tok_copy(out->c[k].rate, sizeof(out->c[k].rate), c->rate);
+            out->c[k].ch = 0;
+            if (c->channels.p && c->channels.len) {
+                char tmp[8];
+                tok_copy(tmp, sizeof(tmp), c->channels);
+                out->c[k].ch = atoi(tmp);
+            }
+            tok_copy(out->c[k].fmtp, sizeof(out->c[k].fmtp), c->fmtp);
+            out->c[k].te = c->telephone_event;
+        }
+        return;
+    }
+}
+
+/* 视频 codec 是否可双向处理：目前只支持 H.264 / VP9（video_xcode 组合）。
+ * 返回 CODEC_NONE 表示该编码名不能作为视频转码的一端。 */
+static codec_id_t xc_video_cid(const char *enc)
+{
+    if (enc == NULL || enc[0] == '\0') return CODEC_NONE;
+    size_t nlen = strlen(enc);
+    const codec_ops_t *ops = codec_find_by_name_kind(enc, nlen, CODEC_KIND_VIDEO);
+    if (ops == NULL) {
+        /*  兜底：按名称查一次再校验类别。
+         * 部分第三方 SDP 的 rtpmap 名与注册表 sdp_name 不完全一致（别名/大小写），
+         * 且按 kind 查找会因 kind 未填而漏掉，这里补一条不限 kind 的查找。 */
+        const codec_ops_t *o2 = codec_registry_find_name(enc, nlen);
+        if (o2 && o2->kind == CODEC_KIND_VIDEO) ops = o2;
+    }
+    if (ops == NULL) return CODEC_NONE;
+    if (ops->id != CODEC_H264 && ops->id != CODEC_VP9 &&
+        ops->id != CODEC_VP8)
+        return CODEC_NONE;
+    if (!codec_can_decode(ops->id) || !codec_can_encode(ops->id))
+        return CODEC_NONE;
+    return ops->id;
+}
+
+typedef struct {
+    int        ok;
+    int        port;
+    int        pt;
+    codec_id_t cid;
+    char       enc[24];
+    char       rate[12];
+    char       fmtp[96];
+} sdp_vsel_t;
+
+/* 从 SDP 的视频段里挑选第一个 SBC 可双向处理的 codec（H264/VP9）。 */
+static int sdp_video_select(const char *sdp, size_t len, sdp_vsel_t *out)
+{
+    if (out == NULL) return 0;
+    memset(out, 0, sizeof(*out));
+    sdp_xc_mline_t vm;
+    sdp_xc_parse(sdp, len, SDP_M_VIDEO, &vm);
+    if (!vm.found) return 0;
+    out->port = vm.port;
+    for (int i = 0; i < vm.n; ++i) {
+        if (vm.c[i].te) continue;
+        codec_id_t cid = xc_video_cid(vm.c[i].enc);
+        if (cid == CODEC_NONE) continue;
+        out->ok   = 1;
+        out->pt   = vm.c[i].pt;
+        out->cid  = cid;
+        snprintf(out->enc, sizeof(out->enc), "%s", vm.c[i].enc);
+        snprintf(out->rate, sizeof(out->rate), "%s",
+                 vm.c[i].rate[0] ? vm.c[i].rate : "90000");
+        snprintf(out->fmtp, sizeof(out->fmtp), "%s", vm.c[i].fmtp);
+        return 1;
+    }
+    return 0;
+}
+
+/* 从 m= 行里定位 fmt-list 起点（跳过 "<type> <port> <proto>" 三个字段） */
+static const char *xc_mline_fmt_start(const char *p, size_t cl)
+{
+    const char *end = p + cl;
+    const char *q = p + 2;
+    int field = 0;
+    while (q < end && field < 3) {
+        while (q < end && *q != ' ' && *q != '\t') ++q;
+        if (q >= end) return end;
+        ++field;
+        while (q < end && (*q == ' ' || *q == '\t')) ++q;
+    }
+    return q;
+}
+
+/* 定位 m= 行的 port 字段 [start,end) */
+static void xc_mline_port_span(const char *p, size_t cl,
+                               const char **ps, const char **pe)
+{
+    const char *end = p + cl;
+    const char *q = p + 2;
+    while (q < end && *q != ' ' && *q != '\t') ++q;   /* type */
+    while (q < end && (*q == ' ' || *q == '\t')) ++q;
+    *ps = q;
+    while (q < end && *q >= '0' && *q <= '9') ++q;
+    *pe = q;
+}
+
+/* offer → B：追加 SBC 可双向处理的静态音频 PT，以及视频 H264/VP9 动态 PT。
+ * 视频两侧 codec 不同时由 video_xcode 转码（VP9↔H264）。
+ * 返回追加个数（0=未改动，缓冲区不动）。 */
+static int sdp_xc_add_offer_audio(char *sdp, size_t *lenp, size_t cap)
+{
+    if (sdp == NULL || lenp == NULL || *lenp == 0) return 0;
+    size_t len = *lenp;
+    sdp_xc_mline_t am, vm;
+    sdp_xc_parse(sdp, len, SDP_M_AUDIO, &am);
+    sdp_xc_parse(sdp, len, SDP_M_VIDEO, &vm);
+
+    int add_pt[SDP_XC_MAXPT];
+    int nadd = 0;
+    /*  只追加 RFC 3551 静态音频 PT 的保守白名单，且必须在 registry 中
+     *  "可解码 + 可编码"。不扫全静态区间——避免把 G722/16000 之类
+     *  SDP 时钟与采样率不一致的 codec 强塞给对端。
+     *
+     *  ★ 顺序与取舍很关键：PCMA 优先，且 PCMA 可用时不再追加 PCMU。
+     *  典型故障（2026-11-22 实测）：offer 尾部是 "0 8" 时，Chrome 对
+     *  G.711 的偏好会选 PCMU(0)；而本仓库 WebRTC 页的 codec 白名单只保留
+     *  PCMA 并据此改写"信令里的 answer"→ 信令宣告 8(PCMA)、实际媒体却是
+     *  0(PCMU)。SBC 按 PCMA 建的转码器永远不命中，未协商的 PT=0 被原样
+     *  转发给 G729 对端 → 对方完全静音（本端却能听到对方）。
+     *  只给 PCMA 可从源头消除这个二义性：所有 G.711 端点都支持 PCMA。 */
+    static const int cand[] = { 8 /* PCMA */, 18 /* G729 */, 0 /* PCMU */ };
+    int have_pcma = 0;
+    if (am.found && am.port > 0) {
+        for (size_t ci = 0; ci < sizeof(cand) / sizeof(cand[0]); ++ci) {
+            int pt = cand[ci];
+            const codec_ops_t *ops = codec_find_by_pt_kind(pt, CODEC_KIND_AUDIO);
+            if (!ops) continue;
+            if (!codec_can_decode(ops->id) || !codec_can_encode(ops->id))
+                continue;
+            /*  PCMA 已可协商 → 不再给对端 PCMU，避免它选到 0。 */
+            if (pt == 0 && have_pcma) continue;
+            int present = 0;
+            for (int j = 0; j < am.n; ++j) {
+                if (am.c[j].pt == pt ||
+                    xc_enc_eq(am.c[j].enc, ops->name) ||
+                    (ops->sdp_name && xc_enc_eq(am.c[j].enc, ops->sdp_name))) {
+                    present = 1;
+                    break;
+                }
+            }
+            if (pt == 8) have_pcma = 1;
+            if (!present)
+                add_pt[nadd++] = pt;
+        }
+    }
+
+    /* 视频候选：H264 / VP9（video_xcode 支持的两个方向） */
+    int add_vpt[4];
+    codec_id_t add_vcid[4];
+    int nvadd = 0;
+    if (vm.found && vm.port > 0) {
+        static const codec_id_t vcand[] = { CODEC_H264, CODEC_VP8, CODEC_VP9 };
+        for (size_t ci = 0; ci < sizeof(vcand) / sizeof(vcand[0]); ++ci) {
+            const codec_ops_t *ops = codec_registry_find(vcand[ci]);
+            if (!ops || ops->kind != CODEC_KIND_VIDEO) continue;
+            if (!codec_can_decode(ops->id) || !codec_can_encode(ops->id))
+                continue;
+            int present = 0;
+            for (int j = 0; j < vm.n; ++j) {
+                if (xc_enc_eq(vm.c[j].enc, ops->name) ||
+                    (ops->sdp_name && xc_enc_eq(vm.c[j].enc, ops->sdp_name))) {
+                    present = 1;
+                    break;
+                }
+            }
+            if (present) continue;
+
+            /* 选一个未使用的动态 PT（96..127） */
+            int pt = -1;
+            for (int cand_pt = CODEC_PT_DYN_MIN; cand_pt <= 127; ++cand_pt) {
+                int used = 0;
+                for (int j = 0; j < am.n; ++j) if (am.c[j].pt == cand_pt) used = 1;
+                for (int j = 0; j < vm.n; ++j) if (vm.c[j].pt == cand_pt) used = 1;
+                for (int j = 0; j < nvadd; ++j) if (add_vpt[j] == cand_pt) used = 1;
+                if (!used) { pt = cand_pt; break; }
+            }
+            if (pt < 0) break;
+            add_vcid[nvadd] = ops->id;
+            add_vpt[nvadd++] = pt;
+        }
+    }
+
+    if (nadd == 0 && nvadd == 0) return 0;
+
+    char *nb = (char *)malloc(cap + 1);
+    if (nb == NULL) return 0;
+    size_t used = 0;
+    const char *p = sdp, *end = sdp + len;
+    int overflow = 0;
+    while (p < end) {
+        const char *eol = memchr(p, '\n', (size_t)(end - p));
+        const char *le = eol ? eol : end;
+        size_t ll = (size_t)(le - p);
+        size_t cl = ll;
+        while (cl > 0 && p[cl - 1] == '\r') --cl;
+        const int is_m = (cl >= 2 && p[0] == 'm' && p[1] == '=');
+        const int is_audio_m =
+            is_m && cl >= 8 && memcmp(p + 2, "audio", 5) == 0 &&
+            (p[7] == ' ' || p[7] == '\t');
+        const int is_video_m =
+            is_m && cl >= 8 && memcmp(p + 2, "video", 5) == 0 &&
+            (p[7] == ' ' || p[7] == '\t');
+
+        if (is_audio_m && nadd > 0) {
+            /* 保留原有 fmt-list，仅在行尾追加 SBC 侧 PT */
+            if (put_line(nb, cap, &used, p, cl) != NSBC_OK) {
+                overflow = 1;
+                break;
+            }
+            char tmp[16];
+            for (int i = 0; i < nadd; ++i) {
+                int tn = snprintf(tmp, sizeof(tmp), " %d", add_pt[i]);
+                if (tn <= 0 ||
+                    put_line(nb, cap, &used, tmp, (size_t)tn) != NSBC_OK) {
+                    overflow = 1;
+                    break;
+                }
+            }
+            if (overflow) break;
+            if (put_line(nb, cap, &used, "\r\n", 2) != NSBC_OK) {
+                overflow = 1;
+                break;
+            }
+            /* 在段内补 rtpmap（追加格式项必须有 rtpmap，否则对端无法识别） */
+            for (int i = 0; i < nadd; ++i) {
+                const codec_ops_t *ops =
+                    codec_find_by_pt_kind(add_pt[i], CODEC_KIND_AUDIO);
+                if (!ops) continue;
+                const char *nm = ops->sdp_name ? ops->sdp_name : ops->name;
+                int rate = ops->clock_rate > 0 ? ops->clock_rate : 8000;
+                char abuf[128];
+                int an = snprintf(abuf, sizeof(abuf), "a=rtpmap:%d %s/%d",
+                                  add_pt[i], nm, rate);
+                if (an <= 0 ||
+                    put_line(nb, cap, &used, abuf, (size_t)an) != NSBC_OK ||
+                    put_line(nb, cap, &used, "\r\n", 2) != NSBC_OK) {
+                    overflow = 1;
+                    break;
+                }
+            }
+            if (overflow) break;
+            p = eol ? eol + 1 : end;
+            continue;
+        }
+
+        if (is_video_m && nvadd > 0) {
+            /* 保留原有 fmt-list，仅在行尾追加 SBC 侧 PT */
+            if (put_line(nb, cap, &used, p, cl) != NSBC_OK) {
+                overflow = 1;
+                break;
+            }
+            char tmp[16];
+            for (int i = 0; i < nvadd; ++i) {
+                int tn = snprintf(tmp, sizeof(tmp), " %d", add_vpt[i]);
+                if (tn <= 0 ||
+                    put_line(nb, cap, &used, tmp, (size_t)tn) != NSBC_OK) {
+                    overflow = 1;
+                    break;
+                }
+            }
+            if (overflow) break;
+            if (put_line(nb, cap, &used, "\r\n", 2) != NSBC_OK) {
+                overflow = 1;
+                break;
+            }
+            for (int i = 0; i < nvadd; ++i) {
+                int is_h264 = (add_vcid[i] == CODEC_H264);
+                /* 编码名以注册表为准（H264 / VP8 / VP9） */
+                const codec_ops_t *vops = codec_registry_find(add_vcid[i]);
+                const char *nm = "H264";
+                if (vops) {
+                    if (vops->sdp_name && vops->sdp_name[0])
+                        nm = vops->sdp_name;
+                    else if (vops->name[0])
+                        nm = vops->name;
+                }
+                char abuf[192];
+                int an = snprintf(abuf, sizeof(abuf), "a=rtpmap:%d %s/90000",
+                                  add_vpt[i], nm);
+                if (an <= 0 ||
+                    put_line(nb, cap, &used, abuf, (size_t)an) != NSBC_OK ||
+                    put_line(nb, cap, &used, "\r\n", 2) != NSBC_OK) {
+                    overflow = 1;
+                    break;
+                }
+                if (is_h264) {
+                    an = snprintf(abuf, sizeof(abuf),
+                                  "a=fmtp:%d packetization-mode=1;"
+                                  "profile-level-id=42e01f", add_vpt[i]);
+                    if (an <= 0 ||
+                        put_line(nb, cap, &used, abuf, (size_t)an) != NSBC_OK ||
+                        put_line(nb, cap, &used, "\r\n", 2) != NSBC_OK) {
+                        overflow = 1;
+                        break;
+                    }
+                }
+            }
+            if (overflow) break;
+            p = eol ? eol + 1 : end;
+            continue;
+        }
+
+        if (put_line(nb, cap, &used, p, ll) != NSBC_OK) {
+            overflow = 1;
+            break;
+        }
+        if (eol && put_line(nb, cap, &used, "\n", 1) != NSBC_OK) {
+            overflow = 1;
+            break;
+        }
+        p = eol ? eol + 1 : end;
+    }
+    if (overflow || used >= cap) {
+        free(nb);
+        return 0;
+    }
+    nb[used] = '\0';
+    memcpy(sdp, nb, used);
+    sdp[used] = '\0';
+    *lenp = used;
+    free(nb);
+    return nadd + nvadd;
+}
+
+/* answer → A：只保留 A 侧选定的音频 codec + A 的 telephone-event。
+ * 失败/不适用返回 0（缓冲区不动）。 */
+static int sdp_xc_answer_for_a(char *ans, size_t *lenp, size_t cap,
+                               const char *a_offer, size_t a_off_len,
+                               int a_pt)
+{
+    if (ans == NULL || lenp == NULL || a_offer == NULL || a_pt < 0)
+        return 0;
+    size_t len = *lenp;
+    sdp_xc_mline_t aa, av, ba, bv;
+    sdp_xc_parse(a_offer, a_off_len, SDP_M_AUDIO, &aa);
+    sdp_xc_parse(a_offer, a_off_len, SDP_M_VIDEO, &av);
+    sdp_xc_parse(ans, len, SDP_M_AUDIO, &ba);
+    sdp_xc_parse(ans, len, SDP_M_VIDEO, &bv);
+    if (!aa.found || !ba.found || ba.port == 0) return 0;
+
+    /* A 侧 a_pt 的 rtpmap 元数据（重建 answer 属性用） */
+    const char *aenc = NULL, *arate = NULL, *afmtp = NULL;
+    int ach = 0, a_te = 0;
+    for (int i = 0; i < aa.n; ++i) {
+        if (aa.c[i].te && a_te == 0 && aa.c[i].pt > 0)
+            a_te = aa.c[i].pt;
+        if (aa.c[i].pt == a_pt) {
+            aenc = aa.c[i].enc;
+            arate = aa.c[i].rate;
+            ach = aa.c[i].ch;
+            afmtp = aa.c[i].fmtp;
+        }
+    }
+    if (aenc == NULL || aenc[0] == '\0') return 0;  /* 无 rtpmap 无法重建 */
+
+    /* 视频逐腿终结：
+     *   - 两侧都有 SBC 可双向处理的视频 codec（H264/VP9）→ 回给 offer 侧
+     *     的视频段只保留 offer 侧选定 codec（对侧由 video_xcode 转码）；
+     *   - 否则 port=0 降级纯音频（绝不伪造 PT）。 */
+    int vport_zero = 0;
+    int v_rewrite = 0;
+    int a_vidx = -1;
+    if (av.found && bv.found && bv.port > 0) {
+        for (int i = 0; i < av.n; ++i) {
+            if (av.c[i].te) continue;
+            if (xc_video_cid(av.c[i].enc) != CODEC_NONE) {
+                a_vidx = i;
+                break;
+            }
+        }
+        int b_ok = 0;
+        for (int i = 0; i < bv.n; ++i) {
+            if (bv.c[i].te) continue;
+            if (xc_video_cid(bv.c[i].enc) != CODEC_NONE) {
+                b_ok = 1;
+                break;
+            }
+        }
+        if (a_vidx >= 0 && b_ok) v_rewrite = 1;
+        else vport_zero = 1;
+        if (vport_zero) {
+            llog(LOG_WARN, "media",
+                 "sdp_xc_answer_for_a: video rejected — A[found=%d port=%d "
+                 "n=%d a_vidx=%d] B[found=%d port=%d n=%d b_ok=%d]",
+                 av.found, av.port, av.n, a_vidx,
+                 bv.found, bv.port, bv.n, b_ok);
+        }
+    } else {
+        llog(LOG_INFO, "media",
+             "sdp_xc_answer_for_a: no video section A[found=%d port=%d] "
+             "B[found=%d port=%d]",
+             av.found, av.port, bv.found, bv.port);
+    }
+
+    char *nb = (char *)malloc(cap + 1);
+    if (nb == NULL) return 0;
+    size_t used = 0;
+    const char *p = ans, *end = ans + len;
+    int overflow = 0, sect_audio = 0, sect_video = 0;
+    while (p < end) {
+        const char *eol = memchr(p, '\n', (size_t)(end - p));
+        const char *le = eol ? eol : end;
+        size_t ll = (size_t)(le - p);
+        size_t cl = ll;
+        while (cl > 0 && p[cl - 1] == '\r') --cl;
+        const int is_m = (cl >= 2 && p[0] == 'm' && p[1] == '=');
+        int mtype = -1;                    /* 0=audio 1=video */
+        if (is_m) {
+            if (cl >= 8 && memcmp(p + 2, "audio", 5) == 0)
+                mtype = 0;
+            else if (cl >= 8 && memcmp(p + 2, "video", 5) == 0)
+                mtype = 1;
+            sect_audio = (mtype == 0);
+            sect_video = (mtype == 1);
+        }
+
+        if (sect_audio && is_m) {
+            /* 音频 m= 行：替换整个 fmt-list 为 A 选定 PT（+ TE） */
+            const char *fs = xc_mline_fmt_start(p, cl);
+            if (put_line(nb, cap, &used, p, (size_t)(fs - p)) != NSBC_OK) {
+                overflow = 1;
+                break;
+            }
+            char tmp[32];
+            int tn = snprintf(tmp, sizeof(tmp), "%d", a_pt);
+            if (tn <= 0 ||
+                put_line(nb, cap, &used, tmp, (size_t)tn) != NSBC_OK) {
+                overflow = 1;
+                break;
+            }
+            if (a_te > 0 && a_te != a_pt) {
+                tn = snprintf(tmp, sizeof(tmp), " %d", a_te);
+                if (tn <= 0 ||
+                    put_line(nb, cap, &used, tmp, (size_t)tn) != NSBC_OK) {
+                    overflow = 1;
+                    break;
+                }
+            }
+            if (put_line(nb, cap, &used, "\r\n", 2) != NSBC_OK) {
+                overflow = 1;
+                break;
+            }
+            /* 紧随 m= 行重建 rtpmap / fmtp —— 原 B 腿载荷属性在下方被丢弃 */
+            char abuf[192];
+            int an = snprintf(abuf, sizeof(abuf), "a=rtpmap:%d %s/%s%s",
+                              a_pt, aenc, (arate && arate[0]) ? arate : "8000",
+                              (ach > 1) ? "/2" : "");
+            if (an <= 0 ||
+                put_line(nb, cap, &used, abuf, (size_t)an) != NSBC_OK ||
+                put_line(nb, cap, &used, "\r\n", 2) != NSBC_OK) {
+                overflow = 1;
+                break;
+            }
+            if (afmtp && afmtp[0]) {
+                an = snprintf(abuf, sizeof(abuf), "a=fmtp:%d %s",
+                              a_pt, afmtp);
+                if (an <= 0 ||
+                    put_line(nb, cap, &used, abuf, (size_t)an) != NSBC_OK ||
+                    put_line(nb, cap, &used, "\r\n", 2) != NSBC_OK) {
+                    overflow = 1;
+                    break;
+                }
+            }
+            if (a_te > 0) {
+                const char *terate = "8000";
+                const char *tefmtp = NULL;
+                for (int i = 0; i < aa.n; ++i) {
+                    if (aa.c[i].pt == a_te) {
+                        if (aa.c[i].rate[0]) terate = aa.c[i].rate;
+                        tefmtp = aa.c[i].fmtp;
+                        break;
+                    }
+                }
+                an = snprintf(abuf, sizeof(abuf),
+                              "a=rtpmap:%d telephone-event/%s", a_te, terate);
+                if (an <= 0 ||
+                    put_line(nb, cap, &used, abuf, (size_t)an) != NSBC_OK ||
+                    put_line(nb, cap, &used, "\r\n", 2) != NSBC_OK) {
+                    overflow = 1;
+                    break;
+                }
+                if (tefmtp && tefmtp[0]) {
+                    an = snprintf(abuf, sizeof(abuf), "a=fmtp:%d %s",
+                                  a_te, tefmtp);
+                    if (an <= 0 ||
+                        put_line(nb, cap, &used, abuf, (size_t)an) != NSBC_OK ||
+                        put_line(nb, cap, &used, "\r\n", 2) != NSBC_OK) {
+                        overflow = 1;
+                        break;
+                    }
+                }
+            }
+            p = eol ? eol + 1 : end;
+            continue;
+        }
+
+        if (sect_audio && !is_m && cl >= 2 && p[0] == 'a' && p[1] == '=') {
+            /* 丢弃 B 腿的载荷相关属性，避免与 A 的 PT 冲突 */
+            if ((cl >= 9 && memcmp(p, "a=rtpmap:", 9) == 0) ||
+                (cl >= 7 && memcmp(p, "a=fmtp:", 7) == 0) ||
+                (cl >= 10 && memcmp(p, "a=rtcp-fb:", 10) == 0)) {
+                p = eol ? eol + 1 : end;
+                continue;
+            }
+        }
+
+        if (sect_video && is_m && v_rewrite) {
+            /* 视频 m= 行：保留对侧端口/proto，fmt-list 收敛到 offer 侧选定 PT，
+             * 紧随其后重建 rtpmap/fmtp（原对侧载荷属性在下方被丢弃）。 */
+            const char *fs = xc_mline_fmt_start(p, cl);
+            size_t pre = (size_t)(fs - p);
+            /* fs 已跳过 proto 后的空白；若前缀最后一个字符已是空白，
+             * 追加 PT 时不能再加前导空格，否则会出现 "RTP/AVP  96"
+             * 这类双空格，严格 SDP 解析器会判为无效 fmt-list。 */
+            int sp = (pre > 0 && (p[pre - 1] == ' ' || p[pre - 1] == '\t'));
+            char tmp[32];
+            char abuf[224];
+            int tn = snprintf(tmp, sizeof(tmp), sp ? "%d" : " %d",
+                              av.c[a_vidx].pt);
+            if (put_line(nb, cap, &used, p, pre) != NSBC_OK ||
+                tn <= 0 ||
+                put_line(nb, cap, &used, tmp, (size_t)tn) != NSBC_OK ||
+                put_line(nb, cap, &used, "\r\n", 2) != NSBC_OK) {
+                overflow = 1;
+                break;
+            }
+            int an = snprintf(abuf, sizeof(abuf), "a=rtpmap:%d %s/%s",
+                              av.c[a_vidx].pt, av.c[a_vidx].enc,
+                              av.c[a_vidx].rate[0] ? av.c[a_vidx].rate
+                                                   : "90000");
+            if (an <= 0 ||
+                put_line(nb, cap, &used, abuf, (size_t)an) != NSBC_OK ||
+                put_line(nb, cap, &used, "\r\n", 2) != NSBC_OK) {
+                overflow = 1;
+                break;
+            }
+            if (av.c[a_vidx].fmtp[0]) {
+                an = snprintf(abuf, sizeof(abuf), "a=fmtp:%d %s",
+                              av.c[a_vidx].pt, av.c[a_vidx].fmtp);
+                if (an <= 0 ||
+                    put_line(nb, cap, &used, abuf, (size_t)an) != NSBC_OK ||
+                    put_line(nb, cap, &used, "\r\n", 2) != NSBC_OK) {
+                    overflow = 1;
+                    break;
+                }
+            }
+            p = eol ? eol + 1 : end;
+            continue;
+        }
+
+        if (sect_video && !is_m && v_rewrite && cl >= 2 &&
+            p[0] == 'a' && p[1] == '=') {
+            if ((cl >= 9 && memcmp(p, "a=rtpmap:", 9) == 0) ||
+                (cl >= 7 && memcmp(p, "a=fmtp:", 7) == 0) ||
+                (cl >= 10 && memcmp(p, "a=rtcp-fb:", 10) == 0) ||
+                (cl >= 7 && memcmp(p, "a=ssrc:", 7) == 0) ||
+                (cl >= 13 && memcmp(p, "a=ssrc-group:", 13) == 0)) {
+                p = eol ? eol + 1 : end;
+                continue;
+            }
+        }
+
+        if (sect_video && is_m && vport_zero) {
+            /* 视频无法安全映射 → port=0（拒绝该媒体流，降级纯音频） */
+            const char *ps = NULL, *pe = NULL;
+            xc_mline_port_span(p, cl, &ps, &pe);
+            if (ps && pe && put_line(nb, cap, &used, p,
+                                     (size_t)(ps - p)) == NSBC_OK &&
+                put_line(nb, cap, &used, "0", 1) == NSBC_OK &&
+                put_line(nb, cap, &used, pe, (size_t)(p + cl - pe)) == NSBC_OK &&
+                put_line(nb, cap, &used, "\r\n", 2) == NSBC_OK) {
+                p = eol ? eol + 1 : end;
+                continue;
+            }
+            overflow = 1;
+            break;
+        }
+
+        if (put_line(nb, cap, &used, p, ll) != NSBC_OK) {
+            overflow = 1;
+            break;
+        }
+        if (eol && put_line(nb, cap, &used, "\n", 1) != NSBC_OK) {
+            overflow = 1;
+            break;
+        }
+        p = eol ? eol + 1 : end;
+    }
+    if (overflow || used >= cap) {
+        free(nb);
+        return 0;
+    }
+    nb[used] = '\0';
+    memcpy(ans, nb, used);
+    ans[used] = '\0';
+    *lenp = used;
+    free(nb);
+    return 1;
 }
 
 int bridge_offer_hook(void *call, const char *in, size_t inlen,
@@ -2985,6 +4197,27 @@ int bridge_offer_hook(void *call, const char *in, size_t inlen,
     if (!e) {
         llog(LOG_WARN, "media", "offer_hook: entry_get NOMEM call=%p", call);
         return NSBC_NOMEM;
+    }
+    /*  第 1 项：保存 A 原始 offer —— answer_hook 逐腿终结时据此重建
+     * "回给 A 的 answer"。每次 offer（含 re-INVITE）都覆盖；malloc 失败
+     * 则清空，绝不让 answer_hook 用到陈旧 SDP。同时复位上一轮的终结结果。 */
+    e->neg_valid = 0;
+    e->neg_a_pt = e->neg_b_pt = 0xFF;
+    e->neg_v_valid = 0;
+    e->neg_v_a_pt = e->neg_v_b_pt = 0xFF;
+    e->neg_v_a_cid = e->neg_v_b_cid = CODEC_NONE;
+    {
+        char *cp = NULL;
+        if (in && inlen) {
+            cp = (char *)malloc(inlen + 1);
+            if (cp) {
+                memcpy(cp, in, inlen);
+                cp[inlen] = '\0';
+            }
+        }
+        free(e->a_offer_sdp);
+        e->a_offer_sdp = cp;
+        e->a_offer_len = cp ? inlen : 0;
     }
     /*  RFC 3312 Precondition 前提条件门控：
      * profile->enable_precondition=0（企业 PBX 等场景关闭）→ 永远置 0，gate 常开；
@@ -3148,12 +4381,17 @@ int bridge_offer_hook(void *call, const char *in, size_t inlen,
          (unsigned)rlo, (unsigned)rhi, (void *)m->cfg.call_port_range);
 
     relay_ports_t ports;
+    memset(&ports, 0, sizeof(ports));
+    /* 明文 A 腿 audio/video 各自独立端口；WebRTC 腿 BUNDLE 复用同一端口 */
+    ports.want_video = (uint8_t)((a_ws ? 0 : 1) | (b_ws ? 0 : 2));
     if (e->relay) {
         /* 3.3：复用 hold 期 relay（端口已在 183 SDP 中通告给 A 腿） */
         ports.a_rtp  = rtp_relay_port(e->relay, 0);
         ports.b_rtp  = rtp_relay_port(e->relay, 1);
         ports.a_rtcp = (uint16_t)(ports.a_rtp ? ports.a_rtp + 1 : 0);
         ports.b_rtcp = (uint16_t)(ports.b_rtp ? ports.b_rtp + 1 : 0);
+        ports.a_vrtp = rtp_relay_video_port(e->relay, 0);
+        ports.b_vrtp = rtp_relay_video_port(e->relay, 1);
         e->local_media = 0;   /* 交接给 B 腿：不再按单腿 AI/discard 处理 */
         llog(LOG_INFO, "media",
              "offer_hook: reuse hold relay call=%p a_rtp=%u b_rtp=%u",
@@ -3189,6 +4427,11 @@ int bridge_offer_hook(void *call, const char *in, size_t inlen,
         nsbc_sa_t sa;
         if (nsbc_sa_from(&sa, e->a_ip, e->a_port, AF_UNSPEC) == NSBC_OK)
             rtp_relay_set_peer_a(e->relay, &sa);
+        /* 视频 m-line 是独立端口，单独记录，避免与 audio 端口混用 */
+        sdp_vsel_t va;
+        if (sdp_video_select(in, inlen, &va) && va.port > 0 &&
+            nsbc_sa_from(&sa, e->a_ip, (uint16_t)va.port, AF_UNSPEC) == NSBC_OK)
+            rtp_relay_set_peer_video(e->relay, 0, &sa);
     }
     /* B 侧 INVITE 重写：offer SDP 告诉 B 把 RTP 发到 SBC 的 B 侧 relay 端口
      * （b_rtp=fd_rtp[1]）。方向决定改写形态——最终根据 mode+dtls 结果选：
@@ -3287,12 +4530,16 @@ int bridge_offer_hook(void *call, const char *in, size_t inlen,
         /* SRTP_RELAY：按接收端类型选 dir（DTLS-SRTP 终结器决定了消毒/注入策略） */
         dir = b_ws ? MB_SDP_WS : (a_ws ? MB_SDP_PLAIN : MB_SDP_ASIS);
     }
+    /* B 腿视频端口：只有明文 B 腿才有独立端口；WebRTC B 腿 BUNDLE 复用 b_rtp */
+    uint16_t rewrite_vport = 0;
+    if (!is_bypass && dir != MB_SDP_WS && e->relay)
+        rewrite_vport = rtp_relay_video_port(e->relay, 1);
     int n = bridge_rewrite_sdp(in, inlen, out, outsz,
                                (e->external_rtp_ip[0]) ? e->external_rtp_ip : m->cfg.local_ip,
-                               rewrite_port, dir);
+                               rewrite_port, rewrite_vport, dir);
     llog(LOG_INFO, "media",
-         "REWRITE_CALL: rewrite_port=%u dir=%d mode=%d is_bypass=%d a_ws=%d b_ws=%d n=%d",
-         (unsigned)rewrite_port, dir, mode, is_bypass, a_ws, b_ws, n);
+         "REWRITE_CALL: rewrite_port=%u video_port=%u dir=%d mode=%d is_bypass=%d a_ws=%d b_ws=%d n=%d",
+         (unsigned)rewrite_port, (unsigned)rewrite_vport, dir, mode, is_bypass, a_ws, b_ws, n);
     if (n < 0) return NSBC_NOSPC;
 
     /*  暴力 dump：rewrite 输出逐行打，确认 video m= 行到底是什么！ */
@@ -3306,6 +4553,20 @@ int bridge_offer_hook(void *call, const char *in, size_t inlen,
                 llog(LOG_INFO, "media", "REWRITE_OUT[%d]: %.*s", di, (int)dl, dp);
             }
             dp = de ? de + 1 : NULL;
+        }
+    }
+
+    /*  第 1 项：offer → B 时追加 SBC 可双向处理的静态音频 PT。
+     * A 只提供 G729 而 B 只会 PCMA 时，B 必须能在 offer 里看到 PCMA，
+     * 否则永远无法协商出可转码的目标。BYPASS / 双 WebRTC 不改写。 */
+    if (!is_bypass && !(a_ws && b_ws)) {
+        size_t xl = (size_t)n;
+        int xadd = sdp_xc_add_offer_audio(out, &xl, outsz);
+        if (xadd > 0) {
+            n = (int)xl;
+            llog(LOG_INFO, "media",
+                 "offer_hook: per-leg SDP termination — appended %d SBC audio PT(s), n=%d",
+                 xadd, n);
         }
     }
 
@@ -3465,6 +4726,9 @@ int bridge_local_start(void *call_key, const char *offer, size_t offer_len,
     if (m->cfg.call_port_range)
         m->cfg.call_port_range(m->cfg.call_port_range_ud, call_key, &rlo, &rhi);
     relay_ports_t ports;
+    memset(&ports, 0, sizeof(ports));
+    /* 单腿本地媒体（hold/AI 放音）：A 腿按明文 SIP 处理，需要独立视频端口 */
+    ports.want_video = 1;
     if (rtp_relay_start(m, &e->relay, &ports, rlo, rhi) != NSBC_OK &&
         (rlo != 0 || rhi != 0)) {
         llog(LOG_WARN, "media",
@@ -3482,6 +4746,10 @@ int bridge_local_start(void *call_key, const char *offer, size_t offer_len,
         nsbc_sa_t sa;
         if (nsbc_sa_from(&sa, e->a_ip, e->a_port, AF_UNSPEC) == NSBC_OK)
             rtp_relay_set_peer_a(e->relay, &sa);
+        sdp_vsel_t va;
+        if (sdp_video_select(offer, offer_len, &va) && va.port > 0 &&
+            nsbc_sa_from(&sa, e->a_ip, (uint16_t)va.port, AF_UNSPEC) == NSBC_OK)
+            rtp_relay_set_peer_video(e->relay, 0, &sa);
     }
     /* B 侧 discard sink：让 relay 认为对侧就绪（rec hook 正常触发）；
      * 转发的包打到 127.0.0.1:9，不会形成回声。 */
@@ -3495,7 +4763,7 @@ int bridge_local_start(void *call_key, const char *offer, size_t offer_len,
     int n = bridge_rewrite_sdp(offer, offer_len, out, outsz,
                                e->external_rtp_ip[0] ? e->external_rtp_ip
                                                      : m->cfg.local_ip,
-                               ports.a_rtp, MB_SDP_ASIS);
+                               ports.a_rtp, ports.a_vrtp, MB_SDP_ASIS);
     if (n < 0) return NSBC_NOSPC;
     llog(LOG_INFO, "media",
          "local_start: call=%p a_rtp=%u b_rtp=%u a_ip=%s a_port=%u sdp=%dB",
@@ -3525,10 +4793,10 @@ int bridge_answer_hook(void *call, const char *in, size_t inlen,
     mb_mode_t mode;
     if (bridge_decide(m, NULL, 0, in, inlen, &mode) == NSBC_OK &&
         mode == MB_TRANSCODE) {
-        llog(LOG_WARN, "media", "transcode required but P0 unsupported");
-        memcpy(out, in, inlen < outsz ? inlen : outsz - 1);
-        out[inlen < outsz ? inlen : outsz - 1] = '\0';
-        return NSBC_NOTSUP;
+        /*  第 1 项后转码已由 bridge_confirm 逐腿规划执行，
+         *  不再在此拦截成 NSBC_NOTSUP（旧 P0 限制）。 */
+        llog(LOG_INFO, "media",
+             "answer_hook: transcode required — handled by per-leg plan");
     }
     /*  RFC 3312 Precondition met 检测：
      * 三层守卫同 offer_hook：force_precondition (dialplan) → profile.enable_precondition */
@@ -3551,7 +4819,7 @@ int bridge_answer_hook(void *call, const char *in, size_t inlen,
         }
     }
     relay_ports_t ports;
-    ports.a_rtp = ports.b_rtp = 0; /* 已分配：取 fd 实际端口 */
+    memset(&ports, 0, sizeof(ports)); /* 已分配：取 fd 实际端口 */
     /* B 对端地址 */
     char ip[64];
     uint16_t port = 0;
@@ -3564,6 +4832,11 @@ int bridge_answer_hook(void *call, const char *in, size_t inlen,
         int rc = nsbc_sa_from(&sa, ip, port, AF_UNSPEC);
         if (rc == NSBC_OK)
             rtp_relay_set_peer_b(e->relay, &sa);
+        /* 明文 B 腿：视频 m-line 独立端口，单独记录 */
+        sdp_vsel_t vb;
+        if (sdp_video_select(in, inlen, &vb) && vb.port > 0 &&
+            nsbc_sa_from(&sa, ip, (uint16_t)vb.port, AF_UNSPEC) == NSBC_OK)
+            rtp_relay_set_peer_video(e->relay, 1, &sa);
     }
     /* 对 A 广告 a_rtp（从 relay A 侧 fd 取——answer SDP 告诉 A 把 RTP 发到
      * relay 的 A 侧端口；原代码错取 fd_rtp[1]=B 侧，导致 A 发错端口收不到） */
@@ -3610,6 +4883,7 @@ int bridge_answer_hook(void *call, const char *in, size_t inlen,
      *   双明文 → ASIS：仅改地址端口（a_rtp=fd_rtp[0] 侧）。 */
     mb_sdp_dir_t adir;
     uint16_t a_rewrite_port = ports.a_rtp;
+    int a_bypass = 0;
     {
         mb_mode_t fmode;
         bridge_decide(m, NULL, 0, in, inlen, &fmode);
@@ -3620,7 +4894,7 @@ int bridge_answer_hook(void *call, const char *in, size_t inlen,
          * B 的原始 RTP/AVP SDP，然后叠加 SBC 的 ICE/DTLS → 四不像被 JsSIP 拒绝。
          * offer_hook 已有对称 guard（line 1325-1329），answer_hook 之前缺。 */
         const int web_rtc_any = (e->dtls[0] || e->dtls[1]);
-        const int a_bypass = !web_rtc_any &&
+        a_bypass = !web_rtc_any &&
             (fmode == MB_BYPASS || e->mode == MB_BYPASS
              || (!e->dtls[0] && !e->dtls[1]
                  && (bridge_decide(m, NULL, 0, NULL, 0, &fmode),
@@ -3635,10 +4909,18 @@ int bridge_answer_hook(void *call, const char *in, size_t inlen,
             adir = e->a_ws ? MB_SDP_WS : MB_SDP_PLAIN;
         }
     }
+    /* A 腿视频端口：只有明文 A 腿才有独立端口；WebRTC A 腿 BUNDLE 复用 a_rtp */
+    uint16_t a_rewrite_vport = 0;
+    if (!a_bypass && adir != MB_SDP_WS && e->relay)
+        a_rewrite_vport = rtp_relay_video_port(e->relay, 0);
     int n = bridge_rewrite_sdp(in, inlen, out, outsz,
                                (e->external_rtp_ip[0]) ? e->external_rtp_ip : m->cfg.local_ip,
-                               a_rewrite_port, adir);
+                               a_rewrite_port, a_rewrite_vport, adir);
     if (n < 0) return NSBC_NOSPC;
+    llog(LOG_INFO, "media",
+         "ANSWER_REWRITE: media_port=%u video_port=%u dir=%d a_ws=%d b_ws=%d",
+         (unsigned)a_rewrite_port, (unsigned)a_rewrite_vport, adir,
+         (int)e->a_ws, (int)e->b_ws);
 
     /*  RFC 3264 段数对齐：把 answer 截断到 A 原始 offer 的 m= 段数。
      * 多出来的 rejected video 段是 offer_hook 为 WebRTC B 追加、浏览器
@@ -3651,6 +4933,88 @@ int bridge_answer_hook(void *call, const char *in, size_t inlen,
             llog(LOG_INFO, "dtls", "answer_hook: truncate m-lines %d→%d "
                  "(a_mlcount=%d)", n, tn, (int)e->a_mlcount);
             n = tn;
+        }
+    }
+
+    /*  第 1 项：每腿独立 SDP 终结 —— 只向 A 宣告双方最终协商的 A 侧
+     *  音频 codec（以及 A 自己的 telephone-event PT），绝不把 B 腿的
+     *  PT 泄漏给 A；同时把定型结果写入 cnode，供 bridge_confirm 直接采用
+     *  （两侧各自启发式推导会得到不一致的收发 codec）。
+     *  双 WebRTC 保持 Opus/P2P 语义，BYPASS 不改写。 */
+    if (!a_bypass && !(e->a_ws && e->b_ws) &&
+        e->a_offer_sdp && e->a_offer_len && inlen > 0) {
+        e->neg_valid = 0;   /* 先失效，只有重建成功才重新置位 */
+        e->neg_v_valid = 0;
+        e->neg_v_a_pt = e->neg_v_b_pt = 0xFF;
+        e->neg_v_a_cid = e->neg_v_b_cid = CODEC_NONE;
+        uint8_t apts[8], bpts[8];
+        codec_id_t acids[8], bcids[8];
+        int an = sdp_extract_audio_codecs(e->a_offer_sdp, e->a_offer_len,
+                                          apts, acids, 8);
+        int bn = sdp_extract_audio_codecs(in, inlen, bpts, bcids, 8);
+        int ai = -1, bi = -1;
+        for (int i = 0; i < an; ++i) {
+            if (acids[i] != CODEC_NONE && codec_can_decode(acids[i]) &&
+                codec_can_encode(acids[i])) {
+                ai = i;
+                break;
+            }
+        }
+        for (int i = 0; i < bn; ++i) {
+            if (bcids[i] != CODEC_NONE && codec_can_decode(bcids[i]) &&
+                codec_can_encode(bcids[i])) {
+                bi = i;
+                break;
+            }
+        }
+        if (ai >= 0 && bi >= 0) {
+            size_t xl = (size_t)n;
+            if (sdp_xc_answer_for_a(out, &xl, outsz,
+                                    e->a_offer_sdp, e->a_offer_len,
+                                    (int)apts[ai])) {
+                const codec_ops_t *ao = codec_registry_find(acids[ai]);
+                const codec_ops_t *bo = codec_registry_find(bcids[bi]);
+                n = (int)xl;
+                e->neg_a_pt = apts[ai];
+                e->neg_a_cid = acids[ai];
+                e->neg_b_pt = bpts[bi];
+                e->neg_b_cid = bcids[bi];
+                e->neg_a_te = find_dtmf_pt(e->a_offer_sdp, e->a_offer_len);
+                e->neg_b_te = find_dtmf_pt(in, inlen);
+                e->neg_valid = 1;
+                llog(LOG_INFO, "media",
+                     "answer_hook: per-leg SDP termination A=%s(pt=%u) "
+                     "B=%s(pt=%u) te=%u/%u",
+                     ao ? ao->name : "?", (unsigned)e->neg_a_pt,
+                     bo ? bo->name : "?", (unsigned)e->neg_b_pt,
+                     (unsigned)e->neg_a_te, (unsigned)e->neg_b_te);
+            } else {
+                e->neg_a_pt = e->neg_b_pt = 0xFF;
+            }
+        }
+
+        /* 视频逐腿终结：A offer / B answer 都存在 SBC 可双向处理的
+         * H264/VP9 时记录映射；两侧 codec 不同由 video_xcode 转码。 */
+        {
+            sdp_vsel_t va, vb;
+            int va_ok = sdp_video_select(e->a_offer_sdp, e->a_offer_len, &va);
+            int vb_ok = sdp_video_select(in, inlen, &vb);
+            if (va_ok && va.port > 0 && vb_ok && vb.port > 0) {
+                e->neg_v_a_pt  = (uint8_t)va.pt;
+                e->neg_v_a_cid = va.cid;
+                e->neg_v_b_pt  = (uint8_t)vb.pt;
+                e->neg_v_b_cid = vb.cid;
+                e->neg_v_valid = 1;
+                llog(LOG_INFO, "media",
+                     "answer_hook: video A=%s(pt=%u) B=%s(pt=%u)",
+                     va.enc, (unsigned)va.pt, vb.enc, (unsigned)vb.pt);
+            } else {
+                llog(LOG_WARN, "media",
+                     "answer_hook: video NOT negotiated — A[ok=%d port=%d "
+                     "enc=%s pt=%d cid=%d] B[ok=%d port=%d enc=%s pt=%d cid=%d]",
+                     va_ok, va.port, va.enc, va.pt, (int)va.cid,
+                     vb_ok, vb.port, vb.enc, vb.pt, (int)vb.cid);
+            }
         }
     }
 
@@ -3750,6 +5114,212 @@ int bridge_answer_hook(void *call, const char *in, size_t inlen,
     return n;
 }
 
+/* ==================================================================
+ * B 发起 re-INVITE 的对称逐腿终结（第 1 项 · 反向）
+ * ==================================================================
+ * 角色约定（与正向 hook 参数顺序保持一致：in = 收到的 SDP，out = 发出去的 SDP）：
+ *   bridge_offer_hook_rev  : in = B 的原始 offer，out = 发往 A 的 offer
+ *   bridge_answer_hook_rev : in = A 的原始 answer，out = 发往 B 的 answer
+ *
+ * 原始终态 SDP 仍由 b2bua 保管（leg[1].offer / leg[0].answer），
+ * bridge_confirm 从中提取每腿 codec；本层只额外保存 B 原始 offer，
+ * 用于 A 的 answer 回来时重建"回给 B 的 answer"。
+ * BYPASS / 任一腿 WebRTC 保持原样（WebRTC 的 ICE/DTLS 重协商不在本期范围）。 */
+int bridge_offer_hook_rev(void *call, const char *in, size_t inlen,
+                          char *out, size_t outsz, void *ud)
+{
+    bridge_mgr_t *m = ud;
+    cnode_t *e = NULL;
+    {
+        br_shard_t *s = &m->sh[ptr_shard(call)];
+        pthread_mutex_lock(&s->lock);
+        e = entry_find(m, call);
+        pthread_mutex_unlock(&s->lock);
+    }
+    if (!e || !in || !inlen) {
+        /* 无 relay 记录 / 无 body：原样透传（不制造 cnode） */
+        if (inlen >= outsz) return NSBC_NOSPC;
+        if (inlen) memcpy(out, in, inlen);
+        out[inlen] = '\0';
+        return (int)inlen;
+    }
+
+    /* 复位上一轮终结结果，并保存 B 原始 offer（覆盖式，失败清空） */
+    e->neg_valid = 0;
+    e->rev_pending = 0;
+    e->neg_a_pt = e->neg_b_pt = 0xFF;
+    e->neg_v_valid = 0;
+    e->neg_v_a_pt = e->neg_v_b_pt = 0xFF;
+    e->neg_v_a_cid = e->neg_v_b_cid = CODEC_NONE;
+    {
+        char *cp = (char *)malloc(inlen + 1);
+        if (cp) {
+            memcpy(cp, in, inlen);
+            cp[inlen] = '\0';
+        }
+        free(e->b_offer_sdp);
+        e->b_offer_sdp = cp;
+        e->b_offer_len = cp ? inlen : 0;
+        e->rev_pending = cp ? 1 : 0;
+    }
+
+    if (inlen >= outsz) return NSBC_NOSPC;
+    memcpy(out, in, inlen);
+    out[inlen] = '\0';
+    int n = (int)inlen;
+
+    /* BYPASS / 任一腿 WebRTC：不改写（保持既有透传语义） */
+    if (!e->relay || e->mode == MB_BYPASS || e->a_ws || e->b_ws)
+        return n;
+
+    /* 双明文：先把 B 的 offer 锚定到 relay 的 A 侧端口（对称于正向
+     * offer → B 用 b_rtp），否则 A 会拿到 B 的原始地址，re-INVITE 后
+     * 两端直连绕过 SBC，转码与录音同时失效。dir=ASIS 只改端口/c=。 */
+    {
+        int rn = bridge_rewrite_sdp(in, inlen, out, outsz,
+                                    (e->external_rtp_ip[0]) ? e->external_rtp_ip
+                                                            : m->cfg.local_ip,
+                                    rtp_relay_port(e->relay, 0),
+                                    rtp_relay_video_port(e->relay, 0),
+                                    MB_SDP_ASIS);
+        if (rn < 0) return NSBC_NOSPC;
+        n = rn;
+        out[n] = '\0';
+    }
+
+    /* B → A：在 B 的 fmt-list 尾部追加 SBC 可双向处理的静态音频 PT，
+     * 让 A 有机会选中 SBC 支持且可转码的 codec。 */
+    size_t xl = (size_t)n;
+    int xadd = sdp_xc_add_offer_audio(out, &xl, outsz);
+    if (xadd > 0) {
+        n = (int)xl;
+        llog(LOG_INFO, "media",
+             "offer_rev_hook: per-leg SDP termination — appended %d SBC audio PT(s), n=%d",
+             xadd, n);
+    }
+    return n;
+}
+
+int bridge_answer_hook_rev(void *call, const char *in, size_t inlen,
+                           char *out, size_t outsz, void *ud)
+{
+    bridge_mgr_t *m = ud;
+    cnode_t *e = NULL;
+    {
+        br_shard_t *s = &m->sh[ptr_shard(call)];
+        pthread_mutex_lock(&s->lock);
+        e = entry_find(m, call);
+        pthread_mutex_unlock(&s->lock);
+    }
+    if (!e || !e->relay || !in || !inlen) {
+        if (inlen >= outsz) return NSBC_NOSPC;
+        if (inlen) memcpy(out, in, inlen);
+        out[inlen] = '\0';
+        return (int)inlen;
+    }
+    if (e->mode == MB_BYPASS || e->a_ws || e->b_ws ||
+        !e->rev_pending || !e->b_offer_sdp || !e->b_offer_len) {
+        if (inlen >= outsz) return NSBC_NOSPC;
+        memcpy(out, in, inlen);
+        out[inlen] = '\0';
+        return (int)inlen;
+    }
+    e->rev_pending = 0;   /* 只处理这一轮 offer 对应的 answer */
+
+    e->neg_valid = 0;   /* 先失效，只有重建成功才重新置位 */
+    e->neg_v_valid = 0;
+    e->neg_v_a_pt = e->neg_v_b_pt = 0xFF;
+    e->neg_v_a_cid = e->neg_v_b_cid = CODEC_NONE;
+    uint8_t apts[8], bpts[8];
+    codec_id_t acids[8], bcids[8];
+    int an = sdp_extract_audio_codecs(in, inlen, apts, acids, 8);
+    int bn = sdp_extract_audio_codecs(e->b_offer_sdp, e->b_offer_len,
+                                      bpts, bcids, 8);
+    int ai = -1, bi = -1;
+    for (int i = 0; i < an; ++i) {
+        if (acids[i] != CODEC_NONE && codec_can_decode(acids[i]) &&
+            codec_can_encode(acids[i])) {
+            ai = i;
+            break;
+        }
+    }
+    for (int i = 0; i < bn; ++i) {
+        if (bcids[i] != CODEC_NONE && codec_can_decode(bcids[i]) &&
+            codec_can_encode(bcids[i])) {
+            bi = i;
+            break;
+        }
+    }
+    if (ai < 0 || bi < 0) {
+        e->neg_a_pt = e->neg_b_pt = 0xFF;
+        if (inlen >= outsz) return NSBC_NOSPC;
+        memcpy(out, in, inlen);
+        out[inlen] = '\0';
+        return (int)inlen;
+    }
+
+    /* 回给 B 的 answer 先锚定到 relay 的 B 侧端口（对称于正向 answer → A
+     * 用 a_rtp），否则 B 会把远端地址改成 A，re-INVITE 后绕过 SBC。 */
+    int rn = bridge_rewrite_sdp(in, inlen, out, outsz,
+                                (e->external_rtp_ip[0]) ? e->external_rtp_ip
+                                                        : m->cfg.local_ip,
+                                rtp_relay_port(e->relay, 1),
+                                rtp_relay_video_port(e->relay, 1),
+                                MB_SDP_PLAIN);
+    if (rn < 0) return NSBC_NOSPC;
+    out[rn] = '\0';
+
+    /* 回给 B 的 answer 只保留 B 侧最终音频 codec 与 B 的 telephone-event PT，
+     * 绝不把 A 腿的 PT 泄漏给 B（否则 B 收到未 offer 过的 PT → 488/BYE）。 */
+    size_t xl = (size_t)rn;
+    if (!sdp_xc_answer_for_a(out, &xl, outsz, e->b_offer_sdp, e->b_offer_len,
+                             (int)bpts[bi])) {
+        e->neg_a_pt = e->neg_b_pt = 0xFF;
+        if (inlen >= outsz) return NSBC_NOSPC;
+        memcpy(out, in, inlen);
+        out[inlen] = '\0';
+        return (int)inlen;
+    }
+    e->neg_a_pt = apts[ai];
+    e->neg_a_cid = acids[ai];
+    e->neg_b_pt = bpts[bi];
+    e->neg_b_cid = bcids[bi];
+    e->neg_a_te = find_dtmf_pt(in, inlen);
+    e->neg_b_te = find_dtmf_pt(e->b_offer_sdp, e->b_offer_len);
+    e->neg_valid = 1;
+    {
+        const codec_ops_t *ao = codec_registry_find(acids[ai]);
+        const codec_ops_t *bo = codec_registry_find(bcids[bi]);
+        llog(LOG_INFO, "media",
+             "answer_rev_hook: per-leg SDP termination A=%s(pt=%u) "
+             "B=%s(pt=%u) te=%u/%u",
+             ao ? ao->name : "?", (unsigned)e->neg_a_pt,
+             bo ? bo->name : "?", (unsigned)e->neg_b_pt,
+             (unsigned)e->neg_a_te, (unsigned)e->neg_b_te);
+    }
+
+    /* 视频逐腿终结（B 发起 re-INVITE）：B offer / A answer 的映射。
+     * 注意从 in（A 原始 answer）取 A 侧视频 codec，不能从 out 取——
+     * out 已被 sdp_xc_answer_for_a 改写成 B 侧 codec。 */
+    {
+        sdp_vsel_t vb_off, va_ans;
+        if (sdp_video_select(e->b_offer_sdp, e->b_offer_len, &vb_off) &&
+            vb_off.port > 0 &&
+            sdp_video_select(in, inlen, &va_ans) && va_ans.port > 0) {
+            e->neg_v_b_pt  = (uint8_t)vb_off.pt;
+            e->neg_v_b_cid = vb_off.cid;
+            e->neg_v_a_pt  = (uint8_t)va_ans.pt;
+            e->neg_v_a_cid = va_ans.cid;
+            e->neg_v_valid = 1;
+            llog(LOG_INFO, "media",
+                 "answer_rev_hook: video B=%s(pt=%u) A=%s(pt=%u)",
+                 vb_off.enc, (unsigned)vb_off.pt,
+                 va_ans.enc, (unsigned)va_ans.pt);
+        }
+    }
+    return (int)xl;
+}
+
 void bridge_release_call(bridge_mgr_t *m, void *call)
 {
     br_shard_t *s = &m->sh[ptr_shard(call)];
@@ -3764,9 +5334,32 @@ void bridge_release_call(bridge_mgr_t *m, void *call)
                  call, (void *)e->relay, e->mode);
             if (e->relay)
                 rtp_relay_stop(e->relay);
-            /*  转码会话清理（REQ-TRANS-004） */
-            if (e->transcode[0]) { transcode_close(e->transcode[0]); e->transcode[0] = NULL; }
-            if (e->transcode[1]) { transcode_close(e->transcode[1]); e->transcode[1] = NULL; }
+            /*  转码会话清理（REQ-TRANS-004）：当前 + re-INVITE 退役的旧会话 */
+            for (int si = 0; si < 2; ++si) {
+                transcode_sess_t *tc =
+                    __atomic_load_n(&e->transcode[si], __ATOMIC_ACQUIRE);
+                if (tc) transcode_close(tc);
+                e->transcode[si] = NULL;
+            }
+            for (int i = 0; i < e->n_xcode_retired; ++i) {
+                if (e->xcode_retired[i])
+                    transcode_close(e->xcode_retired[i]);
+                e->xcode_retired[i] = NULL;
+            }
+            e->n_xcode_retired = 0;
+            /*  视频转码会话清理（VP9↔H264）：当前 + re-INVITE 退役的旧会话 */
+            for (int si = 0; si < 2; ++si) {
+                video_xcode_t *vx =
+                    __atomic_load_n(&e->vxcode[si], __ATOMIC_ACQUIRE);
+                if (vx) video_xcode_destroy(vx);
+                e->vxcode[si] = NULL;
+            }
+            for (int i = 0; i < e->n_vxcode_retired; ++i) {
+                if (e->vxcode_retired[i])
+                    video_xcode_destroy(e->vxcode_retired[i]);
+                e->vxcode_retired[i] = NULL;
+            }
+            e->n_vxcode_retired = 0;
             /*  DTMF RFC4733 去重器清理 */
             for (int si = 0; si < 2; ++si) {
                 if (e->dtmf_rx[si]) {
@@ -3783,6 +5376,12 @@ void bridge_release_call(bridge_mgr_t *m, void *call)
                     e->vid_reasm[si] = NULL;
                 }
             }
+            free(e->a_offer_sdp);
+            e->a_offer_sdp = NULL;
+            e->a_offer_len = 0;
+            free(e->b_offer_sdp);
+            e->b_offer_sdp = NULL;
+            e->b_offer_len = 0;
             free(e);
             return;
         }
@@ -4136,33 +5735,115 @@ static int sdp_extract_video_codecs(const char *sdp, size_t len,
     return n;
 }
 
-/* 在候选 codec 列表里找一个目标：与 src 不同、在 registry 里已注册、
- * 优先选另一个列表里也有的（offer 和 answer 都支持的 codec 作为"中转点"）。
- * P0 每次返回第一个命中的候选即可（单方向只建一个转码会话）。 */
-static codec_id_t find_transcode_dst(codec_id_t src,
-                                      const codec_id_t *candidates, int cand_n,
-                                      const codec_id_t *other, int other_n)
+/* 选择转码目标：候选必须来自"目标腿"的 codec 列表（不是源腿），
+ * 且该 codec 必须能编码。优先选源腿也支持的 codec（便于对侧 re-INVITE）。
+ * out_pt 返回目标腿 SDP 中该 codec 的协商 PT。 */
+static codec_id_t find_xcode_dst(codec_id_t src,
+                                 const uint8_t *dst_pts,
+                                 const codec_id_t *dst_cids, int dst_n,
+                                 const codec_id_t *src_cids, int src_n,
+                                 uint8_t *out_pt)
 {
-    /* 第一优先级：candidates 和 other 的交集（offer 和 answer 都支持的 codec） */
-    for (int i = 0; i < cand_n; ++i) {
-        if (candidates[i] == CODEC_NONE || candidates[i] == src) continue;
-        if (!codec_registry_find(candidates[i])) continue;
-        for (int j = 0; j < other_n; ++j) {
-            if (other[j] == candidates[i])
-                return candidates[i];
+    if (out_pt) *out_pt = 0xFF;
+    /* 第一优先级：目标腿 codec ∩ 源腿 codec */
+    for (int i = 0; i < dst_n; ++i) {
+        if (dst_cids[i] == CODEC_NONE || dst_cids[i] == src) continue;
+        if (!codec_can_encode(dst_cids[i])) continue;
+        for (int j = 0; j < src_n; ++j) {
+            if (src_cids[j] == dst_cids[i]) {
+                if (out_pt) *out_pt = dst_pts[i];
+                return dst_cids[i];
+            }
         }
     }
-    /* 第二优先级：candidates 里第一个已注册且不等于 src 的 codec */
-    for (int i = 0; i < cand_n; ++i) {
-        if (candidates[i] == CODEC_NONE || candidates[i] == src) continue;
-        if (codec_registry_find(candidates[i]))
-            return candidates[i];
+    /* 第二优先级：目标腿第一个可编码 codec */
+    for (int i = 0; i < dst_n; ++i) {
+        if (dst_cids[i] == CODEC_NONE || dst_cids[i] == src) continue;
+        if (!codec_can_encode(dst_cids[i])) continue;
+        if (out_pt) *out_pt = dst_pts[i];
+        return dst_cids[i];
     }
     return CODEC_NONE;
 }
 
-/*  顶层 static 辅助：扫描 SDP 找 "a=rtpmap:<PT> telephone-event/..." 行
- * 返回 telephone-event 的 PT（0=未协商）。bridge_confirm 里调用。 */
+/* 安全替换转码会话：旧会话可能仍被媒体线程读取，延迟到 release 释放 */
+static int cnode_install_xcode(cnode_t *e, int side, transcode_sess_t *tc,
+                               uint8_t src_pt, uint8_t dst_pt)
+{
+    transcode_sess_t *old;
+    if (e == NULL || side < 0 || side > 1) return NSBC_INVAL;
+    old = __atomic_load_n(&e->transcode[side], __ATOMIC_ACQUIRE);
+    if (old != NULL) {
+        if (e->n_xcode_retired >= (int)(sizeof(e->xcode_retired) /
+                                        sizeof(e->xcode_retired[0]))) {
+            llog(LOG_WARN, "media",
+                 "xcode retire list full (call=%p side=%d) — keep old session",
+                 e->call, side);
+            return NSBC_BUSY;
+        }
+        e->xcode_retired[e->n_xcode_retired++] = old;
+    }
+    transcode_set_dst_pt(tc, dst_pt);
+    e->xcode_src_pt[side] = src_pt;
+    e->xcode_dst_pt[side] = dst_pt;
+    e->xcode_sig[side] = ((int)transcode_dst_codec_id(tc) << 16) | (int)dst_pt;
+    __atomic_store_n(&e->transcode[side], tc, __ATOMIC_RELEASE);
+    return NSBC_OK;
+}
+
+static void cnode_drop_xcode(cnode_t *e, int side)
+{
+    transcode_sess_t *old;
+    if (e == NULL || side < 0 || side > 1) return;
+    old = __atomic_load_n(&e->transcode[side], __ATOMIC_ACQUIRE);
+    if (old == NULL) {
+        e->xcode_dst_pt[side] = 0xFF;
+        e->xcode_sig[side] = 0;
+        return;
+    }
+    if (e->n_xcode_retired >= (int)(sizeof(e->xcode_retired) /
+                                    sizeof(e->xcode_retired[0]))) {
+        llog(LOG_WARN, "media", "xcode retire list full — cannot drop call=%p",
+             e->call);
+        return;
+    }
+    __atomic_store_n(&e->transcode[side], NULL, __ATOMIC_RELEASE);
+    e->xcode_retired[e->n_xcode_retired++] = old;
+    e->xcode_src_pt[side] = 0xFF;
+    e->xcode_dst_pt[side] = 0xFF;
+    e->xcode_sig[side] = 0;
+}
+
+/* 视频转码会话退役：只摘指针，真正的 destroy 在 bridge_release_call
+ * （媒体线程可能仍持有旧指针，必须等呼叫结束再释放）。 */
+static void cnode_retire_vxcode(cnode_t *e, int side, video_xcode_t *old)
+{
+    if (!e || !old) return;
+    if (e->n_vxcode_retired >= (int)(sizeof(e->vxcode_retired) /
+                                    sizeof(e->vxcode_retired[0]))) {
+        /* 退役槽满：宁可继续用新会话，旧会话泄漏到 release 时统一清理 */
+        llog(LOG_WARN, "media", "vxcode retire list full call=%p", e->call);
+        return;
+    }
+    e->vxcode_retired[e->n_vxcode_retired++] = old;
+    (void)side;
+}
+
+static void cnode_drop_vxcode(cnode_t *e, int side)
+{
+    if (!e || side < 0 || side > 1) return;
+    video_xcode_t *old = __atomic_load_n(&e->vxcode[side], __ATOMIC_ACQUIRE);
+    if (old) {
+        __atomic_store_n(&e->vxcode[side], NULL, __ATOMIC_RELEASE);
+        cnode_retire_vxcode(e, side, old);
+    }
+    e->vxcode_sig[side] = 0;
+    e->vxcode_src_pt[side] = 0xFF;
+    e->vxcode_dst_pt[side] = 0xFF;
+    e->video_rewrite_active[side] = 0;
+}
+
+
 static uint8_t find_dtmf_pt(const char *sdp, size_t len) {
     const char *p = sdp;
     const char *end = sdp + len;
@@ -4238,6 +5919,22 @@ int bridge_confirm(bridge_mgr_t *m, void *call, const char *offer,
         return NSBC_NOENT;
     }
     if (e->relay) {
+        /*  第 1 项：逐腿 SDP 终结后两侧音频 codec 已在 answer_hook 定型，
+         *  直接用这对 (A,B) 做转码计划，保证与回给 A 的 answer 完全一致。
+         *  offer_n==0（如 originate 无 A 腿 offer）不采用，保持原行为。 */
+        if (e->neg_valid && offer_n > 0 && answer_n > 0 &&
+            e->neg_a_pt != 0xFF && e->neg_b_pt != 0xFF) {
+            offer_pts[0] = e->neg_a_pt;
+            offer_cids[0] = e->neg_a_cid;
+            offer_n = 1;
+            answer_pts[0] = e->neg_b_pt;
+            answer_cids[0] = e->neg_b_cid;
+            answer_n = 1;
+            llog(LOG_INFO, "media",
+                 "BRIDGE_TERMINATED call=%p A_pt=%u A_cid=%d B_pt=%u B_cid=%d",
+                 call, (unsigned)offer_pts[0], (int)offer_cids[0],
+                 (unsigned)answer_pts[0], (int)answer_cids[0]);
+        }
         /* 媒体面已锚定：不降级 bypass
          *
          *  pt_allowed[side] 语义：转发到 side 这一侧时，对端接受的 PT 列表
@@ -4253,12 +5950,120 @@ int bridge_confirm(bridge_mgr_t *m, void *call, const char *offer,
         e->pt_allowed_count[1] = answer_n;
         memcpy(e->pt_allowed[1], answer_pts, (size_t)answer_n);
 
+        /* 逐腿音频 codec 快照（运行时入包校验 + 出包 PT 反查）*/
+        e->audio_n[0] = offer_n;
+        memcpy(e->audio_pt[0], offer_pts, (size_t)offer_n);
+        memcpy(e->audio_cid[0], offer_cids, sizeof(codec_id_t) * (size_t)offer_n);
+        e->audio_n[1] = answer_n;
+        memcpy(e->audio_pt[1], answer_pts, (size_t)answer_n);
+        memcpy(e->audio_cid[1], answer_cids, sizeof(codec_id_t) * (size_t)answer_n);
+
 
 
         e->video_pt_allowed_count[0] = offer_video_n;
         memcpy(e->video_pt_allowed[0], offer_video_pts, (size_t)offer_video_n);
         e->video_pt_allowed_count[1] = answer_video_n;
         memcpy(e->video_pt_allowed[1], answer_video_pts, (size_t)answer_video_n);
+
+        /*  视频转码规划（VP9↔H264）：
+         *    - 优先采用 answer hook 的逐腿选择（neg_v_*），否则从原始
+         *      offer/answer 各挑第一个 H264/VP9；
+         *    - 两侧 codec 不同 → video_xcode 转码；
+         *    - 两侧相同但 PT 不同 → 仅改 RTP 头 PT；
+         *    - 任一侧不可用 → 两个会话都退役，保持原透传。 */
+        {
+            uint8_t v_apt = 0xFF, v_bpt = 0xFF;
+            codec_id_t v_acid = CODEC_NONE, v_bcid = CODEC_NONE;
+            /*  双 WebRTC 才保持原透传：浏览器之间按 ICE/DTLS-SRTP 语义
+             *  直接协商同一 codec，SBC 不介入转码；混合腿（SIP↔WebRTC）
+             *  必须转码——SRTP 已由 relay 终结，转码输出经
+             *  relay_video_emit 重新加密后发往 WebRTC 侧。 */
+            if (e->a_ws && e->b_ws) {
+                for (int side = 0; side < 2; ++side)
+                    cnode_drop_vxcode(e, side);
+                goto video_plan_done;
+            }
+            if (e->neg_v_valid) {
+                v_apt  = e->neg_v_a_pt;
+                v_acid = e->neg_v_a_cid;
+                v_bpt  = e->neg_v_b_pt;
+                v_bcid = e->neg_v_b_cid;
+            } else {
+                sdp_vsel_t va, vb;
+                if (sdp_video_select(offer, offer_len, &va) && va.port > 0 &&
+                    sdp_video_select(answer, answer_len, &vb) && vb.port > 0) {
+                    v_apt  = (uint8_t)va.pt;
+                    v_acid = va.cid;
+                    v_bpt  = (uint8_t)vb.pt;
+                    v_bcid = vb.cid;
+                }
+            }
+
+            if (v_apt != 0xFF && v_bpt != 0xFF &&
+                v_acid != CODEC_NONE && v_bcid != CODEC_NONE) {
+                /* 逐腿终结后每侧只接收自己 codec 的 PT */
+                e->video_pt_allowed_count[0] = 1;
+                e->video_pt_allowed[0][0] = v_apt;
+                e->video_pt_allowed_count[1] = 1;
+                e->video_pt_allowed[1][0] = v_bpt;
+
+                for (int side = 0; side < 2; ++side) {
+                    uint8_t    spt  = (side == 0) ? v_apt : v_bpt;
+                    uint8_t    dpt  = (side == 0) ? v_bpt : v_apt;
+                    codec_id_t scid = (side == 0) ? v_acid : v_bcid;
+                    codec_id_t dcid = (side == 0) ? v_bcid : v_acid;
+
+                    if (scid == dcid) {
+                        cnode_drop_vxcode(e, side);
+                        if (spt != dpt) {
+                            e->video_rewrite_src_pt[side] = spt;
+                            e->video_rewrite_dst_pt[side] = dpt;
+                            e->video_rewrite_active[side] = 1;
+                        } else {
+                            /* 同 codec 同 PT：清掉上一轮 re-INVITE 的 PT 改写 */
+                            e->video_rewrite_active[side] = 0;
+                        }
+                        continue;
+                    }
+
+                    int sig = ((int)scid << 24) ^ ((int)dcid << 16) ^
+                              ((int)spt << 8) ^ (int)dpt;
+                    video_xcode_t *cur =
+                        __atomic_load_n(&e->vxcode[side], __ATOMIC_ACQUIRE);
+                    if (cur && e->vxcode_sig[side] == sig &&
+                        e->vxcode_src_pt[side] == spt &&
+                        e->vxcode_dst_pt[side] == dpt) {
+                        continue;   /* 已按同一组合建好 */
+                    }
+
+                    uint32_t ssrc = 0x4E534200u ^
+                                    (uint32_t)((uintptr_t)e & 0xFFFFu) ^
+                                    ((uint32_t)side << 1);
+                    video_xcode_t *nv =
+                        video_xcode_create(scid, dcid, spt, dpt, ssrc);
+                    if (nv == NULL) {
+                        llog(LOG_WARN, "media",
+                             "VIDEO_XCODE call=%p side=%d CREATE FAIL %d->%d — 保持透传",
+                             call, side, (int)scid, (int)dcid);
+                        continue;
+                    }
+                    if (cur) cnode_retire_vxcode(e, side, cur);
+                    e->vxcode_sig[side]    = sig;
+                    e->vxcode_src_pt[side] = spt;
+                    e->vxcode_dst_pt[side] = dpt;
+                    e->video_rewrite_active[side] = 0;
+                    __atomic_store_n(&e->vxcode[side], nv, __ATOMIC_RELEASE);
+                    llog(LOG_INFO, "media",
+                         "VIDEO_XCODE call=%p side=%d %d(pt=%u) -> %d(pt=%u)",
+                         call, side, (int)scid, (unsigned)spt,
+                         (int)dcid, (unsigned)dpt);
+                }
+            } else {
+                for (int side = 0; side < 2; ++side)
+                    cnode_drop_vxcode(e, side);
+            }
+video_plan_done: ;
+        }
         if (offer_video_n > 0 || answer_video_n > 0) {
             llog(LOG_INFO, "media",
                  "BRIDGE_VIDEO_PTS call=%p offer_video_n=%d answer_video_n=%d",
@@ -4304,6 +6109,12 @@ int bridge_confirm(bridge_mgr_t *m, void *call, const char *offer,
          * 顶层 static find_dtmf_pt（函数外定义）负责实际解析 */
         e->dtmf_pt[0] = find_dtmf_pt(offer, offer_len);
         e->dtmf_pt[1] = find_dtmf_pt(answer, answer_len);
+        /*  第 1 项：answer 已改写成 A 的 PT 域 —— 不能再用它推断 B 侧的
+         *  telephone-event PT，必须用终结时从 B 原始 answer 里取的值。 */
+        if (e->neg_valid) {
+            if (e->neg_a_te) e->dtmf_pt[0] = e->neg_a_te;
+            if (e->neg_b_te) e->dtmf_pt[1] = e->neg_b_te;
+        }
         if (e->dtmf_pt[0] || e->dtmf_pt[1]) {
             llog(LOG_INFO, "media",
                  "DTMF call=%p dtmf_pt[0]=%u dtmf_pt[1]=%u",
@@ -4369,115 +6180,120 @@ int bridge_confirm(bridge_mgr_t *m, void *call, const char *offer,
          *   G.729 互转（offer=G729 PT=96, answer=G729 PT=18 → 96→18）
          *   跨 codec （offer=0, answer=18 → 0→18 走 G711 PCMA→PCM→G729） */
 
-        /* --- side 0 (A→B)：offer codec 发往 answer 侧 --- */
-        for (int i = 0; i < offer_n && !e->transcode[0] && !e->pt_rewrite_active[0]; ++i) {
-            codec_id_t src = offer_cids[i];
-            if (src == CODEC_NONE) continue;     /* 未注册 codec（telephone-event 等），跳过 */
-            if (pt_in_list(offer_pts[i], answer_pts, answer_n)) continue; /* answer 已接受，不需处理 */
+        /* --- 音频转码规划：每次 bridge_confirm 重算（支持 re-INVITE）---
+         * side=0：A(offer) → B(answer)；side=1：B(answer) → A(offer)。
+         * dst 候选必须来自"目标腿"列表，杜绝用源腿列表选目标。 */
+        e->pt_rewrite_active[0] = 0;
+        e->pt_rewrite_active[1] = 0;
 
-            /*  PT rewrite pre-check：同 codec_id 在 answer 里有没有（哪怕 PT 不同）
-             * 例如 WebRTC 侧 G729 PT=96 vs SIP 侧 G729 PT=18 —— 只需改 PT 字节，
-             * 无需 PCM 往返转码（快 ~500x，零延迟增加） */
-            int found_same_codec = 0;
-            uint8_t answer_pt = 0;
-            for (int j = 0; j < answer_n; ++j) {
-                if (answer_cids[j] == src && src != CODEC_NONE) {
-                    found_same_codec = 1;
-                    answer_pt = answer_pts[j];
-                    break;
+        for (int side = 0; side < 2; ++side) {
+            const uint8_t    *sp = (side == 0) ? offer_pts : answer_pts;
+            const codec_id_t *sc = (side == 0) ? offer_cids : answer_cids;
+            int sn = (side == 0) ? offer_n : answer_n;
+            const uint8_t    *dp = (side == 0) ? answer_pts : offer_pts;
+            const codec_id_t *dc = (side == 0) ? answer_cids : offer_cids;
+            int dn = (side == 0) ? answer_n : offer_n;
+
+            int need = 0, rewrite = 0;
+            codec_id_t src = CODEC_NONE, dst = CODEC_NONE;
+            uint8_t src_pt = 0xFF, dst_pt = 0xFF, rw_dst_pt = 0xFF;
+
+            for (int i = 0; i < sn; ++i) {
+                int same_cid = 0;
+                uint8_t same_pt = 0xFF;
+                if (sc[i] == CODEC_NONE) continue;
+                if (!codec_can_decode(sc[i])) continue;
+                /* 按 codec 身份判断（PT 空间两腿独立，不能只比 PT 数字）*/
+                for (int j = 0; j < dn; ++j) {
+                    if (dc[j] == sc[i]) { same_cid = 1; same_pt = dp[j]; break; }
                 }
+                if (same_cid && same_pt == sp[i])
+                    continue;               /* 同 codec 同 PT：直接中继 */
+                need = 1;
+                src = sc[i];
+                src_pt = sp[i];
+                if (same_cid) {
+                    rewrite = 1;
+                    rw_dst_pt = same_pt;    /* 同 codec 不同 PT：只改 PT */
+                } else {
+                    dst = find_xcode_dst(src, dp, dc, dn, sc, sn, &dst_pt);
+                }
+                break;
             }
-            if (found_same_codec) {
-                e->pt_rewrite[0].src_pt = offer_pts[i];
-                e->pt_rewrite[0].dst_pt = answer_pt;
-                e->pt_rewrite_active[0] = 1;
-                const codec_ops_t *ops = codec_registry_find(src);
-                llog(LOG_INFO, "media",
-                     "call %p PT rewrite[0] %s(pt=%u)→pt=%u (same codec, no transcode)",
-                     call, ops ? ops->name : "?",
-                     (unsigned)offer_pts[i], (unsigned)answer_pt);
+
+            if (!need) {
+                e->src_codec[side] = CODEC_NONE;
+                e->dst_codec[side] = CODEC_NONE;
+                cnode_drop_xcode(e, side);
                 continue;
             }
 
-            /* 真·codec 不同：走 transcode */
-            codec_id_t dst = find_transcode_dst(src, offer_cids, offer_n,
-                                                  answer_cids, answer_n);
-            if (dst == CODEC_NONE) continue;
-            transcode_sess_t *tc = NULL;
-            int rc = transcode_open(src, dst, &tc);
-            if (rc == NSBC_OK) {
-                e->transcode[0] = tc;
-                e->mode = MB_TRANSCODE;
-                const codec_ops_t *ops_src = codec_registry_find(src);
-                const codec_ops_t *ops_dst = codec_registry_find(dst);
+            if (rewrite) {
+                cnode_drop_xcode(e, side);
+                e->pt_rewrite[side].src_pt = src_pt;
+                e->pt_rewrite[side].dst_pt = rw_dst_pt;
+                e->pt_rewrite_active[side] = 1;
+                const codec_ops_t *ops = codec_registry_find(src);
                 llog(LOG_INFO, "media",
-                     "call %p transcode[0]=%s(pt=%u)→%s(pt=%u) enabled",
-                     call,
-                     ops_src ? ops_src->name : "?", (unsigned)offer_pts[i],
-                     ops_dst ? ops_dst->name : "?",
-                     ops_dst ? (unsigned)ops_dst->default_pt : (unsigned)answer_pts[0]);
-            } else {
-                const codec_ops_t *ops_src = codec_registry_find(src);
-                const codec_ops_t *ops_dst = codec_registry_find(dst);
+                     "call %p PT rewrite[%d] %s(pt=%u)→pt=%u (same codec)",
+                     call, side, ops ? ops->name : "?",
+                     (unsigned)src_pt, (unsigned)rw_dst_pt);
+                continue;
+            }
+
+            if (dst == CODEC_NONE) {
                 llog(LOG_WARN, "media",
-                     "call %p transcode_open(%s→%s) rc=%d — payload may be dropped",
-                     call,
-                     ops_src ? ops_src->name : "?",
-                     ops_dst ? ops_dst->name : "?", rc);
-            }
-        }
-
-        /* --- side 1 (B→A)：answer codec 发往 offer 侧 --- */
-        for (int i = 0; i < answer_n && !e->transcode[1] && !e->pt_rewrite_active[1]; ++i) {
-            codec_id_t src = answer_cids[i];
-            if (src == CODEC_NONE) continue;
-            if (pt_in_list(answer_pts[i], offer_pts, offer_n)) continue;
-
-            /* PT rewrite pre-check */
-            int found_same_codec = 0;
-            uint8_t offer_pt = 0;
-            for (int j = 0; j < offer_n; ++j) {
-                if (offer_cids[j] == src && src != CODEC_NONE) {
-                    found_same_codec = 1;
-                    offer_pt = offer_pts[j];
-                    break;
-                }
-            }
-            if (found_same_codec) {
-                e->pt_rewrite[1].src_pt = answer_pts[i];
-                e->pt_rewrite[1].dst_pt = offer_pt;
-                e->pt_rewrite_active[1] = 1;
-                const codec_ops_t *ops = codec_registry_find(src);
-                llog(LOG_INFO, "media",
-                     "call %p PT rewrite[1] %s(pt=%u)→pt=%u (same codec, no transcode)",
-                     call, ops ? ops->name : "?",
-                     (unsigned)answer_pts[i], (unsigned)offer_pt);
+                     "call %p side=%d src=%s(pt=%u) no encodable target codec "
+                     "on peer leg — payload may be dropped",
+                     call, side,
+                     codec_registry_find(src) ? codec_registry_find(src)->name : "?",
+                     (unsigned)src_pt);
                 continue;
             }
 
-            codec_id_t dst = find_transcode_dst(src, answer_cids, answer_n,
-                                                  offer_cids, offer_n);
-            if (dst == CODEC_NONE) continue;
+            {
+                const codec_ops_t *so = codec_registry_find(src);
+                const codec_ops_t *eo = codec_registry_find(dst);
+                int sig = ((int)dst << 16) | (int)dst_pt;
+                transcode_sess_t *cur =
+                    __atomic_load_n(&e->transcode[side], __ATOMIC_ACQUIRE);
 
-            transcode_sess_t *tc = NULL;
-            int rc = transcode_open(src, dst, &tc);
-            if (rc == NSBC_OK) {
-                e->transcode[1] = tc;
-                e->mode = MB_TRANSCODE;
-                const codec_ops_t *ops_src = codec_registry_find(src);
-                const codec_ops_t *ops_dst = codec_registry_find(dst);
-                llog(LOG_INFO, "media",
-                     "call %p transcode[1]=%s(pt=%u)→%s(pt=%u) enabled",
-                     call,
-                     ops_src ? ops_src->name : "?", (unsigned)answer_pts[i],
-                     ops_dst ? ops_dst->name : "?",
-                     ops_dst ? (unsigned)ops_dst->default_pt : (unsigned)offer_pts[0]);
+                e->src_codec[side] = src;
+                e->dst_codec[side] = dst;
+                if (cur && e->xcode_sig[side] == sig &&
+                    e->xcode_src_pt[side] == src_pt) {
+                    e->mode = MB_TRANSCODE;   /* 计划未变，沿用现有会话 */
+                    continue;
+                }
+
+                transcode_sess_t *tc = NULL;
+                int rc = transcode_open2(src, dst,
+                                         so ? so->clock_rate : 8000,
+                                         eo ? eo->clock_rate : 8000,
+                                         so ? so->channels : 1, &tc);
+                if (rc == NSBC_OK) {
+                    rc = cnode_install_xcode(e, side, tc, src_pt, dst_pt);
+                    if (rc != NSBC_OK) {
+                        transcode_close(tc);
+                    } else {
+                        e->mode = MB_TRANSCODE;
+                        llog(LOG_INFO, "media",
+                             "call %p transcode[%d]=%s(pt=%u)→%s(pt=%u) enabled",
+                             call, side,
+                             so ? so->name : "?", (unsigned)src_pt,
+                             eo ? eo->name : "?", (unsigned)dst_pt);
+                    }
+                } else {
+                    llog(LOG_WARN, "media",
+                         "call %p transcode_open2(%s→%s) rc=%d — payload may be dropped",
+                         call, so ? so->name : "?", eo ? eo->name : "?", rc);
+                }
             }
         }
 
-        if (e->mode == MB_TRANSCODE && !e->transcode[0] && !e->transcode[1]) {
-            /* 确实需要转码但 codec registry 没有可用 codec → 记 WARN
-             * relay_recv_one 会走原始透传路径，保持静默不丢包 */
+        if (e->mode == MB_TRANSCODE &&
+            !__atomic_load_n(&e->transcode[0], __ATOMIC_ACQUIRE) &&
+            !__atomic_load_n(&e->transcode[1], __ATOMIC_ACQUIRE)) {
             llog(LOG_WARN, "media",
                  "call %p codec mismatch but no transcode session created "
                  "(registry missing target codecs) — running plain relay",
@@ -4629,6 +6445,34 @@ int bridge_call_view(bridge_mgr_t *m, void *call, mb_view_t *v)
     return NSBC_OK;
 }
 
+/*  取媒体层最终定型的音频 codec 名称（side 0=A / 1=B）。
+ *  信令层的 leg[1].answer 在入呼场景存的是"SBC 回给 A 的 answer"，
+ *  直接解析会把 B 腿（WebRTC）显示成 A 的 codec；真实协商结果
+ *  （含转码后两端各自的 codec）只有 bridge_confirm 的 neg_* 知道。 */
+int bridge_negotiated_codec_name(bridge_mgr_t *m, void *call_key, int side,
+                                 char *name, size_t cap)
+{
+    if (!m || !call_key || !name || cap == 0 || side < 0 || side > 1)
+        return 0;
+    name[0] = '\0';
+    br_shard_t *s = &m->sh[ptr_shard(call_key)];
+    pthread_mutex_lock(&s->lock);
+    cnode_t *e = entry_find(m, call_key);
+    int ok = 0;
+    if (e && e->neg_valid) {
+        const codec_ops_t *ops =
+            codec_registry_find(side ? e->neg_b_cid : e->neg_a_cid);
+        /*  ops->name 是内嵌数组，恒非 NULL；只有 sdp_name 是可选指针。 */
+        if (ops && ops->name[0]) {
+            snprintf(name, cap, "%s",
+                     ops->sdp_name ? ops->sdp_name : ops->name);
+            ok = 1;
+        }
+    }
+    pthread_mutex_unlock(&s->lock);
+    return ok;
+}
+
 /* ---- OAM 活跃会话遍历 ---- */
 
 int bridge_foreach_call(bridge_mgr_t *m, bridge_iter_cb cb, void *ud)
@@ -4709,6 +6553,12 @@ uint16_t rtp_relay_port(const rtp_relay_t *r, int side)
 {
     if (!r || side < 0 || side > 1) return 0;
     return r->rtp_port[side];
+}
+
+uint16_t rtp_relay_video_port(const rtp_relay_t *r, int side)
+{
+    if (!r || side < 0 || side > 1) return 0;
+    return r->vrtp_port[side];
 }
 
 const char *bridge_local_ip(const bridge_mgr_t *m)

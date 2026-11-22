@@ -2280,6 +2280,11 @@ static int sig_start(struct nsbc_ctx *ctx)
         llog(LOG_INFO, "sig", "Phase 0: b2b_sdp_hook_add OFFER arc=%d", arc2);
         int arc3 = b2b_sdp_hook_add(B2B_SDP_ANSWER, bridge_answer_hook, s->bridge);
         llog(LOG_INFO, "sig", "Phase 0: b2b_sdp_hook_add ANSWER arc=%d", arc3);
+        /* B 发起 re-INVITE 的对称逐腿终结 */
+        int arc3r = b2b_sdp_hook_add(B2B_SDP_OFFER_REV, bridge_offer_hook_rev, s->bridge);
+        llog(LOG_INFO, "sig", "Phase 0: b2b_sdp_hook_add OFFER_REV arc=%d", arc3r);
+        int arc3rr = b2b_sdp_hook_add(B2B_SDP_ANSWER_REV, bridge_answer_hook_rev, s->bridge);
+        llog(LOG_INFO, "sig", "Phase 0: b2b_sdp_hook_add ANSWER_REV arc=%d", arc3rr);
 
         /* Media View → signaling 自己的 media_view_cb（bridge 内部查状态）*/
         int arc4 = b2b_media_view_hook_add(media_view_cb, s->bridge);
@@ -2517,6 +2522,8 @@ static void sig_stop(struct nsbc_ctx *ctx)
         b2b_register_hook_rm(reg_on_register, s->reg);
         b2b_sdp_hook_rm(B2B_SDP_OFFER, bridge_offer_hook, s->bridge);
         b2b_sdp_hook_rm(B2B_SDP_ANSWER, bridge_answer_hook, s->bridge);
+        b2b_sdp_hook_rm(B2B_SDP_OFFER_REV, bridge_offer_hook_rev, s->bridge);
+        b2b_sdp_hook_rm(B2B_SDP_ANSWER_REV, bridge_answer_hook_rev, s->bridge);
         b2b_media_view_hook_rm(media_view_cb, s->bridge);
         llog(LOG_INFO, "sig", "Phase 0: all b2b hooks unregistered");
     }

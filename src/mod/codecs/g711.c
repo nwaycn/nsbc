@@ -353,6 +353,14 @@ static const codec_ops_t G711_PCMU_OPS = {
     .fini        = pcmu_fini,
     .decode      = pcmu_decode,
     .encode      = pcmu_encode,
+    /* Registry v2 元数据 */
+    .api_version = NSBC_CODEC_API_VERSION,
+    .sdp_name    = "PCMU",
+    .aliases     = "G711U,G.711U,PCMU",
+    .kind        = CODEC_KIND_AUDIO,
+    .payload     = RTP_PAYLOAD_SIMPLE,
+    .priority    = 50,
+    .caps        = CODEC_CAP_DEC | CODEC_CAP_ENC,
 };
 
 static const codec_ops_t G711_PCMA_OPS = {
@@ -366,6 +374,14 @@ static const codec_ops_t G711_PCMA_OPS = {
     .fini        = pcma_fini,
     .decode      = pcma_decode,
     .encode      = pcma_encode,
+    /* Registry v2 元数据 */
+    .api_version = NSBC_CODEC_API_VERSION,
+    .sdp_name    = "PCMA",
+    .aliases     = "G711A,G.711A,PCMA",
+    .kind        = CODEC_KIND_AUDIO,
+    .payload     = RTP_PAYLOAD_SIMPLE,
+    .priority    = 50,
+    .caps        = CODEC_CAP_DEC | CODEC_CAP_ENC,
 };
 
 /* ============================================================================

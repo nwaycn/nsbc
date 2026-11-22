@@ -116,10 +116,10 @@ static struct { b2b_call_destroy_cb fn; void *ud; } g_end_hooks[B2B_END_HOOK_MAX
 static int g_end_hook_n = 0;
 static pthread_mutex_t g_end_hook_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* SDP hook 多槽链：offer + answer 分开两张表 */
+/* SDP hook 多槽链：按 kind 分表（OFFER/ANSWER + B 发起 re-INVITE 的反向两条） */
 typedef struct { b2b_sdp_hook_fn fn; void *ud; } b2b_sdp_hook_slot_t;
-static b2b_sdp_hook_slot_t g_sdp_hooks[2][B2B_SDP_HOOK_MAX];
-static int g_sdp_hook_n[2] = {0, 0};
+static b2b_sdp_hook_slot_t g_sdp_hooks[B2B_SDP_HOOK_KINDS][B2B_SDP_HOOK_MAX];
+static int g_sdp_hook_n[B2B_SDP_HOOK_KINDS] = {0};
 static pthread_mutex_t g_sdp_hook_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* REGISTER 多槽链 */
@@ -4231,9 +4231,46 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                                      "Content-Type: %.*s\r\n",
                                      (int)ct->value.len, ct->value.p);
                     }
+                    /* ★ B 发起 re-INVITE 的对称逐腿终结：A 的 answer 回 B 前
+                     * 先过 B2B_SDP_ANSWER_REV hook 链（只保留 B 侧最终 codec
+                     * 与 B 的 telephone-event PT）。c->leg[0].answer 必须保持
+                     * A 原始 answer —— bridge_confirm 从它提取 A 侧 codec。 */
+                    const char *ans_sdp = m->body.p;
+                    size_t ans_len = m->body.len;
+                    char ans_buf[B2B_SDP_MAX]; ans_buf[0] = '\0';
+                    if (c->leg[0].reinv && m->body.len && m->body.p &&
+                        m->body.len <= B2B_SDP_MAX &&
+                        g_sdp_hook_n[B2B_SDP_ANSWER_REV] > 0) {
+                        b2b_sdp_hook_slot_t hsnap[B2B_SDP_HOOK_MAX];
+                        int hn;
+                        pthread_mutex_lock(&g_sdp_hook_lock);
+                        hn = g_sdp_hook_n[B2B_SDP_ANSWER_REV];
+                        if (hn > B2B_SDP_HOOK_MAX) hn = B2B_SDP_HOOK_MAX;
+                        for (int i = 0; i < hn; ++i)
+                            hsnap[i] = g_sdp_hooks[B2B_SDP_ANSWER_REV][i];
+                        pthread_mutex_unlock(&g_sdp_hook_lock);
+                        for (int i = 0; i < hn; ++i) {
+                            char hbuf[B2B_SDP_MAX]; hbuf[0] = '\0';
+                            const char *hin = ans_buf[0] ? ans_buf : m->body.p;
+                            size_t hinlen = ans_buf[0] ? strlen(ans_buf)
+                                                       : m->body.len;
+                            int rv = hsnap[i].fn(c, hin, hinlen, hbuf,
+                                                 sizeof(hbuf), hsnap[i].ud);
+                            if (rv >= 0) {
+                                if ((size_t)rv >= sizeof(ans_buf))
+                                    rv = (int)sizeof(ans_buf) - 1;
+                                memcpy(ans_buf, hbuf, (size_t)rv);
+                                ans_buf[rv] = '\0';
+                            }
+                        }
+                        if (ans_buf[0]) {
+                            ans_sdp = ans_buf;
+                            ans_len = strlen(ans_buf);
+                        }
+                    }
                     respond_txn(co, c->leg[1].srv_txn, st, NULL,
                                 ctbuf[0] ? ctbuf : NULL,
-                                m->body.p, m->body.len);
+                                ans_sdp, ans_len);
 
                     /* ★ re-INVITE 200 OK: 存 answer 到 leg[0]（A 腿=应答腿）
                      * 初始 INVITE 时 answer 也存 leg[1].answer，bridge_confirm
@@ -4352,10 +4389,46 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                                  "Content-Type: %.*s\r\n",
                                  (int)ct->value.len, ct->value.p);
                 }
+                /* ★ A 发起 re-INVITE 的对称答案终结：B 的 200 OK SDP 必须先过
+                 * 正向 B2B_SDP_ANSWER 链（收敛到 A 侧 codec、锚定 relay A 端口），
+                 * 再回给 A。leg[1].answer 仍保存 B 原始 SDP 供 bridge_confirm 用。 */
+                const char *abody = m->body.len ? m->body.p : NULL;
+                size_t abody_len = m->body.len;
+                char ans_buf[B2B_SDP_MAX];
+                ans_buf[0] = '\0';
+                if (m->body.len && m->body.p &&
+                    g_sdp_hook_n[B2B_SDP_ANSWER] > 0) {
+                    b2b_sdp_hook_slot_t asnap[B2B_SDP_HOOK_MAX];
+                    int ahn;
+                    pthread_mutex_lock(&g_sdp_hook_lock);
+                    ahn = g_sdp_hook_n[B2B_SDP_ANSWER];
+                    if (ahn > B2B_SDP_HOOK_MAX) ahn = B2B_SDP_HOOK_MAX;
+                    for (int i = 0; i < ahn; ++i)
+                        asnap[i] = g_sdp_hooks[B2B_SDP_ANSWER][i];
+                    pthread_mutex_unlock(&g_sdp_hook_lock);
+                    for (int i = 0; i < ahn; ++i) {
+                        char hbuf[B2B_SDP_MAX];
+                        hbuf[0] = '\0';
+                        const char *hin = ans_buf[0] ? ans_buf : m->body.p;
+                        size_t hinlen = ans_buf[0] ? strlen(ans_buf)
+                                                   : m->body.len;
+                        int rv = asnap[i].fn(c, hin, hinlen, hbuf,
+                                             sizeof(hbuf), asnap[i].ud);
+                        if (rv >= 0) {
+                            if ((size_t)rv >= sizeof(ans_buf))
+                                rv = (int)sizeof(ans_buf) - 1;
+                            memcpy(ans_buf, hbuf, (size_t)rv);
+                            ans_buf[rv] = '\0';
+                        }
+                    }
+                    if (ans_buf[0]) {
+                        abody = ans_buf;
+                        abody_len = strlen(ans_buf);
+                    }
+                }
                 respond_txn(co, c->leg[0].srv_txn, m->status, NULL,
                             ctbuf[0] ? ctbuf : NULL,
-                            m->body.len ? m->body.p : NULL,
-                            m->body.len);
+                            abody, abody_len);
 
                 /* ★ A 发 re-INVITE → leg[0].offer 已在 handler 更新 →
                  * B 腿回 200 OK 存 answer 到 leg[1].answer + 清 media_done。 */
@@ -4722,6 +4795,21 @@ static void call_fill_codecs(b2b_call_t *c)
         sig_sdp_extract_cdr(c->leg[1].answer, c->leg[1].answer_len,
                             c->codec_b, sizeof(c->codec_b),
                             c->peer_b, sizeof(c->peer_b));
+    /*  媒体层最终协商结果优先。入呼场景 leg[1].answer 存的是"SBC 回给 A
+     *  的 answer"，直接解析必然把 B 腿 codec 显示成 A 腿的 codec
+     *  （实测 1008(linphone G729) → 1000(WebRTC PCMA) 被显示成 G729/G729）。
+     *  bridge_confirm 的 neg_* 才是两腿真实协商结果（含转码两端）。 */
+    {
+        nsbc_ctx_t *ctx = nsbc_get_ctx();
+        bridge_mgr_t *bm = ctx ? (bridge_mgr_t *)ctx->bridge : NULL;
+        if (bm) {
+            char nm[32];
+            if (bridge_negotiated_codec_name(bm, c, 0, nm, sizeof(nm)))
+                snprintf(c->codec_a, sizeof(c->codec_a), "%s", nm);
+            if (bridge_negotiated_codec_name(bm, c, 1, nm, sizeof(nm)))
+                snprintf(c->codec_b, sizeof(c->codec_b), "%s", nm);
+        }
+    }
 }
 
 static void b2b_emit_cdr(b2b_call_t *c, cdr_phase_t phase)
@@ -6245,8 +6333,43 @@ static void handle_indialog_invite(b2b_call_t *c, int leg, sip_txn_t *t,
         }
     }
     if (leg == 0) {
-        /* A→B：走 B 腿出向 INVITE */
-        leg_txn_store(&o->inv_txn, send_invite_b(c, 1, l->offer, l->offer_len, 1, NULL));
+        /* A→B：走 B 腿出向 INVITE。
+         * ★ A 发起 re-INVITE 的对称逐腿终结：发往 B 的 offer 先过正向
+         * B2B_SDP_OFFER hook 链（补 SBC 可编解码的音频/视频 PT）。
+         * l->offer 必须保持 A 原始 offer —— bridge_confirm / relay 规划
+         * 从 leg[0].offer 提取 A 侧 codec，只有发出去的副本可被改写。 */
+        const char *fwd_sdp = l->offer;
+        size_t fwd_sdp_len = l->offer_len;
+        char fwd_buf[B2B_SDP_MAX]; fwd_buf[0] = '\0';
+        if (m->body.len && l->offer_len && g_sdp_hook_n[B2B_SDP_OFFER] > 0) {
+            b2b_sdp_hook_slot_t hsnap[B2B_SDP_HOOK_MAX];
+            int hn;
+            pthread_mutex_lock(&g_sdp_hook_lock);
+            hn = g_sdp_hook_n[B2B_SDP_OFFER];
+            if (hn > B2B_SDP_HOOK_MAX) hn = B2B_SDP_HOOK_MAX;
+            for (int i = 0; i < hn; ++i)
+                hsnap[i] = g_sdp_hooks[B2B_SDP_OFFER][i];
+            pthread_mutex_unlock(&g_sdp_hook_lock);
+            for (int i = 0; i < hn; ++i) {
+                char hbuf[B2B_SDP_MAX]; hbuf[0] = '\0';
+                const char *hin = fwd_buf[0] ? fwd_buf : l->offer;
+                size_t hinlen = fwd_buf[0] ? strlen(fwd_buf) : l->offer_len;
+                int rv = hsnap[i].fn(c, hin, hinlen, hbuf,
+                                     sizeof(hbuf), hsnap[i].ud);
+                if (rv >= 0) {
+                    if ((size_t)rv >= sizeof(fwd_buf))
+                        rv = (int)sizeof(fwd_buf) - 1;
+                    memcpy(fwd_buf, hbuf, (size_t)rv);
+                    fwd_buf[rv] = '\0';
+                }
+            }
+            if (fwd_buf[0]) {
+                fwd_sdp = fwd_buf;
+                fwd_sdp_len = strlen(fwd_buf);
+            }
+        }
+        leg_txn_store(&o->inv_txn,
+                      send_invite_b(c, 1, fwd_sdp, fwd_sdp_len, 1, NULL));
     } else {
         /* B→A：朝 A 对话目标发 re-INVITE（A 腿 ICT） */
         char branch[40];
@@ -6255,9 +6378,44 @@ static void handle_indialog_invite(b2b_call_t *c, int leg, sip_txn_t *t,
         char to[B2B_HDR_MAX + DLG_TAG_MAX + 8];
         snprintf(to, sizeof(to), "%s;tag=%s", o->to, o->rem_tag);
         char out[SIP_MAX_MSG * 2];
+        /* ★ B 发起 re-INVITE 的对称逐腿终结：发往 A 的 offer 先过
+         * B2B_SDP_OFFER_REV hook 链（在 B 的 fmt-list 里追加 SBC 可编解码
+         * 的静态音频 PT）。l->offer 必须保持 B 原始 offer —— bridge_confirm
+         * 从 leg[1].offer 提取 B 侧 codec，只有发出去的副本可被改写。
+         * 锁只保护回调数组快照，释放后再调（与正向 hook 同防死锁模式）。 */
+        const char *fwd_sdp = l->offer;
+        size_t fwd_sdp_len = l->offer_len;
+        char fwd_buf[B2B_SDP_MAX]; fwd_buf[0] = '\0';
+        if (m->body.len && l->offer_len && g_sdp_hook_n[B2B_SDP_OFFER_REV] > 0) {
+            b2b_sdp_hook_slot_t hsnap[B2B_SDP_HOOK_MAX];
+            int hn;
+            pthread_mutex_lock(&g_sdp_hook_lock);
+            hn = g_sdp_hook_n[B2B_SDP_OFFER_REV];
+            if (hn > B2B_SDP_HOOK_MAX) hn = B2B_SDP_HOOK_MAX;
+            for (int i = 0; i < hn; ++i)
+                hsnap[i] = g_sdp_hooks[B2B_SDP_OFFER_REV][i];
+            pthread_mutex_unlock(&g_sdp_hook_lock);
+            for (int i = 0; i < hn; ++i) {
+                char hbuf[B2B_SDP_MAX]; hbuf[0] = '\0';
+                const char *hin = fwd_buf[0] ? fwd_buf : l->offer;
+                size_t hinlen = fwd_buf[0] ? strlen(fwd_buf) : l->offer_len;
+                int rv = hsnap[i].fn(c, hin, hinlen, hbuf,
+                                     sizeof(hbuf), hsnap[i].ud);
+                if (rv >= 0) {
+                    if ((size_t)rv >= sizeof(fwd_buf))
+                        rv = (int)sizeof(fwd_buf) - 1;
+                    memcpy(fwd_buf, hbuf, (size_t)rv);
+                    fwd_buf[rv] = '\0';
+                }
+            }
+            if (fwd_buf[0]) {
+                fwd_sdp = fwd_buf;
+                fwd_sdp_len = strlen(fwd_buf);
+            }
+        }
         int n = build_dlg_req(co, o, SIP_M_INVITE, cs,
                               o->target[0] ? o->target : o->ruri, to,
-                              branch, NULL, l->offer, l->offer_len,
+                              branch, NULL, fwd_sdp, fwd_sdp_len,
                               out, sizeof(out));
         if (n > 0) {
             /* 设本地发送端口：对话已建立，用 out_prof 端口 */
@@ -8374,8 +8532,8 @@ int b2b_originate(b2b_core_t *co, const b2b_orig_t *o, b2b_call_t **out)
                  * 里 orig_port==0，而 sdp_build_webrtc_answer 看到 port=0 就判
                  * rejected → 硬编码替换 VIDEO_REJECT_MLINE + a=inactive → 浏览器
                  * 丢 video 段。这里用 port=1 作 placeholder（非零，表示"有 video"
-                 * 但还没分配 relay 端口），rewrite 会识别非零 orig_port 然后
-                 * 用 relay 真实端口替换（media_port + media_idx * 2）。
+                 * 但还没分配 relay 端口），rewrite 会识别非零 orig_port 然后用
+                 * relay 真实端口替换（明文腿取 video_port，WebRTC 腿取 media_port）。
                  * BYPASS 模式下 1 会被保留（两端直连不需要 SBC relay）——但
                  * BYPASS 早退路径（L2737-2742）不会走到 rewrite，所以没问题。 */
                 if (video_n > 0 && cap > 16) {
@@ -9803,6 +9961,8 @@ static void b2b_early_media_start(b2b_call_t *c)
         llog(LOG_WARN, "b2b", "early_media: relay port=0 call=%p", (void *)c);
         return;
     }
+    /* A 腿是明文 SIP（下方 WebRTC 分支已排除），视频用独立端口 */
+    uint16_t a_vport = rtp_relay_video_port(relay, 0);
 
     /* SDP c=/m= 地址：profile external_rtp_ip 优先（NAT），fallback local_ip
      * （与 offer_hook / EXT_RTP 同一选择逻辑） */
@@ -9836,7 +9996,7 @@ static void b2b_early_media_start(b2b_call_t *c)
     char sdp[B2B_SDP_MAX];
     int sdp_len = bridge_rewrite_sdp(c->leg[0].offer, c->leg[0].offer_len,
                                      sdp, sizeof(sdp), rtp_ip, a_port,
-                                     MB_SDP_PLAIN);
+                                     a_vport, MB_SDP_PLAIN);
     if (sdp_len <= 0) {
         llog(LOG_WARN, "b2b", "early_media: rewrite_sdp rc=%d call=%p",
              sdp_len, (void *)c);
@@ -10915,7 +11075,7 @@ void b2b_call_destroy_rm_all(void)
 /* ===== SDP hook 多槽链 ===== */
 int b2b_sdp_hook_add(b2b_sdp_hook_kind_t kind, b2b_sdp_hook_fn fn, void *ud)
 {
-    if (kind > 1 || !fn) return NSBC_INVAL;
+    if (kind < 0 || kind >= B2B_SDP_HOOK_KINDS || !fn) return NSBC_INVAL;
     pthread_mutex_lock(&g_sdp_hook_lock);
     for (int i = 0; i < g_sdp_hook_n[kind]; ++i)
         if (g_sdp_hooks[kind][i].fn == fn && g_sdp_hooks[kind][i].ud == ud) {
@@ -10934,7 +11094,7 @@ int b2b_sdp_hook_add(b2b_sdp_hook_kind_t kind, b2b_sdp_hook_fn fn, void *ud)
 }
 void b2b_sdp_hook_rm(b2b_sdp_hook_kind_t kind, b2b_sdp_hook_fn fn, void *ud)
 {
-    if (kind > 1 || !fn) return;
+    if (kind < 0 || kind >= B2B_SDP_HOOK_KINDS || !fn) return;
     pthread_mutex_lock(&g_sdp_hook_lock);
     int out = 0;
     for (int i = 0; i < g_sdp_hook_n[kind]; ++i) {

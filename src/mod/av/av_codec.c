@@ -34,7 +34,9 @@
 #include <libavcodec/avcodec.h>
 #include <libavutil/opt.h>
 #include <libavutil/samplefmt.h>
+#include <libavutil/imgutils.h>
 #include <libswresample/swresample.h>
+#include <libswscale/swscale.h>
 #endif
 
 /* ============================================================================
@@ -59,6 +61,13 @@ struct codec_sess {
     AVCodecContext *enc_ctx;
     AVPacket       *enc_pkt;
     AVFrame        *enc_frame;
+
+    /* 视频编码器懒初始化（宽高在首个解码帧后确定） */
+    int             vid_ready;
+    int             vid_w;
+    int             vid_h;
+    int             vid_fps;
+    struct SwsContext *sws_v;   /* 解码像素格式 → YUV420P */
 #endif
 };
 
@@ -226,6 +235,7 @@ static void av_codec_close(struct codec_sess *sess)
     if (!sess) return;
 #ifdef HAVE_FFMPEG
     if (sess->swr) swr_free(&sess->swr);
+    if (sess->sws_v) sws_freeContext(sess->sws_v);
 
     if (sess->is_decoder) {
         av_packet_free(&sess->pkt);
@@ -430,7 +440,293 @@ __attribute__((unused)) static int parse_fmtp_ptime(const char *fmtp)
     return (int)v;
 }
 
-#define AVCODEC_DECLARE_OPS(cid, cname, cr, ch, pt, ptm)                      \
+/* ============================================================================
+ * 视频编解码（codec_ops_t 的 vid_* 回调）
+ *
+ * 解码：初始化即打开 AVCodec（无需宽高）。
+ * 编码：首个解码帧到达后才知道宽高，故懒初始化；统一转 YUV420P。
+ * H.264 优先 libx264，VP9 优先 libvpx-vp9，缺失时回退原生 encoder。
+ * ==========================================================================*/
+#ifdef HAVE_FFMPEG
+static int av_vid_dec_open(struct codec_sess *sess, codec_id_t cid)
+{
+    const struct ffmpeg_codec_param *p = find_ff_param(cid);
+    if (!p || !p->is_video) return NSBC_NOTSUP;
+
+    const AVCodec *codec = avcodec_find_decoder(p->ffmpeg_id);
+    if (!codec) {
+        llog(LOG_WARN, "av", "video decoder not found id=%d", p->ffmpeg_id);
+        return NSBC_NOTSUP;
+    }
+    AVCodecContext *ctx = avcodec_alloc_context3(codec);
+    if (!ctx) return NSBC_NOMEM;
+    ctx->pkt_timebase = (AVRational){1, 90000};
+    ctx->thread_count = 1;
+    ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
+
+    int rc = avcodec_open2(ctx, codec, NULL);
+    if (rc < 0) {
+        avcodec_free_context(&ctx);
+        llog(LOG_WARN, "av", "video decoder open failed rc=%d id=%d", rc, cid);
+        return NSBC_ERR;
+    }
+    sess->dec_ctx = ctx;
+    sess->pkt   = av_packet_alloc();
+    sess->frame = av_frame_alloc();
+    if (!sess->pkt || !sess->frame) {
+        av_packet_free(&sess->pkt);
+        av_frame_free(&sess->frame);
+        avcodec_free_context(&sess->dec_ctx);
+        return NSBC_NOMEM;
+    }
+    sess->is_decoder = 1;
+    return NSBC_OK;
+}
+
+static const AVCodec *av_vid_find_encoder(enum AVCodecID fid)
+{
+    const AVCodec *codec = NULL;
+    if (fid == AV_CODEC_ID_H264)
+        codec = avcodec_find_encoder_by_name("libx264");
+    else if (fid == AV_CODEC_ID_VP9)
+        codec = avcodec_find_encoder_by_name("libvpx-vp9");
+    else if (fid == AV_CODEC_ID_VP8)
+        codec = avcodec_find_encoder_by_name("libvpx");
+    if (!codec) codec = avcodec_find_encoder(fid);
+    return codec;
+}
+
+static int av_vid_enc_ensure(struct codec_sess *s, int w, int h)
+{
+    if (s->vid_ready && s->vid_w == w && s->vid_h == h) return NSBC_OK;
+
+    const struct ffmpeg_codec_param *p = find_ff_param(s->id);
+    if (!p || !p->is_video) return NSBC_NOTSUP;
+
+    /* 分辨率变化：重建编码器 */
+    if (s->vid_ready) {
+        avcodec_free_context(&s->enc_ctx);
+        av_packet_free(&s->enc_pkt);
+        av_frame_free(&s->enc_frame);
+        s->vid_ready = 0;
+        if (s->sws_v) { sws_freeContext(s->sws_v); s->sws_v = NULL; }
+    }
+
+    const AVCodec *codec = av_vid_find_encoder(p->ffmpeg_id);
+    if (!codec) {
+        llog(LOG_WARN, "av", "video encoder not found id=%d", p->ffmpeg_id);
+        return NSBC_NOTSUP;
+    }
+
+    AVCodecContext *ctx = avcodec_alloc_context3(codec);
+    if (!ctx) return NSBC_NOMEM;
+
+    ctx->width       = w;
+    ctx->height      = h;
+    ctx->pix_fmt     = AV_PIX_FMT_YUV420P;
+    ctx->time_base   = (AVRational){1, 90000};
+    ctx->framerate   = (AVRational){30, 1};
+    ctx->bit_rate    = 800000;
+    ctx->gop_size    = 30;
+    ctx->max_b_frames = 0;
+    ctx->thread_count = 1;
+    ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
+
+    AVDictionary *opts = NULL;
+    if (p->ffmpeg_id == AV_CODEC_ID_H264) {
+        av_dict_set(&opts, "preset", "ultrafast", 0);
+        av_dict_set(&opts, "tune", "zerolatency", 0);
+        /* 与 SDP 宣告的 profile-level-id=42e01f 对齐，避免浏览器按
+         * constrained baseline 解码时遇到 High profile 码流 */
+        av_dict_set(&opts, "profile", "baseline", 0);
+        av_dict_set(&opts, "level", "3.1", 0);
+        av_dict_set(&opts, "x264-params",
+                    "repeat-headers=1:keyint=30:min-keyint=30:scenecut=0", 0);
+    } else if (p->ffmpeg_id == AV_CODEC_ID_VP9) {
+        av_dict_set(&opts, "deadline", "realtime", 0);
+        av_dict_set(&opts, "cpu-used", "8", 0);
+        av_dict_set(&opts, "lag-in-frames", "0", 0);
+        av_dict_set(&opts, "error-resilient", "1", 0);
+    } else if (p->ffmpeg_id == AV_CODEC_ID_VP8) {
+        av_dict_set(&opts, "deadline", "realtime", 0);
+        av_dict_set(&opts, "cpu-used", "8", 0);
+        av_dict_set(&opts, "lag-in-frames", "0", 0);
+    }
+
+    int rc = avcodec_open2(ctx, codec, &opts);
+    av_dict_free(&opts);
+    if (rc < 0) {
+        avcodec_free_context(&ctx);
+        llog(LOG_WARN, "av", "video encoder open failed rc=%d id=%d %dx%d",
+             rc, s->id, w, h);
+        return NSBC_ERR;
+    }
+
+    s->enc_ctx   = ctx;
+    s->enc_pkt   = av_packet_alloc();
+    s->enc_frame = av_frame_alloc();
+    if (!s->enc_pkt || !s->enc_frame) {
+        av_packet_free(&s->enc_pkt);
+        av_frame_free(&s->enc_frame);
+        avcodec_free_context(&s->enc_ctx);
+        return NSBC_NOMEM;
+    }
+    s->vid_w = w;
+    s->vid_h = h;
+    s->vid_ready = 1;
+    s->is_decoder = 0;
+    return NSBC_OK;
+}
+#endif /* HAVE_FFMPEG */
+
+#ifdef HAVE_FFMPEG
+static int av_vid_dec_init(codec_id_t cid, const char *fmtp, codec_sess_t **out)
+{
+    (void)fmtp;
+    if (!out) return NSBC_INVAL;
+    struct codec_sess *s = (struct codec_sess *)calloc(1, sizeof(*s));
+    if (!s) return NSBC_NOMEM;
+    s->id = cid;
+    int rc = av_vid_dec_open(s, cid);
+    if (rc != NSBC_OK) { free(s); return rc; }
+    *out = s;
+    return NSBC_OK;
+}
+
+static int av_vid_enc_init(codec_id_t cid, const char *fmtp, codec_sess_t **out)
+{
+    (void)fmtp;
+    if (!out) return NSBC_INVAL;
+    const struct ffmpeg_codec_param *p = find_ff_param(cid);
+    if (!p || !p->is_video) return NSBC_NOTSUP;
+    if (!av_vid_find_encoder(p->ffmpeg_id)) return NSBC_NOTSUP;
+
+    struct codec_sess *s = (struct codec_sess *)calloc(1, sizeof(*s));
+    if (!s) return NSBC_NOMEM;
+    s->id = cid;
+    s->is_decoder = 0;
+    *out = s;
+    return NSBC_OK;
+}
+
+static void av_vid_frame_free(codec_sess_t *s, video_frame_t *f)
+{
+    if (!s || !f) return;
+#ifdef HAVE_FFMPEG
+    struct codec_sess *cs = (struct codec_sess *)s;
+    if (cs->frame) av_frame_unref(cs->frame);
+#endif
+    memset(f, 0, sizeof(*f));
+}
+
+static int av_vid_decode(codec_sess_t *s, const uint8_t *au, size_t len,
+                         video_frame_t *out)
+{
+    if (!s || !au || len == 0 || !out) return NSBC_INVAL;
+#ifdef HAVE_FFMPEG
+    struct codec_sess *cs = (struct codec_sess *)s;
+    if (!cs->dec_ctx || !cs->pkt || !cs->frame) return NSBC_INVAL;
+
+    AVPacket *pkt = cs->pkt;
+    pkt->data = (uint8_t *)au;
+    pkt->size = (int)len;
+
+    int rc = avcodec_send_packet(cs->dec_ctx, pkt);
+    pkt->data = NULL;
+    pkt->size = 0;
+    if (rc == AVERROR(EAGAIN)) return NSBC_AGAIN;
+    if (rc < 0) return NSBC_ERR;
+
+    rc = avcodec_receive_frame(cs->dec_ctx, cs->frame);
+    if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) return NSBC_AGAIN;
+    if (rc < 0) return NSBC_ERR;
+
+    AVFrame *f = cs->frame;
+    memset(out, 0, sizeof(*out));
+    for (int i = 0; i < 4; ++i) {
+        out->data[i]     = f->data[i];
+        out->linesize[i] = f->linesize[i];
+    }
+    out->width  = f->width;
+    out->height = f->height;
+    out->format = (int)f->format;
+    out->pts    = (uint32_t)f->pts;
+#if LIBAVUTIL_VERSION_MAJOR >= 58
+    out->keyframe = (f->flags & AV_FRAME_FLAG_KEY) != 0;
+#else
+    out->keyframe = f->key_frame != 0;
+#endif
+    if (f->pict_type == AV_PICTURE_TYPE_I) out->keyframe = 1;
+    out->priv = f;
+    return NSBC_OK;
+#else
+    (void)s;
+    return NSBC_NOTSUP;
+#endif
+}
+
+static int av_vid_encode(codec_sess_t *s, const video_frame_t *in,
+                         uint8_t *out, size_t cap,
+                         size_t *out_len, int *keyframe)
+{
+    if (!s || !in || !out || !out_len) return NSBC_INVAL;
+    if (out_len) *out_len = 0;
+    if (keyframe) *keyframe = 0;
+#ifdef HAVE_FFMPEG
+    struct codec_sess *cs = (struct codec_sess *)s;
+    int w = in->width & ~1;
+    int h = in->height & ~1;
+    if (w <= 0 || h <= 0) return NSBC_INVAL;
+
+    int rc = av_vid_enc_ensure(cs, w, h);
+    if (rc != NSBC_OK) return rc;
+
+    AVFrame *f = cs->enc_frame;
+    av_frame_unref(f);
+    f->format = AV_PIX_FMT_YUV420P;
+    f->width  = w;
+    f->height = h;
+    f->pts    = (int64_t)in->pts;
+    if (in->keyframe) f->pict_type = AV_PICTURE_TYPE_I;
+    rc = av_frame_get_buffer(f, 0);
+    if (rc < 0) return NSBC_ERR;
+
+    /* 解码帧像素格式 → 编码器 YUV420P */
+    cs->sws_v = sws_getCachedContext(cs->sws_v, in->width, in->height,
+                                     (enum AVPixelFormat)in->format,
+                                     w, h, AV_PIX_FMT_YUV420P,
+                                     SWS_BILINEAR, NULL, NULL, NULL);
+    if (!cs->sws_v) { av_frame_unref(f); return NSBC_ERR; }
+    sws_scale(cs->sws_v, (const uint8_t *const *)in->data,
+              in->linesize, 0, in->height,
+              f->data, f->linesize);
+
+    rc = avcodec_send_frame(cs->enc_ctx, f);
+    av_frame_unref(f);
+    if (rc == AVERROR(EAGAIN)) return NSBC_AGAIN;
+    if (rc < 0) return NSBC_ERR;
+
+    AVPacket *pkt = cs->enc_pkt;
+    rc = avcodec_receive_packet(cs->enc_ctx, pkt);
+    if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) return NSBC_AGAIN;
+    if (rc < 0) return NSBC_ERR;
+    if (pkt->size <= 0) { av_packet_unref(pkt); return NSBC_AGAIN; }
+    if ((size_t)pkt->size > cap) { av_packet_unref(pkt); return NSBC_NOSPC; }
+
+    memcpy(out, pkt->data, (size_t)pkt->size);
+    *out_len = (size_t)pkt->size;
+    if (keyframe) *keyframe = (pkt->flags & AV_PKT_FLAG_KEY) ? 1 : 0;
+    av_packet_unref(pkt);
+    return NSBC_OK;
+#else
+    (void)s; (void)in; (void)out; (void)cap; (void)keyframe;
+    return NSBC_NOTSUP;
+#endif
+}
+#endif /* HAVE_FFMPEG */
+
+#define AVCODEC_DECLARE_OPS(cid, cname, cr, ch, pt, ptm, sdpn, aliases_,    \
+                            knd, pld, prio, capf)                             \
     /* decoder sess init */                                                   \
     static int cname##_init(const char *fmtp, codec_sess_t **out) {            \
         (void)fmtp;                                                           \
@@ -477,19 +773,76 @@ __attribute__((unused)) static int parse_fmtp_ptime(const char *fmtp)
         ops->fini          = cname##_fini;                                    \
         ops->decode        = cname##_decode;                                  \
         ops->encode        = cname##_encode;                                  \
+        /* Registry v2 元数据 */                                              \
+        ops->api_version   = NSBC_CODEC_API_VERSION;                          \
+        ops->sdp_name      = sdpn;                                            \
+        ops->aliases       = aliases_;                                        \
+        ops->kind          = knd;                                             \
+        ops->payload       = pld;                                             \
+        ops->priority      = prio;                                            \
+        ops->caps          = capf;                                            \
     }
 
 /* 每个 codec 的工厂函数（ops 填充 + 真实/stub 函数对） */
-AVCODEC_DECLARE_OPS(CODEC_G722,     avcodec_g722,     16000, 1,  9,  20)
-AVCODEC_DECLARE_OPS(CODEC_G723_1,   avcodec_g7231,    8000,  1, -1,  30)
-AVCODEC_DECLARE_OPS(CODEC_G726_16,  avcodec_g726_16,  8000,  1, -1,  20)
-AVCODEC_DECLARE_OPS(CODEC_G726_24,  avcodec_g726_24,  8000,  1, -1,  20)
-AVCODEC_DECLARE_OPS(CODEC_G726_32,  avcodec_g726_32,  8000,  1, -1,  20)
-AVCODEC_DECLARE_OPS(CODEC_G726_40,  avcodec_g726_40,  8000,  1, -1,  20)
-AVCODEC_DECLARE_OPS(CODEC_OPUS,     avcodec_opus,     48000, 1, -1,  20)
-AVCODEC_DECLARE_OPS(CODEC_H264,     avcodec_h264,     90000, 0, 96,   0)
-AVCODEC_DECLARE_OPS(CODEC_VP8,      avcodec_vp8,      90000, 0, -1,   0)
-AVCODEC_DECLARE_OPS(CODEC_VP9,      avcodec_vp9,      90000, 0, -1,   0)
+AVCODEC_DECLARE_OPS(CODEC_G722,     avcodec_g722,     16000, 1,  9,  20,
+                    "G722", "G.722,G722", CODEC_KIND_AUDIO, RTP_PAYLOAD_SIMPLE,
+                    60, CODEC_CAP_DEC | CODEC_CAP_ENC)
+AVCODEC_DECLARE_OPS(CODEC_G723_1,   avcodec_g7231,    8000,  1, -1,  30,
+                    "G723", "G723.1,G.723.1", CODEC_KIND_AUDIO, RTP_PAYLOAD_SIMPLE,
+                    40, CODEC_CAP_DEC | CODEC_CAP_ENC)
+AVCODEC_DECLARE_OPS(CODEC_G726_16,  avcodec_g726_16,  8000,  1, -1,  20,
+                    "G726-16", "G726_16,G.726-16", CODEC_KIND_AUDIO, RTP_PAYLOAD_SIMPLE,
+                    30, CODEC_CAP_DEC | CODEC_CAP_ENC)
+AVCODEC_DECLARE_OPS(CODEC_G726_24,  avcodec_g726_24,  8000,  1, -1,  20,
+                    "G726-24", "G726_24,G.726-24", CODEC_KIND_AUDIO, RTP_PAYLOAD_SIMPLE,
+                    30, CODEC_CAP_DEC | CODEC_CAP_ENC)
+AVCODEC_DECLARE_OPS(CODEC_G726_32,  avcodec_g726_32,  8000,  1, -1,  20,
+                    "G726-32", "G726_32,G.726-32", CODEC_KIND_AUDIO, RTP_PAYLOAD_SIMPLE,
+                    30, CODEC_CAP_DEC | CODEC_CAP_ENC)
+AVCODEC_DECLARE_OPS(CODEC_G726_40,  avcodec_g726_40,  8000,  1, -1,  20,
+                    "G726-40", "G726_40,G.726-40", CODEC_KIND_AUDIO, RTP_PAYLOAD_SIMPLE,
+                    30, CODEC_CAP_DEC | CODEC_CAP_ENC)
+AVCODEC_DECLARE_OPS(CODEC_OPUS,     avcodec_opus,     48000, 1, -1,  20,
+                    "opus", "OPUS", CODEC_KIND_AUDIO, RTP_PAYLOAD_SIMPLE,
+                    80, CODEC_CAP_DEC | CODEC_CAP_ENC | CODEC_CAP_STATEFUL)
+AVCODEC_DECLARE_OPS(CODEC_H264,     avcodec_h264,     90000, 0, 96,   0,
+                    "H264", "H.264,AVC", CODEC_KIND_VIDEO, RTP_PAYLOAD_H264,
+                    90, CODEC_CAP_DEC | CODEC_CAP_ENC | CODEC_CAP_VIDEO)
+AVCODEC_DECLARE_OPS(CODEC_VP8,      avcodec_vp8,      90000, 0, -1,   0,
+                    "VP8", "VP8", CODEC_KIND_VIDEO, RTP_PAYLOAD_VP8,
+                    70, CODEC_CAP_DEC | CODEC_CAP_ENC | CODEC_CAP_VIDEO)
+AVCODEC_DECLARE_OPS(CODEC_VP9,      avcodec_vp9,      90000, 0, -1,   0,
+                    "VP9", "VP9", CODEC_KIND_VIDEO, RTP_PAYLOAD_VP9,
+                    70, CODEC_CAP_DEC | CODEC_CAP_ENC | CODEC_CAP_VIDEO)
+
+/* 视频回调按 codec 绑定（不能放进宏：宏体内无法展开 #ifdef）。
+ * 无 FFmpeg 构建不绑定，codec_can_decode/encode 对视频返回 0，
+ * 呼叫保持原透传路径。 */
+#ifdef HAVE_FFMPEG
+#define VIDEO_ATTACH(cid, cname)                                             \
+    static int cname##_vid_dec_init(const char *f, codec_sess_t **o)         \
+        { return av_vid_dec_init(cid, f, o); }                               \
+    static int cname##_vid_enc_init(const char *f, codec_sess_t **o)         \
+        { return av_vid_enc_init(cid, f, o); }                               \
+    static int cname##_vid_decode(codec_sess_t *s, const uint8_t *au,        \
+                                  size_t al, video_frame_t *o)               \
+        { return av_vid_decode(s, au, al, o); }                              \
+    static int cname##_vid_encode(codec_sess_t *s, const video_frame_t *in,  \
+                                  uint8_t *o, size_t cap, size_t *ol, int *kf)\
+        { return av_vid_encode(s, in, o, cap, ol, kf); }                     \
+    static void cname##_vid_frame_free(codec_sess_t *s, video_frame_t *f)    \
+        { av_vid_frame_free(s, f); }                                         \
+    static void cname##_attach_vid(codec_ops_t *ops) {                       \
+        ops->vid_dec_init   = cname##_vid_dec_init;                          \
+        ops->vid_enc_init   = cname##_vid_enc_init;                          \
+        ops->vid_decode     = cname##_vid_decode;                            \
+        ops->vid_encode     = cname##_vid_encode;                            \
+        ops->vid_frame_free = cname##_vid_frame_free;                        \
+    }
+VIDEO_ATTACH(CODEC_H264, avcodec_h264)
+VIDEO_ATTACH(CODEC_VP8,  avcodec_vp8)
+VIDEO_ATTACH(CODEC_VP9,  avcodec_vp9)
+#endif /* HAVE_FFMPEG */
 
 /* ============================================================================
  * av_register_all_codecs：把全部 ops 注册进 codec_registry
@@ -537,6 +890,15 @@ int av_register_all_codecs(void)
     REG_CODEC(avcodec_h264_fill_ops);
     REG_CODEC(avcodec_vp8_fill_ops);
     REG_CODEC(avcodec_vp9_fill_ops);
+
+#ifdef HAVE_FFMPEG
+    /* 视频回调在注册后绑定：registry 只保存 ops 指针，直接补字段即可 */
+    if (slot >= 3) {
+        avcodec_h264_attach_vid(&g_ops_slots[slot - 3]);
+        avcodec_vp8_attach_vid(&g_ops_slots[slot - 2]);
+        avcodec_vp9_attach_vid(&g_ops_slots[slot - 1]);
+    }
+#endif
 
 #undef REG_CODEC
 
