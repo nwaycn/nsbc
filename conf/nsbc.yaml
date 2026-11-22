@@ -237,11 +237,13 @@ web:
     acme_cache_dir: "../acme-cache"      # <- account + cert cache (avoids re-request on restart)
     acme_staging: false                   # <- true for testing, false for production
 
-  # ---- External API (REQ-EXT-API-004: loopback 免鉴权) ----
-  # 默认：127.0.0.1 / ::1 本机请求自动跳过 API Key 检查（本机脚本零摩擦）。
-  # 反代部署（nginx/Apache → 127.0.0.1:8443）必须设 true —— 反代过来的远程请求 peer 也是 loopback。
+  # ---- External API (REQ-EXT-API-004: loopback 鉴权) ----
+  # 安全边界：代码默认 true（本机也必须携带 Bearer API Key）。
+  # 反代部署（nginx/Apache → 127.0.0.1:8443）必须改为 true —— 反代过来的远程请求 peer 也是 loopback。
+  # 当前保持 false：单机部署下允许本机脚本（event_client / CLI）免 Key 直连，不增加使用复杂度。
+  # 只要机器对公网开放 8443，或前面挂反向代理，就应改成 true。
   ext:
-    require_loopback_auth: false         # 默认 false（本机免鉴权）；反代必须 true
+    require_loopback_auth: false         # 单机免 Key；反代/公网部署必须改 true
 
 auth:
   # JWT signing secret (>=32 bytes; production MUST replace with a random value!)

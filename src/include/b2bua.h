@@ -160,6 +160,13 @@ typedef struct call_link {
 
 struct b2b_call {
     pthread_mutex_t lock;
+    /* P0-3：引用计数。创建时=1，tbl_find_ref 查找 +1，用完 call_put -1。
+     * call_destroy 只做一次清理（dead 原子置位），对象在最后一个引用
+     * 释放后才归还 slab —— 避免查找方持有裸指针时被并发 destroy 复用。 */
+    uint32_t refcnt;
+    /* P1-13：存活魔数。事务 TIMEOUT/TERMINATED 回调里 txn_ud 可能指向
+     * 已销毁或已复用的呼叫对象，先用魔数确认再解引用。 */
+    uint32_t magic;
     int dead;
     int media_done;
     int active;

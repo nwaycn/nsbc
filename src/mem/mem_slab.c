@@ -1,6 +1,7 @@
 /* mem_slab.c — 类型化 slab 对象池 + per-thread magazine
  *（REQ-ARCH-006，7.1.5） */
 #include "mem.h"
+#include "log.h"
 
 #include <pthread.h>
 
@@ -181,10 +182,22 @@ void mem_obj_release(void *obj)
     if (!obj)
         return;
     mem_obj_hdr_t *h = obj_hdr(obj);
-    if (h->magic != MEM_OBJ_MAGIC || !h->slab)
+    if (h->magic != MEM_OBJ_MAGIC)
         return;
+    /* P2-13：slab 非空即"在用"，归还共享池后置 NULL；二次释放只告警不重复入栈 */
     mem_slab_t *s = h->slab;
+    if (!s) {
+        llog(LOG_WARN, "mem", "double free detected (magic ok, slot=%u)",
+             h->slot);
+        return;
+    }
     pthread_mutex_lock(&s->lock);
+    if (!h->slab) { /* 并发重复释放：抢锁后复查 */
+        pthread_mutex_unlock(&s->lock);
+        llog(LOG_WARN, "mem", "double free detected (slot=%u)", h->slot);
+        return;
+    }
+    h->slab = NULL; /* 标记已归还：后续 mem_obj_release 可识别 */
     if (s->nfree < s->capacity)
         s->stack[s->nfree++] = (int)h->slot;
     pthread_mutex_unlock(&s->lock);
@@ -242,6 +255,23 @@ void *mem_mag_alloc(mem_mag_t *m, mem_slab_t *s)
         return NULL;
 
     mem_cache_t *c = cache_get(m, s, 1);
+    if (!c) {
+        /* P0-5：magazine 缓存类别耗尽（m->nc 上限）→ 降级为直接从共享池取，
+         * 正常路径（c 非空）行为不变。WARN 只打一次，避免刷屏。 */
+        static int warned;
+        if (!__atomic_exchange_n(&warned, 1, __ATOMIC_RELAXED))
+            llog(LOG_WARN, "mem",
+                 "magazine cache full (nc=%d), fallback to shared slab '%s'",
+                 m->nc, s->name);
+        pthread_mutex_lock(&s->lock);
+        void *obj = pop_one(s);
+        pthread_mutex_unlock(&s->lock);
+        if (obj)
+            __atomic_add_fetch(&s->nalloc, 1, __ATOMIC_RELAXED);
+        else
+            __atomic_add_fetch(&s->nfail, 1, __ATOMIC_RELAXED);
+        return obj;
+    }
 
     /* 本地空：一次锁从共享池批量搬运，锁竞争摊薄到 1/batch */
     if (c->n == 0) {
@@ -281,6 +311,7 @@ void mem_mag_free(mem_mag_t *m, void *obj)
         while (c->n > 0) {
             void *p = c->ptrs[--c->n];
             mem_obj_hdr_t *ch = obj_hdr(p);
+            ch->slab = NULL; /* 与 mem_obj_release 一致：标记已归还 */
             if (s->nfree < s->capacity)
                 s->stack[s->nfree++] = (int)ch->slot;
             __atomic_add_fetch(&s->nrelease, 1, __ATOMIC_RELAXED);
@@ -303,6 +334,7 @@ void mem_mag_destroy(mem_mag_t *m)
         while (c->n > 0) {
             void *p = c->ptrs[--c->n];
             mem_obj_hdr_t *ch = obj_hdr(p);
+            ch->slab = NULL;
             if (s->nfree < s->capacity)
                 s->stack[s->nfree++] = (int)ch->slot;
             __atomic_add_fetch(&s->nrelease, 1, __ATOMIC_RELAXED);

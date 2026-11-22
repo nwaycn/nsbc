@@ -258,6 +258,10 @@ struct rtp_relay {
      * 置 1 后 relay_recv_one 把收到的包发回同一侧（side→side），
      * 而非正常的 side→other。两侧各自环回自己的 peer。 */
     int echo_mode;
+    /* P2-18：原函数级 static 的诊断计数 / PLI 限频，改为呼叫私有。
+     * relay 在 relay_recv_one 内单线程访问，无需额外锁。 */
+    int diag_any_seen[4];      /* 2 side × (rtp + rtcp) */
+    uint64_t last_pli_ms[2];
 };
 
 static void relay_rtcp_observe(rtp_relay_t *r, int side, const uint8_t *buf,
@@ -504,13 +508,13 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
     /* DIAG 2026-10-15：无差别方向计数——两侧各前 5 次 RECV 都打
      * SIP 侧（side=0）是明文 RTP srtp_lane=0，之前 DIAG ENTRY 只打 srtp_lane=1
      * 导致 SIP 侧零 RX 时整条 DIAG 静默，根本不知道是不是收不到包 */
-    static int diag_any_seen[4] = {0}; /* 2 side × (rtp + rtcp) */
     int slot = side * 2 + is_rtcp;
-    if (diag_any_seen[slot] < 5) {
+    /* P2-18：per-relay 计数（原函数级 static 全呼叫共享） */
+    if (r->diag_any_seen[slot] < 5) {
         llog(LOG_NOTICE, "relay",
              "RECV side=%d fd=%d is_rtcp=%d srtp_lane=%d rtp_port=%u",
              side, fd, is_rtcp, srtp_lane, (unsigned)r->rtp_port[side]);
-        ++diag_any_seen[slot];
+        ++r->diag_any_seen[slot];
     }
     for (;;) {
         /*  P0-2 RACE-FIX: 每次循环开头检查 dead flag。rtp_relay_stop
@@ -697,10 +701,10 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
                      *   发 PLI 请求新关键帧，Chrome 收到后立即发新 IDR → 参考链重置。
                      *   限频：同 side 间隔 ≥ 2 秒才发（避免淹没 RTCP 通道）。 */
                     if (vid_reasm_consume_pli_request(r->node->vid_reasm[side])) {
-                        static uint64_t last_pli_ms[2] = {0};
+                        /* P2-18：per-relay 限频（原函数级 static 使所有呼叫共用计时） */
                         uint64_t now = nsbc_now_ms();
-                        if (now - last_pli_ms[side] >= 2000) {
-                            last_pli_ms[side] = now;
+                        if (now - r->last_pli_ms[side] >= 2000) {
+                            r->last_pli_ms[side] = now;
                             uint8_t pli_buf[64];
                             size_t pli_len = 0;
                             /*  Sender SSRC 不能填 0 —— Chrome 会忽略 Sender SSRC=0 的 PLI。

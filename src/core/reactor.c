@@ -38,7 +38,9 @@ struct reactor {
     slot_t *slots;     /* fd → 回调（fd 直查，容量=fd 高水位） */
     int slots_cap;
     nsbc_atomic_t stop;
-    pthread_t owner;
+    pthread_t owner;      /* P1-9：当前允许内联执行 reactor_call 的线程 */
+    pthread_t creator;    /* 创建者线程（main），多 Reactor 线程退出后恢复 */
+    int loop_exited;      /* P1-9：loop 线程已退出（受 task_lock 保护） */
     pthread_mutex_t task_lock;
     reactor_call_t *task_head;
     reactor_call_t *task_tail;
@@ -171,7 +173,46 @@ reactor_t *reactor_create(int max_events)
     }
     r->task_queue_initialized = 1;
     r->owner = pthread_self();
+    r->creator = r->owner;
     return r;
+}
+
+/* P1-9 RACE-FIX：多 Reactor 的 owner 归属。
+ *
+ * 原实现：所有 reactor 由 main 线程创建 → owner 恒为 main。reactor[1..N-1]
+ * 的 reactor_call 从 main 线程发出时走 pthread_equal(owner) 快捷路径，
+ * 于是在 main 线程里直接改写目标 Reactor 的 slots/epoll，与目标线程
+ * reactor_wait 并发 → data race。
+ *
+ * 修复：Reactor 线程启动时把 owner 绑定到真实的 loop 线程，跨线程调用
+ * 一律走任务队列；线程退出前恢复为创建者（main），保证停机阶段
+ * modmgr_stop_all 的 reactor_call（rtp_relay_stop）仍可在 main 线程内联清理。 */
+void reactor_bind_owner_current(reactor_t *r)
+{
+    if (r) r->owner = pthread_self();
+}
+
+/* P1-9：loop 线程退出后的最终收尾。
+ * 在 task_lock 保护下置 loop_exited 并恢复 owner=creator：
+ *   - 之后 reactor_call 在锁内看到 loop_exited → 直接调用方内联执行，
+ *     不会把任务投进无人消费的队列后永久阻塞；
+ *   - 之前已入队的任务由 manager 在调用本函数后再 drain 一次处理。 */
+void reactor_mark_loop_exited(reactor_t *r)
+{
+    if (!r) return;
+    pthread_mutex_lock(&r->task_lock);
+    r->loop_exited = 1;
+    r->owner = r->creator;
+    pthread_mutex_unlock(&r->task_lock);
+    /* 兜底：执行置位前已入队的任务，避免其调用方永久 cond_wait。
+     * 必须在本线程直接跑（不能再走 reactor_wait：owner 已改回创建者，
+     * debug 构建的 owner 检查会拒绝，队列就永远没人消费）。 */
+    (void)reactor_run_tasks(r, UINT_MAX);
+}
+
+int reactor_is_current(const reactor_t *r)
+{
+    return r && pthread_equal(pthread_self(), r->owner);
 }
 
 int reactor_destroy(reactor_t *r)
@@ -368,6 +409,13 @@ int reactor_call(reactor_t *r, reactor_task_fn fn, void *arg)
     }
 
     pthread_mutex_lock(&r->task_lock);
+    /* P1-9：loop 线程已退出 → 没有消费者，直接在调用方线程执行（停机清理路径） */
+    if (r->loop_exited) {
+        pthread_mutex_unlock(&r->task_lock);
+        pthread_cond_destroy(&task.done_cond);
+        pthread_mutex_destroy(&task.lock);
+        return fn(arg);
+    }
     if (r->task_closing) {
         ++r->task_rejected;
         pthread_mutex_unlock(&r->task_lock);

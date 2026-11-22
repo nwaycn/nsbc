@@ -27,21 +27,34 @@ struct ptable {
     ip_table_t **ips;
     int nips;
     uint64_t in_use;
+    /* P1-14：保护 ips/nips 的查找与插入，保证并发建桥时只有一个线程创建 ip_table_t。
+     * 只覆盖数组操作；socket/端口栈操作仍由各 ip_table_t.lock 负责。 */
+    pthread_mutex_t ips_lock;
 };
 
 static ip_table_t *ip_get(ptable_t *t, const char *ip, int create)
 {
+    pthread_mutex_lock(&t->ips_lock);
     for (int i = 0; i < t->nips; ++i) {
-        if (t->ips[i]->used && !strcmp(t->ips[i]->ip, ip))
-            return t->ips[i];
+        if (t->ips[i]->used && !strcmp(t->ips[i]->ip, ip)) {
+            ip_table_t *found = t->ips[i];
+            pthread_mutex_unlock(&t->ips_lock);
+            return found;
+        }
     }
-    if (!create)
+    if (!create) {
+        pthread_mutex_unlock(&t->ips_lock);
         return NULL;
-    if (t->nips >= t->cfg.max_local_ips)
+    }
+    if (t->nips >= t->cfg.max_local_ips) {
+        pthread_mutex_unlock(&t->ips_lock);
         return NULL;
+    }
     ip_table_t *it = calloc(1, sizeof(*it));
-    if (!it)
+    if (!it) {
+        pthread_mutex_unlock(&t->ips_lock);
         return NULL;
+    }
     pthread_mutex_init(&it->lock, NULL);
     snprintf(it->ip, sizeof(it->ip), "%s", ip);
     it->slot = calloc(65536, sizeof(void *));
@@ -53,6 +66,7 @@ static ip_table_t *ip_get(ptable_t *t, const char *ip, int create)
         free(it->slot);
         free(it->free_even);
         free(it);
+        pthread_mutex_unlock(&t->ips_lock);
         return NULL;
     }
     /* 高端口优先弹栈：自顶向下压 */
@@ -60,6 +74,7 @@ static ip_table_t *ip_get(ptable_t *t, const char *ip, int create)
         it->free_even[it->nfree++] = (uint16_t)p;
     it->used = 1;
     t->ips[t->nips++] = it;
+    pthread_mutex_unlock(&t->ips_lock);
     return it;
 }
 
@@ -91,6 +106,7 @@ int ptable_create(const ptable_cfg_t *cfg, ptable_t **out)
         free(t);
         return NSBC_NOMEM;
     }
+    pthread_mutex_init(&t->ips_lock, NULL);
     metric_source_register("nsbc_rtp_ports",
                            "RTP ports currently allocated", r_ports, t);
     *out = t;
@@ -107,6 +123,7 @@ void ptable_destroy(ptable_t *t)
         free(t->ips[i]);
     }
     free(t->ips);
+    pthread_mutex_destroy(&t->ips_lock);
     free(t);
 }
 

@@ -1011,12 +1011,16 @@ impl Db {
             tokio::spawn(async move {
                 let Some(pool) = pool_clone.as_ref() else { return; };
                 if expires_sec == 0 {
-                    let _ = sqlx::query(&fix_ph(
+                    let r = sqlx::query(&fix_ph(
                         "DELETE FROM registrations WHERE user_name = $1 AND instance_id = $2",
                         backend_clone.as_deref().unwrap_or("sqlite"),
                     ))
                     .bind(&user_name_fb).bind(&instance_id_fb)
                     .execute(pool.as_ref()).await;
+                    if let Err(e) = r {
+                        warn!(user = %user_name_fb, instance = %instance_id_fb, error = %e,
+                              "registration unregister fallback write FAILED (batch channel full)");
+                    }
                     return;
                 }
                 let now_ms = std::time::SystemTime::now()
@@ -1059,12 +1063,16 @@ impl Db {
                 };
                 let received_port_i64 = received_port.unwrap_or(0);
                 let nat_detected_i64  = nat_detected.unwrap_or(0);
-                let _ = sqlx::query(&fix_ph(sql, backend_clone.as_deref().unwrap_or("sqlite")))
+                let r = sqlx::query(&fix_ph(sql, backend_clone.as_deref().unwrap_or("sqlite")))
                     .bind(&user_name_fb).bind(contact_fb.as_deref()).bind(&instance_id_fb)
                     .bind(agent_fb.as_deref()).bind(&expires_at).bind(&updated_at)
                     .bind(received_ip).bind(received_port_i64).bind(nat_detected_i64)
                     .bind(public_contact).bind(transport)
                     .execute(pool.as_ref()).await;
+                if let Err(e) = r {
+                    warn!(user = %user_name_fb, instance = %instance_id_fb, error = %e,
+                          "registration upsert fallback write FAILED (batch channel full)");
+                }
             });
         };
         let item = DbBatchItem::Register {
@@ -1442,6 +1450,67 @@ pub fn spawn_batch_consumer(
 // 4 类 flush 实现 — 分桶聚合 + 多 VALUES SQL 批量执行
 // ============================================================================
 
+/// Deduplicate by primary key within one multi-VALUES statement (keep the last item).
+/// PostgreSQL rejects `ON CONFLICT DO UPDATE` when the same statement targets the same
+/// row twice ("cannot affect row a second time"), which would drop the whole batch.
+fn dedupe_last_by<'a, F>(bucket: &'a [DbBatchItem], key: F) -> Vec<&'a DbBatchItem>
+where
+    F: Fn(&'a DbBatchItem) -> Option<&'a str>,
+{
+    let mut seen = std::collections::HashSet::new();
+    let mut keep: Vec<&DbBatchItem> = Vec::with_capacity(bucket.len());
+    for item in bucket.iter().rev() {
+        match key(item) {
+            Some(k) => {
+                if seen.insert(k) {
+                    keep.push(item);
+                }
+            }
+            None => keep.push(item),
+        }
+    }
+    keep.reverse();
+    keep
+}
+
+/// 同一批内同一 call_id 的 start/answer/end 合并为一条。
+///
+/// 以最后一条为基（END payload 最全），但把更早条目里的非零
+/// `start_ms` / `answer_ms` / `end_ms` 补进来 —— 避免 END 行本身不带
+/// answer 时间时，首次插入就把 `answer_time` 写成 NULL（跨批 COALESCE 兜不住）。
+fn merge_cdr_entries(bucket: &mut Vec<DbBatchItem>) {
+    use std::collections::HashMap;
+    let mut index: HashMap<String, usize> = HashMap::new();
+    let mut out: Vec<DbBatchItem> = Vec::with_capacity(bucket.len());
+
+    for item in bucket.drain(..) {
+        let call_id = match &item {
+            DbBatchItem::Cdr { call_id, .. } => call_id.clone(),
+            _ => {
+                out.push(item);
+                continue;
+            }
+        };
+        if let Some(&idx) = index.get(&call_id) {
+            let (old_start, old_ans, old_end) = match &out[idx] {
+                DbBatchItem::Cdr { start_ms, answer_ms, end_ms, .. } =>
+                    (*start_ms, *answer_ms, *end_ms),
+                _ => (0, 0, 0),
+            };
+            out[idx] = item;
+            if let DbBatchItem::Cdr { start_ms, answer_ms, end_ms, .. } = &mut out[idx] {
+                if *start_ms == 0  { *start_ms = old_start; }
+                if *answer_ms == 0 { *answer_ms = old_ans; }
+                if *end_ms == 0    { *end_ms = old_end; }
+            }
+        } else {
+            index.insert(call_id, out.len());
+            out.push(item);
+        }
+    }
+    *bucket = out;
+}
+
 async fn flush_sessions(
     pool: &Arc<Pool<Any>>,
     backend: &'static str,
@@ -1451,6 +1520,13 @@ async fn flush_sessions(
     if n == 0 { return; }
     let elapsed = std::time::Instant::now();
 
+    // 同一批内可能多次上报同一 call_id（call_id 是主键）——保留最后一条快照。
+    let items = dedupe_last_by(bucket, |it| match it {
+        DbBatchItem::Session { call_id, .. } => Some(call_id.as_str()),
+        _ => None,
+    });
+    let n_rows = items.len();
+
     // 当前时间戳（所有 batch item 共享同一个 last_seen，简化时间字段）
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1459,7 +1535,7 @@ async fn flush_sessions(
     let last_seen = ms_to_iso(now_ms).unwrap_or_else(|| "1970-01-01T00:00:00.000Z".into());
 
     // 构造多 VALUES SQL — 13 列，N 行
-    let placeholders: Vec<String> = (0..n)
+    let placeholders: Vec<String> = (0..n_rows)
         .map(|i| (1..=13).map(|c| format!("${}", i * 13 + c)).collect::<Vec<_>>().join(","))
         .collect();
     let values_sql = placeholders.join("), (");
@@ -1508,7 +1584,7 @@ async fn flush_sessions(
     // 绑定参数 — 占位符先按后端方言归一化（必须落到具名变量，query 会借用它）
     let sql = fix_ph(&sql, backend);
     let mut q = sqlx::query(&sql);
-    for item in bucket.iter() {
+    for &item in items.iter() {
         if let DbBatchItem::Session {
             call_id, from_num, to_num, dir, state, event, cause,
             from_ip, codec_a, codec_b, a_peer_ip, b_peer_ip,
@@ -1530,8 +1606,10 @@ async fn flush_sessions(
     }
 
     match q.execute(pool.as_ref()).await {
-        Ok(_) => info!(count = n, elapsed_ms = elapsed.elapsed().as_millis(), "batch sessions flush OK"),
-        Err(e) => warn!(count = n, error = %e, "batch sessions flush FAILED — falling back to per-row"),
+        Ok(_) => info!(count = n_rows, received = n,
+                       elapsed_ms = elapsed.elapsed().as_millis(), "batch sessions flush OK"),
+        Err(e) => warn!(backend, count = n_rows, received = n,
+                        error = %e, "batch sessions flush FAILED — batch dropped (see dedupe/log)"),
     }
     bucket.clear();
 }
@@ -1652,18 +1730,21 @@ async fn flush_cdrs(
     if n == 0 { return; }
     let elapsed = std::time::Instant::now();
 
+    // 同一批内可能含同 call_id 的 start/answer/end 三条 —— ON CONFLICT 不能命中同一行两次，
+    // 以 END 为基合并，并保留更早条目的 start/answer/end 时间（见 merge_cdr_entries）。
+    merge_cdr_entries(bucket);
+    let items: Vec<&DbBatchItem> = bucket.iter().collect();
+    let n_rows = items.len();
+
     // 11 列 (同单条 insert_cdr 的简化 schema — start_time/answer_time/end_time/duration_sec/billsec/cause_code/cause_text/metadata)
-    let placeholders: Vec<String> = (0..n)
+    let placeholders: Vec<String> = (0..n_rows)
         .map(|i| (1..=11).map(|c| format!("${}", i * 11 + c)).collect::<Vec<_>>().join(","))
         .collect();
     let values_sql = placeholders.join("), (");
 
-    // 11 列 — INSERT 同 batch 里可能含同 call_id 三条（phase=start/answer/end）：
-    //   phase=start  → 初始落库（answer_time=NULL, end_time=NULL, duration=0）
-    //   phase=answer → UPDATE answer_time + billsec
-    //   phase=end    → UPDATE end_time + duration_sec + billsec + cause_code + metadata（最全）
-    // 用 COALESCE(excluded.col, cdr.col) 保护 answer_time/end_time：START 的 NULL 不覆盖 ANSWER/END 已写值。
-    // 其余列（duration_sec/billsec/cause_code/cause_text/metadata）END payload 最全，直接覆盖。
+    // 去重后每个 call_id 只剩最后一条（phase=end，payload 最全），因此不会再出现
+    // 同一语句命中同一行两次。COALESCE 仍保留：跨 batch 的 START/ANSWER 已落库时，
+    // 后续 END 的 NULL 列不覆盖已有值。
     let sql = match backend {
         "mysql" => format!(
             "INSERT INTO cdr \
@@ -1699,7 +1780,7 @@ async fn flush_cdrs(
 
     let sql = fix_ph(&sql, backend);
     let mut q = sqlx::query(&sql);
-    for item in bucket.iter() {
+    for &item in items.iter() {
         if let DbBatchItem::Cdr {
             call_id, tenant, from_num, to_num, trunk, rec_path, dir, phase, disposition,
             start_ms, answer_ms, end_ms, billsec, duration_s, cause, emergency,
@@ -1744,8 +1825,10 @@ async fn flush_cdrs(
     }
 
     match q.execute(pool.as_ref()).await {
-        Ok(_) => info!(count = n, elapsed_ms = elapsed.elapsed().as_millis(), "batch cdrs flush OK"),
-        Err(e) => warn!(count = n, error = %e, "batch cdrs flush FAILED"),
+        Ok(_) => info!(count = n_rows, received = n, elapsed_ms = elapsed.elapsed().as_millis(),
+                       "batch cdrs flush OK"),
+        Err(e) => warn!(backend, count = n_rows, received = n,
+                        error = %e, "batch cdrs flush FAILED — batch dropped"),
     }
     bucket.clear();
 }
@@ -1781,7 +1864,8 @@ async fn flush_runtimes(
 
     match q.execute(pool.as_ref()).await {
         Ok(_) => info!(count = n, elapsed_ms = elapsed.elapsed().as_millis(), "batch runtimes flush OK"),
-        Err(e) => warn!(count = n, error = %e, "batch runtimes flush FAILED"),
+        Err(e) => warn!(backend, count = n, error = %e,
+                        "batch runtimes flush FAILED — batch dropped"),
     }
     bucket.clear();
 }
@@ -1929,6 +2013,25 @@ pub fn fix_ph(sql: &str, backend: &str) -> String {
 /// MySQL 不支持 `CREATE INDEX IF NOT EXISTS`，改用 information_schema.statistics
 /// （限定当前库，避免同名库/多 schema 误判）。
 async fn ensure_index(pool: &Pool<Any>, backend: &str, name: &str, table: &str, cols: &str) {
+    ensure_index_ex(pool, backend, name, table, cols, false).await;
+}
+
+/// Unique-index variant — needed for idempotency keys such as billing_transactions
+/// (account_id, call_id). Existing duplicate rows make creation fail; caller only warns,
+/// settlement still guards duplicates inside its transaction.
+async fn ensure_unique_index(pool: &Pool<Any>, backend: &str, name: &str, table: &str, cols: &str) {
+    ensure_index_ex(pool, backend, name, table, cols, true).await;
+}
+
+async fn ensure_index_ex(
+    pool: &Pool<Any>,
+    backend: &str,
+    name: &str,
+    table: &str,
+    cols: &str,
+    unique: bool,
+) {
+    let kind = if unique { "UNIQUE INDEX" } else { "INDEX" };
     let sql = if backend == "mysql" {
         let exists: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM information_schema.statistics \
@@ -1942,12 +2045,12 @@ async fn ensure_index(pool: &Pool<Any>, backend: &str, name: &str, table: &str, 
         if exists > 0 {
             return;
         }
-        format!("CREATE INDEX {} ON {}({})", name, table, cols)
+        format!("CREATE {} {} ON {}({})", kind, name, table, cols)
     } else {
-        format!("CREATE INDEX IF NOT EXISTS {} ON {}({})", name, table, cols)
+        format!("CREATE {} IF NOT EXISTS {} ON {}({})", kind, name, table, cols)
     };
     if let Err(e) = sqlx::query(&sql).execute(pool).await {
-        warn!("ensure_index {} on {} failed: {}", name, table, e);
+        warn!("create {} {} on {} failed: {}", kind, name, table, e);
     }
 }
 
@@ -2118,11 +2221,13 @@ async fn connect_and_migrate(dsn: &str) -> Result<Pool<Any>, sqlx::Error> {
     use sqlx::pool::PoolOptions;
     let mut builder = PoolOptions::<Any>::new();
 
-    // SQLite: in-memory databases are per-connection independent → lock pool size to 1;
-    // also journal_mode=MEMORY + synchronous=OFF to bypass sandbox file restrictions.
-    // File databases also benefit (journal does not hit disk).
+    // SQLite: in-memory databases are per-connection independent → must stay at 1;
+    // file databases use a small pool (4) so API reads and batch flush stop queueing
+    // behind a single connection. WAL + busy_timeout below make concurrent access safe.
+    // acquire_timeout is intentionally left at the sqlx default (not lowered).
     if backend == "sqlite" {
-        builder = builder.max_connections(1)
+        let max_conns = if dsn.contains(":memory:") { 1 } else { 4 };
+        builder = builder.max_connections(max_conns)
             // after_connect: 每个新连接建立时强制设 connection-level PRAGMA。
             // sqlx 的 execute(pool) 每次 acquire 的 Acquire Guard 释放后被回收，
             // 下一次 acquire 可能返回"不同"的 Acquire Guard（虽然底层只有一个连接）。
@@ -2138,9 +2243,13 @@ async fn connect_and_migrate(dsn: &str) -> Result<Pool<Any>, sqlx::Error> {
                 // 用 as_mut() 不需要 — 直接 conn.execute() 就够了。
                 // &mut AnyConnection → reborrow 每次 execute() 不 move
                 let c: &mut sqlx::AnyConnection = &mut *conn;
-                let _ = sqlx::query("PRAGMA journal_mode=WAL").execute(&mut *c).await;
+                if let Err(e) = sqlx::query("PRAGMA journal_mode=WAL").execute(&mut *c).await {
+                    warn!(error = %e, "sqlite PRAGMA journal_mode=WAL failed");
+                }
                 let _ = sqlx::query("PRAGMA synchronous=NORMAL").execute(&mut *c).await;
-                let _ = sqlx::query("PRAGMA busy_timeout=5000").execute(&mut *c).await;
+                if let Err(e) = sqlx::query("PRAGMA busy_timeout=5000").execute(&mut *c).await {
+                    warn!(error = %e, "sqlite PRAGMA busy_timeout failed");
+                }
                 let _ = sqlx::query("PRAGMA wal_autocheckpoint=1000").execute(&mut *c).await;
                 let _ = sqlx::query("PRAGMA auto_vacuum=INCREMENTAL").execute(&mut *c).await;
                 let _ = sqlx::query("PRAGMA foreign_keys=ON").execute(&mut *c).await;
@@ -3778,6 +3887,9 @@ sqlx::query(acct_ddl).execute(pool).await?;
     ensure_index(pool, backend, "idx_bt_account", "billing_transactions", "account_id").await;
     ensure_index(pool, backend, "idx_bt_call", "billing_transactions", "call_id").await;
     ensure_index(pool, backend, "idx_bt_created", "billing_transactions", "created_at").await;
+    // Idempotency key for call settlement: one ledger row per (account, call).
+    // NULL call_id (topup/refund) stays unaffected on all three backends.
+    ensure_unique_index(pool, backend, "uq_bt_account_call", "billing_transactions", "account_id, call_id").await;
 
     // --- accounts upgrade: add billing columns (idempotent, cross-backend) ---
     {
@@ -5210,14 +5322,6 @@ pub async fn query_cdrs(
         where_clauses.push("start_time <= ?".to_string());
         binds.push(t.clone());
     }
-    if let Some(min) = q.duration_min {
-        where_clauses.push("duration_sec >= ?".to_string());
-        binds.push(min.to_string());
-    }
-    if let Some(max) = q.duration_max {
-        where_clauses.push("duration_sec <= ?".to_string());
-        binds.push(max.to_string());
-    }
     /* REQ-SEC-005: disposition filter — cause_text 列就是 "answered"/"failed"/"busy" */
     if let Some(d) = &q.disposition {
         where_clauses.push("cause_text = ?".to_string());
@@ -5278,6 +5382,15 @@ pub async fn query_cdrs(
         binds.push(ip.clone());
     }
 
+    // 数值过滤放在最后，绑定为 i64（String 绑定 INTEGER 列在 PostgreSQL 上直接 500）。
+    // 具体值在 count/rows 查询处按同一顺序绑定，这里只负责拼 WHERE。
+    if q.duration_min.is_some() {
+        where_clauses.push("duration_sec >= ?".to_string());
+    }
+    if q.duration_max.is_some() {
+        where_clauses.push("duration_sec <= ?".to_string());
+    }
+
     let where_sql = if where_clauses.is_empty() {
         String::new()
     } else {
@@ -5290,6 +5403,8 @@ pub async fn query_cdrs(
     let count_sql = fix_ph(&format!("SELECT COUNT(*) FROM cdr {where_sql}"), backend);
     let mut count_q = sqlx::query_scalar::<_, i64>(&count_sql);
     for b in &binds_strs { count_q = count_q.bind(b); }
+    if let Some(min) = q.duration_min { count_q = count_q.bind(min); }
+    if let Some(max) = q.duration_max { count_q = count_q.bind(max); }
     let total: i64 = count_q.fetch_one(pool).await?;
 
     /* ---- 动态 ORDER BY（sort_by + sort_dir）----
@@ -5318,6 +5433,8 @@ pub async fn query_cdrs(
     let rows_raw: Vec<CdrRowRaw> = {
         let mut rows_q = sqlx::query_as::<_, CdrRowRaw>(&rows_sql);
         for b in &binds_strs { rows_q = rows_q.bind(b); }
+        if let Some(min) = q.duration_min { rows_q = rows_q.bind(min); }
+        if let Some(max) = q.duration_max { rows_q = rows_q.bind(max); }
         rows_q = rows_q.bind(q.limit as i64).bind(q.offset as i64);
         rows_q.fetch_all(pool).await?
     };
@@ -9419,33 +9536,80 @@ pub async fn account_topup(&self, account_id: i64, delta_uc: i64, operator: Opti
     Ok(account)
 }
 
-/// Settle call billing: deduct from balance, write ledger entry.
+/// Settle call billing: deduct from balance, write ledger entry — atomically and idempotently.
 pub async fn settle_billing(&self, account_id: i64, call_id: &str, charge_uc: i64, remark: Option<&str>) -> Result<(), sqlx::Error> {
     let pool = self.pool().ok_or(sqlx::Error::Configuration("NSBC_DB_DSN not set".into()))?;
     let backend = self.backend();
     let ts = match backend { "postgres" => "CAST(NOW() AS TEXT)", "mysql" => "CAST(CURRENT_TIMESTAMP(3) AS CHAR)", _ => "datetime('now')" };
+    let mut tx = pool.begin().await?;
 
-    // Fetch current balance
-    let acct = self.get_account(account_id).await?.ok_or(sqlx::Error::RowNotFound)?;
-    let new_balance = acct.balance_uc - charge_uc;
-
-    // Update account (deduct charge)
-    let _is_mysql = backend == "mysql";  /* 预留（PostgreSQL 用 $1/$2，MySQL 用 ?） */
-    let update_sql_raw = format!(
-        "UPDATE accounts SET balance_uc = balance_uc - $1, updated_at = {ts} WHERE id = $2"
+    // 1) Lock the account row so concurrent settlements serialize.
+    //    SQLite has no SELECT ... FOR UPDATE — it serializes writers itself (busy_timeout).
+    let lock = if backend == "sqlite" { "" } else { " FOR UPDATE" };
+    let sel_sql = fix_ph(
+        &format!("SELECT balance_uc FROM accounts WHERE id = $1{lock}"),
+        backend,
     );
-    let update_sql = fix_ph(&update_sql_raw, backend);
-    sqlx::query(&update_sql).bind(charge_uc).bind(account_id).execute(pool).await?;
+    let balance: i64 = sqlx::query_scalar::<_, i64>(&sel_sql)
+        .bind(account_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(sqlx::Error::RowNotFound)?;
 
-    // Insert ledger entry (negative amount = charge)
-    let tx_sql = fix_ph(
-        "INSERT INTO billing_transactions (account_id, call_id, tx_type, amount_uc, balance_after_uc, operator, remark) VALUES ($1, $2, 'call_charge', $3, $4, NULL, $5)",
-        backend
+    // 2) Idempotency: the same call must never be charged twice.
+    let dup_sql = fix_ph(
+        "SELECT COUNT(*) FROM billing_transactions WHERE account_id = $1 AND call_id = $2",
+        backend,
     );
-    sqlx::query(&tx_sql)
+    let existing: i64 = sqlx::query_scalar::<_, i64>(&dup_sql)
+        .bind(account_id)
+        .bind(call_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    if existing > 0 {
+        tx.rollback().await?;
+        return Ok(());
+    }
+
+    let new_balance = balance - charge_uc;
+
+    // 3) Deduct (relative update — never clobber concurrent balance changes)
+    let update_sql = fix_ph(
+        &format!("UPDATE accounts SET balance_uc = balance_uc - $1, updated_at = {ts} WHERE id = $2"),
+        backend,
+    );
+    let res = sqlx::query(&update_sql)
+        .bind(charge_uc)
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await?;
+    if res.rows_affected() == 0 {
+        return Err(sqlx::Error::RowNotFound);
+    }
+
+    // 4) Insert ledger entry (negative amount = charge). ON CONFLICT DO NOTHING (target-less,
+    //    so a missing unique index cannot turn this into a SQL error) + rows_affected check
+    //    covers a concurrent writer that slipped past the check above; rollback undoes the
+    //    deduction so no double charge can persist.
+    let tx_sql = match backend {
+        "mysql" => fix_ph(
+            "INSERT IGNORE INTO billing_transactions (account_id, call_id, tx_type, amount_uc, balance_after_uc, operator, remark) VALUES ($1, $2, 'call_charge', $3, $4, NULL, $5)",
+            backend,
+        ),
+        _ => fix_ph(
+            "INSERT INTO billing_transactions (account_id, call_id, tx_type, amount_uc, balance_after_uc, operator, remark) VALUES ($1, $2, 'call_charge', $3, $4, NULL, $5) ON CONFLICT DO NOTHING",
+            backend,
+        ),
+    };
+    let ins = sqlx::query(&tx_sql)
         .bind(account_id).bind(call_id).bind(-charge_uc).bind(new_balance).bind(remark)
-        .execute(pool).await?;
+        .execute(&mut *tx).await?;
+    if ins.rows_affected() == 0 {
+        tx.rollback().await?;
+        return Ok(());
+    }
 
+    tx.commit().await?;
     Ok(())
 }
 
@@ -9467,10 +9631,6 @@ pub async fn list_security_blacklist(
         where_parts.push(format!("rule_type = ${}", binds.len() + 1));
         binds.push(t.to_string());
     }
-    if let Some(e) = enabled {
-        where_parts.push(format!("enabled = ${}", binds.len() + 1));
-        binds.push((if e { "1" } else { "0" }).to_string());
-    }
     if let Some(kw) = keyword {
         let kw = kw.trim();
         if !kw.is_empty() {
@@ -9479,16 +9639,24 @@ pub async fn list_security_blacklist(
             binds.push(format!("%{}%", kw));
         }
     }
+    // enabled 是 INTEGER 列：必须以 i64 绑定，不能走 String（PostgreSQL 报 text vs integer）。
+    // 追加在字符串条件之后，保证占位符顺序与绑定顺序一致。
+    if enabled.is_some() {
+        where_parts.push(format!("enabled = ${}", binds.len() + 1));
+    }
+    let int_binds = usize::from(enabled.is_some());
     let where_sql = if where_parts.is_empty() { String::new() } else { format!("WHERE {}", where_parts.join(" AND ")) };
     let count_sql = fix_ph(&format!("SELECT COUNT(*) FROM security_blacklist {}", where_sql), backend);
     let rows_sql = fix_ph(&format!(
         "SELECT * FROM security_blacklist {} ORDER BY kind, rule_type, id LIMIT ${} OFFSET ${}",
-        where_sql, binds.len() + 1, binds.len() + 2), backend);
+        where_sql, binds.len() + int_binds + 1, binds.len() + int_binds + 2), backend);
     let mut cq = sqlx::query_scalar::<_, i64>(&count_sql);
     for b in &binds { cq = cq.bind(b.as_str()); }
+    if let Some(e) = enabled { cq = cq.bind(if e { 1i64 } else { 0i64 }); }
     let total = cq.fetch_one(pool).await.unwrap_or(0);
     let mut q = sqlx::query_as::<_, SecurityBlacklist>(&rows_sql);
     for b in &binds { q = q.bind(b.as_str()); }
+    if let Some(e) = enabled { q = q.bind(if e { 1i64 } else { 0i64 }); }
     q = q.bind(limit).bind(offset);
     let rows = q.fetch_all(pool).await?;
     Ok((rows, total))

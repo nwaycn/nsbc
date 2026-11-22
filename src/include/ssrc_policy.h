@@ -15,6 +15,7 @@
  *  - 白名单外第三个及以上新 SSRC：丢弃 + 注入计数（不学习）。
  */
 #include "nsbc_common.h"
+#include <pthread.h>   /* P2-17：策略锁 pthread_mutex_t */
 
 #ifdef __cplusplus
 extern "C" {

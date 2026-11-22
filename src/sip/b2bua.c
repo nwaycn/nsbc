@@ -142,6 +142,25 @@ static pthread_mutex_t g_mv_hook_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* b2b_leg_t / call_link_t / struct b2b_call 已在 b2bua.h 完整定义 */
 
+/* P1-15：安全累加 snprintf 结果。追加前检查剩余空间，累加后封顶 cap-1，
+ * 避免 snprintf 返回值累加后 sizeof(buf)-io 下溢导致越界写。
+ * 未溢出时输出字节与直接 snprintf 完全一致。 */
+static size_t b2b_hdr_append(char *buf, size_t cap, size_t io,
+                             const char *fmt, ...)
+{
+    if (!cap)
+        return 0;
+    if (io >= cap)
+        return cap - 1;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + io, cap - io, fmt, ap);
+    va_end(ap);
+    if (n > 0)
+        io += (size_t)n;
+    return io < cap ? io : cap - 1;
+}
+
 static void disarm_noanswer_timer(b2b_call_t *c); /* 前置声明 */
 static void arm_call_limit_timer(b2b_call_t *c);
 static void disarm_call_limit_timer(b2b_call_t *c);
@@ -526,6 +545,69 @@ static b2b_call_t *tbl_find(b2b_core_t *co, const char *callid, size_t len,
     return found;
 }
 
+/* P0-3：呼叫对象引用计数。
+ * 原 tbl_find 返回裸指针，出 shard 锁后对象可能被 call_destroy 归还 slab
+ * 并被新呼叫复用 → 后续读写即 UAF / 跨呼叫串话。
+ * tbl_find_ref 在 shard 锁内 +1，调用方用完必须 call_put。 */
+/* P1-13：呼叫对象存活魔数（定义 + 事务回收清理 helper） */
+#define B2B_CALL_MAGIC 0xB2B0C411u
+
+/* 事务已进入静默回收（Timer D/I/J/K 到期）→ 清空 leg 中指向它的裸指针。
+ * 在事务对象仍存活时调用（cb_dead 内 t_remove_hash 之前），因此可以安全读 t。 */
+static void b2b_forget_txn(sip_txn_t *t)
+{
+    b2b_call_t *c = (b2b_call_t *)txn_ud(t);
+    if (!c || c->magic != B2B_CALL_MAGIC)
+        return;   /* ud 不是呼叫（例如 server_ud=core）或呼叫已销毁 */
+    call_lock(c);
+    for (int i = 0; i < 2; ++i) {
+        if (c->leg[i].inv_txn == t)    c->leg[i].inv_txn = NULL;
+        if (c->leg[i].srv_txn == t)    c->leg[i].srv_txn = NULL;
+        if (c->leg[i].out_txn == t)    c->leg[i].out_txn = NULL;
+        if (c->leg[i].cancel_txn == t) c->leg[i].cancel_txn = NULL;
+    }
+    if (c->refer_txn == t)
+        c->refer_txn = NULL;
+    call_unlock(c);
+}
+
+/* P0-3：呼叫对象引用计数。
+ * 原 tbl_find 返回裸指针，出 shard 锁后对象可能被 call_destroy 归还 slab
+ * 并被新呼叫复用 → 后续读写即 UAF / 跨呼叫串话。
+ * tbl_find_ref 在 shard 锁内 +1，调用方用完必须 call_put。 */
+static inline void call_ref(b2b_call_t *c)
+{
+    if (c) __atomic_add_fetch(&c->refcnt, 1, __ATOMIC_RELAXED);
+}
+
+static void call_put(b2b_call_t *c)
+{
+    if (c && __atomic_sub_fetch(&c->refcnt, 1, __ATOMIC_ACQ_REL) == 0)
+        mem_obj_release(c);
+}
+
+static b2b_call_t *tbl_find_ref(b2b_core_t *co, const char *callid, size_t len,
+                                int *leg_out)
+{
+    if (len >= DLG_CALLID_MAX)
+        len = DLG_CALLID_MAX - 1;
+    call_shard_t *s = &co->sh[shard_of(callid, len)];
+    b2b_call_t *found = NULL;
+    pthread_mutex_lock(&s->lock);
+    for (call_link_t *p = s->head; p; p = p->next) {
+        b2b_leg_t *l = &p->call->leg[p->leg];
+        if (strlen(l->callid) == len && !memcmp(l->callid, callid, len)) {
+            found = p->call;
+            call_ref(found);   /* 锁内取引用：出锁后对象保证不被释放 */
+            if (leg_out)
+                *leg_out = p->leg;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&s->lock);
+    return found;
+}
+
 static void call_ctor(void *obj, void *ud)
 {
     (void)ud;
@@ -703,6 +785,8 @@ static int b2b_repl_rebuild_from_buf(b2b_core_t *co)
         }
         memset(c, 0, sizeof(*c));
         pthread_mutex_init(&c->lock, NULL);
+        c->refcnt = 1;   /* P0-3：创建引用 */
+        c->magic = B2B_CALL_MAGIC;
 
         /* leg[0] 主叫侧 */
         snprintf(c->leg[0].callid, sizeof(c->leg[0].callid), "%s", dlg->callid_a);
@@ -1025,9 +1109,12 @@ static void detach_txn(sip_txn_t *t)
 static void call_destroy(b2b_call_t *c)
 {
     b2b_core_t *co = c->core;
-    if (c->dead)
+    /* P0-4：dead 的检查与置位必须在同一次原子操作内完成。
+     * ticker（Timer H）与 reactor 线程可能同时进入；旧写法 if(!dead){dead=1}
+     * 两者都能通过 → 双 unlink / 双 on_end / CDR 重复 / double free。
+     * 现在只有 exchange 成功者执行一次清理。 */
+    if (__atomic_exchange_n(&c->dead, 1, __ATOMIC_ACQ_REL))
         return;
-    c->dead = 1;
 
     /* === HA P1: ACTIVE → REPL_DIALOG publish（对话终结锚点） ===
      * STANDBY 收到后可重建对话终止状态（failover 时不会重复接收 BYE）
@@ -1226,7 +1313,11 @@ static void call_destroy(b2b_call_t *c)
      * 内存就被 slab 回收复用了。 */
     c->prof = NULL;
     c->out_prof = NULL;
-    mem_obj_release(c);
+    /* P1-13：清除存活魔数——后续事务回收回调即使拿到此指针也不会再解引用。 */
+    c->magic = 0;
+    /* P0-3/P0-4：释放“创建引用”。若仍有 tbl_find_ref 持有者，对象延后到
+     * 最后一个 call_put 才归还 slab（此时 teardown 已完成，dead=1）。 */
+    call_put(c);
 }
 
 /* 由服务端事务缓存的原始请求构造应答并经事务发出
@@ -1990,11 +2081,11 @@ static sip_txn_t *send_invite_b(b2b_call_t *c, int leg_idx,
                 const char *auth_user = tr->auth_user[0] ? tr->auth_user
                                         : (c->effective_caller_id_num[0] ? c->effective_caller_id_num : "");
                 /* P-Asserted-Identity（必需，运营商计费/路由用） */
-                io += (size_t)snprintf(_ims_work + io, sizeof(_ims_work) - io,
+                io = b2b_hdr_append(_ims_work, sizeof(_ims_work), io,
                     "P-Asserted-Identity: <sip:%s@%s>\r\n",
                     auth_user, tr->ims_domain);
                 /* P-Preferred-Identity（同 PAI，展示主叫） */
-                io += (size_t)snprintf(_ims_work + io, sizeof(_ims_work) - io,
+                io = b2b_hdr_append(_ims_work, sizeof(_ims_work), io,
                     "P-Preferred-Identity: <sip:%s@%s>\r\n",
                     auth_user, tr->ims_domain);
                 /* P-Called-Party-ID（被叫 E.164，IMS 必需；用拨号规则改写后的 dst_number，
@@ -2010,29 +2101,29 @@ static sip_txn_t *send_invite_b(b2b_call_t *c, int leg_idx,
                                   memcpy(_b_to_user, s, ul); _b_to_user[ul] = '\0'; }
                         pcpi = _b_to_user;
                     }
-                    io += (size_t)snprintf(_ims_work + io, sizeof(_ims_work) - io,
+                    io = b2b_hdr_append(_ims_work, sizeof(_ims_work), io,
                         "P-Called-Party-ID: <sip:%s@%s>\r\n", pcpi, tr->ims_domain);
                 }
                 /* P-Access-Network-Info（可选，默认 E-UTRAN-TDD，用户可配 ims_pani_value 覆盖） */
                 if (tr->ims_auto_pani) {
                     const char *pani = tr->ims_pani_value[0] ? tr->ims_pani_value : "E-UTRAN-TDD";
-                    io += (size_t)snprintf(_ims_work + io, sizeof(_ims_work) - io,
+                    io = b2b_hdr_append(_ims_work, sizeof(_ims_work), io,
                         "P-Access-Network-Info: %s\r\n", pani);
                 }
                 /* Privacy: id（可选，CLIR 自动加） */
                 if (tr->ims_auto_privacy) {
-                    io += (size_t)snprintf(_ims_work + io, sizeof(_ims_work) - io,
+                    io = b2b_hdr_append(_ims_work, sizeof(_ims_work), io,
                         "Privacy: id\r\n");
                 }
                 /* P-Charging-Function-Addresses + P-Charging-Vector（RFC 7315，可选）
                  * 运营商在线计费系统必需——CCF/ECF 地址 + 计费向量标识本次会话。 */
                 if (tr->ims_auto_charging) {
                     if (tr->ims_pcfa[0]) {
-                        io += (size_t)snprintf(_ims_work + io, sizeof(_ims_work) - io,
+                        io = b2b_hdr_append(_ims_work, sizeof(_ims_work), io,
                             "P-Charging-Function-Addresses: %s\r\n", tr->ims_pcfa);
                     }
                     if (tr->ims_pcv[0]) {
-                        io += (size_t)snprintf(_ims_work + io, sizeof(_ims_work) - io,
+                        io = b2b_hdr_append(_ims_work, sizeof(_ims_work), io,
                             "P-Charging-Vector: %s\r\n", tr->ims_pcv);
                     }
                 }
@@ -2681,13 +2772,13 @@ static void b2b_append_history_info(b2b_call_t *c, const char *target_uri,
     }
 }
 
-static void arm_noanswer_timer(b2b_call_t *c)
+static int arm_noanswer_timer(b2b_call_t *c)
 {
     b2b_core_t *co = c->core;
     if (!co->cfg.tw)
-        return;
+        return NSBC_OK;
     if (c->dead || c->a_final)
-        return;
+        return NSBC_OK;
     /* REQ-ORIGINATE-001 + REQ-DP-TIMEOUT-001：五层决策链
      * 优先级从高到低：
      *   1) noanswer_ms_override (>0)              — FS originate_timeout brace var（既有，最高优先）
@@ -2705,11 +2796,21 @@ static void arm_noanswer_timer(b2b_call_t *c)
         ms = co->cfg.ring_noanswer_ms;
     }
     if (ms == 0)
-        return;
+        return NSBC_OK;
     tw_del(co->cfg.tw, &c->noanswer_node); /* 续约先摘再挂（幂等） */
-    tw_add(co->cfg.tw, &c->noanswer_node,
-           now_ms() + ms,
-           noanswer_cb, c);
+    /* P2-19：tw_add 失败（时间/跨度非法或节点仍挂轮）时不能再静默忽略，
+     * 否则呼叫无 ring 超时保护会永久挂起。WARN 后由调用方走既有
+     * 终止/清理路径（已持 call_lock 的调用方解锁后 b2b_terminate；
+     * 其余沿用呼叫建立失败的 call_destroy）。 */
+    if (tw_add(co->cfg.tw, &c->noanswer_node,
+               now_ms() + ms,
+               noanswer_cb, c) != NSBC_OK) {
+        llog(LOG_WARN, "b2b",
+             "noanswer timer arm FAILED callid=%s ms=%u — caller aborts",
+             c->leg[0].callid, ms);
+        return NSBC_ERR;
+    }
+    return NSBC_OK;
 }
 
 static void disarm_noanswer_timer(b2b_call_t *c)
@@ -3022,6 +3123,14 @@ static int uac_invite_follow_redirect(b2b_call_t *c, int lg,
 static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                    void *ud)
 {
+    /* P1-13：事务静默回收前清理 leg 里的裸指针（对象此时仍存活）。
+     * ud 可能已被 detach_txn 置 NULL，或用魔数确认呼叫未被回收。 */
+    if (ev == TXN_EV_TERMINATED) {
+        b2b_call_t *cc = ud;
+        if (cc && cc->magic == B2B_CALL_MAGIC)
+            b2b_forget_txn(t);
+        return;
+    }
     b2b_call_t *c = ud;
     if (!c)
         return;
@@ -3210,14 +3319,22 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                              c->leg[0].callid);
                         /* 透传路径里的无应答超时器 arm 被吞掉会丢——这里补挂
                          * （幂等），B 一直不接时放音仍会被 ring_noanswer 切断 */
-                        arm_noanswer_timer(c);
+                        if (arm_noanswer_timer(c) != NSBC_OK) {
+                            call_unlock(c);
+                            b2b_terminate(c, 480);
+                            return;
+                        }
                     } else if (!skip_dup) {
                         respond_a(c, m->status,
                                   m->body.p ? m->body.p : NULL,
                                   m->body.len);
                         c->leg[1].last_prov_status = m->status;
                         /* P0 PBX：Ring NoAnswer 超时器 arm（首次 180/183 才 arm） */
-                        arm_noanswer_timer(c);
+                        if (arm_noanswer_timer(c) != NSBC_OK) {
+                            call_unlock(c);
+                            b2b_terminate(c, 480);
+                            return;
+                        }
                     } else {
                         llog(LOG_DEBUG, "b2b", "skip dup provisional %d callid=%s",
                              m->status, c->leg[0].callid);
@@ -3309,6 +3426,13 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                         int n = hsnap[i].fn(c, in, inlen, tbuf,
                                             sizeof(tbuf), hsnap[i].ud);
                         if (n >= 0) {
+                            /* P1-16：hook 返回长度未校验，截断到缓冲上限-1 */
+                            if ((size_t)n >= sizeof(buf)) {
+                                llog(LOG_DEBUG, "b2b",
+                                     "answer sdp_hook[%d] n=%d >= cap=%zu, truncated",
+                                     i, n, sizeof(buf));
+                                n = (int)sizeof(buf) - 1;
+                            }
                             memcpy(buf, tbuf, (size_t)n);
                             buf[n] = '\0';
                         }
@@ -5100,6 +5224,13 @@ static void b2b_start_b_leg(b2b_call_t *c, sip_txn_t *t, nsbc_sa_t bd,
             size_t inlen = rewritten[0] ? strlen(rewritten) : a->offer_len;
             int n = hsnap[i].fn(c, in, inlen, buf, sizeof(buf), hsnap[i].ud);
             if (n >= 0) {
+                /* P1-16：hook 返回长度未校验，截断到缓冲上限-1 */
+                if ((size_t)n >= sizeof(rewritten)) {
+                    llog(LOG_DEBUG, "b2b",
+                         "offer sdp_hook[%d] n=%d >= cap=%zu, truncated",
+                         i, n, sizeof(rewritten));
+                    n = (int)sizeof(rewritten) - 1;
+                }
                 memcpy(rewritten, buf, (size_t)n);
                 rewritten[n] = '\0';
             }
@@ -5367,6 +5498,8 @@ void handle_new_invite(b2b_core_t *co, sip_txn_t *t,
         return;
     }
     memset(c, 0, sizeof(*c));
+    c->refcnt = 1;   /* P0-3：创建引用 */
+    c->magic = B2B_CALL_MAGIC;
     c->core = co;
     /* Emergency URN 标记进 call 对象：b2b_emit_cdr 写进 CDR emergency 位 */
     c->emergency = (uint8_t)is_emergency;
@@ -5536,7 +5669,7 @@ void handle_new_invite(b2b_core_t *co, sip_txn_t *t,
     if (!cid || !from || !to) {
         llog(LOG_WARN, "b2b", "INVITE rejected 400: missing Call-ID/From/To hdr");
         respond_txn(co, t, 400, NULL, NULL, NULL, 0);
-        mem_obj_release(c);
+        call_put(c);   /* P0-3：释放创建引用 */
         return;
     }
     copy_tok(a->callid, sizeof(a->callid), cid->value);
@@ -5575,7 +5708,7 @@ void handle_new_invite(b2b_core_t *co, sip_txn_t *t,
                  (int)(cid->value.len < 127 ? cid->value.len : 127),
                  cid->value.p);
             respond_txn(co, t, 488, NULL, NULL, NULL, 0);
-            mem_obj_release(c);
+            call_put(c);   /* P0-3：释放创建引用 */
             return;
         }
         memcpy(a->offer, m->body.p, m->body.len);
@@ -5619,7 +5752,7 @@ void handle_new_invite(b2b_core_t *co, sip_txn_t *t,
                 if (nin.interval_s < co->cfg.sess_timer_cfg.min_se_s) {
                     char msehdr[64]; snprintf(msehdr, sizeof(msehdr), "Min-SE: %d\r\n", co->cfg.sess_timer_cfg.min_se_s);
                     respond_txn(co, t, 422, NULL, msehdr, NULL, 0);
-                    mem_obj_release(c);
+                    call_put(c);   /* P0-3：释放创建引用 */
                     return;
                 }
                 sess_timer_uas_negotiate(&co->cfg.sess_timer_cfg, &nin, &nout);
@@ -6048,6 +6181,15 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
 {
     b2b_core_t *co = ud;
 
+    /* P1-13：Timer D/I/J/K 回收前清理 leg 裸指针。ud 通常是 core，
+     * b2b_forget_txn 内用魔数判断 txn_ud(t) 是否真的是呼叫对象。 */
+    if (ev == TXN_EV_TERMINATED) {
+        /* ud==co 表示该 server txn 从未绑定到具体呼叫（REGISTER/OPTIONS 等） */
+        if (txn_ud(t) != co)
+            b2b_forget_txn(t);
+        return;
+    }
+
     if (ev == TXN_EV_TIMEOUT) {
         /* Timer H：2xx 发出后始终收不到 ACK（RFC3261 §13.3.1 应 BYE） */
         b2b_call_t *c = txn_ud(t);
@@ -6409,9 +6551,19 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
     if (m->method == SIP_M_INVITE && sip_msg_in_dialog(m)) {
         int leg = -1;
         sip_hdr_t *cid = sip_hdr_get(m, SIP_H_CALL_ID);
-        b2b_call_t *c = cid ? tbl_find(co, cid->value.p, cid->value.len, NULL) : NULL;
+        /* P0-3：查找方持引用 + 全程 call_lock，与 BYE/call_destroy 串行 */
+        b2b_call_t *c = cid ? tbl_find_ref(co, cid->value.p, cid->value.len, NULL)
+                            : NULL;
         if (c) leg = find_leg_by_dialog(c, m);
         if (!c || leg < 0) {
+            if (c) call_put(c);
+            respond_txn(co, t, 481, NULL, NULL, NULL, 0);
+            return;
+        }
+        call_lock(c);
+        if (c->dead) {
+            call_unlock(c);
+            call_put(c);
             respond_txn(co, t, 481, NULL, NULL, NULL, 0);
             return;
         }
@@ -6421,10 +6573,14 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
 
         /* re-INVITE 需要 dialog 至少有一条腿 CONFIRMED/EARLY（初始 INVITE 完成了） */
         if (o->state != LEG_CONFIRMED && o->state != LEG_EARLY) {
+            call_unlock(c);
+            call_put(c);
             respond_txn(co, t, 491, NULL, NULL, NULL, 0);
             return;
         }
         if (!sip_upd_begin(&l->guard)) {
+            call_unlock(c);
+            call_put(c);
             respond_txn(co, t, 491, NULL, NULL, NULL, 0);
             return;
         }
@@ -6461,6 +6617,8 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
         /* 转发 re-INVITE 到对端 leg（UPDATE 同模式） */
         if (!sip_upd_begin(&o->guard)) {
             sip_upd_end(&l->guard);
+            call_unlock(c);
+            call_put(c);
             respond_txn(co, t, 491, NULL, NULL, NULL, 0);
             return;
         }
@@ -6499,6 +6657,8 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
             sip_upd_end(&o->guard);
             respond_txn(co, t, 500, NULL, NULL, NULL, 0);
         }
+        call_unlock(c);
+        call_put(c);
         /* cli_tu 在 o->out_txn 终响应时回 A 腿 200 OK 并释放 guard */
         return;
     }
@@ -6600,9 +6760,19 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
     if (m->method == SIP_M_UPDATE && sip_msg_in_dialog(m)) {
         int leg = -1;
         sip_hdr_t *cid = sip_hdr_get(m, SIP_H_CALL_ID);
-        b2b_call_t *c = cid ? tbl_find(co, cid->value.p, cid->value.len, NULL) : NULL;
+        /* P0-3：同上，查找方持引用 + call_lock 串行 */
+        b2b_call_t *c = cid ? tbl_find_ref(co, cid->value.p, cid->value.len, NULL)
+                            : NULL;
         if (c) leg = find_leg_by_dialog(c, m);
         if (!c || leg < 0) {
+            if (c) call_put(c);
+            respond_txn(co, t, 481, NULL, NULL, NULL, 0);
+            return;
+        }
+        call_lock(c);
+        if (c->dead) {
+            call_unlock(c);
+            call_put(c);
             respond_txn(co, t, 481, NULL, NULL, NULL, 0);
             return;
         }
@@ -6612,6 +6782,8 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
             llog(LOG_INFO, "b2b",
                  "UPDATE rejected: profile '%s' enable_update=0",
                  c->prof->name);
+            call_unlock(c);
+            call_put(c);
             respond_txn(co, t, 501, NULL, NULL, NULL, 0);
             return;
         }
@@ -6620,10 +6792,14 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
         b2b_leg_t *o = &c->leg[other];
         /* UPDATE 可在 EARLY 或 CONFIRMED 状态发送（RFC 3311） */
         if (o->state != LEG_CONFIRMED && o->state != LEG_EARLY) {
+            call_unlock(c);
+            call_put(c);
             respond_txn(co, t, 491, NULL, NULL, NULL, 0);
             return;
         }
         if (!sip_upd_begin(&l->guard)) {
+            call_unlock(c);
+            call_put(c);
             respond_txn(co, t, 491, NULL, NULL, NULL, 0);
             return;
         }
@@ -6648,6 +6824,8 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
         if (!sip_upd_begin(&o->guard)) {
             sip_upd_end(&l->guard);
             l->srv_txn = NULL;
+            call_unlock(c);
+            call_put(c);
             respond_txn(co, t, 491, NULL, NULL, NULL, 0);
             return;
         }
@@ -6683,6 +6861,8 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
             o->reinv = 0;
             respond_txn(co, t, 500, NULL, NULL, NULL, 0);
         }
+        call_unlock(c);
+        call_put(c);
         return;
     }
 
@@ -7620,6 +7800,8 @@ int b2b_originate(b2b_core_t *co, const b2b_orig_t *o, b2b_call_t **out)
         return NSBC_NOSPC;
     }
     memset(c, 0, sizeof(*c));
+    c->refcnt = 1;   /* P0-3：创建引用 */
+    c->magic = B2B_CALL_MAGIC;
     c->core = co;
     c->originate_created = 1; /* REQ-ORIGINATE-005：标记 originate 创建的 call */
     sip_upd_guard_init(&c->leg[0].guard);
@@ -8016,6 +8198,13 @@ int b2b_originate(b2b_core_t *co, const b2b_orig_t *o, b2b_call_t **out)
                     size_t inlen = rewritten[0] ? strlen(rewritten) : b->offer_len;
                     int n = hsnap[i].fn(c, in, inlen, buf, sizeof(buf), hsnap[i].ud);
                     if (n >= 0) {
+                        /* P1-16：hook 返回长度未校验，截断到缓冲上限-1 */
+                        if ((size_t)n >= sizeof(rewritten)) {
+                            llog(LOG_DEBUG, "b2b",
+                                 "originate offer sdp_hook[%d] n=%d >= cap=%zu, truncated",
+                                 i, n, sizeof(rewritten));
+                            n = (int)sizeof(rewritten) - 1;
+                        }
                         memcpy(rewritten, buf, (size_t)n);
                         rewritten[n] = '\0';
                     }
@@ -8079,7 +8268,11 @@ int b2b_originate(b2b_core_t *co, const b2b_orig_t *o, b2b_call_t **out)
             return NSBC_ERR;
         }
 
-        arm_noanswer_timer(c);
+        if (arm_noanswer_timer(c) != NSBC_OK) {
+            /* P2-19：无 ring 超时保护不能继续，走既有建立失败清理路径 */
+            call_destroy(c);
+            return NSBC_ERR;
+        }
         {
             char sess[512];
             snprintf(sess, sizeof(sess),
@@ -8222,7 +8415,10 @@ int b2b_originate(b2b_core_t *co, const b2b_orig_t *o, b2b_call_t **out)
     tbl_link(co, c, 0);
     add_atomic(&co->total, 1);
 
-    arm_noanswer_timer(c);
+    if (arm_noanswer_timer(c) != NSBC_OK) {
+        call_destroy(c); /* P2-19：同 INVITE 发送失败清理路径 */
+        return NSBC_ERR;
+    }
     a->inv_txn = send_invite_b(c, 0, a->offer, a->offer_len, 0, NULL);
     if (!a->inv_txn) {
         llog(LOG_WARN, "b2b", "bridge A leg INVITE send failed");
@@ -8339,7 +8535,10 @@ int b2b_originate(b2b_core_t *co, const b2b_orig_t *o, b2b_call_t **out)
     }
 
     /* B 腿重新 arm timer（bridge 模式下第二次外呼，用 timeout_ms 覆盖） */
-    arm_noanswer_timer(c);
+    if (arm_noanswer_timer(c) != NSBC_OK) {
+        call_destroy(c); /* P2-19：同 INVITE 发送失败清理路径 */
+        return NSBC_ERR;
+    }
     b->inv_txn = send_invite_b(c, 1, b->offer, b->offer_len, 0, NULL);
     if (!b->inv_txn) {
         llog(LOG_WARN, "b2b", "bridge B leg INVITE send failed");
@@ -8400,10 +8599,13 @@ int b2b_terminate_callid(b2b_core_t *co, const char *callid, size_t len,
 {
     if (!co || !callid || len == 0 || len >= DLG_CALLID_MAX)
         return NSBC_INVAL;
-    b2b_call_t *c = tbl_find(co, callid, len, NULL);
+    /* P0-3：查找方持引用，避免 b2b_terminate 内 call_destroy 提前归还 slab */
+    b2b_call_t *c = tbl_find_ref(co, callid, len, NULL);
     if (!c)
         return NSBC_NOENT;
-    return b2b_terminate(c, cause_code);
+    int rc = b2b_terminate(c, cause_code);
+    call_put(c);
+    return rc;
 }
 
 /* 取出 leg 绑定的 ws_conn（与 signaling.c sa_hide_ws_conn 的约定一致：
@@ -8694,27 +8896,36 @@ static void call_refresh_vq(b2b_call_t *c, bridge_mgr_t *bm)
     if (bridge_call_view(bm, c, &mv) != NSBC_OK || !mv.valid || !mv.gate_open[0])
         return;
 
-    uint32_t exp = 0, lost = 0, jitter_ticks = 0;
+    /* P1-17：丢包统计统一为单一来源，禁止 RTCP RR 与 RTP 序列缺口叠加。
+     * 优先 RTP seq-gap（rtp_expected/rtp_lost）；仅当两侧 rtp_expected
+     * 均为 0 时才回退 RR。RR 回退不再用区间 fraction 反推累计 expected
+     *（旧实现 rr_lost*256/fraction 会把区间比当累计比，与 seq-gap 叠加
+     * 后 loss_q 可 >1000），而是直接用 RR 区间丢包率，单源且天然有界。
+     * ★ 交叉引用：signaling.c sig_on_end_cb 使用逐行一致的同一逻辑。 */
+    uint32_t exp = mv.rtp_expected[0] + mv.rtp_expected[1];
+    uint32_t lost = mv.rtp_lost[0] + mv.rtp_lost[1];
+    uint32_t jitter_ticks = 0;
     int have_rr = 0;
     for (int i = 0; i < 2; i++) {
-        if (mv.have_rr[i] && mv.rr_fraction[i]) {
-            uint32_t fe = mv.rr_fraction[i];
-            if (fe > 0 && mv.rr_lost[i] > 0) {
-                uint64_t e = (uint64_t)mv.rr_lost[i] * 256u / fe;
-                if (e > 0xFFFFFFFFu) e = 0xFFFFFFFFu;
-                exp += (uint32_t)e;
-                lost += mv.rr_lost[i];
-                jitter_ticks += mv.rr_jitter[i];
-                have_rr = 1;
-            }
+        if (mv.have_rr[i]) {
+            jitter_ticks += mv.rr_jitter[i];
+            have_rr = 1;
         }
-        exp += mv.rtp_expected[i];
-        lost += mv.rtp_lost[i];
     }
-    if (exp == 0)
-        return;
-
-    int32_t loss_q = (int32_t)((uint64_t)lost * 1000u / exp); /* 千分比 0..1000 */
+    int32_t loss_q = -1;
+    if (exp > 0) {
+        loss_q = (int32_t)((uint64_t)lost * 1000u / exp); /* 千分比 */
+    } else if (have_rr) {
+        uint32_t fe = mv.rr_fraction[0];
+        if (mv.rr_fraction[1] > fe)
+            fe = mv.rr_fraction[1];
+        if (fe > 0)
+            loss_q = (int32_t)((uint64_t)fe * 1000u / 256u);
+    }
+    if (loss_q < 0)
+        return; /* 无 RTP/RR 数据：保持未采集 */
+    if (loss_q > 1000)
+        loss_q = 1000; /* 钳制 0..1000（fraction 最大 255 → 996） */
     /* 与 signaling.c sig_on_end_cb 保持同一套 ITU-T G.113/G.107 E-model
      * （G.711：Ie=0, Bpl=25.1）：
      *   Ie_eff = 95 * Ppl / (Ppl + 25.1)，R = 93.2 - Ie_eff，
@@ -8840,7 +9051,8 @@ int b2b_dump_call(b2b_core_t *co, const char *callid, size_t len,
     if (!co || !callid || len == 0 || len >= DLG_CALLID_MAX || !out ||
         outsz == 0)
         return NSBC_INVAL;
-    b2b_call_t *c = tbl_find(co, callid, len, NULL);
+    /* P0-3：查找方持引用，快照完成后再释放，防止并发 call_destroy */
+    b2b_call_t *c = tbl_find_ref(co, callid, len, NULL);
     if (!c)
         return NSBC_NOENT;
 
@@ -8848,6 +9060,7 @@ int b2b_dump_call(b2b_core_t *co, const char *callid, size_t len,
     call_lock(c);
     if (c->dead) {
         call_unlock(c);
+        call_put(c);
         return NSBC_NOENT;
     }
     snap_leg(&c->leg[0], &s[0]);
@@ -8870,6 +9083,7 @@ int b2b_dump_call(b2b_core_t *co, const char *callid, size_t len,
         pthread_mutex_unlock(&g_mv_hook_lock);
     }
     call_unlock(c);
+    call_put(c);   /* P0-3：快照完成，后续只用 leg_snap_t s[]，不再访问 c */
 
     size_t pos = 0;
     int rc = buf_put(

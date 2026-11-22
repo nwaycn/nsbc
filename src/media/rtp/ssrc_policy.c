@@ -97,34 +97,48 @@ void ssrc_policy_admit(ssrc_policy_t *p, uint32_t ssrc, int aux)
     SSRC_UNLOCK(p);
 }
 
+/* P2-17 RACE-FIX：以下 4 个配置写入函数由 SIP 线程调用，而 reactor 线程
+ * 在 ssrc_policy_on_rtp / is_aux_pt / is_video_pt 中并发读取同一 cfg/src。
+ * 原实现无锁 → PT 表与 primary 标记半更新。统一改用实例锁。 */
 void ssrc_policy_set_aux_pt(ssrc_policy_t *p, uint8_t pt)
 {
+    SSRC_LOCK(p);
     if (p->cfg.n_aux_pt < 8)
         p->cfg.aux_pt[p->cfg.n_aux_pt++] = pt;
+    SSRC_UNLOCK(p);
 }
 
 void ssrc_policy_set_video_pt(ssrc_policy_t *p, uint8_t pt)
 {
-    if (p->cfg.n_video_pt >= 8) return;
-    /* 去重 */
-    for (int i = 0; i < p->cfg.n_video_pt; ++i)
-        if (p->cfg.video_pt[i] == pt) return;
-    p->cfg.video_pt[p->cfg.n_video_pt++] = pt;
+    SSRC_LOCK(p);
+    if (p->cfg.n_video_pt < 8) {
+        /* 去重 */
+        int dup = 0;
+        for (int i = 0; i < p->cfg.n_video_pt; ++i)
+            if (p->cfg.video_pt[i] == pt) { dup = 1; break; }
+        if (!dup)
+            p->cfg.video_pt[p->cfg.n_video_pt++] = pt;
+    }
+    SSRC_UNLOCK(p);
 }
 
 void ssrc_policy_retarget(ssrc_policy_t *p)
 {
     /* 主源标记清除但保留 CNAME：CNAME 相同的源直接恢复；其余重新学习 */
+    SSRC_LOCK(p);
     p->learned_primary = 0;
     for (int i = 0; i < p->n; ++i) {
         if (p->src[i].used && p->src[i].primary)
             p->src[i].primary = 0;
     }
+    SSRC_UNLOCK(p);
 }
 
 void ssrc_policy_set_local(ssrc_policy_t *p, uint32_t local_ssrc)
 {
+    SSRC_LOCK(p);
     p->cfg.local_ssrc = local_ssrc;
+    SSRC_UNLOCK(p);
 }
 
 src_decision_t ssrc_policy_on_rtp(ssrc_policy_t *p, uint32_t ssrc,

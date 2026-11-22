@@ -437,8 +437,12 @@ static int sip_tcp_flush(sip_transport_t *t, tr_conn_t *c)
                                   : (EPOLLIN | EPOLLRDHUP));
             return 0;
         }
+        /* ★ P0-2 RACE-FIX：整个发送过程持有 sbuf_lock。
+         * 原实现取 p 后立刻解锁再 send，生产者线程可在锁内 realloc/memmove
+         * 同一缓冲 → send/tls_write 读到已释放或已搬移内存（UAF + 字节流错乱）。
+         * 现在是非阻塞 socket，send/tls_write 不会长时间阻塞，持锁发送代价可接受。
+         * 所有返回路径都必须先解锁。 */
         uint8_t *p = c->sbuf + c->sbuf_head;
-        pthread_mutex_unlock(&c->sbuf_lock);
 
         ssize_t n;
 #ifdef NSBC_WITH_OPENSSL
@@ -448,23 +452,29 @@ static int sip_tcp_flush(sip_transport_t *t, tr_conn_t *c)
             if (n == NSBC_AGAIN) {
                 /* TLS 层需要等 WANT_READ/WRITE — reactor 对应关注位 */
                 uint32_t want_ev = (want == TLS_WANT_WRITE) ? EPOLLOUT : EPOLLIN;
+                pthread_mutex_unlock(&c->sbuf_lock);
                 reactor_mod(c->home_reactor, c->fd, want_ev | EPOLLRDHUP);
                 return 0; /* 留待下次 */
             }
-            if (n <= 0)
+            if (n <= 0) {
+                pthread_mutex_unlock(&c->sbuf_lock);
                 return -1; /* TLS 写失败 → conn_close 处理 */
+            }
         } else
 #endif
         {
             n = send(c->fd, p, used, MSG_NOSIGNAL);
-            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                pthread_mutex_unlock(&c->sbuf_lock);
                 return 0; /* 留待下次 EPOLLOUT */
-            if (n == 0) return -1;
-            if (n < 0) return -1;
+            }
+            if (n <= 0) {
+                pthread_mutex_unlock(&c->sbuf_lock);
+                return -1;
+            }
         }
 
         /* 成功发出 n 字节 → 推进 head，满队列清零 */
-        pthread_mutex_lock(&c->sbuf_lock);
         c->sbuf_head += (size_t)n;
         if (c->sbuf_head == c->sbuf_tail)
             c->sbuf_head = c->sbuf_tail = 0;
@@ -651,6 +661,8 @@ static tr_conn_t *conn_accept(sip_transport_t *t, int lfd, int is_tls)
         return NULL;
     }
     /* per-IP 连接计数（防单 IP SYN flood 打满全局 conn_max） */
+    uint32_t ip_bucket = 0;
+    int ip_counted = 0;
     {
         int per_ip_max = t->cfg.tcp_conn_per_ip > 0 ? t->cfg.tcp_conn_per_ip : 50;
         /* IP hash：IPv4 直接取 4 字节 XOR；IPv6 取前 16 字节 XOR */
@@ -674,6 +686,8 @@ static tr_conn_t *conn_accept(sip_transport_t *t, int lfd, int is_tls)
             return NULL;
         }
         t->ip_conn_count[bucket]++;
+        ip_bucket = bucket;
+        ip_counted = 1;
         pthread_mutex_unlock(&t->ip_conn_lock);
     }
     /* P3: conn_lock 保护 conns_cap realloc（与 conn_close 并发） */
@@ -741,10 +755,19 @@ static tr_conn_t *conn_accept(sip_transport_t *t, int lfd, int is_tls)
     c->sbuf_cap = 32 * 1024;
     c->sbuf = malloc(c->sbuf_cap);
     if (!c->sbuf) {
+        /* P2-12：回退 per-IP 连接计数。此时 conns_n 尚未 ++（在函数末尾），
+         * 不能再 --，否则计数变负导致 conn limit 失效。 */
+        if (ip_counted) {
+            pthread_mutex_lock(&t->ip_conn_lock);
+            if (t->ip_conn_count[ip_bucket] > 0)
+                t->ip_conn_count[ip_bucket]--;
+            pthread_mutex_unlock(&t->ip_conn_lock);
+        }
         free(c);
         t->conns[fd] = NULL;
-        --t->conns_n;
         close(fd);
+        llog(LOG_WARN, "sip",
+             "conn_accept: sbuf alloc failed fd=%d, per-IP count rolled back", fd);
         return NULL;
     }
     c->sbuf_head = c->sbuf_tail = 0;
@@ -856,6 +879,40 @@ static tr_conn_t *conn_accept(sip_transport_t *t, int lfd, int is_tls)
     return c;
 }
 
+/* P1-10 RACE-FIX：add_listeners 可能由 OAM/UDS 线程（profile reload）调用，
+ * 而 reactor_add 会改写 owner-only 的 slots 表，必须投递到该 reactor 的
+ * loop 线程执行。reactor_call 在 owner 线程内联、跨线程排队。 */
+typedef struct {
+    reactor_t *r;
+    int fd;
+    uint32_t events;
+    reactor_cb_fn cb;
+    void *arg;
+    int rc;
+} sip_reactor_add_arg_t;
+
+static int sip_reactor_add_fn(void *p)
+{
+    sip_reactor_add_arg_t *a = (sip_reactor_add_arg_t *)p;
+    a->rc = reactor_add(a->r, a->fd, a->events, a->cb, a->arg);
+    return a->rc;
+}
+
+static int sip_tr_reactor_add(reactor_t *r, int fd, uint32_t events,
+                              reactor_cb_fn cb, void *arg)
+{
+    if (!r) return NSBC_INVAL;
+    sip_reactor_add_arg_t a = { r, fd, events, cb, arg, NSBC_OK };
+    int rc = reactor_call(r, sip_reactor_add_fn, &a);
+    return rc == NSBC_OK ? a.rc : rc;
+}
+
+/* P1-12 RACE-FIX：on_udp_event 的 zombie fd 清理只处理当前 reactor 自己的
+ * slot（reactor_del 必须由 owner 线程执行）。不能再向其他 reactor 阻塞
+ * reactor_call：多个 reactor 同时进入本分支时会互相 cond_wait → ABBA 死锁；
+ * 且该 fd 号可能已被其他 reactor 复用为活跃连接，跨 reactor 删除会误杀。
+ * 若某个 reactor 也残留同一个僵尸 fd，它会在自己的回调里自愈。 */
+
 static void on_tcp_accept(int fd, uint32_t ev, void *arg)
 {
     (void)ev;
@@ -901,10 +958,13 @@ static void on_udp_event(int fd, uint32_t ev, void *arg)
             unsigned n = reactor_mgr_count(t->cfg.mgr);
             for (unsigned k = 0; k < n; ++k) {
                 reactor_t *rk = reactor_mgr_get(t->cfg.mgr, k);
-                if (rk) reactor_del(rk, fd);
+                if (rk && reactor_is_current(rk)) {
+                    (void)reactor_del(rk, fd);
+                    break;
+                }
             }
         } else if (t->cfg.re) {
-            reactor_del(t->cfg.re, fd);
+            (void)reactor_del(t->cfg.re, fd);
         }
         /* 注意：不 close(fd) —— 无法确认是不是合法 listener。reactor_del
          * 已经阻止 reactor 继续触发 EPOLLIN，不会再空转。close 可能杀掉
@@ -1206,21 +1266,23 @@ int sip_tr_send(sip_transport_t *t, sip_tr_proto_t proto,
     if (proto == SIP_TR_UDP) {
         int udp = -1;
         uint16_t use_port = g_rx_local_port;
-        /* 诊断：打印所有 UDP fd 端口 + 本次尝试匹配的目标端口 */
-        char fdlist[256] = {0};
-        for (int i = 0; i < t->udp_fd_count && i < 8; ++i) {
-            struct sockaddr_in sin; socklen_t sl = sizeof(sin);
-            uint16_t p = 0;
-            if (t->udp_fds[i] >= 0 &&
-                getsockname(t->udp_fds[i], (struct sockaddr *)&sin, &sl) == 0)
-                p = ntohs(sin.sin_port);
-            char tmp[32]; snprintf(tmp, sizeof(tmp), "[%d]fd=%d:port=%u ",
-                                   i, t->udp_fds[i], p);
-            strncat(fdlist, tmp, sizeof(fdlist) - strlen(fdlist) - 1);
+        /* 诊断：仅在 DEBUG 级别下采集 fd 端口列表（避免热路径 getsockname/strncat 开销） */
+        if (log_get_level() >= LOG_DEBUG) {
+            char fdlist[256] = {0};
+            for (int i = 0; i < t->udp_fd_count && i < 8; ++i) {
+                struct sockaddr_in sin; socklen_t sl = sizeof(sin);
+                uint16_t p = 0;
+                if (t->udp_fds[i] >= 0 &&
+                    getsockname(t->udp_fds[i], (struct sockaddr *)&sin, &sl) == 0)
+                    p = ntohs(sin.sin_port);
+                char tmp[32]; snprintf(tmp, sizeof(tmp), "[%d]fd=%d:port=%u ",
+                                       i, t->udp_fds[i], p);
+                strncat(fdlist, tmp, sizeof(fdlist) - strlen(fdlist) - 1);
+            }
+            llog(LOG_DEBUG, "sip-tr",
+                 "UDP send: g_rx_local_port=%u fd_count=%d fds=%s",
+                 use_port, t->udp_fd_count, fdlist);
         }
-        llog(LOG_DEBUG, "sip-tr",
-             "UDP send: g_rx_local_port=%u fd_count=%d fds=%s",
-             use_port, t->udp_fd_count, fdlist);
         if (use_port > 0 && t->udp_fd_count > 1) {
             for (int i = 0; i < t->udp_fd_count; ++i) {
                 struct sockaddr_in sin; socklen_t sl = sizeof(sin);
@@ -1235,14 +1297,14 @@ int sip_tr_send(sip_transport_t *t, sip_tr_proto_t proto,
         }
         if (udp < 0 && t->udp_fd_count > 0) {
             udp = t->udp_fds[0];
-            llog(LOG_INFO, "sip-tr", "UDP send fallback udp_fds[0] fd=%d", udp);
+            llog(LOG_DEBUG, "sip-tr", "UDP send fallback udp_fds[0] fd=%d", udp);
         }
         if (udp < 0) {
             llog(LOG_WARN, "sip-tr", "UDP send: no udp fds!");
             return NSBC_NOTSUP;
         }
-        /* ★ 诊断：打印 dst 地址细节 + net_tx_batch 返回值 */
-        {
+        /* ★ 诊断：仅 DEBUG 级别下打印 dst 地址细节 + net_tx_batch 返回值 */
+        if (log_get_level() >= LOG_DEBUG) {
             char d_ip[INET6_ADDRSTRLEN] = "-";
             uint16_t d_port = 0;
             if (dst->ss.ss_family == AF_INET) {
@@ -1254,13 +1316,13 @@ int sip_tr_send(sip_transport_t *t, sip_tr_proto_t proto,
                 inet_ntop(AF_INET6, &sin6->sin6_addr, d_ip, sizeof(d_ip));
                 d_port = ntohs(sin6->sin6_port);
             }
-            llog(LOG_INFO, "sip-tr",
+            llog(LOG_DEBUG, "sip-tr",
                  "★UDP_TX dst_fam=%d dst_len=%u dst=%s:%u buf_len=%zu → fd=%d",
                  dst->ss.ss_family, (unsigned)dst->len, d_ip, d_port, len, udp);
         }
         net_tx_dgram_t dg = {buf, len, *dst};
         int n = net_tx_batch(udp, &dg, 1);
-        llog(LOG_INFO, "sip-tr", "★UDP_TX_RC n=%d (expect 1=ok, 0=EAGAIN, -1=err)", n);
+        llog(LOG_DEBUG, "sip-tr", "★UDP_TX_RC n=%d (expect 1=ok, 0=EAGAIN, -1=err)", n);
         return n == 1 ? NSBC_OK : NSBC_AGAIN;
     }
     /* ---- SIP over WebSocket (RFC 7118) ---- */
@@ -1375,7 +1437,7 @@ int sip_tr_add_listeners(sip_transport_t *t, const char *listen_ip,
                 return NSBC_ERR;
             }
             t->udp_fds[t->udp_fd_count++] = fd;
-            reactor_add(t->cfg.re, fd, EPOLLIN, on_udp_event, t);
+            sip_tr_reactor_add(t->cfg.re, fd, EPOLLIN, on_udp_event, t);
             llog(LOG_NOTICE, "sip", "added udp listener %s:%u (total=%d)",
                  listen_ip, udp_port, t->udp_fd_count);
             added++;
@@ -1405,7 +1467,7 @@ int sip_tr_add_listeners(sip_transport_t *t, const char *listen_ip,
                 return NSBC_ERR;
             }
             t->tcp_lfds[t->tcp_count++] = fd;
-            reactor_add(t->cfg.re, fd, EPOLLIN, on_tcp_accept, t);
+            sip_tr_reactor_add(t->cfg.re, fd, EPOLLIN, on_tcp_accept, t);
             llog(LOG_NOTICE, "sip", "added tcp listener %s:%u (total=%d)",
                  listen_ip, tcp_port, t->tcp_count);
             added++;
@@ -1436,7 +1498,7 @@ int sip_tr_add_listeners(sip_transport_t *t, const char *listen_ip,
                 return NSBC_ERR;
             }
             t->tls_lfds[t->tls_count++] = fd;
-            reactor_add(t->cfg.re, fd, EPOLLIN, on_tcp_accept, t);
+            sip_tr_reactor_add(t->cfg.re, fd, EPOLLIN, on_tcp_accept, t);
             llog(LOG_NOTICE, "sip", "added tls listener %s:%u (total=%d)",
                  listen_ip, tls_port, t->tls_count);
             added++;

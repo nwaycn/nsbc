@@ -1180,9 +1180,17 @@ impl CoreApi for RealCore {
     /// 我们只在 UDS 连接/I/O/超时 三类底层错误上返回 Err。
     async fn exec_cmd(&self, cmd: &str) -> Result<String, CoreError> {
         // 防御：去换行 + 限长（避免注入多行命令）
-        let clean: String = cmd.chars().filter(|c| *c != '\n' && *c != '\r').collect();
-        let clean = if clean.len() > 4096 { &clean[..4096] } else { clean.as_str() };
-        send_cmd(&self.sock_path, self.timeout, clean).await
+        let mut clean: String = cmd.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+        if clean.len() > 4096 {
+            // Truncate on a UTF-8 char boundary — slicing at a byte offset can panic
+            // when it lands inside a multi-byte character.
+            let mut end = 4096usize;
+            while end > 0 && !clean.is_char_boundary(end) {
+                end -= 1;
+            }
+            clean.truncate(end);
+        }
+        send_cmd(&self.sock_path, self.timeout, &clean).await
     }
 }
 
@@ -1203,6 +1211,12 @@ async fn send_cmd(
     timeout: Duration,
     cmd: &str,
 ) -> Result<String, CoreError> {
+    // 统一入口防御：CR/LF/NUL 会被 C 侧按行/按 C 字符串解析成第二条命令，直接拒发。
+    if cmd.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
+        return Err(CoreError::Protocol(
+            "command contains CR/LF/NUL — refusing to send".into(),
+        ));
+    }
     let buf = request_raw(sock, timeout, cmd).await?;
     let text = String::from_utf8(buf).map_err(|e| CoreError::Protocol(e.to_string()))?;
     Ok(text

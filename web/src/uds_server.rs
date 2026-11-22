@@ -304,15 +304,13 @@ async fn cmd_recv_loop<C: crate::coreclient::CoreApi + Clone + Send + Sync + 'st
         if let Some(p) = peer.as_pathname() {
             let is_first_connect = {
                 let mut pp = CORE_PEER_CMD_PATH.lock().unwrap();
-                let need_update = match pp.as_ref() {
-                    Some(existing) => existing != p,
-                    None => true,
-                };
-                if need_update {
+                // 先判断旧值再写回：原实现写完 `*pp = Some(p)` 之后才比较，恒为 false。
+                let first = pp.as_deref() != Some(p);
+                if first {
                     tracing::info!(peer = %p.display(), "C side connected (cmd peer path recorded)");
                     *pp = Some(p.to_path_buf());
                 }
-                pp.is_none() || matches!(pp.as_ref(), Some(prev) if prev != p)
+                first
             };
             /* 第一次连接 / peer 变化 → 立即 push_all 绕过 cooldown */
             if is_first_connect {
@@ -380,18 +378,27 @@ async fn cmd_recv_loop<C: crate::coreclient::CoreApi + Clone + Send + Sync + 'st
         /* ---- C→Rust CMD_REQ（cmd_recv_loop 原生处理的请求） ---- */
         if frame_type == FT_CMD_REQ && !is_rust_originated {
             let payload_str = String::from_utf8_lossy(&full_payload).to_string();
-            let resp: Option<(u8, Vec<u8>)> = match dispatch_cmd_req(&payload_str, state).await {
-                Ok(body)  => Some((FT_CMD_RSP, body.into_bytes())),
-                Err(e)    => Some((FT_CMD_RSP, serde_json::json!({"ok": false, "reason": "bad_request", "error": e}).to_string().into_bytes())),
-            };
-            if let Some((ft, body)) = resp {
+            /* dispatch_cmd_req 内部可能阻塞数秒（core 命令 / DB）——放到独立 task，
+             * 否则会卡住同一循环里的 HELLO / CMD_RSP 处理。
+             * 响应通过 ticket 回写，C 侧按 ticket 匹配，因此乱序完成是安全的；
+             * 同一 socket 的 send_to 由内核按 datagram 原子投递，不会串包。 */
+            let sock = sock.clone();
+            let state = state.clone();
+            let peer_path = peer.as_pathname().map(|p| p.to_path_buf());
+            tokio::spawn(async move {
+                let (ft, body) = match dispatch_cmd_req(&payload_str, &state).await {
+                    Ok(body) => (FT_CMD_RSP, body.into_bytes()),
+                    Err(e) => (FT_CMD_RSP, serde_json::json!({
+                        "ok": false, "reason": "bad_request", "error": e
+                    }).to_string().into_bytes()),
+                };
                 let frames = build_fragmented_frames(ft, ticket, &body);
-                if let Some(p) = peer.as_pathname() {
+                if let Some(p) = peer_path {
                     for f in frames {
-                        let _ = sock.send_to(&f, p).await;
+                        let _ = sock.send_to(&f, &p).await;
                     }
                 }
-            }
+            });
             continue;
         }
 

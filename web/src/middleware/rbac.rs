@@ -56,18 +56,27 @@ fn required_level(method: &Method, path: &str) -> Role {
     let action = item.rsplit('/').next().unwrap_or(item);
     // GET last-segment is a literal resource rather than a fixed-action read-only nested
     // route (whitelist enumeration only, no blanket prefix open): /calls/{id}
-    // (uuid_dump diagnostic), /config/{key} (config.get effective value). Only GET + one
-    // segment hit; POST .../hangup naturally unaffected by method difference, multi-segment
-    // paths fall back to default and the route layer returns 405.
+    // (uuid_dump diagnostic), /config/{key} (config.get effective value), plus any
+    // nested /recordings/{path} (recording file download; handler enforces root
+    // containment + extension whitelist). Only GET hits; POST .../hangup naturally
+    // unaffected by method difference.
     let get_nested_readonly = method == Method::GET
-        && ["calls/", "config/"].into_iter().any(|p| {
-            item.strip_prefix(p)
-                .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
-        });
+        && (item.starts_with("recordings/")
+            || ["calls/", "config/"].into_iter().any(|p| {
+                item.strip_prefix(p)
+                    .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
+            }));
+    // 密钥/回调类写操作（POST /ext-keys、POST /ext-keys/:id/revoke、
+    // DELETE /ext-keys/:id、POST /webhooks、DELETE /webhooks/:id）末段可能是
+    // 数字 id，无法按 action 匹配，因此按路径段识别。
+    let ext_admin_write = !matches!(method, &Method::GET | &Method::HEAD | &Method::OPTIONS)
+        && item.split('/').any(|s| s == "ext-keys" || s == "webhooks");
     match (method, action) {
         // Read-only L0: nested read-only resources (priority over action whitelist,
         // last-segment is literal)
         _ if get_nested_readonly => Role::L0,
+        // 密钥/Webhook 写操作：与证书、ACL 同级，需 step-up
+        _ if ext_admin_write => Role::L2,
         // Read-only L0
         (
             &Method::GET,
@@ -87,7 +96,9 @@ fn required_level(method: &Method, path: &str) -> Role {
         // 导致 L1 JWT 可以执行杀通话、转移、录音等高风险操作。
         | (&Method::POST, "kill" | "answer" | "hold" | "mute" | "broadcast"
            | "vad-start" | "vad-stop" | "transfer" | "record"
-           | "send-dtmf" | "send-msg" | "originate") => Role::L2,
+           | "send-dtmf" | "send-msg" | "originate"
+           // 资金类：POST /balances/:id/{topup,refund}
+           | "topup" | "refund") => Role::L2,
         // Operational L1; write operations not explicitly annotated default to L1
         // (do NOT default to L0)
         _ => Role::L1,

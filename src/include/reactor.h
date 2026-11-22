@@ -73,6 +73,16 @@ int reactor_del(reactor_t *r, int fd);
 int reactor_call(reactor_t *r, reactor_task_fn fn, void *arg);
 void reactor_get_task_stats(const reactor_t *r, reactor_task_stats_t *out);
 
+/* P1-9：多 Reactor 线程启动/退出时调整 owner 归属。
+ * 启动时调用 bind_owner_current，把 owner 绑到真实 loop 线程；
+ * 退出时调用 mark_loop_exited，置 loop_exited 并恢复 owner=创建者（main）。 */
+void reactor_bind_owner_current(reactor_t *r);
+/* loop 线程退出收尾：置 loop_exited + 恢复 owner（task_lock 内原子完成）。
+ * 之后 reactor_call 会在调用方线程内联，避免投递到无人消费的队列。 */
+void reactor_mark_loop_exited(reactor_t *r);
+/* P1-12：当前线程是否为该 reactor 的 owner（回调内可据此安全内联 reactor_del）。 */
+int reactor_is_current(const reactor_t *r);
+
 /* 等待并处理一批事件；返回处理条数，<0 错误（EINTR 内部重试） */
 int reactor_wait(reactor_t *r, int timeout_ms);
 

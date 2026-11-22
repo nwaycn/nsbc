@@ -36,7 +36,9 @@ app.component('config-editor', {
             <span v-else class="font-mono break-all text-sm">{{ row.value ?? t('(unset)') }}</span>
           </template>
         </el-table-column>
-        <el-table-column prop="layer" :label="t('Layer')" width="120" />
+        <el-table-column :label="t('Layer')" width="120">
+          <template #default="{row}">{{ row.layer || '-' }}</template>
+        </el-table-column>
         <el-table-column :label="t('Action')" width="140" fixed="right">
           <template #default="{row}">
             <el-button
@@ -147,14 +149,14 @@ app.component('config-editor', {
       loading.value = true;
       try {
         const r = await api.get('/config');
-        items.value = r.data.items || [];
+        items.value = (r && r.items) || [];
       } catch (e) {
         ElementPlus.ElMessage.error(e.message);
       }
       // Listen addresses
       try {
         const lr = await api.get('/listens');
-        listens.value = lr.data || [];
+        listens.value = (lr && lr.listens) || [];
       } catch (_) { /* optional */ }
       loading.value = false;
     };
@@ -166,8 +168,8 @@ app.component('config-editor', {
       // Fetch current effective value via GET /config/:key for accuracy
       try {
         const r = await api.get('/config/' + encodeURIComponent(row.key));
-        editValue.value = r.data.value ?? '';
-        editLayer.value = r.data.layer || editLayer.value;
+        editValue.value = r.value ?? '';
+        editLayer.value = r.layer || editLayer.value;
       } catch (_) {
         editValue.value = row.value ?? '';
       }
@@ -196,7 +198,7 @@ app.component('config-editor', {
       setting.value = true;
       try {
         const r = await api.post('/config/set', { key: editKey.value, value: editValue.value });
-        const changed = r.data.changed;
+        const changed = r.changed;
         ElementPlus.ElMessage.success(
           changed ? t('Hot-set applied — core value changed') : t('Idempotent — value already equals target')
         );

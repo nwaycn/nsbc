@@ -314,6 +314,74 @@ pub struct WebhookCreate {
 }
 fn default_events() -> String { "CALL_INCOMING,CALL_ANSWERED,CALL_END".into() }
 
+/// SSRF guard: whitelist http(s) and reject loopback / private / link-local hosts.
+/// Only literal IPs and `localhost` are inspected here; hostnames are not resolved
+/// (DNS rebinding must be handled by the outbound HTTP client's egress policy).
+fn validate_webhook_url(url: &str) -> Result<(), &'static str> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .ok_or("url must start with http(s)://")?;
+    let authority = rest
+        .split(|c| c == '/' || c == '?' || c == '#')
+        .next()
+        .unwrap_or("");
+    if authority.is_empty() {
+        return Err("url missing host");
+    }
+    // Drop userinfo (`user:pass@host`) before host extraction.
+    let hostport = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+    let host = if let Some(v6) = hostport.strip_prefix('[') {
+        v6.split(']').next().unwrap_or("")
+    } else if hostport.matches(':').count() == 1 {
+        hostport.split(':').next().unwrap_or("")
+    } else {
+        hostport
+    };
+    if host.is_empty() {
+        return Err("url missing host");
+    }
+    let host = host.to_ascii_lowercase();
+    if host == "localhost" || host.ends_with(".localhost") {
+        return Err("webhook host not allowed");
+    }
+    // Strip an IPv6 zone id (`fe80::1%25eth0`) before parsing the literal.
+    let host_ip = host.split('%').next().unwrap_or(&host);
+    if let Ok(ip) = host_ip.parse::<std::net::IpAddr>() {
+        if is_forbidden_ip(ip) {
+            return Err("webhook host not allowed");
+        }
+    }
+    Ok(())
+}
+
+fn is_forbidden_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            o[0] == 0
+                || o[0] == 10
+                || o[0] == 127
+                || (o[0] == 172 && (o[1] & 0xf0) == 16)
+                || (o[0] == 192 && o[1] == 168)
+                || (o[0] == 169 && o[1] == 254)
+        }
+        std::net::IpAddr::V6(v6) => {
+            let o = v6.octets();
+            let loopback = o[..15].iter().all(|b| *b == 0) && o[15] == 1;
+            let unspecified = o.iter().all(|b| *b == 0);
+            let unique_local = (o[0] & 0xfe) == 0xfc;                 // fc00::/7
+            let link_local = o[0] == 0xfe && (o[1] & 0xc0) == 0x80;   // fe80::/10
+            let v4_mapped = o[..10].iter().all(|b| *b == 0) && o[10] == 0xff && o[11] == 0xff;
+            let mapped_forbidden = v4_mapped
+                && is_forbidden_ip(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                    o[12], o[13], o[14], o[15],
+                )));
+            loopback || unspecified || unique_local || link_local || mapped_forbidden
+        }
+    }
+}
+
 async fn list_webhooks<C: crate::coreclient::CoreApi + Clone + 'static>(
     State(st): State<Arc<AppState<C>>>,
     Extension(identity): Extension<Identity>,
@@ -340,11 +408,11 @@ async fn create_webhook<C: crate::coreclient::CoreApi + Clone + 'static>(
     Json(body): Json<WebhookCreate>,
 ) -> ApiResult<Json<WebhookRow>> {
     require_l2(&identity)?;
-    if !body.url.starts_with("https://") && !body.url.starts_with("http://") {
-        return Err(ApiError::BadRequest("url must start with http(s)://".into()));
-    }
     if body.url.len() > 512 {
         return Err(ApiError::BadRequest("url too long".into()));
+    }
+    if let Err(reason) = validate_webhook_url(&body.url) {
+        return Err(ApiError::BadRequest(reason.into()));
     }
 
     let pool = st.db.pool().ok_or(ApiError::DbUnavailable)?;

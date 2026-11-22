@@ -60,6 +60,9 @@ struct worker_pool {
     uint64_t wait_sum_ns;
 };
 
+/* P1-11：定义在 wpool_destroy 前，供 wpool_resize scale-down 复用 */
+static int worker_q_can_destroy(worker_t *w, unsigned idx);
+
 static int worker_submit_enter(worker_pool_t *p)
 {
     unsigned long state =
@@ -481,19 +484,15 @@ int wpool_resize(worker_pool_t *p, unsigned new_n)
             }
             /* 清理 slot 资源（slot_ready 已在上一步置 0，submitter 不会再用 q） */
             if (w->mag) { mem_mag_destroy(w->mag); w->mag = NULL; }
-            /* ★ P0-2.3 RACE-FIX: 等所有 in-flight submitter 释放 q_refcnt 再 destroy */
+            /* ★ P0-2.3 / P1-11：等所有 in-flight submitter 释放 q_refcnt 再 destroy；
+             * 超时则泄漏队列，绝不强 destroy。 */
             {
-                unsigned spins = 0;
-                while (__atomic_load_n(&w->q_refcnt, __ATOMIC_ACQUIRE) != 0) {
-                    sched_yield();
-                    if (++spins > 100000) {
-                        log_warn("worker", "resize: worker[%u] q_refcnt stuck=%u, force destroy",
-                                 i, (unsigned)__atomic_load_n(&w->q_refcnt, __ATOMIC_RELAXED));
-                        break;
-                    }
+                int can_destroy = worker_q_can_destroy(w, i);
+                if (w->q) {
+                    if (can_destroy) mem_mpsc_destroy(w->q);
+                    w->q = NULL;
                 }
             }
-            if (w->q)   { mem_mpsc_destroy(w->q);   w->q = NULL; }
             if (w->ready_initialized) { sem_destroy(&w->ready); w->ready_initialized = 0; }
             if (w->rd)  { w->rd = NULL; }
             log_info("worker", "resize: worker[%u] joined + cleaned up", i);
@@ -503,6 +502,31 @@ int wpool_resize(worker_pool_t *p, unsigned new_n)
 
     pthread_mutex_unlock(&p->resize_lock);
     return NSBC_OK;
+}
+
+/* P1-11 RACE-FIX：等待所有 in-flight submitter 释放 q 引用后再销毁队列。
+ * 原实现在自旋 10 万次后强制 mem_mpsc_destroy，若此时 submitter 仍持有
+ * 引用（刚 double-check 完 slot_ready）→ 访问已释放队列 → UAF。
+ * 改为阻塞等待；极端超时选择泄漏队列而不是强 destroy（泄漏仅在停机路径）。 */
+static int worker_q_can_destroy(worker_t *w, unsigned idx)
+{
+    const unsigned max_wait_ms = 30000;
+    unsigned waited = 0;
+    while (__atomic_load_n(&w->q_refcnt, __ATOMIC_ACQUIRE) != 0) {
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000 * 1000 };
+        nanosleep(&ts, NULL);
+        if (++waited == 5000) {
+            log_warn("worker", "worker[%u] q_refcnt=%u busy, keep waiting",
+                     idx, (unsigned)__atomic_load_n(&w->q_refcnt, __ATOMIC_RELAXED));
+        }
+        if (waited >= max_wait_ms) {
+            log_err("worker", "worker[%u] q_refcnt stuck=%u after %ums — leak queue to avoid UAF",
+                    idx, (unsigned)__atomic_load_n(&w->q_refcnt, __ATOMIC_RELAXED),
+                    max_wait_ms);
+            return 0;
+        }
+    }
+    return 1;
 }
 
 void wpool_destroy(worker_pool_t *p)
@@ -546,15 +570,14 @@ void wpool_destroy(worker_pool_t *p)
         }
         /* join 后清理 slot 资源 */
         if (w->mag) { mem_mag_destroy(w->mag); w->mag = NULL; }
-        /* ★ P0-2.3 RACE-FIX: 同 wpool_resize — 等 q_refcnt 归零 */
+        /* ★ P0-2.3 / P1-11：同 wpool_resize — 等 q_refcnt 归零，超时泄漏不 UAF */
         {
-            unsigned spins = 0;
-            while (__atomic_load_n(&w->q_refcnt, __ATOMIC_ACQUIRE) != 0) {
-                sched_yield();
-                if (++spins > 100000) break;
+            int can_destroy = worker_q_can_destroy(w, i);
+            if (w->q) {
+                if (can_destroy) mem_mpsc_destroy(w->q);
+                w->q = NULL;
             }
         }
-        if (w->q)   { mem_mpsc_destroy(w->q);   w->q = NULL; }
         if (w->ready_initialized) { sem_destroy(&w->ready); w->ready_initialized = 0; }
         if (w->rd)  { w->rd = NULL; }
         __atomic_store_n(&w->slot_ready, 0, __ATOMIC_RELEASE);

@@ -262,12 +262,13 @@ app.component('channels-live', livePanel(t('Live channels'), 'fa-solid fa-phone-
     actionCol: (row) => {
       const callId = row.a_call_id || row.b_call_id || '';
       if (!callId) return '';
-      const esc = callId.replace(/'/g, "\\'");
+      // Percent-encode so the Call-ID is inert text inside the attribute, never HTML/JS.
+      const id = encodeURIComponent(callId);
       return [
-        `<button onclick="nsbcHangup('${esc}')" class="px-2 py-1 text-xs text-red-600 border border-red-300 rounded hover:bg-red-50 hover:text-red-800"><i class="fa-solid fa-phone-slash"></i> ${t('Hang up')}</button>`,
-        `<button onclick="(async ()=>{try{const w=(await window.ElMessageBox.prompt('${t('WAV path or chain (| sep)')}','',{inputValue:'welcome.wav'}))?.value;if(!w)return;await nsbcPlayback('${esc}',w,-1,0)}catch(e){}})()" class="px-2 py-1 text-xs text-green-600 border border-green-300 rounded hover:bg-green-50 hover:text-green-800"><i class="fa-solid fa-play"></i> Play</button>`,
-        `<button onclick="nsbcPlaybackStop('${esc}')" class="px-2 py-1 text-xs text-amber-600 border border-amber-300 rounded hover:bg-amber-50 hover:text-amber-800"><i class="fa-solid fa-stop"></i> Stop</button>`,
-        `<button onclick="(async ()=>{const s=await nsbcPlaybackStatus('${esc}');if(s)window.ElMessage.success('active='+s.active+' side='+s.side+' loop='+s.loop);else window.ElMessage.info('not playing')})()" class="px-2 py-1 text-xs text-slate-600 border border-slate-300 rounded hover:bg-slate-50 hover:text-slate-800"><i class="fa-solid fa-circle-info"></i> Status</button>`,
+        `<button data-act="hangup" data-call-id="${id}" class="px-2 py-1 text-xs text-red-600 border border-red-300 rounded hover:bg-red-50 hover:text-red-800"><i class="fa-solid fa-phone-slash"></i> ${t('Hang up')}</button>`,
+        `<button data-act="play" data-call-id="${id}" class="px-2 py-1 text-xs text-green-600 border border-green-300 rounded hover:bg-green-50 hover:text-green-800"><i class="fa-solid fa-play"></i> Play</button>`,
+        `<button data-act="stop" data-call-id="${id}" class="px-2 py-1 text-xs text-amber-600 border border-amber-300 rounded hover:bg-amber-50 hover:text-amber-800"><i class="fa-solid fa-stop"></i> Stop</button>`,
+        `<button data-act="status" data-call-id="${id}" class="px-2 py-1 text-xs text-slate-600 border border-slate-300 rounded hover:bg-slate-50 hover:text-slate-800"><i class="fa-solid fa-circle-info"></i> Status</button>`,
       ].join(' ');
     },
   }));
@@ -422,11 +423,16 @@ app.component('cdrs-live', {
             </td>
             <td class="px-3 py-2 text-xs">
               <template v-if="getRecUrl(row)">
-                <video v-if="isVideoRec(row)" :src="getRecUrl(row)" controls preload="none" class="h-20 align-middle"></video>
-                <audio v-else :src="getRecUrl(row)" controls preload="none" class="h-6 align-middle"></audio>
-                <a :href="getRecUrl(row)" download target="_blank" class="ml-2 text-blue-600 hover:underline">
-                  <i class="fa-solid fa-download"></i>
-                </a>
+                <template v-if="recUrls[getRecUrl(row)]">
+                  <video v-if="isVideoRec(row)" :src="recUrls[getRecUrl(row)]" controls preload="none" class="h-20 align-middle"></video>
+                  <audio v-else :src="recUrls[getRecUrl(row)]" controls preload="none" class="h-6 align-middle"></audio>
+                  <a :href="recUrls[getRecUrl(row)]" :download="recName(row)" class="ml-2 text-blue-600 hover:underline">
+                    <i class="fa-solid fa-download"></i>
+                  </a>
+                </template>
+                <button v-else @click="loadRec(row)" class="px-2 py-1 text-xs border rounded hover:bg-gray-50">
+                  <i class="fa-solid fa-volume-high"></i> {{ t('Recording') }}
+                </button>
               </template>
               <template v-else>-</template>
             </td>
@@ -512,6 +518,28 @@ app.component('cdrs-live', {
       const url = getRecUrl(row);
       return !!url && url.toLowerCase().endsWith('.mp4');
     }
+    // /recordings/* now requires JWT; fetch with Authorization → Blob → object URL.
+    // Nothing is downloaded until the user clicks "Recording" (preload="none" kept).
+    const recUrls = reactive({});
+    const recLoading = reactive({});
+    async function loadRec(row) {
+      const url = getRecUrl(row);
+      if (!url || recUrls[url] || recLoading[url]) return;
+      recLoading[url] = true;
+      try {
+        const res = await fetch(url, { headers: API.headers(false) });
+        if (!res.ok) throw new Error(t('Recording not found'));
+        recUrls[url] = URL.createObjectURL(await res.blob());
+      } catch (e) {
+        if (window.ElMessage) window.ElMessage.error(e.message || String(e));
+      } finally {
+        delete recLoading[url];
+      }
+    }
+    function recName(row) {
+      const url = getRecUrl(row) || '';
+      return url.split('/').pop() || 'recording';
+    }
     function ringTime(startIso, answerIso) {
       if (!answerIso) return '-';
       const d = Math.round((isoMs(answerIso) - isoMs(startIso)) / 1000);
@@ -562,9 +590,13 @@ app.component('cdrs-live', {
       }
     }
     onMounted(() => { load(); timer = setInterval(() => load(true), 10000); });
-    onBeforeUnmount(() => clearInterval(timer));
+    onBeforeUnmount(() => {
+      clearInterval(timer);
+      Object.values(recUrls).forEach((u) => { try { URL.revokeObjectURL(u); } catch { /* ignore */ } });
+    });
     return { rows, total, loading, error, pageSize, currentPage, totalPages, goPage,
              getRecUrl, isVideoRec, getMeta, ringTime, formatBillsec, fmtIso, isoMs,
+             recUrls, loadRec, recName,
              tabs, activeTab, q, sortBy, sortDir, resetFilters,
              load };  // ← load + pageSize 必须都 return，模板 v-if="total > pageSize" 靠它
   },

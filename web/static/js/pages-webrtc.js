@@ -8,6 +8,13 @@
 
 /* global JsSIP, app, PC_CONFIG, fixVideoPortForLocal, sdpCodecWhitelist, ensureVideoReady, tryPlayWithGesture */
 
+// Escape SIP/JsSIP-provided strings before they enter pushSipLog (rendered via v-html).
+function escapeHtml(v) {
+  return String(v).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+}
+
 app.component('webrtc-page', {
   template: `
   <div class="space-y-6">
@@ -190,7 +197,7 @@ app.component('webrtc-page', {
       const v = (this.realm || '').trim();
       if (v) {
         try { localStorage.setItem('nsbc_sip_domain', v); } catch(_) {}
-        this.pushSipLog(`🔄 Realm = ${v}（Tenant = SIP 域）`);
+        this.pushSipLog(`🔄 Realm = ${escapeHtml(v)}（Tenant = SIP 域）`);
       }
     },
 
@@ -338,7 +345,7 @@ app.component('webrtc-page', {
           this.registered = true;
           this.regStatus = '✅ Registered ' + this.username;
           this.regClass = 'text-green-600';
-          this.pushSipLog(`<span class="text-green-400">REGISTERED</span> as ${this.username}`);
+          this.pushSipLog(`<span class="text-green-400">REGISTERED</span> as ${escapeHtml(this.username)}`);
           // ★ 预热 AudioContext——Register 是用户手势，能绕过 autoplay 策略
           if (!this.ringCtx) {
             try { this.ringCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch(_) {}
@@ -356,7 +363,7 @@ app.component('webrtc-page', {
         this.ua.on('registrationFailed', (e) => {
           this.regStatus = '❌ Register失败';
           this.regClass = 'text-red-500';
-          this.pushSipLog(`<span class="text-red-500">REGISTRATION FAILED</span> ${e.cause}`);
+          this.pushSipLog(`<span class="text-red-500">REGISTRATION FAILED</span> ${escapeHtml(e.cause)}`);
         });
 
         this.ua.on('sip', (e) => {
@@ -377,7 +384,7 @@ app.component('webrtc-page', {
           const from = session.remote_identity?.uri?.toString() || '?';
 
           if (e.originator === 'remote') {
-            self.pushSipLog(`<span class="text-yellow-400">📞 INCOMING</span> from ${from}`);
+            self.pushSipLog(`<span class="text-yellow-400">📞 INCOMING</span> from ${escapeHtml(from)}`);
             self.pendingSession = Vue.markRaw(session);
             self.incomingCall = true;
             self.incomingFrom = from;
@@ -391,7 +398,7 @@ app.component('webrtc-page', {
               self._attachPC(incomingPC);
             }
           } else {
-            self.pushSipLog(`📤 OUTGOING to ${from}`);
+            self.pushSipLog(`📤 OUTGOING to ${escapeHtml(from)}`);
             // ★ Outgoing call也要存 session，Ringing阶段能Hang up
             self.pendingSession = Vue.markRaw(session);
             self._bindSession(session, false);
@@ -402,7 +409,7 @@ app.component('webrtc-page', {
       } catch(e) {
         this.regStatus = '❌ 异常';
         this.regClass = 'text-red-500';
-        this.pushSipLog(`<span class="text-red-500">EXCEPTION:</span> ${e.message || e}`);
+        this.pushSipLog(`<span class="text-red-500">EXCEPTION:</span> ${escapeHtml(e.message || e)}`);
       }
     },
 
@@ -410,7 +417,7 @@ app.component('webrtc-page', {
       session.on('sdp', this._handleSdpEvent);
       session.on('progress', (e) => {
         const r = e.response;
-        this.pushSipLog(`📞 progress: ${r?.status_code || ''} ${r?.reason_phrase || ''}`);
+        this.pushSipLog(`📞 progress: ${r?.status_code || ''} ${escapeHtml(r?.reason_phrase || '')}`);
       });
       session.on('accepted', () => this.pushSipLog(`✅ accepted (180/183)`));
       session.on('confirmed', () => {
@@ -435,7 +442,7 @@ app.component('webrtc-page', {
       });
       session.on('failed', (e) => {
         this.stopRing();
-        this.pushSipLog(`<span class="text-red-500">❌ failed:</span> ${e.cause || ''}`);
+        this.pushSipLog(`<span class="text-red-500">❌ failed:</span> ${escapeHtml(e.cause || '')}`);
         this.onCallEnd('失败: ' + (e.cause || ''));
       });
       // ★ Incoming路径也要绑 peerconnection——answer() 后 ontrack 在 confirmed 之前就触发，
@@ -459,7 +466,7 @@ app.component('webrtc-page', {
       if (!target.startsWith('sip:')) target = 'sip:' + target;
       if (!target.includes('@')) target = target + '@' + this.realm;
 
-      this.pushSipLog(`📤 INVITE → ${target}`);
+      this.pushSipLog(`📤 INVITE → ${escapeHtml(target)}`);
 
       try {
         // ★ 先 getUserMedia + ensureVideoReady（和 nsbc-phone.js 一样）
@@ -471,7 +478,7 @@ app.component('webrtc-page', {
           this.pushSipLog(`📺 本地流就绪`);
         }
       } catch(e) {
-        this.pushSipLog(`<span class="text-red-500">❌ getUserMedia FAIL:</span> ${e.message}`);
+        this.pushSipLog(`<span class="text-red-500">❌ getUserMedia FAIL:</span> ${escapeHtml(e.message)}`);
         return;
       }
 
@@ -483,7 +490,7 @@ app.component('webrtc-page', {
           eventHandlers: this._makeSessionHandlers(false),
         });
       } catch(e) {
-        this.pushSipLog(`<span class="text-red-500">CALL FAIL:</span> ${e.message}`);
+        this.pushSipLog(`<span class="text-red-500">CALL FAIL:</span> ${escapeHtml(e.message)}`);
       }
     },
 
@@ -503,7 +510,7 @@ app.component('webrtc-page', {
           this.pushSipLog(`📺 本地流就绪`);
         }
       } catch(e) {
-        this.pushSipLog(`<span class="text-red-500">❌ getUserMedia FAIL:</span> ${e.message}`);
+        this.pushSipLog(`<span class="text-red-500">❌ getUserMedia FAIL:</span> ${escapeHtml(e.message)}`);
         return;
       }
 
@@ -513,7 +520,7 @@ app.component('webrtc-page', {
           pcConfig: PC_CONFIG,
         });
       } catch(e) {
-        this.pushSipLog(`<span class="text-red-500">ACCEPT FAIL:</span> ${e.message}`);
+        this.pushSipLog(`<span class="text-red-500">ACCEPT FAIL:</span> ${escapeHtml(e.message)}`);
       }
     },
 
@@ -538,7 +545,7 @@ app.component('webrtc-page', {
         const s = this.session || this.pendingSession;
         if (s) s.terminate();
       } catch(e) {
-        this.pushSipLog(`<span class="text-red-500">HANGUP FAIL:</span> ${e.message}`);
+        this.pushSipLog(`<span class="text-red-500">HANGUP FAIL:</span> ${escapeHtml(e.message)}`);
       }
       // 无论怎样都走清理（JsSIP 的 terminate 是异步的，ended 事件会再次调 onCallEnd——但 Vue 的终止幂等检查已兜底）
       setTimeout(() => { this.onCallEnd('Local hangup'); this.isHangingUp = false; }, 500);
@@ -547,7 +554,7 @@ app.component('webrtc-page', {
     onCallEnd(reason) {
       this.stopRing();
       if (!this.session && !this.pendingSession && !this.inCall && !this.incomingCall) return;  // 幂等
-      this.pushSipLog(`CALL END: ${reason}`);
+      this.pushSipLog(`CALL END: ${escapeHtml(reason)}`);
       this.inCall = false;
       this.held = false;
       this.session = null; this.pendingSession = null;
@@ -570,7 +577,7 @@ app.component('webrtc-page', {
           this.pushSipLog(`⏸ HOLD`);
         }
       } catch(e) {
-        this.pushSipLog(`Hold FAIL: ${e.message}`);
+        this.pushSipLog(`Hold FAIL: ${escapeHtml(e.message)}`);
       }
     },
 
@@ -591,7 +598,7 @@ app.component('webrtc-page', {
         const media = (rtpSent > 0 || rtpRecv > 0) ? '✅ MEDIA' : '❌ NO MEDIA';
         this.pushSipLog(`📊 STATS[${tag}] ${media} DTLS=${dtlsState}`);
       } catch(e) {
-        this.pushSipLog(`📊 STATS[${tag}] fail: ${e.message}`);
+        this.pushSipLog(`📊 STATS[${tag}] fail: ${escapeHtml(e.message)}`);
       }
     },
 

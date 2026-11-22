@@ -55,8 +55,17 @@ typedef struct {
 static per_core_ring_t *g_rings = NULL;   /* 动态分配：init 时按 CPU 数建 */
 static int g_ring_cores = 0;
 
+/* P2-14 RACE-FIX：停机生产者闸门。
+ * event_bus_fini 原实现直接 free(g_rings)，此时其他线程仍可能在 push 中途
+ * 持有 rb 指针 → 命中已释放内存。producer 先自增再复查 stopping；fini 先置
+ * stopping 再等待在途 producer 归零，之后才释放。 */
+static nsbc_atomic_t g_bus_producers = 0;
+static volatile int   g_bus_stopping = 0;
+
 int event_bus_init(void)
 {
+    __atomic_store_n(&g_bus_stopping, 0, __ATOMIC_RELEASE);
+    sat_init(g_bus_producers, 0);
     int ncores = (int)pcnt_cpus();
     if (ncores <= 0) ncores = 1;
     /* F-06 修复：不再硬限 RING_MAX_CORES=32。
@@ -82,6 +91,18 @@ int event_bus_init(void)
 
 void event_bus_fini(void)
 {
+    /* P2-14：先关闸，再等在途 producer 退出临界区，最后释放 rings。 */
+    __atomic_store_n(&g_bus_stopping, 1, __ATOMIC_RELEASE);
+    int spins = 0;
+    while (sat_read(g_bus_producers) > 0) {
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000 * 1000 };
+        nanosleep(&ts, NULL);
+        if (++spins > 5000) {
+            log_warn("event_bus", "fini timeout waiting producers (in-flight=%u) — leak rings",
+                     (unsigned)sat_read(g_bus_producers));
+            return;  /* fail-safe：宁可泄漏也不 free 正在被使用的 rings */
+        }
+    }
     if (g_rings) {
         free(g_rings);
         g_rings = NULL;
@@ -145,7 +166,15 @@ static __thread char tls_event_buf[2048];  /* TLS buffer 零 malloc */
 
 int nsbc_event_push(const char *event_name, const char *payload_json)
 {
-    if (!g_rings || !event_name || !event_name[0]) return NSBC_INVAL;
+    if (!event_name || !event_name[0]) return NSBC_INVAL;
+
+    /* P2-14：先登记在途 producer，再复查停机标志；与 event_bus_fini 配对，
+     * 保证 fini 释放 rings 时本函数不会仍持有 g_rings/rb 指针。 */
+    sat_inc(g_bus_producers);
+    if (__atomic_load_n(&g_bus_stopping, __ATOMIC_ACQUIRE) || !g_rings) {
+        sat_dec(g_bus_producers);
+        return NSBC_INVAL;
+    }
 
     /* 1. 找到当前 core 的 ring */
     int core_id = pcpt_idx();  /* percpu.h 已定义 */
@@ -164,20 +193,23 @@ int nsbc_event_push(const char *event_name, const char *payload_json)
         /* 帧太大——不 push（生产绝对优先，不阻塞） */
         log_warn("event_bus", "event frame too large name=%zu payload=%zu — skip",
                  name_size, payload_size);
+        sat_dec(g_bus_producers);
         return NSBC_NOMEM;
     }
     uint16_t name_len = (uint16_t)name_size;
     uint32_t payload_len = (uint32_t)payload_size;
     size_t frame_size = frame_overhead + name_size + payload_size;
 
-    /* 3. 构造帧（纯 TLS 内存操作，无共享状态 → 锁外安全） */
-    uint64_t seq = event_bus_next_seq();
+    /* 3. 构造帧（纯 TLS 内存操作，无共享状态 → 锁外安全）。
+     * P2-15：seq 字段先留空，进入 push 锁后再领取，保证同 ring 上多个
+     * producer 的 seq 分配顺序与帧落盘顺序一致。 */
     char *p = tls_event_buf;
     memcpy(p, &name_len, 2); p += 2;
     memcpy(p, event_name, name_len); p += name_len;
     memcpy(p, &payload_len, 4); p += 4;
     if (payload_len) { memcpy(p, payload_json, payload_len); p += payload_len; }
-    memcpy(p, &seq, 8); p += 8;
+    size_t seq_off = (size_t)(p - tls_event_buf);
+    p += 8;
     *p++ = 0xFF;  /* end_marker */
 
     /* 4. ★ P0-2.2 RACE-FIX: push 临界区 — 拿锁、check capacity、memcpy、store */
@@ -196,8 +228,13 @@ int nsbc_event_push(const char *event_name, const char *payload_json)
     if (ring_avail < frame_size) {
         __atomic_store_n(&rb->push_lock, 0, __ATOMIC_RELEASE);
         __atomic_fetch_add(&rb->dropped_count, 1, __ATOMIC_RELAXED);
+        sat_dec(g_bus_producers);
         return NSBC_BUSY;
     }
+
+    /* P2-15：seq 在 push 锁内领取并回填帧 */
+    uint64_t seq = __atomic_fetch_add(&rb->local_seq, 1, __ATOMIC_RELAXED) + 1;
+    memcpy(tls_event_buf + seq_off, &seq, 8);
 
     uint64_t offset = wp & RING_MASK;
     uint64_t first_chunk = RING_SIZE - offset;
@@ -210,6 +247,7 @@ int nsbc_event_push(const char *event_name, const char *payload_json)
 
     __atomic_store_n(&rb->write_pos, wp + frame_size, __ATOMIC_RELEASE);
     __atomic_store_n(&rb->push_lock, 0, __ATOMIC_RELEASE);
+    sat_dec(g_bus_producers);
     return NSBC_OK;
 }
 

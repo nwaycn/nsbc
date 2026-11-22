@@ -1499,27 +1499,36 @@ static void sig_on_end_cb(void *call_key, void *ud)
              rc, mv.valid, mv.gate_open[0], mv.mode,
              c->leg[0].callid ? c->leg[0].callid : "?");
         if (rc == NSBC_OK && mv.valid && mv.gate_open[0]) {
-            /* 优先用 RTCP RR（有对端报告），退化用 RTP seq-gap 本地推断 */
-            uint32_t exp = 0, lost = 0, jitter_ticks = 0;
+            /* P1-17：丢包统计统一为单一来源，禁止 RTCP RR 与 RTP 序列缺口叠加。
+             * 优先 RTP seq-gap（rtp_expected/rtp_lost）；仅当两侧 rtp_expected
+             * 均为 0 时才回退 RR。RR 回退不再用区间 fraction 反推累计 expected
+             *（旧实现 rr_lost*256/fraction 会把区间比当累计比，与 seq-gap 叠加
+             * 后 loss_q 可 >1000），而是直接用 RR 区间丢包率，单源且天然有界。
+             * ★ 交叉引用：b2bua.c call_refresh_vq 使用逐行一致的同一逻辑。 */
+            uint32_t exp = mv.rtp_expected[0] + mv.rtp_expected[1];
+            uint32_t lost = mv.rtp_lost[0] + mv.rtp_lost[1];
+            uint32_t jitter_ticks = 0;
             int have_rr = 0;
             for (int i = 0; i < 2; i++) {
-                if (mv.have_rr[i] && mv.rr_fraction[i]) {
-                    /* fraction = 累计丢失比例（/256 取整），exp ≈ rr_lost / (fraction/256) */
-                    uint32_t fe = mv.rr_fraction[i];
-                    if (fe > 0 && mv.rr_lost[i] > 0) {
-                        uint64_t e = (uint64_t)mv.rr_lost[i] * 256u / fe;
-                        if (e > 0xFFFFFFFFu) e = 0xFFFFFFFFu;
-                        exp += (uint32_t)e;
-                        lost += mv.rr_lost[i];
-                        jitter_ticks += mv.rr_jitter[i];
-                        have_rr = 1;
-                    }
+                if (mv.have_rr[i]) {
+                    jitter_ticks += mv.rr_jitter[i];
+                    have_rr = 1;
                 }
-                exp += mv.rtp_expected[i];
-                lost += mv.rtp_lost[i];
             }
+            int32_t loss_q = -1;
             if (exp > 0) {
-                vq_loss_pct = (int32_t)((uint64_t)lost * 1000u / exp); /* 千分比 */
+                loss_q = (int32_t)((uint64_t)lost * 1000u / exp); /* 千分比 */
+            } else if (have_rr) {
+                uint32_t fe = mv.rr_fraction[0];
+                if (mv.rr_fraction[1] > fe)
+                    fe = mv.rr_fraction[1];
+                if (fe > 0)
+                    loss_q = (int32_t)((uint64_t)fe * 1000u / 256u);
+            }
+            if (loss_q >= 0) {
+                if (loss_q > 1000)
+                    loss_q = 1000; /* 钳制 0..1000 */
+                vq_loss_pct = loss_q;
                 /* ITU-T G.113/G.107 E-model（G.711：Ie=0, Bpl=25.1）：
                  *   Ie_eff = 95 * Ppl / (Ppl + 25.1)      Ppl=丢包百分比
                  *   R      = 93.2 - Ie_eff                (0..100)

@@ -271,12 +271,19 @@ static void cb_dead(uint64_t now, void *arg)
              "cb_dead: terminating orphan txn state=%d kind=%d refs=%ld",
              t->state, t->kind, t->refs);
         __atomic_add_fetch(&m->tmo, 1, __ATOMIC_RELAXED);
+        /* P1-13：移除哈希前通知 TU —— 对象此刻仍存活，TU 可安全清理
+         * 指向本事务的裸指针；通知后不再访问 t。 */
+        if (t->tu)
+            t->tu(t, NULL, TXN_EV_TERMINATED, t->ud);
         t_remove_hash(t);
         break;
     case TXN_ICT_COMPLETED: /* Timer D */
     case TXN_IST_CONFIRMED: /* Timer I */
     case TXN_NIST_COMPLETED: /* Timer J */
     case TXN_NICT_COMPLETED: /* Timer K */
+        /* P1-13：同上 —— 回收前先让 TU 清空悬空指针 */
+        if (t->tu)
+            t->tu(t, NULL, TXN_EV_TERMINATED, t->ud);
         t_remove_hash(t);
         break;
     default:

@@ -15,7 +15,7 @@
  *   [hdr][payload psize(16 对齐)][debug guard 16B] */
 typedef struct mem_blk {
     uint32_t magic;
-    uint32_t psize;
+    size_t psize;   /* P2-16：size_t，避免 arena ≥4GB 时静默截断 */
     int used;
     struct mem_blk *p_phys;
     struct mem_blk *n_phys;
@@ -133,7 +133,7 @@ nsbc_rc_t mem_arena_create(const mem_arena_cfg_t *cfg, mem_arena_t **out)
 
     mem_blk_t *b = (mem_blk_t *)a->base;
     b->magic = MEM_HDR_MAGIC;
-    b->psize = (uint32_t)(a->bytes - MEM_HDR_SIZE - (size_t)g);
+    b->psize = a->bytes - MEM_HDR_SIZE - (size_t)g;
     b->used = 0;
     b->p_phys = b->n_phys = NULL;
     b->free_next = NULL;
@@ -189,13 +189,13 @@ void *mem_arena_alloc(mem_arena_t *a, size_t n)
     /* 切分：剩余部分能再容纳一个最小块才切；否则整块交出（保留
      * psize，尾部少量 slack 随块走，不丢字节）。 */
     if (b->psize - need >= MEM_HDR_SIZE + (size_t)g + MEM_ALIGN) {
-        uint32_t rem = (uint32_t)(b->psize - need - MEM_HDR_SIZE - (size_t)g);
+        size_t rem = b->psize - need - MEM_HDR_SIZE - (size_t)g;
         mem_blk_t *r = (mem_blk_t *)(payload_of(b) + need + g);
         /* sanity：新块必须完全在 arena 范围内 */
         uint8_t *r_end = (uint8_t *)r + MEM_HDR_SIZE + (size_t)g + rem;
         if (r_end > a->base + a->bytes) {
             /* 不应发生 —— 防御性：放弃切分，整块交出 */
-            b->psize = (uint32_t)need;
+            b->psize = need;
         } else {
             r->magic = MEM_HDR_MAGIC;
             r->psize = rem;
@@ -208,7 +208,7 @@ void *mem_arena_alloc(mem_arena_t *a, size_t n)
             r->free_next = NULL;
             guard_fill(a, r);
             fl_push(a, r);
-            b->psize = (uint32_t)need;
+            b->psize = need;
         }
     }
 
@@ -261,7 +261,7 @@ void mem_arena_free(mem_arena_t *a, void *p)
         n->magic == MEM_HDR_MAGIC &&
         (uint8_t *)n >= a->base && (uint8_t *)n < a->base + a->bytes) {
         fl_unlink(a, n);
-        b->psize += (uint32_t)(MEM_HDR_SIZE + (size_t)g + n->psize);
+        b->psize += MEM_HDR_SIZE + (size_t)g + n->psize;
         b->n_phys = n->n_phys;
         if (n->n_phys)
             n->n_phys->p_phys = b;
@@ -273,7 +273,7 @@ void mem_arena_free(mem_arena_t *a, void *p)
         pr->magic == MEM_HDR_MAGIC &&
         (uint8_t *)pr >= a->base && (uint8_t *)pr < a->base + a->bytes) {
         fl_unlink(a, pr);
-        pr->psize += (uint32_t)(MEM_HDR_SIZE + (size_t)g + b->psize);
+        pr->psize += MEM_HDR_SIZE + (size_t)g + b->psize;
         pr->n_phys = b->n_phys;
         if (b->n_phys)
             b->n_phys->p_phys = pr;

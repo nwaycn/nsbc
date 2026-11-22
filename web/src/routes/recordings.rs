@@ -1,14 +1,14 @@
 //! Recording-related routes:
 //!   GET /api/v1/recordings        — paginated list (protected by RBAC, L0 read-only)
-//!   GET /recordings/*path         — public file download (HTML5 <audio> cannot carry JWT)
+//!   GET /recordings/*path         — file download (RBAC-protected; browser sends the
+//!                                   JWT and plays the response as a Blob)
 //!
 //! File download route security:
 //!   1) Root directory decided by config `recording.path` (default `/var/lib/nsbc/recordings`)
 //!   2) `..` components are stripped from the URL `*path` to prevent directory traversal
 //!   3) After canonicalization, the path must still be within the root directory or 403
 //!   4) Non .wav / .g711a / .pcm extensions directly return 403 (only allow recording files)
-//!   5) CSP must allow audio loading (img-src already covers data:; audio-src inherits
-//!      default-src by default)
+//!   5) Error bodies never echo absolute paths (generic 404 / 500 only)
 //!
 //! Recording file naming: nsbcd recording_stop writes to cfg recording.path;
 //! path format decided by `rec_path_template` (default {caller}-{callee}-{callid}.wav
@@ -89,18 +89,22 @@ async fn list_recordings<C: CoreApi + Clone + 'static>(
 }
 
 // ============================================================
-// Public file download (no RBAC)
+// File download (RBAC-protected)
 // ============================================================
 
-/// Recordings file download — **public, no auth required**.
-/// Mounted at top-level router (NOT inside protected RBAC layer), so browsers
-/// can hit `/recordings/*path` directly without a Bearer token.
-pub fn public_file_router<C>(state: Arc<AppState<C>>) -> Router
+/// Recordings file download — **requires a valid Web JWT** (RBAC L0 read-only).
+/// The browser fetches this with `Authorization: Bearer <jwt>` and plays the
+/// response through a Blob object URL, so the token never appears in the URL.
+pub fn protected_file_router<C>(state: Arc<AppState<C>>) -> Router
 where
     C: CoreApi + Clone + 'static,
 {
     Router::new()
         .route("/recordings/*path", get(download_recording::<C>))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::middleware::rbac::require_auth::<C>,
+        ))
         .with_state(state)
 }
 
@@ -119,24 +123,24 @@ async fn download_recording<C: CoreApi + Clone + 'static>(
     // 0) Pre-check the root directory exists (fail early with a clear error, don't wait
     //    for a later canonicalize on a file that's not there)
     if !root.exists() || !root.is_dir() {
+        tracing::warn!(path = %root.display(), "recording root missing");
         return (
             StatusCode::NOT_FOUND,
-            [
-                (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
-                (header::CONTENT_DISPOSITION,
-                 "inline; filename=\"error.txt\""),
-            ],
-            format!("recording root not found: {}", root.display()),
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            "recording not found",
         )
             .into_response();
     }
     let root_canon = match root.canonicalize() {
         Ok(p) => p,
-        Err(_) => return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-            "recording root resolve failed",
-        ).into_response(),
+        Err(e) => {
+            tracing::warn!(path = %root.display(), err = %e, "recording root resolve failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                "recording not found",
+            ).into_response();
+        }
     };
 
     // 1) Whitelist extension check
@@ -205,15 +209,14 @@ async fn download_recording<C: CoreApi + Clone + 'static>(
     // but we want a clear error with the safe_rel path (not full which may contain
     // internal symlinks).
     if !full.exists() {
-        let msg = format!(
-            "file not found on disk: {}/{} (root={})",
-            root.display(), safe_rel, root_canon.display()
+        tracing::warn!(
+            rel = %rel, safe_rel = %safe_rel, root = %root.display(),
+            "recording download 404"
         );
-        tracing::warn!(%msg, "recording download 404");
         return (
             StatusCode::NOT_FOUND,
             [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-            msg,
+            "recording not found",
         ).into_response();
     }
 
@@ -224,7 +227,7 @@ async fn download_recording<C: CoreApi + Clone + 'static>(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-                format!("resolve failed: {}", full.display()),
+                "recording not found",
             ).into_response();
         }
     };
@@ -244,7 +247,7 @@ async fn download_recording<C: CoreApi + Clone + 'static>(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-                format!("read failed: {}", canon.display()),
+                "recording not found",
             ).into_response();
         }
     };

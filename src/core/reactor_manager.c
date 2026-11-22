@@ -70,6 +70,10 @@ static void *reactor_thread_fn(void *arg)
     reactor_t *r = mgr->reactors[rid];
     if (!r) return NULL;
 
+    /* P1-9：把 owner 绑定到真实 loop 线程。此后其他线程（含 main）
+     * 对 reactor[rid] 的 reactor_call 一律走任务队列，不再内联改写 slots。 */
+    reactor_bind_owner_current(r);
+
     /* reactor_wait 入口设置 task_started=1 和 wait_active=1。
      * 超时 1000ms 无 ticker 时间轮耦合——无超时事件时保持低 CPU 占用。 */
     while (!reactor_stopping(r)) {
@@ -92,6 +96,10 @@ static void *reactor_thread_fn(void *arg)
      * reactor_destroy 统一由 reactor_mgr_destroy 在 main 线程执行，
      * 此时 modmgr_stop_all 已完成，rtp_relay_stop 的 reactor_call
      * 不会再触达这些 reactor。 */
+    /* P1-9：标记 loop 退出并恢复 owner=创建者（main）。此后 main 的
+     * reactor_call 一律内联执行，不会投进无人消费的队列导致永久阻塞。
+     * 置位前已入队的任务由 reactor_mark_loop_exited 内部兜底消费。 */
+    reactor_mark_loop_exited(r);
     log_info("core", "reactor[%u] thread exited (drained, reactor kept for manager destroy)", rid);
     return NULL;
 }

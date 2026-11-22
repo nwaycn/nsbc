@@ -5,9 +5,11 @@
 //! token 原文只在创建时显示一次，DB 存 SHA-256 hash。
 //!
 //! 免鉴权短路 (REQ-EXT-API-004):
-//!   源 IP 127.0.0.1 / ::1 / Unix Domain Socket peer → 跳过 Bearer 检查，
-//!   自动注入 admin scope 的 localhost claims。本机脚本/CLI 直连无需配置任何 Key。
-//!   **跨机器调用仍必须 Bearer Token** —— 只有 loopback 是隐式信任边界。
+//!   默认 **关闭**（`require_loopback_auth: true`）：源 IP 127.0.0.1 / ::1 同样必须
+//!   携带 Bearer API Key。这是安全边界——反代场景下远端请求经过代理后 peer 也是
+//!   loopback，若默认放行等于对公网免鉴权。
+//!   仅在完全可信的单机部署中，可显式设 `web.ext.require_loopback_auth: false`
+//!   让本机脚本/CLI 直连免 Key（此时自动注入 admin scope 的 localhost claims）。
 //!
 //! Scope 分级:
 //!   readonly  → GET 监控类（calls / registrations / cdrs / system）
@@ -77,18 +79,18 @@ pub struct ExtKeyClaims {
 }
 
 /// Middleware: 从 Authorization: Bearer <key> 提取 API Key → 查 DB → 注入 extension
-/// REQ-EXT-API-004: loopback 本机请求默认免鉴权，自动注入 localhost+admin claims。
-/// 运维可通过 `web.ext.require_loopback_auth: true` 强制 loopback 也走 Bearer 检查
-/// （反代场景必须开 —— 反代过来的请求 peer 就是 127.0.0.1）。
+/// REQ-EXT-API-004: 默认 loopback 也必须 Bearer 鉴权（安全边界，反代部署必须保持）。
+/// 仅当运维显式设 `web.ext.require_loopback_auth: false` 时，127.0.0.1 / ::1
+/// 才跳过检查并自动注入 localhost+admin claims。
 pub async fn require_ext_key<C: crate::coreclient::CoreApi + Clone + 'static>(
     State(st): State<Arc<AppState<C>>>,
     mut req: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    // ─── REQ-EXT-API-004: loopback 本机请求免鉴权 ───
-    // 默认：127.0.0.1 / ::1 自动注入 admin claims，本机脚本零摩擦。
-    // 反代部署（nginx → 127.0.0.1:8443）：必须在 yaml 设 web.ext.require_loopback_auth: true
-    // 否则反代过来的远程请求 peer 也是 127.0.0.1，全部触发免鉴权。
+    // ─── REQ-EXT-API-004: loopback 免鉴权仅在显式关闭时生效 ───
+    // 默认 require_loopback_auth=true，loopback 同样走 Bearer 检查。
+    // 反代部署（nginx → 127.0.0.1:8443）：必须保持 true，否则反代过来的远程请求
+    // peer 也是 127.0.0.1，会全部触发免鉴权。
     let is_local = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()

@@ -100,8 +100,11 @@ const API = {
               localStorage.setItem('nsbc_token', rd.access_token);
               if (rd.refresh_token) localStorage.setItem('nsbc_refresh_token', rd.refresh_token);
               try { window.__auth && (window.__auth.token = rd.access_token); } catch(_) {}
-              // 重放原Request（token 已Update）
-              const retryRes = await fetch(this.base + path, opts);
+              // 重放原Request（token 已Update，必须用新 token 重建 headers）
+              const retryOpts = Object.assign({}, opts, {
+                headers: this.headers(opts.body !== undefined),
+              });
+              const retryRes = await fetch(this.base + path, retryOpts);
               if (retryRes.status === 401) {
                 localStorage.clear();
                 location.hash = '#/login';
@@ -1426,14 +1429,14 @@ function crudTable(entity, path, columns, formSchema, asyncLoaders = null) {
         catch (e) { ElMessage.error('Delete failed: ' + e.message); }
       }
 
+      const onTenantChanged = () => { load(); };
       onMounted(() => {
         load(); loadAsyncOptions();
         // 监听Tenant切换，自动重新加载Current实体列表
-        const onTenantChanged = () => { load(); };
         window.addEventListener('nsbc-tenant-changed', onTenantChanged);
-        onBeforeUnmount(() => {
-          window.removeEventListener('nsbc-tenant-changed', onTenantChanged);
-        });
+      });
+      onBeforeUnmount(() => {
+        window.removeEventListener('nsbc-tenant-changed', onTenantChanged);
       });
       watch([page, limit, filterEnabled], load);
 
@@ -1498,7 +1501,7 @@ function livePanel(title, icon, columns, apiPath, opts = {}) {
                 </template>
                 <template v-else>-</template>
               </td>
-              <td v-if="actionCol" class="px-3 py-2 sticky right-0 bg-white border-l">
+              <td v-if="actionCol" class="px-3 py-2 sticky right-0 bg-white border-l" @click="handleRowAction">
                 <span v-html="actionCol(row)"></span>
               </td>
             </tr>
@@ -1609,7 +1612,26 @@ function livePanel(title, icon, columns, apiPath, opts = {}) {
         clearTimeout(refreshTimer);
         document.removeEventListener('nsbc-refresh', scheduleRefresh);
       });
-      return { allRows, filteredRows, loading, error, lastUpdated, load, columns, icon, currentPage, totalPages, pagedRows, actionCol, searchKeyword };
+      // Delegated click handler for v-html action buttons: the Call-ID only ever travels
+      // through a percent-encoded data attribute, never as inline JS.
+      function handleRowAction(ev) {
+        const btn = ev.target && ev.target.closest ? ev.target.closest('button[data-act]') : null;
+        if (!btn) return;
+        let callId = '';
+        try { callId = decodeURIComponent(btn.getAttribute('data-call-id') || ''); } catch { return; }
+        if (!callId) return;
+        const act = btn.getAttribute('data-act');
+        if (act === 'hangup') window.nsbcHangup(callId);
+        else if (act === 'play') window.nsbcPlayPrompt(callId);
+        else if (act === 'stop') window.nsbcPlaybackStop(callId);
+        else if (act === 'status') {
+          window.nsbcPlaybackStatus(callId).then((s) => {
+            if (s) ElMessage.success('active=' + s.active + ' side=' + s.side + ' loop=' + s.loop);
+            else ElMessage.info('not playing');
+          });
+        }
+      }
+      return { allRows, filteredRows, loading, error, lastUpdated, load, columns, icon, currentPage, totalPages, pagedRows, actionCol, searchKeyword, handleRowAction };
     },
   };
 }
@@ -1617,7 +1639,7 @@ function livePanel(title, icon, columns, apiPath, opts = {}) {
 // 所有 const / function 在经典 script 标签间自动Total享全局词法作用域，
 // 后续 pages-crud.js / pages-live.js 可直接使用 app, crudTable, livePanel, API 等。
 
-// ===== 全局Hang up函数（livePanel actionCol 用 v-html + onclick 调） =====
+// ===== 全局Hang up函数（livePanel actionCol 通过事件委托调） =====
 window.nsbcHangup = async function(callId) {
   if (!callId) return;
   try { await ElMessageBox.confirm(t('Confirm hang up call ') + callId + '?', t('Confirm'), { type: 'warning' }); }
@@ -1653,6 +1675,16 @@ window.nsbcPlaybackStop = async function(callId) {
   } catch (e) {
     ElMessage.error('Playback stop failed: ' + (e.message || e));
   }
+};
+
+window.nsbcPlayPrompt = async function(callId) {
+  if (!callId) return;
+  try {
+    const r = await window.ElMessageBox.prompt(t('WAV path or chain (| sep)'), '', { inputValue: 'welcome.wav' });
+    const wav = r && r.value;
+    if (!wav) return;
+    await window.nsbcPlayback(callId, wav, -1, 0);
+  } catch { /* user cancelled */ }
 };
 
 window.nsbcPlaybackStatus = async function(callId) {

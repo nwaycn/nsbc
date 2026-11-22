@@ -49,13 +49,13 @@ impl Default for WebSection {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ExtSection {
-    /// true → 127.0.0.1 / ::1 也必须 Bearer Token（反代部署强制开）
-    /// false (默认) → loopback 免鉴权，本机脚本零摩擦
+    /// true (默认) → 127.0.0.1 / ::1 也必须 Bearer Token（安全边界；反代部署必须保持 true）
+    /// false → 显式关闭后 loopback 免鉴权，仅限可信单机部署自行承担风险
     pub require_loopback_auth: bool,
 }
 
 impl Default for ExtSection {
-    fn default() -> Self { Self { require_loopback_auth: false } }
+    fn default() -> Self { Self { require_loopback_auth: true } }
 }
 
 #[derive(Debug, Clone, Deserialize)]

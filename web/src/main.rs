@@ -132,8 +132,8 @@ pub struct AppState<C: CoreApi + Clone> {
     /// absolute paths or filenames that C-side player resolves from its own
     /// sounds directory — we keep both in sync by setting the same path.
     pub sounds_root: std::path::PathBuf,
-    /// REQ-EXT-API-004: true → 即使 127.0.0.1 / ::1 也必须 Bearer Token。
-    /// 默认 false（本机脚本零摩擦）；反代部署必须开（否则反代进来的远程请求 peer 就是 loopback）。
+    /// REQ-EXT-API-004: true → 即使 127.0.0.1 / ::1 也必须 Bearer Token（默认，安全边界）。
+    /// 仅显式设为 false 才允许 loopback 免鉴权（反代部署必须保持 true）。
     pub require_loopback_auth: bool,
     /// C→Web data.sock channel established (set true on UDS connect to let poller skip
     /// polling). Two tasks (uds_server accept loop + poller interval loop) live across
@@ -229,13 +229,14 @@ fn ext_router<C: CoreApi + Clone + 'static>(st: Arc<AppState<C>>) -> Router {
 fn app_router<C: CoreApi + Clone + 'static>(state: Arc<AppState<C>>) -> Router {
     // Security response headers layer (OWASP baseline, compatible with Vue 3 compile-time
     // template eval). Vue 3 global build uses new Function() for template compilation →
-    // script-src must be 'unsafe-eval'. Cross-Origin-Opener-Policy only takes effect on
-    // HTTPS; on HTTP Chrome silently ignores and warns → removed.
+    // script-src must be 'unsafe-eval'. inline scripts + style attributes in index.html
+    // still require 'unsafe-inline'. media-src adds blob: because recordings are fetched
+    // with Authorization and played via URL.createObjectURL(blob).
     let csp = "default-src 'self'; \
         script-src 'self' 'unsafe-inline' 'unsafe-eval'; \
         style-src 'self' 'unsafe-inline'; \
         img-src 'self' data:; \
-        media-src 'self'; \
+        media-src 'self' blob:; \
         font-src 'self'; \
         connect-src 'self' ws: wss: stun: stuns:; \
         frame-ancestors 'none'; \
@@ -246,7 +247,7 @@ fn app_router<C: CoreApi + Clone + 'static>(state: Arc<AppState<C>>) -> Router {
         .nest("/api/v1", api_router(state.clone()))
         .nest("/ext/v1", ext_router(state.clone()))
         .nest("/ws", ws::router::<C>(state.clone()))  // REQ-AI-WS-001: /ws/ai-media/:call_id — 内部自验 token
-        .merge(routes::recordings::public_file_router(state.clone()))  // ← 顶层直挂 /recordings/*，不走 /api/v1 前缀
+        .merge(routes::recordings::protected_file_router(state.clone()))  // ← /recordings/*（JWT 鉴权）
         .route("/health", axum::routing::get(routes::system::health))
         .merge(static_files::router());
 
@@ -474,6 +475,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load configuration (env > file > defaults)
     let cfg = config::WebConfig::load(config_path)?;
     let bind: SocketAddr = cfg.bind_addr()?;
+
+    // 安全边界提示：非 loopback 监听 + 关闭 loopback 鉴权 = 任何来源都可免 Key 调用 /ext/v1。
+    if !bind.ip().is_loopback() && !cfg.web.ext.require_loopback_auth {
+        tracing::warn!(
+            %bind,
+            "web.ext.require_loopback_auth=false while listening on a non-loopback address; \
+             all /ext/v1 requests bypass API Key authentication — set require_loopback_auth: true \
+             unless this deployment is fully trusted"
+        );
+    }
 
     // TLS certificates: auto-generate self-signed / explicit PEM / public ACME (certmagic)
     let tls_source = if cfg.web.tls.enabled {

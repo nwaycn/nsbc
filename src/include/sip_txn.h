@@ -64,7 +64,12 @@ typedef enum {
     TXN_EV_PROVISIONAL,       /* 客户端：1xx */
     TXN_EV_FINAL,             /* 客户端：2xx~699 */
     TXN_EV_TIMEOUT,           /* B/F/H 超时 */
-    TXN_EV_TRANSPORT_ERR
+    TXN_EV_TRANSPORT_ERR,
+    /* P1-13：事务在 Timer D/I/J/K（已完成/已确认后的静默回收）到点、
+     * 即将从哈希表移除并可能释放时通知 TU。B2BUA 借此清空 leg 中
+     * 仍指向本事务的裸指针，避免 detach_txn 命中已复用的事务对象。
+     * 该事件下 m==NULL，TU 不得发送消息。 */
+    TXN_EV_TERMINATED
 } txn_event_t;
 
 /* TU 回调在分片锁外调用；m 为触发消息（响应/ACK），可能为 NULL（超时） */

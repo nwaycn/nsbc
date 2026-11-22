@@ -121,6 +121,20 @@ fn valid_call_id(id: &str) -> bool {
         && id.bytes().all(|b| (0x21..=0x7e).contains(&b))
 }
 
+/// Command-argument whitelist: ASCII alphanumeric plus path/URI punctuation.
+/// Rejects whitespace (including CR/LF), NUL and any other control character before
+/// the value is concatenated into the line-text UDS command. `extra` allows
+/// operation-specific characters (e.g. `|` for playback chains).
+fn valid_cmd_arg(s: &str, max_len: usize, extra: &[char]) -> bool {
+    !s.is_empty()
+        && s.len() <= max_len
+        && s.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '@' | '.' | ':' | '-' | '_' | '+' | '/' | '\\')
+                || extra.contains(&c)
+        })
+}
+
 /// Generic L2 action success response (shared by all uuid_* write operations).
 #[derive(Debug, Serialize)]
 struct ActionResponse {
@@ -281,8 +295,10 @@ async fn broadcast<C: CoreApi + Clone + 'static>(
     if !valid_call_id(&id) {
         return Err(ApiError::BadRequest("invalid call id".into()));
     }
-    if body.wav_path.is_empty() || body.wav_path.len() > 512 {
-        return Err(ApiError::BadRequest("invalid wav_path".into()));
+    if !valid_cmd_arg(&body.wav_path, 512, &['|']) {
+        return Err(ApiError::BadRequest(
+            "invalid wav_path (allowed: alnum @ . : - _ + / \\ |)".into(),
+        ));
     }
     st.core.call_action(&id, "broadcast", &[&body.wav_path]).await?;
     Ok(action_response(&id))
@@ -339,7 +355,7 @@ struct PlaybackBody {
 }
 
 fn valid_playback_wav(w: &str) -> bool {
-    !w.is_empty() && w.len() <= 1024
+    valid_cmd_arg(w, 1024, &['|'])
 }
 
 async fn playback<C: CoreApi + Clone + 'static>(
@@ -432,8 +448,10 @@ async fn transfer<C: CoreApi + Clone + 'static>(
     if !valid_call_id(&id) {
         return Err(ApiError::BadRequest("invalid call id".into()));
     }
-    if body.dest.is_empty() || body.dest.len() > 512 {
-        return Err(ApiError::BadRequest("invalid dest".into()));
+    if !valid_cmd_arg(&body.dest, 512, &[]) {
+        return Err(ApiError::BadRequest(
+            "invalid dest (allowed: alnum @ . : - _ + / \\ )".into(),
+        ));
     }
     st.core.call_action(&id, "transfer", &[&body.dest]).await?;
     Ok(action_response(&id))
@@ -460,7 +478,7 @@ async fn record<C: CoreApi + Clone + 'static>(
     match act.as_str() {
         "start" => {
             let path = body.path
-                .filter(|p| !p.is_empty() && p.len() <= 512)
+                .filter(|p| valid_cmd_arg(p, 512, &[]))
                 .ok_or_else(|| ApiError::BadRequest("path required for start".into()))?;
             st.core.call_action(&id, "record", &["start", &path]).await?;
         }
