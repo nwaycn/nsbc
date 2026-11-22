@@ -229,8 +229,16 @@ int cq_remove(cc_mgr_t *m, const char *tenant, const char *name)
 
 const cq_queue_t *cq_get(cc_mgr_t *m, const char *tenant, const char *name)
 {
-    cq_slot_t *s = slot_find(m, tenant, name);
-    return s == NULL ? NULL : &s->q;
+    const cq_queue_t *q = NULL;
+    if (m == NULL || name == NULL) return NULL;
+    /* reload 会 swap-remove slots：查找必须持 cq_lock，避免读到被搬移的槽 */
+    pthread_mutex_lock(&m->cq_lock);
+    {
+        cq_slot_t *s = slot_find(m, tenant, name);
+        if (s != NULL) q = &s->q;
+    }
+    pthread_mutex_unlock(&m->cq_lock);
+    return q;
 }
 
 /* 取最高优先级、尚未派发的 waiter（dispatch_ms==0）。
@@ -1319,12 +1327,14 @@ void cq_stats(cc_mgr_t *m, const char *tenant, const char *name,
     const cq_slot_t *s;
     if (m == NULL || out == NULL)
         return;
+    pthread_mutex_lock(&m->cq_lock);
     s = slot_find(m, tenant, name);
     if (s == NULL) {
         memset(out, 0, sizeof(*out));
-        return;
+    } else {
+        *out = s->st;   /* 持锁快照，避免 reload 搬移/清空时读到半更新 */
     }
-    *out = s->st;
+    pthread_mutex_unlock(&m->cq_lock);
 }
 
 /* ==================================================================

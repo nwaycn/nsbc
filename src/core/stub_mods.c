@@ -99,8 +99,10 @@ int  rec_feed_raw(rec_sess_t *s, int leg, const void *payload, size_t len,
  * ====================================================================== */
 
 static pthread_mutex_t g_reload_lock = PTHREAD_MUTEX_INITIALIZER;
-static route_table_t *g_rt_old[2];
-static dp_table_t *g_dp_old[2];
+/* 保留三代：连续 3 次 reload 时仍在途的旧表不会被提前 destroy（读写者可能持有 2 代前指针） */
+#define STUB_OLD_GENS 3
+static route_table_t *g_rt_old[STUB_OLD_GENS];
+static dp_table_t *g_dp_old[STUB_OLD_GENS];
 static int g_rt_old_idx;
 static int g_dp_old_idx;
 
@@ -460,7 +462,7 @@ int trunk_table_reload_json(const char *json, char *out_err, size_t err_sz)
         __atomic_exchange_n(&ctx->rt, nrt, __ATOMIC_ACQ_REL);
     route_table_t *dead = g_rt_old[g_rt_old_idx];
     g_rt_old[g_rt_old_idx] = prev;
-    g_rt_old_idx ^= 1;
+    g_rt_old_idx = (g_rt_old_idx + 1) % STUB_OLD_GENS;
     pthread_mutex_unlock(&g_reload_lock);
     if (dead)
         rt_destroy(dead);
@@ -912,7 +914,7 @@ int dp_rules_reload_json(const char *json, char *out_err, size_t err_sz)
     }
     dp_table_t *dead = g_dp_old[g_dp_old_idx];
     g_dp_old[g_dp_old_idx] = prev;
-    g_dp_old_idx ^= 1;
+    g_dp_old_idx = (g_dp_old_idx + 1) % STUB_OLD_GENS;
     pthread_mutex_unlock(&g_reload_lock);
     if (dead)
         dp_table_free(dead);
@@ -949,14 +951,14 @@ int gw_table_reload_json(const char *json, char *out_err, size_t err_sz)
 
 /* ---- fini 清理：drain reload 链留下的两代 route_table / dp_table ----
  *
- * reload 用"两代保留"（g_rt_old[2] / g_dp_old[2]）：当前代换表后上一代存
- * g_rt_old[idx]，等下次 reload 才 destroy 上上代。进程退出时如果只 reload
- * 过 0-1 次，g_rt_old[] 里还有活着的表没人 destroy → LSan 泄漏 22MB。
+ * reload 用"三代保留"（g_rt_old[STUB_OLD_GENS] / g_dp_old[STUB_OLD_GENS]）：
+ * 当前代换表后上一代存 g_rt_old[idx]，再过 STUB_OLD_GENS-1 次 reload 才 destroy。
+ * 进程退出时若 reload 次数不足，g_rt_old[] 里还有活表没人 destroy → LSan 泄漏。
  * main.c fini 在 modmgr_fini_all 之后调本函数，统一 drain 所有残留。 */
 void stub_mods_reload_fini(void)
 {
     pthread_mutex_lock(&g_reload_lock);
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < STUB_OLD_GENS; ++i) {
         if (g_rt_old[i]) {
             rt_destroy(g_rt_old[i]);
             g_rt_old[i] = NULL;

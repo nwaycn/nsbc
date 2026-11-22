@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -240,7 +241,11 @@ func runTransportLoop(udsPath, sseUrl, apiToken, topics, transport, webhookURL s
 		defer client.Close()
 		banner(fmt.Sprintf("[transport=SSE, url=%s — Ctrl-C to quit]", sseUrl))
 		rawCh := make(chan nsbc_sdk.SseEvent, 64)
-		go client.IterEvents(rawCh)
+		// P2-17：IterEvents 内部是无限重连循环，必须用可取消的 ctx，
+		// 否则退出时生产 goroutine 无法回收。
+		sseCtx, sseCancel := context.WithCancel(context.Background())
+		defer sseCancel()
+		go client.IterEventsCtx(sseCtx, rawCh)
 		go func() {
 			for ev := range rawCh {
 				if f := nsbc_sdk.SseEventToFrame(ev); f != nil {

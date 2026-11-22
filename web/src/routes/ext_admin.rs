@@ -205,36 +205,32 @@ async fn create_ext_key<C: crate::coreclient::CoreApi + Clone + 'static>(
     let raw_key = format!("nsbc_live_{}", hex_encode(&random));
     let key_hash = hash_key(&raw_key);
 
-    // INSERT — 分 backend：postgres RETURNING，sqlite/mysql 无 RETURNING，之后单独查 id
+    // INSERT — 分 backend：postgres/sqlite 用 RETURNING 拿 id；MySQL 用本次执行的 last_insert_id
     let sql = match backend {
         "postgres" =>
             "INSERT INTO ext_api_keys (key_hash, label, scope) VALUES ($1, $2, $3) RETURNING id",
+        "sqlite" =>
+            "INSERT INTO ext_api_keys (key_hash, label, scope) VALUES (?, ?, ?) RETURNING id",
         _ =>
             "INSERT INTO ext_api_keys (key_hash, label, scope) VALUES (?, ?, ?)",
     };
 
     let id: i64 = match backend {
-        "postgres" => sqlx::query_as::<_, (i64,)>(sql)
+        "postgres" | "sqlite" => sqlx::query_as::<_, (i64,)>(sql)
             .bind(&key_hash).bind(&body.label).bind(&body.scope)
             .fetch_one(pool).await
             .map_err(|e| { tracing::error!("create_ext_key insert error: {e}");
                 ApiError::Db("insert failed".into()) })?
             .0,
         _ => {
-            sqlx::query(sql)
+            // LAST_INSERT_ID() 是连接级的：从本次 execute 的 Result 取，避免换连接查错 id
+            let res = sqlx::query(sql)
                 .bind(&key_hash).bind(&body.label).bind(&body.scope)
                 .execute(pool).await
                 .map_err(|e| { tracing::error!("create_ext_key insert error: {e}");
                     ApiError::Db("insert failed".into()) })?;
-            // SQLite: last_insert_rowid(), MySQL: LAST_INSERT_ID()
-            let (v,): (i64,) = if backend == "mysql" {
-                sqlx::query_as("SELECT LAST_INSERT_ID()").fetch_one(pool).await
-                    .map_err(|_| ApiError::Db("id lookup failed".into()))?
-            } else {
-                sqlx::query_as("SELECT last_insert_rowid()").fetch_one(pool).await
-                    .map_err(|_| ApiError::Db("id lookup failed".into()))?
-            };
-            v
+            res.last_insert_id()
+                .ok_or_else(|| ApiError::Db("insert id unavailable".into()))?
         }
     };
 

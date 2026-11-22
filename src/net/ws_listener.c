@@ -65,12 +65,17 @@
 #define WS_READ_BUF_MAX (WS_MAX_PAYLOAD + 14 + 512)
 #define WS_SEND_QUEUE_CAP  8                  /* 每 conn 发送队列容量 */
 
+/* P2-2：TLS 握手（非阻塞）超时与并发上限 */
+#define WS_TLS_HS_TIMEOUT_MS  5000
+#define WS_TLS_HS_MAX         256
+
 /* ==== WS 连接状态机 ==== */
 typedef enum {
     CS_HANDSHAKE = 0,   /* HTTP upgrade 解析中 */
     CS_READ_FRAME,      /* WS frame 头部 + payload 读取中 */
     CS_PENDING_TXN,     /* 有发送队列等 flush */
-    CS_CLOSING          /* CLOSE 帧已发/已收，等收尾 */
+    CS_CLOSING,         /* CLOSE 帧已发/已收，等收尾 */
+    CS_TLS_HANDSHAKE    /* P2-2：TLS 握手进行中（非阻塞，由 epoll 驱动） */
 } ws_conn_state_t;
 
 /* ==== 发送队列项 ==== */
@@ -121,6 +126,8 @@ typedef struct ws_conn {
     void          *ssl;
     void          *rbio;
     int            tls_want;
+    uint64_t       tls_deadline_ms; /* P2-2：握手截止时间（ms）；0=非握手态 */
+    int            hs_counted;      /* P2-2：1=已计入 tls_hs_active，防重复扣减 */
 
     /* WebSocket ping/pong (RFC 6455 §5.5.2) — idle conn detection
      * Proxy idle timeout (Nginx/HAProxy 60-300s) silently drops WSS TCP
@@ -208,9 +215,21 @@ typedef struct {
 
     int          worker_count;
     ws_worker_t *workers;
+
+    /* P2-2：当前处于 TLS 握手中的连接数（__atomic_* 维护） */
+    volatile int tls_hs_active;
 } ws_state_t;
 
 static ws_state_t g_ws = { .listen_fd = -1, .stop_flag = 0 };
+
+/* P2-2：释放一个握手并发槽（幂等，任意关闭路径都可调用） */
+static void ws_hs_release(ws_conn_t *c)
+{
+    if (c->hs_counted) {
+        c->hs_counted = 0;
+        __atomic_fetch_sub(&g_ws.tls_hs_active, 1, __ATOMIC_RELAXED);
+    }
+}
 
 /* epoll 事件批量数组（一次 epoll_wait 最多取这么多） */
 #define WS_EPOLL_BATCH  256
@@ -484,6 +503,39 @@ static int ws_flush_send_queue(ws_conn_t *c)
 
 /* ==== 状态机主循环（worker 每次 EPOLLIN/EPOLLOUT 触发调用）==== */
 /* 返回 0=继续, -1=应关闭 */
+/* P2-2：非阻塞 TLS 握手推进。
+ * 返回 1=握手完成（可继续处理本次 events）；0=等待下次 epoll 事件；-1=失败需关闭。*/
+static int ws_tls_handshake_step(ws_conn_t *c, int events)
+{
+    (void)events;
+    if (!c->ssl) return -1;
+#ifdef NSBC_WITH_OPENSSL
+    int rc = SSL_do_handshake((SSL *)c->ssl);
+    if (rc == 1) {
+        c->tls_deadline_ms = 0;
+        ws_hs_release(c);
+        c->state = CS_HANDSHAKE;
+        c->tls_want = 0;
+        return 1;
+    }
+    int err = SSL_get_error((SSL *)c->ssl, rc);
+    if (err == SSL_ERROR_WANT_READ)  { c->tls_want = 1; return 0; }
+    if (err == SSL_ERROR_WANT_WRITE) { c->tls_want = 2; return 0; }
+
+    {
+        unsigned long e = ERR_get_error();
+        char err_buf[256];
+        ERR_error_string_n(e, err_buf, sizeof(err_buf));
+        /* P0-3：TLS 失败直接断开，绝不降级明文 */
+        llog(LOG_WARN, "ws", "TLS handshake fail: err=%d %s — dropping peer (no plain fallback)",
+             err, err_buf);
+    }
+    return -1;
+#else
+    return -1;
+#endif
+}
+
 static int ws_conn_step(ws_conn_t *c, int events)
 {
     /* 先处理发送（EPOLLOUT）*/
@@ -632,7 +684,7 @@ static int ws_conn_step(ws_conn_t *c, int events)
 
                 /* PING — 回 PONG (already reset pongs_missed above) */
                 if (opcode == WS_OP_PING) {
-                    uint8_t pong[14];
+                    uint8_t pong[10];
                     size_t phdr = 0;
                     pong[phdr++] = 0x80 | WS_OP_PONG;
                     pong[phdr++] = 0x00;
@@ -643,6 +695,11 @@ static int ws_conn_step(ws_conn_t *c, int events)
                             pong[1] = 126;
                             pong[phdr++] = (uint8_t)(frame_plen >> 8);
                             pong[phdr++] = (uint8_t)(frame_plen & 0xff);
+                        } else {
+                            /* >64KB：必须写 8 字节扩展长度，否则 length 字段为 0 */
+                            pong[1] = 127;
+                            for (int k = 7; k >= 0; --k)
+                                pong[phdr++] = (uint8_t)((uint64_t)frame_plen >> (k * 8));
                         }
                     }
                     ws_send_item_t item;
@@ -692,6 +749,13 @@ done_read:
 /* ==== Worker epoll 事件掩码计算 ==== */
 static int ws_calc_epoll_events(ws_conn_t *c)
 {
+    /* P2-2：握手态只关心读，或 SSL_do_handshake 要求可写时关心写 */
+    if (c->state == CS_TLS_HANDSHAKE) {
+        uint32_t hev = EPOLLRDHUP;
+        hev |= (c->tls_want == 2) ? EPOLLOUT : EPOLLIN;
+        return (int)hev;
+    }
+
     uint32_t ev = 0;
     pthread_mutex_lock(&c->send_mtx);
     int need_flush = (c->send_q_count > 0);
@@ -725,6 +789,7 @@ static void ws_close_conn(int epfd, ws_conn_t *c)
     c->close_notified = 1;
 
     epoll_ctl(epfd, EPOLL_CTL_DEL, c->fd, NULL);
+    ws_hs_release(c);   /* P2-2：任何关闭路径都要归还握手并发槽 */
     if (c->ssl) {
 #ifdef NSBC_WITH_OPENSSL
         SSL_free((SSL *)c->ssl);   /* SSL_set_bio 后 SSL_free 连带 free BIO */
@@ -787,6 +852,21 @@ static void *ws_worker_thread(void *ud)
                 continue;    /* ← Bug 1 fix: continue 不跳出 worker 循环 */
             }
 
+            /* P2-2：TLS 握手态由 epoll 驱动推进，不进入 WS 协议状态机 */
+            if (c->state == CS_TLS_HANDSHAKE) {
+                int hs = ws_tls_handshake_step(c, ev->events);
+                if (hs < 0) {
+                    c->closed = 1;
+                    ws_close_conn(w->epfd, c);
+                    continue;
+                }
+                if (hs == 0) {
+                    ws_epoll_update(w->epfd, c, (uint32_t)ws_calc_epoll_events(c));
+                    continue;
+                }
+                /* hs == 1：交给下面的 ws_conn_step 处理可能已到达的 HTTP 请求 */
+            }
+
             /* 状态机推进 */
             int step_rc = ws_conn_step(c, ev->events);
             if (step_rc < 0) {
@@ -820,6 +900,19 @@ static void *ws_worker_thread(void *ud)
             while (c) {
                 ws_conn_t *next = c->next;  /* snapshot — c may close below */
                 if (!c->closed && c->worker_idx == w->idx) {
+                    /* P2-2：握手超时兜底（替代原 SO_RCVTIMEO 的 Slowloris 保护） */
+                    if (c->state == CS_TLS_HANDSHAKE &&
+                        c->tls_deadline_ms > 0 && now > c->tls_deadline_ms) {
+                        llog(LOG_WARN, "ws", "worker[%d] TLS handshake timeout fd=%d",
+                             w->idx, c->fd);
+                        c->closed = 1;
+                        pthread_mutex_unlock(&g_ws.conn_mtx);
+                        ws_close_conn(w->epfd, c);
+                        pthread_mutex_lock(&g_ws.conn_mtx);
+                        c = next;
+                        continue;
+                    }
+
                     uint64_t idle = now - c->last_rx_ms;
 
                     /* 1) Already waiting for pong — check timeout */
@@ -910,7 +1003,7 @@ static void *ws_accept_thread(void *ud)
         struct sockaddr_in cli;
         socklen_t cli_len = sizeof(cli);
         int fd = accept4(g_ws.listen_fd, (struct sockaddr *)&cli, &cli_len,
-                         SOCK_CLOEXEC);    /* 注意：accept4 不设 NONBLOCK — 我们手动设 */
+                         SOCK_CLOEXEC | SOCK_NONBLOCK);  /* P2-2：一律非阻塞 */
         if (fd < 0) {
             if (errno == EINTR) continue;
             if (WS_ATOMIC_LOAD(&g_ws.stop_flag)) break;
@@ -921,8 +1014,8 @@ static void *ws_accept_thread(void *ud)
         /* 停机中 — accept 返回后立刻丢弃，不再进入耗时的 TLS 握手 */
         if (WS_ATOMIC_LOAD(&g_ws.stop_flag)) { close(fd); break; }
 
-        /* Phase 1 TLS：阻塞式 SSL_accept（accept 线程里做，完成后设非阻塞交给 worker）
-         * Phase 2 会改成非阻塞 TLS 状态机
+        /* P2-2：TLS 握手改为 worker 内非阻塞状态机（CS_TLS_HANDSHAKE），
+         * accept 线程只创建 SSL 对象并挂 epoll，绝不做阻塞 SSL_accept。
          * ssl/rbio 类型：OpenSSL 开时用具体类型获编译期检查，关时用 void* 占位（ws_conn_t 已用 void* 存）*/
 #ifdef NSBC_WITH_OPENSSL
         SSL *ssl = NULL;
@@ -936,43 +1029,31 @@ static void *ws_accept_thread(void *ud)
 #ifdef NSBC_WITH_OPENSSL
             SSL_CTX *ssl_ctx = (SSL_CTX *)tls_ctx_get_ssl(tls_ctx);
             if (ssl_ctx) {
-                /* TLS 握手前：设 5s 读超时防 Slowloris */
-                struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
-                setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
+                /* 握手洪水保护：并发握手数达上限直接拒绝（快速失败，不排队） */
+                int active = __atomic_load_n(&g_ws.tls_hs_active, __ATOMIC_RELAXED);
+                if (active >= WS_TLS_HS_MAX) {
+                    llog(LOG_WARN, "ws", "tls handshake slots exhausted (%d) — dropping peer", active);
+                    close(fd);
+                    continue;
+                }
                 ssl = SSL_new(ssl_ctx);
+                if (!ssl) {
+                    close(fd);
+                    continue;
+                }
                 SSL_set_accept_state(ssl);
                 rbio = BIO_new_socket(fd, BIO_NOCLOSE);
-                SSL_set_bio(ssl, rbio, rbio);
-
-                /* 阻塞式 SSL_accept（SO_RCVTIMEO=5s 保护）*/
-                if (SSL_accept(ssl) <= 0) {
-                    unsigned long err = ERR_get_error();
-                    char err_buf[256];
-                    ERR_error_string_n(err, err_buf, sizeof(err_buf));
-                    llog(LOG_WARN, "ws",
-                         "TLS handshake fail: err=%ld %s — dropping peer (no plain fallback)",
-                         err, err_buf);
-                    /* 安全修复 P0-3：TLS 失败直接 close(fd)，**禁止 fallback 到明文 WS**。
-                     * REQ-ARCH-FALLBACK-001 设计原则：一旦启用 TLS，就不能降级到明文——
-                     * 攻击者 MITM 劫持自签证书拒签的浏览器时，降级明文 = 全部流量裸奔。 */
-                    SSL_free(ssl); ssl = NULL;   /* SSL_free 连带 free BIO */
-                    rbio = NULL;
+                if (!rbio) {
+                    SSL_free(ssl);
                     close(fd);
-                    continue;                    /* 跳过当前 peer，下一轮 accept */
-                } else {
-                    /* TLS 成功后取消 SO_RCVTIMEO */
-                    tv.tv_sec = 0; tv.tv_usec = 0;
-                    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+                    continue;
                 }
-                /* 无论 TLS 成功还是 fallback，最终都要取消 SO_RCVTIMEO（非 TLS 也不能有 5s 超时）*/
-                struct timeval tv0 = { .tv_sec = 0, .tv_usec = 0 };
-                setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv0, sizeof(tv0));
+                SSL_set_bio(ssl, rbio, rbio);
             }
 #endif
         }
 
-        /* 停机中：SSL 握手可能阻塞了数秒，握手完成后若已 stop 直接丢弃 */
+        /* 停机中：accept 返回后若已 stop 直接丢弃（不再有阻塞握手等待） */
         if (WS_ATOMIC_LOAD(&g_ws.stop_flag)) {
             if (ssl) {
 #ifdef NSBC_WITH_OPENSSL
@@ -994,9 +1075,7 @@ static void *ws_accept_thread(void *ud)
             continue;
         }
 
-        /* 非 TLS 或 TLS 成功后：设非阻塞 */
-        int flags = fcntl(fd, F_GETFL, 0);
-        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        /* fd 已由 accept4 设为非阻塞（TLS 握手交给 worker 状态机推进） */
 
         /* 分配 conn */
         ws_conn_t *c = (ws_conn_t *)calloc(1, sizeof(*c));
@@ -1012,7 +1091,13 @@ static void *ws_accept_thread(void *ud)
         c->fd = fd;
         c->ssl = ssl;
         c->rbio = rbio;
-        c->state = CS_HANDSHAKE;
+        /* P2-2：TLS 连接先进握手态，由 worker 非阻塞推进；明文直接进 HTTP upgrade */
+        c->state = ssl ? CS_TLS_HANDSHAKE : CS_HANDSHAKE;
+        if (ssl) {
+            c->tls_deadline_ms = ws_now_ms() + WS_TLS_HS_TIMEOUT_MS;
+            __atomic_fetch_add(&g_ws.tls_hs_active, 1, __ATOMIC_RELAXED);
+            c->hs_counted = 1;
+        }
         pthread_mutex_init(&c->send_mtx, NULL);
 
         /* Ping/pong init — conn just created, baseline last_rx = now. */
@@ -1026,6 +1111,7 @@ static void *ws_accept_thread(void *ud)
         c->read_buf_cap = WS_READ_BUF + 128;
         c->read_buf = (uint8_t *)malloc(c->read_buf_cap);
         if (!c->read_buf) {
+            ws_hs_release(c);
             pthread_mutex_destroy(&c->send_mtx);
             if (ssl) {
 #ifdef NSBC_WITH_OPENSSL
@@ -1051,9 +1137,9 @@ static void *ws_accept_thread(void *ud)
         WS_ATOMIC_FETCH_ADD(&g_ws.conn_count, 1);
         pthread_mutex_unlock(&g_ws.conn_mtx);
 
-        /* epoll_ctl ADD 到 worker 的 epfd */
+        /* epoll_ctl ADD 到 worker 的 epfd（TLS 握手需要读写双事件） */
         struct epoll_event ee;
-        ee.events = EPOLLIN | EPOLLRDHUP;
+        ee.events = (uint32_t)(EPOLLIN | EPOLLRDHUP | (ssl ? EPOLLOUT : 0));
         ee.data.ptr = c;
         if (epoll_ctl(w->epfd, EPOLL_CTL_ADD, fd, &ee) != 0) {
             llog(LOG_WARN, "ws", "epoll_ctl ADD fd=%d errno=%d", fd, errno);
@@ -1064,6 +1150,7 @@ static void *ws_accept_thread(void *ud)
                 pp = &(*pp)->next;
             }
             pthread_mutex_unlock(&g_ws.conn_mtx);
+            ws_hs_release(c);
             if (ssl) {
 #ifdef NSBC_WITH_OPENSSL
                 SSL_free(ssl);
@@ -1232,9 +1319,10 @@ void ws_listener_stop(void)
     WS_ATOMIC_STORE(&g_ws.stop_flag, 1);
 
     /* ---- 先关监听 fd 并 join accept 线程 ----
-     * accept 线程可能正阻塞在 SSL_accept（最长 5s），期间仍会向 worker
-     * 投递连接。必须先停 accept，再释放 workers，否则会出现
-     * worker_round_robin % 0（SIGFPE）或访问已释放的 workers 数组。*/
+     * P2-2 后 accept 线程不再阻塞在 TLS 握手，join 应在毫秒级返回；
+     * 但仍须先停 accept 再释放 workers，否则 accept 可能向已释放的
+     * workers 数组投递连接（worker_round_robin % 0 或 UAF）。*/
+    uint64_t stop_t0 = ws_now_ms();
     if (g_ws.listen_fd >= 0) {
         shutdown(g_ws.listen_fd, SHUT_RDWR);
         close(g_ws.listen_fd);
@@ -1242,6 +1330,8 @@ void ws_listener_stop(void)
     }
     pthread_join(g_ws.accept_tid, NULL);
     g_ws.accept_started = 0;
+    llog(LOG_INFO, "ws", "accept thread joined in %llu ms",
+         (unsigned long long)(ws_now_ms() - stop_t0));
 
     /* ---- accept 已停，安全停止并释放 worker ---- */
     if (g_ws.workers) {
@@ -1265,6 +1355,7 @@ void ws_listener_stop(void)
     while (c) {
         ws_conn_t *next = c->next;
         c->closed = 1;
+        ws_hs_release(c);   /* P2-2：停机归还握手槽，避免下次 init 计数残留 */
         if (c->fd >= 0) shutdown(c->fd, SHUT_RDWR);
         c = next;
     }
@@ -1281,6 +1372,7 @@ void ws_listener_shutdown(void)
     while (c) {
         ws_conn_t *next = c->next;
         if (c->read_buf) { free(c->read_buf); c->read_buf = NULL; }
+        ws_hs_release(c);   /* P2-2 */
         if (c->ssl) {
 #ifdef NSBC_WITH_OPENSSL
             SSL_free((SSL *)c->ssl);   /* 连带 free BIO — 不要 double free */

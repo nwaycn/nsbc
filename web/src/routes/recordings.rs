@@ -16,9 +16,12 @@
 use tracing;
 
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
-use axum::body::Body;
+use axum::body::{Body, Bytes};
+use tokio::io::{AsyncRead, AsyncSeekExt, ReadBuf};
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -239,11 +242,23 @@ async fn download_recording<C: CoreApi + Clone + 'static>(
         ).into_response();
     }
 
-    // 4) Read file + Content-Type
-    let data = match tokio::fs::read(&canon).await {
-        Ok(d) => d,
+    // 4) Open file + Content-Type
+    // P2-12：改为分块流式输出，避免大录音文件整件读入内存
+    let mut file = match tokio::fs::File::open(&canon).await {
+        Ok(f) => f,
         Err(e) => {
-            tracing::warn!(err = %e, path = %canon.display(), "read recording failed");
+            tracing::warn!(err = %e, path = %canon.display(), "open recording failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                "recording not found",
+            ).into_response();
+        }
+    };
+    let total = match file.metadata().await {
+        Ok(m) => m.len(),
+        Err(e) => {
+            tracing::warn!(err = %e, path = %canon.display(), "stat recording failed");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
@@ -265,20 +280,27 @@ async fn download_recording<C: CoreApi + Clone + 'static>(
     if let Some(range) = headers.get(header::RANGE) {
         if let Ok(s) = range.to_str() {
             if let Some(start_str) = s.strip_prefix("bytes=").and_then(|v| v.split('-').next()) {
-                if let Ok(start) = start_str.parse::<usize>() {
-                    if start < data.len() {
-                        let sliced = &data[start..];
-                        let end = data.len() - 1;
+                if let Ok(start) = start_str.parse::<u64>() {
+                    if start < total {
+                        if let Err(e) = file.seek(std::io::SeekFrom::Start(start)).await {
+                            tracing::warn!(err = %e, path = %canon.display(), "seek recording failed");
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                                "recording not found",
+                            ).into_response();
+                        }
+                        let end = total - 1;
                         let resp = (
                             StatusCode::PARTIAL_CONTENT,
                             [
                                 (header::CONTENT_TYPE, ctype.to_string()),
-                                (header::CONTENT_LENGTH, sliced.len().to_string()),
+                                (header::CONTENT_LENGTH, (total - start).to_string()),
                                 (header::ACCEPT_RANGES, "bytes".to_string()),
                                 (header::CONTENT_RANGE,
-                                 format!("bytes {start}-{end}/{}", data.len())),
+                                 format!("bytes {start}-{end}/{total}")),
                             ],
-                            Body::from(sliced.to_vec()),
+                            Body::from_stream(FileChunks::new(file)),
                         ).into_response();
                         return resp;
                     }
@@ -291,10 +313,43 @@ async fn download_recording<C: CoreApi + Clone + 'static>(
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, ctype.to_string()),
-            (header::CONTENT_LENGTH, data.len().to_string()),
+            (header::CONTENT_LENGTH, total.to_string()),
             (header::ACCEPT_RANGES, "bytes".to_string()),
             (header::CACHE_CONTROL, "no-cache".to_string()),
         ],
-        Body::from(data),
+        Body::from_stream(FileChunks::new(file)),
     ).into_response()
+}
+
+/// 录音下载分块流：按 64KiB 读取，避免整文件驻留内存
+struct FileChunks {
+    file: tokio::fs::File,
+    buf: Vec<u8>,
+}
+
+impl FileChunks {
+    fn new(file: tokio::fs::File) -> Self {
+        Self { file, buf: vec![0u8; 64 * 1024] }
+    }
+}
+
+impl tokio_stream::Stream for FileChunks {
+    type Item = std::io::Result<Bytes>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = &mut *self;
+        let mut rb = ReadBuf::new(&mut this.buf);
+        match Pin::new(&mut this.file).poll_read(cx, &mut rb) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(Ok(())) => {
+                let n = rb.filled().len();
+                if n == 0 {
+                    Poll::Ready(None)
+                } else {
+                    Poll::Ready(Some(Ok(Bytes::copy_from_slice(&this.buf[..n]))))
+                }
+            }
+        }
+    }
 }

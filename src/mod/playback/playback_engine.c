@@ -74,8 +74,37 @@ typedef struct pb_ctx {
 
 static pthread_mutex_t g_pb_lock = PTHREAD_MUTEX_INITIALIZER;
 static pb_ctx_t *g_pb_list = NULL;
+static pb_ctx_t *g_pb_retired = NULL;  /* tw_del 返回 0（节点已触发）的延迟回收链 */
 static int g_pb_started = 0;
 static uint64_t g_pb_total = 0;
+
+/* 已触发节点：回调可能正在时间轮线程执行，此时 free 会造成 UAF。
+ * dequeued=1（成功摘链，不会有回调）→ 立即释放；否则退役等时间轮线程回收。 */
+static void pb_retire_locked(pb_ctx_t *pb, int dequeued)
+{
+    if (dequeued) {
+        free(pb);
+        return;
+    }
+    pb->next = g_pb_retired;
+    g_pb_retired = pb;
+}
+
+/* 只在时间轮线程（任一 timer 回调入口）或停机流程调用：
+ * 同一线程的回调是串行的，新回调开始时旧回调必已返回。 */
+static void pb_reap_retired(void)
+{
+    pb_ctx_t *p;
+    pthread_mutex_lock(&g_pb_lock);
+    p = g_pb_retired;
+    g_pb_retired = NULL;
+    pthread_mutex_unlock(&g_pb_lock);
+    while (p) {
+        pb_ctx_t *nx = p->next;
+        free(p);
+        p = nx;
+    }
+}
 
 /* ---------- 全局 registry 初始化 ---------- */
 
@@ -101,6 +130,7 @@ void pb_engine_stop(void)
     }
     g_pb_list = NULL;
     pthread_mutex_unlock(&g_pb_lock);
+    pb_reap_retired();
     g_pb_started = 0;
     llog(LOG_INFO, "pb", "playback engine stopped");
 }
@@ -123,6 +153,7 @@ void pb_engine_stop(void)
 static void pb_timer_cb(uint64_t now_ms, void *arg)
 {
     pb_ctx_t *pb = (pb_ctx_t *)arg;
+    pb_reap_retired();   /* 回收上一轮已退役的 ctx（同线程回调已全部返回） */
     if (!pb || !pb->active) return;
 
     nsbc_ctx_t *ctx = nsbc_get_ctx();
@@ -402,7 +433,7 @@ int pb_stop(void *call_key)
     pthread_mutex_unlock(&g_pb_lock);
 
     /* 停时间轮 + 关 snd_file + free chain 路径 */
-    tw_del(ctx->tw, &pb->tn);
+    int dequeued = ctx->tw ? tw_del(ctx->tw, &pb->tn) : 0;
     if (pb->snd) { snd_file_close(pb->snd); pb->snd = NULL; }
     for (int i = 0; i < PB_CHAIN_MAX; ++i) {
         if (pb->chain_wavs[i]) { free(pb->chain_wavs[i]); pb->chain_wavs[i] = NULL; }
@@ -414,7 +445,9 @@ int pb_stop(void *call_key)
         ctx->esl_event_fire("PLAYBACK_STOP", pb->wav_path, strlen(pb->wav_path));
     }
 
-    free(pb);
+    pthread_mutex_lock(&g_pb_lock);
+    pb_retire_locked(pb, dequeued);
+    pthread_mutex_unlock(&g_pb_lock);
     return NSBC_OK;
 }
 
@@ -461,11 +494,11 @@ int pb_stop_by_flag(void *call_key, int stop_on_answer)
         if (pb->call_key == call_key && pb->stop_on_answer == (stop_on_answer ? 1 : 0)) {
             *pp = pb->next; /* 从链表摘除 */
             pb->active = 0;
-            tw_del(ctx->tw, &pb->tn);
+            int dequeued = ctx->tw ? tw_del(ctx->tw, &pb->tn) : 0;
             if (pb->snd) { snd_file_close(pb->snd); pb->snd = NULL; }
             llog(LOG_INFO, "pb", "pb_stop_by_flag stop call=%p flag=%d wav=%s",
                  call_key, stop_on_answer, pb->wav_path);
-            free(pb);
+            pb_retire_locked(pb, dequeued);
             stopped++;
             /* 注意：摘链后继续扫——同一个 call_key 理论上只有一个 ctx，
              * 但 pb_start_ex 之前 pb_stop_if_playing 会先停旧的，

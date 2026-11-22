@@ -8,6 +8,7 @@
  * 应用（粗骨架简化：不做乱序缓存，直接等重传）。
  */
 #include "ha_replica.h"
+#include <pthread.h>
 
 struct ha_repl {
     repl_ops_t ops;
@@ -19,6 +20,9 @@ struct ha_repl {
     int        ring_used;
     repl_rec_t ring[REPL_RING_CAP];
     int        accept_any_seq;  /* FULL resync inflight: skip gap check, accept out-of-order */
+    /* publish 来自多个业务线程（registrar + b2bua/reactor），必须互斥保护
+     * pub_seq / ring_used / ring[]，否则序号与负载会错配 */
+    pthread_mutex_t lock;
 };
 
 int repl_create(const repl_ops_t *ops, int is_active, ha_repl_t **out)
@@ -31,6 +35,7 @@ int repl_create(const repl_ops_t *ops, int is_active, ha_repl_t **out)
         return NSBC_NOMEM;
     if (ops != NULL)
         r->ops = *ops;
+    pthread_mutex_init(&r->lock, NULL);
     r->active = is_active;
     *out = r;
     return NSBC_OK;
@@ -38,6 +43,8 @@ int repl_create(const repl_ops_t *ops, int is_active, ha_repl_t **out)
 
 void repl_destroy(ha_repl_t *r)
 {
+    if (r == NULL) return;
+    pthread_mutex_destroy(&r->lock);
     free(r);
 }
 
@@ -66,8 +73,13 @@ int64_t repl_publish(ha_repl_t *r, repl_type_t type, uint16_t ver,
         return NSBC_INVAL;
     if (len > REPL_PAYLOAD_MAX || (len > 0 && payload == NULL))
         return NSBC_INVAL;
-    if (r->ring_used >= REPL_RING_CAP)
+    /* 多生产者互斥：seq 分配、slot 写入、发送入队必须在同一临界区，
+     * 否则两个线程会拿到不同 seq 却写到同一 slot */
+    pthread_mutex_lock(&r->lock);
+    if (r->ring_used >= REPL_RING_CAP) {
+        pthread_mutex_unlock(&r->lock);
         return NSBC_NOSPC; /* 备端落后：转全量/告警（见头注释） */
+    }
     rec = &r->ring[r->pub_seq % REPL_RING_CAP];
     memset(rec, 0, sizeof(*rec));
     rec->seq = ++r->pub_seq;
@@ -77,14 +89,20 @@ int64_t repl_publish(ha_repl_t *r, repl_type_t type, uint16_t ver,
     if (len > 0)
         memcpy(rec->payload, payload, len);
     ++r->ring_used;
-    if (r->ops.send != NULL) {
-        int rc = r->ops.send(r->ops.ud, rec);
-        if (rc != NSBC_OK) {
-            /* 发送失败留环（ha 通道线程重试）；计数经 OAM 补 */
-            return (int64_t)rec->seq;
+    {
+        uint64_t seq = rec->seq;
+        if (r->ops.send != NULL) {
+            int rc = r->ops.send(r->ops.ud, rec);
+            pthread_mutex_unlock(&r->lock);
+            if (rc != NSBC_OK) {
+                /* 发送失败留环（ha 通道线程重试）；计数经 OAM 补 */
+                return (int64_t)seq;
+            }
+        } else {
+            pthread_mutex_unlock(&r->lock);
         }
+        return (int64_t)seq;
     }
-    return (int64_t)rec->seq;
 }
 
 int repl_ingest(ha_repl_t *r, const repl_rec_t *rec)
@@ -117,16 +135,25 @@ void repl_ack(ha_repl_t *r, uint64_t ack_seq)
 {
     if (r == NULL)
         return;
-    if (ack_seq <= r->pub_seq) {
-        uint64_t base = r->ack_seq;
-        r->ack_seq = ack_seq;
-        /* 淘汰已确认环占用（粗骨架：水位差即环存量，封顶非负） */
-        if (ack_seq > base) {
-            uint64_t adv = ack_seq - base;
-            r->ring_used -= (int)(adv < (uint64_t)r->ring_used
-                                      ? adv : (uint64_t)r->ring_used);
-        }
+    pthread_mutex_lock(&r->lock);
+    if (ack_seq > r->pub_seq) {
+        pthread_mutex_unlock(&r->lock);
+        return;  /* 越界 ACK（异常/陈旧帧）直接忽略 */
     }
+    r->ack_seq = ack_seq;
+    /* 环占用直接由水位差计算，避免增量更新丢失 */
+    r->ring_used = (int)(r->pub_seq - ack_seq);
+    pthread_mutex_unlock(&r->lock);
+}
+
+int repl_apply_control(ha_repl_t *r, const repl_rec_t *rec)
+{
+    if (r == NULL || rec == NULL)
+        return NSBC_INVAL;
+    /* 控制帧（如 REPL_FULL CLEAR）：投递 apply 但不推进 applied_seq */
+    if (r->ops.apply == NULL)
+        return NSBC_OK;
+    return r->ops.apply(r->ops.ud, rec);
 }
 
 void repl_resync_done(ha_repl_t *r, uint64_t snapshot_seq)

@@ -100,10 +100,13 @@ impl AccountStore {
         tracing::warn!(
             "no accounts configured — bootstrapping default admin(L2) + dev(L1); \
              override with NSBC_AUTH_ACCOUNTS or NSBC_AUTH_FILE. \
-             Generated admin pw: {admin_pw}, dev pw: {dev_pw} (these are ephemeral; \
-             set NSBC_AUTH_ACCOUNTS or NSBC_DEFAULT_ADMIN_PW / NSBC_DEFAULT_DEV_PW to persist)",
-            admin_pw = admin_pw,
-            dev_pw = dev_pw,
+             Generated passwords are printed to stderr only (not persisted to log files)"
+        );
+        // 明文口令只写 stderr：WARN 日志会落盘长期留存
+        eprintln!(
+            "[nsbc-web] bootstrap credentials: admin={} dev={} (ephemeral; \
+             set NSBC_DEFAULT_ADMIN_PW / NSBC_DEFAULT_DEV_PW to persist)",
+            admin_pw, dev_pw
         );
 
         Ok(AccountStore { by_name })

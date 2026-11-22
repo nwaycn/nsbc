@@ -205,8 +205,13 @@ static void arm(sip_txn_t *t, tw_node_t *n, uint32_t ms, tw_cb_fn cb,
 static void cb_retr(uint64_t now, void *arg)
 {
     sip_txn_t *t = (sip_txn_t *)arg;
-    txn_mgr_t *m = t->mgr;
-    t_unref(t); /* 本次在轮引用已消费；若重新 arm 会再 +1 */
+    txn_mgr_t *m;
+    if (!t) return;
+    /* 回调期间保活：先补一个引用，再消费在轮引用；
+     * 否则最后引用可能在 switch 前归零，后续全是 UAF */
+    t_ref(t);
+    t_unref(t);
+    m = t->mgr;
     uint32_t next = 0;
     switch (t->state) {
     case TXN_ICT_CALLING:
@@ -236,17 +241,23 @@ static void cb_retr(uint64_t now, void *arg)
         next = t->interval;
         break;
     default:
-        return;
+        goto out;
     }
     if (next)
         arm(t, &t->tm_retr, next, cb_retr, now);
+out:
+    t_unref(t);   /* 释放回调入口补的保活引用 */
 }
 
 static void cb_dead(uint64_t now, void *arg)
 {
     sip_txn_t *t = (sip_txn_t *)arg;
-    txn_mgr_t *m = t->mgr;
-    t_unref(t); /* 消费本次在轮引用 */
+    txn_mgr_t *m;
+    if (!t) return;
+    /* 同 cb_retr：先补保活引用再消费在轮引用 */
+    t_ref(t);
+    t_unref(t);
+    m = t->mgr;
     (void)now;
     switch (t->state) {
     case TXN_ICT_CALLING:    /* Timer B */
@@ -301,6 +312,7 @@ static void cb_dead(uint64_t now, void *arg)
     default:
         break;
     }
+    t_unref(t);   /* 释放回调入口补的保活引用 */
 }
 
 /* OBS 自埋点（REQ-OBS-001）：事务计数器 render，ud=txn_mgr；

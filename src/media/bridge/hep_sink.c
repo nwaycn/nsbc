@@ -413,6 +413,15 @@ int hep_sink_create(const hep_cfg_t *cfg) {
 
 void hep_sink_destroy(void) {
     __atomic_store_n(&g_stop, 1, __ATOMIC_RELEASE);
+    /* 先注销 media_bug consumer（按 cb+ud 匹配）：
+     * 否则 stop 后热路径仍会回调 hep_sink_on_frame，写入已 free 的 rings → UAF */
+    {
+        media_bug_consumer_t c;
+        memset(&c, 0, sizeof(c));
+        c.cb = hep_sink_on_frame;
+        c.ud = NULL;
+        media_bug_unregister_global_consumer(&c);
+    }
     for (int i = 0; i < g_nworkers; ++i) {
         pthread_join(g_workers[i], NULL);
     }

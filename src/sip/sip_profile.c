@@ -497,8 +497,14 @@ int sip_profiles_reload_json(const char *json, char *out_err, size_t err_sz)
      * JSON 只有 ~1.4KB，strdup 成本可忽略。 */
     static char *g_last_json = NULL;
     static size_t g_last_len = 0;
+    static pthread_mutex_t last_mtx = PTHREAD_MUTEX_INITIALIZER;
     size_t cur_len = strlen(json);
-    if (g_last_json && g_last_len == cur_len && memcmp(g_last_json, json, cur_len) == 0) {
+    /* 只在成功后更新缓存；并发调用需加锁，避免 free/strdup 与比较竞争 */
+    pthread_mutex_lock(&last_mtx);
+    int is_dup = (g_last_json && g_last_len == cur_len &&
+                  memcmp(g_last_json, json, cur_len) == 0);
+    pthread_mutex_unlock(&last_mtx);
+    if (is_dup) {
         static unsigned ndup = 0;
         if (ndup++ % 60 == 0) {
             llog(LOG_DEBUG, "sip-profile",
@@ -507,9 +513,6 @@ int sip_profiles_reload_json(const char *json, char *out_err, size_t err_sz)
         }
         return NSBC_OK;
     }
-    free(g_last_json);
-    g_last_json = strdup(json);
-    g_last_len = cur_len;
 
     /* ★ 诊断日志：打完整 JSON，看 external_sip_ip / external_rtp_ip 有没有 */
     llog(LOG_INFO, "sip-profile", "reload_json len=%zu body=%.800s", cur_len, json);
@@ -593,6 +596,13 @@ int sip_profiles_reload_json(const char *json, char *out_err, size_t err_sz)
 
     llog(LOG_NOTICE, "sip-profile", "reload: loaded=%u (retired=%u)",
          loaded, retired_total);
+
+    /* 全部校验/切换成功后才写入去重缓存（失败不污染缓存） */
+    pthread_mutex_lock(&last_mtx);
+    free(g_last_json);
+    g_last_json = strdup(json);
+    g_last_len = cur_len;
+    pthread_mutex_unlock(&last_mtx);
     return NSBC_OK;
 
 rollback:

@@ -179,12 +179,32 @@ fn core_ok(out: &str) -> bool {
     out.trim_start().starts_with("OK")
 }
 
+/// UDS 命令参数白名单：tenant/ext 会直接拼命令行，禁止空格/换行/引号
+fn safe_tok(s: &str, max: usize) -> bool {
+    !s.is_empty()
+        && s.len() <= max
+        && s.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '@' | '*')
+        })
+}
+
+fn check_tenant_ext(tenant: &str, ext: &str) -> Result<(), ApiError> {
+    if !safe_tok(tenant, 64) {
+        return Err(ApiError::BadRequest("invalid tenant".into()));
+    }
+    if !safe_tok(ext, 32) {
+        return Err(ApiError::BadRequest("invalid ext".into()));
+    }
+    Ok(())
+}
+
 pub async fn agent_pause<C: CoreApi + Clone + Send + Sync>(
     State(st): State<Arc<AppState<C>>>, Json(body): Json<AgentPauseBody>,
 ) -> Result<impl IntoResponse, ApiError> {
     let ext = body.ext.trim();
     if ext.is_empty() { return Err(ApiError::BadRequest("ext required".into())); }
     let tenant = tenant_name_of(&st, body.tenant_id, body.tenant).await?;
+    check_tenant_ext(&tenant, ext)?;
     let reason = body.reason.unwrap_or(1);
     let out = st.core.exec_cmd(&format!("cc.agent_pause {} {} {}", tenant, ext, reason)).await?;
     if !core_ok(&out) { return Err(ApiError::BadRequest(out.trim().to_string())); }
@@ -198,6 +218,7 @@ pub async fn agent_resume<C: CoreApi + Clone + Send + Sync>(
     let ext = body.ext.trim();
     if ext.is_empty() { return Err(ApiError::BadRequest("ext required".into())); }
     let tenant = tenant_name_of(&st, body.tenant_id, body.tenant).await?;
+    check_tenant_ext(&tenant, ext)?;
     let out = st.core.exec_cmd(&format!("cc.agent_resume {} {}", tenant, ext)).await?;
     if !core_ok(&out) { return Err(ApiError::BadRequest(out.trim().to_string())); }
     tracing::info!(tenant = %tenant, ext, "queue agent resumed");
@@ -210,6 +231,7 @@ pub async fn agent_state<C: CoreApi + Clone + Send + Sync>(
     let ext = q.ext.as_deref().map(str::trim).unwrap_or("");
     if ext.is_empty() { return Err(ApiError::BadRequest("ext required".into())); }
     let tenant = tenant_name_of(&st, q.tenant_id, q.tenant).await?;
+    check_tenant_ext(&tenant, ext)?;
     let out = st.core.exec_cmd(&format!("cc.agent_state {} {}", tenant, ext)).await?;
     if !core_ok(&out) { return Err(ApiError::NotFound("extension not tracked".into())); }
     Ok(Json(json!({ "ok": true, "raw": out.trim() })))
@@ -219,6 +241,9 @@ pub async fn agent_list<C: CoreApi + Clone + Send + Sync>(
     State(st): State<Arc<AppState<C>>>, Query(q): Query<AgentQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let tenant = tenant_name_of(&st, q.tenant_id, q.tenant).await?;
+    if !safe_tok(&tenant, 64) {
+        return Err(ApiError::BadRequest("invalid tenant".into()));
+    }
     let out = st.core.exec_cmd(&format!("cc.agent_list {}", tenant)).await?;
     let body = out.trim().strip_prefix("OK").map(str::trim).unwrap_or("");
     match serde_json::from_str::<serde_json::Value>(body) {

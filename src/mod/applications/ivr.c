@@ -371,14 +371,26 @@ int ivr_session_start(const ivr_profile_t *p, const char *entry,
 {
     if (!p || !entry || !call_key || !ops || !out)
         return NSBC_INVAL;
-    const ivr_node_t *n = node_find(p, entry);
+    /* 会话持有 profile 的私有快照：reload 会 memset 表内 profile，
+     * 直接挂裸指针会让进行中的 IVR 读到清零结构。持读锁拷贝，避免撕裂。 */
+    ivr_profile_t *snap = (ivr_profile_t *)malloc(sizeof(*snap));
+    if (!snap) return NSBC_NOMEM;
+    pthread_rwlock_rdlock(&g_ivr_lock);
+    *snap = *p;
+    pthread_rwlock_unlock(&g_ivr_lock);
+
+    const ivr_node_t *n = node_find(snap, entry);
     if (!n) {
-        llog(LOG_WARN, "ivr", "entry node '%s' not found in profile '%s'", entry, p->name);
+        llog(LOG_WARN, "ivr", "entry node '%s' not found in profile '%s'", entry, snap->name);
+        free(snap);
         return NSBC_NOENT;
     }
     ivr_sess_t *s = (ivr_sess_t *)calloc(1, sizeof(*s));
-    if (!s) return NSBC_NOMEM;
-    s->p = p;
+    if (!s) {
+        free(snap);
+        return NSBC_NOMEM;
+    }
+    s->p = snap;
     s->call_key = call_key;
     s->ops = *ops;
     *out = s;
@@ -388,6 +400,9 @@ int ivr_session_start(const ivr_profile_t *p, const char *entry,
 
 void ivr_session_end(ivr_sess_t *s)
 {
+    if (!s) return;
+    free((void *)s->p);   /* ivr_session_start 的私有快照 */
+    s->p = NULL;
     free(s);
 }
 

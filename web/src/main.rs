@@ -32,7 +32,6 @@ mod static_files;
 mod sync;
 mod uds_server;
 mod ws;                          // REQ-AI-WS-001: Self-implemented WebSocket
-use std::io::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -135,6 +134,8 @@ pub struct AppState<C: CoreApi + Clone> {
     /// REQ-EXT-API-004: true → 即使 127.0.0.1 / ::1 也必须 Bearer Token（默认，安全边界）。
     /// 仅显式设为 false 才允许 loopback 免鉴权（反代部署必须保持 true）。
     pub require_loopback_auth: bool,
+    /// P2-13：是否信任反向代理的 X-Forwarded-For（默认 false，见 WebSection::trust_proxy）
+    pub trust_proxy: bool,
     /// C→Web data.sock channel established (set true on UDS connect to let poller skip
     /// polling). Two tasks (uds_server accept loop + poller interval loop) live across
     /// tokio tasks; AtomicBool provides lock-free coordination.
@@ -605,6 +606,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         recording_root: recording_root.clone(),
         sounds_root: sounds_root.clone(),
         require_loopback_auth: cfg.web.ext.require_loopback_auth,
+        trust_proxy: cfg.web.trust_proxy,
         data_pushed: Arc::new(AtomicBool::new(false)),
         calls_tx: tokio::sync::broadcast::channel(256).0,
         vad_tx:   tokio::sync::broadcast::channel(1024).0,
@@ -916,6 +918,7 @@ ssrc_out=UNAVAILABLE vq=UNAVAILABLE\n".into()),
             recording_root: std::path::PathBuf::from("/tmp/nsbc-test-recordings"),
             sounds_root: std::path::PathBuf::from("/tmp/nsbc-test-sounds"),
             require_loopback_auth: false,
+            trust_proxy: false,
             data_pushed: Arc::new(AtomicBool::new(false)),
             calls_tx: tokio::sync::broadcast::channel(256).0,
             vad_tx:   tokio::sync::broadcast::channel(1024).0,

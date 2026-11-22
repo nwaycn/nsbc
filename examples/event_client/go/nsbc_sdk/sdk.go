@@ -44,6 +44,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -684,6 +685,14 @@ type SseClient struct {
 	hc      *http.Client
 	resp    *http.Response
 	reader  *bufio.Reader
+	// P2-18：消费端处理不过来时被丢弃的事件计数，避免静默丢事件无从排查
+	dropped atomic.Uint64
+}
+
+// Dropped returns the cumulative count of events dropped because the
+// consumer channel was full.
+func (s *SseClient) Dropped() uint64 {
+	return s.dropped.Load()
 }
 
 // NewSseClient creates an unconnected SSE client.
@@ -795,6 +804,11 @@ func (s *SseClient) readStream(ctx context.Context, ch chan<- SseEvent) error {
 				select {
 				case ch <- ev:
 				default: // drop if consumer lagging
+					n := s.dropped.Add(1)
+					// 首次及每 1000 次打印一次，避免热路径刷屏
+					if n == 1 || n%1000 == 0 {
+						fmt.Fprintf(os.Stderr, "[SSE] consumer lagging, dropped=%d events\n", n)
+					}
 				}
 			}
 			eventName = "message"

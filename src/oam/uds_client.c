@@ -96,6 +96,7 @@ typedef struct {
     int              wake_wr;
 
     pthread_mutex_t  send_lock;     /* 本 shard 的 send/close 串行（拆 g.send_lock 成每 shard 独立） */
+    pthread_mutex_t  put_lock;      /* 多生产者写 ring 串行（registrar/b2bua 会并发 push） */
     pthread_t        thread;        /* consumer thread */
     int              running;       /* 1=已启动 */
 
@@ -265,6 +266,12 @@ static int uds_open_dgram(const char *server_path, const char *bind_path)
     int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
 
+    /* 启用 SCM_CREDENTIALS：recvmsg 才能拿到对端 uid 做鉴权 */
+    {
+        int passcred = 1;
+        (void)setsockopt(fd, SOL_SOCKET, SO_PASSCRED, &passcred, sizeof(passcred));
+    }
+
     /* datagram 也可以设 SO_RCVBUF/SO_SNDBUF 让 kernel queue 更大 */
     int rcvbuf = 1 << 20; /* 1 MB */
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
@@ -304,11 +311,17 @@ static int dgram_send_locked(int fd, const uint8_t *buf, size_t len)
     return 0;
 }
 
-/* 标记所有连接断开（send_lock 内调用） */
+/* 标记所有连接断开（调用方持 conn_lock）
+ * 关闭 fd 前先取所有 shard 的 send_lock：flush 在 send_lock 下使用 fd_push，
+ * 两把锁不互斥时重连可能写到被复用/已关闭的 fd */
 static void mark_broken_locked(void)
 {
+    for (int i = 0; i < g.n_shards; i++)
+        pthread_mutex_lock(&g.shards[i].send_lock);
     if (g.fd_push >= 0) { close(g.fd_push); g.fd_push = -1; }
     if (g.fd_cmd  >= 0) { close(g.fd_cmd);  g.fd_cmd  = -1; }
+    for (int i = 0; i < g.n_shards; i++)
+        pthread_mutex_unlock(&g.shards[i].send_lock);
 }
 
 /* 全量重建两个 datagram 连接（先 bind 自身源路径，再 connect 服务端）。
@@ -738,10 +751,10 @@ static int recv_cmd_once(void)
     };
     ssize_t n = recvmsg(g.fd_cmd, &msg, 0);
 
-    /* 内核不支持 SCM_CREDENTIALS 时跳过校验 */
+    /* 已启用 SO_PASSCRED：收不到凭证 = 不可信，默认丢弃（fail-closed） */
     if (n > 0) {
         struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-        int uid_ok = 1;  /* 无 cmsg = 内核不支持 = 信任（退避） */
+        int uid_ok = 0;
         uid_t peer_uid = (uid_t)-1;
         while (cmsg) {
             if (cmsg->cmsg_level == SOL_SOCKET &&
@@ -754,12 +767,17 @@ static int recv_cmd_once(void)
                          "drop datagram from non-root uid=%u "
                          "(CMD_REQ requires peer uid=0)",
                          (unsigned)peer_uid);
+                } else {
+                    uid_ok = 1;
                 }
                 break;  /* 只取第一个 SCM_CREDENTIALS */
             }
             cmsg = CMSG_NXTHDR(&msg, cmsg);
         }
         if (!uid_ok) {
+            llog(LOG_WARN, "uds",
+                 "drop datagram without/invalid SO_PASSCRED credentials (uid=%u)",
+                 (unsigned)peer_uid);
             frag_check_timeout();
             return 0;  /* 丢弃这帧，不触发上层重连 */
         }
@@ -824,6 +842,7 @@ static int shard_init(uds_shard_t *s, uint32_t ring_size, int idx)
     s->wake_rd = wfd[0];
     s->wake_wr = wfd[1];
     pthread_mutex_init(&s->send_lock, NULL);
+    pthread_mutex_init(&s->put_lock, NULL);
 
     /* 分配 flush batch 临时 buffer（heap，避免 8MB 栈溢出） */
     s->batch = (uds_slot_t *)calloc(UDS_BATCH_SEND, sizeof(uds_slot_t));
@@ -834,6 +853,7 @@ static int shard_init(uds_shard_t *s, uint32_t ring_size, int idx)
         free(s->batch); free(s->frames); free(s->iov); free(s->mh);
         s->batch = NULL; s->frames = NULL; s->iov = NULL; s->mh = NULL;
         pthread_mutex_destroy(&s->send_lock);
+        pthread_mutex_destroy(&s->put_lock);
         close(s->wake_rd); close(s->wake_wr);
         free(s->slots); s->slots = NULL;
         return -1;
@@ -846,6 +866,7 @@ static void shard_destroy(uds_shard_t *s)
     if (s->wake_rd >= 0) { close(s->wake_rd); s->wake_rd = -1; }
     if (s->wake_wr >= 0) { close(s->wake_wr); s->wake_wr = -1; }
     pthread_mutex_destroy(&s->send_lock);
+    pthread_mutex_destroy(&s->put_lock);
     /* 释放 batch 临时 buffer */
     free(s->batch);  s->batch  = NULL;
     free(s->frames); s->frames = NULL;
@@ -855,13 +876,16 @@ static void shard_destroy(uds_shard_t *s)
     s->slots = NULL;
 }
 
-/* 生产侧：SPSC，零锁
- * 返回 0=ok，-1=参数错 */
+/* 生产侧：多生产者（registrar/b2bua/reactor）并发写同一 shard，
+ * head/ring 必须串行；消费侧仍用 head/tail 原子读，不参与此锁 */
 static inline int shard_put(uds_shard_t *s, const char *kind, const char *json)
 {
-    uint32_t head = atomic_load_explicit(&s->head, memory_order_relaxed);
-    uint32_t tail = atomic_load_explicit(&s->tail, memory_order_acquire);
-    uint32_t next_head = (head + 1) & s->mask;
+    uint32_t head, tail, next_head;
+
+    pthread_mutex_lock(&s->put_lock);
+    head = atomic_load_explicit(&s->head, memory_order_relaxed);
+    tail = atomic_load_explicit(&s->tail, memory_order_acquire);
+    next_head = (head + 1) & s->mask;
 
     if (next_head == tail) {
         /* ring full —— 丢最旧 */
@@ -871,10 +895,13 @@ static inline int shard_put(uds_shard_t *s, const char *kind, const char *json)
         atomic_fetch_add_explicit(&g.ring_dropped, 1, memory_order_relaxed);
     }
 
-    uds_slot_t *slot = &s->slots[head];
-    snprintf(slot->kind, sizeof(slot->kind), "%s", kind);
-    snprintf(slot->json, sizeof(slot->json), "%s", json);
+    {
+        uds_slot_t *slot = &s->slots[head];
+        snprintf(slot->kind, sizeof(slot->kind), "%s", kind);
+        snprintf(slot->json, sizeof(slot->json), "%s", json);
+    }
     atomic_store_explicit(&s->head, next_head, memory_order_release);
+    pthread_mutex_unlock(&s->put_lock);
     return 0;
 }
 
@@ -1022,10 +1049,13 @@ static void *shard_consumer_thread(void *arg)
         }
     }
 
-    /* stop：尽力 flush 剩余 */
-    int fatal = 0;
-    while (!fatal)
-        shard_flush_batch(s, &fatal);
+    /* stop：尽力 flush 剩余（n>0 说明还取到了数据，取空即退出，避免空环忙等） */
+    int n = 0;
+    do {
+        int fatal = 0;
+        n = shard_flush_batch(s, &fatal);
+        if (fatal) break;
+    } while (n > 0);
     return NULL;
 }
 
@@ -1466,6 +1496,12 @@ void uds_client_shutdown(void)
         shard_destroy(&g.shards[i]);
     g.n_shards = 0;
 
+    /* 先关闭 socket（需要 conn_lock），再销毁互斥量 —— 顺序不能反 */
+    pthread_mutex_lock(&g.conn_lock);
+    if (g.fd_push >= 0) { close(g.fd_push); g.fd_push = -1; }
+    if (g.fd_cmd  >= 0) { close(g.fd_cmd);  g.fd_cmd  = -1; }
+    pthread_mutex_unlock(&g.conn_lock);
+
     pthread_mutex_destroy(&g.conn_lock);
     pthread_mutex_destroy(&g.cmd_lock);
 
@@ -1480,11 +1516,6 @@ void uds_client_shutdown(void)
     }
     if (g.wake_cmd_rd >= 0) { close(g.wake_cmd_rd); g.wake_cmd_rd = -1; }
     if (g.wake_cmd_wr >= 0) { close(g.wake_cmd_wr); g.wake_cmd_wr = -1; }
-
-    pthread_mutex_lock(&g.conn_lock);
-    if (g.fd_push >= 0) { close(g.fd_push); g.fd_push = -1; }
-    if (g.fd_cmd  >= 0) { close(g.fd_cmd);  g.fd_cmd  = -1; }
-    pthread_mutex_unlock(&g.conn_lock);
 
     /* 清理自身 bind 的源路径文件 */
     unlink(g.path_bind_push);

@@ -241,11 +241,19 @@ static inline void dispatch_common(void *call_key, int leg,
      * Phase 1 SAFE1: 加 unloading 检查 + refcnt 配对，保持零锁约束 */
     int gc_count = __atomic_load_n(&g_global_consumers_count, __ATOMIC_RELAXED);
     for (int i = 0; i < gc_count; ++i) {
-        if (__atomic_load_n(&g_consumer_unloading[i], __ATOMIC_ACQUIRE)) continue;
-        media_bug_cb_t cb = __atomic_load_n(&g_global_consumers[i].cb, __ATOMIC_ACQUIRE);
-        if (!cb) continue;
-        if (!(__atomic_load_n(&g_global_consumers[i].type_mask, __ATOMIC_RELAXED) & (int)type)) continue;
+        /* 先加引用再复查 unloading：先检查后加引用存在窗口，
+         * 卸载方看到 refcnt=0 清空 cb/ud 后回调会收到 NULL ud */
         __atomic_fetch_add(&g_consumer_refcnt[i], 1, __ATOMIC_ACQ_REL);
+        if (__atomic_load_n(&g_consumer_unloading[i], __ATOMIC_ACQUIRE)) {
+            __atomic_fetch_sub(&g_consumer_refcnt[i], 1, __ATOMIC_ACQ_REL);
+            continue;
+        }
+        media_bug_cb_t cb = __atomic_load_n(&g_global_consumers[i].cb, __ATOMIC_ACQUIRE);
+        if (!cb || !(__atomic_load_n(&g_global_consumers[i].type_mask,
+                                      __ATOMIC_RELAXED) & (int)type)) {
+            __atomic_fetch_sub(&g_consumer_refcnt[i], 1, __ATOMIC_ACQ_REL);
+            continue;
+        }
         void *ud = __atomic_load_n(&g_global_consumers[i].ud, __ATOMIC_ACQUIRE);
         cb(&frame, ud);
         __atomic_fetch_sub(&g_consumer_refcnt[i], 1, __ATOMIC_ACQ_REL);
@@ -254,11 +262,18 @@ static inline void dispatch_common(void *call_key, int leg,
     /* 1.5) Phase 2 ops 注册表（record/hep/ai_stream 等）——零锁 + __atomic refcnt */
     int ops_count = __atomic_load_n(&g_mb_ops_count, __ATOMIC_RELAXED);
     for (int i = 0; i < ops_count; ++i) {
-        if (__atomic_load_n(&g_mb_ops[i].unloading, __ATOMIC_ACQUIRE)) continue;
+        /* 同 consumers：先加引用再复查，避免与 unregister 的 memset/清零竞争 */
+        __atomic_fetch_add(&g_mb_ops[i].refcnt, 1, __ATOMIC_ACQ_REL);
+        if (__atomic_load_n(&g_mb_ops[i].unloading, __ATOMIC_ACQUIRE)) {
+            __atomic_fetch_sub(&g_mb_ops[i].refcnt, 1, __ATOMIC_ACQ_REL);
+            continue;
+        }
         void (*cb)(media_bug_frame_t *, void *) =
             __atomic_load_n((void *volatile *)&g_mb_ops[i].ops.frame_cb, __ATOMIC_ACQUIRE);
-        if (!cb) continue;
-        __atomic_fetch_add(&g_mb_ops[i].refcnt, 1, __ATOMIC_ACQ_REL);
+        if (!cb) {
+            __atomic_fetch_sub(&g_mb_ops[i].refcnt, 1, __ATOMIC_ACQ_REL);
+            continue;
+        }
         void *ud = __atomic_load_n((void *volatile *)&g_mb_ops[i].ops.ud, __ATOMIC_ACQUIRE);
         cb(&frame, ud);
         __atomic_fetch_sub(&g_mb_ops[i].refcnt, 1, __ATOMIC_ACQ_REL);

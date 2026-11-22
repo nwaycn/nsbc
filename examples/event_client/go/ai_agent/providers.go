@@ -590,6 +590,9 @@ func (t *NWAYTTS) Synthesize(text string) []byte {
 	// 3. 收循环包：HEAD（拿采样率）→ DATA* → END / ERR
 	var pcm16Samples []int16
 	sampleRate := 0 // 等 HEAD 填充
+	// P2-19：TTS 服务端若持续发 DATA，累计内存无上限；8kHz mono 32MiB ≈ 34 分钟
+	const maxTTSBytes = 32 << 20
+	totalPCM := 0
 
 	for {
 		var typeBuf [1]byte
@@ -625,6 +628,11 @@ func (t *NWAYTTS) Synthesize(text string) []byte {
 				fmt.Fprintf(stderr, "[NWAYTTS] HEAD sample_rate=%d Hz\n", sampleRate)
 			}
 		case 0x02: // DATA — PCM16_LE 原始字节流
+			totalPCM += int(plen)
+			if totalPCM > maxTTSBytes {
+				fmt.Fprintf(stderr, "\n[NWAYTTS] total audio > %d bytes, abort\n", maxTTSBytes)
+				return nil
+			}
 			samples := Pcm16LEToInt16(payload)
 			pcm16Samples = append(pcm16Samples, samples...)
 			fmt.Fprintf(stderr, ".")

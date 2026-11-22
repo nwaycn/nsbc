@@ -201,19 +201,35 @@ pub fn list_ips() -> Result<Vec<String>, FwError> {
 /// set before adding guarantees old entries are removed (e.g. IPs whose ban just expired).
 pub fn sync_all(ips: &[String]) -> Result<(usize, usize), FwError> {
     ensure_table()?;
+    // 先全部校验再 flush：add 到非法 IP 时提前 return 会把封禁表清空
+    let v6_like = |s: &str| {
+        !s.is_empty()
+            && s.len() <= 45
+            && s.chars().all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.')
+    };
+    let mut add_v4: Vec<&str> = Vec::new();
+    let mut add_v6: Vec<&str> = Vec::new();
+    for ip in ips {
+        if ipv4(ip) {
+            add_v4.push(ip.as_str());
+        } else if v6_like(ip) {
+            add_v6.push(ip.as_str());
+        }
+        // 非法项直接忽略，不影响其余封禁项
+    }
+
     run(&format!("flush set {NFT_SET_V4}"))?;
     run(&format!("flush set {NFT_SET_V6}"))?;
 
     let mut v4 = 0usize;
     let mut v6 = 0usize;
-    for ip in ips {
-        if ipv4(ip) {
-            run(&format!("add element {NFT_SET_V4} {{ {ip} }}"))?;
-            v4 += 1;
-        } else {
-            run(&format!("add element {NFT_SET_V6} {{ {ip} }}"))?;
-            v6 += 1;
-        }
+    for ip in add_v4 {
+        run(&format!("add element {NFT_SET_V4} {{ {ip} }}"))?;
+        v4 += 1;
+    }
+    for ip in add_v6 {
+        run(&format!("add element {NFT_SET_V6} {{ {ip} }}"))?;
+        v6 += 1;
     }
     Ok((v4, v6))
 }

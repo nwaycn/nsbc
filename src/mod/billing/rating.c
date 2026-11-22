@@ -281,7 +281,8 @@ int account_open(billing_t *b, const char *key, int64_t balance_uc,
     if (b == NULL || key == NULL)
         return NSBC_INVAL;
     pthread_rwlock_wrlock(&b->lock);
-    a = acct_find(b, key);
+    /* 已持写锁，必须用 *_locked 版本，避免同线程二次加锁自死锁 */
+    a = acct_find_locked(b, key);
     if (a != NULL) {
         a->balance = balance_uc;
         a->credit_limit = credit_limit_uc;
@@ -323,7 +324,8 @@ int account_balance(billing_t *b, const char *key,
     if (b == NULL || key == NULL)
         return NSBC_INVAL;
     pthread_rwlock_rdlock(&b->lock);
-    a = acct_find(b, key);
+    /* 已持读锁，直接用 *_locked 版本，避免读锁递归 */
+    a = acct_find_locked(b, key);
     if (a == NULL) {
         pthread_rwlock_unlock(&b->lock);
         return NSBC_NOENT;
@@ -343,7 +345,7 @@ int account_topup(billing_t *b, const char *key, int64_t delta_uc)
     if (b == NULL || key == NULL)
         return NSBC_INVAL;
     pthread_rwlock_wrlock(&b->lock);
-    a = acct_find(b, key);
+    a = acct_find_locked(b, key);
     if (a == NULL) {
         pthread_rwlock_unlock(&b->lock);
         return NSBC_NOENT;
@@ -362,7 +364,7 @@ int bill_reserve(billing_t *b, const char *key, int64_t amount_uc,
     if (b == NULL || key == NULL || amount_uc <= 0)
         return NSBC_INVAL;
     pthread_rwlock_wrlock(&b->lock);
-    a = acct_find(b, key);
+    a = acct_find_locked(b, key);
     if (a == NULL) {
         pthread_rwlock_unlock(&b->lock);
         return NSBC_NOENT;
@@ -442,7 +444,8 @@ static resv_t *resv_find_call_id(billing_t *b, const char *key, const char *call
 {
     int i;
     if (b == NULL || key == NULL) return NULL;
-    acct_t *a = acct_find(b, key);
+    /* 仅在调用方已持锁时使用（bill_settle 持写锁） */
+    acct_t *a = acct_find_locked(b, key);
     if (a == NULL) return NULL;
     size_t ai = (size_t)(a - b->accts);
 
@@ -493,7 +496,7 @@ int bill_settle(billing_t *b, const char *key, const char *call_id,
     if (actual_uc < 0) return NSBC_INVAL;
 
     pthread_rwlock_wrlock(&b->lock);
-    a = acct_find(b, key);
+    a = acct_find_locked(b, key);
     if (a == NULL) {
         pthread_rwlock_unlock(&b->lock);
         return NSBC_NOENT;
@@ -660,6 +663,18 @@ int bill_reservation_count(billing_t *b)
  *   4. resv[] 完全不动
  * -------------------------------------------------------------------------- */
 
+/* money 字段（微元）可能超出 int 范围（>2147 元即溢出），用 64 位解析 */
+static int64_t jint64(const char *json, const char *key, int64_t dflt)
+{
+    char buf[32];
+    if (jstr(json, key, buf, sizeof(buf)) == 0) {
+        char *end = NULL;
+        long long v = strtoll(buf, &end, 10);
+        if (end != buf) return (int64_t)v;
+    }
+    return dflt;
+}
+
 int account_reload_json(billing_t *b, const char *json)
 {
     int i, n_ok = 0, n_fail = 0;
@@ -684,15 +699,15 @@ int account_reload_json(billing_t *b, const char *json)
         }
         if (key[0] == '\0') { ++n_fail; continue; }
 
-        balance = (int64_t)jint(buf, "balance_uc", -1);
-        if (balance < 0) balance = (int64_t)jint(buf, "balance", 0);
-        credit  = (int64_t)jint(buf, "credit_limit_uc", 0);
-        if (credit == 0) credit = (int64_t)jint(buf, "credit_limit", 0);
+        balance = jint64(buf, "balance_uc", -1);
+        if (balance < 0) balance = jint64(buf, "balance", 0);
+        credit  = jint64(buf, "credit_limit_uc", 0);
+        if (credit == 0) credit = jint64(buf, "credit_limit", 0);
 
         /* Phase 1 新增字段 */
-        int64_t tenant_id       = (int64_t)jint(buf, "tenant_id", 1);
-        int64_t rate_plan_id    = (int64_t)jint(buf, "rate_plan_id", 0);
-        int64_t low_threshold   = (int64_t)jint(buf, "low_threshold_uc", 0);
+        int64_t tenant_id       = jint64(buf, "tenant_id", 1);
+        int64_t rate_plan_id    = jint64(buf, "rate_plan_id", 0);
+        int64_t low_threshold   = jint64(buf, "low_threshold_uc", 0);
         char    account_type[16] = {0};
         jstr(buf, "account_type", account_type, sizeof(account_type));
         if (!account_type[0]) snprintf(account_type, sizeof(account_type), "extension");
@@ -795,8 +810,8 @@ static int json_parse_entry(const char *json, rate_entry_t *r)
 
     jstr(json, "name", r->name, sizeof(r->name));
 
-    r->price_per_min_uc = (int64_t)jint(json, "price_per_min_uc", 0);
-    r->connect_fee_uc   = (int64_t)jint(json, "connect_fee_uc", 0);
+    r->price_per_min_uc = jint64(json, "price_per_min_uc", 0);
+    r->connect_fee_uc   = jint64(json, "connect_fee_uc", 0);
     r->bill_inc_s       = jint(json, "bill_inc_s", 1);
     r->min_bill_s       = jint(json, "min_bill_s", 0);
     r->initial_s        = jint(json, "initial_s", 0);
@@ -975,7 +990,7 @@ int64_t calc_stair_charge(rate_entry_t *tiers, int n_tiers, uint32_t billsec)
         /* 单费率兼容（全覆盖）：只算一次 */
         if (tier_start == 0 && t->tier_max_sec == 0) break;
 
-        remaining -= this_tier;
+        remaining = (this_tier >= remaining) ? 0 : (remaining - this_tier);
     }
 
     return total + connect_fee;

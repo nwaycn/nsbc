@@ -235,14 +235,19 @@ static void on_cfg_event(cfg_event_t ev, const char *detail, void *ud)
      * 有订阅者）。 */
     if ((ev == CFG_EV_RELOAD_SUCCESS || ev == CFG_EV_CHANGED ||
          ev == CFG_EV_ROLLBACK) && c && c->cfg) {
-        /* ★ P0 FIX: 只有 cfg_get_int 真正找到 log.level key 才生效。
-         * 之前 lv=4(LOG_WARN) 做默认值，找不到 key 时 cfg_get_int 返回
-         * NSBC_NOENT 但 lv 已经是 4 —— 每次 reload 把日志级别压到 WARN。
-         * 2026-11-16 现场：启动 INFO → reload → WARN → media_bridge FWD
-         * 诊断 (LOG_INFO) 全停 → 看起来像"日志断流"，实际只是级别不够。 */
-        long lv;
-        if (cfg_get_int(c->cfg, "log.level", &lv, NULL) == NSBC_OK) {
-            log_set_level((log_level_t)lv);
+        /* log.level 是 CGT_ENUM 字符串（默认 "info"），cfg_get_int 会把
+         * "info" 解析成 0（EMERG）→ reload 后日志全灭。按字符串映射级别。 */
+        const char *sp = NULL;
+        if (cfg_get_str(c->cfg, "log.level", &sp, NULL) == NSBC_OK && sp) {
+            static const char *const lvnames[] = {
+                "emerg", "alert", "crit", "err", "warn",
+                "notice", "info", "debug"};
+            for (size_t li = 0; li < sizeof(lvnames) / sizeof(lvnames[0]); ++li) {
+                if (strcasecmp(sp, lvnames[li]) == 0) {
+                    log_set_level((log_level_t)li);
+                    break;
+                }
+            }
         }
     }
     if (c && c->event_fn)

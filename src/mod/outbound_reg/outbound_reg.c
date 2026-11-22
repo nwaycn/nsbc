@@ -438,7 +438,39 @@ int outreg_reload_from_route_table(const trunk_t *list, size_t count)
             }
         }
         if (drop) continue; /* 跳过，不搬到 dst */
-        if (dst != src) g_trunks[dst] = g_trunks[src];
+        if (dst != src) {
+            /* tw_node 内嵌在 trunk 结构里，且已被时间轮链表引用：
+             * 直接结构体拷贝会留下指向旧槽的悬空节点。这里先摘链，
+             * 拷贝后按原到期时间/回调重挂。 */
+            outreg_trunk_t *st = &g_trunks[src];
+            outreg_trunk_t *dt = &g_trunks[dst];
+            tw_node_t save_timer, save_ping;
+            int had_timer = 0, had_ping = 0;
+
+            if (st->timer.queued && g_ctx && g_ctx->tw) {
+                save_timer = st->timer;
+                had_timer = 1;
+                tw_del(g_ctx->tw, &st->timer);
+            }
+            if (st->ping_timer.queued && g_ctx && g_ctx->tw) {
+                save_ping = st->ping_timer;
+                had_ping = 1;
+                tw_del(g_ctx->tw, &st->ping_timer);
+            }
+
+            *dt = *st;
+
+            if (had_timer) {
+                tw_node_init(&dt->timer);
+                (void)tw_add(g_ctx->tw, &dt->timer, save_timer.expire_ms,
+                             save_timer.cb, save_timer.arg);
+            }
+            if (had_ping) {
+                tw_node_init(&dt->ping_timer);
+                (void)tw_add(g_ctx->tw, &dt->ping_timer, save_ping.expire_ms,
+                             save_ping.cb, save_ping.arg);
+            }
+        }
         dst++;
     }
     g_trunk_cnt = dst;

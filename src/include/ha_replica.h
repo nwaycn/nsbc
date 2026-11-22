@@ -73,6 +73,10 @@ int64_t repl_publish(ha_repl_t *r, repl_type_t type, uint16_t ver,
 /* 备端：接收（网络层解码后）；乱序/缺口按 on_gap 处理，重复丢弃 */
 int  repl_ingest(ha_repl_t *r, const repl_rec_t *rec);
 
+/* 备端：投递控制帧到 apply 回调，不推进 applied_seq
+ * （FULL resync 的 CLEAR 帧必须清库但不能推进水位，否则快照帧被当重复丢弃） */
+int  repl_apply_control(ha_repl_t *r, const repl_rec_t *rec);
+
 /* 备端 ACK 水位推进（主端据此淘汰环；粗骨架水位计数 OAM 只读） */
 void repl_ack(ha_repl_t *r, uint64_t ack_seq);
 /* 主端全量推送完成后调（备端水位对齐，清零缺口计数） */

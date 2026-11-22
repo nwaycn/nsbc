@@ -315,12 +315,13 @@ static int mem_get(void *handle, const char *key, char **val, size_t *len)
     /* 拷贝 value 给调用者（调用者负责 free）*/
     uint8_t *copy = (uint8_t *)malloc(e->val_len);
     if (!copy) { pthread_rwlock_unlock(&m->lock); return NSBC_NOMEM; }
-    memcpy(copy, e->val, e->val_len);
+    size_t vlen = e->val_len;          /* 解锁后不得再读 entry */
+    memcpy(copy, e->val, vlen);
 
     pthread_rwlock_unlock(&m->lock);
 
     *val = (char *)copy;
-    *len = e->val_len;
+    *len = vlen;
     return NSBC_OK;
 }
 

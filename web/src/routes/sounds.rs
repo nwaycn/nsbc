@@ -7,10 +7,12 @@
 //!   GET    /sounds/:name     — download / audio preview
 
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use axum::{
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{Path as AxumPath, State},
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -19,6 +21,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::coreclient::CoreApi;
 use crate::error::ApiError;
@@ -254,15 +257,52 @@ async fn download<C: CoreApi + Clone + Send + Sync + 'static>(
         _ => "application/octet-stream",
     };
 
-    let bytes = std::fs::read(&target).map_err(|e| {
-        ApiError::Db(format!("read {}: {e}", target.display()))
+    // P2-12：异步打开 + 分块流式输出，避免阻塞 reactor 和整件读入内存
+    let file = tokio::fs::File::open(&target).await.map_err(|e| {
+        ApiError::Db(format!("open {}: {e}", target.display()))
     })?;
+    let total = file.metadata().await.map(|m| m.len()).unwrap_or(0);
 
     Ok((
         StatusCode::OK,
-        [("content-type", mime),
-         ("content-disposition",
-          &format!("inline; filename=\"{name}\""))],
-        bytes,
+        [
+            ("content-type".to_string(), mime.to_string()),
+            ("content-length".to_string(), total.to_string()),
+            ("content-disposition".to_string(), format!("inline; filename=\"{name}\"")),
+        ],
+        Body::from_stream(FileChunks::new(file)),
     ).into_response())
+}
+
+/// 音频下载分块流：按 64KiB 读取，避免整文件驻留内存
+struct FileChunks {
+    file: tokio::fs::File,
+    buf: Vec<u8>,
+}
+
+impl FileChunks {
+    fn new(file: tokio::fs::File) -> Self {
+        Self { file, buf: vec![0u8; 64 * 1024] }
+    }
+}
+
+impl tokio_stream::Stream for FileChunks {
+    type Item = std::io::Result<Bytes>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = &mut *self;
+        let mut rb = ReadBuf::new(&mut this.buf);
+        match Pin::new(&mut this.file).poll_read(cx, &mut rb) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(Ok(())) => {
+                let n = rb.filled().len();
+                if n == 0 {
+                    Poll::Ready(None)
+                } else {
+                    Poll::Ready(Some(Ok(Bytes::copy_from_slice(&this.buf[..n]))))
+                }
+            }
+        }
+    }
 }

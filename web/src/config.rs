@@ -32,6 +32,10 @@ pub struct WebSection {
     pub tls:     TlsSection,
     /// REQ-EXT-API-004: external API surface 配置
     pub ext:     ExtSection,
+    /// 是否信任反向代理传来的 X-Forwarded-For（P2-13）。
+    /// 默认 false：直连场景直接使用 TCP 源地址，防止客户端伪造 XFF 绕过限流。
+    /// 前置 nginx/haproxy 部署时设为 true，此时仅对 loopback 直连（代理）取 XFF 末位地址。
+    pub trust_proxy: bool,
 }
 
 impl Default for WebSection {
@@ -41,6 +45,7 @@ impl Default for WebSection {
             bind:    "127.0.0.1:8443".into(),
             tls:     TlsSection::default(),
             ext:     ExtSection::default(),
+            trust_proxy: false,
         }
     }
 }

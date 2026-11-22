@@ -50,6 +50,7 @@ typedef struct {
     ha_role_t role;      /* ha_role() 跨线程调用：原子读写 */
     int my_prio;
     char node_id[64];    /* hostname；priority 相同时的 tie-break */
+    char secret[64];     /* ha.peer_secret：非空时心跳额外携带 keyed MAC，防伪造 */
     int peer_prio;
     char peer_node[64];
     uint64_t start_ms;   /* 线程启动时刻（last_recv==0 时的等待基准） */
@@ -667,6 +668,21 @@ static void sample_local_health(ha_t *h)
     ha_hc_sample_local(h->hc, &s);
 }
 
+/* 心跳认证：keyed FNV-1a（无需引入加密库；ha.peer_secret 为空时保持旧行为） */
+static uint64_t hb_mac(const char *body, const char *secret)
+{
+    uint64_t h = 1469598103934665603ULL;
+    for (const char *p = body; p && *p; p++) {
+        h ^= (unsigned char)*p;
+        h *= 1099511628211ULL;
+    }
+    for (const char *p = secret; p && *p; p++) {
+        h ^= (unsigned char)*p;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
 static void *ha_main(void *arg)
 {
     ha_t *h = (ha_t *)arg;
@@ -689,12 +705,18 @@ static void *ha_main(void *arg)
         h->last_iter_ms = now;
 
         if (now - last_send >= h->hb_ms) {
+            char body[160];
             char pkt[192];
-            int n = snprintf(pkt, sizeof(pkt), "NSBC-HB/1 %llu %d %d %s\n",
-                             (unsigned long long)++seq,
-                             (int)__atomic_load_n(&h->role,
-                                                  __ATOMIC_RELAXED),
-                             h->my_prio, h->node_id);
+            int n;
+            snprintf(body, sizeof(body), "NSBC-HB/1 %llu %d %d %s",
+                     (unsigned long long)++seq,
+                     (int)__atomic_load_n(&h->role, __ATOMIC_RELAXED),
+                     h->my_prio, h->node_id);
+            if (h->secret[0])
+                n = snprintf(pkt, sizeof(pkt), "%s mac=%016llx\n", body,
+                             (unsigned long long)hb_mac(body, h->secret));
+            else
+                n = snprintf(pkt, sizeof(pkt), "%s\n", body);
             if (h->have_peer) {
                 ssize_t sent = sendto(h->fd, pkt, (size_t)n, MSG_NOSIGNAL,
                                       (struct sockaddr *)&h->peer.ss, h->peer.len);
@@ -723,6 +745,23 @@ static void *ha_main(void *arg)
         if (r > 0 &&
             (!h->have_peer || nsbc_sa_eq_addr(&src, &h->peer))) {
             in[r] = '\0';
+            /* 配置了共享密钥就必须带 MAC，且校验通过；否则丢弃（防伪造保活） */
+            if (h->secret[0]) {
+                char *mp = strstr(in, " mac=");
+                if (mp) {
+                    unsigned long long pmac = strtoull(mp + 5, NULL, 16);
+                    *mp = '\0';
+                    if (hb_mac(in, h->secret) != pmac) {
+                        llog(LOG_WARN, "ha",
+                             "drop heartbeat with bad MAC (suspicious source)");
+                        continue;
+                    }
+                } else {
+                    llog(LOG_WARN, "ha",
+                         "drop heartbeat without MAC (ha.peer_secret set)");
+                    continue;
+                }
+            }
             last_recv = mono_ms();
             got_hb = 1;
             unsigned long long pseq;
@@ -1099,6 +1138,12 @@ static int ha_init(struct nsbc_ctx *ctx)
         !h->node_id[0])
         snprintf(h->node_id, sizeof(h->node_id), "node-%d", h->my_prio);
     h->node_id[sizeof(h->node_id) - 1] = '\0';
+    /* 可选共享密钥：配置后心跳带 keyed MAC，避免任意主机伪造存活把本机钉在 STANDBY */
+    {
+        const char *sec = NULL;
+        if (cfg_get_str(ctx->cfg, "ha.peer_secret", &sec, NULL) == NSBC_OK && sec)
+            snprintf(h->secret, sizeof(h->secret), "%s", sec);
+    }
     h->peer_prio = 100; /* 对端旧格式/未收到心跳时的默认 */
 
     /* === HA P1-4 健康门参数配置化 ===

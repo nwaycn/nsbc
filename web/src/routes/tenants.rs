@@ -122,6 +122,12 @@ pub async fn delete_one<C: CoreApi + Clone + Send + Sync>(
     if id == 1 {
         return Err(ApiError::BadRequest("default tenant (id=1) cannot be deleted".into()));
     }
+    // P2-14：存在业务引用时拒绝删除，避免产生孤儿配置
+    if st.db.tenant_has_refs(id).await.map_err(|e| ApiError::Db(e.to_string()))? {
+        return Err(ApiError::Conflict(
+            "tenant still referenced by extensions/trunks/dialplan rules/queues/rate plans/IVR".into()
+        ));
+    }
     let ok = st.db.delete_tenant(id).await
         .map_err(|e| ApiError::Db(e.to_string()))?;
     if ok {

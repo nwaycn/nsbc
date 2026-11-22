@@ -557,21 +557,9 @@ int nsbc_ssl_dtls_export_srtp(nsbc_dtls_hdl_t hdl,
     memcpy(sending->label,   "EXTRACTOR-dtls_srtp", 19);
     memcpy(receiving->label, "EXTRACTOR-dtls_srtp", 19);
 
-    /* ★ 诊断：打印完整 keylen 字节 hex，和 Wireshark/Chrome 对比 */
-    {
-        char snd_hex[128] = {0}, rcv_hex[128] = {0};
-        for (int i = 0; i < keylen && i * 3 < 127; ++i) {
-            snd_hex[i*3]   = "0123456789abcdef"[(sending->key[i] >> 4) & 0xF];
-            snd_hex[i*3+1] = "0123456789abcdef"[sending->key[i] & 0xF];
-            snd_hex[i*3+2] = (i + 1 < keylen && (i + 1) * 3 < 127) ? ' ' : '\0';
-            rcv_hex[i*3]   = "0123456789abcdef"[(receiving->key[i] >> 4) & 0xF];
-            rcv_hex[i*3+1] = "0123456789abcdef"[receiving->key[i] & 0xF];
-            rcv_hex[i*3+2] = (i + 1 < keylen && (i + 1) * 3 < 127) ? ' ' : '\0';
-        }
-        llog(LOG_DEBUG, "dtls",
-             "SRTP keys: sending=[%s] receiving=[%s] profile=0x%04x keylen=%d",
-             snd_hex, rcv_hex, profile_id, keylen);
-    }
+    /* 不打印密钥内容：DEBUG 日志会落盘，泄露 SRTP 主密钥 */
+    llog(LOG_DEBUG, "dtls",
+         "SRTP keys derived: profile=0x%04x keylen=%d", profile_id, keylen);
 
     return NSBC_OK;
 #else

@@ -37,8 +37,9 @@ pub async fn enforce<C: CoreApi + Clone + 'static>(
         .map(|c| c.0.ip());
 
     let ip = if let Some(addr) = connect_ip {
-        if addr.is_loopback() {
-            // Behind a reverse proxy (nginx / haproxy). Prefer XFF if present.
+        if st.trust_proxy && addr.is_loopback() {
+            // P2-13：仅当显式开启 web.trust_proxy 且直连对端是本机代理（loopback）时，
+            // 才采信 XFF；取末位（由最近一级代理追加）地址，左侧值客户端可伪造。
             xff_client_ip(&req)
                 .map(|s| s.parse().unwrap_or(addr).to_string())
                 .unwrap_or_else(|| addr.to_string())
@@ -46,7 +47,7 @@ pub async fn enforce<C: CoreApi + Clone + 'static>(
             addr.to_string()
         }
     } else {
-        xff_client_ip(&req).unwrap_or_else(|| "-".to_string())
+        "-".to_string()
     };
 
     let ua = req
@@ -86,20 +87,15 @@ pub async fn enforce<C: CoreApi + Clone + 'static>(
     Ok(next.run(req).await)
 }
 
-/// Extract the leftmost (client-side) non-loopback IP from X-Forwarded-For.
+/// 取 X-Forwarded-For 末位有效 IP（由最近一级可信代理追加）。
+/// P2-13：左侧值由客户端可控，不能作为限流依据，故从右向左取第一个合法 IP。
 /// Returns None when no valid XFF header is present.
 fn xff_client_ip(req: &Request) -> Option<String> {
     let header = req.headers().get("x-forwarded-for")?.to_str().ok()?;
-    // X-Forwarded-For: client, proxy1, proxy2 ...
-    // Leftmost is the original client IP.
-    for candidate in header.split(',') {
-        let candidate = candidate.trim();
-        if candidate.is_empty() { continue; }
-        if let Ok(ip) = candidate.parse::<std::net::IpAddr>() {
-            if !ip.is_loopback() {
-                return Some(candidate.to_string());
-            }
-        }
-    }
-    None
+    header
+        .split(',')
+        .rev()
+        .map(str::trim)
+        .find(|c| !c.is_empty() && c.parse::<std::net::IpAddr>().is_ok())
+        .map(str::to_string)
 }

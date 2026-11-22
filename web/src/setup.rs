@@ -112,8 +112,8 @@ async fn do_create(ctx: &SetupCtx, req: SetupReq) -> ApiResult<Json<Value>> {
     // 安全材料全部自动生成，不要求用户填写：
     // JWT 签名密钥 = 32 字节随机数（64 位 hex，写回 nsbc.yaml，重启后旧令牌继续有效）
     let jwt_secret = random_hex(32)?;
-    // 初始管理员密码固定为 Admin123：交付即用；公网部署由客户登录后自行修改。
-    let admin_pw = String::from("Admin123");
+    // 初始管理员密码改为随机生成并在响应中一次性返回，避免全网都知道固定 Admin123
+    let admin_pw = random_hex(8)?;   // 16 位 hex
 
     // 已有管理员且口令非空 → 不覆盖，提示沿用原密码
     let existing = db

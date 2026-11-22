@@ -208,6 +208,8 @@ static void pcm_wav_refill_buf(snd_src_t *s)
     if (!s->fp) return;
     const int bytes_per_sample = s->bits / 8;
     const int frame_bytes = bytes_per_sample * s->channels;
+    /* 畸形 WAV 防护：bits/channels 为 0 会导致除零或永不前进 */
+    if (bytes_per_sample <= 0 || s->channels <= 0 || s->rbuf_cap == 0) return;
 
     while (s->rbuf_used - s->rbuf_pos < s->rbuf_cap / 2) {
         /* ★ BUGFIX B4：raw 只有 16KB 栈空间，raw_need 必须 clamp */
@@ -325,6 +327,8 @@ int snd_file_pull(snd_src_t *s, int16_t *out, int frames, int loop)
         if (s->rbuf_pos < s->rbuf_used) continue;  /* refill 成功 */
         /* 3. EOF：loop 回绕 */
         if (!loop) break;
+        /* data 段为空/缓冲未分配时回绕也不会产生样本，直接退出防死循环 */
+        if (s->data_bytes == 0 || s->rbuf_cap == 0) break;
         if (s->fp && fseek(s->fp, s->data_offset, SEEK_SET) == 0) {
             s->pos = 0;
             s->rbuf_used = s->rbuf_pos = 0;

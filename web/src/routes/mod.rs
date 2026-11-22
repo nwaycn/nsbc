@@ -59,6 +59,7 @@ mod tests {
             recording_root: std::path::PathBuf::from("/tmp/nsbc-test-recordings"),
             sounds_root: std::path::PathBuf::from("/tmp/nsbc-test-sounds"),
             require_loopback_auth: false,  /* F-10 修复：测试中 loopback peer 免鉴权 */
+            trust_proxy: false,
             data_pushed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             calls_tx: tokio::sync::broadcast::channel(256).0,
             vad_tx:   tokio::sync::broadcast::channel(1024).0,

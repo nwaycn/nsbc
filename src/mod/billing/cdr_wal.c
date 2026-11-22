@@ -79,6 +79,7 @@ static uint32_t crc32_buf(const uint8_t *data, size_t len)
 /* ---- 内存 batch 队列 ---- */
 typedef struct {
     char *lines[WAL_BATCH_MAX];
+    size_t lens[WAL_BATCH_MAX];  /* 记录真实字节数：二进制含 NUL，不能用 strlen */
     int   count;
     int   dirty;                /* 有新数据没 flush */
     time_t last_flush_time;
@@ -324,14 +325,14 @@ static int wal_batch_flush_locked(cdr_wal_t *w)
 
     /* 拼一个大 buffer 批量写，比多次 fwrite 快 */
     size_t total = 0;
-    for (int i = 0; i < w->batch.count; i++) total += strlen(w->batch.lines[i]);
+    for (int i = 0; i < w->batch.count; i++) total += w->batch.lens[i];
 
     char *bigbuf = (char *)malloc(total);
     if (!bigbuf) {
         /* malloc 失败 → 逐条写 */
         for (int i = 0; i < w->batch.count; i++) {
             if (w->batch.lines[i]) {
-                fwrite(w->batch.lines[i], 1, strlen(w->batch.lines[i]), w->fp);
+                fwrite(w->batch.lines[i], 1, w->batch.lens[i], w->fp);
                 free(w->batch.lines[i]); w->batch.lines[i] = NULL;
             }
         }
@@ -343,7 +344,7 @@ static int wal_batch_flush_locked(cdr_wal_t *w)
 
     size_t offset = 0;
     for (int i = 0; i < w->batch.count; i++) {
-        size_t n = strlen(w->batch.lines[i]);
+        size_t n = w->batch.lens[i];
         memcpy(bigbuf + offset, w->batch.lines[i], n);
         offset += n;
         free(w->batch.lines[i]); w->batch.lines[i] = NULL;
@@ -419,11 +420,14 @@ int cdr_wal_append(cdr_wal_t *w, const cdr_event_t *ev)
     if (w->batch.count >= WAL_BATCH_MAX) {
         wal_batch_flush_locked(w);
     }
-    w->batch.lines[w->batch.count] = strdup(packed);
+    /* 二进制记录含 NUL 字节，必须按长度保存，不能 strdup */
+    w->batch.lines[w->batch.count] = (char *)malloc((size_t)pn);
     if (!w->batch.lines[w->batch.count]) {
         pthread_mutex_unlock(&w->lock);
         return NSBC_NOMEM;
     }
+    memcpy(w->batch.lines[w->batch.count], packed, (size_t)pn);
+    w->batch.lens[w->batch.count] = (size_t)pn;
     w->batch.count++;
     w->batch.dirty = 1;
 

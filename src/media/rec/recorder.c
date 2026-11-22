@@ -83,6 +83,7 @@ struct rec_sess {
     rec_open_t       req;
     rec_state_t      state;
     _Atomic int      closing;     /* rec_stop 置 1，rec_feed/rec_feed_raw 快路径跳过 */
+    _Atomic int      in_flight;   /* feed 在途计数：rec_stop 等 0 再销毁，防挂机瞬间 UAF */
     _Atomic int      segment_switching; /* segment close/open 进行中 —— 快路径 skip 这包 */
     uint64_t         bytes;      /* 当前 segment 已写 PCM 字节数（不含 WAV 头） */
     uint64_t         total_bytes;/* 本次录音总累计（所有 segment 合计）*/
@@ -326,8 +327,25 @@ void rec_video_writer_stop(void)
 
 /* ---------- M1 视频轨：媒体线程快路径 ---------- */
 
-int rec_feed_video(rec_sess_t *s, const uint8_t *annexb, size_t len,
-                   uint32_t rtp_ts)
+/* feed 入口引用：先加计数再复查 closing，避免与 rec_stop 的 free 竞争。
+ * rec_stop 置 closing 后等待 in_flight 归零再销毁。 */
+static int rec_enter(rec_sess_t *s)
+{
+    __atomic_add_fetch(&s->in_flight, 1, __ATOMIC_ACQ_REL);
+    if (__atomic_load_n(&s->closing, __ATOMIC_ACQUIRE)) {
+        __atomic_sub_fetch(&s->in_flight, 1, __ATOMIC_ACQ_REL);
+        return 0;
+    }
+    return 1;
+}
+
+static void rec_leave(rec_sess_t *s)
+{
+    __atomic_sub_fetch(&s->in_flight, 1, __ATOMIC_ACQ_REL);
+}
+
+static int rec_feed_video_impl(rec_sess_t *s, const uint8_t *annexb, size_t len,
+                               uint32_t rtp_ts)
 {
     if (s == NULL || annexb == NULL || len == 0) return NSBC_INVAL;
     /* ★ 关闭中快路径 —— rec_stop 已置 closing=1，立即返回 */
@@ -388,6 +406,16 @@ int rec_feed_video(rec_sess_t *s, const uint8_t *annexb, size_t len,
     return NSBC_OK;
 }
 
+int rec_feed_video(rec_sess_t *s, const uint8_t *annexb, size_t len,
+                   uint32_t rtp_ts)
+{
+    if (s == NULL || annexb == NULL || len == 0) return NSBC_INVAL;
+    if (!rec_enter(s)) return NSBC_OK;
+    int rc = rec_feed_video_impl(s, annexb, len, rtp_ts);
+    rec_leave(s);
+    return rc;
+}
+
 const char *rec_video_path(const rec_sess_t *s)
 {
     return (s != NULL && s->video_opened && s->video_path[0] != '\0')
@@ -401,6 +429,8 @@ uint64_t rec_video_frames(const rec_sess_t *s)
 
 /* ---------- rec_open ---------- */
 
+static void rec_sanitize_component(char *dst, size_t cap, const char *src);
+
 int rec_open(rec_mgr_t *m, const rec_open_t *req, rec_sess_t **out)
 {
     rec_sess_t *s;
@@ -412,6 +442,10 @@ int rec_open(rec_mgr_t *m, const rec_open_t *req, rec_sess_t **out)
 
     s->mgr = m;
     s->req = *req;
+    /* SIP 标识清洗后再落盘：callid/主被叫用于文件名，含 ../ 会越出录音根目录 */
+    rec_sanitize_component(s->req.callid, sizeof(s->req.callid), req->callid);
+    rec_sanitize_component(s->req.caller, sizeof(s->req.caller), req->caller);
+    rec_sanitize_component(s->req.callee, sizeof(s->req.callee), req->callee);
     s->state = REC_ST_RECORDING;
     s->rate = m->cfg.rate > 0 ? m->cfg.rate : 8000;
     s->channels = 1;  /* 架构硬约束：永远 mono sess —— 分腿独立录 + stop 时离线 merge_stereo_wav */
@@ -505,7 +539,7 @@ int rec_resume(rec_sess_t *s)
  *   - segment 切换进行中（segment_switching=1）→ skip 这包（掉 1 帧可接受）
  *   - segment close/open、第一帧 WAV 头重写这些 FILE* 非线程安全操作 → 持 mutex
  */
-int rec_feed(rec_sess_t *s, int leg, const media_frame_t *frm)
+static int rec_feed_impl(rec_sess_t *s, int leg, const media_frame_t *frm)
 {
     if (s == NULL || frm == NULL || frm->pcm == NULL) return NSBC_INVAL;
     /* ★ 关闭中快路径 —— rec_stop 已置 closing=1，立即返回避免进锁 */
@@ -593,6 +627,15 @@ int rec_feed(rec_sess_t *s, int leg, const media_frame_t *frm)
     return NSBC_OK;
 }
 
+int rec_feed(rec_sess_t *s, int leg, const media_frame_t *frm)
+{
+    if (s == NULL || frm == NULL) return NSBC_INVAL;
+    if (!rec_enter(s)) return NSBC_OK;
+    int rc = rec_feed_impl(s, leg, frm);
+    rec_leave(s);
+    return rc;
+}
+
 /* ---------- rec_stop ---------- */
 
 int rec_stop(rec_sess_t *s, char *path_out, size_t path_cap, uint64_t *bytes_out)
@@ -600,7 +643,21 @@ int rec_stop(rec_sess_t *s, char *path_out, size_t path_cap, uint64_t *bytes_out
     if (s == NULL) return NSBC_INVAL;
     /* ★ 先置 closing=1 —— 媒体线程的 rec_feed/rec_feed_raw/rec_feed_video 快路径
      * 检测到后立即 return，不会再进入 s->lock。从这一刻起 mutex 不会再被争用。 */
-    __atomic_store_n(&s->closing, 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&s->closing, 1, __ATOMIC_RELEASE);
+
+    /* 等在途 feed 退出：挂断最后一包与 rec_stop 天然并发，closing 只能挡住新包，
+     * 挡不住已进入 fwrite(s->fp/raw_fp) 的包；不等就 free 会 UAF。 */
+    {
+        int guard = 0;
+        while (__atomic_load_n(&s->in_flight, __ATOMIC_ACQUIRE) > 0) {
+            usleep(500);
+            if (++guard > 4000) {  /* 2s 兜底 */
+                llog(LOG_ERR, "rec",
+                     "in-flight feed drain timeout=%d — force close", guard);
+                break;
+            }
+        }
+    }
 
     /* M1 视频轨：等 rec_writer 线程把在途帧写完（pending 由媒体线程 ++，
      * writer 写完 --）。writer 存活期间这里最多等帧间隔（~33ms）量级。 */
@@ -695,8 +752,8 @@ rec_state_t rec_state(const rec_sess_t *s)
  *   - 仅 2 个 atomic load + FILE* fwrite（libc 内部锁） + bytes++
  *   - segment 切换 / raw_fp 延迟 open（第一包）才持 mutex
  *   - segment_switching=1 期间 skip（掉 1 帧可接受）*/
-int rec_feed_raw(rec_sess_t *s, int leg, const void *payload,
-                 size_t len, int payload_type)
+static int rec_feed_raw_impl(rec_sess_t *s, int leg, const void *payload,
+                             size_t len, int payload_type)
 {
     (void)leg;
     if (s == NULL || payload == NULL || len == 0) return NSBC_INVAL;
@@ -804,6 +861,16 @@ int rec_feed_raw(rec_sess_t *s, int leg, const void *payload,
     return NSBC_OK;
 }
 
+int rec_feed_raw(rec_sess_t *s, int leg, const void *payload,
+                 size_t len, int payload_type)
+{
+    if (s == NULL || payload == NULL || len == 0) return NSBC_INVAL;
+    if (!rec_enter(s)) return NSBC_OK;
+    int rc = rec_feed_raw_impl(s, leg, payload, len, payload_type);
+    rec_leave(s);
+    return rc;
+}
+
 int rec_is_silence(const media_frame_t *frm, int threshold_dbov)
 {
     size_t i; int64_t acc = 0;
@@ -816,6 +883,23 @@ int rec_is_silence(const media_frame_t *frm, int threshold_dbov)
 
 /* ---------- REQ-REC-007: path template 变量替换 ---------- */
 
+/* 路径分量白名单清洗：caller/callee/callid 来自 SIP，含 ../ 可越出录音根目录 */
+static void rec_sanitize_component(char *dst, size_t cap, const char *src)
+{
+    size_t i = 0;
+    if (cap == 0) return;
+    for (; src && *src && i + 1 < cap; ++src) {
+        unsigned char c = (unsigned char)*src;
+        int ok = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+                 (c >= 'a' && c <= 'z') || c == '_' || c == '-' || c == '.' ||
+                 c == '@' || c == '+';
+        dst[i++] = ok ? (char)c : '_';
+    }
+    dst[i] = '\0';
+    if (dst[0] == '\0' || !strcmp(dst, ".") || !strcmp(dst, ".."))
+        snprintf(dst, cap, "_");
+}
+
 int resolve_rec_path_template(char *out, size_t out_cap,
                               const char *template,
                               const char *caller, const char *callee,
@@ -825,6 +909,17 @@ int resolve_rec_path_template(char *out, size_t out_cap,
         return NSBC_INVAL;
     if (base_dir == NULL || !base_dir[0])
         base_dir = "./recordings";
+
+    /* SIP 标识一律清洗后再拼路径 */
+    char scaller[128], scallee[128], scallid[128];
+    rec_sanitize_component(scaller, sizeof(scaller),
+                           (caller && caller[0]) ? caller : "anon");
+    rec_sanitize_component(scallee, sizeof(scallee),
+                           (callee && callee[0]) ? callee : "unknown");
+    rec_sanitize_component(scallid, sizeof(scallid), callid);
+    caller = scaller;
+    callee = scallee;
+    callid = scallid;
 
     /* 日期时间（UTC） */
     time_t now = time(NULL);

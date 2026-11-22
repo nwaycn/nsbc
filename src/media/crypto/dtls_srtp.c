@@ -542,13 +542,13 @@ int dtls_ice_handle_stun(dtls_server_t *d, const uint8_t *pkt, size_t pkt_len,
     const char *req_ufrag = NULL;
     const char *req_rag   = NULL;
     int has_controlling = 0;  /* 请求里是否带 ICE-CONTROLLING */
+    char ubuf[48];            /* 栈上解析：static 会被多 reactor 线程并发踩 ufrag */
     for (const uint8_t *a = body; a + 4 <= end; ) {
         uint16_t atype = (uint16_t)((a[0] << 8) | a[1]);
         uint16_t alen  = (uint16_t)((a[2] << 8) | a[3]);
         const uint8_t *val = a + 4;
         if (val + alen > end) break;
-        if (atype == 0x0006 && alen >= 2 && alen < 48) { /* USERNAME */
-            static char ubuf[48];
+        if (atype == 0x0006 && alen >= 2 && alen < 48 && req_ufrag == NULL) { /* USERNAME */
             memcpy(ubuf, val, alen); ubuf[alen] = '\0';
             char *colon = strchr(ubuf, ':');
             if (colon) {

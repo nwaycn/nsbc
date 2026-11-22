@@ -395,6 +395,11 @@ static int parse_file(cfg_t *cfg, const char *path, int depth,
                 free(sn->val);
                 sn->val = xstrdup(v);
             }
+            if (sp + 1 >= (int)(sizeof(stk) / sizeof(stk[0]))) {
+                snprintf(err_path, 256, "%s:%d nesting too deep", path, lineno);
+                fclose(fp);
+                return NSBC_PROTO;
+            }
             stk[++sp].indent = indent;
             stk[sp].container = item;
             continue;
@@ -440,6 +445,11 @@ static int parse_file(cfg_t *cfg, const char *path, int depth,
             cfg_node_t *ch = node_new(N_MAP, k);
             ch->next = parent->child;
             parent->child = ch;
+            if (sp + 1 >= (int)(sizeof(stk) / sizeof(stk[0]))) {
+                snprintf(err_path, 256, "%s:%d nesting too deep", path, lineno);
+                fclose(fp);
+                return NSBC_PROTO;
+            }
             stk[++sp].indent = indent;
             stk[sp].container = ch;
         } else {

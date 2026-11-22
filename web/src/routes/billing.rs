@@ -308,6 +308,18 @@ async fn open_account<C: CoreApi + Clone + Send + Sync + 'static>(
 ) -> Result<impl IntoResponse, ApiError> {
     st.db.pool().ok_or(ApiError::DbUnavailable)?;
 
+    // account_key 会拼进 UDS 命令（"account.open <key> ..."）：严格校验字符集
+    if body.account_key.is_empty()
+        || body.account_key.len() > 64
+        || !body.account_key.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '@' | ':')
+        })
+    {
+        return Err(ApiError::BadRequest(
+            "invalid account_key (allowed: A-Za-z0-9 _ - . @ :, max 64)".into(),
+        ));
+    }
+
     let row = st.db.open_account(body.clone()).await.map_err(|e| {
         if let sqlx::Error::Database(ref db_err) = e {
             let msg = db_err.message().to_ascii_lowercase();

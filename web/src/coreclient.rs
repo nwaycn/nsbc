@@ -1109,9 +1109,13 @@ impl CoreApi for RealCore {
     }
 
     async fn send_message(&self, call_id: &str, body: &str) -> Result<(), CoreError> {
-        // send_msg command format: send_msg <call-id> <body>, body may contain spaces,
-        // so just concatenate directly (call_id charset already validated by routing layer).
-        let cmd = format!("send_msg {} {}", sanitize_arg(call_id), sanitize_arg(body));
+        // send_msg <call-id> <body>：C 侧把 argv[2..] 用空格拼回正文，
+        // 因此空格/中文必须原样保留；只把会破坏行协议的 \r\n\0 换成空格。
+        let clean_body: String = body
+            .chars()
+            .map(|c| if c == '\r' || c == '\n' || c == '\0' { ' ' } else { c })
+            .collect();
+        let cmd = format!("send_msg {} {}", sanitize_arg(call_id), clean_body);
         let resp = send_cmd(&self.sock_path, self.timeout, &cmd).await?;
         parse_call_action_ok_err(&resp, call_id)
     }

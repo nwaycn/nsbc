@@ -262,10 +262,11 @@ const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 type wsOpcode byte
 
 const (
-	wsOpBinary wsOpcode = 0x2
-	wsOpClose  wsOpcode = 0x8
-	wsOpPing   wsOpcode = 0x9
-	wsOpPong   wsOpcode = 0xA
+	wsOpContinuation wsOpcode = 0x0
+	wsOpBinary       wsOpcode = 0x2
+	wsOpClose        wsOpcode = 0x8
+	wsOpPing         wsOpcode = 0x9
+	wsOpPong         wsOpcode = 0xA
 )
 
 type wsFrame struct {
@@ -378,16 +379,52 @@ func computeAccept(key string) string {
 }
 
 func (t *wsTransport) wsRead() (wsFrame, error) {
+	frame, fin, err := t.wsReadOne()
+	if err != nil {
+		return wsFrame{}, err
+	}
+	if fin {
+		return frame, nil
+	}
+	// P2-16：分片消息（RFC 6455 §5.4）——继续读 continuation 帧直到 FIN 置位
+	opcode := frame.opcode
+	payload := frame.payload
+	for !fin {
+		next, nfin, err := t.wsReadOne()
+		if err != nil {
+			return wsFrame{}, err
+		}
+		switch next.opcode {
+		case wsOpContinuation:
+			payload = append(payload, next.payload...)
+			if len(payload) > 256*1024 {
+				return wsFrame{}, fmt.Errorf("fragmented message too large")
+			}
+			fin = nfin
+		case wsOpPing, wsOpPong, wsOpClose:
+			// 控制帧允许穿插在分片消息之间，忽略
+		default:
+			return wsFrame{}, fmt.Errorf("unexpected opcode 0x%X in fragmented message", byte(next.opcode))
+		}
+	}
+	frame.opcode = opcode
+	frame.payload = payload
+	return frame, nil
+}
+
+// wsReadOne 读取单个 WebSocket 帧（可能只是分片中的一片），返回 (帧, FIN)。
+func (t *wsTransport) wsReadOne() (wsFrame, bool, error) {
 	// P2-13：50ms 只用于"首字节"轮询；帧已开始后改用整体超时读完
 	// header/payload，避免大帧或慢链路读到一半被 50ms 截断导致流失步。
 	t.conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
 
 	var hdr [2]byte
 	if _, err := io.ReadFull(t.rw.Reader, hdr[:]); err != nil {
-		return wsFrame{}, err
+		return wsFrame{}, false, err
 	}
 	_ = t.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 
+	fin := (hdr[0] & 0x80) != 0
 	var opcode wsOpcode = wsOpcode(hdr[0] & 0x0F)
 	masked := (hdr[1] & 0x80) != 0
 	length := int(hdr[1] & 0x7F)
@@ -395,31 +432,31 @@ func (t *wsTransport) wsRead() (wsFrame, error) {
 	if length == 126 {
 		var lb [2]byte
 		if _, err := io.ReadFull(t.rw.Reader, lb[:]); err != nil {
-			return wsFrame{}, err
+			return wsFrame{}, false, err
 		}
 		length = int(lb[0])<<8 | int(lb[1])
 	} else if length == 127 {
 		var lb [8]byte
 		if _, err := io.ReadFull(t.rw.Reader, lb[:]); err != nil {
-			return wsFrame{}, err
+			return wsFrame{}, false, err
 		}
 		length = int(lb[4])<<24 | int(lb[5])<<16 | int(lb[6])<<8 | int(lb[7])
 	}
 	if length > 256*1024 {
-		return wsFrame{}, fmt.Errorf("frame too large: %d", length)
+		return wsFrame{}, false, fmt.Errorf("frame too large: %d", length)
 	}
 
 	var mask [4]byte
 	if masked {
 		if _, err := io.ReadFull(t.rw.Reader, mask[:]); err != nil {
-			return wsFrame{}, err
+			return wsFrame{}, false, err
 		}
 	}
 
 	payload := make([]byte, length)
 	if length > 0 {
 		if _, err := io.ReadFull(t.rw.Reader, payload); err != nil {
-			return wsFrame{}, err
+			return wsFrame{}, false, err
 		}
 		if masked {
 			for i := range payload {
@@ -428,33 +465,42 @@ func (t *wsTransport) wsRead() (wsFrame, error) {
 		}
 	}
 
-	return wsFrame{opcode: opcode, payload: payload}, nil
+	return wsFrame{opcode: opcode, payload: payload}, fin, nil
 }
 
 func (t *wsTransport) wsWrite(opcode wsOpcode, payload []byte) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	n := len(payload)
+	// P2-15：客户端 → 服务端帧必须加掩码（RFC 6455 §5.3），
+	// 不加 MASK 会被严格的服务端实现直接断开连接。
+	var maskKey [4]byte
+	if _, err := rand.Read(maskKey[:]); err != nil {
+		return err
+	}
+	masked := make([]byte, n)
+	for i := 0; i < n; i++ {
+		masked[i] = payload[i] ^ maskKey[i%4]
+	}
+
 	var buf []byte
 	buf = append(buf, byte(0x80|byte(opcode)))
-
-	n := len(payload)
 	switch {
 	case n < 126:
-		buf = append(buf, byte(n))
+		buf = append(buf, 0x80|byte(n))
 	case n < 65536:
-		buf = append(buf, 126, byte(n>>8), byte(n))
+		buf = append(buf, 0x80|126, byte(n>>8), byte(n))
 	default:
-		buf = append(buf, 127, 0, 0, 0, 0, byte(n>>24), byte(n>>16), byte(n>>8), byte(n))
+		buf = append(buf, 0x80|127,
+			byte(uint64(n)>>56), byte(uint64(n)>>48), byte(uint64(n)>>40), byte(uint64(n)>>32),
+			byte(n>>24), byte(n>>16), byte(n>>8), byte(n))
 	}
+	buf = append(buf, maskKey[:]...)
+	buf = append(buf, masked...)
 
 	if _, err := t.conn.Write(buf); err != nil {
 		return err
-	}
-	if n > 0 {
-		if _, err := t.conn.Write(payload); err != nil {
-			return err
-		}
 	}
 	return t.rw.Flush()
 }

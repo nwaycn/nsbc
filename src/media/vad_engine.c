@@ -224,9 +224,10 @@ static inline void power_update_sliding(vad_call_state_t *cs, int leg,
     for (size_t i = 0; i < samples; ++i) {
         double abs_s = (double)abs(pcm[i]);
 
-        /* trace ring 写入（环形）*/
+        /* trace ring 写入（环形）；计数器在 1<<30 处回绕（是 TRACE_SIZE 的整数倍），
+         * 避免 int 约 3 天溢出为负后 % 出负下标越界 */
         ring[*wpos % VAD_TRACE_SIZE] = pcm[i];
-        (*wpos)++;
+        if (++(*wpos) >= (1 << 30)) *wpos = 0;
 
         /* NEAR：滑窗更新 —— 加新 sample，减最老的（10ms avg abs = 当前能量）*/
         double drop_near = (double)abs(ring[(*wpos - VAD_NEAR_SAMPLES + VAD_TRACE_SIZE) % VAD_TRACE_SIZE]);
@@ -308,14 +309,19 @@ static void act_push_event(vad_call_state_t *cs, int leg, vad_state_t new_state,
         ev.preroll_offset = pr;
     }
 
-    /* MPSC ring 无锁写 —— 用 atomic store_release 保证 tail 递增后 consumer 可见 */
-    uint32_t next = (g_ring.tail + 1) & (VAD_RING_SIZE - 1);
-    uint32_t head = __atomic_load_n(&g_ring.head, __ATOMIC_ACQUIRE);
-    if (next != head) {
-        g_ring.slots[g_ring.tail] = ev;
-        __atomic_store_n(&g_ring.tail, next, __ATOMIC_RELEASE);
-        pthread_cond_signal(&g_ring.not_empty);
+    /* 多 reactor 线程会并发投递：tail/slot/signal 必须在同一把锁内完成，
+     * 否则两个生产者拿到相同 tail 写同一槽，且 signal 丢唤醒 */
+    pthread_mutex_lock(&g_ring.lock);
+    {
+        uint32_t next = (g_ring.tail + 1) & (VAD_RING_SIZE - 1);
+        uint32_t head = __atomic_load_n(&g_ring.head, __ATOMIC_ACQUIRE);
+        if (next != head) {
+            g_ring.slots[g_ring.tail] = ev;
+            __atomic_store_n(&g_ring.tail, next, __ATOMIC_RELEASE);
+            pthread_cond_signal(&g_ring.not_empty);
+        }
     }
+    pthread_mutex_unlock(&g_ring.lock);
     /* ring 满了就丢 —— VAD_EVENT 是诊断/边界信息，丢了主路径不崩 */
 }
 
@@ -709,13 +715,18 @@ static void *vad_worker(void *arg) {
 
 
     while (!atomic_load(&g_ring.shutdown)) {
-        uint32_t tail = __atomic_load_n(&g_ring.tail, __ATOMIC_ACQUIRE);
-        if (g_ring.head == tail) {
-            pthread_mutex_lock(&g_ring.lock);
+        uint32_t tail;
+        /* 谓词与 wait 使用同一把锁，避免生产者 signal 丢失导致事件滞留 */
+        pthread_mutex_lock(&g_ring.lock);
+        while (!atomic_load(&g_ring.shutdown) &&
+               __atomic_load_n(&g_ring.tail, __ATOMIC_ACQUIRE) == g_ring.head) {
             pthread_cond_wait(&g_ring.not_empty, &g_ring.lock);
-            pthread_mutex_unlock(&g_ring.lock);
-            continue;
         }
+        pthread_mutex_unlock(&g_ring.lock);
+        if (atomic_load(&g_ring.shutdown)) break;
+
+        tail = __atomic_load_n(&g_ring.tail, __ATOMIC_ACQUIRE);
+        if (tail == g_ring.head) continue;   /* 虚假唤醒 */
 
         /* 取一个事件 */
         vad_event_t ev = g_ring.slots[g_ring.head];
@@ -784,8 +795,11 @@ int vad_engine_init(void) {
 }
 
 void vad_engine_shutdown(void) {
+    /* shutdown 标志与 signal 同锁，防止消费者刚判断完谓词就永久 sleep */
+    pthread_mutex_lock(&g_ring.lock);
     atomic_store(&g_ring.shutdown, 1);
-    pthread_cond_signal(&g_ring.not_empty);
+    pthread_cond_broadcast(&g_ring.not_empty);
+    pthread_mutex_unlock(&g_ring.lock);
     pthread_join(g_worker_tid, NULL);
 
     pthread_mutex_destroy(&g_ring.lock);

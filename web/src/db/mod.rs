@@ -692,12 +692,16 @@ impl Db {
         let mut idx: u32 = 0;
 
         if let Some(kw) = keyword {
-            idx += 1;
+            // 复用同一 ${idx} 在 MySQL(?)/PG 占位符展开后数量不一致，每个字段独立占位
+            idx += 1; let p1 = idx;
+            idx += 1; let p2 = idx;
+            idx += 1; let p3 = idx;
+            idx += 1; let p4 = idx;
             clauses.push(format!(
-                "(user_name LIKE ${idx} OR contact LIKE ${idx} OR \
-                 received_ip LIKE ${idx} OR public_contact LIKE ${idx})"
+                "(user_name LIKE ${p1} OR contact LIKE ${p2} OR \
+                 received_ip LIKE ${p3} OR public_contact LIKE ${p4})"
             ));
-            binds.push(format!("%{}%", kw));
+            for _ in 0..4 { binds.push(format!("%{}%", kw)); }
         }
 
         let where_sql = "WHERE ".to_string() + &clauses.join(" AND ");
@@ -5805,9 +5809,11 @@ impl Db {
         if let Some(kw) = keyword {
             let kw = kw.trim();
             if !kw.is_empty() {
-                idx += 1;
-                clauses.push(format!("(extension LIKE ${idx} OR description LIKE ${idx} OR display_number LIKE ${idx})"));
-                binds.push(format!("%{}%", kw));
+                idx += 1; let p1 = idx;
+                idx += 1; let p2 = idx;
+                idx += 1; let p3 = idx;
+                clauses.push(format!("(extension LIKE ${p1} OR description LIKE ${p2} OR display_number LIKE ${p3})"));
+                for _ in 0..3 { binds.push(format!("%{}%", kw)); }
             }
         }
 
@@ -7813,7 +7819,17 @@ impl Db {
         let ts = match self.backend() { "sqlite" => "datetime('now')", "postgres" => "CAST(NOW() AS TEXT)", _ => "CAST(CURRENT_TIMESTAMP(3) AS CHAR)" };
         sets.push(format!("updated_at = {ts}"));
         let where_idx = idx + 1;
-        let sql = format!("UPDATE routes SET {} WHERE id = ${where_idx} RETURNING *", sets.join(", "));
+        let backend = self.backend();
+        let raw_sql = format!("UPDATE routes SET {} WHERE id = ${where_idx} RETURNING *", sets.join(", "));
+        if backend == "mysql" {
+            // MySQL 不支持 UPDATE ... RETURNING：先执行再回读
+            let sql = fix_ph(&strip_returning(&raw_sql), backend);
+            let mut q = sqlx::query(&sql);
+            for b in &binds { q = q.bind(b.as_str()); }
+            q.bind(id).execute(pool).await?;
+            return self.get_route(id).await.and_then(|r| r.ok_or_else(|| sqlx::Error::RowNotFound));
+        }
+        let sql = fix_ph(&raw_sql, backend);
         let mut q = sqlx::query_as::<_, Route>(&sql);
         for b in &binds { q = q.bind(b.as_str()); }
         q = q.bind(id);
@@ -7864,8 +7880,11 @@ impl Db {
         if let Some(kw) = keyword {
             let kw = kw.trim();
             if !kw.is_empty() {
-                idx += 1; clauses.push(format!("(profile_name LIKE ${idx} OR rule_name LIKE ${idx} OR pattern LIKE ${idx})"));
-                binds.push(format!("%{}%", kw));
+                idx += 1; let p1 = idx;
+                idx += 1; let p2 = idx;
+                idx += 1; let p3 = idx;
+                clauses.push(format!("(profile_name LIKE ${p1} OR rule_name LIKE ${p2} OR pattern LIKE ${p3})"));
+                for _ in 0..3 { binds.push(format!("%{}%", kw)); }
             }
         }
         let where_sql = if clauses.is_empty() { String::new() } else { "WHERE ".to_string() + &clauses.join(" AND ") };
@@ -8042,9 +8061,13 @@ impl Db {
         if let Some(kw) = keyword {
             let kw = kw.trim();
             if !kw.is_empty() {
-                idx += 1;
-                clauses.push(format!("(name LIKE ${idx} OR description LIKE ${idx} OR llm_provider LIKE ${idx} OR asr_provider LIKE ${idx} OR tts_provider LIKE ${idx})"));
-                binds.push(format!("%{}%", kw));
+                idx += 1; let p1 = idx;
+                idx += 1; let p2 = idx;
+                idx += 1; let p3 = idx;
+                idx += 1; let p4 = idx;
+                idx += 1; let p5 = idx;
+                clauses.push(format!("(name LIKE ${p1} OR description LIKE ${p2} OR llm_provider LIKE ${p3} OR asr_provider LIKE ${p4} OR tts_provider LIKE ${p5})"));
+                for _ in 0..5 { binds.push(format!("%{}%", kw)); }
             }
         }
         let where_sql = if clauses.is_empty() { String::new() } else { "WHERE ".to_string() + &clauses.join(" AND ") };
@@ -9085,9 +9108,12 @@ pub async fn list_rates(
     if let Some(kw) = keyword {
         let kw = kw.trim();
         if !kw.is_empty() {
-            where_parts.push(format!("(name LIKE ${idx} OR prefix LIKE ${idx})",
-                idx = binds.len() + 1));
+            // 两个 LIKE 各占一个占位符，MySQL 下不能复用 $N
+            let b1 = binds.len() + 1;
             binds.push(format!("%{}%", kw));
+            let b2 = binds.len() + 1;
+            binds.push(format!("%{}%", kw));
+            where_parts.push(format!("(name LIKE ${b1} OR prefix LIKE ${b2})"));
         }
     }
     let where_sql = if where_parts.is_empty() { String::new() } else { format!("WHERE {}", where_parts.join(" AND ")) };
@@ -9656,9 +9682,12 @@ pub async fn list_security_blacklist(
     if let Some(kw) = keyword {
         let kw = kw.trim();
         if !kw.is_empty() {
-            where_parts.push(format!("(value LIKE ${idx} OR comment LIKE ${idx})",
-                idx = binds.len() + 1));
+            // 两个 LIKE 各占一个占位符，MySQL 下不能复用 $N
+            let b1 = binds.len() + 1;
             binds.push(format!("%{}%", kw));
+            let b2 = binds.len() + 1;
+            binds.push(format!("%{}%", kw));
+            where_parts.push(format!("(value LIKE ${b1} OR comment LIKE ${b2})"));
         }
     }
     // enabled 是 INTEGER 列：必须以 i64 绑定，不能走 String（PostgreSQL 报 text vs integer）。
@@ -9987,11 +10016,21 @@ pub async fn delete_account(&self, id: i64) -> Result<bool, sqlx::Error> {
 pub async fn update_account(&self, id: i64, description: &str, credit_limit_uc: i64) -> Result<Option<Account>, sqlx::Error> {
     let Some(pool) = self.pool() else { return Ok(None); };
     let backend = self.backend();
-    let ts = match backend { "postgres" => "NOW()", "mysql" => "CURRENT_TIMESTAMP(3)", _ => "datetime('now')" };
-    let sql = format!(
+    let ts = match backend { "postgres" => "CAST(NOW() AS TEXT)", "mysql" => "CAST(CURRENT_TIMESTAMP(3) AS CHAR)", _ => "datetime('now')" };
+    let raw_sql = format!(
         "UPDATE accounts SET description = $1, credit_limit_uc = $2, updated_at = {ts} WHERE id = $3 RETURNING *"
     );
-    sqlx::query_as::<_, Account>(&fix_ph(&sql, backend))
+    if backend == "mysql" {
+        // MySQL 不支持 UPDATE ... RETURNING：先执行再回读
+        let sql = fix_ph(&strip_returning(&raw_sql), backend);
+        sqlx::query(&sql)
+            .bind(description)
+            .bind(credit_limit_uc)
+            .bind(id)
+            .execute(pool).await?;
+        return self.get_account(id).await;
+    }
+    sqlx::query_as::<_, Account>(&fix_ph(&raw_sql, backend))
         .bind(description)
         .bind(credit_limit_uc)
         .bind(id)
@@ -10097,8 +10136,10 @@ impl Db {
         if let Some(kw) = keyword {
             let kw = kw.trim();
             if !kw.is_empty() {
-                idx += 1; clauses.push(format!("tenant_name LIKE ${idx} OR description LIKE ${idx}"));
-                binds.push(format!("%{}%", kw));
+                idx += 1; let p1 = idx;
+                idx += 1; let p2 = idx;
+                clauses.push(format!("tenant_name LIKE ${p1} OR description LIKE ${p2}"));
+                for _ in 0..2 { binds.push(format!("%{}%", kw)); }
             }
         }
         let where_sql = if clauses.is_empty() { String::new() } else { "WHERE ".to_string() + &clauses.join(" AND ") };
@@ -10191,6 +10232,20 @@ impl Db {
         for (_, v) in &binds { q = q.bind(v); }
         q = q.bind(id);
         q.fetch_one(pool).await
+    }
+
+    /// P2-14：删除租户前检查是否仍被业务表引用（扩展/中继/拨号规则/费率计划/队列/IVR）。
+    /// 用 SELECT 1 ... LIMIT 1 判断存在性，避免各后端 COUNT 返回类型差异。
+    pub async fn tenant_has_refs(&self, id: i64) -> Result<bool, sqlx::Error> {
+        let Some(pool) = self.pool() else { return Ok(false); };
+        let backend = self.backend();
+        for tbl in ["extensions", "trunks", "dialplan_rules", "rate_plans", "queues", "ivr_menus"] {
+            let sql = fix_ph(&format!("SELECT 1 FROM {} WHERE tenant_id = $1 LIMIT 1", tbl), backend);
+            if sqlx::query(&sql).bind(id).fetch_optional(pool).await?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub async fn delete_tenant(&self, id: i64) -> Result<bool, sqlx::Error> {

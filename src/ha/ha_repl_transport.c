@@ -62,6 +62,11 @@ struct ha_repl_trans {
 
     int have_peer;
 
+    /* === TCP 流重组缓冲 ===
+     * TCP 是字节流，一次 recv 可能是半帧或粘多帧；必须按帧头长度累积 */
+    char   rxbuf[sizeof(ha_repl_frame_hdr_t) + REPL_PAYLOAD_MAX];
+    size_t rxlen;
+
     /* === P1 FULL resync 兜底：gap 跟踪 ===
      * 同一个 [gap_start, gap_end) 对连续重复 GAP_MAX 次 → 发 FULL_REQ
      * 避免单次 UDP 抖动误触发全量快照 */
@@ -131,6 +136,25 @@ static int frame_decode_hdr(const char *buf, ha_repl_frame_hdr_t *h)
     if (h->magic != HA_REPL_FRAME_MAGIC) return -1;
     if (h->ver > HA_REPL_FRAME_VER) return -1; /* 版本不匹配 */
     if (h->payload_len > REPL_PAYLOAD_MAX) return -1;
+    return 0;
+}
+
+/* 非阻塞 socket 全量发送：循环处理短写 + EAGAIN（poll 等待可写） */
+static int send_all(int fd, const char *buf, size_t len)
+{
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = send(fd, buf + off, len - off, MSG_NOSIGNAL);
+        if (n > 0) { off += (size_t)n; continue; }
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            struct pollfd p = { fd, POLLOUT, 0 };
+            int rc = poll(&p, 1, 1000);
+            if (rc <= 0) return -1;
+            continue;
+        }
+        return -1;
+    }
     return 0;
 }
 
@@ -231,7 +255,7 @@ static int repl_ops_on_gap(void *ud, uint64_t expect, uint64_t got)
     char frame[sizeof(h) + sizeof(payload)];
     memcpy(frame, &h, sizeof(h));
     memcpy(frame + sizeof(h), &payload, sizeof(payload));
-    (void)send(t->peer_fd, frame, sizeof(frame), MSG_NOSIGNAL);
+    (void)send_all(t->peer_fd, frame, sizeof(frame));
     return NSBC_OK;
 }
 
@@ -242,6 +266,14 @@ static void transport_resend_gap(ha_repl_trans_t *t,
 {
     if (!t || !t->repl) return;
     if (gap_start == 0 || gap_end <= gap_start) return;
+    /* 对端可伪造 gap_end：限制重发范围，避免 transport 线程近乎永久卡死 */
+    {
+        uint64_t pub = repl_published_seq(t->repl);
+        if (gap_end > pub + 1) gap_end = pub + 1;
+        if (gap_end <= gap_start) return;
+        if (gap_end - gap_start > (uint64_t)REPL_RING_CAP)
+            gap_start = gap_end - (uint64_t)REPL_RING_CAP;
+    }
 
     llog(LOG_WARN, "ha-repl",
          "ACTIVE resend gap [%llu..%llu)",
@@ -257,7 +289,10 @@ static void transport_resend_gap(ha_repl_trans_t *t,
         char frame[sizeof(ha_repl_frame_hdr_t) + REPL_PAYLOAD_MAX];
         int n = frame_encode(r, frame, sizeof(frame));
         if (n < 0) continue;
-        (void)send(t->peer_fd, frame, n, MSG_NOSIGNAL);
+        if (send_all(t->peer_fd, frame, (size_t)n) != 0) {
+            llog(LOG_WARN, "ha-repl", "ACTIVE gap resend send failed errno=%d", errno);
+            return;
+        }
         sent++;
     }
     llog(LOG_NOTICE, "ha-repl",
@@ -273,7 +308,7 @@ static int transport_send_full_req(ha_repl_trans_t *t)
     h.ver   = htons(HA_REPL_FRAME_VER);
     h.type  = HA_REPL_FRAME_FULL_REQ_TYPE;
     h.payload_len = 0;
-    (void)send(t->peer_fd, &h, sizeof(h), MSG_NOSIGNAL);
+    (void)send_all(t->peer_fd, (const char *)&h, sizeof(h));
     return NSBC_OK;
 }
 
@@ -299,7 +334,10 @@ static void transport_send_full_snapshot(ha_repl_trans_t *t)
         h.seq         = htobe64(snap_seq + 1);  /* CLEAR 给一个独占 seq */
         h.type        = REPL_FULL;
         h.payload_len = 0;
-        (void)send(t->peer_fd, &h, sizeof(h), MSG_NOSIGNAL);
+        if (send_all(t->peer_fd, (const char *)&h, sizeof(h)) != 0) {
+            llog(LOG_WARN, "ha-repl", "FULL push CLEAR send failed errno=%d", errno);
+            return;
+        }
     }
 
     /* 帧 2..N：ring 所有条目从 ack_seq 之后逐条重发 */
@@ -318,7 +356,10 @@ static void transport_send_full_snapshot(ha_repl_trans_t *t)
             char frame[sizeof(ha_repl_frame_hdr_t) + REPL_PAYLOAD_MAX];
             int n = frame_encode(r, frame, sizeof(frame));
             if (n < 0) continue;
-            (void)send(t->peer_fd, frame, n, MSG_NOSIGNAL);
+            if (send_all(t->peer_fd, frame, (size_t)n) != 0) {
+                llog(LOG_WARN, "ha-repl", "FULL push send failed errno=%d", errno);
+                return;
+            }
             sent++;
         }
     } else {
@@ -328,7 +369,10 @@ static void transport_send_full_snapshot(ha_repl_trans_t *t)
             char frame[sizeof(ha_repl_frame_hdr_t) + REPL_PAYLOAD_MAX];
             int n = frame_encode(r, frame, sizeof(frame));
             if (n < 0) continue;
-            (void)send(t->peer_fd, frame, n, MSG_NOSIGNAL);
+            if (send_all(t->peer_fd, frame, (size_t)n) != 0) {
+                llog(LOG_WARN, "ha-repl", "FULL push send failed errno=%d", errno);
+                return;
+            }
             sent++;
         }
     }
@@ -340,7 +384,7 @@ static void transport_send_full_snapshot(ha_repl_trans_t *t)
         ah.ver   = htons(HA_REPL_FRAME_VER);
         ah.type  = HA_REPL_FRAME_ACK_TYPE;
         ah.payload_len = htonl((uint32_t)snap_seq); /* 跨协议约定：FULL push 结束信号 */
-        (void)send(t->peer_fd, &ah, sizeof(ah), MSG_NOSIGNAL);
+        (void)send_all(t->peer_fd, (const char *)&ah, sizeof(ah));
     }
 
     llog(LOG_NOTICE, "ha-repl",
@@ -391,12 +435,105 @@ static int tcp_connect_blocking(const nsbc_sa_t *peer, int timeout_ms)
     return fd;
 }
 
+/* 处理一个完整帧（调用方已保证 frame 含完整 hdr + payload_len 字节） */
+static void transport_handle_frame(ha_repl_trans_t *t, const char *frame)
+{
+    ha_repl_frame_hdr_t hdr;
+    if (t == NULL || t->repl == NULL) return;
+    if (frame_decode_hdr(frame, &hdr) != 0) return;
+
+    if (hdr.type == HA_REPL_FRAME_ACK_TYPE) {
+        /* ACK：payload_len = 对端 applied_seq（跨协议约定）；ACK 帧 seq 恒 0，
+         * 不能再用它 clamp，否则 ack 永远被压成 0、复制环永不回收 */
+        uint64_t ack = hdr.payload_len;
+        repl_ack(t->repl, ack);
+        t->last_ack_seq = ack;
+        /* FULL resync 收尾：主端快照发完后最后一个 ACK 携带 snap_seq */
+        if (t->full_resync_inflight) {
+            repl_set_accept_any_seq(t->repl, 0);
+            repl_resync_done(t->repl, ack);
+            t->full_resync_inflight = 0;
+            t->same_gap_cnt = 0;
+            t->last_gap_start = 0;
+            t->last_gap_end = 0;
+            llog(LOG_NOTICE, "ha-repl", "FULL resync done: snap_seq=%llu",
+                 (unsigned long long)ack);
+        }
+        return;
+    }
+
+    if (hdr.type == HA_REPL_FRAME_GAP_REQ_TYPE) {
+        /* GAP_REQ：备端请求主端重发 gap_start..gap_end-1 */
+        if (hdr.payload_len >= sizeof(ha_repl_gap_req_t)) {
+            ha_repl_gap_req_t gap;
+            memcpy(&gap, frame + sizeof(hdr), sizeof(gap));
+            if (t->is_active) {
+                transport_resend_gap(t, gap.gap_start, gap.gap_end);
+            } else {
+                llog(LOG_DEBUG, "ha-repl", "STANDBY got GAP_REQ — ignore (not active)");
+            }
+        }
+        return;
+    }
+
+    if (hdr.type == HA_REPL_FRAME_FULL_REQ_TYPE) {
+        /* FULL_REQ：备端请求主端推全量快照（gap 连续超限兜底） */
+        if (t->is_active) {
+            transport_send_full_snapshot(t);
+        } else {
+            llog(LOG_DEBUG, "ha-repl", "STANDBY got FULL_REQ — ignore (not active)");
+        }
+        return;
+    }
+
+    /* REPL_FULL + len==0 = CLEAR 控制帧：必须清库，但绝不推进 applied_seq，
+     * 否则随后 seq <= snap_seq 的快照帧会被幂等分支全部吞掉 */
+    if (hdr.type == REPL_FULL && hdr.payload_len == 0) {
+        if (!t->is_active) {
+            repl_rec_t rec;
+            memset(&rec, 0, sizeof(rec));
+            rec.seq = hdr.seq;
+            rec.type = REPL_FULL;
+            rec.ver = hdr.payload_ver;
+            rec.len = 0;
+            repl_set_accept_any_seq(t->repl, 1);
+            t->full_resync_inflight = 1;
+            (void)repl_apply_control(t->repl, &rec);
+            llog(LOG_NOTICE, "ha-repl",
+                 "STANDBY REPL_FULL_CLEAR: cleared + accept_any_seq=1");
+        }
+        return;
+    }
+
+    {
+        repl_rec_t rec;
+        memset(&rec, 0, sizeof(rec));
+        rec.seq = hdr.seq;
+        rec.type = (repl_type_t)hdr.type;
+        rec.ver = hdr.payload_ver;
+        rec.len = (uint16_t)hdr.payload_len;
+        if (rec.len > 0)
+            memcpy(rec.payload, frame + sizeof(hdr), rec.len);
+        (void)repl_ingest(t->repl, &rec);
+    }
+
+    /* 每收一帧回推 ACK（payload_len = applied_seq） */
+    {
+        ha_repl_frame_hdr_t ah;
+        memset(&ah, 0, sizeof(ah));
+        ah.magic = htons(HA_REPL_FRAME_MAGIC);
+        ah.ver   = htons(HA_REPL_FRAME_VER);
+        ah.type  = HA_REPL_FRAME_ACK_TYPE;
+        ah.payload_len = htonl((uint32_t)repl_applied_seq(t->repl));
+        (void)send_all(t->peer_fd, (const char *)&ah, sizeof(ah));
+    }
+}
+
 /* === transport TCP 线程主循环 === */
 
 static void *ha_repl_trans_thread(void *arg)
 {
     ha_repl_trans_t *t = arg;
-    char rbuf[REPL_PAYLOAD_MAX + 128];
 
     while (!__atomic_load_n(&t->stop, __ATOMIC_ACQUIRE)) {
         if (t->is_active && t->listen_fd >= 0 && t->peer_fd < 0) {
@@ -409,6 +546,7 @@ static void *ha_repl_trans_thread(void *arg)
                 if (afd >= 0) {
                     tcp_set_nonblock_cloexec(afd);
                     t->peer_fd = afd;
+                    t->rxlen = 0;   /* 新连接：重组缓冲从空开始 */
                     t->connected = 1;
                     t->backoff_ms = 100;
                     llog(LOG_NOTICE, "ha-repl",
@@ -438,6 +576,7 @@ static void *ha_repl_trans_thread(void *arg)
             int fd = tcp_connect_blocking(&t->peer_addr, 1000);
             if (fd >= 0) {
                 t->peer_fd = fd;
+                t->rxlen = 0;   /* 新连接：重组缓冲从空开始 */
                 t->connected = 1;
                 t->backoff_ms = 100;
                 llog(LOG_NOTICE, "ha-repl", "STANDBY repl tcp connected port=%u",
@@ -527,9 +666,8 @@ static void *ha_repl_trans_thread(void *arg)
                     char frame[REPL_PAYLOAD_MAX + 128];
                     int flen = frame_encode(&t->send_q[slot], frame, sizeof(frame));
                     if (flen <= 0) break;
-                    ssize_t s = send(t->peer_fd, frame, (size_t)flen, MSG_NOSIGNAL);
-                    if (s < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
-                    if (s < 0) {
+                    /* 非阻塞 socket 可能短写：必须发完整个帧再推进 tail */
+                    if (send_all(t->peer_fd, frame, (size_t)flen) != 0) {
                         llog(LOG_WARN, "ha-repl", "repl send errno=%d → reconnect",
                              errno);
                         goto reconnect;
@@ -538,9 +676,15 @@ static void *ha_repl_trans_thread(void *arg)
                     __atomic_store_n(&t->send_tail, tail, __ATOMIC_RELEASE);
                 }
             }
-            /* === 收 === */
+            /* === 收（TCP 字节流重组）=== */
             if (rc > 0 && (pfds[0].revents & POLLIN)) {
-                ssize_t r = recv(t->peer_fd, rbuf, sizeof(rbuf), 0);
+                size_t space;
+                if (t->rxlen >= sizeof(t->rxbuf)) {
+                    llog(LOG_WARN, "ha-repl", "repl rxbuf overflow → reconnect");
+                    goto reconnect;
+                }
+                space = sizeof(t->rxbuf) - t->rxlen;
+                ssize_t r = recv(t->peer_fd, t->rxbuf + t->rxlen, space, 0);
                 if (r == 0) {
                     /* 对端关 */
                     llog(LOG_WARN, "ha-repl", "peer closed repl tcp → reconnect");
@@ -552,91 +696,22 @@ static void *ha_repl_trans_thread(void *arg)
                          errno);
                     goto reconnect;
                 }
-                /* decode + dispatch */
-                if ((size_t)r >= sizeof(ha_repl_frame_hdr_t)) {
+                t->rxlen += (size_t)r;
+                /* 循环处理完整帧；半帧留在缓冲里等下次 recv */
+                while (t->rxlen >= sizeof(ha_repl_frame_hdr_t)) {
                     ha_repl_frame_hdr_t hdr;
-                    if (frame_decode_hdr(rbuf, &hdr) == 0) {
-                        if (hdr.type == HA_REPL_FRAME_ACK_TYPE) {
-                            /* ACK 帧：payload_len 填 applied_seq（跨协议约定） */
-                            uint64_t ack = hdr.payload_len;
-                            if (ack > hdr.seq) ack = hdr.seq;
-                            repl_ack(t->repl, ack);
-                            t->last_ack_seq = ack;
-                        } else if (hdr.type == HA_REPL_FRAME_GAP_REQ_TYPE) {
-                            /* GAP_REQ 帧：备端请求主端重发 gap_start..gap_end-1 */
-                            if ((size_t)r >= sizeof(hdr) + sizeof(ha_repl_gap_req_t)) {
-                                ha_repl_gap_req_t gap;
-                                memcpy(&gap, rbuf + sizeof(hdr), sizeof(gap));
-                                if (t->is_active) {
-                                    transport_resend_gap(t, gap.gap_start, gap.gap_end);
-                                } else {
-                                    llog(LOG_DEBUG, "ha-repl",
-                                         "STANDBY got GAP_REQ — ignore (not active)");
-                                }
-                            }
-                        } else if (hdr.type == HA_REPL_FRAME_FULL_REQ_TYPE) {
-                            /* FULL_REQ 帧：备端请求主端推全量快照（gap 连续超限兜底） */
-                            if (t->is_active) {
-                                transport_send_full_snapshot(t);
-                            } else {
-                                llog(LOG_DEBUG, "ha-repl",
-                                     "STANDBY got FULL_REQ — ignore (not active)");
-                            }
-                        } else {
-                            repl_rec_t rec;
-                            memset(&rec, 0, sizeof(rec));
-                            rec.seq = hdr.seq;
-                            rec.type = (repl_type_t)hdr.type;
-                            rec.ver = hdr.payload_ver;
-                            rec.len = (uint16_t)hdr.payload_len;
-                            if (rec.len > 0 && (size_t)r >= sizeof(hdr) + rec.len)
-                                memcpy(rec.payload, rbuf + sizeof(hdr), rec.len);
-
-                            /* === FULL resync 边界识别 ===
-                             * STANDBY 收到 REPL_FULL_CLEAR 帧 (type=REPL_FULL, len=0)
-                             * → 开启 accept_any_seq（跳过 gap check）
-                             * ACTIVE 侧：不需要 — 不 ingest */
-                            if (rec.type == REPL_FULL && rec.len == 0 && t->repl) {
-                                repl_set_accept_any_seq(t->repl, 1);
-                                llog(LOG_NOTICE, "ha-repl",
-                                     "STANDBY REPL_FULL_CLEAR: accept_any_seq=1");
-                            }
-
-                            (void)repl_ingest(t->repl, &rec);
-
-                            /* === FULL resync 结束 ===
-                             * 主端 FULL push 最后 ACK 帧 payload_len=snap_seq 但被当 REPL 帧跳过了。
-                             * 识别方式：FULL push 后会有 ACK 帧，收到 ACK 帧且 accept_any_seq=1 → 关闭 + resync_done */
-                            if (t->repl) {
-                                if (t->full_resync_inflight && hdr.type == HA_REPL_FRAME_ACK_TYPE) {
-                                    repl_set_accept_any_seq(t->repl, 0);
-                                    repl_resync_done(t->repl, hdr.payload_len);
-                                    t->full_resync_inflight = 0;
-                                    /* gap 跟踪清零 — 下一轮正常重传/GAP_REQ */
-                                    t->same_gap_cnt = 0;
-                                    t->last_gap_start = 0;
-                                    t->last_gap_end = 0;
-                                    llog(LOG_NOTICE, "ha-repl",
-                                         "FULL resync done: snap_seq=%llu",
-                                         (unsigned long long)hdr.payload_len);
-                                } else if (!t->is_active && rec.type == REPL_FULL && rec.len == 0) {
-                                    /* CLEAR 帧置位 FULL inflight — 等最后 ACK 帧收尾 */
-                                    t->full_resync_inflight = 1;
-                                }
-                            }
-
-                            /* 每收一帧发 ACK —— 简化 P1 骨架 */
-                            char ackbuf[sizeof(ha_repl_frame_hdr_t)];
-                            ha_repl_frame_hdr_t ah;
-                            memset(&ah, 0, sizeof(ah));
-                            ah.magic = htons(HA_REPL_FRAME_MAGIC);
-                            ah.ver   = htons(HA_REPL_FRAME_VER);
-                            ah.type  = HA_REPL_FRAME_ACK_TYPE;
-                            ah.payload_len = htonl((uint32_t)repl_applied_seq(t->repl));
-                            memcpy(ackbuf, &ah, sizeof(ah));
-                            (void)send(t->peer_fd, ackbuf, sizeof(ah), MSG_NOSIGNAL);
-                        }
+                    size_t total;
+                    if (frame_decode_hdr(t->rxbuf, &hdr) != 0) {
+                        llog(LOG_WARN, "ha-repl",
+                             "bad repl frame hdr (magic/ver/len) → reconnect");
+                        goto reconnect;
                     }
+                    total = sizeof(ha_repl_frame_hdr_t) + hdr.payload_len;
+                    if (t->rxlen < total) break;
+                    transport_handle_frame(t, t->rxbuf);
+                    if (t->rxlen > total)
+                        memmove(t->rxbuf, t->rxbuf + total, t->rxlen - total);
+                    t->rxlen -= total;
                 }
             }
             if (rc > 0 && (pfds[0].revents & (POLLERR | POLLHUP))) {
@@ -648,6 +723,7 @@ static void *ha_repl_trans_thread(void *arg)
 
 reconnect:
         if (t->peer_fd >= 0) { close(t->peer_fd); t->peer_fd = -1; }
+        t->rxlen = 0;   /* 丢弃半帧，防止错误流延续 */
         t->connected = 0;
         if (t->is_active && t->listen_fd < 0) {
             /* ACTIVE 重新 listen 等备端 */
