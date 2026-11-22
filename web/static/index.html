@@ -404,8 +404,88 @@
 <div id="app" v-cloak>
 
   <!-- Login — Linear 风深紫渐变 -->
-  <div v-if="!auth.token" class="min-h-screen flex items-center justify-center bg-gradient-to-br from-[#0F0F10] via-[#1A1433] to-[#2D1B5E]">
-    <div class="login-card rounded-2xl shadow-pop p-8 w-[400px] border border-black/5">
+  <div v-if="setup.checking || setup.required || !auth.token" class="min-h-screen flex items-center justify-center bg-gradient-to-br from-[#0F0F10] via-[#1A1433] to-[#2D1B5E]">
+    <!-- 首次启动：系统状态检查中 -->
+    <div v-if="setup.checking" class="login-card rounded-2xl shadow-pop p-8 w-[400px] border border-black/5 text-center text-slate-500">
+      <i class="fa-solid fa-spinner fa-spin mr-2"></i>{{ t('Checking system status...') }}
+    </div>
+
+    <div v-else-if="setup.required" class="login-card rounded-2xl shadow-pop p-8 w-[480px] border border-black/5">
+      <div class="flex items-center gap-3 mb-5">
+        <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-emerald-500 to-emerald-700 flex items-center justify-center shadow-lg shadow-emerald-600/30">
+          <i class="fa-solid fa-database text-white text-lg"></i>
+        </div>
+        <div>
+          <h1 class="text-xl font-bold text-slate-800">{{ t('System initialization') }}</h1>
+          <p class="text-xs text-slate-500">{{ t('First run — choose a database') }}</p>
+        </div>
+      </div>
+
+      <div v-if="!setup.done" class="space-y-3">
+        <p class="text-xs text-slate-500 leading-relaxed">
+          {{ t('Security tokens and the initial admin password are generated automatically. Only choose where the database lives.') }}
+        </p>
+
+        <div class="flex items-center gap-3">
+          <label class="field-label w-20 flex-shrink-0 text-right mb-0">{{ t('Database') }}</label>
+          <el-select v-model="setup.backend" style="width:100%" @change="onSetupBackendChange">
+            <el-option :label="t('SQLite (single node, recommended)')" value="sqlite"></el-option>
+            <el-option label="PostgreSQL" value="postgres"></el-option>
+            <el-option label="MySQL" value="mysql"></el-option>
+          </el-select>
+        </div>
+
+        <p v-if="setup.backend === 'sqlite'" class="text-[11px] text-gray-400 break-all pl-[92px]">
+          {{ t('Will be created automatically:') }} {{ setup.sqlite_path }}
+        </p>
+
+        <template v-else>
+          <div class="flex items-center gap-3">
+            <label class="field-label w-20 flex-shrink-0 text-right mb-0">{{ t('Host') }}</label>
+            <input v-model="setup.host" class="field-input flex-1" placeholder="127.0.0.1">
+          </div>
+          <div class="flex items-center gap-3">
+            <label class="field-label w-20 flex-shrink-0 text-right mb-0">{{ t('Port') }}</label>
+            <input v-model.number="setup.port" type="number" class="field-input flex-1">
+          </div>
+          <div class="flex items-center gap-3">
+            <label class="field-label w-20 flex-shrink-0 text-right mb-0">{{ t('Database name') }}</label>
+            <input v-model="setup.database" class="field-input flex-1" placeholder="nsbc">
+          </div>
+          <div class="flex items-center gap-3">
+            <label class="field-label w-20 flex-shrink-0 text-right mb-0">{{ t('Username') }}</label>
+            <input v-model="setup.user" class="field-input flex-1" placeholder="nsbc">
+          </div>
+          <div class="flex items-center gap-3">
+            <label class="field-label w-20 flex-shrink-0 text-right mb-0">{{ t('Password') }}</label>
+            <input v-model="setup.password" type="password" class="field-input flex-1" placeholder="••••••••">
+          </div>
+        </template>
+
+        <button @click="submitSetup" :disabled="setup.submitting"
+          class="btn btn-primary w-full py-2.5 disabled:opacity-50 mt-2 shadow-lg shadow-blue-600/30">
+          <i class="fa-solid fa-play mr-2"></i>
+          {{ setup.submitting ? t('Initializing...') : t('Initialize and restart') }}
+        </button>
+        <p v-if="setup.error" class="text-red-600 text-sm text-center bg-red-50 border border-red-100 rounded py-2 px-3">{{ setup.error }}</p>
+      </div>
+
+      <div v-else class="space-y-3">
+        <p class="text-green-700 text-sm bg-green-50 border border-green-100 rounded py-2 px-3">
+          <i class="fa-solid fa-circle-check mr-1"></i>{{ t('Initialization complete') }}
+        </p>
+        <div class="text-xs text-slate-500">{{ t('Sign in with the generated credentials:') }}</div>
+        <div class="font-mono text-sm bg-slate-50 border border-slate-200 rounded p-3 space-y-1">
+          <div>user: <b>admin</b></div>
+          <div>pass: <b>{{ setup.adminPassword || t('keep existing password') }}</b></div>
+        </div>
+        <p class="text-xs text-amber-600">
+          {{ setup.restarting ? t('Restarting, the page will reload automatically…') : t('Already saved. Restart nsbc-web, then reload this page.') }}
+        </p>
+      </div>
+    </div>
+
+    <div v-else class="login-card rounded-2xl shadow-pop p-8 w-[400px] border border-black/5">
       <div class="flex items-center gap-3 mb-6">
         <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center shadow-lg shadow-blue-600/30">
           <i class="fa-solid fa-server text-white text-lg"></i>
@@ -590,7 +670,7 @@
 </div>
 
 <!-- 应用核心（API、编辑器、工厂、App 创建） -->
-<script src="js/app-core.js?v=20261115b"></script>
+<script src="js/app-core.js?v=20261122c"></script>
 <!-- CRUD 实体页面（extensions/gateways/trunks 等） -->
 <script src="js/pages-crud.js?v=20261121a"></script>
 <!-- 实时监控面板（realtime/channels/cdrs 等） -->

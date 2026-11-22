@@ -9,10 +9,9 @@
 # Usage:
 #   make fetch         online dep fetch (disable vendor -> rebuild lockfile -> fetch)
 #   make vendor        online vendor (fetch + cargo vendor)
-#   make build         default intranet mode build (zero external crates, offline)
-#   make build-acme    public ACME mode build (must run make vendor first)
-#   make run           default intranet mode start
-#   make run-acme      public ACME mode start
+#   make build         default build WITH acme feature (public ACME; run `make vendor` first)
+#   make build FEATURES=   pure intranet build (no acme, zero extra crates, offline)
+#   make run           start with acme feature
 #   make clean         cargo clean
 #
 # Note:
@@ -28,8 +27,15 @@
 CARGO       := cargo
 RELEASE_DIR := target/release
 BINARY      := $(RELEASE_DIR)/nsbc-web
-FEATURES    :=
+# 默认启用 acme 特性（公网 ACME）；如只需内网精简构建：
+#   make build FEATURES=
+FEATURES    ?= acme
 OFFLINE     := --offline --locked
+# 仅有 FEATURES 非空时追加 --features，FEATURES= 可显式关闭
+ACME_FLAG   := $(if $(FEATURES),--features $(FEATURES))
+
+# 裸 `make` 默认构建（本文件第一个规则是 fetch，若不指定会误跑 fetch）
+.DEFAULT_GOAL := build
 
 # auto-detect whether .cargo/config.toml has vendor config
 VENDOR_CFG  := .cargo/config.toml
@@ -99,8 +105,8 @@ all: build
 # build: 编译 + 便捷 cp 到项目根（开发模式快速 ./nsbc-web 直接跑）
 # 注意: 正式部署请用 `make install` （由根 Makefile 调 web install）
 build:
-	@echo "=== cargo build --release (default intranet mode) ==="
-	$(CARGO) build --release $(OFFLINE)
+	@echo "=== cargo build --release (features: $(if $(FEATURES),$(FEATURES),none)) ==="
+	$(CARGO) build --release $(OFFLINE) $(ACME_FLAG)
 	@echo "✅ build done → $(BINARY)"
 	@echo "=== cp to parent directory (dev convenience) ==="
 	cp -f target/release/nsbc-web ../.
@@ -133,14 +139,14 @@ install:
 
 # ===== 3. quick check (no binary output) =====
 check:
-	$(CARGO) check --release $(OFFLINE)
+	$(CARGO) check --release $(OFFLINE) $(ACME_FLAG)
 
 check-acme:
 	$(CARGO) check --release $(OFFLINE) --features acme
 
 # ===== 4. run =====
 run: build
-	@echo "=== start nsbc-web (default intranet mode) ==="
+	@echo "=== start nsbc-web (features: $(if $(FEATURES),$(FEATURES),none)) ==="
 	./$(BINARY)
 
 run-acme: build-acme

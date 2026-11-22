@@ -276,8 +276,15 @@ void *mem_mag_alloc(mem_mag_t *m, mem_slab_t *s)
     /* 本地空：一次锁从共享池批量搬运，锁竞争摊薄到 1/batch */
     if (c->n == 0) {
         pthread_mutex_lock(&s->lock);
-        while (c->n < s->batch && s->nfree > 0)
-            c->ptrs[c->n++] = pop_one(s);
+        while (c->n < s->batch && s->nfree > 0) {
+            void *p = pop_one(s);
+            if (!p)
+                break;
+            /* P1-1：进入 magazine 的对象统一标记为"已释放"（slab=NULL），
+             * 使二次释放能被检测，避免同一槽位被重复分配。 */
+            obj_hdr(p)->slab = NULL;
+            c->ptrs[c->n++] = p;
+        }
         pthread_mutex_unlock(&s->lock);
         if (c->n == 0) {
             __atomic_add_fetch(&s->nfail, 1, __ATOMIC_RELAXED);
@@ -286,6 +293,7 @@ void *mem_mag_alloc(mem_mag_t *m, mem_slab_t *s)
     }
 
     void *obj = c->ptrs[--c->n]; /* 快路径：无锁无原子 */
+    obj_hdr(obj)->slab = s;       /* P1-1：取出时恢复归属 */
     __atomic_add_fetch(&s->nalloc, 1, __ATOMIC_RELAXED);
     return obj;
 }
@@ -295,8 +303,15 @@ void mem_mag_free(mem_mag_t *m, void *obj)
     if (!obj)
         return;
     mem_obj_hdr_t *h = obj_hdr(obj);
-    if (h->magic != MEM_OBJ_MAGIC || !h->slab)
+    if (h->magic != MEM_OBJ_MAGIC)
         return;
+    /* P1-1：slab==NULL 表示对象已释放（在 magazine 或共享池中）。
+     * 快路径必须同样识别，否则二次释放会让同一槽位出现两份。 */
+    if (!h->slab) {
+        llog(LOG_WARN, "mem", "magazine double free detected (slot=%u)",
+             h->slot);
+        return;
+    }
     mem_slab_t *s = h->slab;
 
     mem_cache_t *c = cache_get(m, s, 1);
@@ -319,6 +334,7 @@ void mem_mag_free(mem_mag_t *m, void *obj)
         pthread_mutex_unlock(&s->lock);
     }
 
+    h->slab = NULL; /* P1-1：与 mem_obj_release 一致，magazine 内也视为已释放 */
     c->ptrs[c->n++] = obj; /* 快路径：无锁无原子 */
 }
 

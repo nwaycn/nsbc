@@ -56,14 +56,17 @@ const welcomeText = "你好，我是 sbc 智能客服，请问有什么能为您
 
 var cachedGreeting []byte
 
+// insecureTLS 由 --insecure 显式开启：默认校验服务端证书（P1-9）。
+var insecureTLS bool
+
 // ★ 全局共享 http.Transport —— 复用 TCP 连接，避免 TIME_WAIT 爆炸
 // 原来 cmd() 每次 new Transport → 每次独立 TCP → 28231 个 TIME_WAIT！
 var (
 	globalTransport = &http.Transport{
-		TLSClientConfig:    &tls.Config{InsecureSkipVerify: true},
-		MaxIdleConns:       32,
+		TLSClientConfig:     &tls.Config{},
+		MaxIdleConns:        32,
 		MaxIdleConnsPerHost: 32,
-		IdleConnTimeout:    90 * time.Second,
+		IdleConnTimeout:     90 * time.Second,
 	}
 	globalHTTPClient = &http.Client{Transport: globalTransport, Timeout: 30 * time.Second}
 )
@@ -308,7 +311,8 @@ func newWsTransport(apiBase, apiToken, callID string) (*wsTransport, error) {
 	var conn net.Conn
 	var err error
 	if scheme == "wss" {
-		conn, err = tls.Dial("tcp", hostPort, &tls.Config{InsecureSkipVerify: true})
+		conn, err = tls.Dial("tcp", hostPort,
+			&tls.Config{InsecureSkipVerify: insecureTLS})
 	} else {
 		conn, err = net.DialTimeout("tcp", hostPort, 10*time.Second)
 	}
@@ -374,12 +378,15 @@ func computeAccept(key string) string {
 }
 
 func (t *wsTransport) wsRead() (wsFrame, error) {
+	// P2-13：50ms 只用于"首字节"轮询；帧已开始后改用整体超时读完
+	// header/payload，避免大帧或慢链路读到一半被 50ms 截断导致流失步。
 	t.conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
 
 	var hdr [2]byte
 	if _, err := io.ReadFull(t.rw.Reader, hdr[:]); err != nil {
 		return wsFrame{}, err
 	}
+	_ = t.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 
 	var opcode wsOpcode = wsOpcode(hdr[0] & 0x0F)
 	masked := (hdr[1] & 0x80) != 0
@@ -494,7 +501,7 @@ func buildLLM(name, transferDest string, apiKey, endpoint, model string, transfe
 	}
 	return &MockLLM{TransferDest: transferDest,
 		TransferKeywords: transferKeywords,
-		HangupKeywords:    []string{"挂断", "再见", "拜拜", "hangup", "bye"}}
+		HangupKeywords:   []string{"挂断", "再见", "拜拜", "hangup", "bye"}}
 }
 
 func buildTTS(name, apiKey, voiceID, nwayAddr string) TTSProvider {
@@ -512,20 +519,20 @@ func buildTTS(name, apiKey, voiceID, nwayAddr string) TTSProvider {
 // =============================================================================
 
 type callSession struct {
-	callID    string
-	orig, to  string // 主被叫
-	done      chan struct{} // 关闭时表示该通话已结束
-	stopped   chan struct{} // 收到 hangup 事件时关闭
-	stopOnce  sync.Once
+	callID   string
+	orig, to string        // 主被叫
+	done     chan struct{} // 关闭时表示该通话已结束
+	stopped  chan struct{} // 收到 hangup 事件时关闭
+	stopOnce sync.Once
 }
 
 func newCallSession(callID, orig, to string) *callSession {
 	return &callSession{
-		callID:   callID,
-		orig:     orig,
-		to:       to,
-		done:     make(chan struct{}),
-		stopped:  make(chan struct{}),
+		callID:  callID,
+		orig:    orig,
+		to:      to,
+		done:    make(chan struct{}),
+		stopped: make(chan struct{}),
 	}
 }
 
@@ -539,8 +546,8 @@ func (s *callSession) markStopped() {
 
 // callTracker — 跟踪所有活跃的 per-call goroutine
 type callTracker struct {
-	mu     sync.Mutex
-	calls  map[string]*callSession
+	mu    sync.Mutex
+	calls map[string]*callSession
 }
 
 func newCallTracker() *callTracker {
@@ -586,8 +593,8 @@ func (t *callTracker) activeCount() int {
 // =============================================================================
 
 type aiSessionTracker struct {
-	mu   sync.Mutex
-	ai   map[string]bool  // call_id → true 表示 C 侧已创建 ai_session
+	mu sync.Mutex
+	ai map[string]bool // call_id → true 表示 C 侧已创建 ai_session
 }
 
 func newAISessionTracker() *aiSessionTracker {
@@ -733,8 +740,8 @@ func handleCall(
 	defer vadTicker.Stop()
 
 	const (
-		vadGraceMs     = 400     // SILENCE 后 400ms 才真正 flush
-		asrBufMaxBytes = 40000   // 5000ms PCMU @ 8kHz safety limit
+		vadGraceMs     = 400   // SILENCE 后 400ms 才真正 flush
+		asrBufMaxBytes = 40000 // 5000ms PCMU @ 8kHz safety limit
 	)
 
 	var (
@@ -746,9 +753,9 @@ func handleCall(
 
 		// --- 异步 TTS 状态（channel 驱动，主循环永不阻塞）---
 		// ttsPlayingCh declared before greeting (L656) — avoids forward reference
-		ttsPlaying     bool
-		needFlush      bool                   // ticker 检测到 grace DONE → 主循环尾部异步处理
-		flushReason    string
+		ttsPlaying  bool
+		needFlush   bool // ticker 检测到 grace DONE → 主循环尾部异步处理
+		flushReason string
 	)
 
 	// --- flushSentence：在主循环尾部被异步调用，里面的 TTS 也跑独立 goroutine ---
@@ -812,12 +819,12 @@ func handleCall(
 			// ★ 等上一次 TTS goroutine 彻底结束（不阻塞，只看 channel 状态）
 			// 如果上一个 TTS 还在播，等它结束再播新的（tail call — 自动排队）
 			go func() {
-				ttsPlayingCh <- true               // 通知主循环：TTS 开始
+				ttsPlayingCh <- true // 通知主循环：TTS 开始
 				fmt.Printf("[ai_agent] ★ TTS start (%d bytes, ~%d ms)\n",
 					len(pcmu), len(pcmu)/640*40)
 				sendAudioPaced(apiBase, apiToken, callID, pcmu, ws, cs, bargeInEnabled, bargeInRMS)
 				fmt.Printf("[ai_agent] ← TTS 回复 (%d bytes)\n", len(pcmu))
-				ttsPlayingCh <- false              // 通知主循环：TTS 结束
+				ttsPlayingCh <- false // 通知主循环：TTS 结束
 			}()
 		}
 	}
@@ -897,7 +904,7 @@ func handleCall(
 		// ★ 异步 flush（主循环尾部，永不阻塞 VAD ticker）
 		if needFlush {
 			needFlush = false
-			flushSentence(flushReason)  // ASR+LLM+TTS-Synthesize 同步，TTS 播放异步
+			flushSentence(flushReason) // ASR+LLM+TTS-Synthesize 同步，TTS 播放异步
 		}
 
 		// --- 拉用户语音帧 ---
@@ -955,7 +962,7 @@ func main() {
 	bargeInRMS := flag.Int("barge-in-rms", 800, "barge-in VAD RMS 阈值")
 	chunkBytes := flag.Int("chunk-bytes", 320, "ai-get-rx 每次拉多少字节（PCM16 20ms = 320B）")
 	transport := flag.String("transport", "auto", "http | ws | auto")
-	insecure := flag.Bool("insecure", true, "跳过 TLS 证书验证（默认 true，自签证书）")
+	insecure := flag.Bool("insecure", false, "跳过 TLS 证书验证（自签证书部署需显式开启）")
 	vadMode := flag.String("vad-mode", "external", "VAD 模式：external=C侧VAD切句, passthrough=全量stream Provider自切")
 
 	// Provider flags
@@ -983,7 +990,11 @@ func main() {
 	}
 
 	if *insecure {
+		// P1-9：只有显式 --insecure 才关闭证书校验（HTTP 与 WSS 两条路径）
+		insecureTLS = true
+		globalTransport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 		nsbc_sdk.SetSSLVerify(false)
+		fmt.Fprintln(stderr, "[warn] --insecure 已开启：TLS 证书校验被跳过，仅限测试环境")
 	}
 
 	// --- providers ---
@@ -1037,7 +1048,7 @@ func main() {
 	}
 
 	tracker := newCallTracker()
-	aiTracker := newAISessionTracker()  // ★ P2: 双重事件门控
+	aiTracker := newAISessionTracker() // ★ P2: 双重事件门控
 
 	// 启动 SSE 客户端（自动重连）
 	sseClient := nsbc_sdk.NewSseClient(sseUrl, 30, headers)

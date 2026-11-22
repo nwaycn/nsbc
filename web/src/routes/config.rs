@@ -1,7 +1,8 @@
 //! Config interface (REQ-WEB-004 / REQ-CFG-011/013):
 //! - GET /config       Full redacted effective snapshot (C2: forwards core `config.export`)
 //! - GET /config/:key  Effective value read-only query (C1: forwards core `config.get`)
-//! - POST /config/set         Hot-set (L1, forwards core `config.set`; audited to config_history)
+//! - POST /config/set         Hot-set (L1; security./tls./sip.listen* keys additionally
+//!                            require role L2 inside the handler; audited to config_history)
 //! - POST /config/validate    Dry-run validation (L0, forwards core `config.validate`, no state change)
 //!
 //! Note: the operator identity for config.set (L1 user identity) is already recorded
@@ -11,10 +12,11 @@ use std::sync::Arc;
 
 use axum::extract::{Path, State};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::auth::{Identity, Role};
 use crate::coreclient::{ConfigSetResult, CoreApi, CoreError};
 use crate::error::{ApiError, ApiResult};
 use crate::AppState;
@@ -42,6 +44,13 @@ fn valid_config_key(key: &str) -> bool {
         && !key.contains("..")
         && key.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+}
+
+/// 敏感配置键（P2-14）：直接改变攻击面的键，写操作需 L2。
+/// RBAC 中间件拿不到请求体，无法按 key 分级，故在 handler 内按角色复检。
+fn is_sensitive_config_key(key: &str) -> bool {
+    const PREFIXES: [&str; 3] = ["security.", "tls.", "sip.listen"];
+    PREFIXES.iter().any(|p| key.starts_with(p))
 }
 
 /// Request body (value allows empty-string delete semantics; route layer does not truncate,
@@ -98,10 +107,15 @@ async fn post_config_validate<C: CoreApi + Clone + 'static>(
 /// After success, writes config_history (silently skipped if DB not configured).
 async fn post_config_set<C: CoreApi + Clone + 'static>(
     State(st): State<Arc<AppState<C>>>,
+    Extension(id): Extension<Identity>,
     Json(body): Json<ConfigWriteReq>,
 ) -> ApiResult<Json<ConfigSetResult>> {
     if !valid_config_key(&body.key) {
         return Err(ApiError::BadRequest("invalid config key".into()));
+    }
+    // P2-14：security./tls./sip.listen* 属于高风险键，L1 不得修改。
+    if is_sensitive_config_key(&body.key) && id.0.role < Role::L2.as_u8() {
+        return Err(ApiError::Forbidden { required: "L2 (sensitive config key)" });
     }
 
     let result = match st.core.config_set(&body.key, &body.value).await {

@@ -722,11 +722,27 @@ static int uds_send(const char *fmt, ...)
  * 变量替换：$focus / $profile / $cli_version 等
  * 返回 strdup 的新串（调用方 free）
  * ================================================================ */
+/* P2-4：统一的有界追加。容量不足时按 2 倍扩容（realloc），
+ * 避免原来 "保守预估 il+256" 在重复 $focus 时写出堆边界。 */
+static int cli_buf_put(char **buf, size_t *cap, size_t *op, char ch)
+{
+    if (*op + 1 >= *cap) {
+        size_t ncap = *cap * 2;
+        char *nb = realloc(*buf, ncap);
+        if (!nb) return -1;
+        *buf = nb;
+        *cap = ncap;
+    }
+    (*buf)[(*op)++] = ch;
+    return 0;
+}
+
 static char *expand_vars(const char *input)
 {
     if (!input || *input == '\0') return strdup(input ? "" : "");
     size_t il = strlen(input);
-    char *out = malloc(il + 256);  /* 保守预估 */
+    size_t cap = il + 256;  /* 初始预估，不足时动态扩容 */
+    char *out = malloc(cap);
     if (!out) return strdup(input);
     size_t op = 0;
     for (size_t i = 0; i < il; ++i) {
@@ -744,16 +760,15 @@ static char *expand_vars(const char *input)
             else if (strcmp(vname, "home") == 0)     val = getenv("HOME") ? getenv("HOME") : "";
             else {
                 /* 未知变量保留原样：$foo → $foo */
-                out[op++] = '$';
+                if (cli_buf_put(&out, &cap, &op, '$') != 0) break;
                 continue;
             }
             for (const char *p = val; *p; ++p) {
-                if (op + 1 >= il + 256) break;
-                out[op++] = *p;
+                if (cli_buf_put(&out, &cap, &op, *p) != 0) break;
             }
             i += vlen;
         } else {
-            out[op++] = input[i];
+            if (cli_buf_put(&out, &cap, &op, input[i]) != 0) break;
         }
     }
     out[op] = '\0';

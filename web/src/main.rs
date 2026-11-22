@@ -27,11 +27,11 @@ mod middleware;
 mod poller;
 mod ai_agent;
 mod routes;
+mod setup;
 mod static_files;
 mod sync;
 mod uds_server;
 mod ws;                          // REQ-AI-WS-001: Self-implemented WebSocket
-use std::io::IsTerminal;
 use std::io::Write as _;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -227,11 +227,31 @@ fn ext_router<C: CoreApi + Clone + 'static>(st: Arc<AppState<C>>) -> Router {
 /// independent from Web UI JWT — uses API Key auth, lets call-centers / CRMs / AI Agents
 /// control + monitor + receive events with zero client deployment.
 fn app_router<C: CoreApi + Clone + 'static>(state: Arc<AppState<C>>) -> Router {
-    // Security response headers layer (OWASP baseline, compatible with Vue 3 compile-time
-    // template eval). Vue 3 global build uses new Function() for template compilation →
-    // script-src must be 'unsafe-eval'. inline scripts + style attributes in index.html
-    // still require 'unsafe-inline'. media-src adds blob: because recordings are fetched
-    // with Authorization and played via URL.createObjectURL(blob).
+    let app = Router::new()
+        .nest("/api/v1", api_router(state.clone()))
+        .nest("/ext/v1", ext_router(state.clone()))
+        .nest("/ws", ws::router::<C>(state.clone()))  // REQ-AI-WS-001: /ws/ai-media/:call_id — 内部自验 token
+        .merge(routes::recordings::protected_file_router(state.clone()))  // ← /recordings/*（JWT 鉴权）
+        .route("/health", axum::routing::get(routes::system::health))
+        // 正常模式下显式告知前端“已配置完成”，用于初始化向导重启后的自动刷新判断
+        .route("/setup/status", axum::routing::get(setup_not_required))
+        .merge(static_files::router());
+    harden(app)
+}
+
+async fn setup_not_required() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({ "required": false }))
+}
+
+/// Security response headers layer (OWASP baseline). NOTE: the UI loads
+/// `vendor/vue.global.prod.js` and defines components with `template:` strings,
+/// so Vue's runtime template compiler calls `new Function()` → 'unsafe-eval' is
+/// required. It can only be dropped after migrating to build-time precompiled
+/// render functions (or a CSP nonce-based compile step). inline scripts + style
+/// attributes in index.html still require 'unsafe-inline'. media-src adds blob:
+/// because recordings are fetched with Authorization and played via
+/// URL.createObjectURL(blob).
+pub(crate) fn harden(app: Router) -> Router {
     let csp = "default-src 'self'; \
         script-src 'self' 'unsafe-inline' 'unsafe-eval'; \
         style-src 'self' 'unsafe-inline'; \
@@ -242,14 +262,6 @@ fn app_router<C: CoreApi + Clone + 'static>(state: Arc<AppState<C>>) -> Router {
         frame-ancestors 'none'; \
         base-uri 'self'; \
         form-action 'self'";
-
-    let app = Router::new()
-        .nest("/api/v1", api_router(state.clone()))
-        .nest("/ext/v1", ext_router(state.clone()))
-        .nest("/ws", ws::router::<C>(state.clone()))  // REQ-AI-WS-001: /ws/ai-media/:call_id — 内部自验 token
-        .merge(routes::recordings::protected_file_router(state.clone()))  // ← /recordings/*（JWT 鉴权）
-        .route("/health", axum::routing::get(routes::system::health))
-        .merge(static_files::router());
 
     // Add security headers layer by layer (SetResponseHeaderLayer overwrites duplicates)
     app.layer(SetResponseHeaderLayer::if_not_present(
@@ -274,133 +286,46 @@ fn app_router<C: CoreApi + Clone + 'static>(state: Arc<AppState<C>>) -> Router {
     ))
 }
 
-/// Phase 4 DB DSN bootstrap (2026-10-15 incremental):
-/// Precedence chain: NSBC_DB_DSN env > cfg.db.dsn > interactive wizard > SQLite default
-fn resolve_db_dsn(cfg: &config::DbSection) -> String {
+/// Phase 4 DB DSN bootstrap:
+/// Precedence: NSBC_DB_DSN env > cfg.db.dsn（向导写回的 nsbc.yaml）> 遗留 SQLite 文件 > 未配置。
+/// 返回 None 表示需要进入 Web 初始化向导（setup.rs），由用户在首页选择数据库。
+fn resolve_db_dsn(cfg: &config::DbSection) -> Option<String> {
     // 1. env override takes highest priority
     if let Ok(v) = std::env::var("NSBC_DB_DSN") {
-        tracing::info!("database DSN environment override active");
-        return v;
+        if !v.trim().is_empty() {
+            tracing::info!("database DSN environment override active");
+            return Some(v);
+        }
     }
-    // 2. explicit config in cfg file
+    // 2. explicit config in nsbc.yaml
     if !cfg.dsn.is_empty() {
+        // 配置指向磁盘 SQLite 但库文件已不存在 → 不静默重建空库，
+        // 交给初始化向导重新选择后端（向导会沿用原 sqlite 路径作为默认值）。
+        if let Some(p) = config::sqlite_dsn_path(&cfg.dsn) {
+            if !p.exists() {
+                tracing::warn!(
+                    dsn = %cfg.dsn,
+                    path = %p.display(),
+                    "configured SQLite file is missing — entering Web setup wizard"
+                );
+                return None;
+            }
+        }
         tracing::info!("using database DSN from config");
-        return cfg.dsn.clone();
+        return Some(cfg.dsn.clone());
     }
-
-    // 3. Interactive wizard (when TTY is available)
-    let is_tty = std::io::stdin().is_terminal();
-
-    if is_tty {
-        tracing::warn!("db.dsn not configured, entering interactive wizard…");
-        println!();
-        println!("╔══════════════════════════════════════╗");
-        println!("║  NSBC Web DB Initialization Wizard (Phase 4) ║");
-        println!("╠══════════════════════════════════════╣");
-        println!("║  1) SQLite  (lightweight single-node, recommended for PoC) ║");
-        println!("║  2) MySQL   (production-grade)                 ║");
-        println!("║  3) PostgreSQL (production-grade)              ║");
-        println!("║  4) Skip (in-memory only)                      ║");
-        println!("╚══════════════════════════════════════╝");
-        print!("Select [1/2/3/4] default(1): ");
-        std::io::stdout().flush().ok();
-
-        let mut choice = String::new();
-        std::io::stdin().read_line(&mut choice).ok();
-        let choice = choice.trim();
-
-        match choice {
-            "2" => {
-                print!("MySQL host [127.0.0.1]: "); std::io::stdout().flush().ok();
-                let mut host = String::new();
-                std::io::stdin().read_line(&mut host).ok();
-                let host = host.trim_or("127.0.0.1");
-
-                print!("MySQL port [3306]: "); std::io::stdout().flush().ok();
-                let mut port = String::new();
-                std::io::stdin().read_line(&mut port).ok();
-                let port = port.trim_or("3306");
-
-                print!("MySQL user [nsbc]: "); std::io::stdout().flush().ok();
-                let mut user = String::new();
-                std::io::stdin().read_line(&mut user).ok();
-                let user = user.trim_or("nsbc");
-
-                print!("MySQL password: "); std::io::stdout().flush().ok();
-                let mut pass = String::new();
-                std::io::stdin().read_line(&mut pass).ok();
-                let pass = pass.trim();
-
-                print!("MySQL database [nsbc]: "); std::io::stdout().flush().ok();
-                let mut dbname = String::new();
-                std::io::stdin().read_line(&mut dbname).ok();
-                let dbname = dbname.trim_or("nsbc");
-
-                let dsn = format!("mysql://{}:{}@{}:{}/{}",
-                    user, pass, host, port, dbname);
-                tracing::info!("🔧 db: MySQL DSN → {}:{}/{}", host, port, dbname);
-                return dsn;
-            }
-            "3" => {
-                print!("PostgreSQL host [127.0.0.1]: "); std::io::stdout().flush().ok();
-                let mut host = String::new();
-                std::io::stdin().read_line(&mut host).ok();
-                let host = host.trim_or("127.0.0.1");
-
-                print!("PostgreSQL port [5432]: "); std::io::stdout().flush().ok();
-                let mut port = String::new();
-                std::io::stdin().read_line(&mut port).ok();
-                let port = port.trim_or("5432");
-
-                print!("PostgreSQL user [nsbc]: "); std::io::stdout().flush().ok();
-                let mut user = String::new();
-                std::io::stdin().read_line(&mut user).ok();
-                let user = user.trim_or("nsbc");
-
-                print!("PostgreSQL password: "); std::io::stdout().flush().ok();
-                let mut pass = String::new();
-                std::io::stdin().read_line(&mut pass).ok();
-                let pass = pass.trim();
-
-                print!("PostgreSQL database [nsbc]: "); std::io::stdout().flush().ok();
-                let mut dbname = String::new();
-                std::io::stdin().read_line(&mut dbname).ok();
-                let dbname = dbname.trim_or("nsbc");
-
-                let dsn = format!("postgres://{}:{}@{}:{}/{}",
-                    user, pass, host, port, dbname);
-                tracing::info!("🔧 db: PostgreSQL DSN → {}:{}/{}", host, port, dbname);
-                return dsn;
-            }
-            "4" => {
-                tracing::info!("🔧 db: wizard skipped — persistence disabled");
-                return String::new();
-            }
-            _ => { /* default SQLite, handled below */ }
-        }
+    // 3. 旧版隐式默认库（db/web.db）不再静默接管：文件存在时只提示，
+    //    由初始化向导让管理员确认是否继续使用它；否则删除库目录后仍会直接
+    //    进入登录页，无法重新选择数据库后端。
+    let legacy = std::path::PathBuf::from("db/web.db");
+    if legacy.exists() {
+        tracing::warn!(
+            path = %legacy.display(),
+            "legacy default SQLite file found — entering Web setup wizard (choose sqlite to keep it)"
+        );
     }
-
-    // 4. SQLite default (TTY not available OR user picked 1 OR just hit Enter)
-    let db_path = std::path::PathBuf::from("data/web.db");
-    if let Some(parent) = db_path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            eprintln!("warning: create_dir_all {}: {e}", parent.display());
-        }
-    }
-    let dsn = format!("sqlite:{}", db_path.display());
-    tracing::info!("using default SQLite database");
-    dsn
-}
-
-/// Extension trait: trim_or default value filling on Option<String>
-trait TrimOr {
-    fn trim_or<'a>(&'a self, default: &'a str) -> &'a str;
-}
-impl TrimOr for String {
-    fn trim_or<'a>(&'a self, default: &'a str) -> &'a str {
-        let t = self.trim();
-        if t.is_empty() { default } else { t }
-    }
+    // 4. 未配置 → Web 初始化向导
+    None
 }
 
 #[tokio::main]
@@ -528,14 +453,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // ---------- 首次启动：数据库未配置 → Web 初始化向导 ----------
+    // 不再走 TTY 交互：直接提供首页向导，由用户选择 sqlite/postgres/mysql；
+    // JWT 密钥、初始管理员密码由服务端自动生成（见 setup.rs）。
+    let dsn = match resolve_db_dsn(&cfg.db) {
+        Some(d) => d,
+        None => {
+            let config_file = config::config_file_path(config_path);
+            // 默认库沿用项目约定 <项目根>/db/web.db（与 conf/nsbc.yaml 中
+            // sqlite:///../db/web.db 示例一致）；若原配置指向的 sqlite 文件
+            // 已丢失则沿用原路径，其次优先已存在的 CWD/db/web.db。
+            let default_sqlite = match config_file.parent() {
+                // 配置文件在 conf/ 下 → 项目根/db/web.db
+                Some(conf) if conf.file_name().and_then(|n| n.to_str()) == Some("conf") => {
+                    conf.parent()
+                        .map(|root| root.join("db").join("web.db"))
+                        .unwrap_or_else(|| exe_dir.join("db").join("web.db"))
+                }
+                // 找不到配置文件时与可执行文件同级 → exe_dir/db/web.db
+                _ => exe_dir.join("db").join("web.db"),
+            };
+            let sqlite_path = config::sqlite_dsn_path(&cfg.db.dsn)
+                .or_else(|| {
+                    std::env::current_dir()
+                        .ok()
+                        .map(|d| d.join("db").join("web.db"))
+                        .filter(|p| p.exists())
+                })
+                .unwrap_or(default_sqlite);
+            tracing::warn!(
+                config = %config_file.display(),
+                sqlite = %sqlite_path.display(),
+                "database not configured — entering Web setup wizard mode (open the Web UI)"
+            );
+            // 启动日志落到文件，这里额外在控制台提示运维直接打开首页完成初始化
+            eprintln!(
+                "nsbc-web: database not configured — open {}://{}/ in a browser to finish setup",
+                if tls_source.is_some() { "https" } else { "http" },
+                bind
+            );
+            let app = setup::router(Arc::new(setup::SetupCtx { config_file, sqlite_path }));
+            serve_app(app, bind, tls_source).await?;
+            return Ok(());
+        }
+    };
+
     // Core control channel: use cfg.core.control_sock instead of hard-coded from_env
     let core = RealCore::from_config(&cfg.core);
     tracing::info!(?core, "core control client initialized");
 
-    // ---------- Phase 4 Web DB bootstrap (2026-10-15 incremental) ----------
-    // dsn precedence: NSBC_DB_DSN env > cfg.db.dsn > interactive wizard > SQLite default
-    // 先于 Auth 初始化：Auth 需要知道是否存在持久化存储，以决定 JWT 密钥来源。
-    let dsn = resolve_db_dsn(&cfg.db);
+    // ---------- Phase 4 Web DB bootstrap ----------
+    // dsn 已在上面解析（env > nsbc.yaml > 遗留 SQLite）；这里只负责建池与建表。
     let db = db::Db::from_dsn(&dsn).await;
 
     // Auth domain: use cfg.auth instead of from_env (includes default account injection)
@@ -678,7 +646,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let app = app_router(state);
+    serve_app(app, bind, tls_source).await
+}
 
+/// 统一的 HTTP/HTTPS 服务入口：初始化向导模式与正常模式共用同一套 TLS/accept 逻辑。
+async fn serve_app(
+    app: Router,
+    bind: SocketAddr,
+    tls_source: Option<tls::TlsSource>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(bind).await?;
 
     // ---- accept loop (three TlsSource branches) ----

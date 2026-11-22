@@ -1525,7 +1525,8 @@ static int sec_reg_cb(sip_tr_proto_t proto, const nsbc_sa_t *src,
     /* 动态封禁：命中即静默丢（限频采样日志，防攻击流量刷屏）
      * CGNAT 修复：排除 BAN_REASON_INV_FLOOD（inv flood ban 不应 block REGISTER） */
     if (cfg->auto_ban && ban_is_banned(ip, BAN_REASON_AUTH_FAIL | BAN_REASON_REG_REQ | BAN_REASON_INV_REQ)) {
-        static unsigned ban_drop_n = 0;
+        /* P2-3：多个 reactor 线程并发调用，采样计数改线程局部 */
+        static _Thread_local unsigned ban_drop_n = 0;
         if (ban_drop_n++ % 512 == 0)
             log_notice("security",
                        "REGISTER silent-drop: banned ip=%s (dropped=%u)",
@@ -1646,8 +1647,12 @@ static int ban_evict_locked(uint64_t now)
 static uint32_t ban_duration_for_strikes(uint32_t base_s, int strikes, uint32_t max_s)
 {
     if (strikes <= 1) return base_s;
-    uint64_t d = (uint64_t)base_s << (strikes - 1);
+    /* P2-2：移位前钳制，strikes 过大时 (strikes-1)>=32 属于移位 UB */
+    int shift = strikes - 1;
+    if (shift > 31) shift = 31;
+    uint64_t d = (uint64_t)base_s << shift;
     if (max_s > 0 && d > max_s) d = max_s;
+    if (d > 0xFFFFFFFFu) d = 0xFFFFFFFFu;
     return (uint32_t)d;
 }
 
@@ -2290,7 +2295,8 @@ static int sec_guard_cb(const char *src_ip, b2b_guard_evt_t evt, void *ud)
     /* B2B_GUARD_INVITE：动态封禁 + 静态 CIDR 黑名单
      * 所有 ban_reason 都 block INVITE（inv flood ban 本来就是用来封 INVITE 的） */
     if (g_cfg.auto_ban && ban_is_banned(src_ip, BAN_REASON_ALL)) {
-        static unsigned ban_drop_n = 0;
+        /* P2-3：多个 reactor 线程并发调用，采样计数改线程局部 */
+        static _Thread_local unsigned ban_drop_n = 0;
         if (ban_drop_n++ % 512 == 0)
             log_notice("security",
                        "INVITE silent-drop: banned ip=%s (dropped=%u)",

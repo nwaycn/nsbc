@@ -485,8 +485,8 @@ WITH_WEB ?= 1
 
 # ============================================================
 # nsbc-web 快捷目标（根目录直接调 web/Makefile 对应 target）
-#   make web          → cd web && make build         (内网默认)
-#   make web-acme     → cd web && make build-acme     (公网 ACME)
+#   make web          → cd web && make build         (默认带 acme)
+#   make web-acme     → cd web && make build-acme     (显式 acme，等价)
 #   make web-check    → cd web && make check
 #   make web-clean    → cd web && make clean
 #   make build-acme   → C core all + web-acme (一键全编译 + 产物到根目录)
@@ -494,7 +494,7 @@ WITH_WEB ?= 1
 #       和 nsbcd/nsbc_cli 并列，这样 ./nsbc-web -c conf/nsbc.yaml 直接跑
 # ============================================================
 web:
-	@echo "=== [nsbc-web] build (intranet mode) ==="
+	@echo "=== [nsbc-web] build (acme mode) ==="
 	$(MAKE) -C web build
 	cp -f web/target/release/nsbc-web .
 	cp -rf web/static .

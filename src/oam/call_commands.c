@@ -133,7 +133,8 @@ static int cmd_uuid_cancel(cmd_ctx_t *c, int argc, char **argv, void *ud)
     b2b_core_t *b = b2b_from_ctx(ctx_from_ud(ud));
     if (!b) { c->io_printf(c->io_ud, "ERR b2b not available\n"); return NSBC_ERR; }
 
-    b2b_call_t *call = b2b_find_callid(b, callid, strlen(callid));
+    B2B_CALL_GUARD(_cg, b, callid, strlen(callid));
+    b2b_call_t *call = _cg.c;
     if (!call) {
         c->io_printf(c->io_ud, "ERR notfound\n");
         log_audit("oam", "uuid-cancel", "call-id=%s leg=%d result=notfound", callid, leg);
@@ -179,7 +180,8 @@ static int cmd_uuid_mute(cmd_ctx_t *c, int argc, char **argv, void *ud)
     b2b_core_t *b = b2b_from_ctx(ctx_from_ud(ud));
     if (!b) { c->io_printf(c->io_ud, "ERR b2b not available\n"); return NSBC_ERR; }
 
-    b2b_call_t *call = b2b_find_callid(b, callid, strlen(callid));
+    B2B_CALL_GUARD(_cg, b, callid, strlen(callid));
+    b2b_call_t *call = _cg.c;
     if (!call) {
         c->io_printf(c->io_ud, "ERR notfound\n");
         log_audit("oam", "uuid-mute", "call-id=%s on=%d leg=%d result=notfound", callid, on, leg);
@@ -222,7 +224,8 @@ static int cmd_uuid_vad_start(cmd_ctx_t *c, int argc, char **argv, void *ud)
     b2b_core_t *b = b2b_from_ctx(ctx_from_ud(ud));
     if (!b) { c->io_printf(c->io_ud, "ERR b2b not available\n"); return NSBC_ERR; }
 
-    b2b_call_t *call = b2b_find_callid(b, callid, strlen(callid));
+    B2B_CALL_GUARD(_cg, b, callid, strlen(callid));
+    b2b_call_t *call = _cg.c;
     if (!call) {
         c->io_printf(c->io_ud, "ERR notfound\n");
         log_audit("oam", "uuid-vad-start", "call-id=%s result=notfound", callid);
@@ -253,7 +256,8 @@ static int cmd_uuid_vad_stop(cmd_ctx_t *c, int argc, char **argv, void *ud)
     b2b_core_t *b = b2b_from_ctx(ctx_from_ud(ud));
     if (!b) { c->io_printf(c->io_ud, "ERR b2b not available\n"); return NSBC_ERR; }
 
-    b2b_call_t *call = b2b_find_callid(b, callid, strlen(callid));
+    B2B_CALL_GUARD(_cg, b, callid, strlen(callid));
+    b2b_call_t *call = _cg.c;
     if (!call) {
         c->io_printf(c->io_ud, "ERR notfound\n");
         log_audit("oam", "uuid-vad-stop", "call-id=%s result=notfound", callid);
@@ -288,7 +292,8 @@ static int cmd_uuid_hold(cmd_ctx_t *c, int argc, char **argv, void *ud)
     b2b_core_t *b = b2b_from_ctx(ctx_from_ud(ud));
     if (!b) { c->io_printf(c->io_ud, "ERR b2b not available\n"); return NSBC_ERR; }
 
-    b2b_call_t *call = b2b_find_callid(b, callid, strlen(callid));
+    B2B_CALL_GUARD(_cg, b, callid, strlen(callid));
+    b2b_call_t *call = _cg.c;
     if (!call) {
         c->io_printf(c->io_ud, "ERR notfound\n");
         log_audit("oam", "uuid-hold", "call-id=%s hold=%d result=notfound", callid, hold);
@@ -409,7 +414,8 @@ static int cmd_ai_set_producer(cmd_ctx_t *c, int argc, char **argv, void *ud)
     int producer = atoi(argv[2]) ? 1 : 0;
     b2b_core_t *b = b2b_from_ctx(ctx_from_ud(ud));
     if (!b) { c->io_printf(c->io_ud, "ERR b2b not available\n"); return NSBC_ERR; }
-    b2b_call_t *call = b2b_find_callid(b, callid, strlen(callid));
+    B2B_CALL_GUARD(_cg, b, callid, strlen(callid));
+    b2b_call_t *call = _cg.c;
     if (!call) { c->io_printf(c->io_ud, "ERR notfound\n"); return NSBC_NOENT; }
     int rc = ai_set_producer(call, producer);
     if (rc == NSBC_OK) {
@@ -441,7 +447,8 @@ static int cmd_ai_vad_state(cmd_ctx_t *c, int argc, char **argv, void *ud)
     if (!pick_callid(c, argv, argc, &callid)) return NSBC_INVAL;
     b2b_core_t *b = b2b_from_ctx(ctx_from_ud(ud));
     if (!b) { c->io_printf(c->io_ud, "ERR b2b not available\n"); return NSBC_ERR; }
-    b2b_call_t *call = b2b_find_callid(b, callid, strlen(callid));
+    B2B_CALL_GUARD(_cg, b, callid, strlen(callid));
+    b2b_call_t *call = _cg.c;
     if (!call) { c->io_printf(c->io_ud, "ERR notfound\n"); return NSBC_NOENT; }
     vad_state_t a_state = VAD_STATE_SILENCE, b_state = VAD_STATE_SILENCE;
     uint16_t a_rms = 0, b_rms = 0;
@@ -465,7 +472,8 @@ static int cmd_ai_request_transfer(cmd_ctx_t *c, int argc, char **argv, void *ud
     }
     b2b_core_t *b = b2b_from_ctx(ctx_from_ud(ud));
     if (!b) { c->io_printf(c->io_ud, "ERR b2b not available\n"); return NSBC_ERR; }
-    b2b_call_t *call = b2b_find_callid(b, callid, strlen(callid));
+    B2B_CALL_GUARD(_cg, b, callid, strlen(callid));
+    b2b_call_t *call = _cg.c;
     if (!call) { c->io_printf(c->io_ud, "ERR notfound\n"); return NSBC_NOENT; }
     int rc = ai_request_transfer(call, argv[2]);
     if (rc == NSBC_OK) {
@@ -487,7 +495,8 @@ static int cmd_ai_get_rx(cmd_ctx_t *c, int argc, char **argv, void *ud)
     if (max_bytes <= 0 || max_bytes > 65536) max_bytes = 4096;
     b2b_core_t *b = b2b_from_ctx(ctx_from_ud(ud));
     if (!b) { c->io_printf(c->io_ud, "ERR b2b not available\n"); return NSBC_ERR; }
-    b2b_call_t *call = b2b_find_callid(b, callid, strlen(callid));
+    B2B_CALL_GUARD(_cg, b, callid, strlen(callid));
+    b2b_call_t *call = _cg.c;
     if (!call) { c->io_printf(c->io_ud, "ERR notfound\n"); return NSBC_NOENT; }
     uint8_t *buf = malloc(max_bytes);
     if (!buf) { c->io_printf(c->io_ud, "ERR nomem\n"); return NSBC_NOMEM; }
@@ -526,7 +535,8 @@ static int cmd_ai_send_tx(cmd_ctx_t *c, int argc, char **argv, void *ud)
     if (n < 0) { free(buf); c->io_printf(c->io_ud, "ERR bad-base64\n"); return NSBC_INVAL; }
     b2b_core_t *b = b2b_from_ctx(ctx_from_ud(ud));
     if (!b) { free(buf); c->io_printf(c->io_ud, "ERR b2b not available\n"); return NSBC_ERR; }
-    b2b_call_t *call = b2b_find_callid(b, callid, strlen(callid));
+    B2B_CALL_GUARD(_cg, b, callid, strlen(callid));
+    b2b_call_t *call = _cg.c;
     if (!call) { free(buf); c->io_printf(c->io_ud, "ERR notfound\n"); return NSBC_NOENT; }
     int rc = ai_send_tx_audio(call, buf, (size_t)n, format);
     free(buf);
@@ -555,7 +565,8 @@ static int cmd_uuid_transfer(cmd_ctx_t *c, int argc, char **argv, void *ud)
     const char *dest = argv[2];
     b2b_core_t *b = b2b_from_ctx(ctx_from_ud(ud));
     if (!b) { c->io_printf(c->io_ud, "ERR b2b not available\n"); return NSBC_ERR; }
-    b2b_call_t *call = b2b_find_callid(b, callid, strlen(callid));
+    B2B_CALL_GUARD(_cg, b, callid, strlen(callid));
+    b2b_call_t *call = _cg.c;
     if (!call) {
         c->io_printf(c->io_ud, "ERR notfound\n");
         log_audit("oam", "uuid-transfer", "call-id=%s dest=%s result=notfound",
@@ -616,7 +627,8 @@ static int cmd_uuid_broadcast(cmd_ctx_t *c, int argc, char **argv, void *ud)
     if (argc < 3) { c->io_printf(c->io_ud, "ERR missing wav path\n"); return NSBC_INVAL; }
     b2b_core_t *b = b2b_from_ctx(ctx_from_ud(ud));
     if (!b) { c->io_printf(c->io_ud, "ERR b2b not available\n"); return NSBC_ERR; }
-    b2b_call_t *call = b2b_find_callid(b, callid, strlen(callid));
+    B2B_CALL_GUARD(_cg, b, callid, strlen(callid));
+    b2b_call_t *call = _cg.c;
     if (!call) { c->io_printf(c->io_ud, "ERR notfound\n"); return NSBC_NOENT; }
     int rc = b2b_broadcast_start(call, -1, argv[2]);
     if (rc == NSBC_OK) c->io_printf(c->io_ud, "OK broadcast %s %s\n", callid, argv[2]);
@@ -632,7 +644,8 @@ static int cmd_uuid_break(cmd_ctx_t *c, int argc, char **argv, void *ud)
     if (!pick_callid(c, argv, argc, &callid)) return NSBC_INVAL;
     b2b_core_t *b = b2b_from_ctx(ctx_from_ud(ud));
     if (!b) { c->io_printf(c->io_ud, "ERR b2b not available\n"); return NSBC_ERR; }
-    b2b_call_t *call = b2b_find_callid(b, callid, strlen(callid));
+    B2B_CALL_GUARD(_cg, b, callid, strlen(callid));
+    b2b_call_t *call = _cg.c;
     if (!call) { c->io_printf(c->io_ud, "ERR notfound\n"); return NSBC_NOENT; }
 
     /* §8 双模扩展：通过 ctx 槽位（非反向 include）停 pb + cancel sleep */
@@ -704,7 +717,8 @@ static int cmd_uuid_playback(cmd_ctx_t *c, int argc, char **argv, void *ud)
 
     b2b_core_t *b = b2b_from_ctx(ctx_from_ud(ud));
     if (!b) { c->io_printf(c->io_ud, "ERR b2b not available\n"); return NSBC_ERR; }
-    b2b_call_t *call = b2b_find_callid(b, callid, strlen(callid));
+    B2B_CALL_GUARD(_cg, b, callid, strlen(callid));
+    b2b_call_t *call = _cg.c;
     if (!call) { c->io_printf(c->io_ud, "ERR notfound\n"); return NSBC_NOENT; }
 
     /* 解析管道符 chain —— 原地切分需要可写副本 */
@@ -767,7 +781,8 @@ static int cmd_uuid_playback_stop(cmd_ctx_t *c, int argc, char **argv, void *ud)
 
     b2b_core_t *b = b2b_from_ctx(ctx_from_ud(ud));
     if (!b) { c->io_printf(c->io_ud, "ERR b2b not available\n"); return NSBC_ERR; }
-    b2b_call_t *call = b2b_find_callid(b, callid, strlen(callid));
+    B2B_CALL_GUARD(_cg, b, callid, strlen(callid));
+    b2b_call_t *call = _cg.c;
     if (!call) { c->io_printf(c->io_ud, "ERR notfound\n"); return NSBC_NOENT; }
 
     int rc = pb_stop(call);
@@ -797,7 +812,8 @@ static int cmd_uuid_playback_status(cmd_ctx_t *c, int argc, char **argv, void *u
 
     b2b_core_t *b = b2b_from_ctx(ctx_from_ud(ud));
     if (!b) { c->io_printf(c->io_ud, "ERR b2b not available\n"); return NSBC_ERR; }
-    b2b_call_t *call = b2b_find_callid(b, callid, strlen(callid));
+    B2B_CALL_GUARD(_cg, b, callid, strlen(callid));
+    b2b_call_t *call = _cg.c;
     if (!call) { c->io_printf(c->io_ud, "ERR notfound\n"); return NSBC_NOENT; }
 
     int side = 0, loop = 0;
@@ -826,7 +842,8 @@ static int cmd_uuid_record(cmd_ctx_t *c, int argc, char **argv, void *ud)
     const char *action = argv[2];
     b2b_core_t *b = b2b_from_ctx(ctx_from_ud(ud));
     if (!b) { c->io_printf(c->io_ud, "ERR b2b not available\n"); return NSBC_ERR; }
-    b2b_call_t *call = b2b_find_callid(b, callid, strlen(callid));
+    B2B_CALL_GUARD(_cg, b, callid, strlen(callid));
+    b2b_call_t *call = _cg.c;
     if (!call) { c->io_printf(c->io_ud, "ERR notfound\n"); return NSBC_NOENT; }
 
     int rc;
@@ -878,7 +895,8 @@ static int cmd_uuid_answer(cmd_ctx_t *c, int argc, char **argv, void *ud)
     if (!pick_callid(c, argv, argc, &callid)) return NSBC_INVAL;
     b2b_core_t *b = b2b_from_ctx(ctx_from_ud(ud));
     if (!b) { c->io_printf(c->io_ud, "ERR b2b not available\n"); return NSBC_ERR; }
-    b2b_call_t *call = b2b_find_callid(b, callid, strlen(callid));
+    B2B_CALL_GUARD(_cg, b, callid, strlen(callid));
+    b2b_call_t *call = _cg.c;
     if (!call) { c->io_printf(c->io_ud, "ERR notfound\n"); return NSBC_NOENT; }
     int rc = b2b_answer_call(call, -1, NULL, 0);
     if (rc == NSBC_OK) {
@@ -906,7 +924,8 @@ static int cmd_uuid_send_dtmf(cmd_ctx_t *c, int argc, char **argv, void *ud)
     }
     b2b_core_t *b = b2b_from_ctx(ctx_from_ud(ud));
     if (!b) { c->io_printf(c->io_ud, "ERR b2b not available\n"); return NSBC_ERR; }
-    b2b_call_t *call = b2b_find_callid(b, callid, strlen(callid));
+    B2B_CALL_GUARD(_cg, b, callid, strlen(callid));
+    b2b_call_t *call = _cg.c;
     if (!call) { c->io_printf(c->io_ud, "ERR notfound\n"); return NSBC_NOENT; }
     int rc = b2b_send_dtmf(call, 0 /* A 腿（入信令端） */,
                            argv[2], strlen(argv[2]), 26, 100);
@@ -954,7 +973,8 @@ static int cmd_send_msg(cmd_ctx_t *c, int argc, char **argv, void *ud)
 
     b2b_core_t *b = b2b_from_ctx(ctx_from_ud(ud));
     if (!b) { c->io_printf(c->io_ud, "ERR b2b not available\n"); return NSBC_ERR; }
-    b2b_call_t *call = b2b_find_callid(b, callid, strlen(callid));
+    B2B_CALL_GUARD(_cg, b, callid, strlen(callid));
+    b2b_call_t *call = _cg.c;
     if (!call) { c->io_printf(c->io_ud, "ERR notfound\n"); return NSBC_NOENT; }
 
     log_audit("oam", "send_msg", "callid=%s body=%s", callid, body);
@@ -989,7 +1009,8 @@ static int cmd_uuid_getvar(cmd_ctx_t *c, int argc, char **argv, void *ud)
     b2b_core_t *b = b2b_from_ctx(ctx_from_ud(ud));
     if (!b) { c->io_printf(c->io_ud, "ERR b2b not available\n"); return NSBC_ERR; }
 
-    b2b_call_t *call = b2b_find_callid(b, callid, strlen(callid));
+    B2B_CALL_GUARD(_cg, b, callid, strlen(callid));
+    b2b_call_t *call = _cg.c;
     if (!call) {
         c->io_printf(c->io_ud, "ERR notfound\n");
         return NSBC_NOENT;
@@ -1020,7 +1041,8 @@ static int cmd_uuid_setvar(cmd_ctx_t *c, int argc, char **argv, void *ud)
     b2b_core_t *b = b2b_from_ctx(ctx_from_ud(ud));
     if (!b) { c->io_printf(c->io_ud, "ERR b2b not available\n"); return NSBC_ERR; }
 
-    b2b_call_t *call = b2b_find_callid(b, callid, strlen(callid));
+    B2B_CALL_GUARD(_cg, b, callid, strlen(callid));
+    b2b_call_t *call = _cg.c;
     if (!call) {
         c->io_printf(c->io_ud, "ERR notfound\n");
         log_audit("oam", "uuid-setvar", "call-id=%s name=%s result=notfound", callid, name);
@@ -1709,8 +1731,9 @@ static int cmd_uuid_media_bug(cmd_ctx_t *c, int argc, char **argv, void *ud)
     const char *action = argv[2];
 
     b2b_core_t *b = b2b_from_ctx(ctx_from_ud(ud));
-    b2b_call_t *call = NULL;
-    if (b) call = b2b_find_callid(b, callid, strlen(callid));
+    /* P0-1：find_ref 契约 —— 作用域守卫负责 put（含所有提前 return） */
+    B2B_CALL_GUARD(_cg, b, callid, strlen(callid));
+    b2b_call_t *call = _cg.c;
 
     if (strcmp(action, "start") == 0) {
         uint32_t mask = 0x0F; /* 默认全开：RAW_RTP|RTCP|HEADER|SIP */
@@ -1885,7 +1908,8 @@ static int cmd_uuid_displace(cmd_ctx_t *c, int argc, char **argv, void *ud)
     b2b_core_t *b = b2b_from_ctx(ctx_from_ud(ud));
     if (!b) { c->io_printf(c->io_ud, "ERR b2b not available\n"); return NSBC_ERR; }
 
-    b2b_call_t *call = b2b_find_callid(b, callid, strlen(callid));
+    B2B_CALL_GUARD(_cg, b, callid, strlen(callid));
+    b2b_call_t *call = _cg.c;
     if (!call) {
         c->io_printf(c->io_ud, "ERR notfound\n");
         return NSBC_NOENT;
@@ -1927,7 +1951,8 @@ static int cmd_uuid_park(cmd_ctx_t *c, int argc, char **argv, void *ud)
     b2b_core_t *b = b2b_from_ctx(ctx_from_ud(ud));
     if (!b) { c->io_printf(c->io_ud, "ERR b2b not available\n"); return NSBC_ERR; }
 
-    b2b_call_t *call = b2b_find_callid(b, callid, strlen(callid));
+    B2B_CALL_GUARD(_cg, b, callid, strlen(callid));
+    b2b_call_t *call = _cg.c;
     if (!call) {
         c->io_printf(c->io_ud, "ERR notfound\n");
         return NSBC_NOENT;
@@ -1956,7 +1981,8 @@ static int cmd_uuid_unpark(cmd_ctx_t *c, int argc, char **argv, void *ud)
     b2b_core_t *b = b2b_from_ctx(ctx_from_ud(ud));
     if (!b) { c->io_printf(c->io_ud, "ERR b2b not available\n"); return NSBC_ERR; }
 
-    b2b_call_t *call = b2b_find_callid(b, callid, strlen(callid));
+    B2B_CALL_GUARD(_cg, b, callid, strlen(callid));
+    b2b_call_t *call = _cg.c;
     if (!call) {
         c->io_printf(c->io_ud, "ERR notfound\n");
         return NSBC_NOENT;
@@ -1991,7 +2017,8 @@ static int cmd_uuid_deflect(cmd_ctx_t *c, int argc, char **argv, void *ud)
     b2b_core_t *b = b2b_from_ctx(ctx_from_ud(ud));
     if (!b) { c->io_printf(c->io_ud, "ERR b2b not available\n"); return NSBC_ERR; }
 
-    b2b_call_t *call = b2b_find_callid(b, callid, strlen(callid));
+    B2B_CALL_GUARD(_cg, b, callid, strlen(callid));
+    b2b_call_t *call = _cg.c;
     if (!call) {
         c->io_printf(c->io_ud, "ERR notfound\n");
         log_audit("oam", "uuid-deflect", "call-id=%s dest=%s result=notfound",
@@ -2045,7 +2072,8 @@ static int cmd_uuid_wait_for_answer(cmd_ctx_t *c, int argc, char **argv, void *u
     b2b_core_t *b = b2b_from_ctx(ctx_from_ud(ud));
     if (!b) { c->io_printf(c->io_ud, "ERR b2b not available\n"); return NSBC_ERR; }
 
-    b2b_call_t *call = b2b_find_callid(b, callid, strlen(callid));
+    B2B_CALL_GUARD(_cg, b, callid, strlen(callid));
+    b2b_call_t *call = _cg.c;
     if (!call) {
         c->io_printf(c->io_ud, "ERR notfound\n");
         return NSBC_NOENT;

@@ -133,6 +133,28 @@ pub struct OriginateResp {
     pub core_output: String,
 }
 
+/// 结构化端点参数白名单（P1-6）：这些值会被直接拼进 UDS 命令行，必须先过
+/// 字符集检查，避免空格/换行注入额外 argv（等价任意命令执行）。
+/// originate 允许唯一的 " &app" 尾缀（&echo / &park / &hangup / &bridge(...)），
+/// 其余字符一律要求可打印 ASCII，且不得超过一个空格。
+fn valid_originate_url(s: &str) -> bool {
+    if s.is_empty() || s.len() > 512 {
+        return false;
+    }
+    if s.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return false;
+    }
+    match s.split_once(' ') {
+        None => true,
+        Some((head, tail)) => {
+            !head.is_empty()
+                && !tail.contains(' ')
+                && tail.starts_with('&')
+                && tail.len() > 1
+        }
+    }
+}
+
 async fn originate<C>(
     State(st): State<Arc<AppState<C>>>,
     Extension(claims): Extension<ExtKeyClaims>,
@@ -142,8 +164,10 @@ where
     C: CoreApi + Clone + 'static,
 {
     require_scope(&claims, ApiKeyScope::Readwrite)?;
-    if body.call_url.is_empty() || body.call_url.len() > 512 {
-        return Err(ApiError::BadRequest("call_url must be 1..512 bytes".into()));
+    if !valid_originate_url(&body.call_url) {
+        return Err(ApiError::BadRequest(
+            "call_url must be 1..512 printable chars (optional ' &app' suffix)".into(),
+        ));
     }
     let cmd = format!("originate {}", body.call_url);
     let output = st.core.exec_cmd(&cmd).await?;
@@ -167,6 +191,10 @@ where
     C: CoreApi + Clone + 'static,
 {
     require_scope(&claims, ApiKeyScope::Readwrite)?;
+    // P1-6：Call-ID 直接拼进 UDS 命令行，必须先过字符白名单（复用以 Web UI 的校验）
+    if !crate::routes::calls::valid_call_id(&call_id) {
+        return Err(ApiError::BadRequest("invalid call_id".into()));
+    }
     let cmd = format!("hangup {}", call_id);
     let _output = st.core.exec_cmd(&cmd).await?;
     Ok(StatusCode::OK)

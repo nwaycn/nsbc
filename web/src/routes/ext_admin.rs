@@ -315,9 +315,9 @@ pub struct WebhookCreate {
 fn default_events() -> String { "CALL_INCOMING,CALL_ANSWERED,CALL_END".into() }
 
 /// SSRF guard: whitelist http(s) and reject loopback / private / link-local hosts.
-/// Only literal IPs and `localhost` are inspected here; hostnames are not resolved
-/// (DNS rebinding must be handled by the outbound HTTP client's egress policy).
-fn validate_webhook_url(url: &str) -> Result<(), &'static str> {
+/// `validate_webhook_dns` additionally resolves hostnames before accepting one
+/// (P2-6), so a DNS name pointing at an internal address cannot be registered.
+fn webhook_host(url: &str) -> Result<String, &'static str> {
     let rest = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))
@@ -341,7 +341,11 @@ fn validate_webhook_url(url: &str) -> Result<(), &'static str> {
     if host.is_empty() {
         return Err("url missing host");
     }
-    let host = host.to_ascii_lowercase();
+    Ok(host.to_ascii_lowercase())
+}
+
+fn validate_webhook_url(url: &str) -> Result<(), &'static str> {
+    let host = webhook_host(url)?;
     if host == "localhost" || host.ends_with(".localhost") {
         return Err("webhook host not allowed");
     }
@@ -351,6 +355,33 @@ fn validate_webhook_url(url: &str) -> Result<(), &'static str> {
         if is_forbidden_ip(ip) {
             return Err("webhook host not allowed");
         }
+    }
+    Ok(())
+}
+
+/// P2-6: resolve every A/AAAA record and reject if any points into a
+/// loopback/private/link-local range. Literal IPs were already validated by
+/// `validate_webhook_url`, so only hostnames hit the resolver here.
+/// (Delivery-time DNS rebinding remains the outbound client's concern; the
+/// delivery implementation is not in `src/` yet.)
+async fn validate_webhook_dns(url: &str) -> Result<(), &'static str> {
+    let host = webhook_host(url)?;
+    let literal = host.split('%').next().unwrap_or(&host);
+    if literal.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(());
+    }
+    let addrs = tokio::net::lookup_host(format!("{host}:80"))
+        .await
+        .map_err(|_| "webhook host resolve failed")?;
+    let mut any = false;
+    for sa in addrs {
+        any = true;
+        if is_forbidden_ip(sa.ip()) {
+            return Err("webhook host resolves to a private address");
+        }
+    }
+    if !any {
+        return Err("webhook host resolve failed");
     }
     Ok(())
 }
@@ -412,6 +443,10 @@ async fn create_webhook<C: crate::coreclient::CoreApi + Clone + 'static>(
         return Err(ApiError::BadRequest("url too long".into()));
     }
     if let Err(reason) = validate_webhook_url(&body.url) {
+        return Err(ApiError::BadRequest(reason.into()));
+    }
+    // P2-6：主机名必须解析后仍落在公网地址（防 DNS 指向内网 SSRF）
+    if let Err(reason) = validate_webhook_dns(&body.url).await {
         return Err(ApiError::BadRequest(reason.into()));
     }
 

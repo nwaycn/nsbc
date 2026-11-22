@@ -1450,6 +1450,23 @@ pub fn spawn_batch_consumer(
 // 4 类 flush 实现 — 分桶聚合 + 多 VALUES SQL 批量执行
 // ============================================================================
 
+/// flush 失败时的兜底（P1-4）：保留本批数据到下一轮重试，不再静默丢弃。
+/// DB 长时间不可用时按 4×MAX_BATCH 封顶，只淘汰最旧的条目并告警，
+/// 避免内存无限增长；成功时由调用方 bucket.clear()。
+fn retain_on_failure<T>(bucket: &mut Vec<T>, what: &'static str,
+                        error: &dyn std::fmt::Display) {
+    let cap = DbBatch::MAX_BATCH * 4;
+    if bucket.len() > cap {
+        let drop_n = bucket.len() - cap;
+        bucket.drain(0..drop_n);
+        warn!(count = bucket.len(), dropped = drop_n, error = %error,
+              "batch {} flush FAILED — oldest rows dropped (cap reached)", what);
+    } else {
+        warn!(count = bucket.len(), error = %error,
+              "batch {} flush FAILED — retained for retry", what);
+    }
+}
+
 /// Deduplicate by primary key within one multi-VALUES statement (keep the last item).
 /// PostgreSQL rejects `ON CONFLICT DO UPDATE` when the same statement targets the same
 /// row twice ("cannot affect row a second time"), which would drop the whole batch.
@@ -1606,12 +1623,13 @@ async fn flush_sessions(
     }
 
     match q.execute(pool.as_ref()).await {
-        Ok(_) => info!(count = n_rows, received = n,
-                       elapsed_ms = elapsed.elapsed().as_millis(), "batch sessions flush OK"),
-        Err(e) => warn!(backend, count = n_rows, received = n,
-                        error = %e, "batch sessions flush FAILED — batch dropped (see dedupe/log)"),
+        Ok(_) => {
+            info!(count = n_rows, received = n,
+                  elapsed_ms = elapsed.elapsed().as_millis(), "batch sessions flush OK");
+            bucket.clear();
+        }
+        Err(e) => retain_on_failure(bucket, "sessions", &e),
     }
-    bucket.clear();
 }
 
 async fn flush_registers(
@@ -1715,10 +1733,12 @@ async fn flush_registers(
     }
 
     match q.execute(pool.as_ref()).await {
-        Ok(_) => info!(count = n, elapsed_ms = elapsed.elapsed().as_millis(), "batch registers flush OK"),
-        Err(e) => warn!(count = n, error = %e, "batch registers flush FAILED"),
+        Ok(_) => {
+            info!(count = n, elapsed_ms = elapsed.elapsed().as_millis(), "batch registers flush OK");
+            bucket.clear();
+        }
+        Err(e) => retain_on_failure(bucket, "registers", &e),
     }
-    bucket.clear();
 }
 
 async fn flush_cdrs(
@@ -1825,12 +1845,13 @@ async fn flush_cdrs(
     }
 
     match q.execute(pool.as_ref()).await {
-        Ok(_) => info!(count = n_rows, received = n, elapsed_ms = elapsed.elapsed().as_millis(),
-                       "batch cdrs flush OK"),
-        Err(e) => warn!(backend, count = n_rows, received = n,
-                        error = %e, "batch cdrs flush FAILED — batch dropped"),
+        Ok(_) => {
+            info!(count = n_rows, received = n, elapsed_ms = elapsed.elapsed().as_millis(),
+                  "batch cdrs flush OK");
+            bucket.clear();
+        }
+        Err(e) => retain_on_failure(bucket, "cdrs", &e),
     }
-    bucket.clear();
 }
 
 async fn flush_runtimes(
@@ -1863,11 +1884,12 @@ async fn flush_runtimes(
     }
 
     match q.execute(pool.as_ref()).await {
-        Ok(_) => info!(count = n, elapsed_ms = elapsed.elapsed().as_millis(), "batch runtimes flush OK"),
-        Err(e) => warn!(backend, count = n, error = %e,
-                        "batch runtimes flush FAILED — batch dropped"),
+        Ok(_) => {
+            info!(count = n, elapsed_ms = elapsed.elapsed().as_millis(), "batch runtimes flush OK");
+            bucket.clear();
+        }
+        Err(e) => retain_on_failure(bucket, "runtimes", &e),
     }
-    bucket.clear();
 }
 
 fn ms_to_iso(ms: u64) -> Option<String> {

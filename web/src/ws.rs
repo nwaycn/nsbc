@@ -177,8 +177,8 @@ where C: CoreApi + Clone + 'static
     let _ = label;  // DB 里的 key label — 审计用
     let _ = scope;  // 显式 admin scope 已在 match 里确认过
 
-    // 1b. call_id 校验
-    if call_id.is_empty() || call_id.len() > 128 {
+    // 1b. call_id 校验（复用 calls 路由的字符白名单：命令参数会拼进 UDS 命令行）
+    if !crate::routes::calls::valid_call_id(&call_id) {
         return Err(ApiError::BadRequest("bad call_id".to_string()));
     }
 
@@ -235,6 +235,11 @@ const WS_PING_INTERVAL: Duration = Duration::from_secs(30);
 const WS_PONG_TIMEOUT:   Duration = Duration::from_secs(10);   // ping 发出后等 pong
 const WS_ZOMBIE_TIMEOUT: Duration = Duration::from_secs(120);  // 客户端最长静默时间
 
+/// AI 媒体桥 UDS→WS 只有 ai-get-rx 拉取式接口（无事件推送），只能轮询：
+/// 50ms 在端到端延迟与命令速率之间折中（每路 20 cmd/s，N 路为 20N）。
+/// 调小会线性放大 nsbcd 的命令处理压力，不要低于 20ms。
+const AI_RX_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 async fn ws_bridge_async<C: CoreApi + Clone + 'static>(
     io: &mut SimpleIo,
     state: &Arc<AppState<C>>,
@@ -258,8 +263,8 @@ async fn ws_bridge_async<C: CoreApi + Clone + 'static>(
     while !disconnected {
         let now = tokio::time::Instant::now();
 
-        // === A: 读 WS frame（带 timeout，避免阻塞 UDS 50ms 轮询）===
-        match tokio::time::timeout(Duration::from_millis(50), ws_read(io)).await {
+        // === A: 读 WS frame（带 timeout，避免阻塞 UDS 轮询）===
+        match tokio::time::timeout(AI_RX_POLL_INTERVAL, ws_read(io)).await {
             Ok(Ok(frame)) => {
                 // 任何来自客户端的合法帧都刷新僵尸计时器
                 last_client_activity = now;
@@ -312,7 +317,7 @@ async fn ws_bridge_async<C: CoreApi + Clone + 'static>(
             pending_ping = true;
         }
 
-        // === C: UDS→WS：ai-get-rx 50ms 轮询 → binary frame ===
+        // === C: UDS→WS：ai-get-rx 轮询 → binary frame（间隔见 AI_RX_POLL_INTERVAL） ===
         match state.core.exec_cmd(&format!("ai-get-rx {} 4096", call_id)).await {
             Ok(output) => {
                 for line in output.lines() {

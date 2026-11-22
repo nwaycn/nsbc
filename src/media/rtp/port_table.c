@@ -101,6 +101,14 @@ int ptable_create(const ptable_cfg_t *cfg, ptable_t **out)
         t->cfg.max_local_ips = 64;
     t->cfg.range_lo &= ~1u;
     t->cfg.range_hi &= ~1u;
+    /* P2-5：校验端口区间。反向/过窄/越界配置会让容量为负或越界，
+     * calloc 失败或索引越界；非法时回退出厂默认 20000-60000。 */
+    if (t->cfg.range_lo + 2 >= t->cfg.range_hi || t->cfg.range_hi > 65534) {
+        log_warn("rtp", "port_table invalid range %u-%u, fallback 20000-60000",
+                 (unsigned)t->cfg.range_lo, (unsigned)t->cfg.range_hi);
+        t->cfg.range_lo = 20000;
+        t->cfg.range_hi = 60000;
+    }
     t->ips = calloc((size_t)t->cfg.max_local_ips, sizeof(*t->ips));
     if (!t->ips) {
         free(t);

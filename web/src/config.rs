@@ -10,7 +10,7 @@
 
 use serde::Deserialize;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Full Web configuration (deserialized from YAML + environment variable overrides).
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -406,6 +406,31 @@ fn resolve_dsn_path(dsn: &str, cfg_dir: &std::path::Path) -> String {
     }
 }
 
+/// 若 DSN 指向磁盘 SQLite 文件，返回其路径；内存库 / 非 SQLite 返回 None。
+/// 用于启动时判断“配置还在，但库文件已被删除”——不能静默重建空库，
+/// 否则管理员会误以为数据仍在、或疑惑为什么又生成了 sqlite 目录。
+pub(crate) fn sqlite_dsn_path(dsn: &str) -> Option<std::path::PathBuf> {
+    if dsn.contains(":memory:") || dsn.contains("mode=memory") {
+        return None;
+    }
+    let rest = dsn.strip_prefix("sqlite:")?;
+    let leading = rest.chars().take_while(|c| *c == '/').count();
+    let path_part = rest.trim_start_matches('/');
+    if path_part.is_empty() {
+        return None;
+    }
+    // 去掉 URI 查询参数，如 sqlite:///x.db?mode=rwc
+    let path_part = path_part.split('?').next().unwrap_or(path_part);
+    if path_part.is_empty() {
+        return None;
+    }
+    if leading >= 3 {
+        Some(std::path::PathBuf::from(format!("/{}", path_part)))
+    } else {
+        Some(std::path::PathBuf::from(path_part))
+    }
+}
+
 /// Config file search order (aligned with nsbcd (C) side, ensuring same-level deployment
 /// shares conf/nsbc.yaml):
 ///   1. Explicit -c argument
@@ -448,6 +473,116 @@ fn find_config(explicit: Option<&str>) -> Option<PathBuf> {
         if pb.exists() { return Some(pb); }
     }
     None
+}
+
+/// 主配置文件路径：显式 -c > 自动发现 > <exe_dir>/conf/nsbc.yaml。
+/// 向导把生成的 db.dsn / auth.jwt_secret 写回这里，保持“所有配置只在 nsbc.yaml”。
+pub(crate) fn config_file_path(config_path: Option<&str>) -> PathBuf {
+    if let Some(p) = config_path.map(PathBuf::from).filter(|p| p.exists()) {
+        return p;
+    }
+    if let Some(p) = find_config(None) {
+        return p;
+    }
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    exe_dir.join("conf").join("nsbc.yaml")
+}
+
+/// 文本级更新 YAML 顶层段下的一个键：保留注释与既有格式，只改目标值。
+/// 找不到 key 时插入到该段末尾；找不到段时在文件末尾追加。
+fn upsert_yaml_key(text: &str, section: &str, key: &str, value: &str) -> String {
+    let quoted = format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""));
+    let sec_hdr = format!("{}:", section);
+    let is_top = |l: &str| {
+        !l.starts_with(' ')
+            && !l.starts_with('\t')
+            && !l.trim().is_empty()
+            && !l.trim_start().starts_with('#')
+    };
+
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+
+    let Some(si) = lines.iter().position(|l| is_top(l) && l.trim_end() == sec_hdr.as_str()) else {
+        if !lines.last().map(|l| l.trim().is_empty()).unwrap_or(true) {
+            lines.push(String::new());
+        }
+        lines.push(sec_hdr);
+        lines.push(format!("  {}: {}", key, quoted));
+        return lines.join("\n") + "\n";
+    };
+
+    let se = lines
+        .iter()
+        .enumerate()
+        .skip(si + 1)
+        .find(|(_, l)| is_top(l))
+        .map(|(i, _)| i)
+        .unwrap_or(lines.len());
+
+    let key_hdr = format!("{}:", key);
+    let found = ((si + 1)..se).find(|&i| lines[i].trim_start().starts_with(&key_hdr));
+    let indent = found
+        .map(|i| lines[i].len() - lines[i].trim_start().len())
+        .unwrap_or(2);
+    let pad = " ".repeat(indent);
+
+    let new_line = match found {
+        Some(i) => {
+            // 仅在 " #" 后视为行尾注释（dsn 中的 # 已被百分号编码）
+            let comment = lines[i]
+                .find(" #")
+                .map(|p| lines[i][p..].trim_end().to_string())
+                .unwrap_or_default();
+            format!("{}{}: {}{}", pad, key, quoted, comment)
+        }
+        None => format!("{}{}: {}", pad, key, quoted),
+    };
+
+    match found {
+        Some(i) => lines[i] = new_line,
+        None => {
+            let mut pos = si + 1;
+            for (i, l) in lines.iter().enumerate().take(se).skip(si + 1) {
+                if !l.trim().is_empty() {
+                    pos = i + 1;
+                }
+            }
+            lines.insert(pos, new_line);
+        }
+    }
+    lines.join("\n") + "\n"
+}
+
+/// 把向导生成的 dsn / jwt_secret 写回主配置 YAML（原子替换，0600）。
+pub(crate) fn write_config_file(
+    path: &Path,
+    dsn: &str,
+    jwt_secret: &str,
+) -> std::io::Result<()> {
+    let mut text = std::fs::read_to_string(path).unwrap_or_default();
+    if text.trim().is_empty() {
+        text = "db:\n  dsn: \"\"\n\nauth:\n  jwt_secret: \"\"\n".to_string();
+    }
+    text = upsert_yaml_key(&text, "db", "dsn", dsn);
+    text = upsert_yaml_key(&text, "auth", "jwt_secret", jwt_secret);
+
+    if let Some(dir) = path.parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir)?;
+        }
+    }
+    let tmp = path.with_extension("yaml.tmp");
+    std::fs::write(&tmp, text)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 /// Environment variable overrides for config file values (env > file).

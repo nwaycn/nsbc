@@ -18,11 +18,16 @@
 #define TXN_SHARDS 64
 #define TXN_BUCKETS 64
 #define BRANCH_MAX 96
+/* P1-2：事务对象存活魔数。b2bua 的 leg 里保存的是事务裸指针，
+ * 事务回收后指针不会立刻失效（slab 槽位可能复用）；在释放前清零魔数，
+ * 让 txn_force_terminate/txn_set_ud 能识别并忽略已回收的事务。 */
+#define TXN_MAGIC 0x54584E42u /* 'TXNB' */
 
 /* 外部 thread-local：sip_transport.c 定义，b2bua.c 写入，txn.c / sip_tr_send 读取 */
 extern __thread uint16_t g_rx_local_port;
 
 struct sip_txn {
+    uint32_t magic; /* P1-2：TXN_MAGIC；释放前清零，detach_txn 据此识别失效指针 */
     nsbc_hnode_t link;
     txn_kind_t kind;
     txn_state_t state;
@@ -108,6 +113,7 @@ static long t_unref(sip_txn_t *t)
             mem_arena_free(m->cfg.pkt_arena, t->req);
         if (t->resp)
             mem_arena_free(m->cfg.pkt_arena, t->resp);
+        t->magic = 0; /* P1-2：归还 slab 前失效，外部裸指针可据此跳过 */
         mem_obj_release(t);
         __atomic_sub_fetch(&m->active, 1, __ATOMIC_RELAXED);
     }
@@ -119,11 +125,11 @@ static long t_unref(sip_txn_t *t)
  * 释放 srv_txn —— t_ref() 让 refcount 不归零，obj 不释放。 */
 void txn_ref(sip_txn_t *t)
 {
-    if (t) t_ref(t);
+    if (t && t->magic == TXN_MAGIC) t_ref(t);
 }
 void txn_unref(sip_txn_t *t)
 {
-    if (t) t_unref(t);
+    if (t && t->magic == TXN_MAGIC) t_unref(t);
 }
 
 static void t_send(sip_txn_t *t, const char *buf, size_t len)
@@ -252,6 +258,11 @@ static void cb_dead(uint64_t now, void *arg)
     case TXN_NICT_TRYING:    /* Timer F */
     case TXN_NICT_PROCEEDING:
     case TXN_IST_COMPLETED:  /* Timer H */
+        /* TU 的 TIMEOUT 处理可能 call_destroy → txn_force_terminate 提前
+         * 摘 hash 并释放 leg 槽位引用，使 refs 归零；若不在这里额外持一个
+         * 引用，回调返回后写 t->state / t_remove_hash 就是 UAF。
+         * 临时引用保证 TU 期间及其后的收尾操作都落在合法对象上。 */
+        t_ref(t);
         if (t->tu)
             t->tu(t, NULL, TXN_EV_TIMEOUT, t->ud);
         __atomic_add_fetch(&m->tmo, 1, __ATOMIC_RELAXED);
@@ -259,6 +270,7 @@ static void cb_dead(uint64_t now, void *arg)
                  : (t->kind == TXN_IST) ? TXN_IST_TERMINATED
                  : TXN_NICT_TERMINATED;
         t_remove_hash(t);
+        t_unref(t);
         break;
     case TXN_IST_PROCEEDING:  /* BUG-1 兜底 Timer P 触发：IST 从未收到过 2xx+ */
     case TXN_NIST_TRYING:     /* BUG-1 兜底 Timer F 触发：NIST 从未收到过 2xx+ */
@@ -389,6 +401,7 @@ static sip_txn_t *t_alloc(txn_mgr_t *m, txn_kind_t kind,
     t->method = meth;
     t->mgr = m;
     t->refs = 0; /* 入 hash +1；每个在轮定时器 +1 */
+    t->magic = TXN_MAGIC; /* P1-2 */
     __atomic_add_fetch(&m->active, 1, __ATOMIC_RELAXED);
     return t;
 }
@@ -425,6 +438,7 @@ sip_txn_t *txn_client_new(txn_mgr_t *m, txn_kind_t kind,
     t->ud = ud;
     t->req = copy_buf(m, buf, len);
     if (!t->req) {
+        t->magic = 0;
         mem_obj_release(t);
         return NULL;
     }
@@ -1027,8 +1041,14 @@ txn_state_t txn_state(const sip_txn_t *t) { return t->state; }
 txn_kind_t txn_kind(const sip_txn_t *t) { return t->kind; }
 const nsbc_sa_t *txn_peer(const sip_txn_t *t) { return &t->peer; }
 uint16_t txn_local_port(const sip_txn_t *t) { return t ? t->local_port : 0; }
-void *txn_ud(const sip_txn_t *t) { return t->ud; }
-void txn_set_ud(sip_txn_t *t, void *ud) { t->ud = ud; }
+void *txn_ud(const sip_txn_t *t) { return t ? t->ud : NULL; }
+void txn_set_ud(sip_txn_t *t, void *ud)
+{
+    /* P1-2：已回收事务（magic 清零/复用中）不再接受写入，
+     * 避免 call_destroy 的 detach_txn 清掉另一通呼叫的 ud。 */
+    if (t && t->magic == TXN_MAGIC)
+        t->ud = ud;
+}
 void txn_set_tu(sip_txn_t *t, txn_tu_fn tu) { t->tu = tu; }
 
 const char *txn_state_name(txn_state_t s)
@@ -1058,7 +1078,8 @@ const char *txn_state_name(txn_state_t s)
  * 幂等：t_remove_hash 内部已检查 t->dead，多次调用安全。 */
 void txn_force_terminate(sip_txn_t *t)
 {
-    if (!t || t->dead)
+    /* P1-2：magic 校验——调用方（detach_txn）可能持有已回收事务的裸指针 */
+    if (!t || t->magic != TXN_MAGIC || t->dead)
         return;
     /* 跳过 cb_dead 的 TU 回调（call 已销毁，不需要再通知），
      * 直接置 TERMINATED + t_remove_hash 做：tw_del Timer G/H/B/F/J/K + 摘链 + unref

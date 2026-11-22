@@ -616,7 +616,8 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
              * 若 Chrome 不发 SRTP 回来（单通根因），此处 cls 永远不会到 3 */
             if (srtp_lane && ds &&
                 dtls_server_state(ds) == DTLS_ST_ESTABLISHED) {
-                static int diag_post_dtls_seen[2] = {0};
+                /* P2-1：诊断计数改为线程局部，避免多 reactor 无锁竞争 */
+                static _Thread_local int diag_post_dtls_seen[2] = {0};
                 if (diag_post_dtls_seen[side] < 5) {
                     llog(LOG_DEBUG, "relay",
                          "DIAG POST-DTLS-RX side=%d fd=%d cls=%d pn=%zd "
@@ -745,8 +746,9 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
          * 这里前 10 次 drop 明确告诉用户 dtls_server 当前 state +
          * 等待时长，grep "SRTP-DROP-BEFORE-DTLS" 即可定位。 */
         if (srtp_lane && !r->srtp[side]) {
-            static int diag_drop_before_dtls[2] = {0};
-            static struct timespec diag_dtls_start[2] = {0};
+            /* P2-1：诊断计数/起点改为线程局部 */
+            static _Thread_local int diag_drop_before_dtls[2] = {0};
+            static _Thread_local struct timespec diag_dtls_start[2] = {0};
             ++r->drops;
             if (diag_drop_before_dtls[side] < 10) {
                 /* 首次记录起点 */
@@ -780,7 +782,8 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
              * 原代码：have_peer[side] 是 SDP 预设的旧地址，NAT 后分机真实源不同，
              * 每次收到都触发 mismatch drop，永远走不到下面的 comedia 学习。
              * 清 have_peer 后，后续包跳过 mismatch 检查直接进入 comedia 学习。 */
-            static int diag_mismatch[4] = {0};  /* 2 side × (rtp+rtcp) */
+            /* P2-1：诊断计数改为线程局部 */
+            static _Thread_local int diag_mismatch[4] = {0};  /* 2 side × (rtp+rtcp) */
             int slot = side * 2 + is_rtcp;
             if (diag_mismatch[slot] < 5) {
                 char ipa[INET6_ADDRSTRLEN] = {0}, ppa[INET6_ADDRSTRLEN] = {0};
@@ -1308,7 +1311,8 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
          * 确认 SBC 把 SRTP 发到 Chrome ICE 候选的真实地址
          *  2026-10-16 v2：加 SSRC 字段，确认 mixed-mode 下重写后的值 */
         {
-            static int diag_sendto_seen[2] = {0};
+            /* P2-1：诊断计数改为线程局部 */
+            static _Thread_local int diag_sendto_seen[2] = {0};
             char ipa[INET6_ADDRSTRLEN] = {0};
             uint16_t dport = 0;
             if (dst->ss.ss_family == AF_INET) {

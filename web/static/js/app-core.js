@@ -24,6 +24,61 @@ window.toggleTheme = function () {
   location.reload();
 };
 
+// ===== Step-up（L2 二次授权）=====
+// 后端 rbac 对 L2 操作要求 X-Nsbc-Step-Up（60s JWT）；入口 POST /auth/step-up 需重输密码。
+// 令牌只放内存：不落 localStorage，刷新页面即失效。
+const StepUp = {
+  _token: null,
+  _exp: 0,        // 毫秒；比服务端 60s 提前 5s 失效
+  _pending: null, // 单飞：并发 L2 请求只弹一次密码框
+
+  token() { return (this._token && Date.now() < this._exp) ? this._token : null; },
+  clear() { this._token = null; this._exp = 0; },
+
+  async acquire() {
+    const cached = this.token();
+    if (cached) return cached;
+    if (!this._pending) {
+      this._pending = this._issue().finally(() => { this._pending = null; });
+    }
+    return this._pending;
+  },
+
+  async _issue() {
+    let password;
+    try {
+      const r = await ElementPlus.ElMessageBox.prompt(
+        t('This operation requires step-up authorization. Re-enter your password (valid for 60 seconds).'),
+        t('High-risk operation confirmation'),
+        {
+          confirmButtonText: t('Authorize'),
+          cancelButtonText: t('Cancel'),
+          inputType: 'password',
+          inputPlaceholder: t('Password'),
+          inputValidator: (v) => (v && v.length > 0) || t('Password required'),
+          closeOnClickModal: false,
+        });
+      password = r.value;
+    } catch (_) {
+      throw new Error(t('Step-up authorization cancelled'));
+    }
+    // 原始 fetch：不能走 API.req，否则会再次触发本拦截
+    const res = await fetch(API.base + '/auth/step-up', {
+      method: 'POST',
+      headers: API.headers(true),
+      body: JSON.stringify({ password }),
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok) {
+      throw new Error((data && data.error && data.error.message) || t('Step-up authorization failed'));
+    }
+    this._token = data.step_up_token;
+    this._exp = Date.now() + Math.max(10, (data.expires_in || 60) - 5) * 1000;
+    return this._token;
+  },
+};
+window.__stepUp = StepUp;
+
 // ===== API wrapper =====
 const API = {
   base: '/api/v1',
@@ -33,6 +88,9 @@ const API = {
     const h = { 'x-nsbc-api-version': '1' };
     if (hasBody) h['Content-Type'] = 'application/json';
     if (this.token()) h['Authorization'] = 'Bearer ' + this.token();
+    // 已缓存的 L2 二次授权令牌（60s）：避免同一窗口内每个高风险操作都弹框
+    const su = StepUp.token();
+    if (su) h['X-Nsbc-Step-Up'] = su;
     return h;
   },
   // GET 请求 per-path in-flight 去重：同一 URL 正在请求时复用同一个 Promise，
@@ -106,6 +164,7 @@ const API = {
               });
               const retryRes = await fetch(this.base + path, retryOpts);
               if (retryRes.status === 401) {
+                StepUp.clear();
                 localStorage.clear();
                 location.hash = '#/login';
                 throw new Error('Unauthorized');
@@ -117,6 +176,7 @@ const API = {
           } catch (refreshErr) { /* refresh 失败走下面清 localStorage */ }
           finally { this._refreshing = false; }
         }
+        StepUp.clear();
         localStorage.clear();
         try { window.__auth && (window.__auth.token = null, window.__auth.user = null, window.__auth.role = null); } catch(_) {}
         location.hash = '#/login';
@@ -125,7 +185,29 @@ const API = {
       // 正常响应：解析并返回
       const text = await res.text();
       const data = text ? JSON.parse(text) : null;
-      if (!res.ok) throw new Error((data && data.detail) || res.statusText);
+      if (!res.ok) {
+        // 错误体是 { error: { code, message } }（web/src/error.rs）
+        const code = data && data.error && data.error.code;
+        const msg = (data && data.error && data.error.message) || (data && data.detail) || res.statusText;
+        // 只有明确要求 step-up 才弹框；"requires L2 privilege" 是角色不足，弹密码无用
+        if (res.status === 403 && code === 'FORBIDDEN' && String(msg).includes('step-up')) {
+          await StepUp.acquire(); // 用户取消 → 抛错，由调用方提示
+          const retryRes = await fetch(this.base + finalPath, {
+            method,
+            headers: this.headers(opts.body !== undefined),
+            body: opts.body,
+          });
+          const retryText = await retryRes.text();
+          const retryData = retryText ? JSON.parse(retryText) : null;
+          if (!retryRes.ok) {
+            // 重放仍失败（刚过期/权限不足）：不再循环，直接抛给调用方
+            throw new Error((retryData && retryData.error && retryData.error.message)
+              || (retryData && retryData.detail) || retryRes.statusText);
+          }
+          return retryData;
+        }
+        throw new Error(msg);
+      }
       return data;
     } // end of retry for loop
     // 循环耗尽（全部 429），抛出最后一次错误
@@ -989,6 +1071,24 @@ const app = createApp({
       loading: false, error: null,
     });
     const loginForm = reactive({ username: 'admin', password: 'admin', captcha_code: '' });
+
+    // ===== 首次启动：数据库初始化向导 =====
+    const setup = reactive({
+      checking: true,
+      required: false,
+      done: false,
+      submitting: false,
+      error: null,
+      backend: 'sqlite',
+      sqlite_path: '',
+      host: '127.0.0.1',
+      port: 5432,
+      user: 'nsbc',
+      password: '',
+      database: 'nsbc',
+      adminPassword: '',
+      restarting: false,
+    });
     const captchaSvg = ref(null);
     const captchaId = ref(null);
     const clientIp = ref('---');
@@ -1085,6 +1185,7 @@ const app = createApp({
           body.captcha_code = loginForm.captcha_code;
         }
         const r = await API.post('/auth/login', body);
+        StepUp.clear(); // 切换账号：旧二次授权令牌不得沿用
         auth.token = r.access_token;
         auth.user  = loginForm.username;
         auth.role  = r.role || 'admin';
@@ -1102,7 +1203,7 @@ const app = createApp({
       }
       finally { auth.loading = false; }
     }
-    function logout() { localStorage.clear(); auth.token = null; location.hash = '#/login'; }
+    function logout() { StepUp.clear(); localStorage.clear(); auth.token = null; location.hash = '#/login'; }
 
     // ===== Change Password =====
     const showPwdDialog = ref(false);
@@ -1148,6 +1249,7 @@ const app = createApp({
         const data = await res.json().catch(() => ({}));
         if (res.ok) {
           ElementPlus.ElMessage.success(t('Password changed. Please log in again.'));
+          StepUp.clear(); // 改密即会话重置，作废二次授权
           showPwdDialog.value = false;
           pwdForm.old_password = ''; pwdForm.new_password = ''; pwdForm.confirm_password = '';
           setTimeout(logout, 800);  // 安全：密码改了后强制重新登录
@@ -1165,15 +1267,104 @@ const app = createApp({
       }
     }
 
-    refreshCaptcha();
+    // ===== 初始化向导：状态查询 / 提交 / 等待自动重启 =====
+    function onSetupBackendChange() {
+      setup.port = setup.backend === 'mysql' ? 3306 : 5432;
+    }
+
+    async function loadSetupStatus() {
+      try {
+        const res = await fetch('/setup/status', { cache: 'no-store' });
+        const data = await res.json().catch(() => null);
+        setup.required = !!(data && data.required);
+        setup.sqlite_path = (data && data.sqlite_path) || '';
+        // 服务端处于初始化模式时，旧的本地会话已无意义，强制回到初始化页
+        if (setup.required) {
+          auth.token = null;
+          try {
+            localStorage.removeItem('nsbc_token');
+            localStorage.removeItem('nsbc_refresh_token');
+            localStorage.removeItem('nsbc_user');
+            localStorage.removeItem('nsbc_role');
+          } catch (_) {}
+        }
+        // 已进入正常模式：把向导生成的一次性密码预填到登录框（只在本标签页有效）
+        if (!setup.required) {
+          try {
+            const sp = sessionStorage.getItem('nsbc_setup_pw');
+            if (sp) { loginForm.password = sp; sessionStorage.removeItem('nsbc_setup_pw'); }
+          } catch (_) {}
+        }
+      } catch (_) {
+        setup.required = false; // 旧版本无该端点 → 正常登录模式
+      } finally {
+        setup.checking = false;
+      }
+    }
+
+    async function submitSetup() {
+      setup.submitting = true;
+      setup.error = null;
+      try {
+        const res = await fetch('/setup', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            backend: setup.backend,
+            host: setup.host,
+            port: Number(setup.port) || 0,
+            user: setup.user,
+            password: setup.password,
+            database: setup.database,
+          }),
+        });
+        const data = await res.json().catch(() => null);
+        if (!res.ok) {
+          throw new Error((data && data.error && data.error.message) || ('HTTP ' + res.status));
+        }
+        setup.done = true;
+        setup.adminPassword = (data && data.admin_password) || '';
+        if (setup.adminPassword) {
+          try { sessionStorage.setItem('nsbc_setup_pw', setup.adminPassword); } catch (_) {}
+        }
+        if (data && data.restart) {
+          setup.restarting = true;
+          waitSetupRestart();
+        }
+      } catch (e) {
+        setup.error = e.message;
+      } finally {
+        setup.submitting = false;
+      }
+    }
+
+    async function waitSetupRestart() {
+      for (let i = 0; i < 45; i++) {
+        await new Promise(r => setTimeout(r, 1000));
+        try {
+          const res = await fetch('/setup/status', { cache: 'no-store' });
+          const data = await res.json().catch(() => null);
+          // 正常模式显式返回 required=false → 新进程已就绪，刷新进入登录页
+          if (res.ok && data && data.required === false) { location.reload(); return; }
+        } catch (_) { /* 重启窗口内连接被拒，继续等 */ }
+      }
+      setup.restarting = false;
+      setup.error = t('Auto restart did not complete. Please restart nsbc-web manually.');
+    }
+
+    // 先判断是否处于首次初始化模式；正常模式才加载验证码 / 恢复会话
+    loadSetupStatus().then(() => {
+      if (setup.required) return;
+      refreshCaptcha();
+      // ===== 登录态自动恢复：刷新后也拉 Tenant 列表 =====
+      // fetchTenants 原来只在 login() 成功回调里调 — 刷新（localStorage 有 token）
+      // 不走 login()，导致 tenantOptions 永远为空 → 所有 tenant_id 下拉无选项
+      if (auth.token) fetchTenants();
+    });
     window.__auth = auth;  // 暴露给 API 401 handler 使用
 
-    // ===== 登录态自动恢复：面Refresh后也拉Tenant列表 =====
-    // fetchTenants 原来只在 login() Success回调里调 — 面Refresh（localStorage 有 token）
-    // 不走 login()，导致 tenantOptions 永远为空 → 所有 tenant_id 下拉无选项
-    if (auth.token) fetchTenants();
-
     return { auth, loginForm, captchaSvg, clientIp, route, menuItems, login, logout, refreshCaptcha,
+             setup, onSetupBackendChange, submitSetup,
              tenantId, tenantOptions, tenantLoading, changeTenant, fetchTenants,
              showPwdDialog, pwdLoading, pwdFormRef, pwdForm, pwdRules, submitChangePassword,
              isDark, toggleTheme };

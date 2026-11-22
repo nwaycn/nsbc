@@ -115,7 +115,7 @@ where
 /// Call-ID routing-layer validation: 1..127 bytes, printable ASCII (0x21-0x7e),
 /// aligned with core obs_control valid_callid()/DLG_CALLID_MAX. Both ends validate
 /// once each.
-fn valid_call_id(id: &str) -> bool {
+pub(crate) fn valid_call_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() < 128
         && id.bytes().all(|b| (0x21..=0x7e).contains(&b))
@@ -125,7 +125,7 @@ fn valid_call_id(id: &str) -> bool {
 /// Rejects whitespace (including CR/LF), NUL and any other control character before
 /// the value is concatenated into the line-text UDS command. `extra` allows
 /// operation-specific characters (e.g. `|` for playback chains).
-fn valid_cmd_arg(s: &str, max_len: usize, extra: &[char]) -> bool {
+pub(crate) fn valid_cmd_arg(s: &str, max_len: usize, extra: &[char]) -> bool {
     !s.is_empty()
         && s.len() <= max_len
         && s.chars().all(|c| {

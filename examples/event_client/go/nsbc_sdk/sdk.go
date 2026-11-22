@@ -7,32 +7,33 @@
 //
 // API contract (same surface as Python nsbc_client):
 //
-//   // Connection
-//   uds := nsbc_sdk.NewClientUds("/var/run/nsbc/control.sock")
-//   err := uds.Connect()
-//   defer uds.Close()
-//   uds.Subscribe("events,cdr")
-//   go uds.IterFrames(frameCh)   // pushes *Frame into channel
+//	// Connection
+//	uds := nsbc_sdk.NewClientUds("/var/run/nsbc/control.sock")
+//	err := uds.Connect()
+//	defer uds.Close()
+//	uds.Subscribe("events,cdr")
+//	go uds.IterFrames(frameCh)   // pushes *Frame into channel
 //
-//   // Originate (dual-path: UDS preferred → HTTP fallback)
-//   callUrl := nsbc_sdk.BuildCallUrl(nsbc_sdk.OriginateOpts{
-//       OrigTo: "7gja30rf",
-//       App:    "echo",
-//       Audio:  []string{"PCMU", "PCMA", "G722", "OPUS"},
-//       Video:  []string{"H264", "VP8"},
-//   })
-//   ok, payload, via := nsbc_sdk.Originate(callUrl, "auto", udsPath, apiBase, apiToken)
+//	// Originate (dual-path: UDS preferred → HTTP fallback)
+//	callUrl := nsbc_sdk.BuildCallUrl(nsbc_sdk.OriginateOpts{
+//	    OrigTo: "7gja30rf",
+//	    App:    "echo",
+//	    Audio:  []string{"PCMU", "PCMA", "G722", "OPUS"},
+//	    Video:  []string{"H264", "VP8"},
+//	})
+//	ok, payload, via := nsbc_sdk.Originate(callUrl, "auto", udsPath, apiBase, apiToken)
 //
-//   // Frame parsing / correlation / webhook
-//   frame := nsbc_sdk.ParseFrame(line)
-//   correlator := nsbc_sdk.NewCallCorrelator(timelineCb)
-//   correlator.Feed(frame)
-//   webhook := nsbc_sdk.NewWebhookSink(url, 5, 2)
-//   webhook.Send(frame)
+//	// Frame parsing / correlation / webhook
+//	frame := nsbc_sdk.ParseFrame(line)
+//	correlator := nsbc_sdk.NewCallCorrelator(timelineCb)
+//	correlator.Feed(frame)
+//	webhook := nsbc_sdk.NewWebhookSink(url, 5, 2)
+//	webhook.Send(frame)
 package nsbc_sdk
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -59,10 +60,10 @@ const (
 )
 
 const (
-	prompt          = "nsbc> "
-	bannerPrefix    = "NSBC "
-	defaultAudio    = "PCMU,PCMA,G722,OPUS"
-	defaultVideo    = "H264,VP8"
+	prompt       = "nsbc> "
+	bannerPrefix = "NSBC "
+	defaultAudio = "PCMU,PCMA,G722,OPUS"
+	defaultVideo = "H264,VP8"
 )
 
 // Frame header: YYYY-MM-DDTHH:MM:SS.mmm DOMAIN body
@@ -80,6 +81,20 @@ func newHTTPClient(timeout time.Duration) *http.Client {
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: !sslVerify},
 	}
 	return &http.Client{Transport: t, Timeout: timeout}
+}
+
+// newStreamHTTPClient is for long-lived streaming responses (SSE). Go's
+// http.Client.Timeout covers reading the response body, so a non-zero value
+// forcibly kills an idle event stream every N seconds. Bound only connect and
+// first-byte (response header) latency here instead.
+func newStreamHTTPClient(timeout time.Duration) *http.Client {
+	d := &net.Dialer{Timeout: timeout}
+	t := &http.Transport{
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: !sslVerify},
+		DialContext:           d.DialContext,
+		ResponseHeaderTimeout: timeout,
+	}
+	return &http.Client{Transport: t, Timeout: 0}
 }
 
 // ---------------------------------------------------------------------------
@@ -128,12 +143,24 @@ func (c *Client) Connect() error {
 	}
 	c.conn = conn
 	c.reader = bufio.NewReaderSize(conn, 65536)
-	// Probe banner (non-blocking)
+	// Probe banner: read until the first "nsbc> " prompt. The deadline only
+	// bounds how long we wait; partial output is kept when it fires, so the
+	// caller never blocks a full second on a server that already answered.
 	_ = conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-	b, err := io.ReadAll(io.LimitReader(c.reader, 4096))
-	if err == nil {
-		c.banner = string(b)
+	var sb strings.Builder
+	for {
+		chunk, rerr := c.reader.ReadString('\n')
+		if chunk != "" {
+			sb.WriteString(chunk)
+			if strings.Contains(chunk, prompt) {
+				break
+			}
+		}
+		if rerr != nil {
+			break
+		}
 	}
+	c.banner = sb.String()
 	_ = conn.SetReadDeadline(time.Time{})
 	return nil
 }
@@ -161,7 +188,7 @@ func (c *Client) SendCommand(cmd string, timeout time.Duration) (string, error) 
 
 	_ = c.conn.SetReadDeadline(time.Now().Add(timeout))
 	var sb strings.Builder
-	for time.Now().Before(time.Now().Add(0)) { // deadline already set above
+	for {
 		line, rerr := c.reader.ReadString('\n')
 		if line != "" {
 			sb.WriteString(line)
@@ -170,7 +197,7 @@ func (c *Client) SendCommand(cmd string, timeout time.Duration) (string, error) 
 			}
 		}
 		if rerr != nil {
-			break
+			break // timeout / EOF：已读取的内容仍然返回
 		}
 	}
 	_ = c.conn.SetReadDeadline(time.Time{})
@@ -197,17 +224,39 @@ func (c *Client) Unsubscribe(topics string) (string, error) {
 }
 
 // IterFrames blocks and pushes parsed *Frame into ch until the connection closes.
+// The producer closes ch exactly once when it returns.
 func (c *Client) IterFrames(ch chan<- *Frame) {
+	c.IterFramesCtx(context.Background(), ch)
+}
+
+// IterFramesCtx is IterFrames with cancellation (P2-10). The send uses select,
+// so a stalled consumer no longer pins the goroutine forever: cancelling ctx
+// releases it. When ctx carries a deadline the socket read deadline follows it;
+// otherwise an idle socket read still blocks (limitation of net.Conn).
+func (c *Client) IterFramesCtx(ctx context.Context, ch chan<- *Frame) {
 	defer close(ch)
 	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		if dl, ok := ctx.Deadline(); ok {
+			_ = c.conn.SetReadDeadline(dl)
+		}
 		line, err := c.reader.ReadString('\n')
 		if err != nil {
 			return
 		}
 		f := ParseFrame(strings.TrimRight(line, "\r\n"))
-		if f != nil {
-			f.Source = "uds"
-			ch <- f
+		if f == nil {
+			continue
+		}
+		f.Source = "uds"
+		select {
+		case ch <- f:
+		case <-ctx.Done():
+			return
 		}
 	}
 }
@@ -227,9 +276,9 @@ type OriginateOpts struct {
 	CallerName string   // origination caller ID name
 	/* REQ-DP-TIMEOUT-001: per-call timeout overrides (秒)。
 	 * >0 → 拼进 brace var；0 → 跳过（走 dialplan rule / 全局默认） */
-	SchedHangup           int
-	OriginateCallTimeout  int
-	CallUrl    string   // explicit call_url (bypasses builder)
+	SchedHangup          int
+	OriginateCallTimeout int
+	CallUrl              string // explicit call_url (bypasses builder)
 }
 
 // BuildCallUrl assembles a FreeSWITCH-style originate call_url with brace-var codec block.
@@ -282,7 +331,7 @@ func BuildCallUrl(opts OriginateOpts) string {
 type OriginateResult struct {
 	OK      bool
 	Payload interface{} // string on UDS; map[string]any on HTTP; map{"uds":...,"web":...} on both-fail
-	Via     string // "uds" | "web" | "both_failed"
+	Via     string      // "uds" | "web" | "both_failed"
 }
 
 // Originate fires an originate via UDS or HTTP, with auto-fallback in "auto" mode.
@@ -487,9 +536,9 @@ func (cc *CallCorrelator) Feed(frame *Frame) map[string]interface{} {
 	tl, ok := cc.calls[callID]
 	if !ok {
 		tl = map[string]interface{}{
-			"call_id": callID,
-			"events":  []interface{}{},
-			"cdr":     nil,
+			"call_id":  callID,
+			"events":   []interface{}{},
+			"cdr":      nil,
 			"start_ts": frame.Ts,
 		}
 		cc.calls[callID] = tl
@@ -529,14 +578,23 @@ func (cc *CallCorrelator) Snapshot() map[string]map[string]interface{} {
 // ---------------------------------------------------------------------------
 
 // WebhookSink forwards every parsed frame as JSON to an external URL.
+// Delivery runs on a fixed worker pool fed by a bounded queue (P2-12), so a
+// slow webhook cannot spawn unbounded goroutines or exhaust memory.
 type WebhookSink struct {
-	url       string
-	timeout   time.Duration
-	retries   int
-	mu        sync.Mutex
-	ok, fail  int
-	hc        *http.Client
+	url      string
+	timeout  time.Duration
+	retries  int
+	mu       sync.Mutex
+	ok, fail int
+	hc       *http.Client
+	queue    chan *Frame
+	start    sync.Once
 }
+
+// webhookQueueSize bounds the in-memory backlog; oldest events are not dropped,
+// new events are rejected (counted in fail) once the queue is full.
+const webhookQueueSize = 1024
+const webhookWorkers = 4
 
 // NewWebhookSink creates a sink. timeout is per-attempt seconds; retries
 // is number of additional attempts after the first fails.
@@ -546,13 +604,32 @@ func NewWebhookSink(url string, timeoutSecs, retries int) *WebhookSink {
 		timeout: time.Duration(timeoutSecs) * time.Second,
 		retries: retries,
 		hc:      newHTTPClient(time.Duration(timeoutSecs) * time.Second),
+		queue:   make(chan *Frame, webhookQueueSize),
 	}
 }
 
-// Send spawns a daemon goroutine to POST the frame (non-blocking).
+// Send enqueues the frame (non-blocking). Workers start lazily on first use.
 func (w *WebhookSink) Send(frame *Frame) {
+	w.start.Do(func() {
+		for i := 0; i < webhookWorkers; i++ {
+			go w.worker()
+		}
+	})
 	fCopy := *frame
-	go w.doPost(&fCopy)
+	select {
+	case w.queue <- &fCopy:
+	default:
+		// 队列满：计入失败（含丢弃），不阻塞事件消费方
+		w.mu.Lock()
+		w.fail++
+		w.mu.Unlock()
+	}
+}
+
+func (w *WebhookSink) worker() {
+	for f := range w.queue {
+		w.doPost(f)
+	}
 }
 
 func (w *WebhookSink) doPost(f *Frame) {
@@ -601,12 +678,12 @@ type SseEvent struct {
 
 // SseClient consumes nsbc-web /calls/stream over SSE.
 type SseClient struct {
-	url      string
-	timeout  time.Duration
-	headers  map[string]string
-	hc       *http.Client
-	resp     *http.Response
-	reader   *bufio.Reader
+	url     string
+	timeout time.Duration
+	headers map[string]string
+	hc      *http.Client
+	resp    *http.Response
+	reader  *bufio.Reader
 }
 
 // NewSseClient creates an unconnected SSE client.
@@ -618,7 +695,8 @@ func NewSseClient(url string, timeoutSecs int, headers map[string]string) *SseCl
 		url:     url,
 		timeout: time.Duration(timeoutSecs) * time.Second,
 		headers: headers,
-		hc:      newHTTPClient(time.Duration(timeoutSecs) * time.Second),
+		// 流式响应不能用 http.Client.Timeout（会每 N 秒强断事件流）
+		hc: newStreamHTTPClient(time.Duration(timeoutSecs) * time.Second),
 	}
 }
 
@@ -658,26 +736,50 @@ func (s *SseClient) Close() {
 // into the channel. Closes ch on disconnect. Auto-reconnect on EOF.
 // Start in a goroutine like: go client.IterEvents(eventCh).
 func (s *SseClient) IterEvents(ch chan<- SseEvent) {
+	s.IterEventsCtx(context.Background(), ch)
+}
+
+// IterEventsCtx is IterEvents with cancellation (P2-10): ctx stops the
+// reconnect loop, so the producer goroutine can be reclaimed by its owner.
+func (s *SseClient) IterEventsCtx(ctx context.Context, ch chan<- SseEvent) {
 	defer close(ch)
 	for {
-		if err := s.readStream(ch); err != nil {
-			time.Sleep(3 * time.Second)
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		if err := s.readStream(ctx, ch); err != nil && ctx.Err() != nil {
+			return
 		}
 		s.Close()
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(3 * time.Second):
+		}
 		if err := s.Connect(); err != nil {
-			time.Sleep(3 * time.Second)
-			continue
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(3 * time.Second):
+			}
 		}
 	}
 }
 
-func (s *SseClient) readStream(ch chan<- SseEvent) error {
+func (s *SseClient) readStream(ctx context.Context, ch chan<- SseEvent) error {
 	eventName := "message"
 	var dataLines []string
 	var retryMs int
 	retrySet := false
 
 	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 		line, err := s.reader.ReadString('\n')
 		if err != nil {
 			return err
@@ -744,9 +846,9 @@ func SseEventToFrame(ev SseEvent) *Frame {
 	}
 
 	SSEToDomain := map[string]string{
-		"ring":     "CALL_INCOMING",
-		"answer":   "CALL_ANSWERED",
-		"hangup":   "CALL_END",
+		"ring":      "CALL_INCOMING",
+		"answer":    "CALL_ANSWERED",
+		"hangup":    "CALL_END",
 		"originate": "CALL_OUTGOING",
 	}
 	sseEvt, _ := payload["event"].(string)

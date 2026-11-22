@@ -71,12 +71,21 @@ fn required_level(method: &Method, path: &str) -> Role {
     // 数字 id，无法按 action 匹配，因此按路径段识别。
     let ext_admin_write = !matches!(method, &Method::GET | &Method::HEAD | &Method::OPTIONS)
         && item.split('/').any(|s| s == "ext-keys" || s == "webhooks");
+    // ACL/防火墙规则变更（POST /security/firewall/{add,del,sync}）与证书、监听
+    // 同级：必须 L2 + step-up。按路径识别（"del"/"sync" 不放入通用 action 表，
+    // 否则会误伤其他资源的同名动作）。
+    let firewall_write = method == Method::POST && {
+        let segs: Vec<&str> = item.split('/').collect();
+        segs.windows(2).any(|w| w[0] == "security" && w[1] == "firewall")
+    };
     match (method, action) {
         // Read-only L0: nested read-only resources (priority over action whitelist,
         // last-segment is literal)
         _ if get_nested_readonly => Role::L0,
         // 密钥/Webhook 写操作：与证书、ACL 同级，需 step-up
         _ if ext_admin_write => Role::L2,
+        // 防火墙/ACL 变更：改规则即改攻击面，需 step-up
+        _ if firewall_write => Role::L2,
         // Read-only L0
         (
             &Method::GET,

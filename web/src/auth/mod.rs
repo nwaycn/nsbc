@@ -177,6 +177,16 @@ impl AuthSvc {
                  must be set (>=32 bytes). Generate: openssl rand -hex 32".to_string()
             })?;
 
+        // P2-8：HS256 密钥太短（<32 字节）可离线暴力破解并伪造任意 token，
+        // 配置加载阶段直接拒绝启动，不再带着弱密钥运行。
+        if secret.len() < 32 {
+            return Err(format!(
+                "JWT secret too short ({} bytes); need >= 32 bytes. \
+                 Generate one with: openssl rand -hex 32",
+                secret.len()
+            ));
+        }
+
         // Accounts: env > cfg > defaults
         let accounts_text = env_text_or_file("NSBC_AUTH_ACCOUNTS", "NSBC_AUTH_FILE")
             ?.unwrap_or_default();
