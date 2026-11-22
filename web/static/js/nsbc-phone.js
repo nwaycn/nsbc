@@ -17,6 +17,14 @@ const $ = (id) => document.getElementById(id);
 let ua = null;
 let currentSession = null;
 let pendingSession = null;
+// 信令连接状态 + 重连看门狗：JsSIP 自带 2~30s 退避，20s 仍未恢复则重建 UA
+let _sipConnected = false;
+let _reconnectTimer = null;
+let _uaRebuilding = false;
+// 与后端 B2B_WS_GRACE_MS 对齐：断线后 10s 内重连成功则通话继续，否则结束 UI
+let _callGraceTimer = null;
+// 用户主动注销（doUnregister）后不再触发自动重建 UA
+let _uaStopIntent = false;
 let localStream = null;
 let remoteStream = null;
 let dc = null, dcOpen = false;
@@ -650,6 +658,7 @@ function bindSessionNonPC(session, isCallee, skipPeerConn) {
 // ============ Register ============
 async function doRegister() {
   if (!window.JsSIP) { ElMessage.error('JsSIP 未加载！请检查 jssip-3.10.0.min.js'); return; }
+  _uaStopIntent = false;   // 用户重新注册 → 恢复自动重连
   const rs = $('regStatus'); if (rs) { rs.textContent = 'Connect中...'; rs.className = 'status'; }
   const br = $('btnReg'); if (br) br.disabled = true;
 
@@ -678,9 +687,51 @@ async function doRegister() {
       connection_recovery_max_interval: 30,
     });
 
+    const ownUA = ua;   // 防止已替换的旧 UA 事件误操作当前全局 ua
     ua.on('connecting',   () => log('info', '🔌 JsSIP connecting...'));
-    ua.on('connected',    () => { log('ok', '🔌 JsSIP connected'); ua.register(); });
-    ua.on('disconnected', () => log('warn', '🔌 JsSIP disconnected'));
+    ua.on('connected',    () => {
+      if (ua !== ownUA) return;
+      _sipConnected = true;
+      if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
+      const recovered = !!_callGraceTimer;
+      if (_callGraceTimer) { clearTimeout(_callGraceTimer); _callGraceTimer = null; }
+      log('ok', '🔌 JsSIP connected');
+      if (recovered && (currentSession || pendingSession)) {
+        try { ElMessage.success('信令已恢复，通话继续'); } catch (_) {}
+      }
+      ua.register();
+    });
+    ua.on('disconnected', () => {
+      if (ua !== ownUA) return;    // 旧 UA（已被重建替换）的事件直接忽略
+      _sipConnected = false;
+      if (_uaRebuilding || _uaStopIntent) return;   // 主动重建/注销触发的 disconnected，不重复处理
+      log('warn', '🔌 JsSIP disconnected');
+      // 与服务端 8s 重连宽限配合：先提示并等待重连，10s 仍未恢复才结束通话 UI，
+      // 避免短暂抖动就拆掉一通仍然存活的呼叫；也避免服务端已挂断而页面一直显示通话中。
+      if (currentSession || pendingSession) {
+        try { ElMessage.warning('信令连接中断，正在重连…'); } catch (_) {}
+        if (_callGraceTimer) clearTimeout(_callGraceTimer);
+        _callGraceTimer = setTimeout(() => {
+          _callGraceTimer = null;
+          if (_sipConnected) return;
+          try { ElMessage.error('信令重连失败，通话已结束'); } catch (_) {}
+          onCallEnd('signaling disconnected');
+        }, 10000);
+      }
+      // JsSIP 自身会按 2~30s 指数退避重连；20s 未恢复则重建 UA 兜底，
+      // 防止 recovery 卡死导致长时间无法注册（历史现象：约 2 分钟才恢复）。
+      if (_reconnectTimer) clearTimeout(_reconnectTimer);
+      _reconnectTimer = setTimeout(() => {
+        _reconnectTimer = null;
+        if (_sipConnected || _uaRebuilding) return;
+        _uaRebuilding = true;
+        log('warn', '🔁 WS 20s 未恢复，重建 UA 重连');
+        const old = ua;
+        ua = null;
+        try { if (old) old.stop(); } catch (_) {}
+        Promise.resolve(doRegister()).finally(() => { _uaRebuilding = false; });
+      }, 20000);
+    });
 
     ua.on('registered', () => {
       const rs2 = $('regStatus'); if (rs2) { rs2.textContent = '✅ Registered ' + user; rs2.className = 'status ok'; }
@@ -743,6 +794,9 @@ async function doRegister() {
 }
 
 async function doUnregister() {
+  _uaStopIntent = true;   // 禁止 disconnected 后的自动重建
+  if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
+  if (_callGraceTimer) { clearTimeout(_callGraceTimer); _callGraceTimer = null; }
   try { if (ua) ua.unregister(); } catch(e) { log('warn', 'unreg err: ' + e.message); }
   setTimeout(() => {
     try { if (ua) ua.stop(); } catch(e) { log('warn', 'stop err: ' + e.message); }

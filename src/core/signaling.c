@@ -1658,7 +1658,9 @@ static int sig_cc_dispatch_task(void *arg)
     char to[256] = "";
     int rc;
 
-    call = b2b_find_callid((b2b_core_t *)ctx->b2b, a->callid, strlen(a->callid));
+    /* P0-1：find_ref 契约 —— 守卫在任务返回时释放引用 */
+    B2B_CALL_GUARD(_cg, (b2b_core_t *)ctx->b2b, a->callid, strlen(a->callid));
+    call = _cg.c;
     if (call == NULL)
         return NSBC_OK;   /* 呼叫已结束：waiter 已由 cq_settle_call 清理 */
     a->call = call;
@@ -1715,8 +1717,10 @@ static int sig_cc_dispatch_cb(void *call_key, const char *callid,
 static int sig_cc_overflow_task(void *arg)
 {
     sig_cc_disp_arg_t *a = (sig_cc_disp_arg_t *)arg;
-    b2b_call_t *call = b2b_find_callid((b2b_core_t *)a->s->ctx->b2b,
-                                       a->callid, strlen(a->callid));
+    /* P0-1：find_ref 契约 —— 守卫在任务返回时释放引用 */
+    B2B_CALL_GUARD(_cg, (b2b_core_t *)a->s->ctx->b2b,
+                   a->callid, strlen(a->callid));
+    b2b_call_t *call = _cg.c;
     if (call == NULL)
         return NSBC_OK;   /* 已结束 */
     b2b_queue_abort(call, 480);   /* max_wait 到期：A 腿回 480 并销毁 */
@@ -2753,7 +2757,8 @@ static void sig_ws_close_cb(void *ud, void *conn)
     int n = b2b_terminate_ws_conn(b2b, conn);
     if (n > 0)
         llog(LOG_WARN, "sig",
-             "ws conn=%p closed → terminated %d call(s) (send BYE toward SIP side)",
+             "ws conn=%p closed → %d call(s) switched to reconnect grace"
+             " (immediate terminate only if timer wheel is off)",
              conn, n);
     else
         llog(LOG_DEBUG, "sig", "ws conn=%p closed (no active call bound)", conn);

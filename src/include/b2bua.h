@@ -185,6 +185,15 @@ struct b2b_call {
      * 优先级链：call->sched_hangup_ms_override > cfg fallback（originate 走 cfg.originate_caller_timeout_ms，
      * 入站走 0=不限制，Session Timer 继续生效）。 */
     tw_node_t sched_hangup_node;
+    /* WebRTC 信令断线宽限：WSS 连接被判定死亡后不立即挂断，先保留
+     * B2B_WS_GRACE_MS；期间同一 AoR 用新 conn 重新注册则重绑该 leg，
+     * 超时才按 503 终止。ws_lost_conn 记录掉线 conn 用于判定是否已重绑。 */
+    tw_node_t ws_lost_node;
+    void *ws_lost_conn;
+    uint8_t ws_lost_leg;
+    /* 当前这一轮宽限的到期时刻：若回调触发时 deadline 已被下一次断线推后，
+     * 说明这是一次"已被重新武装"的过期回调，按新 deadline 重挂而不是挂断。 */
+    uint64_t ws_lost_deadline;
     uint64_t start_ms;
     uint64_t answer_ms;
     int redirect_count;
@@ -671,9 +680,37 @@ int b2b_respond_leg(b2b_call_t *call, int b_leg, int status,
 
 /* ---- API 层呼叫控制（cmd_registry 调用） ---- */
 
-/* 按任一 Leg Call-ID 定位呼叫（供 cmd_registry + obs_control 使用）；
- * 不在头文件声明是历史遗留，本次补齐修复隐式声明隐患。 */
+/* 按任一 Leg Call-ID 定位呼叫（供 cmd_registry + obs_control 使用）。
+ *
+ * P0-1：find_ref 契约 —— 返回时已对呼叫 +1 引用，调用方必须用
+ * b2b_call_put() 释放；否则呼叫对象永不归还 slab（泄漏）。
+ * 直接在调用线程使用裸返回值是安全的：引用期间 call_destroy 只会
+ * 摘表/置 dead，对象要等最后一个 put 才真正释放。
+ *
+ * 为避免 30+ 命令逐个改 return 路径，推荐使用作用域守卫：
+ *     B2B_CALL_GUARD(g, b, callid, strlen(callid));
+ *     b2b_call_t *call = g.c;
+ * 变量离开作用域（含任意提前 return）时自动 put。 */
 b2b_call_t *b2b_find_callid(b2b_core_t *co, const char *callid, size_t len);
+void b2b_call_put(b2b_call_t *c);
+
+typedef struct { b2b_call_t *c; } b2b_call_guard_t;
+
+static inline void b2b_call_guard_release(b2b_call_guard_t *g)
+{
+    if (g->c)
+        b2b_call_put(g->c);
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+#define B2B_CALL_GUARD(name, co, cid, len)                                  \
+    b2b_call_guard_t name __attribute__((cleanup(b2b_call_guard_release)))  \
+        = { b2b_find_callid((co), (cid), (len)) }
+#else
+/* 非 GCC 构建无 cleanup 属性：退化为显式调用方 put */
+#define B2B_CALL_GUARD(name, co, cid, len) \
+    b2b_call_guard_t name = { b2b_find_callid((co), (cid), (len)) }
+#endif
 
 /* 向通话注入 DTMF（REQ-CCMD-001，uuid_send_dtmf） */
 int b2b_send_dtmf(b2b_call_t *call, int b_leg, const char *digits, size_t len,

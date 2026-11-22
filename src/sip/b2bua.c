@@ -18,6 +18,7 @@
 #include "ha.h"                 /* REQ-HA-001: 主备角色门控（ha_role，主二进制内符号）
                                  * HA P1: ha_repl_publish() — 主→备对话状态复制接线点 */
 #include "log.h"
+#include "location_db.h"    /* WS 断线宽限：按 AoR 查最新 ws_conn 重绑 */
 #include "media_bug.h"
 #include "media_bridge.h"   /* REQ-ORIGINATE-003 &echo: bridge_lookup_relay + rtp_relay_set_echo */
 #include "srtp_session.h"   /* ★ HA P3-3: nsbc_srtp_session_create / get_material */
@@ -107,6 +108,7 @@ extern __thread sip_tr_proto_t g_rx_proto;
 #define B2B_HDR_MAX    256
 #endif
 #define B2B_CALL_SHARDS 1024   /* 64 → 1024: tbl_find 链表扫描从 ~780→~49 节点，延迟降 16 倍 */
+#define B2B_WS_GRACE_MS 8000u  /* WS 断线重连宽限：期间同 AoR 重连则重绑，超时才挂断 */
 
 /* REQ-AI-001 / REQ-EVENTS-001：call_destroy 多槽 hook 数组（B2B_END_HOOK_MAX=32）
  * pthread_mutex_t hook_lock 保护注册/卸载；遍历时持锁（add/rm 都是小操作）。 */
@@ -167,6 +169,7 @@ static void disarm_call_limit_timer(b2b_call_t *c);
 /* REQ-DP-TIMEOUT-001：sched_hangup timer 三函数 + 决策链 */
 static void arm_sched_hangup_timer(b2b_call_t *c);
 static void disarm_sched_hangup_timer(b2b_call_t *c);
+static void disarm_ws_lost_timer(b2b_call_t *c);
 static void sched_hangup_expire_cb(uint64_t cb_now, void *arg);
 static void call_limit_expire_cb(uint64_t cb_now, void *arg);
 static void b2b_emit_cdr(b2b_call_t *c, cdr_phase_t phase);
@@ -552,22 +555,64 @@ static b2b_call_t *tbl_find(b2b_core_t *co, const char *callid, size_t len,
 /* P1-13：呼叫对象存活魔数（定义 + 事务回收清理 helper） */
 #define B2B_CALL_MAGIC 0xB2B0C411u
 
-/* 事务已进入静默回收（Timer D/I/J/K 到期）→ 清空 leg 中指向它的裸指针。
- * 在事务对象仍存活时调用（cb_dead 内 t_remove_hash 之前），因此可以安全读 t。 */
+/* P1-2：leg/call 事务槽持有 1 个 txn 引用。
+ * 存储：新值 +1、旧值 -1（覆盖安全）；清空：-1。
+ * 槽位非 NULL 期间事务对象不会被 slab 回收，从而把“裸指针 + 魔数跳过”
+ * 的缓解方案升级为真正的引用计数生命周期。
+ * 槽位写入用原子交换：b2b_forget_txn（事务线程）与 call_destroy
+ * （另一线程）会并发清槽，只有真正把 t 换出来的那一方 unref，杜绝双释放。 */
+static void leg_txn_store(sip_txn_t **slot, sip_txn_t *t)
+{
+    if (t)
+        txn_ref(t);   /* 先给新值上引用，再原子替换，读者不会看到未持有的指针 */
+    sip_txn_t *old = __atomic_exchange_n(slot, t, __ATOMIC_ACQ_REL);
+    if (old == t) {
+        if (t)
+            txn_unref(t);   /* 同一事务重复存储：抵消本次 +1 */
+        return;
+    }
+    if (old)
+        txn_unref(old);
+}
+
+/* 仅当槽位仍指向 t 时清空并释放引用（CAS 保证并发清槽只 unref 一次） */
+static void leg_txn_drop(sip_txn_t **slot, sip_txn_t *t)
+{
+    if (!t || __atomic_load_n(slot, __ATOMIC_ACQUIRE) != t)
+        return;
+    sip_txn_t *expect = t;
+    if (__atomic_compare_exchange_n(slot, &expect, NULL, 0,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        txn_unref(t);
+}
+
+/* 清空 leg 中指向 t 的槽位并释放其引用。
+ * 调用方必须已持有 call_lock —— cli_tu 的 TIMEOUT 分支在锁内，
+ * 不能再走 b2b_forget_txn（内部会重复加锁导致死锁）。 */
+static void b2b_forget_txn_locked(b2b_call_t *c, sip_txn_t *t)
+{
+    if (!c || c->magic != B2B_CALL_MAGIC)
+        return;   /* ud 不是呼叫（例如 server_ud=core）或呼叫已销毁 */
+    for (int i = 0; i < 2; ++i) {
+        if (c->leg[i].inv_txn == t)    leg_txn_drop(&c->leg[i].inv_txn, t);
+        if (c->leg[i].srv_txn == t)    leg_txn_drop(&c->leg[i].srv_txn, t);
+        if (c->leg[i].out_txn == t)    leg_txn_drop(&c->leg[i].out_txn, t);
+        if (c->leg[i].cancel_txn == t) leg_txn_drop(&c->leg[i].cancel_txn, t);
+    }
+    if (c->refer_txn == t)
+        leg_txn_drop(&c->refer_txn, t);
+}
+
+/* 事务已进入静默回收（Timer D/I/J/K 到期 / Timer B/F/H 超时）→ 清空 leg
+ * 中指向它的槽位。在事务对象仍存活时调用（cb_dead 内 t_remove_hash 之前），
+ * 因此可以安全读 t。 */
 static void b2b_forget_txn(sip_txn_t *t)
 {
     b2b_call_t *c = (b2b_call_t *)txn_ud(t);
     if (!c || c->magic != B2B_CALL_MAGIC)
-        return;   /* ud 不是呼叫（例如 server_ud=core）或呼叫已销毁 */
+        return;
     call_lock(c);
-    for (int i = 0; i < 2; ++i) {
-        if (c->leg[i].inv_txn == t)    c->leg[i].inv_txn = NULL;
-        if (c->leg[i].srv_txn == t)    c->leg[i].srv_txn = NULL;
-        if (c->leg[i].out_txn == t)    c->leg[i].out_txn = NULL;
-        if (c->leg[i].cancel_txn == t) c->leg[i].cancel_txn = NULL;
-    }
-    if (c->refer_txn == t)
-        c->refer_txn = NULL;
+    b2b_forget_txn_locked(c, t);
     call_unlock(c);
 }
 
@@ -584,6 +629,12 @@ static void call_put(b2b_call_t *c)
 {
     if (c && __atomic_sub_fetch(&c->refcnt, 1, __ATOMIC_ACQ_REL) == 0)
         mem_obj_release(c);
+}
+
+/* P0-1：对外释放 find_ref 引用（header 中的 B2B_CALL_GUARD 依赖它） */
+void b2b_call_put(b2b_call_t *c)
+{
+    call_put(c);
 }
 
 static b2b_call_t *tbl_find_ref(b2b_core_t *co, const char *callid, size_t len,
@@ -616,6 +667,10 @@ static void call_ctor(void *obj, void *ud)
     tw_node_init(&c->noanswer_node);
     tw_node_init(&c->call_limit_node);
     tw_node_init(&c->sched_hangup_node);
+    tw_node_init(&c->ws_lost_node);
+    c->ws_lost_conn = NULL;
+    c->ws_lost_leg = 0;
+    c->ws_lost_deadline = 0;
     c->prof = NULL;
     c->out_prof = NULL;
 }
@@ -1105,6 +1160,40 @@ static void detach_txn(sip_txn_t *t)
     txn_set_ud(t, NULL);
 }
 
+/* 覆盖事务槽位：原子换出旧值，若旧值非新值则先强制终止再释放引用。
+ * 与 leg_txn_store 的差别：旧事务会被立即 detach（停重传/超时定时器）。
+ * 为什么不用「先读槽位再 detach_txn」：读取与清槽可能被 b2b_forget_txn /
+ * call_destroy 并发打断，后者会把旧事务的 leg 引用释放；若读到的指针在
+ * detach_txn 之前已被回收，就会对已释放对象解引用。原子 exchange 保证
+ * 拿到旧值的那一方才是唯一有权 detach+unref 的一方。 */
+static void leg_txn_replace(sip_txn_t **slot, sip_txn_t *t)
+{
+    if (t)
+        txn_ref(t);
+    sip_txn_t *old = __atomic_exchange_n(slot, t, __ATOMIC_ACQ_REL);
+    if (old == t) {
+        if (t)
+            txn_unref(t);   /* 同一事务重复存储：抵消本次 +1 */
+        return;
+    }
+    if (old) {
+        detach_txn(old);
+        txn_unref(old);
+    }
+}
+
+/* 原子取走槽位并终止其事务：换出成功者才 detach + unref。
+ * 与 b2b_forget_txn 并发时，只有一方能拿到非 NULL 旧值，避免
+ * 「读到指针后对象被对方释放，再对已回收对象 detach」的窗口。 */
+static void leg_txn_detach(sip_txn_t **slot)
+{
+    sip_txn_t *tx = __atomic_exchange_n(slot, NULL, __ATOMIC_ACQ_REL);
+    if (!tx)
+        return;
+    detach_txn(tx);
+    txn_unref(tx);
+}
+
 /* 呼叫销毁：摘除表、关对话、断开关联后归还 slab */
 static void call_destroy(b2b_call_t *c)
 {
@@ -1157,6 +1246,8 @@ static void call_destroy(b2b_call_t *c)
     disarm_noanswer_timer(c); /* catch-all：所有终止路径最终走到这里 */
     disarm_call_limit_timer(c); /* REQ-ORIGINATE-005：通话时长上限 timer */
     disarm_sched_hangup_timer(c); /* REQ-DP-TIMEOUT-001：应用层硬上限 timer */
+    disarm_ws_lost_timer(c);      /* WebRTC 断线宽限：call 结束时取消，避免回调悬垂 */
+    c->ws_lost_conn = NULL;
     /* Session Timer: disarm all timer nodes */
     if (c->core->cfg.tw) {
         tw_del(c->core->cfg.tw, &c->leg[0].refresh_node);
@@ -1177,14 +1268,17 @@ static void call_destroy(b2b_call_t *c)
         c->key_held = 0;
     }
     for (int i = 0; i < 2; ++i) {
-        detach_txn(c->leg[i].inv_txn);
-        detach_txn(c->leg[i].srv_txn);
-        detach_txn(c->leg[i].out_txn);
-        detach_txn(c->leg[i].cancel_txn);
+        /* P1-2：原子取走槽位并强制终止，再释放其引用。
+         * 若事务线程已通过 b2b_forget_txn 清槽，exchange 返回 NULL，
+         * 不会双 unref；反之 forget 的 CAS 失败，也不会双 unref。 */
+        leg_txn_detach(&c->leg[i].inv_txn);
+        leg_txn_detach(&c->leg[i].srv_txn);
+        leg_txn_detach(&c->leg[i].out_txn);
+        leg_txn_detach(&c->leg[i].cancel_txn);
         if (c->leg[i].dlg)
             dlg_close(co->cfg.dlg, c->leg[i].dlg);
     }
-    detach_txn(c->refer_txn);
+    leg_txn_detach(&c->refer_txn);
     /* REQ-REC-006：call 结束时自动停录制——走 recording 模块统一 registry+stop 路径
      * Advisor 2026-10-01l：先 atomic NULL call->rec[leg] 消除媒体线程 UAF 窗口
      * （recording_apply_dp_action 内部 reg_get 还能找到 sess，因为 registry reg_del 还没跑） */
@@ -2629,8 +2723,8 @@ static void b2b_queue_requeue(b2b_call_t *c, int cause)
         dlg_close(c->core->cfg.dlg, b->dlg);
         b->dlg = NULL;
     }
-    b->inv_txn = NULL;
-    b->out_txn = NULL;
+    leg_txn_store(&b->inv_txn, NULL);
+    leg_txn_store(&b->out_txn, NULL);
     b->state = LEG_IDLE;
     b->reinv = 0;
     b->auth_attempts = 0;
@@ -3039,8 +3133,8 @@ static int uac_invite_handle_challenge(b2b_call_t *c, int lg,
 
     if (b->dlg) { dlg_close(co->cfg.dlg, b->dlg); b->dlg = NULL; }
     b->cseq++;
-    b->inv_txn = send_invite_b(c, lg, b->offer, b->offer_len, 0,
-                               auth_extra[0] ? auth_extra : NULL);
+    leg_txn_store(&b->inv_txn, send_invite_b(c, lg, b->offer, b->offer_len, 0,
+                               auth_extra[0] ? auth_extra : NULL));
     if (b->inv_txn) {
         llog(LOG_INFO, "b2b",
              "bridge A leg INVITE re-sent after %d (attempts=%u) callid=%s",
@@ -3106,7 +3200,7 @@ static int uac_invite_follow_redirect(b2b_call_t *c, int lg,
                          strlen(b->loc_tag), b->target, b->cseq, SIP_M_INVITE);
     if (b->dlg) b->dlg->ud = c;
 
-    b->inv_txn = send_invite_b(c, lg, b->offer, b->offer_len, 0, NULL);
+    leg_txn_store(&b->inv_txn, send_invite_b(c, lg, b->offer, b->offer_len, 0, NULL));
     if (!b->inv_txn) {
         c->redirect_count--;
         llog(LOG_WARN, "b2b", "bridge A 302 send failed target=%s", new_target);
@@ -3241,6 +3335,10 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
             return;
         }
         if (ev == TXN_EV_TIMEOUT) {
+            /* P1-2 收口：Timer B/F 超时后事务即将被 cb_dead 摘链回收，
+             * 先清掉 leg 槽位引用；否则该引用会一直挂到 call_destroy，
+             * 让已终止事务对象无法归还 slab。 */
+            b2b_forget_txn_locked(c, t);
             disarm_noanswer_timer(c);
             a->state = LEG_TERMINATED;
             call_unlock(c);
@@ -3729,7 +3827,7 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                         /* A 发起的 re-INVITE：应答给 A */
                         respond_a(c, st, c->leg[1].answer,
                                   c->leg[1].answer_len);
-                        c->leg[0].srv_txn = NULL;
+                        leg_txn_store(&c->leg[0].srv_txn, NULL);
                     }
                 }
                 call_unlock(c);
@@ -3862,8 +3960,8 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                                  b->offer_len, b->offer ? b->offer : "(null)");
                             if (b->dlg) { dlg_close(co->cfg.dlg, b->dlg); b->dlg = NULL; }
                             b->cseq++;
-                            b->inv_txn = send_invite_b(c, 1, b->offer, b->offer_len, 0,
-                                                       auth_extra);
+                            leg_txn_store(&b->inv_txn, send_invite_b(c, 1, b->offer, b->offer_len, 0,
+                                                       auth_extra));
                             if (b->inv_txn) {
                                 llog(LOG_INFO, "b2b",
                                      "P1-12 INVITE re-sent trunk=%s auth_attempts=%u auth_flags=0x%02x callid=%s",
@@ -4002,8 +4100,8 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                         if (dn > 0) extra_used += (size_t)dn;
                     }
                     extra_hi_dv[extra_used] = '\0';
-                    b->inv_txn = send_invite_b(c, 1, b->offer, b->offer_len, 0,
-                                               extra_hi_dv[0] ? extra_hi_dv : NULL);
+                    leg_txn_store(&b->inv_txn, send_invite_b(c, 1, b->offer, b->offer_len, 0,
+                                               extra_hi_dv[0] ? extra_hi_dv : NULL));
                     if (!b->inv_txn) {
                         /* 重定向 INVITE 发失败 → 透传给 A 腿原码 */
                         llog(LOG_WARN, "b2b", "302 redirect send failed, target=%s",
@@ -4044,15 +4142,18 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
             }
             sip_upd_end(&c->leg[1].guard);
             c->leg[1].reinv = 0;
-            c->leg[1].inv_txn = NULL;
+            leg_txn_store(&c->leg[1].inv_txn, NULL);
             if (c->leg[0].srv_txn) {
                 respond_a(c, st, NULL, 0);
-                c->leg[0].srv_txn = NULL;
+                leg_txn_store(&c->leg[0].srv_txn, NULL);
             }
             call_unlock(c);
             return;
         }
         if (ev == TXN_EV_TIMEOUT) {
+            /* P1-2 收口：超时事务即将被 cb_dead 回收，先清槽释放 leg 引用。
+             * 本分支已进入 t==inv_txn 判定，清空槽位不影响后续逻辑。 */
+            b2b_forget_txn_locked(c, t);
             /* Timer B/F 触发（B 腿 ICT 事务绝对期限 64*T1=32s）。
              * RFC3261 §17.1.1.2：Timer B 覆盖整个 ICT 生命周期，收到 1xx
              * 后 sip_txn 只停 Timer A（重传），**不停 B** —— 即此处与
@@ -4067,10 +4168,10 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
             if (reinv) {
                 sip_upd_end(&c->leg[1].guard);
                 c->leg[1].reinv = 0;
-                c->leg[1].inv_txn = NULL;
+                leg_txn_store(&c->leg[1].inv_txn, NULL);
                 if (c->leg[0].srv_txn) {
                     respond_a(c, 408, NULL, 0);
-                    c->leg[0].srv_txn = NULL;
+                    leg_txn_store(&c->leg[0].srv_txn, NULL);
                 }
             } else {
                 if (c->queue_wait && !c->a_final && !c->dead) {
@@ -4107,7 +4208,7 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                      st, c->hangup_by, c->leg[0].callid);
                 c->leg[0].state = LEG_TERMINATED;
                 c->leg[1].state = LEG_TERMINATED;
-                c->leg[0].out_txn = NULL;
+                leg_txn_store(&c->leg[0].out_txn, NULL);
                 /* ★ 不清 BYE 入站 srv_txn —— call_destroy 会 detach_txn
                  * force_terminate 防止 BYE NIST 残留到 Timer J (32s)。 */
                 call_unlock(c);
@@ -4155,7 +4256,7 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                     respond_txn(co, c->leg[1].srv_txn, st, NULL, NULL,
                                 NULL, 0);
                 }
-                c->leg[1].srv_txn = NULL;
+                leg_txn_store(&c->leg[1].srv_txn, NULL);
                 c->leg[0].reinv = 0;
             }
             /* 双腿 guard 释放：srv_txn 有无都要放（reinv 路径上面已放
@@ -4177,13 +4278,16 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
         } else if (ev == TXN_EV_TIMEOUT) {
             /* BYE TIMEOUT 兜底：覆盖 BYE 入站转发和 API 发起两种来源。
              * 32s Timer J 是 BYE NICT 不回 200 OK 的最后期限。 */
+            /* P1-2 收口：先清槽释放 leg 引用（已进入 t==out_txn 判定）。
+             * 若走 call_destroy，其 detach 看到的槽位已是 NULL，不会重复。 */
+            b2b_forget_txn_locked(c, t);
             if (IS_BYE_OUT(0)) {
                 llog(LOG_WARN, "b2b",
                      "BYE TIMEOUT: A leg no 200 OK, hangup_by=%d → force call_destroy callid=%s",
                      c->hangup_by, c->leg[0].callid);
                 c->leg[0].state = LEG_TERMINATED;
                 c->leg[1].state = LEG_TERMINATED;
-                c->leg[0].out_txn = NULL;
+                leg_txn_store(&c->leg[0].out_txn, NULL);
                 call_unlock(c);
                 call_destroy(c);
                 return;
@@ -4194,14 +4298,14 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                  c->leg[0].callid);
             if (c->leg[1].srv_txn) {
                 respond_txn(co, c->leg[1].srv_txn, 408, NULL, NULL, NULL, 0);
-                c->leg[1].srv_txn = NULL;
+                leg_txn_store(&c->leg[1].srv_txn, NULL);
             }
             sip_upd_end(&c->leg[0].guard);
             sip_upd_end(&c->leg[1].guard);
             c->leg[0].reinv = 0;
-            c->leg[0].inv_txn = NULL;
+            leg_txn_store(&c->leg[0].inv_txn, NULL);
         }
-        c->leg[0].out_txn = NULL;
+        leg_txn_store(&c->leg[0].out_txn, NULL);
         call_unlock(c);
         return;
     }
@@ -4219,7 +4323,7 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                      st, c->hangup_by, c->leg[0].callid);
                 c->leg[0].state = LEG_TERMINATED;
                 c->leg[1].state = LEG_TERMINATED;
-                c->leg[1].out_txn = NULL;
+                leg_txn_store(&c->leg[1].out_txn, NULL);
                 call_unlock(c);
                 call_destroy(c);
                 return;
@@ -4230,7 +4334,7 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                 llog(LOG_INFO, "b2b", "hangup ok -> call_destroy!");
                 c->leg[0].state = LEG_TERMINATED;
                 c->leg[1].state = LEG_TERMINATED;
-                c->leg[1].out_txn = NULL;
+                leg_txn_store(&c->leg[1].out_txn, NULL);
                 call_unlock(c);
                 call_destroy(c);
                 return;
@@ -4261,7 +4365,7 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                     c->leg[1].answer_len = m->body.len;
                     c->media_done = 0;
                 }
-                c->leg[0].srv_txn = NULL;
+                leg_txn_store(&c->leg[0].srv_txn, NULL);
             }
             /* PRACK/UPDATE/MESSAGE/INFO 转发终响应：释放双 leg 的 upd guard
              * （转发时 begin 了 l/o 两腿，否则后续 in-dialog 请求会 491）。
@@ -4281,13 +4385,16 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
         } else if (ev == TXN_EV_TIMEOUT) {
             /* BYE TIMEOUT 兜底：覆盖 BYE 入站转发和 API 发起两种来源。
              * 32s Timer J 是 BYE NICT 不回 200 OK 的最后期限。 */
+            /* P1-2 收口：先清槽释放 leg 引用（已进入 t==out_txn 判定）。
+             * 若走 call_destroy，其 detach 看到的槽位已是 NULL，不会重复。 */
+            b2b_forget_txn_locked(c, t);
             if (IS_BYE_OUT(1)) {
                 llog(LOG_WARN, "b2b",
                      "BYE TIMEOUT: B leg no 200 OK, hangup_by=%d → force call_destroy callid=%s",
                      c->hangup_by, c->leg[0].callid);
                 c->leg[0].state = LEG_TERMINATED;
                 c->leg[1].state = LEG_TERMINATED;
-                c->leg[1].out_txn = NULL;
+                leg_txn_store(&c->leg[1].out_txn, NULL);
                 call_unlock(c);
                 call_destroy(c);
                 return;
@@ -4298,24 +4405,24 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                  c->leg[0].callid);
             if (c->leg[0].srv_txn) {
                 respond_txn(co, c->leg[0].srv_txn, 408, NULL, NULL, NULL, 0);
-                c->leg[0].srv_txn = NULL;
+                leg_txn_store(&c->leg[0].srv_txn, NULL);
             }
             sip_upd_end(&c->leg[0].guard);
             sip_upd_end(&c->leg[1].guard);
         }
-        c->leg[1].out_txn = NULL;
+        leg_txn_store(&c->leg[1].out_txn, NULL);
         call_unlock(c);
         return;
     }
 
     /* re-INVITE 的 CANCEL 应答（200/481）：仅清理 */
     if (t == c->leg[0].cancel_txn) {
-        c->leg[0].cancel_txn = NULL;
+        leg_txn_store(&c->leg[0].cancel_txn, NULL);
         call_unlock(c);
         return;
     }
     if (t == c->leg[1].cancel_txn) {
-        c->leg[1].cancel_txn = NULL;
+        leg_txn_store(&c->leg[1].cancel_txn, NULL);
         call_unlock(c);
         return;
     }
@@ -4372,9 +4479,9 @@ static void send_cancel_req(b2b_call_t *c, int leg)
                                   now_ms());
     if (t) {
         if (l->reinv)
-            l->cancel_txn = t;
+            leg_txn_store(&l->cancel_txn, t);
         else
-            l->out_txn = t;
+            leg_txn_store(&l->out_txn, t);
     }
 }
 
@@ -4507,7 +4614,7 @@ static void send_bye_leg(b2b_call_t *c, int leg)
                                   l->reliable, out, (size_t)n, cli_tu, c,
                                   now_ms());
     if (t) {
-        l->out_txn = t;
+        leg_txn_store(&l->out_txn, t);
         l->state = LEG_TERMINATING;
         llog(LOG_INFO, "b2b", "★BYE_TXN_CREATED leg=%d txn=%p", leg, (void *)t);
 
@@ -4533,7 +4640,7 @@ static void send_bye_leg(b2b_call_t *c, int leg)
             llog(LOG_INFO, "b2b",
                  "★BYE_CLEAR_INV_TXN leg=%d: clearing stale inv_txn=%p (out_txn=%p)",
                  leg, (void *)l->inv_txn, (void *)t);
-            l->inv_txn = NULL;
+            leg_txn_store(&l->inv_txn, NULL);
         }
     } else {
         llog(LOG_WARN, "b2b", "★BYE_TXN_NEW FAIL leg=%d txn_client_new returned NULL", leg);
@@ -5321,7 +5428,7 @@ static void b2b_start_b_leg(b2b_call_t *c, sip_txn_t *t, nsbc_sa_t bd,
     } else {
         b->offer_len = 0;
     }
-    b->inv_txn = send_invite_b(c, 1, out_sdp, out_sdp_len, 0, b_extra_ptr);
+    leg_txn_store(&b->inv_txn, send_invite_b(c, 1, out_sdp, out_sdp_len, 0, b_extra_ptr));
     char dstbuf[128];
     nsbc_sa_fmt(&b->dst, dstbuf, sizeof(dstbuf));
     llog(LOG_INFO, "b2b", "send_invite_b rc=%p dst=%s", b->inv_txn, dstbuf);
@@ -5654,7 +5761,6 @@ void handle_new_invite(b2b_core_t *co, sip_txn_t *t,
     a->proto = proto;
     a->reliable = proto != SIP_TR_UDP;
     a->dst = *src;
-    a->inv_txn = t;
 
     sip_hdr_t *cid = sip_hdr_get(m, SIP_H_CALL_ID);
     sip_hdr_t *from = sip_hdr_get(m, SIP_H_FROM);
@@ -5771,6 +5877,10 @@ void handle_new_invite(b2b_core_t *co, sip_txn_t *t,
 
     txn_set_ud(t, c);
     txn_set_tu(t, b2b_server_tu); /* Timer H（2xx 无 ACK）上送 */
+    /* P1-2：校验全部通过、ud/tu 已绑定后才把入站 INVITE 事务放入槽位并持引用。
+     * 提前存入会让 400/422/488 等早期拒绝路径 call_put() 直接归还 slab，
+     * 槽位里的引用永远没人释放（事务泄漏）。 */
+    leg_txn_store(&a->inv_txn, t);
     tbl_link(co, c, 0);
     add_atomic(&co->total, 1);
 
@@ -6101,13 +6211,13 @@ static void handle_indialog_invite(b2b_call_t *c, int leg, sip_txn_t *t,
         respond_txn(co, t, 491, NULL, NULL, NULL, 0);
         return;
     }
-    l->srv_txn = t;
+    leg_txn_store(&l->srv_txn, t);
     txn_set_ud(t, c);
     txn_set_tu(t, b2b_server_tu); /* re-INVITE 2xx 无 ACK：Timer H */
     if (m->body.len) {
         if (m->body.len > B2B_SDP_MAX) {
             sip_upd_end(&l->guard);
-            l->srv_txn = NULL;
+            leg_txn_store(&l->srv_txn, NULL);
             respond_txn(co, t, 488, NULL, NULL, NULL, 0);
             return;
         }
@@ -6117,7 +6227,7 @@ static void handle_indialog_invite(b2b_call_t *c, int leg, sip_txn_t *t,
     /* 向另一条腿发 re-INVITE */
     if (!sip_upd_begin(&o->guard)) {
         sip_upd_end(&l->guard);
-        l->srv_txn = NULL;
+        leg_txn_store(&l->srv_txn, NULL);
         respond_txn(co, t, 491, NULL, NULL, NULL, 0);
         return;
     }
@@ -6136,7 +6246,7 @@ static void handle_indialog_invite(b2b_call_t *c, int leg, sip_txn_t *t,
     }
     if (leg == 0) {
         /* A→B：走 B 腿出向 INVITE */
-        o->inv_txn = send_invite_b(c, 1, l->offer, l->offer_len, 1, NULL);
+        leg_txn_store(&o->inv_txn, send_invite_b(c, 1, l->offer, l->offer_len, 1, NULL));
     } else {
         /* B→A：朝 A 对话目标发 re-INVITE（A 腿 ICT） */
         char branch[40];
@@ -6155,10 +6265,10 @@ static void handle_indialog_invite(b2b_call_t *c, int leg, sip_txn_t *t,
             g_rx_local_port = (op && op->sip_udp_port)
                               ? op->sip_udp_port
                               : (uint16_t)co->cfg.local_udp_port;
-            o->out_txn = txn_client_new(
+            leg_txn_store(&o->out_txn, txn_client_new(
                 co->cfg.txn, TXN_ICT, branch, strlen(branch), SIP_M_INVITE,
                 &o->dst, o->reliable, out, (size_t)n, cli_tu, c,
-                now_ms());
+                now_ms()));
             if (o->out_txn)
                 snprintf(o->last_branch, sizeof(o->last_branch), "%s",
                          branch);
@@ -6167,7 +6277,7 @@ static void handle_indialog_invite(b2b_call_t *c, int leg, sip_txn_t *t,
     if ((leg == 0 && !o->inv_txn) || (leg == 1 && !o->out_txn)) {
         sip_upd_end(&l->guard);
         sip_upd_end(&o->guard);
-        l->srv_txn = NULL;
+        leg_txn_store(&l->srv_txn, NULL);
         o->reinv = 0;
         respond_txn(co, t, 500, NULL, NULL, NULL, 0);
     }
@@ -6319,17 +6429,25 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
         if (sip_msg_in_dialog(m)) {
             int leg = -1;
             sip_hdr_t *cid = sip_hdr_get(m, SIP_H_CALL_ID);
-            b2b_call_t *c = NULL;
-            if (cid)
-                c = tbl_find(co, cid->value.p, cid->value.len, NULL);
-            if (c) leg = find_leg_by_dialog(c, m);
-            if (c && leg >= 0) {
-                call_lock(c);
-                if (!c->dead)
-                    handle_indialog_invite(c, leg, t, m);
-                call_unlock(c);
+            /* P0-1：查找即取引用；leg 匹配必须在 call_lock 内完成，
+             * 否则与 call_destroy 的 teardown 并发读 leg 属于无锁竞争。 */
+            b2b_call_t *c = cid ? tbl_find_ref(co, cid->value.p,
+                                               cid->value.len, NULL) : NULL;
+            if (!c) {
+                respond_txn(co, t, 481, NULL, NULL, NULL, 0);
                 return;
             }
+            call_lock(c);
+            if (!c->dead)
+                leg = find_leg_by_dialog(c, m);
+            if (!c->dead && leg >= 0) {
+                handle_indialog_invite(c, leg, t, m);
+                call_unlock(c);
+                call_put(c);
+                return;
+            }
+            call_unlock(c);
+            call_put(c);
             respond_txn(co, t, 481, NULL, NULL, NULL, 0);
             return;
         }
@@ -6383,33 +6501,36 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
     if (m->method == SIP_M_CANCEL) {
         sip_hdr_t *cid = sip_hdr_get(m, SIP_H_CALL_ID);
         int leg = -1, tbl_leg = -1;
-        b2b_call_t *c = NULL;
-        if (cid) {
-            /* 先用 tbl_find 拿到 call + 默认 leg（不丢兼容） */
-            c = tbl_find(co, cid->value.p, cid->value.len, &tbl_leg);
-            /* CANCEL 无 To tag — 按哪条腿在 CALLING/EARLY 精确匹配 */
-            if (c) leg = find_leg_for_cancel(c, tbl_leg);
-        }
-        /* 200 给 CANCEL 本身 */
+        /* P0-1：查找即取引用；leg 匹配移到 call_lock 之内 */
+        b2b_call_t *c = cid ? tbl_find_ref(co, cid->value.p,
+                                           cid->value.len, &tbl_leg) : NULL;
+        /* 200 给 CANCEL 本身（呼叫已不存在也回 200，防对端重传） */
         respond_txn(co, t, 200, NULL, NULL, NULL, 0);
         if (!c)
             return;
         call_lock(c);
         if (c->dead) {
             call_unlock(c);
+            call_put(c);
             return;
         }
+        /* CANCEL 无 To tag — 按哪条腿在 CALLING/EARLY 精确匹配 */
+        leg = find_leg_for_cancel(c, tbl_leg);
         b2b_leg_t *target = &c->leg[leg >= 0 ? leg : (tbl_leg >= 0 ? tbl_leg : 0)];
         /* 存储 CANCEL 入站 NIST → call_destroy 时 detach_txn(cancel_txn) 清理，
          * 避免 Timer J (32s) 自然超时堆积。用 cancel_txn 字段，不占 srv_txn
-         * （srv_txn 是 re-INVITE/MESSAGE/INFO 用的）。 */
-        if (target->cancel_txn && target->cancel_txn != t)
-            detach_txn(target->cancel_txn);
-        target->cancel_txn = t;
+         * （srv_txn 是 re-INVITE/MESSAGE/INFO 用的）。
+         * 用 leg_txn_replace 原子覆盖：旧值 detach 与新值安装不可被并发
+         * 清槽打断，避免对已释放的旧事务解引用。 */
+        leg_txn_replace(&target->cancel_txn, t);
+        /* P1-2：绑定 ud/tu，Timer J 终结时 b2b_server_tu 才能回调
+         * b2b_forget_txn 清槽并释放该引用（否则要等 call_destroy）。 */
+        txn_set_ud(t, c);
+        txn_set_tu(t, b2b_server_tu);
         if (target->srv_txn) {
             /* re-INVITE 取消：487 该 re-INVITE，呼叫保留 */
             respond_txn(co, target->srv_txn, 487, NULL, NULL, NULL, 0);
-            target->srv_txn = NULL;
+            leg_txn_store(&target->srv_txn, NULL);
             sip_upd_end(&target->guard);
             int other = (leg >= 0 ? leg : 0) ^ 1;
             if (c->leg[other].reinv) {
@@ -6417,6 +6538,7 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                 c->leg[other].reinv = 0;
             }
             call_unlock(c);
+            call_put(c);
             return;
         }
         if (!c->a_final) {
@@ -6427,16 +6549,18 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                 c->leg[1].state == LEG_EARLY)
                 send_cancel_req(c, 1);
             call_unlock(c);
+            call_put(c);
             return;
         }
         call_unlock(c);
+        call_put(c);
         return;
     }
 
     if (m->method == SIP_M_BYE) {
         sip_hdr_t *cid = sip_hdr_get(m, SIP_H_CALL_ID);
         int leg = -1;
-        b2b_call_t *c = cid ? tbl_find(co, cid->value.p, cid->value.len, NULL)
+        b2b_call_t *c = cid ? tbl_find_ref(co, cid->value.p, cid->value.len, NULL)
                             : NULL;
         llog(LOG_WARN, "b2b",
              "BYE_RECV callid=[%.*s] txn=%p cid_present=%d call_found=%d",
@@ -6450,6 +6574,16 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                  (int)(cid ? cid->value.len : 0), cid ? cid->value.p : "?",
                  bye_rp ? bye_rp->ss.ss_family : -1);
             respond_txn(co, t, 481, NULL, NULL, NULL, 0);
+            return;
+        }
+        /* P0-1：先加呼叫锁，再读 leg 状态做 To tag 匹配，避免与 call_destroy
+         * 的 teardown 竞争；call_destroy 前必须 call_put 释放本次引用。 */
+        call_lock(c);
+        if (c->dead) {
+            call_unlock(c);
+            call_put(c);
+            /* 呼叫已进入销毁：仍回 200，避免对端重复重传 BYE */
+            respond_txn(co, t, 200, NULL, NULL, NULL, 0);
             return;
         }
         /* ★ 用 find_leg_by_dialog 按 To tag 匹配 leg。
@@ -6483,25 +6617,23 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
             }
         }
         if (leg < 0) {
+            call_unlock(c);
+            call_put(c);
             respond_txn(co, t, 481, NULL, NULL, NULL, 0);
             return;
         }
         respond_txn(co, t, 200, NULL, NULL, NULL, 0);
-        call_lock(c);
-        if (c->dead) {
-            llog(LOG_WARN, "b2b", "★BYE_POST_200_OK: call already dead → skip");
-            call_unlock(c);
-            return;
-        }
         llog(LOG_INFO, "b2b",
              "★BYE_PREP leg=%d leg_state=%d other_state=%d dead=0",
              leg, c->leg[leg].state, c->leg[leg ^ 1].state);
         /* 存储 BYE 入站 NIST 事务 → call_destroy 时 detach_txn 会 force_terminate。
          * 旧代码不存，BYE NIST 靠 Timer J (64*T1=32s) 自然 cb_dead→t_remove_hash，
-         * 压测 60 通 → 60 条残留，10s 后仍有 21 条未到期。 */
-        if (c->leg[leg].srv_txn && c->leg[leg].srv_txn != t)
-            detach_txn(c->leg[leg].srv_txn);
-        c->leg[leg].srv_txn = t;
+         * 压测 60 通 → 60 条残留，10s 后仍有 21 条未到期。
+         * 用 leg_txn_replace 原子覆盖，理由同 CANCEL 分支。 */
+        leg_txn_replace(&c->leg[leg].srv_txn, t);
+        /* P1-2：同理绑定 ud/tu，Timer J 终结时释放槽位引用 */
+        txn_set_ud(t, c);
+        txn_set_tu(t, b2b_server_tu);
         c->leg[leg].state = LEG_TERMINATING;
         /* ★ 记录谁发起的挂断：leg=0→A腿(主叫)发BYE，leg=1→B腿(被叫)发BYE */
         c->hangup_by = leg + 1;
@@ -6541,6 +6673,7 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
         c->leg[leg].state = LEG_TERMINATED;
         call_unlock(c);
         call_destroy(c);
+        call_put(c);
         return;
     }
 
@@ -6554,14 +6687,14 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
         /* P0-3：查找方持引用 + 全程 call_lock，与 BYE/call_destroy 串行 */
         b2b_call_t *c = cid ? tbl_find_ref(co, cid->value.p, cid->value.len, NULL)
                             : NULL;
-        if (c) leg = find_leg_by_dialog(c, m);
-        if (!c || leg < 0) {
-            if (c) call_put(c);
+        if (!c) {
             respond_txn(co, t, 481, NULL, NULL, NULL, 0);
             return;
         }
         call_lock(c);
-        if (c->dead) {
+        if (!c->dead)
+            leg = find_leg_by_dialog(c, m);
+        if (c->dead || leg < 0) {
             call_unlock(c);
             call_put(c);
             respond_txn(co, t, 481, NULL, NULL, NULL, 0);
@@ -6623,7 +6756,7 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
             return;
         }
         o->reinv = 1;
-        o->out_txn = NULL;
+        leg_txn_store(&o->out_txn, NULL);
 
         char extra[512];
         extra[0] = '\0';
@@ -6646,9 +6779,9 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                               m->body.len,
                               out, sizeof(out));
         if (n > 0) {
-            o->out_txn = txn_client_new(
+            leg_txn_store(&o->out_txn, txn_client_new(
                 co->cfg.txn, TXN_ICT, branch, strlen(branch), SIP_M_INVITE,
-                &o->dst, o->reliable, out, (size_t)n, cli_tu, c, now_ms());
+                &o->dst, o->reliable, out, (size_t)n, cli_tu, c, now_ms()));
             if (o->out_txn)
                 snprintf(o->last_branch, sizeof(o->last_branch), "%s", branch);
         }
@@ -6670,9 +6803,18 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
     if (m->method == SIP_M_REFER && sip_msg_in_dialog(m)) {
         int leg = -1;
         sip_hdr_t *cid = sip_hdr_get(m, SIP_H_CALL_ID);
-        b2b_call_t *c = cid ? tbl_find(co, cid->value.p, cid->value.len, NULL) : NULL;
-        if (c) leg = find_leg_by_dialog(c, m);
-        if (!c || leg < 0) {
+        b2b_call_t *c = cid ? tbl_find_ref(co, cid->value.p, cid->value.len, NULL) : NULL;
+        if (!c) {
+            respond_txn(co, t, 481, NULL, NULL, NULL, 0);
+            return;
+        }
+        /* P0-1：leg 匹配在 call_lock 内完成；引用持有到 transfer 结束 */
+        call_lock(c);
+        if (!c->dead)
+            leg = find_leg_by_dialog(c, m);
+        call_unlock(c);
+        if (leg < 0) {
+            call_put(c);
             respond_txn(co, t, 481, NULL, NULL, NULL, 0);
             return;
         }
@@ -6681,6 +6823,7 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
 
         /* REFER 时发起腿必须 CONFIRMED（在通话中） */
         if (l->state != LEG_CONFIRMED && l->state != LEG_EARLY) {
+            call_put(c);
             respond_txn(co, t, 481, NULL, NULL, NULL, 0);
             return;
         }
@@ -6690,6 +6833,7 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
 
         /* 无 Refer-To → 481 Invalid REFER */
         if (!rt_hdr || !rt_hdr->value.p || !rt_hdr->value.len) {
+            call_put(c);
             respond_txn(co, t, 481, NULL, NULL, NULL, 0);
             return;
         }
@@ -6708,6 +6852,7 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                 llog(LOG_WARN, "b2b",
                      "attended transfer invalid Replaces format callid=%s",
                      cid->value.p);
+                call_put(c);
                 respond_txn(co, t, 400, NULL, NULL, NULL, 0);
                 return;
             }
@@ -6753,6 +6898,7 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                      rc, is_attended, cid->value.p);
             }
         }
+        call_put(c);
         return;
     }
 
@@ -6763,14 +6909,14 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
         /* P0-3：同上，查找方持引用 + call_lock 串行 */
         b2b_call_t *c = cid ? tbl_find_ref(co, cid->value.p, cid->value.len, NULL)
                             : NULL;
-        if (c) leg = find_leg_by_dialog(c, m);
-        if (!c || leg < 0) {
-            if (c) call_put(c);
+        if (!c) {
             respond_txn(co, t, 481, NULL, NULL, NULL, 0);
             return;
         }
         call_lock(c);
-        if (c->dead) {
+        if (!c->dead)
+            leg = find_leg_by_dialog(c, m);
+        if (c->dead || leg < 0) {
             call_unlock(c);
             call_put(c);
             respond_txn(co, t, 481, NULL, NULL, NULL, 0);
@@ -6823,14 +6969,14 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
         /* 转发 UPDATE 到对端 leg */
         if (!sip_upd_begin(&o->guard)) {
             sip_upd_end(&l->guard);
-            l->srv_txn = NULL;
+            leg_txn_store(&l->srv_txn, NULL);
             call_unlock(c);
             call_put(c);
             respond_txn(co, t, 491, NULL, NULL, NULL, 0);
             return;
         }
         o->reinv = 1;
-        o->out_txn = NULL;
+        leg_txn_store(&o->out_txn, NULL);
 
         char branch[40];
         new_branch(branch, sizeof(branch));
@@ -6848,16 +6994,16 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                               m->body.len,
                               out, sizeof(out));
         if (n > 0) {
-            o->out_txn = txn_client_new(
+            leg_txn_store(&o->out_txn, txn_client_new(
                 co->cfg.txn, TXN_NICT, branch, strlen(branch), SIP_M_UPDATE,
-                &o->dst, o->reliable, out, (size_t)n, cli_tu, c, now_ms());
+                &o->dst, o->reliable, out, (size_t)n, cli_tu, c, now_ms()));
             if (o->out_txn)
                 snprintf(o->last_branch, sizeof(o->last_branch), "%s", branch);
         }
         if (!o->out_txn) {
             sip_upd_end(&l->guard);
             sip_upd_end(&o->guard);
-            l->srv_txn = NULL;
+            leg_txn_store(&l->srv_txn, NULL);
             o->reinv = 0;
             respond_txn(co, t, 500, NULL, NULL, NULL, 0);
         }
@@ -6870,9 +7016,18 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
     if (m->method == SIP_M_PRACK && sip_msg_in_dialog(m)) {
         int leg = -1;
         sip_hdr_t *cid = sip_hdr_get(m, SIP_H_CALL_ID);
-        b2b_call_t *c = cid ? tbl_find(co, cid->value.p, cid->value.len, NULL) : NULL;
-        if (c) leg = find_leg_by_dialog(c, m);
-        if (!c || leg < 0) {
+        b2b_call_t *c = cid ? tbl_find_ref(co, cid->value.p, cid->value.len, NULL) : NULL;
+        if (!c) {
+            respond_txn(co, t, 481, NULL, NULL, NULL, 0);
+            return;
+        }
+        /* P0-1：全程持引用 + call_lock（与 UPDATE 同模式） */
+        call_lock(c);
+        if (!c->dead)
+            leg = find_leg_by_dialog(c, m);
+        if (c->dead || leg < 0) {
+            call_unlock(c);
+            call_put(c);
             respond_txn(co, t, 481, NULL, NULL, NULL, 0);
             return;
         }
@@ -6882,14 +7037,20 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
         /* REQ-SIP-PROFILE-001：profile 关 PRACK → 本侧从不发 reliable 1xx
          * （local_rseq 恒 0），到达的 PRACK 一律 481（防误配/恶意注入） */
         if (c->prof && !c->prof->enable_prack) {
+            call_unlock(c);
+            call_put(c);
             respond_txn(co, t, 481, NULL, NULL, NULL, 0);
             return;
         }
         if (o->state != LEG_EARLY) {
+            call_unlock(c);
+            call_put(c);
             respond_txn(co, t, 481, NULL, NULL, NULL, 0);
             return;
         }
         if (!sip_upd_begin(&l->guard)) {
+            call_unlock(c);
+            call_put(c);
             respond_txn(co, t, 491, NULL, NULL, NULL, 0);
             return;
         }
@@ -6950,11 +7111,13 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
         /* 转发 PRACK 到对端 leg（early dialog） */
         if (!sip_upd_begin(&o->guard)) {
             sip_upd_end(&l->guard);
-            l->srv_txn = NULL;
+            leg_txn_store(&l->srv_txn, NULL);
+            call_unlock(c);
+            call_put(c);
             respond_txn(co, t, 491, NULL, NULL, NULL, 0);
             return;
         }
-        o->out_txn = NULL;
+        leg_txn_store(&o->out_txn, NULL);
 
         char branch[40];
         new_branch(branch, sizeof(branch));
@@ -6970,18 +7133,20 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                               extra[0] ? extra : NULL, NULL, 0,
                               out, sizeof(out));
         if (n > 0) {
-            o->out_txn = txn_client_new(
+            leg_txn_store(&o->out_txn, txn_client_new(
                 co->cfg.txn, TXN_NICT, branch, strlen(branch), SIP_M_PRACK,
-                &o->dst, o->reliable, out, (size_t)n, cli_tu, c, now_ms());
+                &o->dst, o->reliable, out, (size_t)n, cli_tu, c, now_ms()));
             if (o->out_txn)
                 snprintf(o->last_branch, sizeof(o->last_branch), "%s", branch);
         }
         if (!o->out_txn) {
             sip_upd_end(&l->guard);
             sip_upd_end(&o->guard);
-            l->srv_txn = NULL;
+            leg_txn_store(&l->srv_txn, NULL);
             respond_txn(co, t, 500, NULL, NULL, NULL, 0);
         }
+        call_unlock(c);
+        call_put(c);
         return;
     }
 
@@ -6989,20 +7154,33 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
     if (m->method == SIP_M_MESSAGE && sip_msg_in_dialog(m)) {
         int leg = -1;
         sip_hdr_t *cid = sip_hdr_get(m, SIP_H_CALL_ID);
-        b2b_call_t *c = cid ? tbl_find(co, cid->value.p, cid->value.len, NULL) : NULL;
-        if (c) leg = find_leg_by_dialog(c, m);
-        if (!c || leg < 0) {
+        b2b_call_t *c = cid ? tbl_find_ref(co, cid->value.p, cid->value.len, NULL) : NULL;
+        if (!c) {
+            respond_txn(co, t, 481, NULL, NULL, NULL, 0);
+            return;
+        }
+        /* P0-1：全程持引用 + call_lock */
+        call_lock(c);
+        if (!c->dead)
+            leg = find_leg_by_dialog(c, m);
+        if (leg < 0) {
+            call_unlock(c);
+            call_put(c);
             respond_txn(co, t, 481, NULL, NULL, NULL, 0);
             return;
         }
         b2b_leg_t *l = &c->leg[leg];
         int other = leg ^ 1;
         b2b_leg_t *o = &c->leg[other];
-        if (o->state != LEG_CONFIRMED && o->state != LEG_EARLY) {
+        if (c->dead || (o->state != LEG_CONFIRMED && o->state != LEG_EARLY)) {
+            call_unlock(c);
+            call_put(c);
             respond_txn(co, t, 491, NULL, NULL, NULL, 0);
             return;
         }
         if (!sip_upd_begin(&l->guard)) {
+            call_unlock(c);
+            call_put(c);
             respond_txn(co, t, 491, NULL, NULL, NULL, 0);
             return;
         }
@@ -7011,7 +7189,7 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
          * 由 cli_tu 回 A 腿——A 收到 200 时 guard 已释放，连续
          * MESSAGE/INFO 不会 491。CONFIRMED 后 INVITE 的 inv_txn 已
          * 固定，srv_txn 此时空闲（re-INVITE 场景由 guard 串行互斥）。 */
-        l->srv_txn = t;
+        leg_txn_store(&l->srv_txn, t);
         txn_set_ud(t, c);
 
         /* 构建 extra：透传 Content-Type + Content-Length（如有 body） */
@@ -7034,10 +7212,12 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
         if (!sip_upd_begin(&o->guard)) {
             sip_upd_end(&l->guard);
             respond_txn(co, l->srv_txn, 491, NULL, NULL, NULL, 0);
-            l->srv_txn = NULL;
+            leg_txn_store(&l->srv_txn, NULL);
+            call_unlock(c);
+            call_put(c);
             return;
         }
-        o->out_txn = NULL;
+        leg_txn_store(&o->out_txn, NULL);
 
         char branch[40];
         new_branch(branch, sizeof(branch));
@@ -7055,9 +7235,9 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                               m->body.len,
                               out, sizeof(out));
         if (n > 0) {
-            o->out_txn = txn_client_new(
+            leg_txn_store(&o->out_txn, txn_client_new(
                 co->cfg.txn, TXN_NICT, branch, strlen(branch), SIP_M_MESSAGE,
-                &o->dst, o->reliable, out, (size_t)n, cli_tu, c, now_ms());
+                &o->dst, o->reliable, out, (size_t)n, cli_tu, c, now_ms()));
             if (o->out_txn)
                 snprintf(o->last_branch, sizeof(o->last_branch), "%s", branch);
         }
@@ -7065,10 +7245,14 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
             sip_upd_end(&l->guard);
             sip_upd_end(&o->guard);
             respond_txn(co, l->srv_txn, 500, NULL, NULL, NULL, 0);
-            l->srv_txn = NULL;
+            leg_txn_store(&l->srv_txn, NULL);
+            call_unlock(c);
+            call_put(c);
             return;
         }
         /* cli_tu 在 o->out_txn 终响应时回 A 腿并释放 guard */
+        call_unlock(c);
+        call_put(c);
         return;
     }
 
@@ -7076,26 +7260,39 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
     if (m->method == SIP_M_INFO && sip_msg_in_dialog(m)) {
         int leg = -1;
         sip_hdr_t *cid = sip_hdr_get(m, SIP_H_CALL_ID);
-        b2b_call_t *c = cid ? tbl_find(co, cid->value.p, cid->value.len, NULL) : NULL;
-        if (c) leg = find_leg_by_dialog(c, m);
-        if (!c || leg < 0) {
+        b2b_call_t *c = cid ? tbl_find_ref(co, cid->value.p, cid->value.len, NULL) : NULL;
+        if (!c) {
+            respond_txn(co, t, 481, NULL, NULL, NULL, 0);
+            return;
+        }
+        /* P0-1：全程持引用 + call_lock */
+        call_lock(c);
+        if (!c->dead)
+            leg = find_leg_by_dialog(c, m);
+        if (leg < 0) {
+            call_unlock(c);
+            call_put(c);
             respond_txn(co, t, 481, NULL, NULL, NULL, 0);
             return;
         }
         b2b_leg_t *l = &c->leg[leg];
         int other = leg ^ 1;
         b2b_leg_t *o = &c->leg[other];
-        if (o->state != LEG_CONFIRMED && o->state != LEG_EARLY) {
+        if (c->dead || (o->state != LEG_CONFIRMED && o->state != LEG_EARLY)) {
+            call_unlock(c);
+            call_put(c);
             respond_txn(co, t, 491, NULL, NULL, NULL, 0);
             return;
         }
         if (!sip_upd_begin(&l->guard)) {
+            call_unlock(c);
+            call_put(c);
             respond_txn(co, t, 491, NULL, NULL, NULL, 0);
             return;
         }
 
         /* 延迟响应：同 MESSAGE，存 srv_txn 等 B 腿终响应再回 A */
-        l->srv_txn = t;
+        leg_txn_store(&l->srv_txn, t);
         txn_set_ud(t, c);
 
         /* 构建 extra：透传 Content-Type/Content-Length（如有 body） */
@@ -7118,10 +7315,12 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
         if (!sip_upd_begin(&o->guard)) {
             sip_upd_end(&l->guard);
             respond_txn(co, l->srv_txn, 491, NULL, NULL, NULL, 0);
-            l->srv_txn = NULL;
+            leg_txn_store(&l->srv_txn, NULL);
+            call_unlock(c);
+            call_put(c);
             return;
         }
-        o->out_txn = NULL;
+        leg_txn_store(&o->out_txn, NULL);
 
         char branch[40];
         new_branch(branch, sizeof(branch));
@@ -7139,9 +7338,9 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                               m->body.len,
                               out, sizeof(out));
         if (n > 0) {
-            o->out_txn = txn_client_new(
+            leg_txn_store(&o->out_txn, txn_client_new(
                 co->cfg.txn, TXN_NICT, branch, strlen(branch), SIP_M_INFO,
-                &o->dst, o->reliable, out, (size_t)n, cli_tu, c, now_ms());
+                &o->dst, o->reliable, out, (size_t)n, cli_tu, c, now_ms()));
             if (o->out_txn)
                 snprintf(o->last_branch, sizeof(o->last_branch), "%s", branch);
         }
@@ -7149,10 +7348,14 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
             sip_upd_end(&l->guard);
             sip_upd_end(&o->guard);
             respond_txn(co, l->srv_txn, 500, NULL, NULL, NULL, 0);
-            l->srv_txn = NULL;
+            leg_txn_store(&l->srv_txn, NULL);
+            call_unlock(c);
+            call_put(c);
             return;
         }
         /* cli_tu 在 o->out_txn 终响应时回 A 腿并释放 guard */
+        call_unlock(c);
+        call_put(c);
         return;
     }
 
@@ -7162,24 +7365,37 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
     if (m->method == SIP_M_PUBLISH && sip_msg_in_dialog(m)) {
         int leg = -1;
         sip_hdr_t *cid = sip_hdr_get(m, SIP_H_CALL_ID);
-        b2b_call_t *c = cid ? tbl_find(co, cid->value.p, cid->value.len, NULL) : NULL;
-        if (c) leg = find_leg_by_dialog(c, m);
-        if (!c || leg < 0) {
+        b2b_call_t *c = cid ? tbl_find_ref(co, cid->value.p, cid->value.len, NULL) : NULL;
+        if (!c) {
+            respond_txn(co, t, 481, NULL, NULL, NULL, 0);
+            return;
+        }
+        /* P0-1：全程持引用 + call_lock */
+        call_lock(c);
+        if (!c->dead)
+            leg = find_leg_by_dialog(c, m);
+        if (leg < 0) {
+            call_unlock(c);
+            call_put(c);
             respond_txn(co, t, 481, NULL, NULL, NULL, 0);
             return;
         }
         b2b_leg_t *l = &c->leg[leg];
         int other = leg ^ 1;
         b2b_leg_t *o = &c->leg[other];
-        if (o->state != LEG_CONFIRMED && o->state != LEG_EARLY) {
+        if (c->dead || (o->state != LEG_CONFIRMED && o->state != LEG_EARLY)) {
+            call_unlock(c);
+            call_put(c);
             respond_txn(co, t, 491, NULL, NULL, NULL, 0);
             return;
         }
         if (!sip_upd_begin(&l->guard)) {
+            call_unlock(c);
+            call_put(c);
             respond_txn(co, t, 491, NULL, NULL, NULL, 0);
             return;
         }
-        l->srv_txn = t;
+        leg_txn_store(&l->srv_txn, t);
         txn_set_ud(t, c);
 
         /* 透传 Content-Type + Content-Length（PUBLISH 带 application/pidf+xml） */
@@ -7202,10 +7418,12 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
         if (!sip_upd_begin(&o->guard)) {
             sip_upd_end(&l->guard);
             respond_txn(co, l->srv_txn, 491, NULL, NULL, NULL, 0);
-            l->srv_txn = NULL;
+            leg_txn_store(&l->srv_txn, NULL);
+            call_unlock(c);
+            call_put(c);
             return;
         }
-        o->out_txn = NULL;
+        leg_txn_store(&o->out_txn, NULL);
 
         char branch[40];
         new_branch(branch, sizeof(branch));
@@ -7223,10 +7441,10 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                               m->body.len,
                               out, sizeof(out));
         if (n > 0) {
-            o->out_txn = txn_client_new(
+            leg_txn_store(&o->out_txn, txn_client_new(
                 co->cfg.txn, TXN_NICT,
                 branch, strlen(branch), m->method,
-                &o->dst, o->reliable, out, (size_t)n, cli_tu, c, now_ms());
+                &o->dst, o->reliable, out, (size_t)n, cli_tu, c, now_ms()));
             if (o->out_txn)
                 snprintf(o->last_branch, sizeof(o->last_branch), "%s", branch);
         }
@@ -7234,10 +7452,14 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
             sip_upd_end(&l->guard);
             sip_upd_end(&o->guard);
             respond_txn(co, l->srv_txn, 500, NULL, NULL, NULL, 0);
-            l->srv_txn = NULL;
+            leg_txn_store(&l->srv_txn, NULL);
+            call_unlock(c);
+            call_put(c);
             return;
         }
         /* cli_tu 在 o->out_txn 终响应时回 A 腿并释放 guard */
+        call_unlock(c);
+        call_put(c);
         return;
     }
 
@@ -7247,24 +7469,37 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
         && sip_msg_in_dialog(m)) {
         int leg = -1;
         sip_hdr_t *cid = sip_hdr_get(m, SIP_H_CALL_ID);
-        b2b_call_t *c = cid ? tbl_find(co, cid->value.p, cid->value.len, NULL) : NULL;
-        if (c) leg = find_leg_by_dialog(c, m);
-        if (!c || leg < 0) {
+        b2b_call_t *c = cid ? tbl_find_ref(co, cid->value.p, cid->value.len, NULL) : NULL;
+        if (!c) {
+            respond_txn(co, t, 481, NULL, NULL, NULL, 0);
+            return;
+        }
+        /* P0-1：全程持引用 + call_lock */
+        call_lock(c);
+        if (!c->dead)
+            leg = find_leg_by_dialog(c, m);
+        if (leg < 0) {
+            call_unlock(c);
+            call_put(c);
             respond_txn(co, t, 481, NULL, NULL, NULL, 0);
             return;
         }
         b2b_leg_t *l = &c->leg[leg];
         int other = leg ^ 1;
         b2b_leg_t *o = &c->leg[other];
-        if (o->state != LEG_CONFIRMED && o->state != LEG_EARLY) {
+        if (c->dead || (o->state != LEG_CONFIRMED && o->state != LEG_EARLY)) {
+            call_unlock(c);
+            call_put(c);
             respond_txn(co, t, 491, NULL, NULL, NULL, 0);
             return;
         }
         if (!sip_upd_begin(&l->guard)) {
+            call_unlock(c);
+            call_put(c);
             respond_txn(co, t, 491, NULL, NULL, NULL, 0);
             return;
         }
-        l->srv_txn = t;
+        leg_txn_store(&l->srv_txn, t);
         txn_set_ud(t, c);
 
         /* 透传 Content-Type + Content-Length（SUBSCRIBE/NOTIFY 带 application/sipxml） */
@@ -7287,10 +7522,12 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
         if (!sip_upd_begin(&o->guard)) {
             sip_upd_end(&l->guard);
             respond_txn(co, l->srv_txn, 491, NULL, NULL, NULL, 0);
-            l->srv_txn = NULL;
+            leg_txn_store(&l->srv_txn, NULL);
+            call_unlock(c);
+            call_put(c);
             return;
         }
-        o->out_txn = NULL;
+        leg_txn_store(&o->out_txn, NULL);
 
         char branch[40];
         new_branch(branch, sizeof(branch));
@@ -7308,10 +7545,10 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                               m->body.len,
                               out, sizeof(out));
         if (n > 0) {
-            o->out_txn = txn_client_new(
+            leg_txn_store(&o->out_txn, txn_client_new(
                 co->cfg.txn, TXN_NICT,
                 branch, strlen(branch), m->method,
-                &o->dst, o->reliable, out, (size_t)n, cli_tu, c, now_ms());
+                &o->dst, o->reliable, out, (size_t)n, cli_tu, c, now_ms()));
             if (o->out_txn)
                 snprintf(o->last_branch, sizeof(o->last_branch), "%s", branch);
         }
@@ -7319,10 +7556,14 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
             sip_upd_end(&l->guard);
             sip_upd_end(&o->guard);
             respond_txn(co, l->srv_txn, 500, NULL, NULL, NULL, 0);
-            l->srv_txn = NULL;
+            leg_txn_store(&l->srv_txn, NULL);
+            call_unlock(c);
+            call_put(c);
             return;
         }
         /* cli_tu 在 o->out_txn 终响应时回 A 腿并释放 guard */
+        call_unlock(c);
+        call_put(c);
         return;
     }
 
@@ -7590,8 +7831,8 @@ void b2b_on_rx(void *ud, sip_tr_proto_t proto, const nsbc_sa_t *src,
                     sip_hdr_parse_cseq(cs) == NSBC_OK &&
                     cs->u.cseq.method == SIP_M_ACK) {
                     int leg = -1;
-                    b2b_call_t *c = tbl_find(co, cid->value.p,
-                                             cid->value.len, &leg);
+                    b2b_call_t *c = tbl_find_ref(co, cid->value.p,
+                                                 cid->value.len, &leg);
                     if (c && leg == 0) {
                         call_lock(c);
                         /* 首 INVITE 的 server txn 在 inv_txn（srv_txn 是
@@ -7666,7 +7907,10 @@ void b2b_on_rx(void *ud, sip_tr_proto_t proto, const nsbc_sa_t *src,
                             }
                         }
                         call_unlock(c);
+                        call_put(c);
                     } else {
+                        if (c)
+                            call_put(c);
                         llog(LOG_WARN, "b2b",
                              "ack tbl_find fail: c=%p leg=%d callid=%.*s",
                              (void *)c, leg,
@@ -7715,13 +7959,16 @@ void b2b_on_rx(void *ud, sip_tr_proto_t proto, const nsbc_sa_t *src,
         if (cid && cseq && sip_hdr_parse_cseq(cseq) == NSBC_OK &&
             cseq->u.cseq.method == SIP_M_INVITE) {
             int leg = -1;
-            b2b_call_t *c = tbl_find(co, cid->value.p, cid->value.len, &leg);
-            if (c && leg == 1 && c->leg[1].state == LEG_CONFIRMED) {
-                matched_invite_2xx = 1;
-                call_lock(c);
-                if (!c->dead)
-                    send_ack_leg(c, 1);
-                call_unlock(c);
+            b2b_call_t *c = tbl_find_ref(co, cid->value.p, cid->value.len, &leg);
+            if (c) {
+                if (leg == 1 && c->leg[1].state == LEG_CONFIRMED) {
+                    matched_invite_2xx = 1;
+                    call_lock(c);
+                    if (!c->dead)
+                        send_ack_leg(c, 1);
+                    call_unlock(c);
+                }
+                call_put(c);
             }
         }
     }
@@ -8261,7 +8508,7 @@ int b2b_originate(b2b_core_t *co, const b2b_orig_t *o, b2b_call_t **out)
                 b->offer_len = 0;
             }
 
-            b->inv_txn = send_invite_b(c, 1, out_sdp, out_sdp_len, 0, NULL);
+            leg_txn_store(&b->inv_txn, send_invite_b(c, 1, out_sdp, out_sdp_len, 0, NULL));
         }
         if (!b->inv_txn) {
             call_destroy(c);
@@ -8419,7 +8666,7 @@ int b2b_originate(b2b_core_t *co, const b2b_orig_t *o, b2b_call_t **out)
         call_destroy(c); /* P2-19：同 INVITE 发送失败清理路径 */
         return NSBC_ERR;
     }
-    a->inv_txn = send_invite_b(c, 0, a->offer, a->offer_len, 0, NULL);
+    leg_txn_store(&a->inv_txn, send_invite_b(c, 0, a->offer, a->offer_len, 0, NULL));
     if (!a->inv_txn) {
         llog(LOG_WARN, "b2b", "bridge A leg INVITE send failed");
         call_destroy(c);
@@ -8539,7 +8786,7 @@ int b2b_originate(b2b_core_t *co, const b2b_orig_t *o, b2b_call_t **out)
         call_destroy(c); /* P2-19：同 INVITE 发送失败清理路径 */
         return NSBC_ERR;
     }
-    b->inv_txn = send_invite_b(c, 1, b->offer, b->offer_len, 0, NULL);
+    leg_txn_store(&b->inv_txn, send_invite_b(c, 1, b->offer, b->offer_len, 0, NULL));
     if (!b->inv_txn) {
         llog(LOG_WARN, "b2b", "bridge B leg INVITE send failed");
         call_destroy(c);
@@ -8621,53 +8868,207 @@ static void *leg_ws_conn_of(const b2b_leg_t *l)
     return conn;
 }
 
+/* 与 sa_hide_ws_conn 对称：把新 ws_conn* 写回 leg->dst（AF_UNSPEC + padding）。 */
+static void leg_ws_conn_set(b2b_leg_t *l, void *conn)
+{
+    if (!l)
+        return;
+    memset(&l->dst, 0, sizeof(l->dst));
+    l->dst.ss.ss_family = AF_UNSPEC;
+    memcpy(((char *)&l->dst.ss) + sizeof(struct sockaddr_storage) - sizeof(void *),
+           &conn, sizeof(void *));
+}
+
+/* 取掉线 leg 对应的 AoR：
+ *   li==1（被叫 WebRTC）→ A 腿 ruri 就是被叫 AoR；
+ *   li==0（主叫 WebRTC）→ A 腿 From 头里的主叫 URI。 */
+static void call_aor_of(const b2b_call_t *c, int li, char *out, size_t outsz)
+{
+    if (!out || outsz == 0)
+        return;
+    out[0] = '\0';
+    const char *u;
+    if (li == 1) {
+        u = c->leg[0].ruri[0] ? c->leg[0].ruri : c->leg[1].ruri;
+    } else {
+        u = c->leg[0].from;
+        const char *lt = strchr(u, '<');
+        if (lt)
+            u = lt + 1;
+    }
+    if (!u || !u[0])
+        return;
+    if (strncasecmp(u, "sip:", 4) == 0 || strncasecmp(u, "sips:", 5) == 0) {
+        const char *colon = strchr(u, ':');
+        if (colon)
+            u = colon + 1;
+    }
+    if (*u == '<')
+        ++u;
+    size_t n = 0;
+    while (u[n] && u[n] != '>' && u[n] != ';' && u[n] != '?' && n + 1 < outsz) {
+        out[n] = u[n];
+        ++n;
+    }
+    out[n] = '\0';
+}
+
+static void disarm_ws_lost_timer(b2b_call_t *c)
+{
+    b2b_core_t *co = c ? c->core : NULL;
+    if (co && co->cfg.tw)
+        tw_del(co->cfg.tw, &c->ws_lost_node);
+}
+
+/* WS 断线宽限到期：期间未用新 conn 重绑，则按 transport lost 终止。 */
+static void ws_lost_expire_cb(uint64_t cb_now, void *arg)
+{
+    b2b_call_t *c = (b2b_call_t *)arg;
+    (void)cb_now;
+    call_lock(c);
+    if (c->dead) {
+        call_unlock(c);
+        return;
+    }
+    /* 已被后续断线重新武装（deadline 被推后）：本次是过期回调，按新 deadline 重挂 */
+    if (c->ws_lost_deadline > now_ms() + 50) {
+        b2b_core_t *co = c->core;
+        if (co && co->cfg.tw)
+            tw_add(co->cfg.tw, &c->ws_lost_node, c->ws_lost_deadline,
+                   ws_lost_expire_cb, c);
+        call_unlock(c);
+        return;
+    }
+    void *old = c->ws_lost_conn;
+    c->ws_lost_conn = NULL;
+    c->ws_lost_deadline = 0;
+    int li = (int)c->ws_lost_leg;
+    if (!old || li < 0 || li > 1) {
+        call_unlock(c);
+        return;
+    }
+
+    /* 已被其它路径换绑（例如重注册/新 INVITE 更新了 leg dst）→ 保留呼叫 */
+    if (leg_ws_conn_of(&c->leg[li]) != old) {
+        llog(LOG_INFO, "b2b",
+             "ws grace: callid=%s leg=%d already re-bound, keep call",
+             c->leg[0].callid, li);
+        call_unlock(c);
+        return;
+    }
+
+    /* 查 registrar：同一 AoR 是否已在宽限期内用新 conn 重新注册 */
+    void *fresh = NULL;
+    char aor[128];
+    call_aor_of(c, li, aor, sizeof(aor));
+    nsbc_ctx_t *ctx = nsbc_get_ctx();
+    loc_db_t *db = ctx ? (loc_db_t *)ctx->loc_db : NULL;
+    if (db && aor[0]) {
+        loc_binding_t bs[4];
+        int nb = loc_query(db, aor, bs, 4, now_ms());
+        for (int i = 0; i < nb; ++i) {
+            if (bs[i].ws_conn && bs[i].ws_conn != old &&
+                ws_conn_alive(bs[i].ws_conn)) {
+                fresh = bs[i].ws_conn;
+                break;
+            }
+        }
+    }
+    if (fresh) {
+        leg_ws_conn_set(&c->leg[li], fresh);
+        llog(LOG_WARN, "b2b",
+             "ws grace: callid=%s leg=%d re-bound old=%p new=%p (reconnected)",
+             c->leg[0].callid, li, old, fresh);
+        call_unlock(c);
+        return;
+    }
+
+    llog(LOG_WARN, "b2b",
+         "ws grace expired: callid=%s leg=%d no reconnect in %ums → terminate 503",
+         c->leg[0].callid, li, B2B_WS_GRACE_MS);
+    call_unlock(c);
+    b2b_terminate(c, 503);
+}
+
 int b2b_terminate_ws_conn(b2b_core_t *co, void *conn)
 {
     if (!co || !conn)
         return NSBC_INVAL;
 
-    /* 先收集 callid（最多 8 条：一个 WS 连接同时承载的正常呼叫数），
-     * 解锁后再按 callid 走 b2b_terminate_callid —— 避免持锁发送 + 悬垂指针。 */
+    /* WS 断开不再立即挂断：给 B2B_WS_GRACE_MS 重连宽限，期间同一 AoR 用
+     * 新 conn 重新注册则重绑 leg；超时由 ws_lost_expire_cb 按 503 终止。
+     * 没有定时器轮时退回旧的立即终止行为。 */
     char ids[8][DLG_CALLID_MAX];
     size_t lens[8];
-    int n = 0;
+    int n_total = 0, n_grace = 0, n_term = 0;
     uint32_t gen = (uint32_t)__sync_add_and_fetch(&co->dump_gen, 1);
 
-    for (int si = 0; si < B2B_CALL_SHARDS && n < 8; ++si) {
+    for (int si = 0; si < B2B_CALL_SHARDS; ++si) {
         call_shard_t *sh = &co->sh[si];
         pthread_mutex_lock(&sh->lock);
-        for (call_link_t *p = sh->head; p && n < 8; p = p->next) {
+        for (call_link_t *p = sh->head; p; p = p->next) {
             b2b_call_t *c = p->call;
             call_lock(c);
             if (c->dead || c->dump_mark == gen) {
                 call_unlock(c);
                 continue;
             }
-            if (leg_ws_conn_of(&c->leg[0]) == conn ||
-                leg_ws_conn_of(&c->leg[1]) == conn) {
-                c->dump_mark = gen;   /* 一个 call 在 A/B 两个分片各有一条 link */
-                const char *id = c->leg[0].callid[0] ? c->leg[0].callid
-                                                     : c->leg[1].callid;
-                size_t len = strlen(id);
-                if (len > 0 && len < DLG_CALLID_MAX) {
-                    memcpy(ids[n], id, len);
-                    ids[n][len] = '\0';
-                    lens[n] = len;
-                    ++n;
+            int li = -1;
+            if (leg_ws_conn_of(&c->leg[0]) == conn)
+                li = 0;
+            else if (leg_ws_conn_of(&c->leg[1]) == conn)
+                li = 1;
+            if (li < 0) {
+                call_unlock(c);
+                continue;
+            }
+            c->dump_mark = gen;   /* 一个 call 在 A/B 两个分片各有一条 link */
+            ++n_total;
+
+            if (co->cfg.tw) {
+                if (c->ws_lost_conn == conn) {   /* 重复 close：已在宽限期，跳过 */
+                    call_unlock(c);
+                    continue;
                 }
+                c->ws_lost_conn = conn;
+                c->ws_lost_leg = (uint8_t)li;
+                uint64_t dl = now_ms() + B2B_WS_GRACE_MS;
+                c->ws_lost_deadline = dl;
+                tw_del(co->cfg.tw, &c->ws_lost_node);
+                tw_add(co->cfg.tw, &c->ws_lost_node, dl,
+                       ws_lost_expire_cb, c);
+                ++n_grace;
+                llog(LOG_WARN, "b2b",
+                     "ws conn=%p closed → grace %ums before terminating callid=%s (leg=%d)",
+                     conn, B2B_WS_GRACE_MS, c->leg[0].callid, li);
+                call_unlock(c);
+                continue;
+            }
+
+            /* 无定时器轮：退回立即终止 */
+            const char *id = c->leg[0].callid[0] ? c->leg[0].callid
+                                                 : c->leg[1].callid;
+            size_t len = strlen(id);
+            if (len > 0 && len < DLG_CALLID_MAX && n_term < 8) {
+                memcpy(ids[n_term], id, len);
+                ids[n_term][len] = '\0';
+                lens[n_term] = len;
+                ++n_term;
             }
             call_unlock(c);
         }
         pthread_mutex_unlock(&sh->lock);
     }
 
-    for (int i = 0; i < n; ++i) {
+    for (int i = 0; i < n_term; ++i) {
         llog(LOG_WARN, "b2b",
              "ws conn=%p closed → terminate callid=%s (WebRTC transport lost)",
              conn, ids[i]);
         b2b_terminate_callid(co, ids[i], lens[i], 503);
     }
-    return n;
+    llog(LOG_INFO, "b2b", "ws conn=%p closed: %d call(s) in grace, %d terminated",
+         conn, n_grace, n_term);
+    return n_total;
 }
 
 leg_state_t b2b_leg_state(b2b_call_t *c, int b_leg)
@@ -9153,11 +9554,13 @@ int b2b_valid_callid(const char *s, size_t len)
     return 1;
 }
 
+/* P0-1：find_ref 契约 —— 返回 +1 引用；调用方必须 b2b_call_put()。
+ * tbl_find_ref 在 shard 锁内 +1，避免出锁后对象被 call_destroy 回收。 */
 b2b_call_t *b2b_find_callid(b2b_core_t *co, const char *callid, size_t len)
 {
     if (!co || !b2b_valid_callid(callid, len))
         return NULL;
-    return tbl_find(co, callid, len, NULL);
+    return tbl_find_ref(co, callid, len, NULL);
 }
 
 /* ==================================================================
@@ -9743,7 +10146,7 @@ static int send_reinvite_leg(b2b_call_t *c, int leg,
         /* B-腿：直接 send_invite_b(c, body, len, reinv=1, NULL) */
         sip_txn_t *t = send_invite_b(c, 1, body, bodylen, 1, NULL);
         if (!t) return NSBC_ERR;
-        l->inv_txn = t;
+        leg_txn_store(&l->inv_txn, t);
         l->reinv = 1;
         return NSBC_OK;
     }
@@ -9766,7 +10169,7 @@ static int send_reinvite_leg(b2b_call_t *c, int leg,
                                   SIP_M_INVITE, &l->dst, l->reliable,
                                   out, (size_t)n, cli_tu, c, now_ms());
     if (!t) return NSBC_ERR;
-    l->inv_txn = t;
+    leg_txn_store(&l->inv_txn, t);
     l->reinv = 1;
     return NSBC_OK;
 }
@@ -9911,7 +10314,7 @@ static int b2b_send_refer(b2b_call_t *c, int leg,
      * inv_txn 永远残留。此函数入口已确认 leg.state=CONFIRMED，inv_txn 是 stale 指针，安全清掉即可。 */
     if (l->inv_txn) {
         llog(LOG_INFO, "b2b", "REFER leg=%d clearing stale inv_txn (local_media/ai passthrough)", leg);
-        l->inv_txn = NULL;
+        leg_txn_store(&l->inv_txn, NULL);
     }
     /* extra 头块：Refer-To + Replaces（可选） */
     char extra[512];
@@ -9952,7 +10355,7 @@ static int b2b_send_refer(b2b_call_t *c, int leg,
     if (!t) return NSBC_ERR;
     /* 存 refer_txn 让 cli_tu 能匹配 REFER 响应做自动 BYE；
      * Blind transfer 通常双腿同时 REFER，第一腿存这里就够（响应里 legs 已标） */
-    if (!c->refer_txn) c->refer_txn = t;
+    if (!c->refer_txn) leg_txn_store(&c->refer_txn, t);
     (void)t;
     return NSBC_OK;
 }
@@ -10148,10 +10551,10 @@ int b2b_send_message(b2b_call_t *call, int leg,
     /* 客户端事务发起（NICT：MESSAGE 是非 INVITE）；cli_tu 到终态
      * 时自动释放双腿 guard（leg[1]/leg[0] 的 out_txn 分支都会命中
      * sip_upd_end，幂等）。此处无入站 srv_txn——API 发完立即返回。 */
-    dst->out_txn = txn_client_new(
+    leg_txn_store(&dst->out_txn, txn_client_new(
         co->cfg.txn, TXN_NICT, branch, strlen(branch), SIP_M_MESSAGE,
         &dst->dst, dst->reliable, out, (size_t)n, cli_tu, call,
-        now_ms());
+        now_ms()));
     if (dst->out_txn) {
         snprintf(dst->last_branch, sizeof(dst->last_branch), "%s", branch);
     } else {
@@ -10264,8 +10667,11 @@ int b2b_bridge(b2b_core_t *co, const char *callid_a, const char *callid_b)
         return NSBC_INVAL;
     if (strcmp(callid_a, callid_b) == 0)
         return NSBC_INVAL;
-    b2b_call_t *ca = b2b_find_callid(co, callid_a, strlen(callid_a));
-    b2b_call_t *cb = b2b_find_callid(co, callid_b, strlen(callid_b));
+    /* P0-1：两路查找都持引用，函数返回（含提前 return）由守卫自动释放 */
+    B2B_CALL_GUARD(_cga, co, callid_a, strlen(callid_a));
+    B2B_CALL_GUARD(_cgb, co, callid_b, strlen(callid_b));
+    b2b_call_t *ca = _cga.c;
+    b2b_call_t *cb = _cgb.c;
     if (!ca || !cb) return NSBC_NOENT;
     if (!co->cfg.bridge_ctrl) return NSBC_NOTSUP; /* P1: media bridge 未装配 */
     /* bridge_ctrl(call_key_a, BC_BRIDGE_UP, call_key_b) — 两 call_key 都是
@@ -10413,7 +10819,7 @@ static void sess_timer_refresh_cb(uint64_t cb_now, void *arg)
                                               strlen(branch), SIP_M_INVITE,
                                               &me->dst, me->reliable, req, (size_t)n,
                                               cli_tu, c, now_ms());
-                if (t) me->out_txn = t;
+                if (t) leg_txn_store(&me->out_txn, t);
             }
         } else {
             /* B 腿 refresher → send_invite_b 朝 Bob 发 re-INVITE */
