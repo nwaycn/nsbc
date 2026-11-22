@@ -40,6 +40,39 @@
   .video-box .dot { display:inline-block; width:6px; height:6px; border-radius:50%; margin-right:4px; }
   .video-box .dot.on { background:#4ade80; box-shadow:0 0 6px #4ade80; }
   .video-box .dot.off { background:#64748b; }
+
+  /* ---- 媒体能量指示：音频 RMS 电平 + 视频帧间动态 ---- */
+  .meters { position:absolute; top:10px; right:10px; width:152px; display:flex;
+            flex-direction:column; gap:8px; padding:9px 11px; border-radius:12px;
+            background:linear-gradient(180deg, rgba(2,6,23,.86), rgba(15,23,42,.74));
+            border:1px solid rgba(96,165,250,.4);
+            box-shadow:0 8px 24px rgba(0,0,0,.5), inset 0 1px 0 rgba(255,255,255,.06);
+            backdrop-filter:blur(6px); pointer-events:none; }
+  .mrow { display:flex; align-items:center; gap:8px; }
+  .mkey { width:12px; font-size:10px; font-weight:700; letter-spacing:.5px;
+          color:#93c5fd; text-shadow:0 0 6px rgba(96,165,250,.6);
+          font-family:'JetBrains Mono',monospace; }
+  .mbar { position:relative; flex:1; height:12px; border-radius:6px;
+          background:#070d1a; border:1px solid rgba(255,255,255,0.18);
+          box-shadow:inset 0 2px 4px rgba(0,0,0,.9), inset 0 -1px 0 rgba(255,255,255,.06);
+          overflow:hidden; }
+  .mbar i { position:absolute; left:0; top:0; bottom:0; width:0%; border-radius:5px;
+            background:linear-gradient(90deg,#00e676,#ffd600 65%,#ff3d00);
+            box-shadow:0 0 10px rgba(0,230,118,.7); will-change:width; }
+  .mbar.video i { background:linear-gradient(90deg,#00b0ff,#7c4dff 65%,#ff4081);
+                  box-shadow:0 0 10px rgba(0,176,255,.7); }
+  /* LED 分段刻度（覆盖在填充之上） */
+  .mbar::after { content:''; position:absolute; inset:0; border-radius:5px;
+                 background-image:repeating-linear-gradient(90deg,
+                   transparent 0 5px, rgba(0,0,0,.6) 5px 7px); }
+  .mbar.hot { border-color:rgba(255,82,82,.55); }
+  .mbar.hot i { animation:pulse .55s ease-in-out infinite alternate; }
+  @keyframes pulse { from { filter:brightness(1); } to { filter:brightness(1.6); } }
+  .mval { width:26px; text-align:right; font-size:12px; font-weight:700;
+          color:#64748b; font-variant-numeric:tabular-nums;
+          font-family:'JetBrains Mono',monospace; }
+  .mval.warn { color:#fbbf24; }
+  .mval.hot  { color:#ff5252; text-shadow:0 0 8px rgba(255,82,82,.8); }
   .incoming { background:rgba(234,179,8,0.1); border:1px solid #eab308; border-radius:10px;
               padding:12px 16px; display:none; align-items:center; justify-content:space-between; }
   .incoming.show { display:flex; }
@@ -106,6 +139,8 @@
     .incoming { flex-direction: column; gap: 10px; text-align: center; }
     .dc-area { flex-direction: column; }
     .sip-log, .dc-log { font-size: 11px; }
+    .meters { width: 118px; padding: 6px 8px; gap: 6px; }
+    .mbar { height: 10px; }
     /* 视频卡位置：远程在上、本地在下（镜像布局） */
     .card:nth-of-type(2) .videos > .video-box:first-child { order: 2; }
     .card:nth-of-type(2) .videos > .video-box:last-child  { order: 1; }
@@ -144,10 +179,18 @@
         <div class="video-box">
           <video id="localVideo" autoplay muted playsinline></video>
           <div class="lbl"><span class="dot off" id="localDot"></span>Local</div>
+          <div class="meters">
+            <div class="mrow"><span class="mkey">A</span><div class="mbar"><i id="localAudioBar"></i></div><span class="mval" id="localAudioVal">0</span></div>
+            <div class="mrow"><span class="mkey">V</span><div class="mbar video"><i id="localMotionBar"></i></div><span class="mval" id="localMotionVal">0</span></div>
+          </div>
         </div>
         <div class="video-box">
           <video id="remoteVideo" autoplay playsinline></video>
           <div class="lbl"><span class="dot off" id="remoteDot"></span>Remote</div>
+          <div class="meters">
+            <div class="mrow"><span class="mkey">A</span><div class="mbar"><i id="remoteAudioBar"></i></div><span class="mval" id="remoteAudioVal">0</span></div>
+            <div class="mrow"><span class="mkey">V</span><div class="mbar video"><i id="remoteMotionBar"></i></div><span class="mval" id="remoteMotionVal">0</span></div>
+          </div>
         </div>
       </div>
       <div class="toolbar">
@@ -220,5 +263,146 @@
 
 </div>
 <script src="js/nsbc-phone.js?v=20261112a"></script>
+<script>
+// =============================================================================
+// 媒体能量指示（仅本页增强，不改 nsbc-phone.js）
+//   A 条：音频 RMS 电平（Web Audio AnalyserNode，快升慢降）
+//   V 条：视频帧间灰度差（32x24 采样 canvas，反映画面切换/运动）
+// srcObject 由 nsbc-phone.js 赋值，元素上无法监听其变化 → 500ms 轮询比对。
+// =============================================================================
+(function () {
+  'use strict';
+  const AC = window.AudioContext || window.webkitAudioContext;
+  let ac = null;
+
+  function ensureAC() {
+    if (!AC) return null;
+    if (!ac) { try { ac = new AC(); } catch (_) { return null; } }
+    if (ac.state === 'suspended') { try { ac.resume(); } catch (_) {} }
+    return ac;
+  }
+  // 自动播放策略：首次用户手势后解锁 AudioContext
+  document.addEventListener('click', () => {
+    if (ac && ac.state === 'suspended') { try { ac.resume(); } catch (_) {} }
+  });
+
+  function makeMeter(ids) {
+    const video = document.getElementById(ids.video);
+    const bars = {
+      a: document.getElementById(ids.audioBar),
+      av: document.getElementById(ids.audioVal),
+      v: document.getElementById(ids.motionBar),
+      vv: document.getElementById(ids.motionVal),
+    };
+    if (!video || !bars.a || !bars.v) return null;
+
+    const cv = document.createElement('canvas');
+    cv.width = 32; cv.height = 24;
+    const cx = cv.getContext('2d', { willReadFrequently: true });
+
+    const st = {
+      video, bars,
+      stream: null, srcNode: null, analyser: null, buf: null,
+      prev: null, lastSample: 0, aLvl: 0, vLvl: 0, _a: -1, _v: -1,
+    };
+
+    // 重新绑定音频分析链（换流或挂断时调用，传 null 即解绑）
+    st.bind = (stream) => {
+      if (st.stream === stream) return;
+      st.stream = stream;
+      if (st.srcNode) { try { st.srcNode.disconnect(); } catch (_) {} }
+      st.srcNode = null; st.analyser = null; st.prev = null;
+      st.aLvl = 0; st.vLvl = 0;
+      if (!stream || !stream.getAudioTracks().length) return;
+      const a = ensureAC();
+      if (!a) return;
+      try {
+        st.srcNode = a.createMediaStreamSource(stream);
+        st.analyser = a.createAnalyser();
+        st.analyser.fftSize = 512;
+        st.analyser.smoothingTimeConstant = 0.3;
+        st.buf = new Uint8Array(st.analyser.fftSize);
+        st.srcNode.connect(st.analyser);
+      } catch (e) {
+        console.warn('[meters] audio attach failed:', e.message);
+      }
+    };
+
+    st.tick = (now) => {
+      /* ---- 音频：RMS → 0..100 ---- */
+      let aPct = 0;
+      if (st.analyser && st.buf) {
+        st.analyser.getByteTimeDomainData(st.buf);
+        let sum = 0;
+        for (let i = 0; i < st.buf.length; i++) {
+          const d = (st.buf[i] - 128) / 128;
+          sum += d * d;
+        }
+        aPct = Math.min(100, Math.sqrt(sum / st.buf.length) * 420);
+      }
+      st.aLvl = aPct > st.aLvl ? aPct : st.aLvl * 0.72;   // 快升慢降
+      /* ---- 视频：每 100ms 采样一帧，比较相邻帧灰度平均绝对差 ---- */
+      let vPct = 0;
+      if (st.video.readyState >= 2 && now - st.lastSample >= 100) {
+        st.lastSample = now;
+        try {
+          cx.drawImage(st.video, 0, 0, cv.width, cv.height);
+          const px = cx.getImageData(0, 0, cv.width, cv.height).data;
+          const n = px.length / 4;
+          const gray = new Float32Array(n);
+          let diff = 0;
+          for (let i = 0, j = 0; i < px.length; i += 4, j++) {
+            const g = (px[i] * 299 + px[i + 1] * 587 + px[i + 2] * 114) / 1000;
+            gray[j] = g;
+            if (st.prev) diff += Math.abs(g - st.prev[j]);
+          }
+          if (st.prev) vPct = Math.min(100, (diff / n) * 8);
+          st.prev = gray;
+        } catch (_) {
+          st.prev = null;   // 画面不可读（未就绪）时丢弃本帧
+        }
+      }
+      st.vLvl = vPct > st.vLvl ? vPct : st.vLvl * 0.8;
+
+      // 只在整数档位变化时写 DOM，避免 60fps 布局抖动
+      const lvlCls = (lv, warn, hot) => lv >= hot ? 'hot' : (lv >= warn ? 'warn' : '');
+      const a = Math.round(st.aLvl), v = Math.round(st.vLvl);
+      if (a !== st._a) {
+        st._a = a;
+        st.bars.a.style.width = a + '%';
+        st.bars.av.textContent = a;
+        st.bars.av.className = 'mval ' + lvlCls(a, 55, 80);
+        st.bars.a.parentNode.classList.toggle('hot', a >= 85);
+      }
+      if (v !== st._v) {
+        st._v = v;
+        st.bars.v.style.width = v + '%';
+        st.bars.vv.textContent = v;
+        st.bars.vv.className = 'mval ' + lvlCls(v, 50, 72);
+        st.bars.v.parentNode.classList.toggle('hot', v >= 72);
+      }
+    };
+    return st;
+  }
+
+  const meters = [
+    makeMeter({ video: 'localVideo', audioBar: 'localAudioBar', audioVal: 'localAudioVal',
+                motionBar: 'localMotionBar', motionVal: 'localMotionVal' }),
+    makeMeter({ video: 'remoteVideo', audioBar: 'remoteAudioBar', audioVal: 'remoteAudioVal',
+                motionBar: 'remoteMotionBar', motionVal: 'remoteMotionVal' }),
+  ].filter(Boolean);
+  if (!meters.length) return;
+
+  // srcObject 变化检测
+  setInterval(() => {
+    for (const m of meters) m.bind(m.video.srcObject || null);
+  }, 500);
+
+  (function loop(now) {
+    for (const m of meters) m.tick(now);
+    requestAnimationFrame(loop);
+  })(performance.now());
+})();
+</script>
 </body>
 </html>
