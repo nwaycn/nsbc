@@ -641,6 +641,9 @@ static void ai_rec_feed(void *ud, void *call_key,
     /* per-frame PCM16 栈缓冲（20ms @ 8kHz G.711 → 160 samples → 320B PCM16，留 1024 够 60ms） */
     int16_t pcm16_buf[1024];
     size_t pcm16_samples = 0;
+    /* G.711 解码器不接收输出容量参数，解码输入必须先钳制到 pcm16_buf 采样数，
+     * 否则超长 RTP payload / 转码输出会写穿栈缓冲。*/
+    const size_t pcm16_cap = sizeof(pcm16_buf) / sizeof(pcm16_buf[0]);
 
     /* 写 ring buffer（持 s->lock 保护并发写）；转码+解码都在锁内完成 ——
      * rx_tc 是 per-session 会话，仅在媒体线程单线程访问，无并发。 */
@@ -677,10 +680,12 @@ static void ai_rec_feed(void *ud, void *call_key,
 
     if (in_codec == CODEC_PCMU) {
         /* PCMU (pt=0) — 直接原生 ulaw_decode，绕 transcode */
-        pcm16_samples = g711_ulaw_decode(payload, len, pcm16_buf);
+        pcm16_samples = g711_ulaw_decode(payload, len < pcm16_cap ? len : pcm16_cap,
+                                         pcm16_buf);
     } else if (in_codec == CODEC_PCMA) {
         /* PCMA (pt=8) — 直接原生 alaw_decode */
-        pcm16_samples = g711_alaw_decode(payload, len, pcm16_buf);
+        pcm16_samples = g711_alaw_decode(payload, len < pcm16_cap ? len : pcm16_cap,
+                                         pcm16_buf);
     } else if (s->rx_tc) {
         /* 非 G.711 codec (G729/G722/Opus) — 先走 transcode → PCMA → alaw_decode */
         size_t out_len = 0;
@@ -690,7 +695,8 @@ static void ai_rec_feed(void *ud, void *call_key,
             return;  /* AGAIN/错误：本帧跳过 */
         }
         tc_len = out_len;
-        pcm16_samples = g711_alaw_decode(tc_buf, tc_len, pcm16_buf);
+        pcm16_samples = g711_alaw_decode(tc_buf, tc_len < pcm16_cap ? tc_len : pcm16_cap,
+                                         pcm16_buf);
     } else {
         llog(LOG_WARN, "ai", "⚠️ rec_feed codec=%d(%s) 既不是 G.711 也没 rx_tc → drop call=%p",
              (int)in_codec, ops ? ops->name : "?", call_key);

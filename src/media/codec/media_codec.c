@@ -251,6 +251,14 @@ int transcode_process(transcode_sess_t *t, const uint8_t *in, size_t in_len,
         return NSBC_OK;
     }
 
+    /* 解码器不接收输出容量参数，pcm_buf 只有 1500 个 int16_t 采样；
+     * 远程 RTP payload 可远超此值（G.711 为 1B→1 sample），必须先行拦截，
+     * 否则解码会写穿栈/堆上的 pcm_buf。*/
+    if (in_len > sizeof(t->pcm_buf) / sizeof(t->pcm_buf[0])) {
+        llog(LOG_WARN, "codec", "transcode payload too large (%zu), dropped", in_len);
+        return NSBC_INVAL;
+    }
+
     /* --- 1. decode：RTP payload → PCM frame --- */
     memset(&frm, 0, sizeof(frm));
     frm.pcm = t->pcm_buf;

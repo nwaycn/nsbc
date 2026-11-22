@@ -88,12 +88,14 @@ async fn init_internal(
     tls: &TlsSection,
     bind: SocketAddr,
 ) -> Result<TlsSource, String> {
-    let cert_pair = load_or_generate_certs(tls, bind)?;
+    let (cert_pair, self_generated) = load_or_generate_certs(tls, bind)?;
     let acceptor = build_acceptor(&cert_pair.0, &cert_pair.1)?;
     let holder: AcceptorHolder = Arc::new(RwLock::new(Arc::new(acceptor)));
 
-    // Explicit PEM users handle renewal themselves — we only manage auto_generate
-    let renew_task = if tls.auto_generate {
+    // 仅对「本进程生成的自签证书」启用自动续期。
+    // 运维提供的正式 cert/key 不写 meta.json，若仍启动续期任务，
+    // 启动即检查会因 meta 缺失走 regenerate 分支，原地覆盖正式证书。
+    let renew_task = if tls.auto_generate && self_generated {
         Some(tokio::spawn(cert_renew_loop(
             tls.clone(),
             bind,
@@ -106,7 +108,13 @@ async fn init_internal(
     Ok(TlsSource::Internal { holder, renew_task })
 }
 
-pub fn load_or_generate_certs(tls: &TlsSection, bind: SocketAddr) -> Result<CertPair, String> {
+/// 返回 `(cert_pair, self_generated)`：`self_generated=true` 表示本次启动
+/// 自行生成了自签证书（带 meta.json）；若直接加载已有 PEM 则为 false，
+/// 调用方据此决定是否启用自动续期，防止覆盖运维提供的正式证书。
+pub fn load_or_generate_certs(
+    tls: &TlsSection,
+    bind: SocketAddr,
+) -> Result<(CertPair, bool), String> {
     let cert_exists = tls.cert_path.exists();
     let key_exists  = tls.key_path.exists();
 
@@ -116,7 +124,8 @@ pub fn load_or_generate_certs(tls: &TlsSection, bind: SocketAddr) -> Result<Cert
             key  = %tls.key_path.display(),
             "using existing TLS cert/key"
         );
-        return load_pems(&tls.cert_path, &tls.key_path);
+        // 已有 PEM 可能是运维提供的正式证书 — 本进程未生成，标记 false
+        return Ok((load_pems(&tls.cert_path, &tls.key_path)?, false));
     }
 
     if tls.auto_generate {
@@ -129,7 +138,7 @@ pub fn load_or_generate_certs(tls: &TlsSection, bind: SocketAddr) -> Result<Cert
         let not_after_unix = time::OffsetDateTime::now_utc().unix_timestamp()
             + tls.validity_days.max(1) as i64 * 86400;
         write_pems(&tls.cert_path, &tls.key_path, &cert, &key, not_after_unix)?;
-        Ok((cert, key))
+        Ok(((cert, key), true))
     } else {
         Err(format!(
             "TLS enabled but cert/key not found at {} / {} (auto_generate=false)",
@@ -313,8 +322,12 @@ async fn try_renew_if_expiring(
             }
         }
         _ => {
-            tracing::warn!("cert meta missing/unreadable — forcing regenerate");
-            do_renew(tls, bind, holder).await?;
+            // meta 缺失/不可读通常意味着这不是本进程生成的自签证书
+            // （例如运维提供的正式证书）→ 不做任何覆盖，交由运维续期。
+            tracing::warn!(
+                cert = %tls.cert_path.display(),
+                "cert meta missing/unreadable — skip renewal to avoid overwriting external cert"
+            );
         }
     }
     Ok(())

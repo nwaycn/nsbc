@@ -60,6 +60,9 @@
 #define WS_OP_PONG      0xA
 #define WS_MAX_PAYLOAD  (64 * 1024)          /* 64KB — 防内存 DoS */
 #define WS_READ_BUF     16384                 /* 16KB per-conn ring read buf */
+/* 读缓冲上限：最大 WS 扩展头 14B + WS_MAX_PAYLOAD，另留 512B 余量，
+ * 保证 64KB 帧能一次性完整落入缓冲（否则水平触发 EPOLLIN 永久空转）。*/
+#define WS_READ_BUF_MAX (WS_MAX_PAYLOAD + 14 + 512)
 #define WS_SEND_QUEUE_CAP  8                  /* 每 conn 发送队列容量 */
 
 /* ==== WS 连接状态机 ==== */
@@ -89,9 +92,9 @@ typedef struct ws_conn {
     int            close_notified; /* REQ-CALL-HANGUP-001：关闭回调只发一次 */
     ws_conn_state_t state;
 
-    /* 统一 per-conn 读缓冲 — 动态分配（按需扩到 WS_MAX_PAYLOAD + 128）
+    /* 统一 per-conn 读缓冲 — 动态分配（按需扩到 WS_READ_BUF_MAX）
      * 默认 accept 时只 malloc WS_READ_BUF + 128 ≈ 16KB，
-     * 大 payload（>16KB）触发 realloc 到 WS_MAX_PAYLOAD + 128 ≈ 64KB。
+     * 大 payload（>16KB）触发 realloc 到 WS_READ_BUF_MAX ≈ 64KB。
      * 几百 WS 连接场景省几十 MB 固定内存。*/
     uint8_t        *read_buf;
     size_t         read_buf_cap;   /* 当前分配容量（动态）*/
@@ -489,28 +492,40 @@ static int ws_conn_step(ws_conn_t *c, int events)
         if (rc < 0) return -1;
     }
 
-    /* 读相关事件 — 统一先把 socket 数据读进 read_buf 尾部 */
-    if (events & (EPOLLIN | EPOLLPRI)) {
+    /* 读相关事件 — 统一先把 socket 数据读进 read_buf 尾部。
+     * EPOLLOUT 也进来：TLS 读返回 WANT_WRITE 后需要借可写事件重试 SSL_read。 */
+    if (events & (EPOLLIN | EPOLLPRI | EPOLLOUT)) {
         /* compact 一下腾出空间 */
         ws_compact_read_buf(c);
 
-        /* 容量不够 → realloc 到 WS_MAX_PAYLOAD + 128B（上限）*/
-        size_t room = c->read_buf_cap - c->read_len - 256;
-        if (room == 0) {
-            if (c->read_buf_cap < WS_MAX_PAYLOAD + 128) {
-                size_t new_cap = WS_MAX_PAYLOAD + 128;
-                uint8_t *nb = (uint8_t *)realloc(c->read_buf, new_cap);
-                if (!nb) return -1;
-                c->read_buf = nb;
-                c->read_buf_cap = new_cap;
-                room = c->read_buf_cap - c->read_len - 256;
-            }
+        /* 容量不够 → realloc 到 WS_READ_BUF_MAX（上限）。
+         * 上限必须能容纳「最大扩展头 + WS_MAX_PAYLOAD」，否则 64KB 帧永远
+         * 装不进缓冲，水平触发 EPOLLIN 会持续空转 100% CPU。*/
+        size_t room = (c->read_buf_cap > c->read_len + 256)
+                    ? c->read_buf_cap - c->read_len - 256 : 0;
+        if (room == 0 && c->read_buf_cap < WS_READ_BUF_MAX) {
+            size_t new_cap = WS_READ_BUF_MAX;
+            uint8_t *nb = (uint8_t *)realloc(c->read_buf, new_cap);
+            if (!nb) return -1;
+            c->read_buf = nb;
+            c->read_buf_cap = new_cap;
+            room = c->read_buf_cap - c->read_len - 256;
         }
-        if (room > 0) {
+        if (room == 0) {
+            /* 缓冲已达上限仍无空间 — 帧超过上限，断开避免空转 */
+            return -1;
+        }
+        {
             ssize_t n = ws_nb_read(c, c->read_buf + c->read_len, room);
             if (n == -1) return -1;
+            if (n == 0) return -1;         /* 对端有序关闭（否则水平触发空转） */
             if (n == -2) goto done_read;  /* EAGAIN / TLS WANT_READ */
-            c->read_len += (size_t)n;
+            if (n == -3) {                /* TLS WANT_WRITE — 等 EPOLLOUT 后重试 */
+                c->tls_want = 2;
+                goto done_read;
+            }
+            /* 仅正值累加；任何负值都已在上面分流，防止 size_t 下溢 */
+            if (n > 0) c->read_len += (size_t)n;
         }
 
         /* ── 状态 1: HTTP HANDSHAKE ──────────────────────── */
@@ -684,8 +699,8 @@ static int ws_calc_epoll_events(ws_conn_t *c)
 
     /* EPOLLIN: 只要不是 CLOSING 就需要读 */
     if (c->state != CS_CLOSING) ev |= EPOLLIN;
-    /* EPOLLOUT: 有待发送 */
-    if (need_flush) ev |= EPOLLOUT;
+    /* EPOLLOUT: 有待发送，或 TLS 读需要可写后才能重试（WANT_WRITE） */
+    if (need_flush || c->tls_want == 2) ev |= EPOLLOUT;
     /* 加上 EPOLLERR / EPOLLHUP 总是需要 */
     ev |= EPOLLRDHUP;
     return ev;
@@ -903,6 +918,9 @@ static void *ws_accept_thread(void *ud)
             continue;
         }
 
+        /* 停机中 — accept 返回后立刻丢弃，不再进入耗时的 TLS 握手 */
+        if (WS_ATOMIC_LOAD(&g_ws.stop_flag)) { close(fd); break; }
+
         /* Phase 1 TLS：阻塞式 SSL_accept（accept 线程里做，完成后设非阻塞交给 worker）
          * Phase 2 会改成非阻塞 TLS 状态机
          * ssl/rbio 类型：OpenSSL 开时用具体类型获编译期检查，关时用 void* 占位（ws_conn_t 已用 void* 存）*/
@@ -954,6 +972,28 @@ static void *ws_accept_thread(void *ud)
 #endif
         }
 
+        /* 停机中：SSL 握手可能阻塞了数秒，握手完成后若已 stop 直接丢弃 */
+        if (WS_ATOMIC_LOAD(&g_ws.stop_flag)) {
+            if (ssl) {
+#ifdef NSBC_WITH_OPENSSL
+                SSL_free(ssl);   /* 连带 free BIO */
+#endif
+            }
+            close(fd);
+            break;
+        }
+
+        /* worker 未就绪（启动失败）— 丢弃 peer，避免后面 % 0 */
+        if (g_ws.worker_count <= 0 || !g_ws.workers) {
+            if (ssl) {
+#ifdef NSBC_WITH_OPENSSL
+                SSL_free(ssl);
+#endif
+            }
+            close(fd);
+            continue;
+        }
+
         /* 非 TLS 或 TLS 成功后：设非阻塞 */
         int flags = fcntl(fd, F_GETFL, 0);
         fcntl(fd, F_SETFL, flags | O_NONBLOCK);
@@ -981,7 +1021,7 @@ static void *ws_accept_thread(void *ud)
         c->pongs_missed = 0;
 
         /* ★ P4 fix: 动态 read_buf —— 默认只 malloc WS_READ_BUF + 128B ≈ 16KB，
-         * 大 payload 触发 realloc 到 WS_MAX_PAYLOAD + 128B ≈ 64KB。
+         * 大 payload 触发 realloc 到 WS_READ_BUF_MAX ≈ 64KB。
          * 几百 WS 连接省 (64-16)KB × 1000 = ~48MB 固定内存。 */
         c->read_buf_cap = WS_READ_BUF + 128;
         c->read_buf = (uint8_t *)malloc(c->read_buf_cap);
@@ -1191,7 +1231,19 @@ void ws_listener_stop(void)
 
     WS_ATOMIC_STORE(&g_ws.stop_flag, 1);
 
-    /* ---- 先停 worker 线程（发 kick 让 epoll_wait 返回，不拿 conn_mtx） ---- */
+    /* ---- 先关监听 fd 并 join accept 线程 ----
+     * accept 线程可能正阻塞在 SSL_accept（最长 5s），期间仍会向 worker
+     * 投递连接。必须先停 accept，再释放 workers，否则会出现
+     * worker_round_robin % 0（SIGFPE）或访问已释放的 workers 数组。*/
+    if (g_ws.listen_fd >= 0) {
+        shutdown(g_ws.listen_fd, SHUT_RDWR);
+        close(g_ws.listen_fd);
+        g_ws.listen_fd = -1;
+    }
+    pthread_join(g_ws.accept_tid, NULL);
+    g_ws.accept_started = 0;
+
+    /* ---- accept 已停，安全停止并释放 worker ---- */
     if (g_ws.workers) {
         for (int i = 0; i < g_ws.worker_count; i++) {
             uint64_t kick = 1;
@@ -1206,17 +1258,6 @@ void ws_listener_stop(void)
         g_ws.workers = NULL;
         g_ws.worker_count = 0;
     }
-
-    /* ---- 关闭监听 fd 让 accept4 返回 ---- */
-    if (g_ws.listen_fd >= 0) {
-        shutdown(g_ws.listen_fd, SHUT_RDWR);
-        close(g_ws.listen_fd);
-        g_ws.listen_fd = -1;
-    }
-
-    /* ---- 现在 join accept 线程（worker 已停，不会再抢 conn_mtx） ---- */
-    pthread_join(g_ws.accept_tid, NULL);
-    g_ws.accept_started = 0;
 
     /* ---- 关闭所有活跃连接（标记 closed + shutdown fd）---- */
     pthread_mutex_lock(&g_ws.conn_mtx);

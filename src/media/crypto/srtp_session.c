@@ -254,12 +254,24 @@ void nsbc_srtp_session_destroy(nsbc_srtp_sess_t *s)
     free(s);
 }
 
+/* SRTP 认证标签长度：AES-CM + HMAC-SHA1-80 = 10B；AEAD GCM = 16B。
+ * srtp_protect/protect_rtcp 会在负载末尾追加该长度的 tag。*/
+static size_t srtp_tag_len(const nsbc_srtp_sess_t *s)
+{
+    return (s->policy.cipher == SRTP_CIPHER_AESCM128) ? 10 : 16;
+}
+
 int nsbc_srtp_protect_rtp(nsbc_srtp_sess_t *s, uint8_t *buf, size_t *len, size_t cap)
 {
-    (void)cap;
     if (s == NULL || buf == NULL || len == NULL)
         return NSBC_INVAL;
 #ifdef NSBC_WITH_SRTP
+    /* 追加 tag 后不得超过调用者缓冲容量，否则写越界 */
+    if (*len + srtp_tag_len(s) > cap) {
+        llog(LOG_WARN, "srtp", "protect_rtp buffer too small: len=%zu tag=%zu cap=%zu",
+             *len, srtp_tag_len(s), cap);
+        return NSBC_ERR;
+    }
     int slen = (int)*len;
     srtp_err_status_t rc = srtp_protect(s->send_ctx, buf, &slen);
     if (rc == srtp_err_status_ok) {
@@ -272,6 +284,7 @@ int nsbc_srtp_protect_rtp(nsbc_srtp_sess_t *s, uint8_t *buf, size_t *len, size_t
     }
     return NSBC_ERR;
 #else
+    (void)cap;
     return NSBC_NOTSUP;
 #endif
 }
@@ -301,10 +314,15 @@ int nsbc_srtp_unprotect_rtp(nsbc_srtp_sess_t *s, uint8_t *buf, size_t *len)
 
 int nsbc_srtp_protect_rtcp(nsbc_srtp_sess_t *s, uint8_t *buf, size_t *len, size_t cap)
 {
-    (void)cap;
     if (s == NULL || buf == NULL || len == NULL)
         return NSBC_INVAL;
 #ifdef NSBC_WITH_SRTP
+    /* RTCP 同样会在尾部追加 auth tag（10B/16B），容量不足必须拒绝 */
+    if (*len + srtp_tag_len(s) > cap) {
+        llog(LOG_WARN, "srtp", "protect_rtcp buffer too small: len=%zu tag=%zu cap=%zu",
+             *len, srtp_tag_len(s), cap);
+        return NSBC_ERR;
+    }
     int slen = (int)*len;
     /* 调用 libsrtp2 的 srtp_protect_rtcp——不是 nsbc_srtp_protect_rtcp 自身！ */
     srtp_err_status_t rc = srtp_protect_rtcp(s->send_ctx, buf, &slen);
@@ -314,6 +332,7 @@ int nsbc_srtp_protect_rtcp(nsbc_srtp_sess_t *s, uint8_t *buf, size_t *len, size_
     }
     return NSBC_ERR;
 #else
+    (void)cap;
     return NSBC_NOTSUP;
 #endif
 }
