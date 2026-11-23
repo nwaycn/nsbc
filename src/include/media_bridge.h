@@ -258,6 +258,10 @@ int bridge_call_view(bridge_mgr_t *m, void *call_key, mb_view_t *v);
 int bridge_negotiated_codec_name(bridge_mgr_t *m, void *call_key, int side,
                                  char *name, size_t cap);
 
+/* 183 早期媒体透传前置判断：1=两腿音频 codec 不同（需转码，不能直接转发
+ * 落地早期媒体），0=一致（可透传），<0=尚未定型。 */
+int bridge_answer_needs_transcode(bridge_mgr_t *m, void *call_key);
+
 /* OAM 活跃会话遍历（REQ-OAM-010 "show transcode"）：
  * 回调参数：call_key（不透明指针，仅用于 Web 端映射 call-id）、
  * mode（bypass/relay/transcode）、relay 端口对（bypass 时为 0）、

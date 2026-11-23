@@ -377,7 +377,7 @@ static app_rc_t app_answer(app_ctx_t *c, const char *data, void *ud)
                                 pre_answered, sizeof(pre_answered)) == NSBC_OK
                    && strcmp(pre_answered, "true") == 0;
     if (!pre_done) {
-        b2b_pre_answer_call((b2b_call_t *)c->call_key);
+        b2b_pre_answer_call((b2b_call_t *)c->call_key, 0 /* 隐式：无 SDP */);
         if (c->vars) chan_var_set(c->vars, c->leg, "pre_answered", "true");
     }
 
@@ -418,7 +418,7 @@ static app_rc_t app_pre_answer(app_ctx_t *c, const char *data, void *ud)
 {
     (void)data; (void)ud;
     if (!cv_call_alive(c)) return APP_RC_FAILED;
-    int rc = b2b_pre_answer_call((b2b_call_t *)c->call_key);
+    int rc = b2b_pre_answer_call((b2b_call_t *)c->call_key, 1 /* 显式：183+SDP */);
     if (rc == NSBC_OK) {
         /* 标记通道变量供后续 early media 动作感知 */
         if (c->vars) chan_var_set(c->vars, c->leg, "pre_answered", "true");

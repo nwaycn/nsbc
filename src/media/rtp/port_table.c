@@ -206,6 +206,80 @@ int ptable_alloc_pair_range(ptable_t *t, const char *local_ip, void *owner,
     return NSBC_OK;
 }
 
+/* 从空闲栈里摘掉一个指定偶数端口（swap-remove）。返回 1=摘到，0=不在栈中。 */
+static int stack_remove(ip_table_t *it, uint16_t v)
+{
+    for (int i = it->nfree - 1; i >= 0; --i) {
+        if (it->free_even[i] == v) {
+            it->free_even[i] = it->free_even[--it->nfree];
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int ptable_alloc_quad_range(ptable_t *t, const char *local_ip, void *owner,
+                            uint16_t lo, uint16_t hi,
+                            uint16_t *rtp_port, uint16_t *rtcp_port,
+                            uint16_t *v_rtp_port, uint16_t *v_rtcp_port)
+{
+    ip_table_t *it = ip_get(t, local_ip ? local_ip : "0.0.0.0", 1);
+    if (!it)
+        return NSBC_NOSPC;
+
+    uint16_t rlo = (lo == 0) ? t->cfg.range_lo : (uint16_t)(lo & ~1u);
+    uint16_t rhi = (hi == 0) ? t->cfg.range_hi : (uint16_t)(hi & ~1u);
+    if (rhi < rlo)
+        rhi = rlo;
+    /* 需要 p..p+3：p 最大只能是 rhi-2（video RTP=rhi，video RTCP=rhi+1） */
+    if ((int)rhi - (int)rlo < 2)
+        return NSBC_NOSPC;
+
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += 1;
+    if (pthread_mutex_timedlock(&it->lock, &ts) != 0) {
+        llog(LOG_ERR, "media",
+             "ptable: quad timedlock FAILED after 1s! local_ip=%s owner=%p",
+             local_ip ? local_ip : "(null)", owner);
+        return NSBC_NOSPC;
+    }
+    /* 与 pair 分配同风格：高端口优先，取满足条件的最大 p */
+    uint16_t best = 0;
+    uint16_t pmax = (uint16_t)(rhi - 2);
+    for (int i = 0; i < it->nfree; ++i) {
+        uint16_t q = it->free_even[i];
+        if (q < rlo || q > pmax)
+            continue;
+        if (it->slot[q] || it->slot[q + 2])
+            continue;
+        if (q > best)
+            best = q;
+    }
+    if (!best || !stack_remove(it, best)) {
+        pthread_mutex_unlock(&it->lock);
+        return NSBC_NOSPC;
+    }
+    if (!stack_remove(it, (uint16_t)(best + 2))) {
+        /* 理论不可达（slot 空 ⇒ 该偶数口必在空闲栈）；防御性回滚防端口泄漏 */
+        it->free_even[it->nfree++] = best;
+        pthread_mutex_unlock(&it->lock);
+        return NSBC_NOSPC;
+    }
+    it->slot[best] = owner;
+    it->slot[best + 1] = owner;
+    it->slot[best + 2] = owner;
+    it->slot[best + 3] = owner;
+    it->n_in_use += 4;
+    pthread_mutex_unlock(&it->lock);
+    __sync_fetch_and_add(&t->in_use, 4);
+    *rtp_port = best;
+    *rtcp_port = (uint16_t)(best + 1);
+    *v_rtp_port = (uint16_t)(best + 2);
+    *v_rtcp_port = (uint16_t)(best + 3);
+    return NSBC_OK;
+}
+
 void ptable_release_pair(ptable_t *t, const char *local_ip, uint16_t rtp_port)
 {
     ip_table_t *it = ip_get(t, local_ip ? local_ip : "0.0.0.0", 0);

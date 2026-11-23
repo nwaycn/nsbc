@@ -55,6 +55,14 @@ int pb_start(void *call_key, const char *wav_path, int side, int loop,
 int pb_start_ex(void *call_key, const char *wav_path, int side, int loop,
                  int pt, int stop_on_answer, pb_ctx_t **out);
 
+/* ★ 内置标准回铃音（无需 WAV 文件）：450Hz 正弦，1s 响 / 4s 停循环
+ * （国标；欧标 425Hz 节奏相同，听感一致）。供 183 preanswer 自动放音：
+ *   - side 语义同 pb_start_ex（0=A 腿）
+ *   - pt 仅支持 0=PCMU / 8=PCMA（P0 编码器限制），否则 NSBC_NOTSUP
+ *   - 固定 loop=1、stop_on_answer=1（B 腿接通自动停）
+ * relay 未建立时返回 NSBC_NOENT（preanswer 路径在 183 发出后调用，relay 必已存在）。 */
+int pb_start_ringback(void *call_key, int side, int pt);
+
 /* 管道符拼接模式：chain 数 N 个 wav 文件按顺序依次播放
  * （每个 EOF 自动 start 下一个，最后一个 EOF 自动 stop）。 */
 int pb_start_chain(void *call_key, const char **wav_list, int n,

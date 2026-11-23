@@ -48,6 +48,18 @@ int ptable_alloc_pair(ptable_t *t, const char *local_ip, void *owner,
 int ptable_alloc_pair_range(ptable_t *t, const char *local_ip, void *owner,
                             uint16_t lo, uint16_t hi,
                             uint16_t *rtp_port, uint16_t *rtcp_port);
+
+/* 连续四口分配（audio 对 + video 对）：
+ * 在 [lo,hi] 内找一个偶数 p，使 p..p+3 四口全空闲，
+ * 返回 audio=(p,p+1)、video=(p+2,p+3) —— 即 video=audio+2。
+ * 用途：A 腿明文 SIP 的 audio/video 端口连续性（linphone 等 UA 习惯
+ * 把视频端口自行挪到 audio+2，端口连续时两条路径落到同一 socket）。
+ * 段内找不到连续四口返回 NSBC_NOSPC，调用方降级为单独分配音频对。
+ * 注意 p <= hi-2，保证 video RTP 不越出配置的 RTP 端口段。 */
+int ptable_alloc_quad_range(ptable_t *t, const char *local_ip, void *owner,
+                            uint16_t lo, uint16_t hi,
+                            uint16_t *rtp_port, uint16_t *rtcp_port,
+                            uint16_t *v_rtp_port, uint16_t *v_rtcp_port);
 void ptable_release_pair(ptable_t *t, const char *local_ip,
                          uint16_t rtp_port);
 

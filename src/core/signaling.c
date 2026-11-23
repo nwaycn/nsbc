@@ -2260,7 +2260,7 @@ static int sig_start(struct nsbc_ctx *ctx)
     long early_max = 30;
     cfg_get_int(cfg, "sip.early_media_max_s", &early_max, NULL);
     bc.early_media_max_s = (uint32_t)(early_max < 0 ? 0 : early_max);
-    /* P1-12：route_table 指针 → b2bua.c cli_tu INVITE 401/407 challenge 现算 HA1 */
+    /* P1-12: route_table -> b2bua.c cli_tu INVITE 401/407 challenge HA1 */
     bc.rt = ctx->rt;
     if (b2b_core_create(&bc, &s->b2b) != NSBC_OK) {
         llog(LOG_CRIT, "sig", "b2b core create failed");

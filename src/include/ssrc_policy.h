@@ -48,6 +48,12 @@ typedef struct {
     int n_aux_pt;
     uint8_t  video_pt[8];      /* video m-line 的 payload type 集合 */
     int n_video_pt;
+    /*  audio m-line 的 payload type 集合。音频轨与视频轨是并列的独立 track
+     *  （各自一个 SSRC），传统 SIP 终端不带 a=ssrc:。缺少这张表时，若视频
+     *  SSRC 先到（G.729 带 DTX 时音频首包可能晚于视频），音频 SSRC 会被判
+     *  "第三个源"永久丢弃 → 对端完全听不到本端语音。 */
+    uint8_t  audio_pt[8];
+    int n_audio_pt;
     uint64_t switch_idle_ms;   /* 主源静默多久允许切换，默认 5000 */
     int max_sources;           /* 默认 SSRC_POLICY_MAX_SRC */
 } ssrc_policy_cfg_t;
@@ -78,6 +84,12 @@ void ssrc_policy_set_aux_pt(ssrc_policy_t *p, uint8_t pt);
  * 让全新 SSRC（传统 SIP 不带 a=ssrc:）也能通过 policy 放行。
  * 多次调用累加，上限 8 个。 */
 void ssrc_policy_set_video_pt(ssrc_policy_t *p, uint8_t pt);
+
+/* audio PT 白名单：从 SDP m=audio 行 fmt-list 提取的 PT 集合，
+ * 与 video 白名单对称——音频/视频各是一条独立 track，各自放行一个主源，
+ * 不因"另一个 track 的 SSRC 先到"而把本 track 判成注入源。
+ * 多次调用累加，上限 8 个。 */
+void ssrc_policy_set_audio_pt(ssrc_policy_t *p, uint8_t pt);
 
 /* re-INVITE/UPDATE 媒体重指：保留 CNAME 偏好，允许一次重新学习 */
 void ssrc_policy_retarget(ssrc_policy_t *p);

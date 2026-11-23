@@ -259,8 +259,14 @@ static int b2b_is_private_ip(const char *ip)
     if ((h & 0xFFF00000u) == 0xAC100000u) return 1;  /* 172.16.0.0/12 */
     if ((h & 0xFFFF0000u) == 0xC0A80000u) return 1;  /* 192.168.0.0/16 */
     if ((h & 0xFFC00000u) == 0x64400000u) return 1;  /* 100.64.0.0/10 CGNAT */
-    if ((h & 0xFF000000u) == 0x1E000000u) return 1;  /* 30.0.0.0/8 运营商CGNAT(电信/联通) */
-    if ((h & 0xFF000000u) == 0x70000000u) return 1;  /* 112.0.0.0/8 运营商CGNAT(移动) */
+    /* ★2026-11-23 修复：删除 30/8、112/8 两条"运营商 CGNAT"判定。
+     * 这两段都是已分配的公网地址（112/8 属中国移动，30/8 属美国国防部），
+     * 只要我们能从公网收到该源地址的包，它就必须按公网处理：
+     * 一旦误判为私网，respond_a 的 adv_host 会回落 local_host（云主机
+     * 内网 IP，如 172.27.102.160），200 OK 的 Contact 变成不可达地址，
+     * 对端 ACK 发不过来 → leg0 永远停在 CALLING → 32s 后 Timer H 拆线。
+     * 现场抓包证据：112.64.68.187 呼叫时 200 OK 连续重传三次、无 ACK，
+     * Contact: <sip:172.27.102.160:5060>。 */
     if ((h & 0xFF000000u) == 0x7F000000u) return 1;  /* 127.0.0.0/8 回环 */
     if ((h & 0xFFFF0000u) == 0xA9FE0000u) return 1;  /* 169.254.0.0/16 LinkLocal */
     return 0;
@@ -635,6 +641,16 @@ static void call_put(b2b_call_t *c)
 void b2b_call_put(b2b_call_t *c)
 {
     call_put(c);
+}
+
+/*  不透明呼叫键 magic 守卫（见 b2bua.h 注释）。
+ * media 层在解引用 call_key 前调用；call_destroy 会把 magic 清 0，
+ * slab 复用由新呼叫 memset + 重设 magic，旧指针读到的 magic 不匹配即
+ * 判定为陈旧，从而避免 UAF 解引用。只读 magic 字段，不解引用 prof 等。 */
+int b2b_call_is_alive(const void *call_key)
+{
+    const b2b_call_t *c = (const b2b_call_t *)call_key;
+    return c != NULL && c->magic == B2B_CALL_MAGIC;
 }
 
 static b2b_call_t *tbl_find_ref(b2b_core_t *co, const char *callid, size_t len,
@@ -2358,7 +2374,13 @@ static int b2b_build_diversion_header(char *out, size_t outsz,
 /* ------------------------------------------------------------------ */
 /* REQ-DP-APP-001：new_invite 尾部 early media 启动（定义在 §6 之后） */
 static void b2b_early_media_start(b2b_call_t *c);
+
+/* ★ preanswer_183：NSBC 锚定媒体时自动给 A 腿回 183+SDP（见定义处注释） */
+static int b2b_send_preanswer_183(b2b_call_t *c);
 static int em_pick_play_pt(const char *sdp);   /* early media 放音 PT 协商 */
+static int em_pick_ring_pt(const char *sdp);   /* 内置回铃音 PT 协商（含 G.729） */
+static int em_sdp_audio_single_pt(const char *in, int in_len, char *out,
+                                  size_t outsz, int pt);
 
 static void respond_a(b2b_call_t *c, int status, const char *body,
                       size_t bodylen)
@@ -2542,6 +2564,189 @@ static void respond_a(b2b_call_t *c, int status, const char *body,
     llog(LOG_INFO, "b2b", "respond_a: txn_send_response rc=%d len=%zu t=%p status=%d", trc, len, t, status);
 out:
     txn_unref(t);
+}
+
+/* ★ preanswer_183：给 A 腿回 183 Session Progress + SDP（等效 FreeSWITCH
+ * pre_answer）。目的是让主叫在 B 腿接听前就拿到 SDP answer，提前建立媒体
+ * 并把主叫的真实 NAT 源端口 latch 进 relay。
+ *
+ * ★ 2026-11-23 策略调整：本函数不再由落地 1xx 自动调用。落地回什么 180/183
+ * 就透传什么（带 SDP 时经 answer hook 重写为 A 侧地址），NSBC 自己生成
+ * 183+SDP+回铃音只由拨号规则显式触发：
+ *   - pre_answer：本函数（保证媒体可收）；
+ *   - ringback / playback / queue：b2b_early_media_start（183+SDP+放音）。
+ * 发送前置条件仍是 relay 存在（媒体确实由 NSBC 转发）；显式 media=bypass
+ * 或不锚定时返回 0，调用方降级为无 SDP 的 183 / 原样透传。
+ *
+ * 183 发出后自动登记内置标准回铃音 PT（pre_183_tone_pt1），由调用方在
+ * 释放 call 锁后 pb_start_ringback 放音——振铃期主叫不会听到静音。
+ *
+ * 返回 1=已发 183（调用方不要再透传 B 的这条 1xx）；0=未发，按原逻辑处理。 */
+static int b2b_send_preanswer_183(b2b_call_t *c)
+{
+    b2b_core_t *co = c->core;
+    nsbc_ctx_t *ctx = nsbc_get_ctx();
+    b2b_leg_t *a = &c->leg[0];
+
+    if (!co || !ctx || !ctx->bridge)
+        return 0;
+    if (c->early_183_ms)
+        return 0;                      /* 已经有 SDP 发给 A，不能出现第二个 answer */
+    if (c->media_mode == 1)            /* 显式 bypass：NSBC 不过媒体 */
+        return 0;
+    if (!a->inv_txn || !a->offer[0] || a->offer_len == 0)
+        return 0;
+    if (a->state != LEG_CALLING && a->state != LEG_EARLY)
+        return 0;
+    /* 只处理明文 SIP 腿；WebRTC(SRTP/DTLS/ICE) 的 answer 由 bridge 统一生成 */
+    if (strstr(a->offer, "UDP/TLS/RTP/") || strstr(a->offer, "a=fingerprint") ||
+        strstr(a->offer, "a=ice-ufrag"))
+        return 0;
+    /* relay 不存在 = 本呼叫不锚定媒体（bypass 或 auto 决策为 bypass） */
+    rtp_relay_t *relay = NULL;
+    nsbc_sa_t peer[2];
+    if (bridge_lookup_relay((bridge_mgr_t *)ctx->bridge, c, &relay, peer) != NSBC_OK ||
+        !relay)
+        return 0;
+    uint16_t a_port = rtp_relay_port(relay, 0);
+    if (!a_port)
+        return 0;
+    uint16_t a_vport = rtp_relay_video_port(relay, 0);
+
+    const char *rtp_ip = (c->prof && c->prof->external_rtp_ip[0])
+                             ? c->prof->external_rtp_ip
+                             : bridge_local_ip((const bridge_mgr_t *)ctx->bridge);
+    if (!rtp_ip || !rtp_ip[0])
+        return 0;
+
+    char sdp[B2B_SDP_MAX];
+    int n = bridge_rewrite_sdp(a->offer, a->offer_len, sdp, sizeof(sdp),
+                               rtp_ip, a_port, a_vport, MB_SDP_PLAIN);
+    if (n <= 0) {
+        llog(LOG_WARN, "b2b", "preanswer_183: rewrite_sdp rc=%d callid=%s",
+             n, a->callid);
+        return 0;
+    }
+    /* 自动回铃音：A offer 里有 pb 可编码的编码（G.711 或 G.729）时，把 183 的
+     * m=audio 压成该单一 PT 再发——对端就按它收流，不会被自己 offer 首选的
+     * opus 等抢走。没有可编码的 PT 则用原始 offer 重写，只建媒体不放音。 */
+    int tone_pt = em_pick_ring_pt(a->offer);
+    if (tone_pt >= 0) {
+        char pt_sdp[B2B_SDP_MAX];
+        int plen = em_sdp_audio_single_pt(sdp, n, pt_sdp, sizeof(pt_sdp), tone_pt);
+        if (plen > 0) {
+            memcpy(sdp, pt_sdp, (size_t)plen);
+            n = plen;
+        } else {
+            llog(LOG_WARN, "b2b",
+                 "preanswer_183: audio single pt rc=%d callid=%s", plen, a->callid);
+        }
+    }
+    respond_a(c, 183, sdp, (size_t)n);
+    /* 记录已发 A 的早期 answer：200 OK 若 m= 行未变则逐字节复用 */
+    if ((size_t)n < sizeof(c->early_answer)) {
+        memcpy(c->early_answer, sdp, (size_t)n);
+        c->early_answer[n] = '\0';
+        c->early_answer_len = (uint32_t)n;
+        c->early_passthrough = 0;   /* 本地生成，200 的 PT 集合可能不同 */
+    }
+    a->state = LEG_EARLY;
+    c->early_183_ms = now_ms();
+    /* pt+1 编码交给调用方：解锁后 pb_start_ringback 启动内置回铃音 */
+    c->pre_183_tone_pt1 = (tone_pt >= 0) ? (uint8_t)(tone_pt + 1) : 0;
+    llog(LOG_NOTICE, "b2b",
+         "preanswer_183: 183+SDP sent callid=%s rtp=%s:%u video=%u media_mode=%u tone_pt=%d",
+         a->callid, rtp_ip, (unsigned)a_port, (unsigned)a_vport,
+         (unsigned)c->media_mode, tone_pt);
+    return 1;
+}
+
+/* ==================================================================
+ * 早期媒体 SDP 透传辅助（2026-11-23）
+ * ==================================================================
+ * 默认策略：落地回什么 180/183 就透传什么。
+ *   - 不带 SDP 的 180/183：原样透传，回铃由终端自产；
+ *   - 带 SDP 的 1xx（早期媒体/彩铃/公告）：必须按"面向 A 的 answer"重写，
+ *     否则 B 的 c=/m= 会把 A 的 RTP 引到落地侧，绕过 NSBC（锚定失效）。
+ * 这里直接复用 200 OK 的 B2B_SDP_ANSWER 多槽 hook 链（bridge_answer_hook
+ * 负责 relay 端口/codec 收敛/DTLS 注入），保证 183 与 200 的 answer 同源。
+ * ================================================================== */
+
+/* 运行 B2B_SDP_ANSWER hook 链，返回最终 SDP 长度；<=0 表示无可用输出。 */
+static int run_answer_hooks(void *call, const char *in, size_t inlen,
+                            char *out, size_t outsz)
+{
+    if (!in || !inlen || !out || outsz < 2)
+        return 0;
+    out[0] = '\0';
+    b2b_sdp_hook_slot_t hsnap[B2B_SDP_HOOK_MAX];
+    int hn;
+    pthread_mutex_lock(&g_sdp_hook_lock);
+    hn = g_sdp_hook_n[B2B_SDP_ANSWER];
+    if (hn > B2B_SDP_HOOK_MAX) hn = B2B_SDP_HOOK_MAX;
+    for (int i = 0; i < hn; ++i) hsnap[i] = g_sdp_hooks[B2B_SDP_ANSWER][i];
+    pthread_mutex_unlock(&g_sdp_hook_lock);
+    if (hn <= 0)
+        return 0;
+    size_t curlen = 0;
+    for (int i = 0; i < hn; ++i) {
+        char tbuf[B2B_SDP_MAX];
+        tbuf[0] = '\0';
+        const char *src = out[0] ? out : in;
+        size_t srclen = out[0] ? curlen : inlen;
+        int n = hsnap[i].fn(call, src, srclen, tbuf, sizeof(tbuf),
+                            hsnap[i].ud);
+        if (n < 0)
+            return 0;               /* hook 拒绝改写 → 交由调用方降级 */
+        if ((size_t)n >= sizeof(tbuf))
+            n = (int)sizeof(tbuf) - 1;   /* 与 200 OK 路径同口径截断 */
+        if ((size_t)n >= outsz)
+            return 0;
+        memcpy(out, tbuf, (size_t)n);
+        out[n] = '\0';
+        curlen = (size_t)n;
+    }
+    return (int)curlen;
+}
+
+/* 取下一行 m= 行（跳过 \r），返回指向行首的指针并输出不含行尾的长度。 */
+static const char *next_mline(const char *s, const char *end, size_t *len)
+{
+    const char *p = s;
+    while (p && p < end) {
+        const char *e = memchr(p, '\n', (size_t)(end - p));
+        const char *le = e ? e : end;
+        size_t l = (size_t)(le - p);
+        if (l && p[l - 1] == '\r')
+            --l;
+        if (l >= 2 && p[0] == 'm' && p[1] == '=') {
+            *len = l;
+            return p;
+        }
+        p = e ? e + 1 : NULL;
+    }
+    return NULL;
+}
+
+/* 两份 SDP 的 m= 行序列是否完全一致（段数/端口/proto/fmt-list）。 */
+static int sdp_mlines_equal(const char *a, size_t alen,
+                            const char *b, size_t blen)
+{
+    if (!a || !b)
+        return 0;
+    const char *ea = a + alen, *eb = b + blen;
+    const char *pa = a, *pb = b;
+    for (;;) {
+        size_t la = 0, lb = 0;
+        const char *ma = next_mline(pa, ea, &la);
+        const char *mb = next_mline(pb, eb, &lb);
+        if (!ma || !mb)
+            return (!ma && !mb);
+        if (la != lb || memcmp(ma, mb, la) != 0)
+            return 0;
+        pa = ma + la;
+        pb = mb + lb;
+    }
 }
 
 /* 媒体决策一次 */
@@ -3423,9 +3628,80 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                             return;
                         }
                     } else if (!skip_dup) {
-                        respond_a(c, m->status,
-                                  m->body.p ? m->body.p : NULL,
-                                  m->body.len);
+                        /* ★ 早期媒体策略（2026-11-23）——默认透传落地的 1xx：
+                         *   - 不带 SDP 的 180/183：原样透传，回铃由终端自产；
+                         *   - 带 SDP 的 180/183（早期媒体/彩铃/公告）：走与
+                         *     200 OK 完全相同的 answer hook 链，改写成"面向
+                         *     A 的 answer"（relay A 侧地址 + 逐腿 codec），
+                         *     既保留落地早期媒体，又不泄漏 B 的媒体地址。
+                         * NSBC 自己生成 183+SDP+回铃音只由拨号规则显式触发
+                         * （pre_answer / ringback / playback / queue），不再
+                         * 因"媒体被锚定"自动接管。 */
+                        int fwd_done = 0;
+                        if (m->body.len > B2B_SDP_MAX) {
+                            /* 超长 SDP 无法安全改写：宁可只透传状态，也不能
+                             * 把落地 c=/m= 原样泄给 A */
+                            llog(LOG_WARN, "b2b",
+                                 "1xx body %zu > B2B_SDP_MAX, drop SDP "
+                                 "callid=%s", m->body.len, c->leg[0].callid);
+                            respond_a(c, m->status, NULL, 0);
+                            fwd_done = 1;
+                        } else if (m->status >= 180 && m->body.len > 0 &&
+                                   g_sdp_hook_n[B2B_SDP_ANSWER] > 0) {
+                            char ebuf[B2B_SDP_MAX];
+                            int en = run_answer_hooks(c, m->body.p,
+                                                      m->body.len,
+                                                      ebuf, sizeof(ebuf));
+                            if (en > 0 && ebuf[0]) {
+                                nsbc_ctx_t *mctx = nsbc_get_ctx();
+                                int need_tc = (mctx && mctx->bridge)
+                                    ? bridge_answer_needs_transcode(
+                                          (bridge_mgr_t *)mctx->bridge, c)
+                                    : -1;
+                                if (need_tc == 1) {
+                                    /* 需要转码：转码器要到 bridge_confirm
+                                     * （200/ACK）才建立，此处转发会把 B 编码的
+                                     * payload 按 A 的 PT 送出 → 主叫听到噪声。
+                                     * 降级为本地 183+SDP+内置回铃音。 */
+                                    llog(LOG_WARN, "b2b",
+                                         "early media %d 需转码，降级本地 183 "
+                                         "callid=%s", m->status,
+                                         c->leg[0].callid);
+                                    if (b2b_send_preanswer_183(c) != 1) {
+                                        respond_a(c, m->status, NULL, 0);
+                                    }
+                                    fwd_done = 1;
+                                } else {
+                                    size_t el = (size_t)en;
+                                    respond_a(c, m->status, ebuf, el);
+                                    /* 记住已发给 A 的早期 answer，200 OK 复用 */
+                                    if (el < sizeof(c->early_answer)) {
+                                        memcpy(c->early_answer, ebuf, el);
+                                        c->early_answer[el] = '\0';
+                                        c->early_answer_len = (uint32_t)el;
+                                        c->early_passthrough = 1;
+                                    }
+                                    c->early_183_ms = now_ms();
+                                    fwd_done = 1;
+                                    llog(LOG_INFO, "b2b",
+                                         "early media passthrough: %d w/ SDP "
+                                         "%zuB callid=%s", m->status, el,
+                                         c->leg[0].callid);
+                                }
+                            } else {
+                                /* 改写失败：只透传状态码，SDP 丢弃（安全优先） */
+                                llog(LOG_WARN, "b2b",
+                                     "1xx SDP rewrite failed (%zuB) → status "
+                                     "only callid=%s", m->body.len,
+                                     c->leg[0].callid);
+                                respond_a(c, m->status, NULL, 0);
+                                fwd_done = 1;
+                            }
+                        }
+                        if (!fwd_done)
+                            respond_a(c, m->status,
+                                      m->body.p ? m->body.p : NULL,
+                                      m->body.len);
                         c->leg[1].last_prov_status = m->status;
                         /* P0 PBX：Ring NoAnswer 超时器 arm（首次 180/183 才 arm） */
                         if (arm_noanswer_timer(c) != NSBC_OK) {
@@ -3445,6 +3721,22 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                           m->body.p ? m->body.p : NULL, m->body.len);
             }
             call_unlock(c);
+            /* ★ 183+SDP 已发且 A offer 有 G.711 → 自动放内置标准回铃音
+             * （锁外：pb_start_ringback 内部 tw_add + bridge 查询），
+             * B 腿接通时由 pb_stop_by_flag(c,1) 自动停。 */
+            if (c->pre_183_tone_pt1) {
+                int tone_pt = (int)c->pre_183_tone_pt1 - 1;
+                c->pre_183_tone_pt1 = 0;
+                int trc = pb_start_ringback(c, 0 /* A 腿 */, tone_pt);
+                if (trc == NSBC_OK)
+                    llog(LOG_NOTICE, "b2b",
+                         "preanswer_183: auto ringback OK pt=%d callid=%s",
+                         tone_pt, c->leg[0].callid);
+                else
+                    llog(LOG_WARN, "b2b",
+                         "preanswer_183: auto ringback rc=%d pt=%d callid=%s",
+                         trc, tone_pt, c->leg[0].callid);
+            }
             return;
         }
         if (ev == TXN_EV_FINAL && m) {
@@ -3536,6 +3828,35 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                         }
                     }
                     if (buf[0]) { ab = buf; abl = strlen(buf); }
+                }
+                /* ★ 183→200 answer 一致性（2026-11-23）：已给 A 发过带 SDP 的
+                 * 早期 answer 时，若本次 200 的 A 侧 m= 行（端口/proto/
+                 * fmt-list）与 183 完全一致，逐字节复用。RFC 3264 规定 answer
+                 * 一经发出不得更改；Linphone/PJSIP 检测到变化会在 ACK 后立即
+                 * BYE。codec 真变了（B 改了协商）才重新生成。 */
+                if (c->early_answer_len > 0 && abl > 0 &&
+                    sdp_mlines_equal(c->early_answer, c->early_answer_len,
+                                     ab, abl)) {
+                    llog(LOG_INFO, "b2b",
+                         "200 OK 复用 183 early answer (%uB) callid=%s",
+                         c->early_answer_len, c->leg[0].callid);
+                    ab = c->early_answer;
+                    abl = c->early_answer_len;
+                    c->early_answer_len = 0;   /* 仅本 transaction 有效 */
+                } else if (c->early_answer_len > 0) {
+                    /* 200 的协商结果真的变了（B 改 codec/端口），只能重发新
+                     * answer。透传场景属异常（B 前后 answer 不一致）；本地
+                     * 183（单 PT 回铃）与 200（逐腿协商）本来就不同，属正常，
+                     * 只在 DEBUG 记录。 */
+                    if (c->early_passthrough)
+                        llog(LOG_WARN, "b2b",
+                             "200 OK 未复用 183 answer（m= 行变化）callid=%s",
+                             c->leg[0].callid);
+                    else
+                        llog(LOG_DEBUG, "b2b",
+                             "200 OK 重新生成 answer（本地 183）callid=%s",
+                             c->leg[0].callid);
+                    c->early_answer_len = 0;
                 }
                 if (abl) {
                     memcpy(c->leg[1].answer, ab, abl);
@@ -9767,7 +10088,7 @@ int b2b_answer_call(b2b_call_t *call, int b_leg,
  * 不触发计费，激活 Early Media 通道让 playback 等提前介入。
  * ==================================================================*/
 
-int b2b_pre_answer_call(b2b_call_t *call)
+int b2b_pre_answer_call(b2b_call_t *call, int with_sdp)
 {
     if (!call) return NSBC_INVAL;
     b2b_call_t *c = call;
@@ -9789,17 +10110,93 @@ int b2b_pre_answer_call(b2b_call_t *call)
     }
     call_unlock(c);
 
-    /* hold SDP（占位：实际需从 media_bridge 拿 A 腿 hold SDP）
-     * P0 简化：传 NULL SDP（对端可能接受无 SDP 的 183，或忽略）
-     * P1：从 media_bridge 预创建 hold SDP 注入 */
-    int rc = b2b_respond_leg(c, 0, 183, NULL, NULL, 0);
-    if (rc == NSBC_OK) {
-        llog(LOG_INFO, "b2b", "pre_answer: sent 183 Session Progress call=%p", c);
-        /* 标记：调用方会写 chan_var "pre_answered=true" */
-    } else {
-        llog(LOG_WARN, "b2b", "pre_answer: 183 send failed rc=%d call=%p", rc, c);
+    if (!with_sdp) {
+        /* 隐式 pre_answer（answer app 前置的 §8 兼容路径）：保持旧语义——
+         * 只补一个无 SDP 的 183 状态，不预建 relay，避免把普通 bypass 呼叫
+         * 强行锚定成 relay。 */
+        int rc0 = b2b_respond_leg(c, 0, 183, NULL, NULL, 0);
+        if (rc0 == NSBC_OK)
+            llog(LOG_INFO, "b2b", "pre_answer(implicit): 183(no SDP) callid=%s",
+                 c->leg[0].callid);
+        return rc0;
     }
-    return rc;
+
+    if (c->media_mode == 1) {
+        /* 显式 media=bypass 与 pre_answer 冲突：尊重 bypass，不预建 relay
+         * （否则 offer_hook 会强制改回 RELAY）。旁路下无法通告 NSBC 媒体
+         * 地址，只能退回无 SDP 的 183。 */
+        llog(LOG_WARN, "b2b",
+             "pre_answer: media=bypass 与早期媒体冲突，按 bypass 处理 "
+             "callid=%s", c->leg[0].callid);
+        int rc0 = b2b_respond_leg(c, 0, 183, NULL, NULL, 0);
+        return rc0;
+    }
+
+    /* ★ pre_answer（拨号规则显式声明的早期媒体）：必须带 SDP——主叫提前
+     * 拿到 answer 才能开始收发 RTP，这才符合"保证媒体可以收到"的语义。
+     * app_chain 早于 send_invite_b，此时 relay 可能还没建：先用
+     * bridge_local_start 预建（与 hold/queue 同一套路，offer_hook 之后复用
+     * 同一 relay 与端口，A 腿 183 通告的地址与后建 B 腿不冲突）。 */
+    nsbc_ctx_t *ctx = nsbc_get_ctx();
+    if (ctx && ctx->bridge && c->leg[0].offer_len > 0) {
+        rtp_relay_t *rl = NULL;
+        nsbc_sa_t pr[2];
+        if (bridge_lookup_relay((bridge_mgr_t *)ctx->bridge, c, &rl, pr) != NSBC_OK ||
+            !rl) {
+            char tmp[B2B_SDP_MAX];
+            int n = bridge_local_start(c, c->leg[0].offer,
+                                       c->leg[0].offer_len,
+                                       tmp, sizeof(tmp), ctx->bridge);
+            if (n <= 0)
+                llog(LOG_WARN, "b2b",
+                     "pre_answer: bridge_local_start rc=%d callid=%s",
+                     n, c->leg[0].callid);
+        }
+    }
+
+    int rc = NSBC_ERR;
+    int tone_pt = -1;
+    call_lock(c);
+    if (!c->dead && c->leg[0].inv_txn &&
+        c->leg[0].state != LEG_TERMINATED &&
+        c->leg[0].state != LEG_TERMINATING) {
+        /* 复用自动 183 生成器（relay A 侧端口 + 收敛 PT + 内置回铃音）。
+         * 无 offer / 无 relay / A=WebRTC 时返回 0 → 降级为无 SDP 的 183。 */
+        if (b2b_send_preanswer_183(c) == 1) {
+            rc = NSBC_OK;
+            tone_pt = c->pre_183_tone_pt1 ? (int)c->pre_183_tone_pt1 - 1 : -1;
+        }
+    }
+    call_unlock(c);
+
+    if (rc != NSBC_OK) {
+        rc = b2b_respond_leg(c, 0, 183, NULL, NULL, 0);
+        if (rc == NSBC_OK)
+            llog(LOG_INFO, "b2b",
+                 "pre_answer: 183(no SDP) callid=%s", c->leg[0].callid);
+        else
+            llog(LOG_WARN, "b2b", "pre_answer: 183 send failed rc=%d call=%p",
+                 rc, c);
+        return rc;
+    }
+
+    llog(LOG_NOTICE, "b2b", "pre_answer: 183+SDP sent callid=%s tone_pt=%d",
+         c->leg[0].callid, tone_pt);
+    /* 回铃在锁外启动（pb_start_ringback 内部 tw_add + bridge 查询）；
+     * 先清掉 pre_183_tone_pt1，避免 B 首个 1xx 被吞时重复启动。 */
+    if (tone_pt >= 0) {
+        call_lock(c);
+        c->pre_183_tone_pt1 = 0;
+        call_unlock(c);
+        int trc = pb_start_ringback(c, 0 /* A 腿 */, tone_pt);
+        if (trc == NSBC_OK)
+            llog(LOG_NOTICE, "b2b", "pre_answer: ringback OK pt=%d callid=%s",
+                 tone_pt, c->leg[0].callid);
+        else
+            llog(LOG_WARN, "b2b", "pre_answer: ringback rc=%d pt=%d callid=%s",
+                 trc, tone_pt, c->leg[0].callid);
+    }
+    return NSBC_OK;
 }
 
 /* ==================================================================
@@ -9862,9 +10259,12 @@ int b2b_request_early_media(b2b_call_t *call, const char *wav, int loop,
 }
 
 /* 在 A 的 INVITE offer（或 in-dialog 场景的历史 answer）里找 audio m= 行，
- * 按 offer 的 payload 顺序返回第一个 pb 引擎可编码的 PT（P0：0=PCMU /
- * 8=PCMA，查表 g711.c）。全是非 G.711（opus/G729 等）时返回 -1。 */
-static int em_pick_play_pt(const char *sdp)
+ * 按 offer 的 payload 顺序返回第一个 pb 引擎可编码的 PT：
+ *   0=PCMU / 8=PCMA（g711.c 快路径）；
+ *   allow_g729=1 时额外认 18=G.729（仅内置回铃音用，编码器按需创建，
+ *   文件放音 pb_start_ex 只有 G.711 通路，不能传 18）。
+ * 都不支持（opus 等）时返回 -1。 */
+static int em_pick_play_pt2(const char *sdp, int allow_g729)
 {
     if (!sdp) return -1;
     const char *m = strstr(sdp, "m=audio");
@@ -9883,13 +10283,18 @@ static int em_pick_play_pt(const char *sdp)
     tok = strtok_r(NULL, " \t\r\n", &save);         /* proto */
     (void)tok;
     while ((tok = strtok_r(NULL, " \t\r\n", &save))) {
-        if (!strcmp(tok, "0") || !strcmp(tok, "8")) {
+        if (!strcmp(tok, "0") || !strcmp(tok, "8") ||
+            (allow_g729 && !strcmp(tok, "18"))) {
             /* telephone-event(101/120) 等动态 PT 不在集合里，天然跳过 */
             return atoi(tok);
         }
     }
     return -1;
 }
+
+static int em_pick_play_pt(const char *sdp) { return em_pick_play_pt2(sdp, 0); }
+/* 内置回铃音：G.729-only 的 offer 也要能出声 */
+static int em_pick_ring_pt(const char *sdp) { return em_pick_play_pt2(sdp, 1); }
 
 /* 合成 answer 压成单编码（G.711 静态 PT）：
  * - m=audio 行 payload 只留协商出的 pt（否则沿用 offer 顺序 PCMA 优先时，
@@ -9909,6 +10314,41 @@ static int em_sdp_single_pt(const char *in, int in_len, char *out, size_t outsz,
             p += linelen;                          /* drop */
             continue;
         }
+        if (!strncmp(p, "m=audio", 7)) {
+            char line[512];
+            size_t cl = linelen < sizeof(line) ? linelen : sizeof(line) - 1;
+            memcpy(line, p, cl); line[cl] = '\0';
+            unsigned port = 0;
+            char proto[64] = "";
+            if (sscanf(line, "m=audio %u %63s", &port, proto) >= 2 && proto[0]) {
+                int n = snprintf(out + o, outsz - o,
+                                 "m=audio %u %s %d\r\n", port, proto, pt);
+                if (n < 0 || (size_t)n >= outsz - o) return -1;
+                o += (size_t)n;
+                p += linelen;
+                continue;
+            }
+        }
+        if (o + linelen > outsz) return -1;
+        memcpy(out + o, p, linelen);
+        o += linelen;
+        p += linelen;
+    }
+    if (o < outsz) out[o] = '\0';
+    return (int)o;
+}
+
+/* ★ preanswer 183 用：只把 m=audio 行压成单一 G.711 PT，其余行原样保留
+ * （尤其是 video 的 a=rtpmap/a=fmtp，em_sdp_single_pt 会全删，不能复用）。
+ * 这样对端按该 PT 收内置回铃音，不会被它自己 offer 首选的 G.729/opus 抢走。 */
+static int em_sdp_audio_single_pt(const char *in, int in_len, char *out,
+                                  size_t outsz, int pt)
+{
+    size_t o = 0;
+    const char *p = in, *end = in + in_len;
+    while (p < end) {
+        const char *nl = memchr(p, '\n', (size_t)(end - p));
+        size_t linelen = nl ? (size_t)(nl - p) + 1 : (size_t)(end - p);
         if (!strncmp(p, "m=audio", 7)) {
             char line[512];
             size_t cl = linelen < sizeof(line) ? linelen : sizeof(line) - 1;
@@ -10004,14 +10444,13 @@ static void b2b_early_media_start(b2b_call_t *c)
     }
 
     /* ②b：按 A offer 的 codec 协商放音编码（不再强行 PCMU）。
-     * answer m= 行只留 pb 引擎可编码的那个 PT（A offer 顺序取第一个
-     * G.711：MicroSIP "8 0 120" → PCMA）；opus/G729-only 的 offer
-     * P0 无编码器 → WARN 跳过放音（不出非法 answer）。 */
+     * answer m= 行只留 pb 引擎可编码的那个 PT（A offer 顺序第一个
+     * PCMU/PCMA/G.729）；opus-only 的 offer 无编码器 → WARN 跳过放音。 */
     int play_pt = em_pick_play_pt(c->leg[0].offer);
     if (play_pt < 0) {
         llog(LOG_WARN, "b2b",
-             "early_media: A offer has no playable codec (need PCMU/PCMA; "
-             "opus/G.729 transcode is P1) call=%p — skip",
+             "early_media: A offer has no playable codec (need PCMU/PCMA/G.729; "
+             "opus transcode is P1) call=%p — skip",
              (void *)c);
         return;
     }
@@ -10039,7 +10478,14 @@ static void b2b_early_media_start(b2b_call_t *c)
     int stop_on_answer;
     int started = 0;
     call_lock(c);
-    if (!c->dead && c->leg[0].inv_txn &&
+    if (c->early_183_ms) {
+        /* ★ preanswer_183 已给 A 发过 183+SDP：同一 INVITE 再发 183 会构成
+         * 第二个 SDP answer，只能启动放音（relay 端口同一个，放音不受影响）。 */
+        started = 1;
+        llog(LOG_NOTICE, "b2b",
+             "early_media: 183 already sent (preanswer_183), playback only call=%p",
+             (void *)c);
+    } else if (!c->dead && c->leg[0].inv_txn &&
         c->leg[0].state != LEG_TERMINATED &&
         c->leg[0].state != LEG_TERMINATING) {
         respond_a(c, 183, sdp, (size_t)sdp_len);

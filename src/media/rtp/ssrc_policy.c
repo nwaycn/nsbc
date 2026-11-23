@@ -40,6 +40,14 @@ static int is_video_pt(const ssrc_policy_t *p, uint8_t pt)
     return 0;
 }
 
+static int is_audio_pt(const ssrc_policy_t *p, uint8_t pt)
+{
+    for (int i = 0; i < p->cfg.n_audio_pt; ++i)
+        if (p->cfg.audio_pt[i] == pt)
+            return 1;
+    return 0;
+}
+
 static src_entry_t *find(ssrc_policy_t *p, uint32_t ssrc)
 {
     for (int i = 0; i < p->n; ++i)
@@ -122,6 +130,19 @@ void ssrc_policy_set_video_pt(ssrc_policy_t *p, uint8_t pt)
     SSRC_UNLOCK(p);
 }
 
+void ssrc_policy_set_audio_pt(ssrc_policy_t *p, uint8_t pt)
+{
+    SSRC_LOCK(p);
+    if (p->cfg.n_audio_pt < 8) {
+        int dup = 0;
+        for (int i = 0; i < p->cfg.n_audio_pt; ++i)
+            if (p->cfg.audio_pt[i] == pt) { dup = 1; break; }
+        if (!dup)
+            p->cfg.audio_pt[p->cfg.n_audio_pt++] = pt;
+    }
+    SSRC_UNLOCK(p);
+}
+
 void ssrc_policy_retarget(ssrc_policy_t *p)
 {
     /* 主源标记清除但保留 CNAME：CNAME 相同的源直接恢复；其余重新学习 */
@@ -193,18 +214,22 @@ src_decision_t ssrc_policy_on_rtp(ssrc_policy_t *p, uint32_t ssrc,
         return SRC_DEC_PRIMARY;
     }
 
-    /* ★ REQ-MEDIA-VIDEO-003：video PT 白名单放行
-     * 传统 SIP 终端 SDP 不带 a=ssrc:，video SSRC 未预登记。
-     * 但 media_bridge.c:admit_ssrc_from_sdp 已从 m=video 行 fmt-list
-     * 提取 PT 进 video_pt[] 白名单。全新 SSRC 只要 PT 命中此白名单 →
-     * 放行作为独立 primary（video track 与 audio track 是并列主源）。
+    /* ★ REQ-MEDIA-VIDEO-003 / REQ-MEDIA-AUDIO-003：audio/video PT 白名单放行
+     * 传统 SIP 终端 SDP 不带 a=ssrc:，SSRC 未预登记。但
+     * media_bridge.c:admit_ssrc_from_sdp 已从 m=audio / m=video 行 fmt-list
+     * 提取 PT 进 audio_pt[] / video_pt[] 白名单。全新 SSRC 只要 PT 命中
+     * 白名单 → 放行作为独立 primary（audio track 与 video track 是并列主源）。
+     *
+     * 关键场景：G.729 带 DTX 时音频首包可能晚于视频首包。若只认 video
+     * 白名单，视频 SSRC 先占住"第一个源"，音频 SSRC 会被判第三个源永久
+     * 丢弃 → 对端完全听不到本端语音（原来只测 PCMA 时不复现）。
      *
      * 安全边界：
-     *   - video_pt 由 SDP 解析填充，不是运行时动态信任
-     *   - collision 检测在最前面，video SSRC 撞我们自己的仍被 drop
-     *   - max_sources 上限 8，video SSRC 太多会走回收逻辑
-     *   - 非 video PT + 非 aux PT → 走下面的发言切换或 drop（保持安全语义） */
-    if (is_video_pt(p, pt)) {
+     *   - 两张 PT 表都由 SDP 解析填充，不是运行时动态信任
+     *   - collision 检测在最前面，撞我们自己的 SSRC 仍被 drop
+     *   - max_sources 上限 8，源太多会走回收逻辑
+     *   - 非 audio/video/aux PT → 走下面的发言切换或 drop（保持安全语义） */
+    if (is_audio_pt(p, pt) || is_video_pt(p, pt)) {
         e = alloc_entry(p, ssrc, now_ms);
         if (e) {
             e->primary = 1;

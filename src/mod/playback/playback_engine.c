@@ -13,6 +13,7 @@
 #include "snd_file.h"
 #include "media_bridge.h"
 #include "g711.h"
+#include "media_codec.h"   /* G.729 回铃音编码器（bcg729），非 G.711 放音用 */
 #include "app_ctx.h"
 #include "nsbc_common.h"
 #include "log.h"
@@ -20,6 +21,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <errno.h>
+#include <math.h>
 
 /* ---------- RTP 封装 ---------- */
 
@@ -45,7 +47,11 @@ typedef struct pb_ctx {
     void *call_key;
     int side;                 /* 0=A, 1=B, -1=both */
     int loop;                 /* 0=once, 1=loop */
-    uint8_t pt;               /* RTP payload type：0=PCMU, 8=PCMA */
+    uint8_t pt;               /* RTP payload type：0=PCMU, 8=PCMA, 18=G.729 */
+    /* 非 G.711 放音编码器（当前仅 G.729 回铃音）——pt 为 0/8 时保持 NULL，
+     * 走 g711.c 的快路径；pb 释放时统一 fini。 */
+    const codec_ops_t *cops;
+    codec_sess_t      *cenc;
     int stop_on_answer;       /* 1=B 腿 LEG_CONFIRMED 时 pb_stop_by_flag(c,1) 停
                                  * (ringback 行为)，
                                  * 0=不受接通影响 (playback / endless_playback / MoH) */
@@ -64,6 +70,12 @@ typedef struct pb_ctx {
     char wav_path[256];
     struct pb_ctx *next;
 
+    /* ---- 内置回铃音（无 WAV 源）----
+     * is_ringback=1 时 timer 回调不再 snd_file_pull，改为实时合成 450Hz
+     * 正弦（1s 响 / 4s 停）。rb_samples 为累计采样数（8kHz）。 */
+    uint8_t is_ringback;
+    uint32_t rb_samples;
+
     /* ---- chain 多文件串联 ----
      * pb_start_chain 时填；中间文件播完 EOF 自动 start 下一个；
      * 最后一个 EOF 自动 pb_stop。 */
@@ -78,12 +90,22 @@ static pb_ctx_t *g_pb_retired = NULL;  /* tw_del 返回 0（节点已触发）�
 static int g_pb_started = 0;
 static uint64_t g_pb_total = 0;
 
+/* 统一释放：先关非 G.711 编码器，再 free 上下文。 */
+static void pb_free_ctx(pb_ctx_t *pb)
+{
+    if (pb == NULL) return;
+    if (pb->cenc && pb->cops && pb->cops->fini)
+        pb->cops->fini(pb->cenc);
+    pb->cenc = NULL;
+    free(pb);
+}
+
 /* 已触发节点：回调可能正在时间轮线程执行，此时 free 会造成 UAF。
  * dequeued=1（成功摘链，不会有回调）→ 立即释放；否则退役等时间轮线程回收。 */
 static void pb_retire_locked(pb_ctx_t *pb, int dequeued)
 {
     if (dequeued) {
-        free(pb);
+        pb_free_ctx(pb);
         return;
     }
     pb->next = g_pb_retired;
@@ -101,7 +123,7 @@ static void pb_reap_retired(void)
     pthread_mutex_unlock(&g_pb_lock);
     while (p) {
         pb_ctx_t *nx = p->next;
-        free(p);
+        pb_free_ctx(p);
         p = nx;
     }
 }
@@ -149,6 +171,31 @@ void pb_engine_stop(void)
 #define PB_RTP_FRAMES_PER_PACKET 160 /* 20ms × 8kHz */
 #define PB_TICK_MS 100                /* timer_wheel tick_ms */
 #define PB_PACKETS_PER_TICK 5         /* 100 / 20 = 5 个 RTP 包/次 tick */
+
+/* ★ 内置标准回铃音合成：450Hz 正弦，1s 响 / 4s 停（5s 周期）。
+ * 8kHz 下 450Hz 每 20ms（160 采样）恰好 9 个周期，帧内相位连续、无爆音。
+ * 电平 ~ -16dBFS（振幅 5000），与运营商回铃音听感接近。 */
+#define RB_TONE_HZ     450
+#define RB_TONE_AMP    5000
+#define RB_ON_MS       1000
+#define RB_PERIOD_MS   5000
+#define RB_SR          8000
+
+static int pb_ringback_pull(pb_ctx_t *pb, int16_t *buf, int frames)
+{
+    for (int i = 0; i < frames; ++i) {
+        uint32_t n = pb->rb_samples++;
+        uint32_t ms = n / (RB_SR / 1000);   /* 采样号 → 毫秒 */
+        if ((ms % RB_PERIOD_MS) < RB_ON_MS) {
+            double ph = 2.0 * 3.14159265358979323846 * RB_TONE_HZ *
+                        (double)n / (double)RB_SR;
+            buf[i] = (int16_t)(RB_TONE_AMP * sin(ph));
+        } else {
+            buf[i] = 0;
+        }
+    }
+    return frames;
+}
 
 static void pb_timer_cb(uint64_t now_ms, void *arg)
 {
@@ -210,7 +257,9 @@ static void pb_timer_cb(uint64_t now_ms, void *arg)
     /* ★ 每 tick 拉满 100ms 数据，拆成 5 个 20ms RTP 包 */
     const int total_frames = PB_RTP_FRAMES_PER_PACKET * PB_PACKETS_PER_TICK; /* 160×5 = 800 */
     int16_t pcm_buf[PB_MAX_FRAMES];
-    int pulled = snd_file_pull(pb->snd, pcm_buf, total_frames, pb->loop);
+    int pulled = pb->is_ringback
+                     ? pb_ringback_pull(pb, pcm_buf, total_frames)
+                     : snd_file_pull(pb->snd, pcm_buf, total_frames, pb->loop);
     pb->total_pulled += pulled;
     if (pulled <= 0) {
         /* EOF —— chain 中间文件自动 start 下一个，最后一个才停 */
@@ -265,9 +314,27 @@ static void pb_timer_cb(uint64_t now_ms, void *arg)
     while (remaining > 0) {
         int pkt_frames = remaining >= PB_RTP_FRAMES_PER_PACKET ? PB_RTP_FRAMES_PER_PACKET : remaining;
         uint8_t payload[PB_RTP_FRAMES_PER_PACKET];
-        size_t enc = (pb->pt == 8)
-            ? g711_alaw_encode(pcm_buf + offset, pkt_frames, payload)
-            : g711_ulaw_encode(pcm_buf + offset, pkt_frames, payload);
+        size_t enc;
+        if (pb->pt == 0 || pb->pt == 8) {
+            enc = (pb->pt == 8)
+                ? g711_alaw_encode(pcm_buf + offset, pkt_frames, payload)
+                : g711_ulaw_encode(pcm_buf + offset, pkt_frames, payload);
+        } else if (pb->cenc && pb->cops && pb->cops->encode) {
+            /* G.729（及其他非 G.711）回铃音：160 样本 = 20ms → 20 字节 */
+            media_frame_t mf;
+            memset(&mf, 0, sizeof(mf));
+            mf.pcm = pcm_buf + offset;
+            mf.samples = (size_t)pkt_frames;
+            mf.rate = 8000;
+            mf.channels = 1;
+            mf.rtp_ts = pb->ts;
+            enc = 0;
+            if (pb->cops->encode(pb->cenc, &mf, payload, sizeof(payload),
+                                 &enc) != NSBC_OK)
+                enc = 0;
+        } else {
+            enc = 0;
+        }
         if (enc == 0) break;
 
         uint8_t rtp_frame[12 + PB_RTP_FRAMES_PER_PACKET];
@@ -409,6 +476,100 @@ int pb_start_ex(void *call_key, const char *wav_path, int side, int loop,
     }
 
     if (out) *out = pb;
+    return NSBC_OK;
+}
+
+/* ★ 内置回铃音启动（183 preanswer 自动放音用）：与 pb_start_ex 同一套
+ * 注册/时间轮链路，只是音频源换成实时合成（snd=NULL）。
+ * 调用约定：reactor 线程、未持 call 锁、relay 已建立（183 发出后）。 */
+int pb_start_ringback(void *call_key, int side, int pt)
+{
+    if (!g_pb_started || !call_key)
+        return NSBC_INVAL;
+    if (pt != 0 && pt != 8 && pt != 18) {
+        llog(LOG_WARN, "pb", "pb_start_ringback: unsupported pt=%d", pt);
+        return NSBC_NOTSUP;
+    }
+    nsbc_ctx_t *ctx = nsbc_get_ctx();
+    if (!ctx || !ctx->tw || !ctx->bridge)
+        return NSBC_ERR;
+
+    rtp_relay_t *relay = NULL;
+    nsbc_sa_t peer[2] = {{0}};
+    if (bridge_lookup_relay((bridge_mgr_t *)ctx->bridge, call_key, &relay, peer)
+            != NSBC_OK || !relay) {
+        llog(LOG_WARN, "pb", "pb_start_ringback: relay not ready call=%p", call_key);
+        return NSBC_NOENT;
+    }
+
+    pb_stop_if_playing(call_key);   /* 单 call 只允许一个播放 ctx */
+
+    pb_ctx_t *pb = calloc(1, sizeof(*pb));
+    if (!pb)
+        return NSBC_NOMEM;
+    pb->call_key = call_key;
+    pb->side = side;
+    pb->loop = 1;
+    pb->pt = (uint8_t)pt;
+    pb->stop_on_answer = 1;
+    pb->is_ringback = 1;
+    pb->relay = relay;
+    pb->peer[0] = peer[0];
+    pb->peer[1] = peer[1];
+    pb->ssrc = (uint32_t)rand();
+    pb->active = 1;
+    snprintf(pb->wav_path, sizeof(pb->wav_path), "tone:ringback");
+
+    /* G.729 等非 G.711：必须自带编码器，否则整段回铃音发不出去
+     * （A 腿只 offer 18 时不能退回 G.711）。编码器创建失败就整体放弃。 */
+    if (pt != 0 && pt != 8) {
+        const codec_ops_t *ops = codec_registry_find(CODEC_G729);
+        codec_sess_t *sess = NULL;
+        int crc = NSBC_NOTSUP;
+        if (ops && ops->encode) {
+            if (ops->encoder_init)
+                crc = ops->encoder_init(NULL, &sess);
+            else if (ops->init)
+                crc = ops->init(NULL, &sess);
+            if (crc == NSBC_OK && sess == NULL)
+                crc = NSBC_ERR;
+        }
+        if (crc != NSBC_OK) {
+            llog(LOG_WARN, "pb",
+                 "pb_start_ringback: g729 encoder init rc=%d call=%p — skip",
+                 crc, call_key);
+            free(pb);
+            return NSBC_NOTSUP;
+        }
+        pb->cops = ops;
+        pb->cenc = sess;
+    }
+
+    pthread_mutex_lock(&g_pb_lock);
+    pb->next = g_pb_list;
+    g_pb_list = pb;
+    g_pb_total++;
+    pthread_mutex_unlock(&g_pb_lock);
+
+    tw_node_init(&pb->tn);
+    {
+        uint64_t expire = nsbc_now_ms() + 1;
+        int rc = tw_add(ctx->tw, &pb->tn, expire, pb_timer_cb, pb);
+        llog(LOG_INFO, "pb",
+             "ringback tw_add expire=%lu rc=%d call=%p pt=%u side=%d",
+             (unsigned long)expire, rc, call_key, pb->pt, side);
+    }
+    llog(LOG_NOTICE, "pb", "RINGBACK START call=%p side=%d pt=%u",
+         call_key, side, pb->pt);
+
+    /* 与 pb_start_ex 对齐：ESL 事件让上层能看到振铃期放音 */
+    if (ctx->esl_event_fire) {
+        char jbuf[512];
+        int n = snprintf(jbuf, sizeof(jbuf),
+                         "{\"call_key\":\"%p\",\"side\":%d,\"wav\":\"tone:ringback\",\"loop\":1}",
+                         call_key, side);
+        ctx->esl_event_fire("PLAYBACK_START", jbuf, (size_t)n);
+    }
     return NSBC_OK;
 }
 

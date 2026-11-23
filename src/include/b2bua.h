@@ -251,6 +251,14 @@ struct b2b_call {
     uint64_t early_183_ms;
     uint64_t early_end_ms;
     uint32_t early_bytes;
+    /* 183 早期 answer 快照（2026-11-23 早期媒体透传）：
+     * 首个带 SDP 的落地 1xx（180/183）经 answer hook 改写成"面向 A 的
+     * answer"后发 A，并保存于此。B 的 200 OK 若 A 侧 m= 行（端口/proto/
+     * fmt-list）与 183 完全一致，必须逐字节复用——RFC 3264 规定 answer
+     * 一经发出不得更改；Linphone/PJSIP 发现 answer 变化会 ACK 后立即 BYE。 */
+    char   early_answer[B2B_SDP_MAX];
+    uint32_t early_answer_len;
+    uint8_t  early_passthrough;   /* 1=183 来自落地透传，0=NSBC 本地生成 */
     /* ====== REQ-DP-APP-001 Early Media（ringback/playback 正确时序） ======
      * app_ringback/app_playback 在 dp_execute（resolve_cb 阶段）执行时
      * relay 尚未建立（offer_hook 要到 send_invite_b 才建 relay），且 A 腿
@@ -268,6 +276,10 @@ struct b2b_call {
     uint8_t em_stop_on_answer; /* 1=B 腿 LEG_CONFIRMED 时自动停（ringback），
                                   * 0=不受接通影响（playback / endless_playback） */
     char em_wav[256];         /* 放音 WAV 路径 */
+    /* preanswer 183 自动回铃音 PT（pt+1 编码：0=不放，1=PCMU(0)，9=PCMA(8)）。
+     * b2b_send_preanswer_183 在持 call 锁的 1xx 路径里只登记；
+     * 解锁后由调用方 pb_start_ringback 放内置标准回铃音。 */
+    uint8_t pre_183_tone_pt1;
     /* === REQ-PBX-CC-002 3.3：队列等待（全忙入队）===
      * queue_wait=1：A 腿已回 183、尚未建 B 腿，等待 cq tick 派发；
      * 派发时由 b2b_queue_dispatch 用本结构记录的队列归属重排/结算。 */
@@ -694,6 +706,14 @@ int b2b_respond_leg(b2b_call_t *call, int b_leg, int status,
 b2b_call_t *b2b_find_callid(b2b_core_t *co, const char *callid, size_t len);
 void b2b_call_put(b2b_call_t *c);
 
+/*  不透明呼叫键存活校验（magic 守卫）。
+ * media 层登记的 call_key 是裸指针，生命周期由 b2bua 掌握；异步 resolve
+ * 期间呼叫可能已被 call_destroy 归还 slab 并被新对象复用，此时解引用
+ * 会读到垃圾（实测 bridge_offer_hook 读到 prof="a=rtcp-f" 的 SDP 文本而
+ * 崩溃）。任何把 call_key 转成 b2b_call_t* 并解引用之前，必须先调用本
+ * 函数；返回 0 表示不可解引用。1=存活，0=陈旧/复用/NULL。 */
+int b2b_call_is_alive(const void *call_key);
+
 typedef struct { b2b_call_t *c; } b2b_call_guard_t;
 
 static inline void b2b_call_guard_release(b2b_call_guard_t *g)
@@ -738,7 +758,7 @@ int b2b_valid_callid(const char *s, size_t len);
  * 不发 200 OK（避免计费触发）。B2BUA 状态机转到 PRE_ANSWERED（复用
  * CALL_STATE_EARLY + pre_answer_sent 标志）。media_bridge 可提前介入。
  * 成功后后续的 playback / media 操作可在未接通状态执行。 */
-int b2b_pre_answer_call(b2b_call_t *call);
+int b2b_pre_answer_call(b2b_call_t *call, int with_sdp);
 
 /* ---- REQ-DP-APP-001 Early Media 请求（app_ringback / app_playback 用） ----
  * 在 dp_execute（resolve_cb 阶段，relay 尚未建立）调用，只登记意图：
