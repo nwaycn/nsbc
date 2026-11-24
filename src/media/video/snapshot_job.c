@@ -608,6 +608,17 @@ static const uint8_t *snap_build_au(snap_ctx_t *c, codec_id_t cid,
         memcpy(c->au, au, len);
         *out_len = len;
         *reason = SNAPSHOT_OK;
+        /* DEBUG: 打印 AU 前 32 字节 hex，便于定位 DECODE_FAIL 根因 */
+        {
+            size_t dmp = len < 32 ? len : 32;
+            char hex[97]; hex[0] = '\0';
+            for (size_t i = 0; i < dmp; i++) {
+                snprintf(hex + i * 3, 4, "%02x ", c->au[i]);
+            }
+            llog(LOG_INFO, "snapshot",
+                 "  AU_DUMP cid=%d len=%zu head=[%s]",
+                 (int)cid, len, hex);
+        }
         return c->au;
     }
 

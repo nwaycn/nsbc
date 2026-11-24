@@ -1856,48 +1856,64 @@ window.nsbcSnapshot = async function(callId) {
     const started = await API.post('/calls/' + encodeURIComponent(callId) + '/snapshot', { frames: 1 });
     const jobs = (started && started.jobs) || [];
     if (!jobs.length) throw new Error('NO_VIDEO');
-    let hit = null, last = 'TIMEOUT';
-    for (const job of jobs) {
+    const pollOneJob = async (job) => {
+      let last = 'TIMEOUT';
       for (let i = 0; i < 20; i++) {
         let stt = null;
         try { stt = await API.get('/calls/snapshot/' + encodeURIComponent(job.job_id)); }
         catch (e) { last = e.message || String(e); break; }
         if (stt && !stt.running) {
           last = stt.result || 'UNKNOWN';
-          if (stt.result === 'OK' && stt.image_url) hit = job;
           break;
         }
         await new Promise(r => setTimeout(r, 300));
       }
-      if (hit) break;
+      if (last !== 'OK') return { job, ok: false, why: last };
+      try {
+        const res = await fetch(
+          API.base + '/calls/snapshot/' + encodeURIComponent(job.job_id) + '/image',
+          { headers: API.headers(false) });
+        if (!res.ok) return { job, ok: false, why: 'HTTP_' + res.status };
+        const blob = await res.blob();
+        const dataUrl = await new Promise((resolve, reject) => {
+          const fr = new FileReader();
+          fr.onload = () => resolve(fr.result);
+          fr.onerror = () => reject(new Error('read fail'));
+          fr.readAsDataURL(blob);
+        });
+        return { job, ok: true, dataUrl };
+      } catch (e) { return { job, ok: false, why: 'FETCH_FAIL' }; }
+    };
+    const results = await Promise.all(jobs.map(pollOneJob));
+    const hints = {
+      NO_VIDEO: t('No video on this call'),
+      NO_KEYFRAME: t('No keyframe received (video peer did not respond to PLI)'),
+      NO_CODEC: t('Video codec has no decoder on this server'),
+      DECODE_FAIL: t('Video decode failed'),
+      TIMEOUT: t('No frame captured before timeout'),
+      FETCH_FAIL: t('Failed to download snapshot image'),
+    };
+    const successes = results.filter(r => r.ok);
+    const failures = results.filter(r => !r.ok);
+    if (!successes.length) {
+      const why = failures[0] ? (hints[failures[0].why] || failures[0].why) : 'UNKNOWN';
+      throw new Error(why);
     }
-    if (!hit) {
-      const hints = {
-        NO_VIDEO: t('No video on this call'),
-        NO_KEYFRAME: t('No keyframe received (video peer did not respond to PLI)'),
-        NO_CODEC: t('Video codec has no decoder on this server'),
-        DECODE_FAIL: t('Video decode failed'),
-        TIMEOUT: t('No frame captured before timeout'),
-      };
-      throw new Error(hints[last] || last);
+    let html = '';
+    if (failures.length) {
+      html += '<div style="font-size:12px;color:#b91c1c;background:#fef2f2;border:1px solid #fecaca;padding:6px 10px;border-radius:4px;margin-bottom:10px">';
+      html += failures.map(r => 'leg ' + r.job.leg + ': ' + (hints[r.why] || r.why)).join('<br>');
+      html += '</div>';
     }
-    const res = await fetch(
-      API.base + '/calls/snapshot/' + encodeURIComponent(hit.job_id) + '/image',
-      { headers: API.headers(false) });
-    if (!res.ok) throw new Error('image HTTP ' + res.status);
-    const blob = await res.blob();
-    const dataUrl = await new Promise((resolve, reject) => {
-      const fr = new FileReader();
-      fr.onload = () => resolve(fr.result);
-      fr.onerror = () => reject(new Error('image read failed'));
-      fr.readAsDataURL(blob);
-    });
-    ElMessageBox.alert(
-      `<div style="font-size:12px;color:#6b7280;margin-bottom:6px">leg ${hit.leg} · job ${hit.job_id}</div>` +
-      `<img src="${dataUrl}" style="max-width:100%;border-radius:6px">`,
-      t('Snapshot'),
-      { dangerouslyUseHTMLString: true }
-    );
+    html += '<div style="display:flex;gap:12px;flex-wrap:wrap">';
+    html += successes.map(r =>
+      '<div style="flex:1;min-width:240px">' +
+      '<div style="font-size:12px;color:#6b7280;margin-bottom:6px">leg ' + r.job.leg + ' \xB7 job ' + r.job.job_id + '</div>' +
+      '<img src="' + r.dataUrl + '" style="max-width:100%;border-radius:6px">' +
+      '</div>'
+    ).join('');
+    html += '</div>';
+    ElMessageBox.alert(html, t('Snapshot'), { dangerouslyUseHTMLString: true });
   } catch (e) {
     ElMessage.error(t('Snapshot') + ' failed: ' + (e.message || e));
   } finally {

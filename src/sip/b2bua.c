@@ -2890,6 +2890,16 @@ static int sdp_mlines_equal(const char *a, size_t alen,
 static void maybe_start_media(b2b_call_t *c)
 {
     b2b_core_t *co = c->core;
+    /*  诊断：为什么没进 bridge_confirm（P0：WebRTC→SIP 呼叫零 BRIDGE_CONFIRM）。
+     *  两侧 SDP 齐备是硬条件，任一为 0 都直接返回。 */
+    llog(LOG_INFO, "b2b",
+         "maybe_start_media call=%p media_done=%d cfg.media=%p active=%d "
+         "leg[0].offer=%zu leg[0].answer=%zu leg[1].offer=%zu "
+         "leg[1].answer=%zu state[0]=%d state[1]=%d callid=%s",
+         (void *)c, c->media_done, (void *)co->cfg.media, c->active,
+         c->leg[0].offer_len, c->leg[0].answer_len,
+         c->leg[1].offer_len, c->leg[1].answer_len,
+         (int)c->leg[0].state, (int)c->leg[1].state, c->leg[0].callid);
     if (c->media_done || !co->cfg.media)
         return;
 

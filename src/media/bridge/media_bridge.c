@@ -91,11 +91,13 @@ typedef struct cnode {
      *  neg_* 语义不变（side0=A / side1=B），bridge_confirm 直接采用。 */
     char              *b_offer_sdp;
     size_t             b_offer_len;
-    /*  B 的 answer（SBC 发出 offer、B 应答）。leg=1 的 fmtp/解码参数
-     *  （如 H.264 sprop-parameter-sets）从这里取；bridge_confirm 保存，
-     *  release 释放。 */
+    /*  B 的原始 answer（SBC 发出 offer、B 应答）。leg=1 的 fmtp/解码参数
+     *  （如 H.264 sprop-parameter-sets）从这里取；bridge_answer_hook 每次
+     *  收到原始 200 OK 覆盖并置 b_answer_fresh，bridge_confirm 消费一次后
+     *  清 0，release 释放。 */
     char              *b_answer_sdp;
     size_t             b_answer_len;
+    uint8_t            b_answer_fresh; /* 1=b_answer_sdp 是本轮 answer hook 的原始 SDP */
     uint8_t            rev_pending;  /* 1=已收 B 的 offer，等待 A 的 answer 回 B */
     uint8_t            neg_valid;   /* 1=音频 codec 已终结定型 */
     uint8_t            neg_a_pt;    /* 朝 A（side 0）的音频 PT */
@@ -2090,11 +2092,23 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
                     rtcp_vid_dst = 1;
             }
         }
+        /*  对端是否协商了 rtcp-mux（RFC 5761）：WebRTC 腿恒 mux（SBC 在
+         *  answer 里声明 a=rtcp-mux，音视频共用一条传输）；明文腿 SBC 已
+         *  剥掉 a=rtcp-mux，RTCP 必须按 RFC 3550 §11 发到 RTP 端口 + 1，
+         *  否则对端把 SR/RR 丢弃（PLI 也到不了，视频定格）。 */
+        const int peer_mux = (!r->node) ? 1
+                           : ((other == 0) ? (int)r->node->a_ws
+                                           : (int)r->node->b_ws);
+        int dst_is_rtcp_port = 0;   /* dst 已经是 RTCP 端口（comedia 学到的 RTCP 源） */
+        nsbc_sa_t rtcp_dst_fix;
         const nsbc_sa_t *dst;
         if (rtcp_vid_dst) {
-            dst = r->vrlatched[other]
-                  ? &r->vrlatch[other]
-                  : (r->vhave_peer[other] ? &r->vpeer[other] : &r->latch[other]);
+            if (r->vrlatched[other]) {
+                dst = &r->vrlatch[other];
+                dst_is_rtcp_port = 1;
+            } else {
+                dst = r->vhave_peer[other] ? &r->vpeer[other] : &r->latch[other];
+            }
         } else if (out_vid && r->fd_vrtp[other] >= 0) {
             dst = r->vlatched[other]
                   ? &r->vlatch[other]
@@ -2103,6 +2117,17 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
             dst = r->latched[other]
                   ? &r->latch[other]
                   : (r->have_peer[other] ? &r->peer[other] : &r->latch[other]);
+        }
+        /*  RTCP 目的地是"RTP 端口"（latch/SDP）时，未协商 rtcp-mux 的对端
+         *  实际监听端口是 RTP+1 —— 上面所有 latch 都只从 RTP 包学习
+         *  （音频/视频 RTCP 源另有 vrlatch 单独记录），这里统一补 +1。 */
+        if (is_rtcp && !peer_mux && !dst_is_rtcp_port) {
+            uint16_t dp = nsbc_sa_port(dst);
+            if (dp > 0 && dp < 65535) {
+                rtcp_dst_fix = *dst;
+                nsbc_sa_set_port(&rtcp_dst_fix, (uint16_t)(dp + 1));
+                dst = &rtcp_dst_fix;
+            }
         }
         /* REQ-DTLS-001：明文 RTP → WebRTC 侧（对侧有 dtls 终结器）前加密。
          * RTP/RTCP 按 PT 字节判（与入向对称，rtcp-mux 兼容）。
@@ -2156,10 +2181,14 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
             ++r->diag_sendto[side];
         }
         /*  明文腿的视频必须从独立视频端口发出：源端口与对端发送目标一致，
-         *  避免严格 symmetric-RTP 的 UA 丢弃源端口不匹配的视频包。 */
+         *  避免严格 symmetric-RTP 的 UA 丢弃源端口不匹配的视频包。
+         *  非 rtcp-mux 对端的 RTCP 从通告的 RTCP socket（RTP+1）发出，
+         *  与 SDP 告知对端的端口一致（RFC 3550 §11 / 对称 RTCP）。 */
         int out_fd = rtcp_vid_dst ? r->fd_vrtcp[other]
                      : ((out_vid && r->fd_vrtp[other] >= 0)
                         ? r->fd_vrtp[other] : r->fd_rtp[other]);
+        if (is_rtcp && !rtcp_vid_dst && !peer_mux && r->fd_rtcp[other] >= 0)
+            out_fd = r->fd_rtcp[other];
         ssize_t sret = sendto(out_fd, buf, send_len, MSG_NOSIGNAL,
                               (const struct sockaddr *)&dst->ss, dst->len);
         if (sret != (ssize_t)send_len) {
@@ -2635,13 +2664,51 @@ static int attr_is_webrtc_only(const char *p, size_t llen)
     return 0;
 }
 
+/*  PLEN 方向预扫描：收集 m=video 段里最终会带 a=rtpmap 输出的 PT 集合。
+ *
+ *  2026-11-24 抓包确认的缺陷：attr_is_webrtc_only() 会把浏览器大把
+ *  a=rtpmap:<pt> 行剥掉（只留 VP8/rtx/H264 + 后面追加的 VP9），
+ *  而 plen_slim_fmt_list() 之前把 m=video 的 20 个 PT 全部透传，
+ *  结果 offer 里 m=video 列 21 个 PT、只有 4 条 rtpmap → 非法 SDP，
+ *  Linphone 直接丢弃整个视频段（200 OK 只剩 m=audio），
+ *  连媒体会话都没起来（抓包零 RTP/RTCP）。
+ *  这里按"真正会输出的 rtpmap"构建允许集合，供 slim 收窄 fmt-list。 */
+static void sdp_plain_video_pt_set(const char *sdp, size_t len, uint8_t ok[128])
+{
+    memset(ok, 0, 128);
+    const char *p = sdp, *end = sdp + len;
+    int in_video = 0;
+    while (p < end) {
+        const char *eol = memchr(p, '\n', (size_t)(end - p));
+        const char *le = eol ? eol : end;
+        size_t ll = (size_t)(le - p);
+        while (ll > 0 && p[ll - 1] == '\r') --ll;
+
+        if (ll >= 2 && p[0] == 'm' && p[1] == '=') {
+            in_video = (ll >= 7 && memcmp(p + 2, "video ", 6) == 0);
+        } else if (in_video && ll >= 9 &&
+                   memcmp(p, "a=rtpmap:", 9) == 0 &&
+                   !attr_is_webrtc_only(p, ll)) {
+            int pt = atoi(p + 9);
+            if (pt >= 0 && pt < 128) ok[pt] = 1;
+        }
+        p = eol ? eol + 1 : end;
+    }
+}
+
 /* 精简 m= 行的 fmt-list —— PLEN 模式只保留原始 offer 里已有的子集：
  *   audio 段：PCMA(8) / PCMU(0) + telephone-event 8k(126)
- *   video 段：只保留一个 H264 baseline PT(102)
+ *   video 段：只保留最终会输出 a=rtpmap 的 PT（见 sdp_plain_video_pt_set）
  * 关键：从原始 fmt-list 挑子集，**不塞新 PT**（否则后面没 rtpmap 会让 SIP 端困惑）。
  * 原始 m=audio "8 110 126" → 精简成 "8 126"
- * 原始 m=video "102 103 104 107 108 ...(18 个)" → 精简成 "102" */
-static int plen_slim_fmt_list(char *mline, size_t mline_cap)
+ * 原始 m=video "96 97 102 ...(20 个)" → 只留 96/97/102（其余 rtpmap 已被剥掉）
+ *
+ * 2026-11-24 视频不再硬编码 PT=102 为 H264：
+ *   WebRTC/浏览器对 PT 分配是动态的（同一次 offer，H264 可能是 PT=96 也可能是 PT=102），
+ *   把非 H264 PT 当作 H264 发给 Linphone 会让对方 answer 带 video_port=0 退化成纯音频。
+ *   现在把 m=video 的 fmt-list 原样透传给 SIP 端点，让它自己从 rtpmap 里挑支持的 codec。 */
+static int plen_slim_fmt_list(char *mline, size_t mline_cap,
+                              const uint8_t *video_pt_ok)
 {
     /* m=<type> <port> <proto> <pt1> <pt2> ... → 只留前三个 token + 精简后的 PT 子集 */
     const char *sp1 = strchr(mline, ' ');
@@ -2675,7 +2742,10 @@ static int plen_slim_fmt_list(char *mline, size_t mline_cap)
                     || strcmp(tok, "0") == 0       /* PCMU */
                     || strcmp(tok, "126") == 0);   /* telephone-event 8k */
         } else if (type_len == 5 && memcmp(media_type, "video", 5) == 0) {
-            keep_it = (strcmp(tok, "102") == 0);   /* 唯一保留的 H264 */
+            /*  只保留最终会带 rtpmap 输出的 PT：m=video 里列了 PT 却没有
+             *  对应 a=rtpmap 属非法 SDP，Linphone 会丢弃整个视频段。 */
+            int ptv = atoi(tok);
+            keep_it = (video_pt_ok && ptv >= 0 && ptv < 128 && video_pt_ok[ptv]);
         }
         if (keep_it) {
             size_t cur = strlen(keep);
@@ -3068,6 +3138,115 @@ static int sdp_build_webrtc_answer(
     return (int)used;
 }
 
+/*  RFC 8843(BUNDLE)/5761(rtcp-mux)：WebRTC 腿的多条 m= 段共用同一个传输
+ *  端口（bridge_rewrite_sdp 在 dir=WS 且 video_port==0 时让 video 复用
+ *  audio 端口）。共用端口必须在 answer 的每个未拒绝 m= 段显式声明
+ *  a=rtcp-mux，否则对端按 RFC 3550 认为 RTCP 在 RTP 端口 + 1，SR/RR/PLI
+ *  全部落空（视频定格、质量统计失效）。
+ *  answer 骨架通常由 sdp_build_webrtc_answer 补齐；本函数是最终兜底：
+ *  只在确实存在"两个非零端口相同"时工作，给缺少 a=rtcp-mux 的段补一行，
+ *  已声明则不重复。返回新长度；0=未改动（调用方保留原长度）。 */
+static int sdp_ensure_rtcp_mux(char *buf, size_t cap, size_t len)
+{
+    if (!buf || len == 0 || len >= cap) return 0;
+    /* 1) 是否存在非零端口复用 */
+    uint16_t seen[8];
+    int nseen = 0, shared = 0;
+    const char *p = buf, *end = buf + len;
+    while (p < end) {
+        const char *eol = memchr(p, '\n', (size_t)(end - p));
+        const char *le = eol ? eol : end;
+        size_t ll = (size_t)(le - p);
+        if (ll >= 8 && p[0] == 'm' && p[1] == '=') {
+            const char *q = p + 2;
+            while (q < le && *q != ' ') ++q;
+            while (q < le && *q == ' ') ++q;
+            unsigned v = 0;
+            while (q < le && *q >= '0' && *q <= '9')
+                v = v * 10u + (unsigned)(*q++ - '0');
+            if (v > 0 && v <= 65535u) {
+                for (int i = 0; i < nseen; ++i)
+                    if (seen[i] == (uint16_t)v) shared = 1;
+                if (nseen < 8) seen[nseen++] = (uint16_t)v;
+            }
+        }
+        p = eol ? eol + 1 : end;
+    }
+    if (!shared) return 0;
+
+    /* 2) 逐段复制，段尾补 a=rtcp-mux（已有则不补） */
+    static const char MUX[] = "a=rtcp-mux\r\n";
+    const size_t mux_len = sizeof(MUX) - 1;
+    char *nb = (char *)malloc(cap);
+    if (!nb) return 0;
+    size_t used = 0;
+    int have_sect = 0, sect_port = 0, sect_mux = 0, overflow = 0;
+    p = buf;
+    while (p < end) {
+        const char *eol = memchr(p, '\n', (size_t)(end - p));
+        const char *le = eol ? eol : end;
+        size_t ll = (size_t)(le - p);
+        size_t cl = ll;
+        while (cl > 0 && p[cl - 1] == '\r') --cl;
+
+        int flush_mux = 0;
+        if (cl >= 8 && p[0] == 'm' && p[1] == '=') {
+            if (have_sect && sect_port > 0 && !sect_mux) flush_mux = 1;
+            const char *q = p + 2;
+            while (q < p + cl && *q != ' ') ++q;
+            while (q < p + cl && *q == ' ') ++q;
+            unsigned v = 0;
+            while (q < p + cl && *q >= '0' && *q <= '9')
+                v = v * 10u + (unsigned)(*q++ - '0');
+            sect_port = (int)v;
+            sect_mux = 0;
+            have_sect = 1;
+        } else if (have_sect && cl >= 10 && memcmp(p, "a=rtcp-mux", 10) == 0) {
+            sect_mux = 1;
+        }
+        if (flush_mux) {
+            if (used + mux_len >= cap) { overflow = 1; break; }
+            memcpy(nb + used, MUX, mux_len);
+            used += mux_len;
+        }
+        if (used + ll >= cap) { overflow = 1; break; }
+        memcpy(nb + used, p, ll);
+        used += ll;
+        if (eol) {
+            if (used >= cap) { overflow = 1; break; }
+            nb[used++] = '\n';
+        }
+        p = eol ? eol + 1 : end;
+    }
+    if (!overflow && have_sect && sect_port > 0 && !sect_mux) {
+        /* 末行可能没有换行符（非标准但防御）：先补 CRLF 再落属性 */
+        if (used > 0 && nb[used - 1] != '\n') {
+            if (used + 2 >= cap) {
+                overflow = 1;
+            } else {
+                nb[used++] = '\r';
+                nb[used++] = '\n';
+            }
+        }
+        if (!overflow) {
+            if (used + mux_len < cap) {
+                memcpy(nb + used, MUX, mux_len);
+                used += mux_len;
+            } else {
+                overflow = 1;
+            }
+        }
+    }
+    if (overflow || used == 0 || used >= cap) {
+        free(nb);
+        return 0;
+    }
+    memcpy(buf, nb, used);
+    buf[used] = '\0';
+    free(nb);
+    return (int)used;
+}
+
 /*  RFC 3264 段数对齐：answer 的 m= 段数必须等于 A 原始 offer 的段数。
  * offer_hook 会为 WebRTC B 追加 rejected video m-line（sdp_ensure_video_mline），
  * 浏览器 answer 把它原样回显 → answer 比 A 的 offer 多一段。
@@ -3107,6 +3286,11 @@ int bridge_rewrite_sdp(const char *in, size_t in_len, char *out,
     const char *end = in + in_len;
     uint16_t media_port = rtp_port;
     int media_idx = 0;
+    /*  PLEN 方向：先算出 m=video 里最终保留 rtpmap 的 PT 集合，
+     *  避免 fmt-list 保留全部 PT 而 rtpmap 只输出少数几条（非法 SDP）。 */
+    uint8_t vpt_ok[128];
+    if (dir == MB_SDP_PLAIN)
+        sdp_plain_video_pt_set(in, in_len, vpt_ok);
 
     while (p < end) {
         const char *eol = memchr(p, '\n', (size_t)(end - p));
@@ -3321,7 +3505,7 @@ int bridge_rewrite_sdp(const char *in, size_t in_len, char *out,
 
                     if (dir == MB_SDP_PLAIN && this_port != 0) {
                         llog(LOG_INFO, "media", "rewrite: PLEN slim_fmt IN: %s", tmp);
-                        int slim = plen_slim_fmt_list(tmp, sizeof(tmp));
+                        int slim = plen_slim_fmt_list(tmp, sizeof(tmp), vpt_ok);
                         if (slim > 0) {
                             outlen = (size_t)slim;
                             llog(LOG_INFO, "media", "rewrite: PLEN slim_fmt OK out=%s", tmp);
@@ -3953,7 +4137,11 @@ static cnode_t *entry_get(bridge_mgr_t *m, void *call)
  *      未 offer 过的 PT 会拒绝 SDP → 488/BYE）。
  *  视频：编码名与 PT 完全一致才保留；否则视频段 port=0 降级纯音频
  *  （视频转码尚未实现，不能伪造 PT）。BYPASS 完全不改写。 */
-#define SDP_XC_MAXPT 16
+#define SDP_XC_MAXPT 32   /* 2026-11-24 从 16 提到 32：WebRTC m=video 可有 20+ 个 PT
+                              (含 rtx/red/ulpfec 等冗余 codec)，sdp_xc_parse 截断到 16 会
+                              把 VP9 PT=98 这类 codec 漏掉 → present 检查未命中 →
+                              sdp_xc_add_offer_audio 追加一个新 PT=98（fmt-list 重复），
+                              Linphone answer 里整条 m=video section 消失。 */
 
 typedef struct {
     int found;      /* 是否存在该类型媒体段 */
@@ -4186,6 +4374,54 @@ static int sdp_xc_add_offer_audio(char *sdp, size_t *lenp, size_t cap)
     codec_id_t add_vcid[4];
     int nvadd = 0;
     if (vm.found && vm.port > 0) {
+        /* 扫原始 m=video 行所有 PT token（跳过 "m=video <port> <proto>" 后），
+         * 构建全量 used PT 位图，弥补 vm.c[] 截断（SDP_XC_MAXPT 上限）的漏洞。
+         * 这是 present 命中 + PT used 检查的主数据源。 */
+        int video_used[128] = {0};  /* PT 范围 0..127 */
+        const char *scan = sdp;
+        int safety1 = 0;
+        while (scan < sdp + len && safety1++ < 4096) {
+            if ((size_t)(sdp + len - scan) >= 5 &&
+                memcmp(scan, "m=vid", 5) == 0) break;  /* 找到第一个 m=video  */
+            scan = memchr(scan, '\n', (size_t)(sdp + len - scan));
+            if (!scan) break;
+            ++scan;
+        }
+        if (scan && (size_t)(sdp + len - scan) >= 5) {
+            /* scan 指向 "m=video ..." 行 */
+            const char *lend = memchr(scan, '\n', (size_t)(sdp + len - scan));
+            if (!lend) lend = sdp + len;
+            const char *tok = scan;
+            /* 跳过前三个 token: "m=video", port, proto */
+            for (int skip = 0; skip < 3; ++skip) {
+                const char *sp = memchr(tok, ' ', (size_t)(lend - tok));
+                if (!sp) break;
+                tok = sp + 1;
+            }
+            /* 扫剩余的 PT token，全部标记 used */
+            int safety2 = 0;
+            while (tok < lend && safety2++ < 128) {
+                while (tok < lend && (*tok == ' ' || *tok == '\r' || *tok == '\n')) ++tok;
+                if (tok >= lend) break;
+                const char *next = tok;
+                while (next < lend && *next != ' ' && *next != '\r' && *next != '\n') ++next;
+                if (next == tok) break;  /* 零长度 token → 死循环保护 */
+                char pend = *next;
+                *(char *)next = '\0';
+                int pt_val = atoi(tok);
+                *(char *)next = pend;
+                if (pt_val >= 0 && pt_val < 128) video_used[pt_val] = 1;
+                tok = next;
+            }
+        }
+        char vubuf[256] = ""; size_t vubp = 0;
+        for (int j = 0; j < 128 && vubp < 250; j++)
+            if (video_used[j])
+                vubp += snprintf(vubuf + vubp, sizeof(vubuf) - vubp,
+                                 "%s%d", vubp ? "," : "", j);
+        llog(LOG_INFO, "media", "sdp_xc_add: vm.n=%d vm.port=%d video_used=[%s]",
+             vm.n, vm.port, vubuf);
+
         static const codec_id_t vcand[] = { CODEC_H264, CODEC_VP8, CODEC_VP9 };
         for (size_t ci = 0; ci < sizeof(vcand) / sizeof(vcand[0]); ++ci) {
             const codec_ops_t *ops = codec_registry_find(vcand[ci]);
@@ -4200,31 +4436,47 @@ static int sdp_xc_add_offer_audio(char *sdp, size_t *lenp, size_t cap)
                     break;
                 }
             }
+            llog(LOG_INFO, "media", "sdp_xc_add: vcand[%zu] id=%d name='%s' present=%d",
+                 ci, (int)ops->id, ops->name ? ops->name : "(null)", present);
             if (present) continue;
 
-            /* 选一个未使用的动态 PT（96..127） */
+            /* 选一个未使用的动态 PT（96..127），用 video_used 全量位图 */
             int pt = -1;
             for (int cand_pt = CODEC_PT_DYN_MIN; cand_pt <= 127; ++cand_pt) {
-                int used = 0;
-                for (int j = 0; j < am.n; ++j) if (am.c[j].pt == cand_pt) used = 1;
-                for (int j = 0; j < vm.n; ++j) if (vm.c[j].pt == cand_pt) used = 1;
-                for (int j = 0; j < nvadd; ++j) if (add_vpt[j] == cand_pt) used = 1;
-                if (!used) { pt = cand_pt; break; }
+                if (video_used[cand_pt]) continue;
+                int dup = 0;
+                for (int j = 0; j < nvadd; ++j) if (add_vpt[j] == cand_pt) dup = 1;
+                for (int j = 0; j < am.n; ++j) if (am.c[j].pt == cand_pt) dup = 1;
+                if (!dup) { pt = cand_pt; break; }
             }
             if (pt < 0) break;
+            llog(LOG_INFO, "media", "sdp_xc_add: append video codec id=%d name='%s' pt=%d",
+                 (int)ops->id, ops->name, pt);
+            video_used[pt] = 1;
             add_vcid[nvadd] = ops->id;
             add_vpt[nvadd++] = pt;
         }
     }
 
     if (nadd == 0 && nvadd == 0) return 0;
+    llog(LOG_INFO, "media", "sdp_xc_add_offer_audio: ENTER nadd=%d nvadd=%d len=%zu",
+         nadd, nvadd, len);
 
     char *nb = (char *)malloc(cap + 1);
     if (nb == NULL) return 0;
     size_t used = 0;
     const char *p = sdp, *end = sdp + len;
     int overflow = 0;
-    while (p < end) {
+    int loop_safety = 0;
+    /*  追加的 a=rtpmap/a=fmtp 必须落到媒体段末尾，不能紧跟 m= 行。
+     *  RFC 4566 的媒体描述顺序是 m= → i= → c= → b= → k= → a=，
+     *  紧跟 m= 输出会得到 "m=audio .../a=rtpmap:18/c=IN IP4 ..." 的非法
+     *  顺序（2026-11-24 实测：Linphone/belle-sip 只认 c= 之前的属性，
+     *  于是只回 PT=18、video 段整个消失，且因远端地址解析失败而不发 RTP）。
+     *  这里先缓存，遇到下一个 m= 或 SDP 结束再输出。 */
+    char pend[2048];
+    size_t pendl = 0;
+    while (p < end && loop_safety++ < 65536) {
         const char *eol = memchr(p, '\n', (size_t)(end - p));
         const char *le = eol ? eol : end;
         size_t ll = (size_t)(le - p);
@@ -4238,27 +4490,66 @@ static int sdp_xc_add_offer_audio(char *sdp, size_t *lenp, size_t cap)
             is_m && cl >= 8 && memcmp(p + 2, "video", 5) == 0 &&
             (p[7] == ' ' || p[7] == '\t');
 
-        if (is_audio_m && nadd > 0) {
-            /* 保留原有 fmt-list，仅在行尾追加 SBC 侧 PT */
-            if (put_line(nb, cap, &used, p, cl) != NSBC_OK) {
+        /* 段尾冲刷：上一个媒体段的追加属性在这里落盘 */
+        if (is_m && pendl > 0) {
+            if (put_line(nb, cap, &used, pend, pendl) != NSBC_OK) {
                 overflow = 1;
                 break;
             }
-            char tmp[16];
-            for (int i = 0; i < nadd; ++i) {
-                int tn = snprintf(tmp, sizeof(tmp), " %d", add_pt[i]);
-                if (tn <= 0 ||
-                    put_line(nb, cap, &used, tmp, (size_t)tn) != NSBC_OK) {
-                    overflow = 1;
-                    break;
+            pendl = 0;
+        }
+
+        if (is_audio_m && nadd > 0) {
+            /* parse + 去重 + 重建 fmt-list，与 video 分支保持一致的防御性处理 */
+            char rebuilt[1024]; size_t rb = 0;
+            int first_tok = 1;
+            const char *tok = p, *line_end = p + cl;
+            for (int skip = 0; skip < 3 && tok < line_end; ++skip) {
+                while (tok < line_end && *tok == ' ') ++tok;
+                if (tok >= line_end) break;
+                const char *next = tok;
+                while (next < line_end && *next != ' ') ++next;
+                if (!first_tok) rb += snprintf(rebuilt + rb, sizeof(rebuilt) - rb, " ");
+                rb += snprintf(rebuilt + rb, sizeof(rebuilt) - rb, "%.*s",
+                               (int)(next - tok), tok);
+                tok = next;
+                first_tok = 0;
+            }
+            int seen[128] = {0};
+            int safety3 = 0;
+            while (tok < line_end && safety3++ < 128) {
+                while (tok < line_end && (*tok == ' ' || *tok == '\r' || *tok == '\n')) ++tok;
+                if (tok >= line_end) break;
+                const char *next = tok;
+                while (next < line_end && *next != ' ' && *next != '\r' && *next != '\n') ++next;
+                if (next == tok) break;
+                char pend = *next;
+                *(char *)next = '\0';
+                int pv = atoi(tok);
+                *(char *)next = pend;
+                if (pv >= 0 && pv < 128 && !seen[pv]) {
+                    seen[pv] = 1;
+                    rb += snprintf(rebuilt + rb, sizeof(rebuilt) - rb, " %d", pv);
                 }
+                tok = next;
+            }
+            for (int i = 0; i < nadd; ++i) {
+                if (seen[add_pt[i]]) continue;
+                seen[add_pt[i]] = 1;
+                rb += snprintf(rebuilt + rb, sizeof(rebuilt) - rb, " %d", add_pt[i]);
+            }
+            rebuilt[sizeof(rebuilt) - 1] = '\0';
+            if (put_line(nb, cap, &used, rebuilt, rb) != NSBC_OK) {
+                overflow = 1;
+                break;
             }
             if (overflow) break;
             if (put_line(nb, cap, &used, "\r\n", 2) != NSBC_OK) {
                 overflow = 1;
                 break;
             }
-            /* 在段内补 rtpmap（追加格式项必须有 rtpmap，否则对端无法识别） */
+            /* 在段内补 rtpmap（追加格式项必须有 rtpmap，否则对端无法识别）。
+             * 先缓存到 pend，等本段 c=/a= 行输出完，下一个 m= 前再写。 */
             for (int i = 0; i < nadd; ++i) {
                 const codec_ops_t *ops =
                     codec_find_by_pt_kind(add_pt[i], CODEC_KIND_AUDIO);
@@ -4267,15 +4558,14 @@ static int sdp_xc_add_offer_audio(char *sdp, size_t *lenp, size_t cap)
                 /* G.722 等：SDP 时钟率必须用 RTP 时钟率（8000），
                  * 不能用 PCM 采样率（16000），否则写出非标准 G722/16000 */
                 int rate = codec_rtp_clock_rate(ops);
-                char abuf[128];
-                int an = snprintf(abuf, sizeof(abuf), "a=rtpmap:%d %s/%d",
+                int an = snprintf(pend + pendl, sizeof(pend) - pendl,
+                                  "a=rtpmap:%d %s/%d\r\n",
                                   add_pt[i], nm, rate);
-                if (an <= 0 ||
-                    put_line(nb, cap, &used, abuf, (size_t)an) != NSBC_OK ||
-                    put_line(nb, cap, &used, "\r\n", 2) != NSBC_OK) {
+                if (an <= 0 || (size_t)an >= sizeof(pend) - pendl) {
                     overflow = 1;
                     break;
                 }
+                pendl += (size_t)an;
             }
             if (overflow) break;
             p = eol ? eol + 1 : end;
@@ -4283,19 +4573,53 @@ static int sdp_xc_add_offer_audio(char *sdp, size_t *lenp, size_t cap)
         }
 
         if (is_video_m && nvadd > 0) {
-            /* 保留原有 fmt-list，仅在行尾追加 SBC 侧 PT */
-            if (put_line(nb, cap, &used, p, cl) != NSBC_OK) {
+            /* 先 parse 原始 m=video 行，重建去重后的 fmt-list，
+             * 再追加 add_vpt（跳过已存在的），**绝对不允许重复 PT 出现在输出里**。
+             * 这是最终防御——任何上游（vcand 循环、原始 SDP）导致的重复在这里被抹平。 */
+            char rebuilt[1024]; size_t rb = 0;
+            int first_tok = 1;
+            const char *tok = p, *line_end = p + cl;
+            /* 1. 先复制前三个 token（m=video、port、proto）不去重 */
+            for (int skip = 0; skip < 3 && tok < line_end; ++skip) {
+                while (tok < line_end && *tok == ' ') ++tok;
+                if (tok >= line_end) break;
+                const char *next = tok;
+                while (next < line_end && *next != ' ') ++next;
+                if (!first_tok) rb += snprintf(rebuilt + rb, sizeof(rebuilt) - rb, " ");
+                rb += snprintf(rebuilt + rb, sizeof(rebuilt) - rb, "%.*s",
+                               (int)(next - tok), tok);
+                tok = next;
+                first_tok = 0;
+            }
+            /* 2. 去重复制原始 fmt-list PT */
+            int seen2[128] = {0};
+            int safety4 = 0;
+            while (tok < line_end && safety4++ < 128) {
+                while (tok < line_end && (*tok == ' ' || *tok == '\r' || *tok == '\n')) ++tok;
+                if (tok >= line_end) break;
+                const char *next = tok;
+                while (next < line_end && *next != ' ' && *next != '\r' && *next != '\n') ++next;
+                if (next == tok) break;
+                char pend = *next;
+                *(char *)next = '\0';
+                int pv = atoi(tok);
+                *(char *)next = pend;
+                if (pv >= 0 && pv < 128 && !seen2[pv]) {
+                    seen2[pv] = 1;
+                    rb += snprintf(rebuilt + rb, sizeof(rebuilt) - rb, " %d", pv);
+                }
+                tok = next;
+            }
+            /* 3. 追加 add_vpt 里未出现的 */
+            for (int i = 0; i < nvadd; ++i) {
+                if (seen2[add_vpt[i]]) continue;  /* 原始 fmt-list 里已经有了，跳过 */
+                seen2[add_vpt[i]] = 1;
+                rb += snprintf(rebuilt + rb, sizeof(rebuilt) - rb, " %d", add_vpt[i]);
+            }
+            rebuilt[sizeof(rebuilt) - 1] = '\0';
+            if (put_line(nb, cap, &used, rebuilt, rb) != NSBC_OK) {
                 overflow = 1;
                 break;
-            }
-            char tmp[16];
-            for (int i = 0; i < nvadd; ++i) {
-                int tn = snprintf(tmp, sizeof(tmp), " %d", add_vpt[i]);
-                if (tn <= 0 ||
-                    put_line(nb, cap, &used, tmp, (size_t)tn) != NSBC_OK) {
-                    overflow = 1;
-                    break;
-                }
             }
             if (overflow) break;
             if (put_line(nb, cap, &used, "\r\n", 2) != NSBC_OK) {
@@ -4315,12 +4639,18 @@ static int sdp_xc_add_offer_audio(char *sdp, size_t *lenp, size_t cap)
                 char abuf[768];
                 int an = snprintf(abuf, sizeof(abuf), "a=rtpmap:%d %s/90000",
                                   add_vpt[i], nm);
-                if (an <= 0 ||
-                    put_line(nb, cap, &used, abuf, (size_t)an) != NSBC_OK ||
-                    put_line(nb, cap, &used, "\r\n", 2) != NSBC_OK) {
+                an = (an > 0 && (size_t)an < sizeof(abuf)) ? an : -1;
+                if (an < 0) {
                     overflow = 1;
                     break;
                 }
+                int pn = snprintf(pend + pendl, sizeof(pend) - pendl,
+                                  "%s\r\n", abuf);
+                if (pn <= 0 || (size_t)pn >= sizeof(pend) - pendl) {
+                    overflow = 1;
+                    break;
+                }
+                pendl += (size_t)pn;
                 /* fmtp 由 codec 元数据提供（desc->default_fmtp）：
                  *   H.264 packetization-mode/profile-level-id
                  *   H.265 sprop-max-don-diff=0;sprop-vps/sps/pps
@@ -4333,12 +4663,17 @@ static int sdp_xc_add_offer_audio(char *sdp, size_t *lenp, size_t cap)
                 if (xf) {
                     an = snprintf(abuf, sizeof(abuf), "a=fmtp:%d %s",
                                   add_vpt[i], xf);
-                    if (an <= 0 || (size_t)an >= sizeof(abuf) ||
-                        put_line(nb, cap, &used, abuf, (size_t)an) != NSBC_OK ||
-                        put_line(nb, cap, &used, "\r\n", 2) != NSBC_OK) {
+                    if (an <= 0 || (size_t)an >= sizeof(abuf)) {
                         overflow = 1;
                         break;
                     }
+                    pn = snprintf(pend + pendl, sizeof(pend) - pendl,
+                                  "%s\r\n", abuf);
+                    if (pn <= 0 || (size_t)pn >= sizeof(pend) - pendl) {
+                        overflow = 1;
+                        break;
+                    }
+                    pendl += (size_t)pn;
                 }
             }
             if (overflow) break;
@@ -4356,6 +4691,10 @@ static int sdp_xc_add_offer_audio(char *sdp, size_t *lenp, size_t cap)
         }
         p = eol ? eol + 1 : end;
     }
+    /* SDP 结束时冲刷最后一段的追加属性 */
+    if (!overflow && pendl > 0 &&
+        put_line(nb, cap, &used, pend, pendl) != NSBC_OK)
+        overflow = 1;
     if (overflow || used >= cap) {
         free(nb);
         return 0;
@@ -5384,6 +5723,21 @@ int bridge_answer_hook(void *call, const char *in, size_t inlen,
         br_shard_t *s = &m->sh[ptr_shard(call)];
         pthread_mutex_lock(&s->lock);
         e = entry_find(m, call);
+        /*  ★ B 腿 codec/PT 的权威来源：in 是本轮 B 的原始 200 OK（后续
+         *  hook 会把它改写成回给 A 的 answer，PT 换成 A 侧编号）。
+         *  bridge_confirm 必须基于原始 SDP 建 pmap[1]/answer_pts，否则
+         *  A→B 入包会误判"对端接受"而跳过转码。 */
+        if (e && e->relay && in && inlen) {
+            char *cp = (char *)malloc(inlen + 1);
+            if (cp) {
+                memcpy(cp, in, inlen);
+                cp[inlen] = '\0';
+                free(e->b_answer_sdp);
+                e->b_answer_sdp = cp;
+                e->b_answer_len = inlen;
+                e->b_answer_fresh = 1;
+            }
+        }
         pthread_mutex_unlock(&s->lock);
     }
     if (!e || !e->relay) {
@@ -5428,6 +5782,32 @@ int bridge_answer_hook(void *call, const char *in, size_t inlen,
     char ip[64];
     uint16_t port = 0;
     parse_media_addr(in, inlen, ip, sizeof(ip), &port);
+    llog(LOG_INFO, "media",
+         "answer_hook: B media addr %s:%u (dtls=%d) call=%p",
+         ip[0] ? ip : "(null)", (unsigned)port, e->dtls[1] ? 1 : 0, call);
+
+    /*  NAT 兜底（与 offer_hook A 腿同口径）：SDP c= 私网 + 信令源公网 →
+     *  用信令源 IP 替代（端口保留 SDP 值）。否则 RTP 全部发往私网地址，
+     *  对端收不到也就不会回包，comedia 永远学不到真实地址 → 双向无声。
+     *  纯兜底：对端一旦回包，latch 仍会覆盖成实测地址。 */
+    if (ip[0] && !e->dtls[1]) {
+        b2b_call_t *bc1 = b2b_call_is_alive(call) ? (b2b_call_t *)call : NULL;
+        char sip_src[64] = "";
+        if (bc1 && bc1->leg[1].dst.ss.ss_family == AF_INET) {
+            const struct sockaddr_in *sin1 =
+                (const struct sockaddr_in *)&bc1->leg[1].dst.ss;
+            inet_ntop(AF_INET, &sin1->sin_addr, sip_src, sizeof(sip_src));
+        }
+        if (sip_src[0] && mb_ipv4_is_private(ip) &&
+            !mb_ipv4_is_private(sip_src)) {
+            llog(LOG_WARN, "media",
+                 "answer_hook: B SDP 私网地址 %s 不可达（信令源 %s，NAT 后）"
+                 " → RTP 目标改用信令源 IP，端口保留 %u",
+                 ip, sip_src, (unsigned)port);
+            snprintf(ip, sizeof(ip), "%s", sip_src);
+        }
+    }
+
     if (ip[0] && !e->dtls[1]) {
         /* B=WebRTC（dtls[1] 非空）时不设固定 peer：ICE 实际源地址/端口
          * 与 SDP c=/m= 可能不同（浏览器任选候选），该侧纯 latch 首包
@@ -5708,6 +6088,18 @@ int bridge_answer_hook(void *call, const char *in, size_t inlen,
         llog(LOG_DEBUG, "dtls", "SRTP_RELAY: answer inject A-side ICE credentials "
              "fd=%d ice_ufrag=%s fp=%s",
              e->relay->fd_rtp[0], dcp->ice_ufrag, dcp->fp_sha256);
+    }
+    /*  RFC 5761 最终兜底：WebRTC 腿音视频共用同一媒体端口（BUNDLE）时，
+     *  answer 每个未拒绝 m= 段都必须显式带 a=rtcp-mux。骨架缺失/被上游
+     *  重建丢掉时在这里补齐；已有则不重复（函数内部判断端口是否复用）。 */
+    if (e->a_ws) {
+        int mn = sdp_ensure_rtcp_mux(out, outsz, (size_t)n);
+        if (mn > 0) {
+            llog(LOG_INFO, "media",
+                 "answer_hook: injected a=rtcp-mux for shared BUNDLE port "
+                 "(n=%d)", mn);
+            n = mn;
+        }
     }
     /* B=WebRTC：answer SDP 来自 B（此时 answer_hook 的 in 就是 B 的 answer），
      * 提取 B 的 fingerprint 注入 dtls[1]，完成后握手自动校验。
@@ -6633,7 +7025,9 @@ int bridge_confirm(bridge_mgr_t *m, void *call, const char *offer,
     if (!m || !call || !offer || !offer_len || !answer || !answer_len)
         return NSBC_INVAL;
 
-    /*  完整 SDP dump：offer=A 腿原始 INVITE SDP，answer=B 腿原始 200 OK SDP
+    /*  完整 SDP dump：offer=A 腿原始 INVITE SDP；answer 是调用方传入的
+     *  SDP（入呼场景为 answer hook 回给 A 的改写 answer，B 原始 200 OK
+     *  另由 b_answer_sdp stash，见下方解析）
      * 分段打（每 256B 一行），避免单行过长被日志截断 */
     llog(LOG_INFO, "media",
          "BRIDGE_CONFIRM call=%p offer_len=%zu answer_len=%zu",
@@ -6658,38 +7052,27 @@ int bridge_confirm(bridge_mgr_t *m, void *call, const char *offer,
     /* bridge_decide 全路径返回 NSBC_OK（与 offer/answer hook 同口径，
      * 不检查返回值）；初值兜底，决策结果必被其写入。 */
     mb_mode_t final_mode = MB_BYPASS;
-    bridge_decide(m, offer, offer_len, answer, answer_len, &final_mode);
 
-    /*  通用 codec 列表提取（PT + codec_id）
-     * 无论 bridge_decide 返回什么，都解析拿到两侧 audio codec 列表，
-     * 为运行时通用转码做准备（G.711 互转 + G.729 互转 + 跨 codec）。 */
-    uint8_t offer_pts[8], answer_pts[8];
-    codec_id_t offer_cids[8], answer_cids[8];
-    int offer_n = sdp_extract_audio_codecs(offer, offer_len, offer_pts, offer_cids, 8);
-    int answer_n = sdp_extract_audio_codecs(answer, answer_len, answer_pts, answer_cids, 8);
-
-    /*  完整逐腿 PT/cid 列表（payload map 输入）。逐腿终结会把 offer_n/answer_n
+    /*  A 腿（side 0）codec 列表：offer 就是 A 的原始 INVITE SDP。
+     *  完整逐腿 PT/cid 列表（payload map 输入）——逐腿终结会把 offer_n/answer_n
      *  收窄到 1 条最终 codec，但 map 需要保留全部协商 PT（含 telephone-event/
      *  CN 旁路载荷），否则事件包无法识别与转发。 */
-    uint8_t offer_all_pts[8], answer_all_pts[8];
-    codec_id_t offer_all_cids[8], answer_all_cids[8];
-    int offer_all_n = offer_n, answer_all_n = answer_n;
+    uint8_t offer_pts[8];
+    codec_id_t offer_cids[8];
+    int offer_n = sdp_extract_audio_codecs(offer, offer_len, offer_pts, offer_cids, 8);
+    uint8_t offer_all_pts[8];
+    codec_id_t offer_all_cids[8];
+    int offer_all_n = offer_n;
     if (offer_all_n > 0) {
         memcpy(offer_all_pts, offer_pts, (size_t)offer_all_n);
         memcpy(offer_all_cids, offer_cids,
                sizeof(codec_id_t) * (size_t)offer_all_n);
     }
-    if (answer_all_n > 0) {
-        memcpy(answer_all_pts, answer_pts, (size_t)answer_all_n);
-        memcpy(answer_all_cids, answer_cids,
-               sizeof(codec_id_t) * (size_t)answer_all_n);
-    }
 
     /*  REQ-MEDIA-VIDEO-003：video PT 提取 —— 独立于 audio codec，
      * 因为 pt_allowed[8] 槽给 audio 用刚好够。video PT 单独存 video_pt_allowed。 */
-    uint8_t offer_video_pts[8], answer_video_pts[8];
+    uint8_t offer_video_pts[8];
     int offer_video_n = sdp_extract_video_codecs(offer, offer_len, offer_video_pts, 8);
-    int answer_video_n = sdp_extract_video_codecs(answer, answer_len, answer_video_pts, 8);
 
     br_shard_t *s = &m->sh[ptr_shard(call)];
     pthread_mutex_lock(&s->lock);
@@ -6698,6 +7081,43 @@ int bridge_confirm(bridge_mgr_t *m, void *call, const char *offer,
         pthread_mutex_unlock(&s->lock);
         return NSBC_NOENT;
     }
+
+    /*  ★ B 腿（side 1）的 codec/PT 必须基于 B 的原始 200 OK：
+     *  answer 参数是 answer hook 回给 A 的改写 SDP（A 侧 PT 编号），
+     *  拿它建 pmap[1]/answer_pts 会让"A→B 的入包"误判对端接受同 codec，
+     *  运行时跳过转码直接 relay（浏览器收到 G.729 无声）。
+     *  bridge_answer_hook 已把 B 原始 200 OK stash 到 b_answer_sdp 并置
+     *  fresh；没有 fresh（B 发起 re-INVITE 方向反转）时回退 answer 参数。 */
+    const char *b_sdp = answer;
+    size_t b_sdp_len = answer_len;
+    if (e->b_answer_fresh && e->b_answer_sdp && e->b_answer_len) {
+        b_sdp = e->b_answer_sdp;
+        b_sdp_len = e->b_answer_len;
+    }
+    e->b_answer_fresh = 0;
+    llog(LOG_INFO, "media",
+         "BRIDGE_B_SDP call=%p source=%s len=%zu",
+         call, (b_sdp == answer) ? "param" : "raw200", b_sdp_len);
+
+    bridge_decide(m, offer, offer_len, b_sdp, b_sdp_len, &final_mode);
+
+    /*  通用 codec 列表提取（PT + codec_id）
+     * 无论 bridge_decide 返回什么，都解析拿到两侧 audio codec 列表，
+     * 为运行时通用转码做准备（G.711 互转 + G.729 互转 + 跨 codec）。 */
+    uint8_t answer_pts[8];
+    codec_id_t answer_cids[8];
+    int answer_n = sdp_extract_audio_codecs(b_sdp, b_sdp_len, answer_pts, answer_cids, 8);
+    uint8_t answer_all_pts[8];
+    codec_id_t answer_all_cids[8];
+    int answer_all_n = answer_n;
+    if (answer_all_n > 0) {
+        memcpy(answer_all_pts, answer_pts, (size_t)answer_all_n);
+        memcpy(answer_all_cids, answer_cids,
+               sizeof(codec_id_t) * (size_t)answer_all_n);
+    }
+    uint8_t answer_video_pts[8];
+    int answer_video_n = sdp_extract_video_codecs(b_sdp, b_sdp_len, answer_video_pts, 8);
+
     if (e->relay) {
         /*  第 1 项：逐腿 SDP 终结后两侧音频 codec 已在 answer_hook 定型，
          *  直接用这对 (A,B) 做转码计划，保证与回给 A 的 answer 完全一致。
@@ -6738,29 +7158,68 @@ int bridge_confirm(bridge_mgr_t *m, void *call, const char *offer,
         memcpy(e->audio_pt[1], answer_pts, (size_t)answer_n);
         memcpy(e->audio_cid[1], answer_cids, sizeof(codec_id_t) * (size_t)answer_n);
 
+        /*  逐腿终结后每腿只协商一个音频 codec（+ telephone-event）：
+         *  pmap 收窄到该 PT，否则 peer_accepts_payload 会拿"offer/answer
+         *  里列过但未选中"的 codec 误判可零转码中继（例如 A 的 offer 里
+         *  也列了 PCMA，但最终协商是 G.729）。 */
+        const uint8_t *map_pts0 = offer_all_pts;
+        const codec_id_t *map_cids0 = offer_all_cids;
+        int map_n0 = offer_all_n;
+        const uint8_t *map_pts1 = answer_all_pts;
+        const codec_id_t *map_cids1 = answer_all_cids;
+        int map_n1 = answer_all_n;
+        uint8_t narrow0[2], narrow1[2];
+        codec_id_t narrow_c0[2], narrow_c1[2];
+        if (e->neg_valid && e->neg_a_pt != 0xFF && e->neg_b_pt != 0xFF) {
+            int n0 = 0, n1 = 0;
+            narrow0[n0] = e->neg_a_pt;
+            narrow_c0[n0] = e->neg_a_cid;
+            ++n0;
+            if (e->neg_a_te) {
+                narrow0[n0] = e->neg_a_te;
+                narrow_c0[n0] = CODEC_TELEPHONE_EVENT;
+                ++n0;
+            }
+            narrow1[n1] = e->neg_b_pt;
+            narrow_c1[n1] = e->neg_b_cid;
+            ++n1;
+            if (e->neg_b_te) {
+                narrow1[n1] = e->neg_b_te;
+                narrow_c1[n1] = CODEC_TELEPHONE_EVENT;
+                ++n1;
+            }
+            map_pts0 = narrow0;
+            map_cids0 = narrow_c0;
+            map_n0 = n0;
+            map_pts1 = narrow1;
+            map_cids1 = narrow_c1;
+            map_n1 = n1;
+        }
+
         /* 每腿 payload map（§2.2）：名字做主键、PT 做索引，保存 rate/fmtp。
          * 运行时 relay/transcode 判定与旁路载荷转发都查这张表。 */
         build_leg_pmap(e, 0, offer, offer_len,
-                       offer_all_pts, offer_all_cids, offer_all_n);
-        build_leg_pmap(e, 1, answer, answer_len,
-                       answer_all_pts, answer_all_cids, answer_all_n);
+                       map_pts0, map_cids0, map_n0);
+        build_leg_pmap(e, 1, b_sdp, b_sdp_len,
+                       map_pts1, map_cids1, map_n1);
 
 
 
         /*  保存 B 的 answer：leg 1 的 fmtp（如 H.264 sprop-parameter-sets）
-         *  仅存在于该 SDP 中；re-INVITE 每次覆盖，malloc 失败则清空。 */
-        {
+         *  仅存在于该 SDP 中。b_sdp 已经是 answer hook stash 的原始 200 OK
+         *  时无需重复拷贝；否则（如 B 发起 re-INVITE 方向反转）覆盖。 */
+        if (b_sdp != e->b_answer_sdp) {
             char *cp = NULL;
-            if (answer && answer_len) {
-                cp = (char *)malloc(answer_len + 1);
+            if (b_sdp && b_sdp_len) {
+                cp = (char *)malloc(b_sdp_len + 1);
                 if (cp) {
-                    memcpy(cp, answer, answer_len);
-                    cp[answer_len] = '\0';
+                    memcpy(cp, b_sdp, b_sdp_len);
+                    cp[b_sdp_len] = '\0';
                 }
             }
             free(e->b_answer_sdp);
             e->b_answer_sdp = cp;
-            e->b_answer_len = cp ? answer_len : 0;
+            e->b_answer_len = cp ? b_sdp_len : 0;
         }
 
         e->video_pt_allowed_count[0] = offer_video_n;
@@ -6794,7 +7253,7 @@ int bridge_confirm(bridge_mgr_t *m, void *call, const char *offer,
             } else {
                 sdp_vsel_t va, vb;
                 if (sdp_video_select(offer, offer_len, &va) && va.port > 0 &&
-                    sdp_video_select(answer, answer_len, &vb) && vb.port > 0) {
+                    sdp_video_select(b_sdp, b_sdp_len, &vb) && vb.port > 0) {
                     v_apt  = (uint8_t)va.pt;
                     v_acid = va.cid;
                     v_bpt  = (uint8_t)vb.pt;
@@ -6890,7 +7349,7 @@ video_plan_done: ;
                     r_cid[0] = va.cid;
                     r_pt[0]  = (uint8_t)va.pt;
                 }
-                if (sdp_video_select(answer, answer_len, &vb) && vb.port > 0) {
+                if (sdp_video_select(b_sdp, b_sdp_len, &vb) && vb.port > 0) {
                     r_cid[1] = vb.cid;
                     r_pt[1]  = (uint8_t)vb.pt;
                 }
@@ -7037,7 +7496,7 @@ video_plan_done: ;
         /*  DTMF RFC4733：扫描 offer/answer SDP 提取 telephone-event PT
          * 顶层 static find_dtmf_pt（函数外定义）负责实际解析 */
         e->dtmf_pt[0] = find_dtmf_pt(offer, offer_len);
-        e->dtmf_pt[1] = find_dtmf_pt(answer, answer_len);
+        e->dtmf_pt[1] = find_dtmf_pt(b_sdp, b_sdp_len);
         /*  第 1 项：answer 已改写成 A 的 PT 域 —— 不能再用它推断 B 侧的
          *  telephone-event PT，必须用终结时从 B 原始 answer 里取的值。 */
         if (e->neg_valid) {
@@ -7076,9 +7535,9 @@ video_plan_done: ;
                         nd[0] = SDP_DIR_INACTIVE;
                 }
             }
-            if (answer_len > 0) {
+            if (b_sdp_len > 0) {
                 memset(&sd, 0, sizeof(sd));
-                if (sdp_parse(&sd, answer, answer_len) == NSBC_OK && sd.nmedia > 0) {
+                if (sdp_parse(&sd, b_sdp, b_sdp_len) == NSBC_OK && sd.nmedia > 0) {
                     nd[1] = sdp_media_effective_dir(&sd, &sd.media[0]);
                     if (sdp_media_is_legacy_hold(&sd, &sd.media[0]))
                         nd[1] = SDP_DIR_INACTIVE;
@@ -7205,8 +7664,8 @@ video_plan_done: ;
                 size_t src_sdp_len = (side == 0) ? e->a_offer_len
                                                  : e->b_offer_len;
                 /* 目标腿 SDP：side=0 目标是 B（answer），side=1 目标是 A（offer）*/
-                const char *dst_sdp = (side == 0) ? answer : offer;
-                size_t dst_sdp_len = (side == 0) ? answer_len : offer_len;
+                const char *dst_sdp = (side == 0) ? b_sdp : offer;
+                size_t dst_sdp_len = (side == 0) ? b_sdp_len : offer_len;
                 /* fmtp 透传：优先取 payload map 里协商好的 fmtp（名字命中、
                  * 已校验 rate），缺失时回退 SDP 文本扫描。 */
                 s_fmtp[0] = '\0';
