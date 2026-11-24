@@ -139,7 +139,7 @@
       try { saved = localStorage.getItem('nsbc_lang'); } catch (e) {}
       var lang = saved || ((navigator.language || '').indexOf('zh') === 0 ? 'zh' : 'en');
       window.NSBC_LANG = lang;
-      if (lang === 'zh') document.write('<script src="js/lang-zh.js?v=20261124a"><\/script>');
+      if (lang === 'zh') document.write('<script src="js/lang-zh.js?v=20261124b"><\/script>');
     })();
   </script>
   <script src="js/i18n.js"></script>
@@ -670,7 +670,7 @@
 </div>
 
 <!-- 应用核心（API、编辑器、工厂、App 创建） -->
-<script src="js/app-core.js?v=20261124b"></script>
+<script src="js/app-core.js?v=20261124c"></script>
 <!-- CRUD 实体页面（extensions/gateways/trunks 等） -->
 <script src="js/pages-crud.js?v=20261121a"></script>
 <!-- 实时监控面板（realtime/channels/cdrs 等） -->

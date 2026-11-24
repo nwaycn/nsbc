@@ -70,8 +70,9 @@
  *  - 256KB 对这些命令绰绰有余；32MB 堆太重回退。 */
 #define CTL_BUF_MAX (256 * 1024)
 #define CTL_OUT_MAX (256 * 1024)
-/* uuid_dump：两 Leg × 各 2KB SDP + 头行，16KB 足够 */
-#define CTL_DUMP_MAX (16 * 1024)
+/* uuid_dump：两 Leg × (offer+answer)，WebRTC/视频 SDP 单段可达 8KB，
+ * 满载 2×2×8KB=32KB，16KB 会在视频通话上触发 ERR dump failed。 */
+#define CTL_DUMP_MAX (64 * 1024)
 
 typedef struct {
     int fd;

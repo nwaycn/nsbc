@@ -8,15 +8,15 @@
 
 | 能力 | H.264 | H.265/HEVC | VP8 | VP9 |
 |---|---|---|---|---|
-| SDP 协商 | 支持 | 支持（无 fmtp，见 G3） | 支持 | 支持 |
+| SDP 协商 | 支持 | 支持（含 sprop-*，见 G3） | 支持 | 支持 |
 | RTP 打包/解包 | RFC 6184 | RFC 7798 | RFC 7741 | RFC 9628 |
 | 关键帧判定 | 支持 | IRAP + VPS/SPS/PPS | 支持 | 支持 |
 | 解码 | 支持 | 支持 | 支持 | 支持 |
 | 编码 | 支持 | 需 libx265（G2） | 需 libvpx | 需 libvpx |
 | 转码到任意视频编码 | 支持 | 支持 | 支持 | 支持 |
 | 录像（→ .h264 → mp4） | 支持（reasm 直录） | 支持（转码录制） | 支持（转码录制） | 支持（转码录制） |
-| 抓图（JPEG） | 支持 | 不支持（G4） | 不支持（G4） | 不支持（G4） |
-| Web 抓图入口 | 支持 | — | — | — |
+| 抓图（JPEG） | 支持 | 支持 | 支持 | 支持 |
+| Web 抓图入口 | 支持 | 支持 | 支持 | 支持 |
 
 视频编解码由 `mod_av`（FFmpeg）统一提供；无 FFmpeg 构建时视频 `codec_ops` 仍注册但 `vid_*` 为空，`codec_can_decode/encode` 返回 false，媒体面退化为纯透传。
 
@@ -59,9 +59,15 @@ H.265 编码参数：`libx265` + `preset=ultrafast` + `x265-params=tune=zerolate
 
 ## 5. 抓图（snapshot_job）
 
-- 数据源：H.264 腿的完整 AU（`vid_reasm`），解析 SPS/PPS，按 `SNAPSHOT_MAX_FRAMES`（3）取候选帧，过滤黑帧/过小帧（<160×120），择优编码为 JPEG。
+- 数据源：`BUG_VIDEO_AU` 全局消费者，按腿取完整 AU：
+  - H.264 腿：`vid_reasm`（RTP 重组）；
+  - H.265/VP8/VP9 腿：`video_xcode_create_tap` 观察实例（只解包，不解码/不重编码），同编码直通呼叫也会建立；
+  - 上述实例通过 `au sink` 投递 `(au, len, ts, key, codec_id)`，抓图作业按 `codec_id` 选解码器。
+- 编译期能力：H.264/H.265（FFmpeg 内建 HEVC 解码）、VP8/VP9（FFmpeg 内建）任一缺失时返回 `NO_CODEC`，不会空转等待。
+- 参数集：H.264 补 SPS/PPS，H.265 补 VPS/SPS/PPS（带内优先，缺失时回落到 SDP `sprop-*`）；VP8/VP9 裸帧直喂，不做 Annex-B 处理。
+- 取帧策略：按 `SNAPSHOT_MAX_FRAMES`（3）取候选帧，过滤黑帧/过小帧（<160×120），择优编码为 JPEG。
 - 默认等关键帧超时 2500ms；同一呼叫同一腿最短间隔 2000ms；产物目录 `NSBC_SNAPSHOT_DIR`（默认 `/tmp/nsbc_snapshots`），TTL 默认 3600s 后清理。
-- 失败码：`SNAPSHOT_NO_VIDEO / NO_KEYFRAME / NO_PARAM_SETS / DECODE_FAIL / TOO_SMALL / BLACK_FRAME / BUSY / TIMEOUT`。
+- 失败码：`SNAPSHOT_NO_VIDEO / NO_KEYFRAME / NO_PARAM_SETS / NO_CODEC / DECODE_FAIL / TOO_SMALL / BLACK_FRAME / BUSY / TIMEOUT`。
 - OAM：`snapshot <call-id> [leg] [frames]`、`snapshot_status <job-id>`。
 - Web：`POST /api/v1/calls/{id}/snapshot` 启动；`GET /api/v1/calls/snapshot/{job}` 轮询；`GET /api/v1/calls/snapshot/{job}/image` 取 JPEG（路径必须落在 `NSBC_SNAPSHOT_DIR` 内）；前端在途通话页「抓图」按钮直接弹窗预览。
 
@@ -81,8 +87,8 @@ H.265 编码参数：`libx265` + `preset=ultrafast` + `x265-params=tune=zerolate
 
 - **G1 未编译验证**：本次改动仅做过静态审查与 `cargo check`；C 侧需在构建机执行 `make -j"$(nproc)"` 才能确认。另：`web` 的 `cargo test` 在仓库基线上即编译失败（测试用 `MockCore.canned` 未随 `Arc<Mutex<...>>` 改造更新），与视频改动无关。
 - **G2 libx265 依赖**：H.264→H.265 方向需要目标机 FFmpeg 带 `libx265`；缺失时该方向创建转码失败并保持透传。H.265 作为源（解码/录像/抓图前置）不受影响。上线前需 `ffmpeg -encoders | grep 265` 确认。
-- **G3 H.265 SDP 参数集缺失**：SDP 只生成 `a=rtpmap`，不生成 `sprop-vps/sps/pps`，完全依赖带内参数集（已开 `repeat-headers=1`）；对端若严格要求 fmtp 可能协商失败或首帧解码失败。
-- **G4 抓图仅覆盖 H.264**：VP8/VP9/H.265 腿无法抓图（`snapshot_job` 只解 H.264 AU）。要覆盖需把帧源改挂 `video_xcode` 解包/解码输出。
+- **G3 H.265 SDP 参数集（已修复）**：注册期用与转码完全一致的 x265 参数（`preset=ultrafast`、`tune=zerolatency:repeat-headers=1:keyint=30:min-keyint=30:scenecut=0`）编一帧 320x240，从 Annex-B 码流提取 VPS/SPS/PPS，base64 后缓存到 `codec_ops_t.default_fmtp`，SDP 输出 `a=fmtp:<pt> sprop-max-don-diff=0;sprop-vps=...;sprop-sps=...;sprop-pps=...`。自动 offer（`b2bua.c`）与视频段 PT 追加（`media_bridge.c`）统一从该字段读取；透传路径原样转发对端 fmtp（视频 fmtp 缓冲已从 96 扩到 512，避免长 sprop 被截断）。libx265 缺失时退化为仅 `sprop-max-don-diff=0`，仍依赖带内参数集。注：sprop 里的 SPS 是 320x240 的编码器初始值，实际码流首帧（IDR）会带同参数的参数集覆盖，主流解码器均可重初始化。
+- **G4 抓图仍依赖对端关键帧**：PLI 是唯一手段，对端不响应或 GOP 极长时可能超时（`NO_KEYFRAME`）。同腿 2s 内重复抓图会被间隔限制拒绝。
 - **G5 中途开录不生效（非 H.264 腿）**：`rec_xcode` / 复用 sink 仅在 `bridge_confirm` 时按「当时是否有录制会话」建立。通话建立后才开录且无 re-INVITE 时，VP8/VP9/H.265 腿视频不进录像；H.264 腿不受影响。已建立后停录再开录可继续复用。
 - **G6 H.265 RTP AP 假设无 DONL**：按 `sprop-max-don-diff=0` 解析 AP（2 字节长度前缀）。带 DONL 的对端会解析错位。
 - **G7 H.265 只要求解码器即可作为目标编码**：`xc_video_cid` 对 H.265 只检查 `codec_can_decode`，无 libx265 时 H.264→H.265 方向会走到创建失败（有告警、可回退透传），但不会提前拒绝协商。
@@ -96,12 +102,11 @@ H.265 编码参数：`libx265` + `preset=ultrafast` + `x265-params=tune=zerolate
 1. 构建：`make -j"$(nproc)"`；`cd web && cargo build`；`ffmpeg -encoders | grep -i 265`。
 2. 编码组合（均开录像）：`VP8↔VP8`、`VP8↔H.264`、`VP9↔VP8`、`H.265↔H.265`、`H.265↔H.264`。
 3. 预期日志：`video_xcode created src=... dst=...`；复用腿无 `VIDEO_REC_XCODE`；独立录制腿有 `VIDEO_REC_XCODE ... -> H264`；`rec_feed_video` 帧数 > 0。
-4. 产物：mp4 可播放、音画同步；抓图 JPEG 可预览。
-5. 回归：纯 H.264 通话、纯音频通话、H.264-only 录像不退化。
+4. 产物：mp4 可播放、音画同步；对 H.264 / H.265 / VP8 / VP9 四种编码各抓图一次，JPEG 可预览；纯音频通话抓图返回 `NO_VIDEO`。
+5. H.265 fmtp：抓包确认 SDP 中 `a=rtpmap:<pt> H265/90000` 后紧跟 `a=fmtp:<pt> sprop-max-don-diff=0;sprop-vps=...;sprop-sps=...;sprop-pps=...`；日志出现 `HEVC sprop ready: vps=..B sps=..B pps=..B`；libx265 缺失时为 `HEVC sprop: libx265 not available` 且 fmtp 只含 `sprop-max-don-diff=0`。
+6. 回归：纯 H.264 通话、纯音频通话、H.264-only 录像不退化。
 
 ## 9. 后续路线
 
-- P1：抓图帧源接入 `video_xcode`，覆盖 VP8/VP9/H.265。
 - P1：录制链路改为「确认时创建、feed 时动态取会话」，消除 G5。
-- P2：H.265 SDP 增加 `sprop-vps/sps/pps`（从首帧参数集缓存回填），并支持 `sprop-max-don-diff`。
 - P2：转码分辨率/码率按 SDP 与 RTCP 反馈自适应（G8/G9）。

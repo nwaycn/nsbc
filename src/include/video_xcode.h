@@ -23,7 +23,8 @@ typedef void (*video_xcode_emit_fn)(void *ud, const uint8_t *pkt, size_t len);
 
 /* 每个重编码成功的帧回调一次（H.264 Annex-B，含起始码/SPS/PPS）。
  * 供录制旁路直接取 AU，免去再打包成 RTP 又解包的开销。
- * key=1 表示该帧为 IDR；ts 为输出 90kHz RTP 时间戳。 */
+ * key=1 表示该帧为 IDR；ts 为输出 90kHz RTP 时间戳。
+ * tap 实例（video_xcode_create_tap）回调的是源编码 AU，格式见该函数说明。 */
 typedef void (*video_xcode_au_fn)(void *ud, const uint8_t *au, size_t len,
                                   uint32_t ts, int key);
 
@@ -31,6 +32,12 @@ typedef void (*video_xcode_au_fn)(void *ud, const uint8_t *au, size_t len,
 video_xcode_t *video_xcode_create(codec_id_t src, codec_id_t dst,
                                   uint8_t src_pt, uint8_t dst_pt,
                                   uint32_t out_ssrc);
+
+/* 观察模式（同编码也建）：只解包，不经解码/重编码，收齐完整帧即回调
+ * au sink，交付源编码 AU（H.264/H.265 为 Annex-B，VP8/VP9 为裸帧）。
+ * 供录像（H.264 腿）与抓图（全部编码）使用，几乎不占 CPU。 */
+video_xcode_t *video_xcode_create_tap(codec_id_t src, uint8_t src_pt);
+
 void video_xcode_destroy(video_xcode_t *vx);
 
 /* 输入一个源腿 RTP 载荷；收齐完整帧时内部解码/重编码并多次回调 emit。

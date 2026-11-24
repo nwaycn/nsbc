@@ -35,6 +35,7 @@
 #ifdef HAVE_FFMPEG
 #include <libavcodec/avcodec.h>
 #include <libavutil/opt.h>
+#include <libavutil/base64.h>
 #include <libavutil/samplefmt.h>
 #include <libavutil/imgutils.h>
 #include <libswresample/swresample.h>
@@ -1177,6 +1178,164 @@ VIDEO_ATTACH(CODEC_H265, avcodec_h265)
 VIDEO_ATTACH(CODEC_MJPEG, avcodec_mjpeg)
 #endif /* HAVE_FFMPEG */
 
+#ifdef HAVE_FFMPEG
+/* ============================================================================
+ * H.265 SDP 参数集（sprop-vps / sprop-sps / sprop-pps）
+ *
+ * RFC 7798 允许在 fmtp 中带外宣告参数集。SBC 自己编码 H.265（H.264→H.265
+ * 方向）时，对端在收到首个 IDR 前需要这些参数集初始化解码器；部分终端即使
+ * 支持带内参数集也会优先读 fmtp。
+ *
+ * 参数集与编码器配置强相关，而 SDP 生成时编码器尚未启动，因此这里在 codec
+ * 注册阶段用与转码一致的参数编一帧，从码流中提取 VPS/SPS/PPS 并 base64 缓存。
+ * 只执行一次；libx265 不可用时返回 NULL，SDP 退化为不带 sprop（仅带内）。
+ * ==========================================================================*/
+static char g_hevc_sprop[768];
+
+/* 从 Annex-B 码流取下一个 NAL（支持 3/4 字节起始码） */
+static int hevc_annexb_next(const uint8_t *p, size_t len, size_t *off,
+                            const uint8_t **nal, size_t *nal_len)
+{
+    size_t i = *off;
+    while (i + 3 <= len) {
+        size_t sc = 0;
+        if (p[i] == 0 && p[i + 1] == 0) {
+            if (p[i + 2] == 1) sc = 3;
+            else if (i + 4 <= len && p[i + 2] == 0 && p[i + 3] == 1) sc = 4;
+        }
+        if (sc == 0) { ++i; continue; }
+
+        size_t ns = i + sc;
+        size_t j  = ns;
+        while (j + 3 <= len) {
+            if (p[j] == 0 && p[j + 1] == 0 &&
+                (p[j + 2] == 1 ||
+                 (j + 4 <= len && p[j + 2] == 0 && p[j + 3] == 1)))
+                break;
+            ++j;
+        }
+        if (j + 3 > len) j = len;
+
+        *nal     = p + ns;
+        *nal_len = j - ns;
+        *off     = j;
+        return *nal_len > 0;
+    }
+    return 0;
+}
+
+static void hevc_sprop_build_once(void)
+{
+    /* codec 模块 reload 会重新走一遍注册，这里保证真正只编一次 */
+    static int done;
+    if (done) return;
+    done = 1;
+
+    const AVCodec *codec = avcodec_find_encoder_by_name("libx265");
+    if (!codec) {
+        llog(LOG_INFO, "av", "HEVC sprop: libx265 not available");
+        return;
+    }
+
+    AVCodecContext *ctx  = avcodec_alloc_context3(codec);
+    AVDictionary   *opts = NULL;
+    AVFrame        *frm  = NULL;
+    AVPacket       *pkt  = NULL;
+    uint8_t vps[256], sps[512], pps[256];
+    size_t vps_len = 0, sps_len = 0, pps_len = 0;
+    if (!ctx) return;
+
+    ctx->width       = 320;
+    ctx->height      = 240;
+    ctx->pix_fmt     = AV_PIX_FMT_YUV420P;
+    ctx->time_base   = (AVRational){1, 30};
+    ctx->framerate   = (AVRational){30, 1};
+    ctx->bit_rate    = 200000;
+    ctx->gop_size    = 30;
+    ctx->max_b_frames = 0;
+
+    /* 与 av_vid_enc_ensure 的 H.265 参数保持一致，保证 sprop 对得上实际码流 */
+    av_dict_set(&opts, "preset", "ultrafast", 0);
+    av_dict_set(&opts, "x265-params",
+                "tune=zerolatency:repeat-headers=1:keyint=30:min-keyint=30"
+                ":scenecut=0:log-level=error", 0);
+
+    if (avcodec_open2(ctx, codec, &opts) < 0) {
+        av_dict_free(&opts);
+        avcodec_free_context(&ctx);
+        llog(LOG_WARN, "av", "HEVC sprop: encoder open failed");
+        return;
+    }
+    av_dict_free(&opts);
+
+    frm = av_frame_alloc();
+    pkt = av_packet_alloc();
+    if (!frm || !pkt) goto out;
+
+    frm->format = ctx->pix_fmt;
+    frm->width  = ctx->width;
+    frm->height = ctx->height;
+    frm->pts    = 0;
+    if (av_frame_get_buffer(frm, 0) < 0) goto out;
+
+    /* 中性画面：有限范围黑（Y=16，Cb/Cr=128），一帧足够产出参数集 */
+    for (int y = 0; y < ctx->height; ++y)
+        memset(frm->data[0] + (size_t)y * frm->linesize[0], 16,
+               (size_t)ctx->width);
+    for (int p = 1; p < 3; ++p) {
+        int hh = ctx->height / 2;
+        for (int y = 0; y < hh; ++y)
+            memset(frm->data[p] + (size_t)y * frm->linesize[p], 128,
+                   (size_t)(ctx->width / 2));
+    }
+
+    if (avcodec_send_frame(ctx, frm) < 0) goto out;
+    if (avcodec_receive_packet(ctx, pkt) < 0) {
+        /* 部分 x265 构建会缓存首帧：flush 后再取 */
+        if (avcodec_send_frame(ctx, NULL) < 0) goto out;
+        if (avcodec_receive_packet(ctx, pkt) < 0) goto out;
+    }
+
+    size_t off = 0;
+    const uint8_t *nal = NULL;
+    size_t nl = 0;
+    while (hevc_annexb_next(pkt->data, (size_t)pkt->size, &off, &nal, &nl)) {
+        if (nl < 2) continue;
+        int t = (nal[0] >> 1) & 0x3F;
+        if (t == 32 && nl <= sizeof(vps)) { memcpy(vps, nal, nl); vps_len = nl; }
+        else if (t == 33 && nl <= sizeof(sps)) { memcpy(sps, nal, nl); sps_len = nl; }
+        else if (t == 34 && nl <= sizeof(pps)) { memcpy(pps, nal, nl); pps_len = nl; }
+    }
+
+out:
+    if (vps_len && sps_len && pps_len) {
+        /* 兼容各版本 av_base64_encode 签名（老版本返回 char*，新版本返回 int），
+         * 不使用返回值，改为校验输出缓冲是否被写满。 */
+        char b64v[512] = {0}, b64s[1024] = {0}, b64p[512] = {0};
+        (void)av_base64_encode(b64v, sizeof(b64v), vps, (int)vps_len);
+        (void)av_base64_encode(b64s, sizeof(b64s), sps, (int)sps_len);
+        (void)av_base64_encode(b64p, sizeof(b64p), pps, (int)pps_len);
+        if (b64v[0] && b64s[0] && b64p[0]) {
+            int sn = snprintf(g_hevc_sprop, sizeof(g_hevc_sprop),
+                              "sprop-max-don-diff=0;sprop-vps=%s;sprop-sps=%s;sprop-pps=%s",
+                              b64v, b64s, b64p);
+            if (sn <= 0 || (size_t)sn >= sizeof(g_hevc_sprop)) {
+                /* 截断的 base64 会让对端解出坏参数集，宁可不宣告 */
+                g_hevc_sprop[0] = '\0';
+                llog(LOG_WARN, "av", "HEVC sprop too long, fall back to no sprop");
+            } else {
+                llog(LOG_INFO, "av",
+                     "HEVC sprop ready: vps=%zuB sps=%zuB pps=%zuB",
+                     vps_len, sps_len, pps_len);
+            }
+        }
+    }
+    av_packet_free(&pkt);
+    av_frame_free(&frm);
+    avcodec_free_context(&ctx);
+}
+#endif /* HAVE_FFMPEG */
+
 /* ============================================================================
  * av_register_all_codecs：把全部 ops 注册进 codec_registry
  *
@@ -1239,12 +1398,23 @@ int av_register_all_codecs(void)
     }
 #endif
 
-    /* H.264 默认 fmtp 归入 codec 元数据：SDP 重写 / answer 生成统一从
-     * ops->default_fmtp 读取，核心不再硬编码 packetization-mode。 */
+    /* H.264/H.265 默认 fmtp 归入 codec 元数据：SDP 重写 / answer 生成统一从
+     * ops->default_fmtp 读取，核心不再硬编码 packetization-mode。
+     * H.265 的 sprop-vps/sps/pps 由 libx265 编一帧生成（见 hevc_sprop_build_once），
+     * 失败时只声明 sprop-max-don-diff=0（与本端 AP 解包假设一致）。 */
     for (int i = 0; i < slot; ++i) {
         if (g_ops_slots[i].id == CODEC_H264 && g_ops_slots[i].default_fmtp == NULL)
             g_ops_slots[i].default_fmtp =
                 "packetization-mode=1;profile-level-id=42e01f";
+        if (g_ops_slots[i].id == CODEC_H265 && g_ops_slots[i].default_fmtp == NULL) {
+#ifdef HAVE_FFMPEG
+            hevc_sprop_build_once();
+            g_ops_slots[i].default_fmtp = g_hevc_sprop[0]
+                ? g_hevc_sprop : "sprop-max-don-diff=0";
+#else
+            g_ops_slots[i].default_fmtp = "sprop-max-don-diff=0";
+#endif
+        }
     }
 
     /* G.722 双时钟率：RTP 8000 / PCM 16000（SDP 写 8000）*/

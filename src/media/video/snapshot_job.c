@@ -73,6 +73,7 @@ typedef struct snap_job {
     uint8_t  busy[2];
     uint64_t got_key;
     uint32_t drop_count;
+    int      cid;                 /* 本腿视频编码（首帧 AU 确定，原子读写）*/
 
     snapshot_result_info_t info;
     pthread_t th;
@@ -108,6 +109,7 @@ const char *snapshot_result_name(int result)
     case SNAPSHOT_NO_VIDEO:      return "NO_VIDEO";
     case SNAPSHOT_NO_KEYFRAME:   return "NO_KEYFRAME";
     case SNAPSHOT_NO_PARAM_SETS: return "NO_PARAM_SETS";
+    case SNAPSHOT_NO_CODEC:      return "NO_CODEC";
     case SNAPSHOT_DECODE_FAIL:   return "DECODE_FAIL";
     case SNAPSHOT_TOO_SMALL:     return "TOO_SMALL";
     case SNAPSHOT_BLACK_FRAME:   return "BLACK_FRAME";
@@ -161,7 +163,10 @@ static void snap_tap_cb(media_bug_frame_t *f, void *ud)
 {
     (void)ud;
     if (f == NULL || f->data == NULL || f->data_len == 0) return;
-    if (f->type != BUG_VIDEO_AU || f->codec_id != CODEC_H264) return;
+    if (f->type != BUG_VIDEO_AU) return;
+    /* 支持的全部视频编码；参数集/解码按 codec_id 分派 */
+    if (f->codec_id != CODEC_H264 && f->codec_id != CODEC_H265 &&
+        f->codec_id != CODEC_VP8  && f->codec_id != CODEC_VP9) return;
     if (f->data_len > SNAP_AU_CAP) return;
     if (__atomic_load_n(&g_active_jobs, __ATOMIC_RELAXED) == 0) return;
 
@@ -189,6 +194,10 @@ static void snap_tap_cb(media_bug_frame_t *f, void *ud)
         pthread_mutex_unlock(&j->lock);
         return;
     }
+
+    /* 首帧确定编码：worker 据此选择解码器与参数集处理方式 */
+    if (__atomic_load_n(&j->cid, __ATOMIC_RELAXED) == 0)
+        __atomic_store_n(&j->cid, (int)f->codec_id, __ATOMIC_RELAXED);
 
     /* 关键帧之前的数据对解码无意义，直接丢弃（等待 PLI 响应）*/
     if (j->got_key == 0 && !f->keyframe) {
@@ -254,11 +263,11 @@ static size_t snap_start_code(const uint8_t *p, size_t n)
     return 0;
 }
 
-/* 遍历 Annex-B NAL：标记是否含 SPS/PPS/IDR，并把 SPS/PPS 存入缓存。 */
-static void snap_scan_au(const uint8_t *au, size_t len,
-                         uint8_t *sps, size_t *sps_len,
-                         uint8_t *pps, size_t *pps_len,
-                         int *found7, int *found8, int *found5)
+/* 遍历 H.264 Annex-B NAL：标记是否含 SPS/PPS/IDR，并把 SPS/PPS 存入缓存。 */
+static void snap_scan_au_h264(const uint8_t *au, size_t len,
+                              uint8_t *sps, size_t *sps_len,
+                              uint8_t *pps, size_t *pps_len,
+                              int *found7, int *found8, int *found5)
 {
     size_t i = 0;
     *found7 = *found8 = *found5 = 0;
@@ -286,6 +295,45 @@ static void snap_scan_au(const uint8_t *au, size_t len,
             *pps_len = c;
         } else if (type == 5) {
             *found5 = 1;
+        }
+        i = nend;
+    }
+}
+
+/* 遍历 H.265 Annex-B NAL（RFC 7798）：NAL 头 2 字节，type=(b0>>1)&0x3F。
+ * 缓存 VPS(32)/SPS(33)/PPS(34)，标记 IRAP(16..21)。 */
+static void snap_scan_au_h265(const uint8_t *au, size_t len,
+                              uint8_t *vps, size_t *vps_len,
+                              uint8_t *sps, size_t *sps_len,
+                              uint8_t *pps, size_t *pps_len,
+                              int *found32, int *found33, int *found34,
+                              int *found_irap)
+{
+    size_t i = 0;
+    *found32 = *found33 = *found34 = *found_irap = 0;
+    while (i + 3 <= len) {
+        size_t sc = snap_start_code(au + i, len - i);
+        if (sc == 0) { ++i; continue; }
+        size_t nstart = i + sc;
+        if (nstart + 2 > len) break;
+        size_t j = nstart + 2;
+        while (j + 3 <= len && snap_start_code(au + j, len - j) == 0) ++j;
+        size_t nend = (j + 3 <= len) ? j : len;
+        size_t nlen = nend - nstart;
+        if (nlen < 2) { i = nstart; continue; }
+
+        int type = (au[nstart] >> 1) & 0x3F;
+        uint8_t *dst = NULL;
+        size_t   *dst_len = NULL;
+        if (type == 32)      { *found32 = 1; dst = vps; dst_len = vps_len; }
+        else if (type == 33) { *found33 = 1; dst = sps; dst_len = sps_len; }
+        else if (type == 34) { *found34 = 1; dst = pps; dst_len = pps_len; }
+        else if (type >= 16 && type <= 21) { *found_irap = 1; }
+
+        if (dst != NULL) {
+            size_t c = nlen < SNAP_PS_CAP ? nlen : SNAP_PS_CAP;
+            memcpy(dst, au + nstart, c);
+            *dst_len = c;
         }
         i = nend;
     }
@@ -384,8 +432,12 @@ typedef struct {
     const codec_ops_t *enc_ops;
     codec_sess_t *dec;
     codec_sess_t *enc;
+    codec_id_t cid;        /* 当前解码器对应的编码 */
+    int      ps_loaded;    /* SDP sprop 只解析一次 */
     uint8_t *au;
     size_t   au_cap;
+    uint8_t  vps[SNAP_PS_CAP];   /* H.265 用 */
+    size_t   vps_len;
     uint8_t  sps[SNAP_PS_CAP];
     size_t   sps_len;
     uint8_t  pps[SNAP_PS_CAP];
@@ -446,14 +498,44 @@ static int snap_b64_decode(const char *in, size_t inlen,
     return (int)n;
 }
 
-/* 从该腿 SDP fmtp 的 sprop-parameter-sets=<sps>,<pps> 预置参数集。
- * H.264 流若只在 fmtp 宣告参数集（不在每个 IDR 前重发），没有它就无法解码。 */
+/* 取 fmtp 中指定 key（如 "sprop-vps="）的 base64 值并解码。返回字节数。 */
+static size_t snap_fmtp_b64(const char *fmtp, const char *key,
+                            uint8_t *out, size_t cap)
+{
+    const char *p = strstr(fmtp, key);
+    if (p == NULL) return 0;
+    p += strlen(key);
+    const char *end = p;
+    while (*end != '\0' && *end != ';' && *end != ' ' &&
+           *end != '\r' && *end != '\n')
+        ++end;
+    int n = snap_b64_decode(p, (size_t)(end - p), out, cap);
+    return (n > 0) ? (size_t)n : 0;
+}
+
+/* 从该腿 SDP fmtp 预置参数集。
+ *   H.264：sprop-parameter-sets=<sps>,<pps>
+ *   H.265：sprop-vps= / sprop-sps= / sprop-pps=（各自 base64）
+ * 流若只在 fmtp 宣告参数集（不在每个关键帧前重发），没有它就无法解码。 */
 static void snap_load_fmtp_sprop(snap_job_t *j, snap_ctx_t *c)
 {
     char fmtp[1024];
     if (!media_bridge_call_video_fmtp(j->m, j->call, j->leg,
                                       fmtp, sizeof(fmtp)))
         return;
+
+    codec_id_t cid = (codec_id_t)__atomic_load_n(&j->cid, __ATOMIC_RELAXED);
+    if (cid == CODEC_H265) {
+        c->vps_len = snap_fmtp_b64(fmtp, "sprop-vps=", c->vps, sizeof(c->vps));
+        c->sps_len = snap_fmtp_b64(fmtp, "sprop-sps=", c->sps, sizeof(c->sps));
+        c->pps_len = snap_fmtp_b64(fmtp, "sprop-pps=", c->pps, sizeof(c->pps));
+        if (c->vps_len && c->sps_len && c->pps_len)
+            llog(LOG_INFO, "snapshot",
+                 "job=%" PRIu64 " leg=%d sprop from fmtp: vps=%zu sps=%zu pps=%zu",
+                 j->id, j->leg, c->vps_len, c->sps_len, c->pps_len);
+        return;
+    }
+    if (cid != CODEC_H264) return;   /* VP8/VP9 无参数集 */
 
     const char *p = strstr(fmtp, "sprop-parameter-sets=");
     if (p == NULL) return;
@@ -505,14 +587,69 @@ static void snap_release(snap_job_t *j, int idx)
     pthread_mutex_unlock(&j->lock);
 }
 
-/* 组装送解码器的 AU：缺 SPS/PPS 时用缓存前缀补齐。
+/* 组装送解码器的 AU：
+ *   - H.264：缺 SPS/PPS 时用缓存前缀补齐；
+ *   - H.265：缺 VPS/SPS/PPS 时用缓存前缀补齐（顺序 VPS→SPS→PPS）；
+ *   - VP8/VP9：裸帧，原样交给解码器。
  * 返回 NULL 表示无法解码（reason 给出失败原因）。 */
-static const uint8_t *snap_build_au(snap_ctx_t *c, const uint8_t *au, size_t len,
+static const uint8_t *snap_build_au(snap_ctx_t *c, codec_id_t cid,
+                                    const uint8_t *au, size_t len,
                                     size_t *out_len, int *reason)
 {
+    /* ---- VP8/VP9：无起始码、无参数集 ---- */
+    if (cid == CODEC_VP8 || cid == CODEC_VP9) {
+        if (len > c->au_cap) {
+            uint8_t *nb = (uint8_t *)realloc(c->au, len);
+            if (nb == NULL) { *reason = SNAPSHOT_DECODE_FAIL; return NULL; }
+            c->au = nb;
+            c->au_cap = len;
+        }
+        if (c->au == NULL) { *reason = SNAPSHOT_DECODE_FAIL; return NULL; }
+        memcpy(c->au, au, len);
+        *out_len = len;
+        *reason = SNAPSHOT_OK;
+        return c->au;
+    }
+
+    /* ---- H.265 ---- */
+    if (cid == CODEC_H265) {
+        int f32 = 0, f33 = 0, f34 = 0, firap = 0;
+        snap_scan_au_h265(au, len, c->vps, &c->vps_len, c->sps, &c->sps_len,
+                          c->pps, &c->pps_len, &f32, &f33, &f34, &firap);
+        if (!f32 && c->vps_len == 0) { *reason = SNAPSHOT_NO_PARAM_SETS; return NULL; }
+        if (!f33 && c->sps_len == 0) { *reason = SNAPSHOT_NO_PARAM_SETS; return NULL; }
+        if (!f34 && c->pps_len == 0) { *reason = SNAPSHOT_NO_PARAM_SETS; return NULL; }
+
+        size_t total = len;
+        if (!f32) total += 4 + c->vps_len;
+        if (!f33) total += 4 + c->sps_len;
+        if (!f34) total += 4 + c->pps_len;
+        if (total > c->au_cap) {
+            uint8_t *nb = (uint8_t *)realloc(c->au, total);
+            if (nb == NULL) { *reason = SNAPSHOT_DECODE_FAIL; return NULL; }
+            c->au = nb;
+            c->au_cap = total;
+        }
+        if (c->au == NULL) { *reason = SNAPSHOT_DECODE_FAIL; return NULL; }
+
+        static const uint8_t sc[4] = { 0, 0, 0, 1 };
+        size_t off = 0;
+        if (!f32) { memcpy(c->au + off, sc, 4); off += 4;
+                    memcpy(c->au + off, c->vps, c->vps_len); off += c->vps_len; }
+        if (!f33) { memcpy(c->au + off, sc, 4); off += 4;
+                    memcpy(c->au + off, c->sps, c->sps_len); off += c->sps_len; }
+        if (!f34) { memcpy(c->au + off, sc, 4); off += 4;
+                    memcpy(c->au + off, c->pps, c->pps_len); off += c->pps_len; }
+        memcpy(c->au + off, au, len); off += len;
+        *out_len = off;
+        *reason = SNAPSHOT_OK;
+        return c->au;
+    }
+
+    /* ---- H.264 ---- */
     int f7 = 0, f8 = 0, f5 = 0;
-    snap_scan_au(au, len, c->sps, &c->sps_len, c->pps, &c->pps_len,
-                 &f7, &f8, &f5);
+    snap_scan_au_h264(au, len, c->sps, &c->sps_len, c->pps, &c->pps_len,
+                      &f7, &f8, &f5);
 
     if (!f7 && c->sps_len == 0) { *reason = SNAPSHOT_NO_PARAM_SETS; return NULL; }
     if (!f8 && c->pps_len == 0) { *reason = SNAPSHOT_NO_PARAM_SETS; return NULL; }
@@ -569,15 +706,7 @@ static void *snap_job_thread(void *arg)
     char path[256];
     path[0] = '\0';
 
-    ctx.dec_ops = codec_registry_find(CODEC_H264);
     ctx.enc_ops = codec_registry_find(CODEC_MJPEG);
-    if (ctx.dec_ops == NULL || ctx.dec_ops->vid_dec_init == NULL ||
-        ctx.dec_ops->vid_decode == NULL) {
-        res = SNAPSHOT_DECODE_FAIL;
-        llog(LOG_WARN, "snapshot", "job=%" PRIu64 ": H.264 decoder unavailable "
-             "(mod_av not loaded?)", j->id);
-        goto done;
-    }
     if (ctx.enc_ops == NULL || ctx.enc_ops->vid_enc_init == NULL ||
         ctx.enc_ops->vid_encode == NULL) {
         res = SNAPSHOT_DECODE_FAIL;
@@ -589,8 +718,7 @@ static void *snap_job_thread(void *arg)
     /* 生物特征数据 TTL：清理过期快照（worker 线程，串行且低频） */
     snap_ttl_sweep();
 
-    /* P3-a：从 SDP fmtp 预置 SPS/PPS（带内参数集缺失时的兜底） */
-    snap_load_fmtp_sprop(j, &ctx);
+    /* 解码器与 SDP 参数集在首帧确定编码后再初始化（H.264/H.265/VP8/VP9） */
 
     for (;;) {
         if (__atomic_load_n(&j->cancel, __ATOMIC_RELAXED)) {
@@ -628,6 +756,40 @@ static void *snap_job_thread(void *arg)
         rtp_ts = j->bts[idx];
 
         if (au == NULL || au_len == 0) { snap_release(j, idx); continue; }
+
+        /* 编码由首帧 AU 确定；切换时重建解码器并清空参数集缓存 */
+        codec_id_t cid = (codec_id_t)__atomic_load_n(&j->cid, __ATOMIC_RELAXED);
+        if (cid == CODEC_NONE) { snap_release(j, idx); continue; }
+        if (ctx.cid != cid) {
+            if (ctx.dec != NULL && ctx.dec_ops && ctx.dec_ops->fini)
+                ctx.dec_ops->fini(ctx.dec);
+            ctx.dec = NULL;
+            ctx.cid = cid;
+            ctx.sps_len = 0;
+            ctx.pps_len = 0;
+            ctx.vps_len = 0;
+            ctx.ps_loaded = 0;
+            ctx.dec_ops = codec_registry_find(cid);
+            if (ctx.dec_ops == NULL || ctx.dec_ops->vid_dec_init == NULL ||
+                ctx.dec_ops->vid_decode == NULL ||
+                !codec_can_decode(cid)) {
+                snap_release(j, idx);
+                res = SNAPSHOT_NO_CODEC;
+                llog(LOG_WARN, "snapshot",
+                     "job=%" PRIu64 " leg=%d codec=%d: no decoder available",
+                     j->id, j->leg, (int)cid);
+                break;
+            }
+            llog(LOG_INFO, "snapshot", "job=%" PRIu64 " leg=%d codec=%d selected",
+                 j->id, j->leg, (int)cid);
+        }
+
+        /* P3-a：从 SDP fmtp 预置参数集（仅 H.264/H.265；带内缺失时兜底）*/
+        if (!ctx.ps_loaded) {
+            ctx.ps_loaded = 1;
+            snap_load_fmtp_sprop(j, &ctx);
+        }
+
         if (!key && !got_key_frame) { snap_release(j, idx); continue; }
         if (key) {
             got_key_frame = 1;
@@ -636,7 +798,8 @@ static void *snap_job_thread(void *arg)
 
         int reason = SNAPSHOT_OK;
         size_t dec_len = 0;
-        const uint8_t *dec_au = snap_build_au(&ctx, au, au_len, &dec_len, &reason);
+        const uint8_t *dec_au = snap_build_au(&ctx, cid, au, au_len,
+                                              &dec_len, &reason);
         if (dec_au == NULL) {
             snap_release(j, idx);
             res = reason;
@@ -786,8 +949,8 @@ done:
              drops, ci.path[0] ? ci.path : "-");
         if (res == SNAPSHOT_NO_KEYFRAME)
             llog(LOG_WARN, "snapshot",
-                 "job=%" PRIu64 " no keyframe AU seen; snapshot taps H.264 legs "
-                 "only (H.265/VP8/VP9 AU not wired)", id);
+                 "job=%" PRIu64 " no keyframe AU seen; peer did not answer PLI "
+                 "or GOP is too long", id);
 
         /* 结果通道（§3.4.4）：元数据走事件总线，不塞图像内容。
          * 事件名 SNAPSHOT；订阅方用 job_id 关联 snapshot_status 查询。 */
@@ -915,6 +1078,7 @@ gate_done:
     j->cb = cb;
     j->ud = ud;
     j->got_key = 0;
+    __atomic_store_n(&j->cid, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&j->drop_count, 0, __ATOMIC_RELAXED);
     for (int i = 0; i < 2; ++i) {
         j->blen[i] = 0;

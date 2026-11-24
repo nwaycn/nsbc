@@ -16,6 +16,7 @@ struct video_xcode {
     codec_sess_t     *enc;
 
     int               src_kind;      /* 1=H264, 2=VP9, 3=VP8, 4=H265 */
+    int               tap;           /* 1=只解包（同编码观察），不解码/重编码 */
     union {
         rtp_h264_depack_t h264;
         rtp_vp9_depack_t  vp9;
@@ -95,24 +96,26 @@ static void xcode_close(video_xcode_t *vx)
     free(vx);
 }
 
-video_xcode_t *video_xcode_create(codec_id_t src, codec_id_t dst,
+/* 源编码 → 内部解包器编号；不支持的编码返回 0 */
+static int xcode_src_kind(codec_id_t cid)
+{
+    if (cid == CODEC_H264) return 1;
+    if (cid == CODEC_VP9)  return 2;
+    if (cid == CODEC_VP8)  return 3;
+    if (cid == CODEC_H265) return 4;
+    return 0;
+}
+
+/* 公共初始化：分配实例 + 解包器（不含解码/编码器） */
+static video_xcode_t *xcode_alloc(codec_id_t src, codec_id_t dst,
                                   uint8_t src_pt, uint8_t dst_pt,
                                   uint32_t out_ssrc)
 {
-    if (src == CODEC_NONE || dst == CODEC_NONE || src == dst) return NULL;
+    int sk = xcode_src_kind(src);
+    if (sk == 0) return NULL;
 
     const codec_ops_t *so = codec_registry_find(src);
-    const codec_ops_t *dop = codec_registry_find(dst);
-    if (!so || !dop) return NULL;
-    if (so->kind != CODEC_KIND_VIDEO || dop->kind != CODEC_KIND_VIDEO) return NULL;
-    if (!so->vid_decode || !dop->vid_encode) return NULL;
-
-    int sk = 0;
-    if (so->id == CODEC_H264) sk = 1;
-    else if (so->id == CODEC_VP9) sk = 2;
-    else if (so->id == CODEC_VP8) sk = 3;
-    else if (so->id == CODEC_H265) sk = 4;
-    else return NULL;   /* 目前只支持 H.264 / H.265 / VP9 / VP8 */
+    if (!so || so->kind != CODEC_KIND_VIDEO) return NULL;
 
     video_xcode_t *vx = (video_xcode_t *)calloc(1, sizeof(*vx));
     if (!vx) return NULL;
@@ -120,7 +123,7 @@ video_xcode_t *video_xcode_create(codec_id_t src, codec_id_t dst,
     vx->src = src;
     vx->dst = dst;
     vx->sops = so;
-    vx->dops = dop;
+    vx->dops = dst != CODEC_NONE ? codec_registry_find(dst) : NULL;
     vx->src_kind = sk;
     vx->src_pt = src_pt;
     vx->dst_pt = dst_pt;
@@ -138,11 +141,49 @@ video_xcode_t *video_xcode_create(codec_id_t src, codec_id_t dst,
     else if (sk == 3) rtp_vp8_depack_init(&vx->dep.vp8);
     else rtp_h265_depack_init(&vx->dep.h265);
 
-    if (so->vid_dec_init(NULL, &vx->dec) != NSBC_OK) { xcode_close(vx); return NULL; }
-    if (dop->vid_enc_init(NULL, &vx->enc) != NSBC_OK) { xcode_close(vx); return NULL; }
+    return vx;
+}
+
+/* 观察模式：同编码（或无需转码）的腿也建实例，只解包并经 au sink
+ * 交付源编码 AU（H.264/H.265 为 Annex-B，VP8/VP9 为裸帧）。
+ * 供录像（H.264 腿）与抓图（全部编码）使用，不消耗解码/编码算力。 */
+video_xcode_t *video_xcode_create_tap(codec_id_t src, uint8_t src_pt)
+{
+    if (src == CODEC_NONE) return NULL;
+    video_xcode_t *vx = xcode_alloc(src, CODEC_NONE, src_pt, 0, 0);
+    if (!vx) return NULL;
+    vx->tap = 1;
+    llog(LOG_INFO, "xcode", "video_tap created src=%s pt=%u",
+         vx->sops->sdp_name ? vx->sops->sdp_name : vx->sops->name,
+         (unsigned)src_pt);
+    return vx;
+}
+
+video_xcode_t *video_xcode_create(codec_id_t src, codec_id_t dst,
+                                  uint8_t src_pt, uint8_t dst_pt,
+                                  uint32_t out_ssrc)
+{
+    if (src == CODEC_NONE || dst == CODEC_NONE || src == dst) return NULL;
+
+    const codec_ops_t *dop = codec_registry_find(dst);
+    if (!dop) return NULL;
+    if (dop->kind != CODEC_KIND_VIDEO || !dop->vid_encode) return NULL;
+
+    video_xcode_t *vx = xcode_alloc(src, dst, src_pt, dst_pt, out_ssrc);
+    if (!vx) return NULL;
+    if (!vx->sops->vid_decode) { video_xcode_destroy(vx); return NULL; }
+
+    if (vx->sops->vid_dec_init(NULL, &vx->dec) != NSBC_OK) {
+        xcode_close(vx);
+        return NULL;
+    }
+    if (dop->vid_enc_init(NULL, &vx->enc) != NSBC_OK) {
+        xcode_close(vx);
+        return NULL;
+    }
 
     llog(LOG_INFO, "xcode", "video_xcode created src=%s dst=%s pt=%u->%u",
-         so->sdp_name ? so->sdp_name : so->name,
+         vx->sops->sdp_name ? vx->sops->sdp_name : vx->sops->name,
          dop->sdp_name ? dop->sdp_name : dop->name,
          (unsigned)src_pt, (unsigned)dst_pt);
     return vx;
@@ -289,6 +330,21 @@ int video_xcode_input(video_xcode_t *vx,
 
     if (r < 0) return r;
     if (r == 0) return 0;
+
+    /* 观察模式：直接把源编码 AU 交给 sink，不解码/不重编码 */
+    if (vx->tap) {
+        video_xcode_au_fn afn = __atomic_load_n(&vx->au_fn, __ATOMIC_ACQUIRE);
+        if (afn)
+            afn(__atomic_load_n(&vx->au_ud, __ATOMIC_RELAXED),
+                au, au_len, au_ts, key);
+        /* 首个关键帧之前请求 PLI；之后不再打扰对端 */
+        if (!vx->got_key) {
+            if (key) vx->got_key = 1;
+            else     vx->need_pli = 1;
+        }
+        return 0;
+    }
+
     return xcode_frame(vx, au, au_len, au_ts, key, emit, ud);
 }
 

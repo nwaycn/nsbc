@@ -1874,7 +1874,9 @@ window.nsbcSnapshot = async function(callId) {
     if (!hit) {
       const hints = {
         NO_VIDEO: t('No video on this call'),
-        NO_KEYFRAME: t('No keyframe received (H.264 video legs only)'),
+        NO_KEYFRAME: t('No keyframe received (video peer did not respond to PLI)'),
+        NO_CODEC: t('Video codec has no decoder on this server'),
+        DECODE_FAIL: t('Video decode failed'),
         TIMEOUT: t('No frame captured before timeout'),
       };
       throw new Error(hints[last] || last);

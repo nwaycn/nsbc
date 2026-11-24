@@ -9168,13 +9168,26 @@ int b2b_originate(b2b_core_t *co, const b2b_orig_t *o, b2b_call_t **out)
                                         video_pt[i], video_list[i]);
                         if (left <= 0 || (size_t)left >= cap) goto _sdp_too_long;
                         p += left; cap -= (size_t)left;
-                        /* H264 需要 fmtp:packetization-mode=1;profile-level-id=42e01f */
-                        if (!strcasecmp(video_list[i], "H264") && cap > 64) {
-                            left = snprintf(p, cap,
-                                "a=fmtp:%d packetization-mode=1;profile-level-id=42e01f\r\n",
-                                video_pt[i]);
-                            if (left <= 0 || (size_t)left >= cap) goto _sdp_too_long;
-                            p += left; cap -= (size_t)left;
+                        /* fmtp 统一取自 codec 注册表元数据：
+                         *   H.264 → packetization-mode=1;profile-level-id=42e01f
+                         *   H.265 → sprop-max-don-diff=0;sprop-vps/sps/pps
+                         *   VP8/VP9 无 fmtp（default_fmtp 为空 → 不输出）
+                         * 注册表未提供时 H.264 保留原有兜底字符串。 */
+                        if (cap > 64) {
+                            const codec_ops_t *vo = codec_find_by_name_kind(
+                                video_list[i], strlen(video_list[i]),
+                                CODEC_KIND_VIDEO);
+                            const char *xf =
+                                (vo && vo->default_fmtp && vo->default_fmtp[0])
+                                    ? vo->default_fmtp : NULL;
+                            if (!xf && !strcasecmp(video_list[i], "H264"))
+                                xf = "packetization-mode=1;profile-level-id=42e01f";
+                            if (xf) {
+                                left = snprintf(p, cap, "a=fmtp:%d %s\r\n",
+                                                video_pt[i], xf);
+                                if (left <= 0 || (size_t)left >= cap) goto _sdp_too_long;
+                                p += left; cap -= (size_t)left;
+                            }
                         }
                     }
                 }

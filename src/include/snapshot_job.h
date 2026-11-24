@@ -3,6 +3,7 @@
  * 场景：通话中业务需要抓取对端一帧画面做人脸比对/活体检测。
  * 特性（方案文档 §3.4）：
  *   - 不改变 relay/转码模式，纯旁路 tap（BUG_VIDEO_AU 全局消费者）；
+ *   - 支持 H.264 / H.265 / VP8 / VP9（按 AU 携带的 codec_id 自动分派解码器）；
  *   - 异步作业：立即返回 job_id，worker 线程完成解码→JPEG 落盘；
  *   - 主动发 PLI 请求关键帧（500ms 限频），亚秒级返回；
  *   - 全局并发上限 16；同一呼叫同一腿最短间隔 2s（start 内强制）；
@@ -35,6 +36,7 @@ typedef enum {
     SNAPSHOT_NO_VIDEO,          /* 该腿未协商视频 / 无 relay */
     SNAPSHOT_NO_KEYFRAME,       /* 超时仍无关键帧（PLI 无响应）*/
     SNAPSHOT_NO_PARAM_SETS,     /* 有 IDR 但缺 SPS/PPS，无法解码 */
+    SNAPSHOT_NO_CODEC,          /* 该腿编码无可用解码器（未编入 FFmpeg）*/
     SNAPSHOT_DECODE_FAIL,       /* 解码器初始化/解码出错 */
     SNAPSHOT_TOO_SMALL,         /* 分辨率过低（<160x120）*/
     SNAPSHOT_BLACK_FRAME,       /* 画面接近全黑 */

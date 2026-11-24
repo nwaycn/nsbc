@@ -53,10 +53,11 @@ _Static_assert(MB_SRTP_MATERIAL_MAX == SRTP_KEY_MAX,
 #define RELAY_BUF 2048
 #define MB_REC_HOOK_MAX 4
 
-/* M1 视频帧 hook 的回调上下文 —— vid_reasm 完整帧回调用 */
+/* M1 视频帧 hook 的回调上下文 —— vid_reasm / rec_xcode / tap 回调用 */
 typedef struct vid_hook_ud {
     struct cnode *node;
     int           side;
+    codec_id_t    cid;    /* tap 实例：源编码（写 BUG_VIDEO_AU 用） */
 } vid_hook_ud_t;
 
 typedef struct cnode {
@@ -167,6 +168,12 @@ typedef struct cnode {
     int                rec_xcode_sig[2];
     uint8_t            rec_xcode_pt[2];
     vid_hook_ud_t      rec_ud[2];
+    /*  观察实例（tap）：非 H.264 且没有通话转码时也建立（同编码可直通），
+     *  只解包不改写媒体流，源编码 AU 直接投递给 media_bug 供抓图使用。 */
+    video_xcode_t     *tap_xcode[2];
+    int                tap_xcode_sig[2];
+    uint8_t            tap_xcode_pt[2];
+    vid_hook_ud_t      tap_ud[2];
     /*  PT rewrite：同 codec 不同 PT（如 WebRTC G729 PT=96 → SIP G729 PT=18）
      * 只改 RTP header 的 PT 字节，不做 PCM 往返转码。比 transcode 快得多。 */
     struct { uint8_t src_pt; uint8_t dst_pt; } pt_rewrite[2];
@@ -646,6 +653,26 @@ static void bridge_rec_au_cb(void *ud, const uint8_t *au, size_t len,
         rec_feed_video(sess, au, len, ts);
 }
 
+/* 观察实例（tap）的 AU 回调：交付源编码完整帧（H.264/H.265 为 Annex-B，
+ * VP8/VP9 为裸帧），供 BUG_VIDEO_AU 消费者（抓图）使用。
+ * 录像需要 H.264 落盘，仍由 vid_reasm / rec_xcode 负责。 */
+static void bridge_tap_au_cb(void *ud, const uint8_t *au, size_t len,
+                             uint32_t ts, int key)
+{
+    vid_hook_ud_t *u = (vid_hook_ud_t *)ud;
+    if (u == NULL || u->node == NULL || !b2b_call_is_alive(u->node->call))
+        return;
+    if (!media_bug_video_active()) return;   /* 无抓图消费者：零开销 */
+    int leg = u->side;
+    if (leg < 0 || leg > 1 || au == NULL || len == 0) return;
+    uint32_t vssrc = 0;
+    if (u->node->relay != NULL)
+        vssrc = __atomic_load_n(&u->node->relay->vid_ssrc[leg],
+                                __ATOMIC_RELAXED);
+    media_bug_dispatch_video_au(u->node->call, leg, au, len, u->cid, key, ts,
+                                vssrc);
+}
+
 /* 从原始 SDP 提取指定 PT 的 a=fmtp 值（去掉前缀 "a=fmtp:<pt> "）。
  * 找不到返回 0；buf 始终 '\0' 结尾。 */
 static int sdp_fmtp_for_pt(const char *sdp, size_t len, int pt,
@@ -1115,7 +1142,8 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
          * latch 未就绪 / precondition / direction gate 均不影响录制路径。 */
         if (!is_rtcp && n >= 2 && r->node != NULL &&
             (r->node->vid_reasm[side] != NULL ||
-             r->node->rec_xcode[side] != NULL)) {
+             r->node->rec_xcode[side] != NULL ||
+             r->node->tap_xcode[side] != NULL)) {
             uint8_t vpt = (uint8_t)(buf[1] & 0x7F);
             if (pt_in_list(vpt, r->node->video_pt_allowed[side],
                            r->node->video_pt_allowed_count[side])) {
@@ -1175,6 +1203,23 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
                                                 pkt.marker, pkt.ts, NULL, NULL);
                         if (video_xcode_take_pli(rx))
                             relay_video_request_pli(r, side, pkt.ssrc);
+                    }
+
+                    /*  观察实例：源编码 AU → media_bug（抓图）。只解包，
+                     *  不改写转发面；与 rec_xcode 并存时各自独立解包。 */
+                    video_xcode_t *tx = __atomic_load_n(
+                        &r->node->tap_xcode[side], __ATOMIC_ACQUIRE);
+                    if (tx != NULL) {
+                        (void)video_xcode_input(tx, pkt.payload, pkt.payload_len,
+                                                pkt.marker, pkt.ts, NULL, NULL);
+                        if (video_xcode_take_pli(tx)) {
+                            /* 与 vid_reasm 共用 2s 限频，避免关键帧等待期刷 PLI */
+                            uint64_t tnow = nsbc_now_ms();
+                            if (tnow - r->last_pli_ms[side] >= 2000) {
+                                r->last_pli_ms[side] = tnow;
+                                relay_video_request_pli(r, side, pkt.ssrc);
+                            }
+                        }
                     }
                 }
             }
@@ -3919,7 +3964,7 @@ typedef struct {
         char enc[24];
         char rate[12];
         int  ch;
-        char fmtp[96];
+        char fmtp[512];  /* H.265 sprop-vps/sps/pps 较长，96 已不够 */
         int  te;    /* telephone-event */
     } c[SDP_XC_MAXPT];
 } sdp_xc_mline_t;
@@ -4030,7 +4075,7 @@ typedef struct {
     codec_id_t cid;
     char       enc[24];
     char       rate[12];
-    char       fmtp[96];
+    char       fmtp[512];  /* H.265 sprop-* 可能较长 */
 } sdp_vsel_t;
 
 /* 从 SDP 的视频段里挑选第一个 SBC 可双向处理的 codec（H264/VP9）。 */
@@ -4258,8 +4303,7 @@ static int sdp_xc_add_offer_audio(char *sdp, size_t *lenp, size_t cap)
                 break;
             }
             for (int i = 0; i < nvadd; ++i) {
-                int is_h264 = (add_vcid[i] == CODEC_H264);
-                /* 编码名以注册表为准（H264 / VP8 / VP9） */
+                /* 编码名以注册表为准（H264 / H265 / VP8 / VP9） */
                 const codec_ops_t *vops = codec_registry_find(add_vcid[i]);
                 const char *nm = "H264";
                 if (vops) {
@@ -4268,7 +4312,7 @@ static int sdp_xc_add_offer_audio(char *sdp, size_t *lenp, size_t cap)
                     else if (vops->name[0])
                         nm = vops->name;
                 }
-                char abuf[192];
+                char abuf[768];
                 int an = snprintf(abuf, sizeof(abuf), "a=rtpmap:%d %s/90000",
                                   add_vpt[i], nm);
                 if (an <= 0 ||
@@ -4277,16 +4321,19 @@ static int sdp_xc_add_offer_audio(char *sdp, size_t *lenp, size_t cap)
                     overflow = 1;
                     break;
                 }
-                if (is_h264) {
-                    /* H.264 fmtp 由 codec 元数据提供（desc->default_fmtp），
-                     * 核心不再硬编码 packetization-mode/profile-level-id */
-                    const char *xf =
-                        (vops && vops->default_fmtp && vops->default_fmtp[0])
-                            ? vops->default_fmtp
-                            : "packetization-mode=1;profile-level-id=42e01f";
+                /* fmtp 由 codec 元数据提供（desc->default_fmtp）：
+                 *   H.264 packetization-mode/profile-level-id
+                 *   H.265 sprop-max-don-diff=0;sprop-vps/sps/pps
+                 *   VP8/VP9 为空 → 不输出 fmtp */
+                const char *xf =
+                    (vops && vops->default_fmtp && vops->default_fmtp[0])
+                        ? vops->default_fmtp : NULL;
+                if (!xf && add_vcid[i] == CODEC_H264)
+                    xf = "packetization-mode=1;profile-level-id=42e01f";
+                if (xf) {
                     an = snprintf(abuf, sizeof(abuf), "a=fmtp:%d %s",
                                   add_vpt[i], xf);
-                    if (an <= 0 ||
+                    if (an <= 0 || (size_t)an >= sizeof(abuf) ||
                         put_line(nb, cap, &used, abuf, (size_t)an) != NSBC_OK ||
                         put_line(nb, cap, &used, "\r\n", 2) != NSBC_OK) {
                         overflow = 1;
@@ -4567,7 +4614,7 @@ static int sdp_xc_answer_for_a(char *ans, size_t *lenp, size_t cap,
              * 这类双空格，严格 SDP 解析器会判为无效 fmt-list。 */
             int sp = (pre > 0 && (p[pre - 1] == ' ' || p[pre - 1] == '\t'));
             char tmp[32];
-            char abuf[224];
+            char abuf[768];
             int tn = snprintf(tmp, sizeof(tmp), sp ? "%d" : " %d",
                               av.c[a_vidx].pt);
             if (put_line(nb, cap, &used, p, pre) != NSBC_OK ||
@@ -4588,9 +4635,12 @@ static int sdp_xc_answer_for_a(char *ans, size_t *lenp, size_t cap,
                 break;
             }
             if (av.c[a_vidx].fmtp[0]) {
+                /* 视频 fmtp（H.265 sprop-vps/sps/pps 可超 200 字节）：
+                 * 缓冲已按 fmtp[512] + abuf[768] 放大，仍超长则判失败，
+                 * 绝不发出被截断的 sprop 参数 */
                 an = snprintf(abuf, sizeof(abuf), "a=fmtp:%d %s",
                               av.c[a_vidx].pt, av.c[a_vidx].fmtp);
-                if (an <= 0 ||
+                if (an <= 0 || (size_t)an >= sizeof(abuf) ||
                     put_line(nb, cap, &used, abuf, (size_t)an) != NSBC_OK ||
                     put_line(nb, cap, &used, "\r\n", 2) != NSBC_OK) {
                     overflow = 1;
@@ -5959,6 +6009,13 @@ void bridge_release_call(bridge_mgr_t *m, void *call)
                 if (rx) video_xcode_destroy(rx);
                 e->rec_xcode[si] = NULL;
             }
+            /* 观察实例（tap）清理：只解包，无解码/编码资源 */
+            for (int si = 0; si < 2; ++si) {
+                video_xcode_t *tx =
+                    __atomic_load_n(&e->tap_xcode[si], __ATOMIC_ACQUIRE);
+                if (tx) video_xcode_destroy(tx);
+                e->tap_xcode[si] = NULL;
+            }
             free(e->a_offer_sdp);
             e->a_offer_sdp = NULL;
             e->a_offer_len = 0;
@@ -6470,6 +6527,19 @@ static void cnode_drop_rec_xcode(cnode_t *e, int side)
     e->rec_xcode_pt[side] = 0xFF;
 }
 
+/* 观察实例退役：同 rec_xcode，destroy 延后到 release */
+static void cnode_drop_tap(cnode_t *e, int side)
+{
+    if (!e || side < 0 || side > 1) return;
+    video_xcode_t *old = __atomic_load_n(&e->tap_xcode[side], __ATOMIC_ACQUIRE);
+    if (old) {
+        __atomic_store_n(&e->tap_xcode[side], NULL, __ATOMIC_RELEASE);
+        cnode_retire_vxcode(e, side, old);
+    }
+    e->tap_xcode_sig[side] = 0;
+    e->tap_xcode_pt[side] = 0xFF;
+}
+
 
 static uint8_t find_dtmf_pt(const char *sdp, size_t len) {
     const char *p = sdp;
@@ -6838,6 +6908,9 @@ video_plan_done: ;
                 if (cid == CODEC_H264) {
                     if (e->rec_xcode[side] != NULL)
                         cnode_drop_rec_xcode(e, side);
+                    /* 重新协商回 H.264：观察实例不再需要（reasm 接管抓图） */
+                    if (e->tap_xcode[side] != NULL)
+                        cnode_drop_tap(e, side);
                     if (e->vid_reasm[side] == NULL) {
                         e->vid_ud[side].node = e;
                         e->vid_ud[side].side = side;
@@ -6863,6 +6936,39 @@ video_plan_done: ;
                     llog(LOG_INFO, "media",
                          "VIDEO_REASM call=%p side=%d DESTROYED (renegotiated to non-H.264)",
                          call, side);
+                }
+
+                /*  观察实例（tap）：非 H.264 腿即使与对侧同编码（无通话转码）
+                 *  也建立，保证抓图可用；只解包，不占解码/编码算力。 */
+                int tsig = ((int)cid << 24) ^ ((int)r_pt[side] << 8);
+                if (cid == CODEC_NONE) {
+                    if (e->tap_xcode[side] != NULL)
+                        cnode_drop_tap(e, side);
+                } else if (e->tap_xcode[side] == NULL ||
+                           e->tap_xcode_sig[side] != tsig) {
+                    if (e->tap_xcode[side] != NULL)
+                        cnode_drop_tap(e, side);
+                    video_xcode_t *tv = video_xcode_create_tap(cid, r_pt[side]);
+                    if (tv == NULL) {
+                        llog(LOG_WARN, "media",
+                             "VIDEO_TAP call=%p side=%d CREATE FAIL codec=%d(pt=%u)"
+                             " — snapshot unavailable on this leg",
+                             call, side, (int)cid, (unsigned)r_pt[side]);
+                    } else {
+                        e->tap_ud[side].node = e;
+                        e->tap_ud[side].side = side;
+                        e->tap_ud[side].cid  = cid;
+                        video_xcode_set_au_sink(tv, bridge_tap_au_cb,
+                                                &e->tap_ud[side]);
+                        e->tap_xcode_sig[side] = tsig;
+                        e->tap_xcode_pt[side]  = r_pt[side];
+                        __atomic_store_n(&e->tap_xcode[side], tv,
+                                         __ATOMIC_RELEASE);
+                        llog(LOG_INFO, "media",
+                             "VIDEO_TAP call=%p side=%d codec=%d(pt=%u) CREATED"
+                             " (snapshot)",
+                             call, side, (int)cid, (unsigned)r_pt[side]);
+                    }
                 }
 
                 /* VP8/VP9/H.265：仅在该腿已存在录音 sess 时建立定向转码，

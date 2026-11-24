@@ -36,8 +36,10 @@ use std::fmt;
 fn sanitize_arg(s: &str) -> String {
     s.chars()
         .map(|c| {
-            if c.is_ascii_alphanumeric() || "-_.:/@+=,;".contains(c) { c }
-            else { '_' }
+            // 与核心 b2b_valid_callid 的字符集对齐：可打印 ASCII 原样保留，
+            // 只替换空白/控制字符/非 ASCII —— 行协议只按空白切分，
+            // 保留 '~' '?' '%' '#' 等标点才不会把 Call-ID 改坏。
+            if ('!'..='~').contains(&c) { c } else { '_' }
         })
         .collect()
 }
