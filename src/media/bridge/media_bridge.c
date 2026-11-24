@@ -1063,6 +1063,28 @@ static void relay_recv_one(rtp_relay_t *r, int side, int is_rtcp,
         src.ss = ss;
         src.len = sl;
 
+        /*  明文腿收到 STUN：必须在 comedia latch / media_bug / rtp_parse
+         * 之前消费掉。现场（2026-11-24）：Linphone 尽管 SDP 里没有任何
+         * ICE 属性，仍每 500ms 往 RTP/RTCP 端口各发一个 Binding Request。
+         * 旧路径把它当明文 RTP 处理：
+         *   1) 先进入 latch 学习 —— 若 STUN 源端口与真实 RTP 源端口不同，
+         *      出向媒体会被改发到该端口（对端整段收不到）；
+         *   2) 被 media_bug_dispatch_rtp_raw 当作 RTP 投递；
+         *   3) rtp_parse 版本校验失败后计入 drops，污染丢包统计。
+         * 本腿没有协商 ICE，SBC 也不参与该端点的连通性检查，静默丢弃即可
+         * （回 Binding Error 反而会让侧端 ICE 状态机误判连通性）。 */
+        if (!srtp_lane && rx_classify(buf, (size_t)n) == 1) {
+            static _Thread_local int diag_plain_stun[2] = {0};
+            if (diag_plain_stun[side] < 3 || diag_plain_stun[side] % 200 == 0) {
+                llog(LOG_DEBUG, "relay",
+                     "STUN rx on plaintext leg side=%d fd=%d is_rtcp=%d n=%zd "
+                     "→ ignored (no ICE on this leg)",
+                     side, fd, is_rtcp, n);
+            }
+            ++diag_plain_stun[side];
+            continue;
+        }
+
         if (srtp_lane && r->srtp[side]) {
             /* SRTP → 解密后继续明文 relay 路径。
              * RTP/RTCP 判别见文件头 is_rtcp_packet() 注释（含 M-bit 冲突处理）。 */
@@ -3568,6 +3590,104 @@ int bridge_rewrite_sdp(const char *in, size_t in_len, char *out,
     out[used] = '\0';
     return (int)used;
 }
+
+/*  明文腿 H.264 fmtp 的 profile-level-id 必须描述本机编码器实际发出的码流
+ * （RFC 6184 §8.1：SDP 参数与码流不一致时，严格实现按 SDP 预置解码器）。
+ *
+ * 现场（2026-11-24）：SBC→Linphone 的 offer 里 H.264 fmtp 是从 WebRTC 腿
+ * 原样透传的 "level-asymmetry-allowed=1;packetization-mode=1;
+ * profile-level-id=42001f"，而本机 x264（av_codec.c：profile=baseline,
+ * level=3.1）实际发出的 SPS 是 67 42 C0 1F，即 profile-level-id=42c01f。
+ * 本次抓包中 Linphone 收到后每 5s 发 SIP INFO picture_fast_update 要关键帧、
+ * 视频始终不出图；SDP 宣告的 profile 与码流不一致是首要疑点。
+ *
+ * 只改 fmtp 中 "profile-level-id=" 后的 6 个十六进制字符（等长原地替换），
+ * packetization-mode 等其余参数与其它行一律不动；非 H.264 的 fmtp 不动。
+ * 只处理 Baseline 系（profile_idc=0x42）：Main/High 等码流若是对端透传的，
+ * 改 profile 反而会与真实码流不符，故不动。
+ * 返回改写的 fmtp 行数（0=无需改动）。
+ *
+ * ★ NSBC_H264_LOCAL_PROFILE_ID 必须与 mod/av/av_codec.c 的 x264 参数
+ *   （profile=baseline / level=3.1）实际输出的 SPS 保持一致。 */
+#define NSBC_H264_LOCAL_PROFILE_ID "42c01f"
+
+static int sdp_name_is(const char *s, size_t n, const char *want)
+{
+    size_t wl = strlen(want);
+    if (n < wl) return 0;
+    for (size_t i = 0; i < wl; ++i) {
+        char a = s[i], b = want[i];
+        if (a >= 'a' && a <= 'z') a = (char)(a - 'a' + 'A');
+        if (b >= 'a' && b <= 'z') b = (char)(b - 'a' + 'A');
+        if (a != b) return 0;
+    }
+    return 1;
+}
+
+static int sdp_align_h264_profile(char *sdp, size_t len)
+{
+    if (sdp == NULL || len == 0) return 0;
+    uint8_t h264_pt[128];
+    memset(h264_pt, 0, sizeof(h264_pt));
+
+    /* 第 1 遍：a=rtpmap:<pt> H264/90000 → 标记 H.264 的 PT */
+    size_t pos = 0;
+    while (pos < len) {
+        const char *nl = memchr(sdp + pos, '\n', len - pos);
+        size_t line_end = nl ? (size_t)(nl - sdp) : len;
+        size_t ll = line_end - pos;
+        if (ll > 9 && memcmp(sdp + pos, "a=rtpmap:", 9) == 0) {
+            const char *q = sdp + pos + 9;
+            int pt = atoi(q);
+            const char *sp = memchr(q, ' ', ll - 9);
+            if (sp != NULL && pt >= 0 && pt < 128) {
+                size_t navail = (size_t)(sdp + line_end - (sp + 1));
+                if (sdp_name_is(sp + 1, navail, "H264") &&
+                    (navail == 4 || sp[1 + 4] == '/'))
+                    h264_pt[pt] = 1;
+            }
+        }
+        if (nl == NULL) break;
+        pos = line_end + 1;
+    }
+
+    /* 第 2 遍：a=fmtp:<pt> ... profile-level-id=XXXXXX → 换成编码器实际值 */
+    int fixed = 0;
+    pos = 0;
+    while (pos < len) {
+        const char *nl = memchr(sdp + pos, '\n', len - pos);
+        size_t line_end = nl ? (size_t)(nl - sdp) : len;
+        size_t ll = line_end - pos;
+        if (ll > 7 && memcmp(sdp + pos, "a=fmtp:", 7) == 0) {
+            int pt = atoi(sdp + pos + 7);
+            if (pt >= 0 && pt < 128 && h264_pt[pt]) {
+                char *key = memmem(sdp + pos, ll, "profile-level-id=", 17);
+                if (key != NULL) {
+                    char *val = key + 17;
+                    size_t vavail = (size_t)(sdp + line_end - val);
+                    int hex6 = (vavail >= 6);
+                    for (int i = 0; hex6 && i < 6; ++i)
+                        if (!isxdigit((unsigned char)val[i])) hex6 = 0;
+                    if (hex6 && vavail > 6 &&
+                        isxdigit((unsigned char)val[6]))
+                        hex6 = 0;  /* 非标准的长值，不动 */
+                    /* 只对齐 Baseline 系（profile_idc=0x42） */
+                    if (hex6 && !(val[0] == '4' && val[1] == '2'))
+                        hex6 = 0;
+                    if (hex6 &&
+                        memcmp(val, NSBC_H264_LOCAL_PROFILE_ID, 6) != 0) {
+                        memcpy(val, NSBC_H264_LOCAL_PROFILE_ID, 6);
+                        ++fixed;
+                    }
+                }
+            }
+        }
+        if (nl == NULL) break;
+        pos = line_end + 1;
+    }
+    return fixed;
+}
+
 /* ------------------------------------------------------------------ */
 /* relay 生命周期                                                       */
 /* ------------------------------------------------------------------ */
@@ -5483,6 +5603,20 @@ int bridge_offer_hook(void *call, const char *in, size_t inlen,
          "REWRITE_CALL: rewrite_port=%u video_port=%u dir=%d mode=%d is_bypass=%d a_ws=%d b_ws=%d n=%d",
          (unsigned)rewrite_port, (unsigned)rewrite_vport, dir, mode, is_bypass, a_ws, b_ws, n);
     if (n < 0) return NSBC_NOSPC;
+
+    /*  明文腿 offer：把 H.264 fmtp 的 profile-level-id 对齐到本机编码器
+     * 实际发出的码流（WebRTC 腿透传的 42e01f/42001f 与 x264 的 42c01f
+     * 不一致，Linphone 会反复 picture_fast_update）。详见
+     * sdp_align_h264_profile() 上方注释。
+     * 只改 offer，不改 answer —— answer 的 fmtp 必须与对端 offer 兼容
+     * （RFC 3264 §6.1 / RFC 6184 §8.2.2）。 */
+    if (!is_bypass && dir == MB_SDP_PLAIN) {
+        int h264fix = sdp_align_h264_profile(out, (size_t)n);
+        if (h264fix > 0)
+            llog(LOG_INFO, "media",
+                 "offer_hook: H.264 profile-level-id aligned to local encoder "
+                 "(%s) in %d fmtp line(s)", NSBC_H264_LOCAL_PROFILE_ID, h264fix);
+    }
 
     /*  暴力 dump：rewrite 输出逐行打，确认 video m= 行到底是什么！ */
     {
