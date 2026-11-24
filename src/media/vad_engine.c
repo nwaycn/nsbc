@@ -136,6 +136,10 @@ typedef struct {
     /* --- WebRTC VAD 二级判据（每 leg 独立实例，NULL = 创建失败 → fail-open）--- */
     VadInst     *wvad[VAD_LEGS_PER_CALL];
 
+    /* --- 非 G.711 解码器（lazy 创建，每 leg 独立；PCM tap 未启用时兜底）--- */
+    codec_sess_t      *dec[VAD_LEGS_PER_CALL];
+    const codec_ops_t *dec_ops[VAD_LEGS_PER_CALL];
+
     /* --- 1s Trace ring（每 leg 独立环形缓冲）--- */
     int          trace_wpos[VAD_LEGS_PER_CALL];
     short        trace_data[VAD_LEGS_PER_CALL][VAD_TRACE_SIZE];
@@ -576,11 +580,36 @@ void vad_on_rtp_frame(media_bug_frame_t *frame, void *ud) {
         llog(LOG_NOTICE, "vad", "vad_on_rtp_frame ENTRY call=%p leg=%d len=%zu",
              frame ? frame->call_key : NULL, frame ? frame->leg : -1,
              frame ? frame->data_len : 0);
-    if (!frame || !frame->call_key || !frame->data || frame->data_len < 12) return;
+    if (!frame || !frame->call_key) return;
     if (frame->leg != 0 && frame->leg != 1) return;
 
-    /* 1) RTP parse */
     rtp_pkt_t pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.pt = -1;
+
+    /* 2) 取 PCM：
+     *    a) PCM tap（BUG_PCM_READ）已由框架解码 → 直接用（首选路径，
+     *       不依赖 PT，G.729/G.722/Opus 等都能覆盖）；
+     *    b) 兼容旧路径：原始 RTP → G.711 查表 / 其他静态 PT lazy 解码；
+     *       动态 PT（96-127）没有名字无法可靠解码，必须走 PCM tap。 */
+    int16_t pcm_stack[320];  /* 最多 320 字节 payload = 320 samples = 640B */
+    int16_t *pcm = pcm_stack;
+    size_t pcm_cap = sizeof(pcm_stack) / sizeof(pcm_stack[0]);
+    size_t samples = 0;
+    int pcm_rate = 8000;
+    int pcm_ch = 1;
+
+    if (frame->pcm != NULL && frame->samples > 0) {
+        pcm = (int16_t *)(uintptr_t)frame->pcm;
+        samples = frame->samples;
+        pcm_rate = frame->rate > 0 ? frame->rate : 8000;
+        pcm_ch = frame->channels > 0 ? frame->channels : 1;
+        goto pcm_ready;
+    }
+
+    if (frame->data == NULL || frame->data_len < 12) return;
+
+    /* 1) RTP parse（旧路径兜底） */
     nsbc_rc_t prc = rtp_parse(frame->data, frame->data_len, &pkt);
     if (prc != NSBC_OK) {
         static __thread int vd_pf = 0;
@@ -590,31 +619,96 @@ void vad_on_rtp_frame(media_bug_frame_t *frame, void *ud) {
         return;
     }
     if (pkt.pt != 0 && pkt.pt != 8) {
-        static __thread int vd_pt = 0;
-        if (vd_pt++ < 3)
-            llog(LOG_WARN, "vad", "vad_on_rtp_frame pt=%d 不是G.711 call=%p",
+        static __thread int vd_pt2 = 0;
+        if (vd_pt2++ < 3)
+            llog(LOG_NOTICE, "vad",
+                 "pt=%d 非 G.711，尝试 codec 解码 call=%p",
                  (int)pkt.pt, frame->call_key);
-        return;  /* 只处理 G.711 */
     }
 
-    /* 2) G.711 → PCM16（项目已有的查表实现）*/
-    int16_t pcm_stack[320];  /* 最多 320 字节 payload = 320 samples = 640B */
-    int16_t *pcm = pcm_stack;
-    size_t pcm_cap = sizeof(pcm_stack) / sizeof(pcm_stack[0]);
-
-    if (pkt.payload_len > pcm_cap) {
-        static __thread int16_t pcm_large[8192];
-        pcm = pcm_large;
-        pcm_cap = sizeof(pcm_large) / sizeof(pcm_large[0]);
-        if (pkt.payload_len > pcm_cap) return;
+    if (pkt.pt == 0 || pkt.pt == 8) {
+        if (pkt.payload_len > pcm_cap) {
+            static __thread int16_t pcm_large[8192];
+            pcm = pcm_large;
+            pcm_cap = sizeof(pcm_large) / sizeof(pcm_large[0]);
+            if (pkt.payload_len > pcm_cap) return;
+        }
+        samples = (pkt.pt == 0)
+                ? g711_ulaw_decode(pkt.payload, pkt.payload_len, pcm)
+                : g711_alaw_decode(pkt.payload, pkt.payload_len, pcm);
+    } else {
+        const codec_ops_t *ops = codec_find_by_pt_kind(pkt.pt, CODEC_KIND_AUDIO);
+        static __thread int16_t pcm_dec[4096];
+        if (ops == NULL || ops->decode == NULL || ops->init == NULL) {
+            static __thread int vd_pt = 0;
+            if (vd_pt++ < 3)
+                llog(LOG_WARN, "vad",
+                     "pt=%d 无可用解码器（动态 PT 请启用 PCM tap）call=%p",
+                     (int)pkt.pt, frame->call_key);
+            return;
+        }
+        pthread_mutex_lock(&g_states_lock);
+        {
+            int di = find_slot(frame->call_key);
+            if (di >= 0) {
+                vad_call_state_t *dcs = &g_states[di];
+                if (dcs->dec_ops[frame->leg] != ops) {
+                    if (dcs->dec[frame->leg] && dcs->dec_ops[frame->leg] &&
+                        dcs->dec_ops[frame->leg]->fini)
+                        dcs->dec_ops[frame->leg]->fini(dcs->dec[frame->leg]);
+                    dcs->dec[frame->leg] = NULL;
+                    dcs->dec_ops[frame->leg] = ops;
+                    ops->init(NULL, &dcs->dec[frame->leg]);
+                }
+                if (dcs->dec[frame->leg] != NULL) {
+                    media_frame_t mf;
+                    memset(&mf, 0, sizeof(mf));
+                    mf.pcm = pcm_dec;
+                    mf.samples = 0;
+                    mf.rate = codec_pcm_sample_rate(ops);
+                    mf.channels = 1;
+                    if (ops->decode(dcs->dec[frame->leg], pkt.payload,
+                                    pkt.payload_len, &mf) == NSBC_OK) {
+                        samples = mf.samples;
+                        pcm = pcm_dec;
+                        pcm_rate = mf.rate > 0 ? mf.rate : 8000;
+                        pcm_ch = 1;
+                    }
+                }
+            }
+        }
+        pthread_mutex_unlock(&g_states_lock);
+        if (samples > sizeof(pcm_dec) / sizeof(pcm_dec[0])) samples = 0;
     }
-
-    size_t samples;
-    if (pkt.pt == 0)
-        samples = g711_ulaw_decode(pkt.payload, pkt.payload_len, pcm);
-    else
-        samples = g711_alaw_decode(pkt.payload, pkt.payload_len, pcm);
     if (samples == 0) return;
+
+pcm_ready:
+    /* 2.2) 统一到 8k 单声道（VAD 内部固定 8k / 10ms 子帧）：
+     *      多声道先混单，再按整数倍抽取；只做能量/包络分析，无需高质量重采样。 */
+    if (pcm_ch > 1 || pcm_rate != 8000) {
+        static __thread int16_t pcm8[8192];
+        size_t cap8 = sizeof(pcm8) / sizeof(pcm8[0]);
+        size_t i, o = 0;
+        size_t ch = pcm_ch > 0 ? (size_t)pcm_ch : 1;
+        for (i = 0; i < samples && o < cap8; ++i) {
+            int32_t acc = 0;
+            size_t c;
+            for (c = 0; c < ch; ++c)
+                acc += pcm[i * ch + c];
+            pcm8[o++] = (int16_t)(acc / (int32_t)ch);
+        }
+        if (pcm_rate > 8000) {
+            size_t step = (size_t)(pcm_rate / 8000);
+            size_t n8 = 0;
+            if (step < 1) step = 1;
+            for (i = 0; i < o && n8 < cap8; i += step)
+                pcm8[n8++] = pcm8[i];
+            o = n8;
+        }
+        pcm = pcm8;
+        samples = o;
+        if (samples == 0) return;
+    }
 
     /* 2.5) 诊断：每 50 帧打一次 pt/payload_len/samples/rms_before_hpf */
     static __thread int dec_cnt = 0;
@@ -625,7 +719,7 @@ void vad_on_rtp_frame(media_bug_frame_t *frame, void *ud) {
              "DECODE call=%p leg=%d pt=%d payload_len=%zu samples=%zu "
              "rms_raw=%u first=%d mid=%d last=%d",
              frame->call_key, frame->leg, (int)pkt.pt,
-             pkt.payload_len, samples, (unsigned)rms_raw,
+             frame->data_len, samples, (unsigned)rms_raw,
              (int)first, (int)mid, (int)last);
     }
 
@@ -769,7 +863,8 @@ static void *vad_worker(void *arg) {
 
 static const media_bug_consumer_t kVadConsumer = {
     .name      = "vad_engine",
-    .type_mask = BUG_RAW_RTP,
+    /* P1-5/P2-9：改用框架解码后的 PCM tap，彻底摆脱 PT 0/8 限制 */
+    .type_mask = BUG_PCM_READ,
     .cb        = vad_on_rtp_frame,
     .ud        = NULL,
 };
@@ -886,6 +981,12 @@ int vad_stop_for_call(void *call_key) {
                 WebRtcVad_Free(g_states[idx].wvad[leg]);
                 g_states[idx].wvad[leg] = NULL;
             }
+            if (g_states[idx].dec[leg]) {
+                if (g_states[idx].dec_ops[leg] && g_states[idx].dec_ops[leg]->fini)
+                    g_states[idx].dec_ops[leg]->fini(g_states[idx].dec[leg]);
+                g_states[idx].dec[leg] = NULL;
+                g_states[idx].dec_ops[leg] = NULL;
+            }
         }
         g_states[idx].active = 0;
         g_states[idx].call_key = NULL;
@@ -913,6 +1014,12 @@ void vad_stop_all(void) {
                 if (g_states[i].wvad[leg]) {
                     WebRtcVad_Free(g_states[i].wvad[leg]);
                     g_states[i].wvad[leg] = NULL;
+                }
+                if (g_states[i].dec[leg]) {
+                    if (g_states[i].dec_ops[leg] && g_states[i].dec_ops[leg]->fini)
+                        g_states[i].dec_ops[leg]->fini(g_states[i].dec[leg]);
+                    g_states[i].dec[leg] = NULL;
+                    g_states[i].dec_ops[leg] = NULL;
                 }
             }
             g_states[i].active = 0;

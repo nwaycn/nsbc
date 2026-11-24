@@ -361,6 +361,9 @@ static const codec_ops_t G711_PCMU_OPS = {
     .payload     = RTP_PAYLOAD_SIMPLE,
     .priority    = 50,
     .caps        = CODEC_CAP_DEC | CODEC_CAP_ENC,
+    .rtp_clock_rate  = 8000,
+    .pcm_sample_rate = 8000,
+    .frame_samples   = 160,
 };
 
 static const codec_ops_t G711_PCMA_OPS = {
@@ -382,6 +385,9 @@ static const codec_ops_t G711_PCMA_OPS = {
     .payload     = RTP_PAYLOAD_SIMPLE,
     .priority    = 50,
     .caps        = CODEC_CAP_DEC | CODEC_CAP_ENC,
+    .rtp_clock_rate  = 8000,
+    .pcm_sample_rate = 8000,
+    .frame_samples   = 160,
 };
 
 /* ============================================================================
@@ -396,6 +402,9 @@ int g711_register(void)
     if (rc2 != NSBC_OK) return rc2;
     return NSBC_OK;
 }
+
+/* 自注册到 mod_codecs 的内置 codec 段 */
+NSBC_CODEC_REGISTRAR(g711_register)
 
 /*
     Author:       李浩 (Li Hao)

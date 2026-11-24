@@ -25,6 +25,10 @@
 #include "cmd_registry.h"
 #include "log.h"
 #include "media_bug.h"
+#include "media_bridge.h"   /* §3.4 snapshot：视频状态 / PLI */
+#include "media_codec.h"    /* codec_conformance_selftest */
+#include "codec_plugin.h"   /* §4 P2：codec 动态装载 */
+#include "snapshot_job.h"   /* §3.4 视频抓图作业 */
 #include "hep_sink.h"
 #include "vad_engine.h"
 #include "playback_engine.h"
@@ -37,6 +41,7 @@
 #include <cjson/cJSON.h>
 #include <time.h>
 #include <stdint.h>
+#include <inttypes.h>
 
 #include <stdio.h>
 #include <string.h>
@@ -1783,7 +1788,7 @@ static int cmd_uuid_media_bug(cmd_ctx_t *c, int argc, char **argv, void *ud)
         return NSBC_OK;
     }
     if (strcmp(action, "list") == 0) {
-        char out[1024];
+        char out[4096];
         media_bug_status(out, sizeof(out));
         c->io_printf(c->io_ud, "%s", out);
         return NSBC_OK;
@@ -1802,11 +1807,210 @@ static int cmd_media_bug_purge(cmd_ctx_t *c, int argc, char **argv, void *ud)
     if (!c || !c->io_printf) return NSBC_INVAL;
     media_bug_purge_all();
     /* purge_all 返回 void；用 status 再看一眼清理后的 per-call bugs 数 */
-    char out[512];
+    char out[4096];
     media_bug_status(out, sizeof(out));
     c->io_printf(c->io_ud, "OK purged all bugs\n%s", out);
     log_audit("oam", "media-bug-purge", "all purged");
     return NSBC_OK;
+}
+
+/* ==================================================================
+ * snapshot <call-id> [leg=-1|0|1] [frames=1..3] — 视频抓图（L2，审计）
+ * snapshot_status <job-id> — 查询抓图作业（L1）
+ * codec_selftest — codec 编解码一致性自测（L1）
+ * ==================================================================*/
+
+static int cmd_snapshot(cmd_ctx_t *c, int argc, char **argv, void *ud)
+{
+    if (!c || !c->io_printf) return NSBC_INVAL;
+
+    char *callid = NULL;
+    if (!pick_callid(c, argv, argc, &callid)) return NSBC_INVAL;
+
+    int leg = -1;   /* -1 = 双腿，谁有视频抓谁 */
+    if (argc >= 3) {
+        leg = atoi(argv[2]);
+        if (leg < -1 || leg > 1) {
+            c->io_printf(c->io_ud, "ERR leg must be -1|0|1\n");
+            return NSBC_INVAL;
+        }
+    }
+    int frames = 1;
+    if (argc >= 4) {
+        frames = atoi(argv[3]);
+        if (frames < 1 || frames > SNAPSHOT_MAX_FRAMES) {
+            c->io_printf(c->io_ud, "ERR frames must be 1..%d\n",
+                         SNAPSHOT_MAX_FRAMES);
+            return NSBC_INVAL;
+        }
+    }
+
+    nsbc_ctx_t *xc = ctx_from_ud(ud);
+    if (!xc || !xc->bridge) {
+        c->io_printf(c->io_ud, "ERR media bridge not available\n");
+        return NSBC_ERR;
+    }
+    b2b_core_t *b = b2b_from_ctx(xc);
+    if (!b) { c->io_printf(c->io_ud, "ERR b2b not available\n"); return NSBC_ERR; }
+
+    B2B_CALL_GUARD(_cg, b, callid, strlen(callid));
+    b2b_call_t *call = _cg.c;
+    if (!call) {
+        c->io_printf(c->io_ud, "ERR notfound\n");
+        log_audit("oam", "snapshot", "call-id=%s result=notfound", callid);
+        return NSBC_NOENT;
+    }
+
+    bridge_mgr_t *m = (bridge_mgr_t *)xc->bridge;
+    int started = 0;
+    int count = (leg < 0) ? 2 : 1;
+    for (int k = 0; k < count; ++k) {
+        int L = (leg < 0) ? k : leg;
+        if (!media_bridge_call_has_video(m, call, L)) {
+            if (leg >= 0)
+                c->io_printf(c->io_ud, "ERR no video on leg %d\n", L);
+            continue;
+        }
+        snapshot_result_t why = SNAPSHOT_OK;
+        uint64_t id = snapshot_job_start(m, call, L, 0, frames, NULL, NULL,
+                                         &why);
+        if (id == 0) {
+            c->io_printf(c->io_ud, "ERR snapshot %s (leg %d)\n",
+                         snapshot_result_name(why), L);
+            continue;
+        }
+        c->io_printf(c->io_ud, "OK snapshot job=%" PRIu64
+                     " leg=%d frames=%d result via snapshot_status\n",
+                     id, L, frames);
+        log_audit("oam", "snapshot", "call-id=%s job=%" PRIu64
+                  " leg=%d frames=%d", callid, id, L, frames);
+        ++started;
+    }
+    if (started == 0 && leg < 0)
+        c->io_printf(c->io_ud, "ERR no video on any leg\n");
+    return started > 0 ? NSBC_OK : NSBC_ERR;
+}
+
+static int cmd_snapshot_status(cmd_ctx_t *c, int argc, char **argv, void *ud)
+{
+    (void)ud;
+    if (!c || !c->io_printf) return NSBC_INVAL;
+    if (argc < 2) {
+        c->io_printf(c->io_ud, "ERR usage: snapshot_status <job-id>\n");
+        return NSBC_INVAL;
+    }
+    uint64_t id = strtoull(argv[1], NULL, 10);
+    snapshot_result_info_t info;
+    int running = 0;
+    int rc = snapshot_job_get(id, &info, &running);
+    if (rc != NSBC_OK) {
+        c->io_printf(c->io_ud, "ERR job %" PRIu64 " not found\n", id);
+        return NSBC_NOENT;
+    }
+    if (running) {
+        c->io_printf(c->io_ud, "OK job=%" PRIu64 " running leg=%d\n",
+                     id, info.leg);
+    } else {
+        c->io_printf(c->io_ud,
+                     "OK job=%" PRIu64 " result=%s leg=%d %dx%d frames=%d "
+                     "%" PRIu64 "ms %" PRIu64 " bytes path=%s\n",
+                     id, snapshot_result_name(info.result), info.leg,
+                     info.width, info.height, info.frames_captured,
+                     info.elapsed_ms, info.bytes,
+                     info.path[0] ? info.path : "-");
+    }
+    return NSBC_OK;
+}
+
+static int cmd_media_bug_selftest(cmd_ctx_t *c, int argc, char **argv, void *ud)
+{
+    (void)argc; (void)argv; (void)ud;
+    if (!c || !c->io_printf) return NSBC_INVAL;
+    char out[4096];
+    int issues = media_bug_selftest(out, sizeof(out));
+    c->io_printf(c->io_ud, "%s", out);
+    log_audit("oam", "media-bug-selftest", "issues=%d", issues);
+    return issues == 0 ? NSBC_OK : NSBC_ERR;
+}
+
+/* ==================================================================
+ * codec_load <abs .so path> — 动态加载 codec 插件（L2，审计）
+ * codec_plugins — 列出已加载插件（L1 只读）
+ * ==================================================================*/
+
+static int cmd_codec_load(cmd_ctx_t *c, int argc, char **argv, void *ud)
+{
+    (void)ud;
+    if (!c || !c->io_printf) return NSBC_INVAL;
+    if (argc < 2 || argv[1][0] == '\0') {
+        c->io_printf(c->io_ud, "ERR usage: codec_load <abs-path.so>\n");
+        return NSBC_INVAL;
+    }
+
+    char name[64];
+    int rc = codec_plugin_load(argv[1], name, sizeof(name));
+    if (rc == NSBC_OK) {
+        c->io_printf(c->io_ud, "OK codec_load plugin=%s total=%d\n",
+                     name, codec_plugin_count());
+        log_audit("oam", "codec-load", "path=%s plugin=%s result=ok",
+                  argv[1], name);
+    } else if (rc == NSBC_EXISTS) {
+        c->io_printf(c->io_ud, "ERR already loaded\n");
+        log_audit("oam", "codec-load", "path=%s result=exists", argv[1]);
+    } else if (rc == NSBC_NOMEM) {
+        c->io_printf(c->io_ud, "ERR plugin slots full\n");
+        log_audit("oam", "codec-load", "path=%s result=slots-full", argv[1]);
+    } else if (rc == NSBC_INVAL) {
+        c->io_printf(c->io_ud,
+                     "ERR invalid plugin (path/abi/symbol)\n");
+        log_audit("oam", "codec-load", "path=%s result=invalid", argv[1]);
+    } else {
+        c->io_printf(c->io_ud, "ERR load failed rc=%d\n", rc);
+        log_audit("oam", "codec-load", "path=%s result=err rc=%d",
+                  argv[1], rc);
+    }
+    return rc == NSBC_OK ? NSBC_OK : NSBC_ERR;
+}
+
+typedef struct {
+    cmd_ctx_t *c;
+    int        n;
+} codec_plugin_list_ctx_t;
+
+static int codec_plugin_list_cb(const nsbc_codec_plugin_t *p,
+                                const char *path, void *ud)
+{
+    codec_plugin_list_ctx_t *l = (codec_plugin_list_ctx_t *)ud;
+    l->c->io_printf(l->c->io_ud, "codec_plugin[%d] name=%s version=%s "
+                    "codec=%s id=%u path=%s\n",
+                    l->n++, p->name,
+                    p->version != NULL ? p->version : "-",
+                    p->ops->name, (unsigned)p->ops->id, path);
+    return 0;
+}
+
+static int cmd_codec_plugins(cmd_ctx_t *c, int argc, char **argv, void *ud)
+{
+    (void)argc; (void)argv; (void)ud;
+    if (!c || !c->io_printf) return NSBC_INVAL;
+    int total = codec_plugin_count();
+    c->io_printf(c->io_ud, "codec_plugins: total=%d\n", total);
+    if (total > 0) {
+        codec_plugin_list_ctx_t l = { c, 0 };
+        (void)codec_plugin_foreach(codec_plugin_list_cb, &l);
+    }
+    return NSBC_OK;
+}
+
+static int cmd_codec_selftest(cmd_ctx_t *c, int argc, char **argv, void *ud)
+{
+    (void)argc; (void)argv; (void)ud;
+    if (!c || !c->io_printf) return NSBC_INVAL;
+    char out[4096];
+    int fails = codec_conformance_selftest(out, sizeof(out));
+    c->io_printf(c->io_ud, "%s", out);
+    log_audit("oam", "codec-selftest", "failures=%d", fails);
+    return fails == 0 ? NSBC_OK : NSBC_ERR;
 }
 
 /* ==================================================================
@@ -2198,6 +2402,20 @@ void call_commands_register(cmd_reg_t *reg, nsbc_ctx_t *ctx)
           "media_bug", CMD_L2_ADMIN, cmd_uuid_media_bug, ctx },
         { "media_bug",     "media_bug purge_all（L2，强制清理）",
           "media_bug", CMD_L2_ADMIN, cmd_media_bug_purge, ctx },
+
+        /* ---- §3.4 snapshot 视频抓图 ---- */
+        { "snapshot",      "视频抓图 <call-id> [leg=-1|0|1] [frames=1..3]（L2，审计）",
+          "media_bug", CMD_L2_ADMIN, cmd_snapshot, ctx },
+        { "snapshot_status","查询抓图作业 <job-id>（L1 只读）",
+          "media_bug", CMD_L1_MONITOR, cmd_snapshot_status, ctx },
+        { "codec_selftest","codec 编解码一致性自测（L1 只读）",
+          "codec", CMD_L1_MONITOR, cmd_codec_selftest, ctx },
+        { "codec_load",    "动态加载 codec 插件 <abs-path.so>（L2，审计）",
+          "codec", CMD_L2_ADMIN, cmd_codec_load, ctx },
+        { "codec_plugins", "列出已加载 codec 插件（L1 只读）",
+          "codec", CMD_L1_MONITOR, cmd_codec_plugins, ctx },
+        { "media_bug_selftest","media_bug 注册/快照一致性自检（L1 只读）",
+          "media_bug", CMD_L1_MONITOR, cmd_media_bug_selftest, ctx },
 
         /* ---- hep HEP3 推流 ---- */
         { "hep",           "hep status|flush|reload（L1/L2 混合，审计）",

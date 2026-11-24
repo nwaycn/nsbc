@@ -1595,6 +1595,18 @@ reg_auth_ok:
     }
     respond(r, proto, src, m, 200, extra[0] ? extra : NULL, NULL, 0, txn);
 
+    /* WS 重连补发：同一 AoR 断线期间若有 pending BYE（挂断时 WS 已死，
+     * send_bye_leg 无法送达），在新连接上补发，让 WebRTC 侧结束通话。
+     * 必须在 200 OK 之后发送，保证客户端先完成注册再收到 BYE。 */
+    if ((proto == SIP_TR_WS || proto == SIP_TR_WSS) && aor[0]) {
+        void *wc = sig_ws_bridge_conn_from_sa(src);
+        int nfl = b2b_pending_bye_flush(aor, wc);
+        if (nfl > 0)
+            llog(LOG_WARN, "reg",
+                 "pending BYE flushed after REGISTER aor=%s n=%d conn=%p",
+                 aor, nfl, wc);
+    }
+
     /* ===== 诊断：200 OK 最终返回汇总 ===== */
     {
         const char *_role_s =

@@ -1813,6 +1813,7 @@ function livePanel(title, icon, columns, apiPath, opts = {}) {
         if (!callId) return;
         const act = btn.getAttribute('data-act');
         if (act === 'hangup') window.nsbcHangup(callId);
+        else if (act === 'snapshot') window.nsbcSnapshot(callId);
         else if (act === 'play') window.nsbcPlayPrompt(callId);
         else if (act === 'stop') window.nsbcPlaybackStop(callId);
         else if (act === 'status') {
@@ -1841,6 +1842,64 @@ window.nsbcHangup = async function(callId) {
     ElMessage.success('Hang up command sent');
   } catch (e) {
     ElMessage.error('Hang up failed: ' + (e.message || e));
+  }
+};
+
+// ===== 视频抓图（snapshot，V2 §3.4.4）=====
+// POST 启动作业 → 轮询 /calls/snapshot/{job} → GET .../image（带 JWT）→ 转 data: URL 弹窗。
+// CSP img-src 已允许 data:，不必为预览放开 blob:。
+window.nsbcSnapshot = async function(callId) {
+  if (!callId) return;
+  let loading = null;
+  try { if (window.ElLoading && ElLoading.service) loading = ElLoading.service({ lock: true, text: t('Snapshot') }); } catch (_) {}
+  try {
+    const started = await API.post('/calls/' + encodeURIComponent(callId) + '/snapshot', { frames: 1 });
+    const jobs = (started && started.jobs) || [];
+    if (!jobs.length) throw new Error('NO_VIDEO');
+    let hit = null, last = 'TIMEOUT';
+    for (const job of jobs) {
+      for (let i = 0; i < 20; i++) {
+        let stt = null;
+        try { stt = await API.get('/calls/snapshot/' + encodeURIComponent(job.job_id)); }
+        catch (e) { last = e.message || String(e); break; }
+        if (stt && !stt.running) {
+          last = stt.result || 'UNKNOWN';
+          if (stt.result === 'OK' && stt.image_url) hit = job;
+          break;
+        }
+        await new Promise(r => setTimeout(r, 300));
+      }
+      if (hit) break;
+    }
+    if (!hit) {
+      const hints = {
+        NO_VIDEO: t('No video on this call'),
+        NO_KEYFRAME: t('No keyframe received (H.264 video legs only)'),
+        TIMEOUT: t('No frame captured before timeout'),
+      };
+      throw new Error(hints[last] || last);
+    }
+    const res = await fetch(
+      API.base + '/calls/snapshot/' + encodeURIComponent(hit.job_id) + '/image',
+      { headers: API.headers(false) });
+    if (!res.ok) throw new Error('image HTTP ' + res.status);
+    const blob = await res.blob();
+    const dataUrl = await new Promise((resolve, reject) => {
+      const fr = new FileReader();
+      fr.onload = () => resolve(fr.result);
+      fr.onerror = () => reject(new Error('image read failed'));
+      fr.readAsDataURL(blob);
+    });
+    ElMessageBox.alert(
+      `<div style="font-size:12px;color:#6b7280;margin-bottom:6px">leg ${hit.leg} · job ${hit.job_id}</div>` +
+      `<img src="${dataUrl}" style="max-width:100%;border-radius:6px">`,
+      t('Snapshot'),
+      { dangerouslyUseHTMLString: true }
+    );
+  } catch (e) {
+    ElMessage.error(t('Snapshot') + ' failed: ' + (e.message || e));
+  } finally {
+    if (loading) loading.close();
   }
 };
 

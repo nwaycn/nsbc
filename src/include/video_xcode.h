@@ -6,7 +6,7 @@
  * 单方向流水线：源腿 RTP 载荷 → 解包(AU) → FFmpeg 解码 → 重编码
  *               → 打包为对侧腿 RTP 载荷（回调发送）。
  *
- * 只支持 H.264 / VP8 / VP9（其余组合返回 NULL，呼叫保持原透传）。
+ * 只支持 H.264 / H.265 / VP8 / VP9（其余组合返回 NULL，呼叫保持原透传）。
  * 每方向一个实例，仅媒体线程访问；无锁、无动态扩容。
  */
 #include "nsbc_common.h"
@@ -20,6 +20,12 @@ typedef struct video_xcode video_xcode_t;
 
 /* 每产出一个 RTP 包（含 12 字节头）回调一次 */
 typedef void (*video_xcode_emit_fn)(void *ud, const uint8_t *pkt, size_t len);
+
+/* 每个重编码成功的帧回调一次（H.264 Annex-B，含起始码/SPS/PPS）。
+ * 供录制旁路直接取 AU，免去再打包成 RTP 又解包的开销。
+ * key=1 表示该帧为 IDR；ts 为输出 90kHz RTP 时间戳。 */
+typedef void (*video_xcode_au_fn)(void *ud, const uint8_t *au, size_t len,
+                                  uint32_t ts, int key);
 
 /* 创建会话；src/dst 必须可解/可编。失败返回 NULL（保持透传）。 */
 video_xcode_t *video_xcode_create(codec_id_t src, codec_id_t dst,
@@ -36,6 +42,9 @@ int video_xcode_input(video_xcode_t *vx,
 
 /* 取走一次“需要上游关键帧”的请求（PLI/FIR 由调用方发送）。 */
 int video_xcode_take_pli(video_xcode_t *vx);
+
+/* 注册重编码 AU 旁路（录制用）。fn=NULL 取消。仅媒体线程调用。 */
+void video_xcode_set_au_sink(video_xcode_t *vx, video_xcode_au_fn fn, void *ud);
 
 #ifdef __cplusplus
 }

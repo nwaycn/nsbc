@@ -331,6 +331,23 @@ pub struct CallList {
     pub truncated: bool,
 }
 
+/// One video snapshot job started by `snapshot <call-id> [leg] [frames]`.
+/// Core returns one OK line per leg (leg=-1 fans out to both legs with video).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SnapshotJob {
+    pub job_id: u64,
+    pub leg: i32,
+    pub frames: u32,
+}
+
+/// Result of starting snapshot job(s) (V2 §3.4.4, L1 audit). The JPEG is produced
+/// asynchronously; the caller polls `snapshot_status`/`snapshot-status` by job_id or
+/// subscribes to the `SNAPSHOT` event.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct SnapshotStart {
+    pub jobs: Vec<SnapshotJob>,
+}
+
 /// Single Leg media plane view (REQ-OBS-010). None = core has no collection source
 /// (UNAVAILABLE, e.g. P0 media did not yet attach to b2b or a bypass leg does not transit
 /// through this device); strictly forbidden to fill with estimated values.
@@ -592,6 +609,17 @@ pub trait CoreApi: Send + Sync {
         &self,
         call_id: &str,
     ) -> impl Future<Output = Result<(), CoreError>> + Send;
+
+    /// Start video snapshot job(s) (`snapshot <call-id> [leg] [frames]`, L1 audit,
+    /// V2 §3.4.4). Returns the started jobs (one per leg for leg=None/-1); call not
+    /// found -> [`CoreError::NotFound`]; no video / rate limited / busy ->
+    /// [`CoreError::CoreRejected`] with the core-side reason (NO_VIDEO/BUSY/...).
+    fn snapshot(
+        &self,
+        call_id: &str,
+        leg: Option<i32>,
+        frames: Option<u32>,
+    ) -> impl Future<Output = Result<SnapshotStart, CoreError>> + Send;
 
     /// Dialplan Application registry (`show apps`, L0 read-only, REQ-DP-APP-001/REQ-AI-001).
     /// Returns the list of all registered dialplan apps (answer/ai/bridge/...),
@@ -988,6 +1016,23 @@ impl CoreApi for RealCore {
         let cmd = format!("hangup {}", sanitize_arg(call_id));
         let body = send_cmd(&self.sock_path, self.timeout, &cmd).await?;
         parse_hangup(&body)
+    }
+    async fn snapshot(
+        &self,
+        call_id: &str,
+        leg: Option<i32>,
+        frames: Option<u32>,
+    ) -> Result<SnapshotStart, CoreError> {
+        // Core syntax: `snapshot <call-id> [leg] [frames]` — positional, so an
+        // explicit frames value requires a leg placeholder (-1 = both legs).
+        let mut cmd = format!("snapshot {}", sanitize_arg(call_id));
+        if let Some(f) = frames {
+            cmd.push_str(&format!(" {} {f}", leg.unwrap_or(-1)));
+        } else if let Some(l) = leg {
+            cmd.push_str(&format!(" {l}"));
+        }
+        let body = send_cmd(&self.sock_path, self.timeout, &cmd).await?;
+        parse_snapshot(&body)
     }
     async fn dialplan_apps(&self) -> Result<Vec<AppInfo>, CoreError> {
         // show apps -> header apps=N + each line "name  help"; when dialplan module is not loaded
@@ -1422,6 +1467,51 @@ pub fn parse_hangup(body: &str) -> Result<(), CoreError> {
     } else {
         Err(CoreError::Protocol(format!("bad hangup response: {body:?}")))
     }
+}
+
+/// Parse `snapshot <call-id> [leg] [frames]` response (src/oam/call_commands.c
+/// cmd_snapshot). Core emits one line per started job:
+///   `OK snapshot job=12 leg=0 frames=1 ...`
+/// fanning out to both legs when leg=-1; failures are `ERR notfound` or
+/// `ERR snapshot <REASON> (leg N)` / `ERR no video on leg N`.
+pub fn parse_snapshot(body: &str) -> Result<SnapshotStart, CoreError> {
+    let mut jobs = Vec::new();
+    let mut last_err: Option<String> = None;
+    for raw in body.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line == "ERR notfound" {
+            return Err(CoreError::NotFound("call-id not found".into()));
+        }
+        if let Some(rest) = line.strip_prefix("OK snapshot job=") {
+            let mut job_id = 0u64;
+            let mut leg = -1i32;
+            let mut frames = 1u32;
+            for (idx, tok) in rest.split_whitespace().enumerate() {
+                if idx == 0 {
+                    job_id = tok.parse().unwrap_or(0);
+                } else if let Some(v) = tok.strip_prefix("leg=") {
+                    leg = v.parse().unwrap_or(-1);
+                } else if let Some(v) = tok.strip_prefix("frames=") {
+                    frames = v.parse().unwrap_or(1);
+                }
+            }
+            jobs.push(SnapshotJob { job_id, leg, frames });
+            continue;
+        }
+        if let Some(msg) = line.strip_prefix("ERR") {
+            last_err = Some(msg.trim().to_string());
+        }
+    }
+    if !jobs.is_empty() {
+        return Ok(SnapshotStart { jobs });
+    }
+    if let Some(msg) = last_err {
+        return Err(CoreError::CoreRejected(msg));
+    }
+    Err(CoreError::Protocol(format!("bad snapshot response: {body:?}")))
 }
 
 /// Parse `config.set <k> <v>` / `config.validate <k> <v>` response (C side obs_control
@@ -2557,6 +2647,31 @@ leg 0 sdp_offer 50\nabc\n";
                     Err(CoreError::Protocol("uncanned hangup".into()))
                 });
             parse_hangup(&canned?)
+        }
+        async fn snapshot(
+            &self,
+            call_id: &str,
+            leg: Option<i32>,
+            frames: Option<u32>,
+        ) -> Result<SnapshotStart, CoreError> {
+            // Mirror RealCore's positional argument layout.
+            let mut cmd = format!("snapshot {call_id}");
+            if let Some(f) = frames {
+                cmd.push_str(&format!(" {} {f}", leg.unwrap_or(-1)));
+            } else if let Some(l) = leg {
+                cmd.push_str(&format!(" {l}"));
+            }
+            self.calls.lock().unwrap().push(cmd);
+            let key = format!("snapshot:{call_id}");
+            // Canned keys: prefer "snapshot:<id>", fallback to generic "snapshot".
+            let canned = {
+                let map = self.canned.lock().unwrap();
+                map.get(&key)
+                    .or_else(|| map.get("snapshot"))
+                    .cloned()
+            }
+            .unwrap_or_else(|| Err(CoreError::Protocol("uncanned snapshot".into())));
+            parse_snapshot(&canned?)
         }
         async fn dialplan_apps(&self) -> Result<Vec<AppInfo>, CoreError> {
             // Can "show apps" response; default empty array (dialplan module not loaded)

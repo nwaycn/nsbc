@@ -48,6 +48,8 @@ enum {
     CODEC_H264,      /* 17 H.264/AVC（mod_av FFmpeg）*/
     CODEC_VP8,       /* 18 VP8（mod_av FFmpeg）*/
     CODEC_VP9,       /* 19 VP9（mod_av FFmpeg）*/
+    CODEC_MJPEG,     /* 20 JPEG 编码（抓图输出，mod_av FFmpeg；无 SDP 载荷）*/
+    CODEC_H265,      /* 21 H.265/HEVC（mod_av FFmpeg；RFC 7798）*/
 
     CODEC_ID_BUILTIN_MAX = 32,  /* 内置 ID 上限（不含） */
     CODEC_ID_DYNAMIC_MIN = 64,  /* 动态模块分配起点 */
@@ -65,6 +67,7 @@ enum {
     RTP_PAYLOAD_H264   = 3,   /* RFC 6184 */
     RTP_PAYLOAD_VP8    = 4,   /* RFC 7741 */
     RTP_PAYLOAD_VP9    = 5,   /* RFC 9628 */
+    RTP_PAYLOAD_H265   = 6,   /* RFC 7798（2 字节 NAL 头 / AP 48 / FU 49）*/
     RTP_PAYLOAD_CUSTOM = 255  /* 模块自带 unpack/pack */
 };
 
@@ -74,6 +77,8 @@ enum {
 #define CODEC_CAP_STATEFUL  (1u << 2)   /* 编解码器有跨帧状态（G.729/AMR）*/
 #define CODEC_CAP_VIDEO     (1u << 3)
 #define CODEC_CAP_FEC       (1u << 4)
+#define CODEC_CAP_EVENT     (1u << 5)   /* 旁路载荷：telephone-event/CN/red/rtx，
+                                         * 只参与 PT 识别与转发，不进 PCM 转码 */
 
 typedef enum {
     CODEC_FRAMING_RTP = 0,
@@ -145,6 +150,15 @@ typedef struct codec_ops {
     uint32_t    caps;             /* CODEC_CAP_* */
     const char *default_fmtp;     /* 如 AMR-WB "octet-align=1" */
 
+    /* --- v2.1 双时钟率（G.722/AMR-WB 必需）---
+     * RTP 时间戳时钟率与 PCM 采样率必须分开：
+     *   G.722  RTP=8000（RFC 3551），PCM=16000
+     *   AMR-WB RTP=16000，PCM=16000
+     * 填 0 表示未声明，按 clock_rate 兜底（用 codec_rtp_clock_rate() 读取）。 */
+    int         rtp_clock_rate;
+    int         pcm_sample_rate;
+    int         frame_samples;    /* 每帧每声道样本数；0=按 ptime 推导 */
+
     /* --- v2 扩展回调（可空）--- */
     int  (*fmtp_negotiate)(const char *local, const char *remote,
                            char *out, size_t cap);
@@ -153,6 +167,8 @@ typedef struct codec_ops {
                        codec_frame_t *frames, int max_frames, int *n_frames);
     int  (*rtp_pack)(codec_sess_t *s, const codec_frame_t *frames, int n_frames,
                      uint8_t *out, size_t cap, size_t *out_len);
+    /* 丢包隐藏：解码失败/丢包时生成一帧替代 PCM（可空）*/
+    int  (*plc)(codec_sess_t *s, media_frame_t *out);
 
     /* 视频编解码（kind==VIDEO 时使用） */
     int  (*vid_dec_init)(const char *fmtp, codec_sess_t **out);
@@ -200,6 +216,83 @@ int  codec_registry_unload_wait(codec_id_t id, int timeout_ms);
 int  codec_registry_unregister(codec_id_t id);
 
 /* ============================================================================
+ * desc + impl 两级模型（对标 switch_codec_interface + implementations）
+ *
+ * desc  = 身份（名字/SDP 名/别名/类别/静态 PT/能力/优先级）
+ * impl  = 单一 profile 能力（RTP 时钟率 / PCM 采样率 / 帧长 / 声道 / 码率）
+ *
+ * 兼容策略：现有 codec_ops_t 视为「desc + 单 impl」的视图，不必重写；
+ * 需要多 profile（G.729 10/20/30ms、AMR mode-set）的 codec 注册 desc + impls，
+ * impl->ops 指向同一套回调时 desc 与 ops 共用实现。
+ * ==========================================================================*/
+typedef struct codec_impl {
+    int         rtp_clock_rate;   /* RTP 时间戳时钟率（G722=8000）*/
+    int         pcm_sample_rate;  /* PCM 实际采样率（G722=16000）*/
+    int         frame_samples;    /* 每帧每声道样本数（8k@20ms=160）*/
+    int         ptime_ms;
+    int         channels;
+    int         default_pt;       /* 该 impl 的静态 PT；-1=动态 */
+    uint32_t    bitrate;          /* bps；0=不限定 */
+    const char *default_fmtp;
+    const codec_ops_t *ops;       /* 现有实现视图（init/decode/encode 等）*/
+} codec_impl_t;
+
+typedef struct codec_desc {
+    codec_id_t  id;
+    const char *name;
+    const char *sdp_name;
+    const char *aliases;
+    uint8_t     kind;
+    int         default_pt;
+    uint32_t    caps;
+    uint16_t    priority;
+    const char *default_fmtp;
+    const codec_impl_t *impls;    /* NULL → 用 ops 单 impl 兼容视图 */
+    int         n_impls;
+} codec_desc_t;
+
+/* 注册 desc（启动期；指针必须长期有效）。返回 NSBC_OK / NSBC_EXISTS 等。 */
+int  codec_desc_register(const codec_desc_t *desc);
+const codec_desc_t *codec_desc_by_id(codec_id_t id);
+/* 名称/SDP 名/别名查找 desc（kind=0 不限）*/
+const codec_desc_t *codec_by_name(const char *name, size_t len, int kind);
+/* 按能力选具体实现：优先精确匹配 pcm_rate/ptime/channels/bitrate，
+ * 无精确匹配时降级到第一个可编码实现（并打日志）。desc 可来自 codec_by_name。 */
+const codec_impl_t *codec_pick(const codec_desc_t *desc,
+                               int want_pcm_rate, int want_ptime_ms,
+                               int channels, uint32_t bitrate);
+/* ops 的双时钟率读取（0 值按 clock_rate 兜底）*/
+int  codec_rtp_clock_rate(const codec_ops_t *ops);
+int  codec_pcm_sample_rate(const codec_ops_t *ops);
+int  codec_frame_samples(const codec_ops_t *ops);
+
+/* ============================================================================
+ * 每腿 payload map（SDP 协商结果，生命周期与呼叫绑定）
+ * 名字做主键、PT 只做索引；旁路载荷（telephone-event/CN/red/rtx）标 is_event。
+ * ==========================================================================*/
+typedef struct leg_payload {
+    uint8_t    pt;
+    codec_id_t cid;
+    const codec_impl_t *impl;
+    int        rtp_rate;      /* 来自 rtpmap */
+    int        pcm_rate;      /* 来自 impl / fmtp */
+    int        channels;
+    int        ptime_hint;    /* fmtp ptime/maxptime，缺省 20 */
+    int        is_event;      /* telephone-event / CN / red / rtx */
+    char       fmtp[128];
+} leg_payload_t;
+
+/* 追加一条协商结果：enc 为 rtpmap 编码名（可不以 '\0' 结尾）。
+ * 返回新的条目数（map 满或参数非法时返回原 n）。 */
+int codec_payload_map_add(leg_payload_t *map, int cap, int n,
+                          int pt, const char *enc, size_t enc_len,
+                          int rtp_rate, int channels, const char *fmtp);
+const leg_payload_t *codec_payload_map_find(const leg_payload_t *map, int n,
+                                            int pt);
+/* 两条腿能否零转码中继（同 codec 且 fmtp 兼容）*/
+int codec_payload_map_can_relay(const leg_payload_t *a, const leg_payload_t *b);
+
+/* ============================================================================
  * 转码会话：src→dst（内部按需级联重采样，见 resample.h）
  * ==========================================================================*/
 typedef struct transcode_sess transcode_sess_t;
@@ -210,6 +303,12 @@ int  transcode_open(codec_id_t src, codec_id_t dst, transcode_sess_t **out);
 int  transcode_open2(codec_id_t src, codec_id_t dst,
                      int src_rate, int dst_rate, int channels,
                      transcode_sess_t **out);
+/* fmtp 透传版本：协商出的 fmtp 直接交给 init/encoder_init（AMR octet-align、
+ * Opus maxaveragebitrate、G.722 时钟率等）。src_fmtp/dst_fmtp 可 NULL。 */
+int  transcode_open_ex(codec_id_t src, codec_id_t dst,
+                       int src_rate, int dst_rate, int channels,
+                       const char *src_fmtp, const char *dst_fmtp,
+                       transcode_sess_t **out);
 void transcode_close(transcode_sess_t *t);
 /* 一帧 RTP 载荷进、一帧载荷出（无足够数据时 out_len=0/AGAIN） */
 int  transcode_process(transcode_sess_t *t,
@@ -220,11 +319,32 @@ codec_id_t transcode_dst_codec_id(const transcode_sess_t *t);
 /* 协商出的目标腿 PT（0xFF=未设置）；会话创建后只写一次，媒体线程只读 */
 void       transcode_set_dst_pt(transcode_sess_t *t, uint8_t pt);
 uint8_t    transcode_get_dst_pt(const transcode_sess_t *t);
+/* 双时钟率只读视图（RTP 头 ts 步进用 rtp，PCM 处理用 pcm）*/
+int  transcode_src_rtp_rate(const transcode_sess_t *t);
+int  transcode_dst_rtp_rate(const transcode_sess_t *t);
+int  transcode_plc(transcode_sess_t *t, uint8_t *out, size_t cap,
+                   size_t *out_len);
 
 /* SDP fmtp 协商裁剪（如 AMR octet-align、Opus maxaveragebitrate），
  * 交集结果写 dst（有界）；无对应 codec 返回 NOTSUP */
 int  codec_fmtp_negotiate(codec_id_t id, const char *offer, const char *answer,
                           char *dst, size_t cap);
+
+/* ============================================================================
+ * 内置 codec 自注册段（ELF，GNU ld）
+ *
+ * 新增 codec 只需在自己源文件里写 NSBC_CODEC_REGISTRAR(my_register)，
+ * 模块装载入口（src/mod/codecs/codecs.c）遍历段即可，无需再手工列举。
+ * 该段不依赖任何额外构建系统配置，find src/mod/codecs的.c 自动收集源文件。
+ * ==========================================================================*/
+typedef int (*codec_registrar_fn)(void);
+#define NSBC_CODEC_REGISTRAR(fn)                                             \
+    static const codec_registrar_fn __nsbc_codec_reg_##fn                    \
+        __attribute__((used, section("nsbc_codecs"))) = fn;
+
+/* 一致性自测：回环编解码 + 名字/别名 + 动态 PT 载荷 map + 异常载荷。
+ * 结果写 out（有界），返回失败项数（0=全通过）。 */
+int  codec_conformance_selftest(char *out, size_t cap);
 
 #ifdef __cplusplus
 }

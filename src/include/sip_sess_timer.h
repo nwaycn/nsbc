@@ -2,7 +2,7 @@
 #define NSBC_SIP_SESS_TIMER_H
 
 /* RFC 4028 会话定时（Session-Expires / Min-SE / refresher 参数）
- * 对应 REQ-SIP-014（P0 缺口：当前零代码）。
+ * 对应 REQ-SIP-014。
  *
  * 机制：协商出会话刷新间隔与 refresher 角色；refresher 在间隔过半时
  * 发 re-INVITE/UPDATE；对端在间隔+偏移内未收到刷新即发 BYE 拆话，

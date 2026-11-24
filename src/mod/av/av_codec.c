@@ -29,6 +29,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdarg.h>
+#include <pthread.h>
 
 #ifdef HAVE_FFMPEG
 #include <libavcodec/avcodec.h>
@@ -37,6 +39,32 @@
 #include <libavutil/imgutils.h>
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
+
+/* FFmpeg 的 av_log 默认写 stderr，daemon 化后看不到。
+ * 桥接到 llog，便于定位 avcodec_open2 等失败的具体原因。 */
+static void av_log_to_llog(void *avcl, int level, const char *fmt, va_list vl)
+{
+    (void)avcl;
+    char buf[512];
+    int n = vsnprintf(buf, sizeof(buf), fmt, vl);
+    if (n <= 0) return;
+    while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = '\0';
+    if (n == 0) return;
+    int lv = (level <= AV_LOG_ERROR)   ? LOG_ERR  :
+             (level <= AV_LOG_WARNING) ? LOG_WARN : LOG_DEBUG;
+    llog(lv, "ffmpeg", "%s", buf);
+}
+
+static pthread_once_t g_av_log_once = PTHREAD_ONCE_INIT;
+static void av_log_bridge_init(void)
+{
+    av_log_set_level(AV_LOG_WARNING);
+    av_log_set_callback(av_log_to_llog);
+}
+static void av_log_bridge(void)
+{
+    (void)pthread_once(&g_av_log_once, av_log_bridge_init);
+}
 #endif
 
 /* ============================================================================
@@ -88,6 +116,10 @@ struct ffmpeg_codec_param {
 
 static const struct ffmpeg_codec_param FF_PARAMS[] = {
     { CODEC_G722,    AV_CODEC_ID_ADPCM_G722,     0,      0 },
+    /* AMR 编码器用 bit_rate 选 mode；显式给最大值，避免不同 FFmpeg
+     * 构建对 0 值处理不一致（解码器忽略该字段）。 */
+    { CODEC_AMR_NB,  AV_CODEC_ID_AMR_NB,         12200,  0 },
+    { CODEC_AMR_WB,  AV_CODEC_ID_AMR_WB,         23850,  0 },
     { CODEC_G723_1,  AV_CODEC_ID_G723_1,         0,      0 },
     { CODEC_G726_16, AV_CODEC_ID_ADPCM_G726,     16000,  0 },
     { CODEC_G726_24, AV_CODEC_ID_ADPCM_G726,     24000,  0 },
@@ -95,8 +127,11 @@ static const struct ffmpeg_codec_param FF_PARAMS[] = {
     { CODEC_G726_40, AV_CODEC_ID_ADPCM_G726,     40000,  0 },
     { CODEC_OPUS,    AV_CODEC_ID_OPUS,           0,      0 },
     { CODEC_H264,    AV_CODEC_ID_H264,           0,      1 },
+    { CODEC_H265,    AV_CODEC_ID_HEVC,           0,      1 },
     { CODEC_VP8,     AV_CODEC_ID_VP8,            0,      1 },
     { CODEC_VP9,     AV_CODEC_ID_VP9,            0,      1 },
+    /* JPEG：仅用于 snapshot 抓图输出（无 SDP 载荷，不进协商） */
+    { CODEC_MJPEG,   AV_CODEC_ID_MJPEG,          0,      1 },
 };
 
 static const struct ffmpeg_codec_param *find_ff_param(codec_id_t id)
@@ -121,6 +156,7 @@ static const struct ffmpeg_codec_param *find_ff_param(codec_id_t id)
 static int av_codec_open(struct codec_sess *sess, int is_decoder)
 {
 #ifdef HAVE_FFMPEG
+    av_log_bridge();
     const struct ffmpeg_codec_param *p = find_ff_param(sess->id);
     if (!p) return NSBC_NOTSUP;
 
@@ -149,7 +185,8 @@ static int av_codec_open(struct codec_sess *sess, int is_decoder)
         /* 音频：通用 PCM S16 interleaved */
         ctx->sample_fmt  = AV_SAMPLE_FMT_S16;
         ctx->sample_rate = (sess->id == CODEC_OPUS) ? 48000 :
-                           (sess->id == CODEC_G722) ? 16000 : 8000;
+                           (sess->id == CODEC_G722 || sess->id == CODEC_AMR_WB)
+                               ? 16000 : 8000;
 #if LIBAVCODEC_VERSION_MAJOR >= 59
         /* FFmpeg 5.1+: channels → ch_layout */
         av_channel_layout_default(&ctx->ch_layout, 1);
@@ -172,7 +209,8 @@ static int av_codec_open(struct codec_sess *sess, int is_decoder)
     if (is_decoder && !p->is_video) {
         enum AVSampleFormat target_fmt   = AV_SAMPLE_FMT_S16;
         int                target_rate   = (sess->id == CODEC_OPUS) ? 48000 :
-                                           (sess->id == CODEC_G722) ? 16000 : 8000;
+                                           (sess->id == CODEC_G722 ||
+                                            sess->id == CODEC_AMR_WB) ? 16000 : 8000;
         int                target_ch     = 1;
 
         if (ctx->sample_fmt != target_fmt ||
@@ -488,6 +526,8 @@ static const AVCodec *av_vid_find_encoder(enum AVCodecID fid)
     const AVCodec *codec = NULL;
     if (fid == AV_CODEC_ID_H264)
         codec = avcodec_find_encoder_by_name("libx264");
+    else if (fid == AV_CODEC_ID_HEVC)
+        codec = avcodec_find_encoder_by_name("libx265");
     else if (fid == AV_CODEC_ID_VP9)
         codec = avcodec_find_encoder_by_name("libvpx-vp9");
     else if (fid == AV_CODEC_ID_VP8)
@@ -500,11 +540,14 @@ static int av_vid_enc_ensure(struct codec_sess *s, int w, int h)
 {
     if (s->vid_ready && s->vid_w == w && s->vid_h == h) return NSBC_OK;
 
+    av_log_bridge();
     const struct ffmpeg_codec_param *p = find_ff_param(s->id);
     if (!p || !p->is_video) return NSBC_NOTSUP;
 
-    /* 分辨率变化：重建编码器 */
-    if (s->vid_ready) {
+    /* 分辨率变化或首帧：重建编码器。
+     * 注意 enc_ctx 可能已由 vid_enc_init 以占位尺寸（176x144）打开，
+     * 用 enc_ctx 判断而不是 vid_ready，避免首帧重建时泄漏旧上下文。 */
+    if (s->enc_ctx || s->enc_pkt || s->enc_frame) {
         avcodec_free_context(&s->enc_ctx);
         av_packet_free(&s->enc_pkt);
         av_frame_free(&s->enc_frame);
@@ -523,14 +566,24 @@ static int av_vid_enc_ensure(struct codec_sess *s, int w, int h)
 
     ctx->width       = w;
     ctx->height      = h;
+    /* 像素格式统一 YUV420P */
     ctx->pix_fmt     = AV_PIX_FMT_YUV420P;
     ctx->time_base   = (AVRational){1, 90000};
-    ctx->framerate   = (AVRational){30, 1};
-    ctx->bit_rate    = 800000;
-    ctx->gop_size    = 30;
-    ctx->max_b_frames = 0;
-    ctx->thread_count = 1;
-    ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
+    if (p->ffmpeg_id == AV_CODEC_ID_MJPEG) {
+        /* MJPEG 帧内编码：只保留抓图必需字段（宽高 + 像素格式 + 质量）。
+         * 部分 FFmpeg 构建对 bit_rate/gop/framerate/低延迟标志的组合会
+         * 返回 EINVAL(-22)，这里与 ffmpeg CLI 的 mjpeg 用法对齐。 */
+        ctx->color_range = AVCOL_RANGE_JPEG;
+        ctx->qmin = 2;   /* 抓图质量：2..6 足够人脸比对 */
+        ctx->qmax = 6;
+    } else {
+        ctx->framerate   = (AVRational){30, 1};
+        ctx->bit_rate    = 800000;
+        ctx->gop_size    = 30;
+        ctx->max_b_frames = 0;
+        ctx->thread_count = 1;
+        ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
+    }
 
     AVDictionary *opts = NULL;
     if (p->ffmpeg_id == AV_CODEC_ID_H264) {
@@ -542,6 +595,13 @@ static int av_vid_enc_ensure(struct codec_sess *s, int w, int h)
         av_dict_set(&opts, "level", "3.1", 0);
         av_dict_set(&opts, "x264-params",
                     "repeat-headers=1:keyint=30:min-keyint=30:scenecut=0", 0);
+    } else if (p->ffmpeg_id == AV_CODEC_ID_HEVC) {
+        /* H.265 实时编码：ultrafast + zerolatency，IDR 自带 VPS/SPS/PPS，
+         * 便于录制直接落 Annex-B（与 H.264 路径一致）。 */
+        av_dict_set(&opts, "preset", "ultrafast", 0);
+        av_dict_set(&opts, "x265-params",
+                    "tune=zerolatency:repeat-headers=1:keyint=30:min-keyint=30"
+                    ":scenecut=0:log-level=error", 0);
     } else if (p->ffmpeg_id == AV_CODEC_ID_VP9) {
         av_dict_set(&opts, "deadline", "realtime", 0);
         av_dict_set(&opts, "cpu-used", "8", 0);
@@ -553,12 +613,14 @@ static int av_vid_enc_ensure(struct codec_sess *s, int w, int h)
         av_dict_set(&opts, "lag-in-frames", "0", 0);
     }
 
+    /* 打开失败时 ctx 会被释放，提前保存关键参数供日志定位 */
+    int vfmt = (int)ctx->pix_fmt;
     int rc = avcodec_open2(ctx, codec, &opts);
     av_dict_free(&opts);
     if (rc < 0) {
         avcodec_free_context(&ctx);
-        llog(LOG_WARN, "av", "video encoder open failed rc=%d id=%d %dx%d",
-             rc, s->id, w, h);
+        llog(LOG_WARN, "av", "video encoder open failed rc=%d id=%d %dx%d fmt=%d",
+             rc, s->id, w, h, vfmt);
         return NSBC_ERR;
     }
 
@@ -584,6 +646,7 @@ static int av_vid_dec_init(codec_id_t cid, const char *fmtp, codec_sess_t **out)
 {
     (void)fmtp;
     if (!out) return NSBC_INVAL;
+    av_log_bridge();
     struct codec_sess *s = (struct codec_sess *)calloc(1, sizeof(*s));
     if (!s) return NSBC_NOMEM;
     s->id = cid;
@@ -632,10 +695,15 @@ static int av_vid_decode(codec_sess_t *s, const uint8_t *au, size_t len,
     pkt->size = (int)len;
 
     int rc = avcodec_send_packet(cs->dec_ctx, pkt);
+    if (rc == AVERROR(EAGAIN)) {
+        /* 解码器输出队列未取空导致输入被拒：先取一帧腾出空间，再重送
+         * 当前 AU，避免整帧输入丢失（VP8/VP9 单包多帧、B 帧会触发）。 */
+        (void)avcodec_receive_frame(cs->dec_ctx, cs->frame);
+        rc = avcodec_send_packet(cs->dec_ctx, pkt);
+    }
     pkt->data = NULL;
     pkt->size = 0;
-    if (rc == AVERROR(EAGAIN)) return NSBC_AGAIN;
-    if (rc < 0) return NSBC_ERR;
+    if (rc < 0 && rc != AVERROR(EAGAIN)) return NSBC_ERR;
 
     rc = avcodec_receive_frame(cs->dec_ctx, cs->frame);
     if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) return NSBC_AGAIN;
@@ -682,8 +750,10 @@ static int av_vid_encode(codec_sess_t *s, const video_frame_t *in,
     if (rc != NSBC_OK) return rc;
 
     AVFrame *f = cs->enc_frame;
+    enum AVPixelFormat dst_fmt = cs->enc_ctx->pix_fmt;
+    if (dst_fmt == AV_PIX_FMT_NONE) dst_fmt = AV_PIX_FMT_YUV420P;
     av_frame_unref(f);
-    f->format = AV_PIX_FMT_YUV420P;
+    f->format = dst_fmt;
     f->width  = w;
     f->height = h;
     f->pts    = (int64_t)in->pts;
@@ -691,10 +761,10 @@ static int av_vid_encode(codec_sess_t *s, const video_frame_t *in,
     rc = av_frame_get_buffer(f, 0);
     if (rc < 0) return NSBC_ERR;
 
-    /* 解码帧像素格式 → 编码器 YUV420P */
+    /* 解码帧像素格式 → 编码器像素格式（统一 YUV420P） */
     cs->sws_v = sws_getCachedContext(cs->sws_v, in->width, in->height,
                                      (enum AVPixelFormat)in->format,
-                                     w, h, AV_PIX_FMT_YUV420P,
+                                     w, h, dst_fmt,
                                      SWS_BILINEAR, NULL, NULL, NULL);
     if (!cs->sws_v) { av_frame_unref(f); return NSBC_ERR; }
     sws_scale(cs->sws_v, (const uint8_t *const *)in->data,
@@ -814,6 +884,267 @@ AVCODEC_DECLARE_OPS(CODEC_VP8,      avcodec_vp8,      90000, 0, -1,   0,
 AVCODEC_DECLARE_OPS(CODEC_VP9,      avcodec_vp9,      90000, 0, -1,   0,
                     "VP9", "VP9", CODEC_KIND_VIDEO, RTP_PAYLOAD_VP9,
                     70, CODEC_CAP_DEC | CODEC_CAP_ENC | CODEC_CAP_VIDEO)
+/* H.265/HEVC：priority 85 —— 低于 H.264（兼容性优先），高于 VP8/VP9。
+ * default_pt=-1：动态 PT，由 SDP 协商。 */
+AVCODEC_DECLARE_OPS(CODEC_H265,     avcodec_h265,     90000, 0, -1,   0,
+                    "H265", "HEVC,H.265,H265", CODEC_KIND_VIDEO, RTP_PAYLOAD_H265,
+                    85, CODEC_CAP_DEC | CODEC_CAP_ENC | CODEC_CAP_VIDEO)
+/* JPEG：snapshot 抓图输出专用，不做 SDP 协商（default_pt=-1）。
+ * 只使用 vid_encode；vid_decode 存在但无业务调用。 */
+AVCODEC_DECLARE_OPS(CODEC_MJPEG,    avcodec_mjpeg,    90000, 0, -1,   0,
+                    "MJPEG", "JPEG,MJPG", CODEC_KIND_VIDEO, RTP_PAYLOAD_SIMPLE,
+                    10, CODEC_CAP_ENC | CODEC_CAP_VIDEO)
+
+/* ============================================================================
+ * AMR-NB / AMR-WB（RFC 4867 octet-aligned）
+ *
+ * RTP 载荷布局： CMR(1) + ToC(1..N) + 各帧 speech 数据
+ *   ToC: F(1) FT(4) Q(1) P(2)；F=1 表示后面还有一个 ToC 字节。
+ * FFmpeg 的 AMR 解码器吃「去掉 ToC 的单帧」，编码器输出「不带 ToC 的单帧」，
+ * 因此本文件负责 ToC 拆装 + CMR 填充，使 mod_av 可直接参与 AMR 转码。
+ * ==========================================================================*/
+/* 每帧总字节数（含 1 字节 ToC）；FT=15 只有 ToC，无数据 */
+static const int k_amr_nb_frame_bytes[16] = {
+    13, 14, 16, 18, 20, 21, 27, 32, 6, 0, 0, 0, 0, 0, 0, 1
+};
+static const int k_amr_wb_frame_bytes[16] = {
+    18, 24, 33, 37, 41, 47, 51, 59, 61, 0, 0, 0, 0, 0, 0, 1
+};
+/* speech 数据字节数（不含 ToC），用于编码后反推 FT */
+static const int k_amr_nb_speech[9] = { 12, 13, 15, 17, 19, 20, 26, 31, 5 };
+static const int k_amr_wb_speech[9] = { 17, 23, 32, 36, 40, 46, 50, 58, 60 };
+
+static int amr_sess_open(codec_id_t id, int is_dec, const char *fmtp,
+                         codec_sess_t **out)
+{
+    codec_sess_t *s;
+    int rc;
+    (void)fmtp;   /* FFmpeg AMR 解码器无需 fmtp；octet-align 由本层保证 */
+    if (out == NULL) return NSBC_INVAL;
+    s = (codec_sess_t *)calloc(1, sizeof(*s));
+    if (s == NULL) return NSBC_NOMEM;
+    s->id = id;
+    rc = av_codec_open(s, is_dec);
+    if (rc != NSBC_OK) { free(s); return rc; }
+    *out = s;
+    return NSBC_OK;
+}
+
+static int amr_unpack_common(const uint8_t *p, size_t len, int wb,
+                             codec_frame_t *frames, int max_frames, int *n)
+{
+    const int *tab = wb ? k_amr_wb_frame_bytes : k_amr_nb_frame_bytes;
+    uint8_t toc[16];
+    int nf = 0, i;
+
+    if (p == NULL || frames == NULL || n == NULL) return NSBC_INVAL;
+    *n = 0;
+    if (len < 2) return NSBC_OK;      /* 只有 CMR 或空载荷 */
+
+    i = 1;                            /* 跳过 CMR */
+    while (i < (int)len && nf < 16) {
+        toc[nf++] = p[i++];
+        if (!(toc[nf - 1] & 0x80)) break;   /* F=0：ToC 列表结束 */
+    }
+    for (int k = 0; k < nf; ++k) {
+        int ft = (toc[k] >> 3) & 0x0F;
+        int sz = tab[ft];
+        int speech = sz > 0 ? sz - 1 : 0;
+        if (speech <= 0) continue;          /* FT=15 / 无效 mode */
+        if (i + speech > (int)len) {
+            llog(LOG_DEBUG, "av", "AMR frame %d truncated (need %d, left %d)",
+                 k, speech, (int)len - i);
+            break;
+        }
+        if (*n >= max_frames) break;
+        frames[*n].data = p + i;
+        frames[*n].len = (size_t)speech;
+        frames[*n].samples = wb ? 320 : 160;
+        frames[*n].speech = 1;
+        (*n)++;
+        i += speech;
+    }
+    return NSBC_OK;
+}
+
+static int amr_unpack_nb(codec_sess_t *s, const uint8_t *p, size_t len,
+                         codec_frame_t *frames, int max_frames, int *n)
+{
+    (void)s;
+    return amr_unpack_common(p, len, 0, frames, max_frames, n);
+}
+
+static int amr_unpack_wb(codec_sess_t *s, const uint8_t *p, size_t len,
+                         codec_frame_t *frames, int max_frames, int *n)
+{
+    (void)s;
+    return amr_unpack_common(p, len, 1, frames, max_frames, n);
+}
+
+/* 编码：FFmpeg 输出单帧 → 前面补 CMR + ToC */
+static int amr_encode_common(codec_sess_t *s, const media_frame_t *in,
+                             uint8_t *out, size_t cap, size_t *ol, int wb)
+{
+    uint8_t tmp[128];
+    size_t tlen = 0;
+    const int *sp = wb ? k_amr_wb_speech : k_amr_nb_speech;
+    int rc, ft = -1;
+
+    if (s == NULL || in == NULL || out == NULL || ol == NULL)
+        return NSBC_INVAL;
+    *ol = 0;
+    rc = av_codec_encode(s, in, tmp, sizeof(tmp), &tlen);
+    if (rc != NSBC_OK || tlen == 0) return rc;
+
+    for (int i = 0; i < 9; ++i) {
+        if ((size_t)sp[i] == tlen) { ft = i; break; }
+    }
+    if (ft < 0) {
+        /* 非标准长度：取最接近的 mode，保证对端可解析 */
+        size_t diff = (size_t)-1;
+        for (int i = 0; i < 9; ++i) {
+            int d = (int)tlen - sp[i];
+            size_t ad = (size_t)(d < 0 ? -d : d);
+            if (ad < diff) { diff = ad; ft = i; }
+        }
+        if (tlen > (size_t)sp[ft]) tlen = (size_t)sp[ft];
+    }
+    if (cap < tlen + 2) return NSBC_NOSPC;
+    out[0] = 0xF0;                                  /* CMR: no mode request */
+    out[1] = (uint8_t)(((ft & 0x0F) << 3) | 0x04);  /* F=0 FT=mode Q=1 P=0 */
+    memcpy(out + 2, tmp, tlen);
+    *ol = tlen + 2;
+    return NSBC_OK;
+}
+
+static int amr_nb_encode(codec_sess_t *s, const media_frame_t *in,
+                         uint8_t *out, size_t cap, size_t *ol)
+{
+    return amr_encode_common(s, in, out, cap, ol, 0);
+}
+
+static int amr_wb_encode(codec_sess_t *s, const media_frame_t *in,
+                         uint8_t *out, size_t cap, size_t *ol)
+{
+    return amr_encode_common(s, in, out, cap, ol, 1);
+}
+
+/* fmtp 协商：始终 octet-align=1，保留远端 mode-set */
+static int amr_fmtp_negotiate(const char *local, const char *remote,
+                              char *out, size_t cap)
+{
+    char modeset[64] = "";
+    (void)local;
+    if (out == NULL || cap == 0) return NSBC_INVAL;
+    if (remote != NULL) {
+        const char *m = strstr(remote, "mode-set=");
+        if (m != NULL) {
+            size_t n = 0;
+            m += 9;
+            while (m[n] != '\0' && m[n] != ';' && m[n] != ' ' &&
+                   n + 1 < sizeof(modeset)) {
+                modeset[n] = m[n];
+                ++n;
+            }
+            modeset[n] = '\0';
+        }
+        if (strstr(remote, "octet-align=0") != NULL)
+            llog(LOG_WARN, "av", "AMR remote wants octet-align=0, forcing 1");
+    }
+    if (modeset[0])
+        snprintf(out, cap, "octet-align=1;mode-set=%s", modeset);
+    else
+        snprintf(out, cap, "octet-align=1");
+    return NSBC_OK;
+}
+
+static int amr_nb_dec_init(const char *f, codec_sess_t **o)
+{
+    return amr_sess_open(CODEC_AMR_NB, 1, f, o);
+}
+static int amr_nb_enc_init(const char *f, codec_sess_t **o)
+{
+    return amr_sess_open(CODEC_AMR_NB, 0, f, o);
+}
+static int amr_wb_dec_init(const char *f, codec_sess_t **o)
+{
+    return amr_sess_open(CODEC_AMR_WB, 1, f, o);
+}
+static int amr_wb_enc_init(const char *f, codec_sess_t **o)
+{
+    return amr_sess_open(CODEC_AMR_WB, 0, f, o);
+}
+static void amr_fini(codec_sess_t *s) { av_codec_close(s); }
+static int amr_nb_decode(codec_sess_t *s, const uint8_t *in, size_t il,
+                         media_frame_t *out)
+{
+    return av_codec_decode(s, in, il, out);
+}
+static int amr_wb_decode(codec_sess_t *s, const uint8_t *in, size_t il,
+                         media_frame_t *out)
+{
+    return av_codec_decode(s, in, il, out);
+}
+
+static void amr_fill_common(codec_ops_t *ops, codec_id_t id, const char *name,
+                            const char *sdpn, const char *aliases,
+                            int clock, uint16_t prio)
+{
+    memset(ops, 0, sizeof(*ops));
+    ops->id = id;
+    snprintf(ops->name, sizeof(ops->name), "%s", name);
+    ops->clock_rate = clock;
+    ops->channels = 1;
+    ops->default_pt = -1;      /* AMR 一律动态 PT */
+    ops->ptime_ms = 20;
+    ops->api_version = NSBC_CODEC_API_VERSION;
+    ops->sdp_name = sdpn;
+    ops->aliases = aliases;
+    ops->kind = CODEC_KIND_AUDIO;
+    ops->payload = RTP_PAYLOAD_AMR;
+    ops->priority = prio;
+    ops->caps = CODEC_CAP_DEC | CODEC_CAP_ENC | CODEC_CAP_STATEFUL;
+    ops->default_fmtp = "octet-align=1";
+    ops->fmtp_negotiate = amr_fmtp_negotiate;
+    ops->rtp_clock_rate = clock;
+    ops->pcm_sample_rate = clock;
+    ops->frame_samples = clock / 50;     /* 20ms */
+    ops->fini = amr_fini;
+}
+
+static void avcodec_amr_nb_fill_ops(codec_ops_t *ops)
+{
+    amr_fill_common(ops, CODEC_AMR_NB, "amr_nb", "AMR",
+                    "AMR_NB,AMR-NB,AMR", 8000, 55);
+    ops->init = amr_nb_dec_init;
+    ops->encoder_init = amr_nb_enc_init;
+    ops->decode = amr_nb_decode;
+    ops->encode = amr_nb_encode;
+    ops->rtp_unpack = amr_unpack_nb;
+}
+
+static void avcodec_amr_wb_fill_ops(codec_ops_t *ops)
+{
+    amr_fill_common(ops, CODEC_AMR_WB, "amr_wb", "AMR-WB",
+                    "AMR_WB,AMRWB,AMR-WB", 16000, 75);
+    ops->init = amr_wb_dec_init;
+    ops->encoder_init = amr_wb_enc_init;
+    ops->decode = amr_wb_decode;
+    ops->encode = amr_wb_encode;
+    ops->rtp_unpack = amr_unpack_wb;
+}
+
+/* 双时钟率收尾：G.722 RTP=8000/PCM=16000；AMR 由 fill 时已填写 */
+static void av_fixup_dual_clock(codec_ops_t *slots, int n)
+{
+    for (int i = 0; i < n; ++i) {
+        if (slots[i].id == CODEC_G722) {
+            slots[i].rtp_clock_rate = 8000;    /* RFC 3551 */
+            slots[i].pcm_sample_rate = 16000;
+            slots[i].frame_samples = 320;      /* 20ms @ 16k PCM */
+        }
+    }
+}
 
 /* 视频回调按 codec 绑定（不能放进宏：宏体内无法展开 #ifdef）。
  * 无 FFmpeg 构建不绑定，codec_can_decode/encode 对视频返回 0，
@@ -842,6 +1173,8 @@ AVCODEC_DECLARE_OPS(CODEC_VP9,      avcodec_vp9,      90000, 0, -1,   0,
 VIDEO_ATTACH(CODEC_H264, avcodec_h264)
 VIDEO_ATTACH(CODEC_VP8,  avcodec_vp8)
 VIDEO_ATTACH(CODEC_VP9,  avcodec_vp9)
+VIDEO_ATTACH(CODEC_H265, avcodec_h265)
+VIDEO_ATTACH(CODEC_MJPEG, avcodec_mjpeg)
 #endif /* HAVE_FFMPEG */
 
 /* ============================================================================
@@ -856,7 +1189,7 @@ int av_register_all_codecs(void)
      * 之前用单个栈变量 `codec_ops_t ops`，循环内被 fill_ops 覆盖后
      * codec_registry_register(&ops) 存的栈地址在函数返回后悬空，
      * 导致 show codecs 显示 NAME/RATE/PTIME 等全是垃圾值。 */
-    static codec_ops_t g_ops_slots[16];   /* 16 > 10 个 AV codec，留点余量 */
+    static codec_ops_t g_ops_slots[20];   /* 12 个 AV codec（含 AMR NB/WB）+ MJPEG + 余量 */
     int slot = 0;
     int total = 0, ok = 0;
 
@@ -881,6 +1214,8 @@ int av_register_all_codecs(void)
     } while (0)
 
     REG_CODEC(avcodec_g722_fill_ops);
+    REG_CODEC(avcodec_amr_nb_fill_ops);
+    REG_CODEC(avcodec_amr_wb_fill_ops);
     REG_CODEC(avcodec_g7231_fill_ops);
     REG_CODEC(avcodec_g726_16_fill_ops);
     REG_CODEC(avcodec_g726_24_fill_ops);
@@ -890,15 +1225,30 @@ int av_register_all_codecs(void)
     REG_CODEC(avcodec_h264_fill_ops);
     REG_CODEC(avcodec_vp8_fill_ops);
     REG_CODEC(avcodec_vp9_fill_ops);
+    REG_CODEC(avcodec_h265_fill_ops);
+    REG_CODEC(avcodec_mjpeg_fill_ops);
 
 #ifdef HAVE_FFMPEG
     /* 视频回调在注册后绑定：registry 只保存 ops 指针，直接补字段即可 */
-    if (slot >= 3) {
-        avcodec_h264_attach_vid(&g_ops_slots[slot - 3]);
-        avcodec_vp8_attach_vid(&g_ops_slots[slot - 2]);
-        avcodec_vp9_attach_vid(&g_ops_slots[slot - 1]);
+    if (slot >= 5) {
+        avcodec_h264_attach_vid(&g_ops_slots[slot - 5]);
+        avcodec_vp8_attach_vid(&g_ops_slots[slot - 4]);
+        avcodec_vp9_attach_vid(&g_ops_slots[slot - 3]);
+        avcodec_h265_attach_vid(&g_ops_slots[slot - 2]);
+        avcodec_mjpeg_attach_vid(&g_ops_slots[slot - 1]);
     }
 #endif
+
+    /* H.264 默认 fmtp 归入 codec 元数据：SDP 重写 / answer 生成统一从
+     * ops->default_fmtp 读取，核心不再硬编码 packetization-mode。 */
+    for (int i = 0; i < slot; ++i) {
+        if (g_ops_slots[i].id == CODEC_H264 && g_ops_slots[i].default_fmtp == NULL)
+            g_ops_slots[i].default_fmtp =
+                "packetization-mode=1;profile-level-id=42e01f";
+    }
+
+    /* G.722 双时钟率：RTP 8000 / PCM 16000（SDP 写 8000）*/
+    av_fixup_dual_clock(g_ops_slots, slot);
 
 #undef REG_CODEC
 

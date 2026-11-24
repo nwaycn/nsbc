@@ -604,6 +604,10 @@ static void b2b_forget_txn_locked(b2b_call_t *c, sip_txn_t *t)
         if (c->leg[i].srv_txn == t)    leg_txn_drop(&c->leg[i].srv_txn, t);
         if (c->leg[i].out_txn == t)    leg_txn_drop(&c->leg[i].out_txn, t);
         if (c->leg[i].cancel_txn == t) leg_txn_drop(&c->leg[i].cancel_txn, t);
+        if (c->leg[i].refresh_txn == t) {
+            leg_txn_drop(&c->leg[i].refresh_txn, t);
+            c->leg[i].refresh_pending = 0;
+        }
     }
     if (c->refer_txn == t)
         leg_txn_drop(&c->refer_txn, t);
@@ -1291,6 +1295,7 @@ static void call_destroy(b2b_call_t *c)
         leg_txn_detach(&c->leg[i].srv_txn);
         leg_txn_detach(&c->leg[i].out_txn);
         leg_txn_detach(&c->leg[i].cancel_txn);
+        leg_txn_detach(&c->leg[i].refresh_txn);
         if (c->leg[i].dlg)
             dlg_close(co->cfg.dlg, c->leg[i].dlg);
     }
@@ -1345,7 +1350,7 @@ static void call_destroy(b2b_call_t *c)
     /* REQ-MEDIA-BUG-001：per-call bugs 自动清理
      * ——global consumers 不依赖 call_key，不受 call_destroy 影响；
      * per-call 手动 attach 的必须在 call 结束时 detach，避免悬挂指针。 */
-    media_bug_detach_all_for_call(c);
+    media_bug_notify_destroy(c);   /* 触发 ops.on_destroy + per-call bug 清理 */
     /* REQ-AI-001 / REQ-EVENTS-001：多模块 call_destroy hook 遍历
      * ——独立于 b2b_cfg_t.on_end 单槽，让 ai_dialog / event_handlers / ...
      * 都能在呼叫销毁前拿到通知（ai_dialog 要在这里关 per-call session 线程）。
@@ -2133,11 +2138,49 @@ static sip_txn_t *send_invite_b(b2b_call_t *c, int leg_idx,
             if (cur + sn < sizeof(st_extra)) { memcpy(st_extra + cur, se_line, sn); cur += sn; st_extra[cur] = '\0'; }
         }
     } else if (a->session_expires[0] && co->cfg.sess_timer_enabled && a->timer_effective) {
-        /* P1 完整模式 + 三层守卫通过：sess_timer_uas_negotiate 存的是完整头行
-         * "Session-Expires: N;refresher=xxx\r\n"，直接拼 */
+        /* P1 完整模式 + 三层守卫通过。a->session_expires 通常是协商后的完整头行
+         * "Session-Expires: N;refresher=xxx\r\n"；但 A 腿未声明 Supported:timer
+         * 时不会走协商，字段里仍是原始值 "N;refresher=x"——这种形态绝不能
+         * 直接当完整头拼进报文（会产生无头名的畸形行），必须补头名。 */
         size_t cur = strlen(st_extra);
-        size_t slen = strlen(a->session_expires);
-        if (cur + slen < sizeof(st_extra)) { memcpy(st_extra + cur, a->session_expires, slen); cur += slen; st_extra[cur] = '\0'; }
+        if (!strncasecmp(a->session_expires, "Session-Expires", 15)) {
+            size_t slen = strlen(a->session_expires);
+            if (cur + slen < sizeof(st_extra)) {
+                memcpy(st_extra + cur, a->session_expires, slen);
+                cur += slen;
+                st_extra[cur] = '\0';
+            }
+        } else {
+            int sn = snprintf(st_extra + cur, sizeof(st_extra) - cur,
+                              "Session-Expires: %s\r\n", a->session_expires);
+            (void)sn;
+        }
+    } else if (!a->session_expires[0] && co->cfg.sess_timer_enabled && a->timer_effective) {
+        /* A 腿没带 Session-Expires：B2BUA 作为 B 腿 UAC 主动提出本地定时器，
+         * 保证 WebRTC/外线对端也有会话定时（僵尸对话兜底）。对端 200 OK 不
+         * 回 Session-Expires 时按不支持处理，不会 arm。 */
+        char se_line[128];
+        int sn;
+        if (a->min_se[0]) {
+            /* A 已单独发过 Min-SE：本函数后面会按原值注入，这里不要再拼一条，
+             * 否则 B 腿 INVITE 出现两个 Min-SE 头。 */
+            sn = snprintf(se_line, sizeof(se_line),
+                          "Session-Expires: %d;refresher=uac\r\n",
+                          co->cfg.sess_timer_cfg.def_se_s);
+        } else {
+            sn = snprintf(se_line, sizeof(se_line),
+                          "Session-Expires: %d;refresher=uac\r\nMin-SE: %d\r\n",
+                          co->cfg.sess_timer_cfg.def_se_s,
+                          co->cfg.sess_timer_cfg.min_se_s);
+        }
+        if (sn > 0 && (size_t)sn < sizeof(se_line)) {
+            size_t cur = strlen(st_extra);
+            if (cur + sn < sizeof(st_extra)) {
+                memcpy(st_extra + cur, se_line, sn);
+                cur += sn;
+                st_extra[cur] = '\0';
+            }
+        }
     }
     if (a->min_se[0] && a->timer_effective) {
         /* Min-SE：仅三层守卫通过时才注入 */
@@ -2335,6 +2378,7 @@ static void finish_with_a_response(b2b_call_t *c, int status,
                                    const char *body, size_t bodylen);
 static void send_cancel_req(b2b_call_t *c, int leg);
 static void send_bye_leg(b2b_call_t *c, int leg);
+static void call_aor_of(const b2b_call_t *c, int li, char *out, size_t outsz);
 static int build_dlg_req(b2b_core_t *co, b2b_leg_t *l,
                          sip_method_t method, long cseq, const char *ruri,
                          const char *to_with_tag, const char *branch,
@@ -2343,6 +2387,99 @@ static int build_dlg_req(b2b_core_t *co, b2b_leg_t *l,
 static sip_txn_t *send_invite_b(b2b_call_t *c, int leg_idx,
                                 const char *body, size_t bodylen, int reinv,
                                 const char *extra /* History-Info 等额外头块，自带 CRLF */);
+
+/* RFC 4028：解析 Session-Expires 值，兼容两种存储形态——
+ *   1) 协商后的完整头行 "Session-Expires: N;refresher=x\r\n"
+ *   2) 未协商时的原始值 "N;refresher=x"（A 腿未声明 Supported:timer）
+ * 返回间隔秒（<=0 视为无有效值）；rf 输出 refresher 参数（缺省 NONE）。 */
+static int parse_sess_expires_value(const char *s, sip_refresher_t *rf)
+{
+    if (rf) *rf = SIP_REF_NONE;
+    if (!s || !s[0])
+        return 0;
+    if (!strncasecmp(s, "Session-Expires", 15)) {
+        s = strchr(s, ':');
+        if (!s)
+            return 0;
+        ++s;
+    }
+    int se = atoi(s);
+    if (rf) {
+        const char *rp = strstr(s, "refresher=");
+        if (rp) {
+            rp += 10;
+            if (!strncmp(rp, "uac", 3)) *rf = SIP_REF_UAC;
+            else if (!strncmp(rp, "uas", 3)) *rf = SIP_REF_UAS;
+        }
+    }
+    return se;
+}
+
+/* RFC 4028：按 200 OK 协商结果 arm 单腿。
+ * we_are_uac=1 表示该 leg 上 B2BUA 是 UAC（B 腿），0=UAS（A 腿）。
+ * peer_refresher 为 Session-Expires 里的 refresher 值（缺省按 RFC 4028 §4
+ * 视为 uac）。关键点：无论本侧是不是 refresher 都必须把 st.active 置 1，
+ * 否则被刷新方永远不会检测 interval+grace 超时（僵尸对话）。 */
+static void sess_timer_arm_leg(b2b_core_t *co, b2b_call_t *c, int li,
+                               int we_are_uac, int interval_s,
+                               sip_refresher_t peer_refresher, uint64_t nm)
+{
+    if (!co || !co->cfg.tw || !c || li < 0 || li > 1 || interval_s <= 0)
+        return;
+    b2b_leg_t *lg = &c->leg[li];
+
+    if (peer_refresher == SIP_REF_NONE)
+        peer_refresher = SIP_REF_UAC;   /* RFC 4028 §4：缺省 UAC 刷新 */
+    int i_refresh = (we_are_uac && peer_refresher == SIP_REF_UAC) ||
+                    (!we_are_uac && peer_refresher == SIP_REF_UAS);
+
+    sess_timer_nego_t n;
+    n.interval_s = interval_s;
+    n.min_se_s   = co->cfg.sess_timer_cfg.min_se_s;
+    n.refresher  = i_refresh ? peer_refresher : SIP_REF_NONE;
+    sess_timer_arm(&lg->st, &n, nm);
+
+    tw_del(co->cfg.tw, &lg->refresh_node);
+    if (i_refresh) {
+        tw_add(co->cfg.tw, &lg->refresh_node,
+               nm + (uint64_t)interval_s * 500u + 200u,
+               sess_timer_refresh_cb, c);
+    }
+    tw_del(co->cfg.tw, &lg->expire_node);
+    tw_add(co->cfg.tw, &lg->expire_node,
+           nm + (uint64_t)interval_s * 1000u + SESS_TIMER_GRACE_MS,
+           sess_timer_expire_cb, c);
+
+    llog(LOG_NOTICE, "b2b",
+         "Session Timer armed leg=%d interval=%ds refresher=%s(my=%s)",
+         li, interval_s,
+         peer_refresher == SIP_REF_UAC ? "uac" : "uas",
+         i_refresh ? "yes" : "no");
+}
+
+/* 收到对端 re-INVITE/UPDATE 刷新：只重置收到请求的那条 dialog。 */
+static void sess_timer_on_refresh_received(b2b_core_t *co, b2b_call_t *c, int li)
+{
+    if (!co || !co->cfg.tw || !c || li < 0 || li > 1)
+        return;
+    b2b_leg_t *lg = &c->leg[li];
+    if (!lg->st.active)
+        return;
+
+    uint64_t nm = now_ms();
+    sess_timer_reset(&lg->st, nm);
+    tw_del(co->cfg.tw, &lg->expire_node);
+    tw_add(co->cfg.tw, &lg->expire_node,
+           nm + (uint64_t)lg->st.interval_s * 1000u + SESS_TIMER_GRACE_MS,
+           sess_timer_expire_cb, c);
+    /* 本侧刷新者：重排下一次刷新；已有刷新在途则不排，等 2xx/失败处理。 */
+    if (lg->st.refresher != SIP_REF_NONE && !lg->refresh_pending) {
+        tw_del(co->cfg.tw, &lg->refresh_node);
+        tw_add(co->cfg.tw, &lg->refresh_node,
+               nm + (uint64_t)lg->st.interval_s * 500u + 200u,
+               sess_timer_refresh_cb, c);
+    }
+}
 
 /* ------------------------------------------------------------------ */
 /* REQ-SIP-DIV-001：Diversion 头（RFC 5806）构造                          */
@@ -3448,22 +3585,41 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
          (void *)c->leg[0].out_txn, (void *)c->leg[1].out_txn,
          (void *)c->leg[0].inv_txn, (void *)c->leg[1].inv_txn);
 
-    /* Session Timer: refresh_cb 发出的 re-INVITE 收到 2xx → reset + arm 下次
-     * 此块无 t==inv_txn 守卫，因为 A-leg/B-leg re-INVITE 都用独立 txn。
-     * 初始 INVITE 的 2xx 不会误触发（refresh_pending 初始化 = 0）。
-     * 关键：用 tw_add 不用 tw_mod — refresh_node 触发后已被 timer_wheel 移除！ */
-    if (ev == TXN_EV_FINAL && m && m->status >= 200) {
+    /* RFC 4028：刷新 re-INVITE 的终态处理。
+     * 成功（2xx）→ 补 ACK + 重排下一次刷新；失败（3xx-6xx / 超时）
+     * → 立即拆话，不要等 interval 到期（对端已明确拒绝或失联）。
+     * 用专用 refresh_txn 匹配，避免把 BYE/CANCEL 的响应误当成刷新结果。 */
+    if ((ev == TXN_EV_FINAL || ev == TXN_EV_TIMEOUT) && t) {
         for (int li = 0; li < 2; li++) {
             b2b_leg_t *lg = &c->leg[li];
-            if (lg->refresh_pending && lg->st.active) {
+            if (!lg->refresh_txn || lg->refresh_txn != t || !lg->refresh_pending)
+                continue;
+
+            int status = (ev == TXN_EV_FINAL && m) ? m->status : 0;
+            leg_txn_drop(&lg->refresh_txn, t);
+            lg->refresh_pending = 0;
+
+            if (status >= 200 && status < 300) {
                 uint64_t nm = now_ms();
-                sess_timer_reset(&lg->st, nm);
-                int64_t half_ms = (int64_t)lg->st.interval_s * 500 + 200;
-                tw_add(co->cfg.tw, &lg->refresh_node, (uint64_t)((int64_t)nm + half_ms),
-                       sess_timer_refresh_cb, c);
-                tw_mod(co->cfg.tw, &lg->expire_node,
-                       nm + (uint64_t)lg->st.interval_s * 1000u + SESS_TIMER_GRACE_MS);
-                lg->refresh_pending = 0;
+                send_ack_leg(c, li);   /* re-INVITE 2xx 必须 ACK */
+                sess_timer_refresh_acked(&lg->st, nm);
+                if (lg->st.active && co->cfg.tw) {
+                    tw_del(co->cfg.tw, &lg->refresh_node);
+                    tw_add(co->cfg.tw, &lg->refresh_node,
+                           nm + (uint64_t)lg->st.interval_s * 500u + 200u,
+                           sess_timer_refresh_cb, c);
+                    tw_mod(co->cfg.tw, &lg->expire_node,
+                           nm + (uint64_t)lg->st.interval_s * 1000u + SESS_TIMER_GRACE_MS);
+                }
+                llog(LOG_INFO, "b2b",
+                     "Session Timer refresh OK leg=%d status=%d", li, status);
+            } else {
+                llog(LOG_WARN, "b2b",
+                     "Session Timer refresh FAIL leg=%d status=%d ev=%d → terminate",
+                     li, status, (int)ev);
+                call_unlock(c);
+                b2b_terminate(c, 408);
+                return;
             }
         }
     }
@@ -3515,6 +3671,7 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                     a->answer_len = m->body.len;
                 }
                 a->state = LEG_CONFIRMED;
+                media_bug_notify_answer(c);   /* ops.on_answer 生命周期接通 */
                 /* ★ ringback：originate A 腿接通 → 只停 stop_on_answer=1 的
                  * (ringback)，playback/endless_playback 继续 */
                 pb_stop_by_flag(c, 1);
@@ -3863,6 +4020,7 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                     c->leg[1].answer_len = abl;
                 }
                 c->leg[1].state = LEG_CONFIRMED;
+                media_bug_notify_answer(c);   /* ops.on_answer 生命周期接通 */
 
                 /* === HA P1: ACTIVE → REPL_DIALOG publish（INVITE 建立对话锚点） ===
                  * v3 payload：在 v2 call 状态机基础上，追加 profile 查找名 + relay 端口
@@ -4057,67 +4215,41 @@ static void cli_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
                                  "%.*s", (int)bose->value.len, bose->value.p);
                 }
 
-                /* Session Timer: extract Bob 200 OK + arm both legs
-                 * ★ 三层守卫：直接用协商阶段算好的 al->timer_effective（保持全链路一致） */
+                /* Session Timer：按 200 OK 协商结果 arm 两条腿。
+                 * ★ 关键修复：被刷新方也必须 arm（st.active=1）以启动
+                 *   interval+grace 超时监控；原实现只有本侧是 refresher 才
+                 *   arm，导致对端停止刷新时永远不拆话（僵尸对话）。 */
                 {
                     b2b_leg_t *al = &c->leg[0];
                     if (al->timer_effective) {
-                    sess_timer_nego_t nb;
-                    uint64_t nm = now_ms();
-                    /* A-leg arm（协商后值格式 "Session-Expires: N;refresher=xxx\r\n"） */
-                    if (al->session_expires[0]) {
-                        sess_timer_nego_t na;
-                        const char *v = al->session_expires;
-                        if ((v = strchr(v, ':')) != NULL) v++;
-                        na.interval_s = atoi(v);
-                        /* 从协商后的值解析 refresher */
-                        na.refresher = SIP_REF_NONE;
-                        {
-                            const char *rp = strstr(v, "refresher=");
-                            if (rp) { rp += 10; if (!strncmp(rp, "uac", 3)) na.refresher = SIP_REF_UAC;
-                                else if (!strncmp(rp, "uas", 3)) na.refresher = SIP_REF_UAS; }
+                        uint64_t nm = now_ms();
+                        /* A-leg: B2BUA=UAS。session_expires 可能是协商后的完整
+                         * 头行，也可能是未协商（A 未声明 Supported:timer）的原始
+                         * 值，统一交给 parse_sess_expires_value 处理。 */
+                        if (al->session_expires[0]) {
+                            sip_refresher_t rf = SIP_REF_NONE;
+                            int se = parse_sess_expires_value(al->session_expires, &rf);
+                            if (se >= co->cfg.sess_timer_cfg.min_se_s)
+                                sess_timer_arm_leg(co, c, 0, 0, se, rf, nm);
                         }
-                        if (na.interval_s >= co->cfg.sess_timer_cfg.min_se_s) {
-                            /* A-leg: B2BUA=UAS → 仅当 refresher=uas 时 B2BUA 是刷新方 → arm st + refresh_node；
-                             * 否则只 arm expire_node 做超时监控 */
-                            if (na.refresher == SIP_REF_UAS) {
-                                sess_timer_arm(&al->st, &na, nm);
-                                tw_del(co->cfg.tw, &al->refresh_node);
-                                int64_t half_ms = (int64_t)na.interval_s * 500 + 200;
-                                tw_add(co->cfg.tw, &al->refresh_node, (uint64_t)((int64_t)nm + half_ms), sess_timer_refresh_cb, c);
-                            }
-                            tw_del(co->cfg.tw, &al->expire_node);
-                            tw_add(co->cfg.tw, &al->expire_node, nm + (uint64_t)na.interval_s * 1000u + SESS_TIMER_GRACE_MS, sess_timer_expire_cb, c);
-                        }
-                    }
-                    /* B-leg arm（从 Bob 200 OK）
-                     * ★ 必须用 cfg 上限裁剪 —— Bob 200 OK 里的 Session-Expires 可能超过
-                     *   B2BUA 同意的上限（典型：WebRTC UA 自报 6000s），不裁剪会导致
-                     *   B2BUA arm 一个 100 分钟级的 expire timer → 100min 后 EXPIRED 断话。
-                     *   A-leg 协商已在 sess_timer_uas_negotiate 里做了 max_se_s 裁剪，
-                     *   B-leg arm 也要保持对称。 */
-                    sip_hdr_t *bose = sip_hdr_get(m, SIP_H_SESSION_EXPIRES);
-                    if (bose) {
-                        nb.interval_s = atoi(bose->value.p);
-                        nb.refresher = SIP_REF_NONE;
-                        const char *rp = strstr(bose->value.p, "refresher=");
-                        if (rp) { rp += 10; if (!strncmp(rp, "uac", 3)) nb.refresher = SIP_REF_UAC; else if (!strncmp(rp, "uas", 3)) nb.refresher = SIP_REF_UAS; }
-                        if (nb.interval_s > co->cfg.sess_timer_cfg.max_se_s)
-                            nb.interval_s = co->cfg.sess_timer_cfg.max_se_s;
-                        if (nb.interval_s >= co->cfg.sess_timer_cfg.min_se_s) {
-                            /* B-leg: B2BUA=UAC → 仅当 refresher=uac 时 B2BUA 是刷新方 */
-                            if (nb.refresher == SIP_REF_UAC) {
-                                sess_timer_arm(&c->leg[1].st, &nb, nm);
-                                tw_del(co->cfg.tw, &c->leg[1].refresh_node);
-                                int64_t half_ms2 = (int64_t)nb.interval_s * 500 + 200;
-                                tw_add(co->cfg.tw, &c->leg[1].refresh_node, (uint64_t)((int64_t)nm + half_ms2), sess_timer_refresh_cb, c);
-                            }
-                            tw_del(co->cfg.tw, &c->leg[1].expire_node);
-                            tw_add(co->cfg.tw, &c->leg[1].expire_node, nm + (uint64_t)nb.interval_s * 1000u + SESS_TIMER_GRACE_MS, sess_timer_expire_cb, c);
+                        /* B-leg: B2BUA=UAC；Bob 200 OK 的 SE 必须按 cfg 上限裁剪
+                         * （WebRTC UA 常自报 6000s，裁剪后才能及时发现僵死）。 */
+                        sip_hdr_t *bose = sip_hdr_get(m, SIP_H_SESSION_EXPIRES);
+                        if (bose) {
+                            char sev[64];
+                            size_t sl = bose->value.len < sizeof(sev) - 1
+                                        ? bose->value.len : sizeof(sev) - 1;
+                            memcpy(sev, bose->value.p, sl);
+                            sev[sl] = '\0';
+                            sip_refresher_t rf = SIP_REF_NONE;
+                            int se = parse_sess_expires_value(sev, &rf);
+                            if (se > co->cfg.sess_timer_cfg.max_se_s)
+                                se = co->cfg.sess_timer_cfg.max_se_s;
+                            if (se >= co->cfg.sess_timer_cfg.min_se_s)
+                                sess_timer_arm_leg(co, c, 1, 1, se, rf, nm);
                         }
                     }
                 }
-                } /* closes profile guard block */
                 send_ack_leg(c, 1);
 
                 /* ★ originate 单腿模式：bridge_confirm（maybe_start_media）
@@ -4879,6 +5011,158 @@ static void send_cancel_req(b2b_call_t *c, int leg)
     }
 }
 
+/* ------------------------------------------------------------------
+ * WS 断线 pending BYE 队列
+ *
+ * 场景：WS 连接因 pong miss 被关闭后，leg 的 dst 仍是 dead conn，
+ * send_bye_leg 无法投递 BYE；对端（WebRTC）UI 会一直停留在通话中。
+ * 这里把已组装好的 BYE 报文暂存，等同一 AoR 重新 REGISTER（新 ws_conn）
+ * 后补发，让客户端补收到挂断。
+ * 只按 user part 匹配（单域部署足够），最多保留 5 分钟。
+ * ------------------------------------------------------------------ */
+#define B2B_PENDING_BYE_MAX       32
+#define B2B_PENDING_BYE_MSG_MAX   2048
+#define B2B_PENDING_BYE_TTL_MS    (5u * 60u * 1000u)
+
+typedef struct {
+    int      used;
+    uint64_t expire_ms;
+    char     user[64];
+    size_t   len;
+    char     msg[B2B_PENDING_BYE_MSG_MAX];
+} b2b_pending_bye_t;
+
+static b2b_pending_bye_t g_pending_bye[B2B_PENDING_BYE_MAX];
+static pthread_mutex_t g_pending_bye_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* 取 AoR 的 user part 并转小写，用于跨 REGISTER/leg 匹配。 */
+static void pending_bye_user_of(const char *aor, char *out, size_t outsz)
+{
+    if (!out || outsz == 0)
+        return;
+    out[0] = '\0';
+    if (!aor)
+        return;
+    const char *u = aor;
+    if (strncasecmp(u, "sips:", 5) == 0)
+        u += 5;
+    else if (strncasecmp(u, "sip:", 4) == 0)
+        u += 4;
+    if (*u == '<')
+        ++u;
+    size_t n = 0;
+    while (u[n] && u[n] != '@' && u[n] != ';' && u[n] != '>' &&
+           n + 1 < outsz) {
+        out[n] = (char)tolower((unsigned char)u[n]);
+        ++n;
+    }
+    out[n] = '\0';
+}
+
+/* 暂存一条 BYE：WS 已死时由 send_bye_leg 调用。 */
+static void pending_bye_enqueue(const char *aor, const char *msg, size_t len)
+{
+    if (!aor || !aor[0] || !msg || len == 0 ||
+        len >= B2B_PENDING_BYE_MSG_MAX) {
+        llog(LOG_WARN, "b2b",
+             "pending BYE enqueue skip: aor=%s len=%zu (上限 %d)",
+             aor ? aor : "-", len, B2B_PENDING_BYE_MSG_MAX - 1);
+        return;
+    }
+    char user[64];
+    pending_bye_user_of(aor, user, sizeof(user));
+    if (!user[0])
+        return;
+
+    uint64_t now = now_ms();
+    pthread_mutex_lock(&g_pending_bye_lock);
+
+    int slot = -1, oldest = -1;
+    for (int i = 0; i < B2B_PENDING_BYE_MAX; ++i) {
+        b2b_pending_bye_t *e = &g_pending_bye[i];
+        if (e->used && e->expire_ms <= now) {
+            e->used = 0;
+            llog(LOG_INFO, "b2b",
+                 "pending BYE expired: user=%s (等不到 WS 重连)", e->user);
+        }
+        if (!e->used && slot < 0)
+            slot = i;
+        if (e->used && (oldest < 0 || e->expire_ms < g_pending_bye[oldest].expire_ms))
+            oldest = i;
+    }
+    if (slot < 0) {
+        /* 队列满：淘汰最旧的一条，保证新挂断不被静默丢弃。 */
+        slot = oldest;
+        if (slot >= 0)
+            llog(LOG_WARN, "b2b",
+                 "pending BYE 队列满，淘汰最旧 user=%s", g_pending_bye[slot].user);
+    }
+    if (slot < 0) {
+        pthread_mutex_unlock(&g_pending_bye_lock);
+        return;
+    }
+
+    b2b_pending_bye_t *e = &g_pending_bye[slot];
+    memset(e, 0, sizeof(*e));
+    e->used = 1;
+    e->expire_ms = now + B2B_PENDING_BYE_TTL_MS;
+    snprintf(e->user, sizeof(e->user), "%s", user);
+    memcpy(e->msg, msg, len);
+    e->len = len;
+
+    llog(LOG_WARN, "b2b",
+         "pending BYE queued: user=%s bytes=%zu (等 WS 重连补发, ttl=%ums)",
+         user, len, B2B_PENDING_BYE_TTL_MS);
+    pthread_mutex_unlock(&g_pending_bye_lock);
+}
+
+/* WS 重连（同一 AoR 重新 REGISTER）后补发 pending BYE。
+ * 由 registrar REGISTER-200 成功后调用；返回补发条数。 */
+int b2b_pending_bye_flush(const char *aor, void *ws_conn)
+{
+    if (!aor || !aor[0] || !ws_conn)
+        return 0;
+    char user[64];
+    pending_bye_user_of(aor, user, sizeof(user));
+    if (!user[0])
+        return 0;
+
+    uint64_t now = now_ms();
+    int sent = 0;
+    pthread_mutex_lock(&g_pending_bye_lock);
+    for (int i = 0; i < B2B_PENDING_BYE_MAX; ++i) {
+        b2b_pending_bye_t *e = &g_pending_bye[i];
+        if (!e->used)
+            continue;
+        if (e->expire_ms <= now) {
+            e->used = 0;
+            continue;
+        }
+        if (strcmp(e->user, user) != 0)
+            continue;
+        if (!ws_conn_alive(ws_conn)) {
+            llog(LOG_WARN, "b2b",
+                 "pending BYE flush: user=%s conn=%p 已失效，保留待下次重连",
+                 user, ws_conn);
+            break;
+        }
+        int rc = ws_conn_send(ws_conn, e->msg, e->len);
+        if (rc >= 0) {
+            llog(LOG_WARN, "b2b",
+                 "pending BYE flushed: user=%s bytes=%zu conn=%p rc=%d",
+                 user, e->len, ws_conn, rc);
+            e->used = 0;
+            ++sent;
+        } else {
+            llog(LOG_WARN, "b2b",
+                 "pending BYE flush FAIL: user=%s bytes=%zu conn=%p rc=%d",
+                 user, e->len, ws_conn, rc);
+        }
+    }
+    pthread_mutex_unlock(&g_pending_bye_lock);
+    return sent;
+}
+
 static void send_bye_leg(b2b_call_t *c, int leg)
 {
     b2b_core_t *co = c->core;
@@ -4988,17 +5272,25 @@ static void send_bye_leg(b2b_call_t *c, int leg)
     /* ★ 根因修复：pong miss 会 close fd 并置 ws_conn.closed=1，但
      * leg[].dst 里存的 ws_conn 指针不会主动清理 → 后续 BYE/CANCEL
      * 转发时拿 dead conn 创建 NICT txn → ws_conn_send → -1 →
-     * BYE 发不到对端。这里拦截 dead conn → warn + skip。
+     * BYE 发不到对端。这里拦截 dead conn：不能立即发送，但也不丢弃，
+     * 而是把已组装的 BYE 存入 pending 队列，等同一 AoR 重新 REGISTER
+     * 拿到新 ws_conn 后补发（否则 WebRTC 侧永远收不到挂断）。
      *
      * call_destroy 在外层 BYE handler 里已经紧跟 send_bye_leg 调用，
-     * 不依赖 BYE 发送成功——所以 skip 发送是安全的（best-effort）。 */
+     * 不依赖 BYE 发送成功。 */
     if (l->dst.ss.ss_family == AF_UNSPEC) {
         void *conn = sig_ws_bridge_conn_from_sa(&l->dst);
         if (!conn || !ws_conn_alive(conn)) {
+            /* WS 已死：BYE 无法送达。把已组装的 BYE 暂存，等同一 AoR
+             * 重连后由 registrar 调 b2b_pending_bye_flush() 补发，
+             * 否则 WebRTC 侧 UI 会一直停留在“通话中”。 */
+            char aor[128];
+            call_aor_of(c, leg, aor, sizeof(aor));
             llog(LOG_WARN, "b2b",
                  "send_bye_leg: leg=%d WS conn=%p DEAD (pong miss/closed=1) — "
-                 "skip BYE send, 对端已掉线，call_destroy 继续",
-                 leg, conn);
+                 "BYE queued for WS reconnect aor=%s",
+                 leg, conn, aor[0] ? aor : "-");
+            pending_bye_enqueue(aor, out, (size_t)n);
             return;
         }
     }
@@ -6642,17 +6934,11 @@ static void handle_indialog_invite(b2b_call_t *c, int leg, sip_txn_t *t,
     }
     o->reinv = 1;
 
-    /* Session Timer: re-INVITE received → reset both leg timers */
-    if (co->cfg.sess_timer_enabled) {
-        uint64_t nm = now_ms();
-        for (int i = 0; i < 2; ++i) {
-            if (c->leg[i].st.active) {
-                sess_timer_reset(&c->leg[i].st, nm);
-                tw_mod(co->cfg.tw, &c->leg[i].refresh_node, nm + (uint64_t)c->leg[i].st.interval_s * 500u);
-                tw_mod(co->cfg.tw, &c->leg[i].expire_node, nm + (uint64_t)c->leg[i].st.interval_s * 1000u + SESS_TIMER_GRACE_MS);
-            }
-        }
-    }
+    /* RFC 4028：入站 re-INVITE 视为对端刷新，只重置收到请求的这条 dialog。
+     * 另一条腿的 dialog 独立计时，不能一起续命 —— 否则一条腿僵死会被
+     * 另一条腿的刷新长期掩盖，永远不会触发 session timeout。 */
+    if (co->cfg.sess_timer_enabled)
+        sess_timer_on_refresh_received(co, c, leg);
     if (leg == 0) {
         /* A→B：走 B 腿出向 INVITE。
          * ★ A 发起 re-INVITE 的对称逐腿终结：发往 B 的 offer 先过正向
@@ -6816,6 +7102,7 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
         }
         if (c->a_final >= 200 && c->a_final < 300) {
             c->leg[0].state = LEG_CONFIRMED;
+            media_bug_notify_answer(c);   /* ops.on_answer 生命周期接通 */
             /* REQ-PBX-CDR-001：ANSWER emit — A 腿 ACK 收到即记账（幂等） */
             if (c->answer_ms == 0) {
                 c->answer_ms = now_ms();
@@ -7428,6 +7715,10 @@ void b2b_server_tu(sip_txn_t *t, const sip_msg_t *m, txn_event_t ev,
             respond_txn(co, t, 491, NULL, NULL, NULL, 0);
             return;
         }
+        /* RFC 4028：带 Session-Expires 的 UPDATE 是合法刷新请求 */
+        if (co->cfg.sess_timer_enabled &&
+            sip_hdr_get(m, SIP_H_SESSION_EXPIRES))
+            sess_timer_on_refresh_received(co, c, leg);
         /* 注意：不要改 l->srv_txn —— 那是 INVITE 的 server txn */
         txn_set_ud(t, c);
         txn_set_tu(t, b2b_server_tu);
@@ -8340,6 +8631,7 @@ void b2b_on_rx(void *ud, sip_tr_proto_t proto, const nsbc_sa_t *src,
                                      c->leg[0].callid);
                             }
                             c->leg[0].state = LEG_CONFIRMED;
+                            media_bug_notify_answer(c);   /* 幂等兜底路径 */
                             /* ★ ringback：A 腿 ACK 双腿 CONFIRMED → 只停 stop_on_answer=1 的
                              * (ringback)，playback 继续。幂等兜底路径。 */
                             pb_stop_by_flag(c, 1);
@@ -11377,33 +11669,39 @@ static void sess_timer_refresh_cb(uint64_t cb_now, void *arg)
 {
     b2b_call_t *c = (b2b_call_t *)arg;
     b2b_core_t *co = c->core;
-    int myleg = -1, otherleg = -1;
+    int myleg = -1;
 
     call_lock(c);
+
+    if (c->dead) {
+        call_unlock(c);
+        return;
+    }
 
     /* 确定刷新哪腿：每腿独立判断 refresher 角色 */
     for (int i = 0; i < 2; ++i) {
         int due = sess_timer_due_refresh(&c->leg[i].st, cb_now);
         if (c->leg[i].st.active && c->leg[i].st.refresher != SIP_REF_NONE && due) {
             myleg = i;
-            otherleg = 1 - i;
             break;
         }
     }
 
     if (myleg >= 0) {
         b2b_leg_t *me = &c->leg[myleg];
-        b2b_leg_t *other = &c->leg[otherleg];
 
-        /* 发送 re-INVITE 但不重置 refresh_node —
-         * refresh_sent 保持 1（标记已发未确认），timer 到期 due_refresh 会返回 0
-         * 等 re-INVITE 被确认后（cli_tu 收到 2xx）再 reset + tw_mod 下次 */
+        /* refresh_sent 保持 1（标记已发未确认）：到期后 due_refresh 返回 0，
+         * 等 2xx（cli_tu）再 reset + 重排；无响应由 expire_node 兜底拆话。
+         * 这里不要后移 expire_node：刷新在 interval/2 发出，expire 原本就在
+         * interval+grace，失败还有 ICT Timer B（32s）先兜底。 */
         me->refresh_pending = 1;
-        tw_mod(co->cfg.tw, &me->expire_node,
-               cb_now + (uint64_t)me->st.interval_s * 1000u + SESS_TIMER_GRACE_MS);
 
+        sip_txn_t *t = NULL;
         if (myleg == 0) {
-            /* A 腿 refresher → 用 A-leg dialog 朝 Alice 发 re-INVITE */
+            /* A 腿 refresher → 用 A-leg dialog 朝 Alice 发 re-INVITE。
+             * RFC 4028 §7.1：会话刷新用 re-INVITE 不需要重协商 SDP，
+             * 这里刻意不带 body —— a->offer 是 Alice 自己的 offer（方向
+             * 属性相反），原样回发会造成 sendonly/recvonly 语义翻转。 */
             char branch[40];
             new_branch(branch, sizeof(branch));
             long cs = ++me->cseq;
@@ -11411,29 +11709,38 @@ static void sess_timer_refresh_cb(uint64_t cb_now, void *arg)
             snprintf(to, sizeof(to), "%s;tag=%s", me->to, me->rem_tag);
             char extra[256];
             if (me->session_expires[0]) {
-                snprintf(extra, sizeof(extra), "Supported: timer\r\n%s", me->session_expires);
+                snprintf(extra, sizeof(extra), "Supported: timer\r\n%s",
+                         me->session_expires);
             } else {
                 snprintf(extra, sizeof(extra), "Supported: timer\r\n");
             }
             char req[4096];
             int n = build_dlg_req(co, me, SIP_M_INVITE, cs,
                                   me->target[0] ? me->target : me->ruri, to,
-                                  branch, extra, me->offer, me->offer_len,
+                                  branch, extra, NULL, 0,
                                   req, sizeof(req));
             if (n > 0) {
-                sip_txn_t *t = txn_client_new(co->cfg.txn, TXN_ICT, branch,
-                                              strlen(branch), SIP_M_INVITE,
-                                              &me->dst, me->reliable, req, (size_t)n,
-                                              cli_tu, c, now_ms());
-                if (t) leg_txn_store(&me->out_txn, t);
+                t = txn_client_new(co->cfg.txn, TXN_ICT, branch,
+                                   strlen(branch), SIP_M_INVITE,
+                                   &me->dst, me->reliable, req, (size_t)n,
+                                   cli_tu, c, now_ms());
             }
         } else {
-            /* B 腿 refresher → send_invite_b 朝 Bob 发 re-INVITE */
-            sip_txn_t *t = send_invite_b(c, 1, other->offer, other->offer_len, 1, NULL);
-            if (!t) {
-                llog(LOG_WARN, "b2bua", "re-INVITE Bob failed call=%p",
-                     (void *)c);
-            }
+            /* B 腿 refresher → 同样不带 SDP（见上）。 */
+            t = send_invite_b(c, 1, NULL, 0, 1, NULL);
+        }
+
+        if (t) {
+            leg_txn_store(&me->refresh_txn, t);
+            llog(LOG_INFO, "b2b", "Session Timer refresh sent leg=%d interval=%ds",
+                 myleg, me->st.interval_s);
+        } else {
+            llog(LOG_WARN, "b2b",
+                 "Session Timer refresh send FAIL leg=%d → terminate", myleg);
+            me->refresh_pending = 0;
+            call_unlock(c);
+            b2b_terminate(c, 503);
+            return;
         }
     }
 

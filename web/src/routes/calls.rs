@@ -3,6 +3,8 @@
 //! - GET  /channels      In-flight call A/B Leg listing (read-only, `show channels`)
 //! - GET  /calls/{id}    Single-call two-sided Leg diagnosis (read-only, `uuid_dump`)
 //! - POST /calls/{id}/hangup Force hangup (L1 audit, `hangup`)
+//! - POST /calls/{id}/snapshot Start video snapshot job(s) (L1 audit, `snapshot`,
+//!   V2 §3.4.4: returns job ids immediately; result via SNAPSHOT event / OAM)
 //!
 //! REQ-CCMD-001 command enhancements (L2, core cmd_registry new routes):
 //! - POST /calls/{id}/kill          uuid_kill
@@ -21,7 +23,9 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
+use axum::http::header;
 use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -47,6 +51,11 @@ where
         .route("/vad/stream", get(stream_vad::<C>))
         .route("/calls/:id", get(get_call::<C>))
         .route("/calls/:id/hangup", post(hangup::<C>))
+        .route("/calls/:id/snapshot", post(snapshot::<C>))
+        // Snapshot job follow-up: status (JSON) + captured JPEG. Static "snapshot"
+        // segment wins over "/calls/:id", so these never shadow GET /calls/{id}.
+        .route("/calls/snapshot/:job", get(snapshot_status::<C>))
+        .route("/calls/snapshot/:job/image", get(snapshot_image::<C>))
         // REQ-CCMD-001 new L2 command endpoints
         .route("/calls/:id/kill", post(kill::<C>))
         .route("/calls/:id/answer", post(answer::<C>))
@@ -189,6 +198,193 @@ async fn hangup<C: CoreApi + Clone + 'static>(
         "status": "hungup",
         "call_id": id,
     })))
+}
+
+/// Video snapshot request body (optional). `leg`: 0=A, 1=B, -1=both (default);
+/// `frames`: 1..=3 decoded candidates, the sharpest is saved (default 1).
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct SnapshotBody {
+    pub(crate) leg: Option<i32>,
+    pub(crate) frames: Option<u32>,
+}
+
+/// POST /calls/{id}/snapshot — start video snapshot job(s) (V2 §3.4.4, L1 audit).
+/// Returns the started job ids immediately; decoding/JPEG encoding happens on the
+/// core snapshot worker. Completion is announced via the `SNAPSHOT` event
+/// (metadata only, never image content). Core errors surface as-is:
+/// call not found -> 404, no video / rate-limited / busy -> 4xx with reason.
+async fn snapshot<C: CoreApi + Clone + 'static>(
+    State(st): State<Arc<AppState<C>>>,
+    Path(id): Path<String>,
+    body: Option<Json<SnapshotBody>>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if !valid_call_id(&id) {
+        return Err(ApiError::BadRequest("invalid call id".into()));
+    }
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+    if let Some(l) = body.leg {
+        if !(-1..=1).contains(&l) {
+            return Err(ApiError::BadRequest("leg must be -1, 0 or 1".into()));
+        }
+    }
+    if let Some(f) = body.frames {
+        if !(1..=3).contains(&f) {
+            return Err(ApiError::BadRequest("frames must be 1..3".into()));
+        }
+    }
+    let started = st.core.snapshot(&id, body.leg, body.frames).await?;
+    Ok(Json(json!({
+        "status": "started",
+        "call_id": id,
+        "jobs": started.jobs,
+    })))
+}
+
+/// Snapshot job state derived from the core `snapshot_status <job-id>` line.
+#[derive(Debug, Serialize)]
+pub(crate) struct SnapshotJobStatus {
+    pub(crate) job_id: u64,
+    pub(crate) running: bool,
+    pub(crate) result: Option<String>,
+    pub(crate) leg: Option<i32>,
+    pub(crate) width: Option<i32>,
+    pub(crate) height: Option<i32>,
+    pub(crate) frames: Option<i32>,
+    pub(crate) elapsed_ms: Option<u64>,
+    pub(crate) bytes: Option<u64>,
+    /// Host-side JPEG path; internal only (not echoed to the client).
+    #[serde(skip)]
+    pub(crate) path: Option<String>,
+    /// Ready-to-use JPEG endpoint (only when `result=OK` and the file exists).
+    pub(crate) image_url: Option<String>,
+}
+
+/// Parse core output (src/oam/call_commands.c cmd_snapshot_status):
+///   running: `OK job=12 running leg=0`
+///   done:    `OK job=12 result=OK leg=0 640x360 frames=1 123ms 45678 bytes path=/tmp/x.jpg`
+///   unknown: `ERR job 12 not found`
+fn parse_snapshot_status(job_id: u64, out: &str) -> ApiResult<SnapshotJobStatus> {
+    let mut st = SnapshotJobStatus {
+        job_id,
+        running: false,
+        result: None,
+        leg: None,
+        width: None,
+        height: None,
+        frames: None,
+        elapsed_ms: None,
+        bytes: None,
+        path: None,
+        image_url: None,
+    };
+    let mut ok_seen = false;
+    for tok in out.split_whitespace() {
+        if tok == "OK" {
+            ok_seen = true;
+        } else if tok == "running" {
+            st.running = true;
+        } else if let Some(v) = tok.strip_prefix("result=") {
+            st.result = Some(v.to_string());
+        } else if let Some(v) = tok.strip_prefix("leg=") {
+            st.leg = v.parse().ok();
+        } else if let Some(v) = tok.strip_prefix("frames=") {
+            st.frames = v.parse().ok();
+        } else if let Some(v) = tok.strip_prefix("bytes=") {
+            st.bytes = v.parse().ok();
+        } else if let Some(v) = tok.strip_prefix("path=") {
+            // 失败作业打印 path=-，不能当成文件路径
+            if v != "-" {
+                st.path = Some(v.to_string());
+            }
+        } else if let Some(ms) = tok.strip_suffix("ms") {
+            st.elapsed_ms = ms.parse().ok();
+        } else if let Some((w, h)) = tok.split_once('x') {
+            // 分辨率 token（640x360）；解析失败忽略
+            if let (Ok(w), Ok(h)) = (w.parse::<i32>(), h.parse::<i32>()) {
+                st.width = Some(w);
+                st.height = Some(h);
+            }
+        }
+    }
+    if !ok_seen {
+        return Err(ApiError::NotFound("snapshot job not found".into()));
+    }
+    if st.result.as_deref() == Some("OK") && st.path.is_some() {
+        st.image_url = Some(format!("/api/v1/calls/snapshot/{job_id}/image"));
+    }
+    Ok(st)
+}
+
+/// GET /calls/snapshot/{job} — poll one snapshot job (L1 read-only).
+async fn snapshot_status<C: CoreApi + Clone + 'static>(
+    State(st): State<Arc<AppState<C>>>,
+    Path(job): Path<String>,
+) -> ApiResult<Json<SnapshotJobStatus>> {
+    let job_id = parse_job_id(&job)?;
+    let raw = st
+        .core
+        .exec_cmd(&format!("snapshot_status {job_id}"))
+        .await?;
+    Ok(Json(parse_snapshot_status(job_id, &raw)?))
+}
+
+/// GET /calls/snapshot/{job}/image — stream the captured JPEG (L1 read-only).
+///
+/// The core writes frames under `NSBC_SNAPSHOT_DIR` (default `/tmp/nsbc_snapshots`,
+/// same env the core reads). The `path=` reported by `snapshot_status` is never
+/// trusted directly: it must canonicalize inside that root.
+async fn snapshot_image<C: CoreApi + Clone + 'static>(
+    State(st): State<Arc<AppState<C>>>,
+    Path(job): Path<String>,
+) -> ApiResult<Response> {
+    let job_id = parse_job_id(&job)?;
+    let raw = st
+        .core
+        .exec_cmd(&format!("snapshot_status {job_id}"))
+        .await?;
+    let stt = parse_snapshot_status(job_id, &raw)?;
+    if stt.running {
+        return Err(ApiError::ServiceUnavailable(
+            "snapshot job still running".into(),
+        ));
+    }
+    if stt.result.as_deref() != Some("OK") {
+        return Err(ApiError::NotFound(format!(
+            "snapshot failed: {}",
+            stt.result.unwrap_or_else(|| "UNKNOWN".into())
+        )));
+    }
+    let reported = stt
+        .path
+        .ok_or_else(|| ApiError::NotFound("snapshot image path missing".into()))?;
+
+    let root = std::env::var("NSBC_SNAPSHOT_DIR")
+        .unwrap_or_else(|_| "/tmp/nsbc_snapshots".to_string());
+    let root_canon = std::fs::canonicalize(&root)
+        .map_err(|_| ApiError::NotFound("snapshot directory missing".into()))?;
+    let file = std::fs::canonicalize(&reported)
+        .map_err(|_| ApiError::NotFound("snapshot image missing".into()))?;
+    if !file.starts_with(&root_canon) {
+        tracing::warn!(path = %file.display(), "snapshot image outside root blocked");
+        return Err(ApiError::NotFound("snapshot image not found".into()));
+    }
+    let bytes = tokio::fs::read(&file).await.map_err(|e| {
+        tracing::warn!(err = %e, path = %file.display(), "read snapshot failed");
+        ApiError::ServiceUnavailable("snapshot image read failed".into())
+    })?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "image/jpeg"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+fn parse_job_id(s: &str) -> ApiResult<u64> {
+    s.parse::<u64>()
+        .map_err(|_| ApiError::BadRequest("invalid snapshot job id".into()))
 }
 
 // ===== REQ-CCMD-001 L2 command endpoints =====

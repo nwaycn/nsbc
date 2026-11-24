@@ -887,12 +887,13 @@ static void *ws_worker_thread(void *ud)
          * WS_PING_TIMEOUT_MS, increment pongs_missed. On >=3 missed
          * (~90s total dead), close the conn.
          *
-         * Why? Session Timer (RFC 4028) is a TODO skeleton in sip_sess_timer.c —
-         * after answer zero SIP traffic is exchanged → middle proxy
-         * (Nginx/HAProxy idle timeout 60-300s) silently drops WSS TCP →
-         * A leg BYE later finds B leg WSS dead → B leg never gets BYE.
-         * Ping every 30s keeps proxy table entries alive and detects
-         * dead proxies/peers quickly. */
+         * Why? SIP Session Timer (RFC 4028) now runs on both B2BUA legs,
+         * but a WSS path can die while the call is still active with no
+         * traffic in either direction: a middle proxy (Nginx/HAProxy idle
+         * timeout 60-300s) silently drops the TCP connection, or the peer
+         * loses network. Without WS-level liveness the server keeps a dead
+         * conn (and sends BYE into a black hole). Ping every 30s keeps proxy
+         * table entries alive and detects dead proxies/peers quickly. */
         {
             uint64_t now = ws_now_ms();
             pthread_mutex_lock(&g_ws.conn_mtx);

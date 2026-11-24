@@ -282,6 +282,20 @@ int bridge_active_count(bridge_mgr_t *m);
 int bridge_lookup_relay(bridge_mgr_t *m, void *call_key,
                         rtp_relay_t **out_relay, nsbc_sa_t out_peer[2]);
 
+/* ---------- §3.4 snapshot job：视频状态查询 / PLI ---------- */
+
+/* 该腿是否协商了视频（video_pt_allowed_count > 0）。1=有，0=无/未找到。 */
+int media_bridge_call_has_video(bridge_mgr_t *m, void *call_key, int leg);
+
+/* 向该腿对端发 RTCP PLI 请求关键帧（500ms 限频）。
+ * NSBC_OK=已发；NSBC_AGAIN=尚未学习到视频 SSRC（稍后重试）；NSBC_NOENT=无 relay。 */
+int media_bridge_request_keyframe(bridge_mgr_t *m, void *call_key, int leg);
+
+/* 该腿视频 SDP 的 a=fmtp（用于提取 H.264 sprop-parameter-sets 等解码参数）。
+ * leg 0 取 A 的 offer，leg 1 取 B 的 answer。返回 1=命中，0=无视频/无 fmtp。 */
+int media_bridge_call_video_fmtp(bridge_mgr_t *m, void *call_key, int leg,
+                                 char *out, size_t cap);
+
 /* REQ-DP-APP-001：bridge 绑定/SDP 重写用的 local IP（offer_hook 同源。
  * b2bua 合成 183 answer SDP 时 profile 未配 external_rtp_ip 的 fallback）。 */
 const char *bridge_local_ip(const bridge_mgr_t *m);

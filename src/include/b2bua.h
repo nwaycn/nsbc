@@ -114,6 +114,9 @@ typedef struct b2b_leg {
     tw_node_t   refresh_node;
     tw_node_t   expire_node;
     uint8_t     refresh_pending; /* refresh_cb 发出的 re-INVITE 未确认标记 */
+    /* 刷新 re-INVITE 专用事务槽：不能复用 out_txn（BYE/CANCEL 也在用，
+     * 混用会导致刷新响应被按 BYE 响应处理）。 */
+    sip_txn_t  *refresh_txn;
     /* 100rel (RFC 3262) 可靠临时响应 */
     unsigned    local_rseq;     /* 本 leg 发的 reliable 1xx 的 RSeq（0=无 pending） */
     unsigned    peer_rseq;      /* 对端 leg 原始 RSeq（收到的 reliable 1xx） */
@@ -656,6 +659,13 @@ int b2b_terminate_callid(b2b_core_t *c, const char *callid, size_t len,
  * 调用本函数：找出 dst 绑定该 ws_conn 的呼叫，向对端腿发 BYE/CANCEL 并清理。
  * 返回被终止的呼叫数；可跨线程调用（内部按 callid 重新查表）。 */
 int b2b_terminate_ws_conn(b2b_core_t *c, void *conn);
+
+/* WS 重连后补发 pending BYE：
+ * WS 因 pong 超时被关闭时，send_bye_leg 无法把 BYE 投递给 WebRTC 客户端，
+ * 只能把报文暂存（bounded queue，TTL 5 分钟）。同一 AoR 重新 REGISTER
+ * （拿到新 ws_conn）后由 registrar 调用本函数补发，避免客户端 UI 停留在通话中。
+ * 返回成功补发的条数。 */
+int b2b_pending_bye_flush(const char *aor, void *ws_conn);
 
 /* CANCEL 早期 INVITE（uuid_cancel）：
  *   leg=-1 双腿都取消；0=仅 A；1=仅 B。

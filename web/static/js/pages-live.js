@@ -266,6 +266,7 @@ app.component('channels-live', livePanel(t('Live channels'), 'fa-solid fa-phone-
       const id = encodeURIComponent(callId);
       return [
         `<button data-act="hangup" data-call-id="${id}" class="px-2 py-1 text-xs text-red-600 border border-red-300 rounded hover:bg-red-50 hover:text-red-800"><i class="fa-solid fa-phone-slash"></i> ${t('Hang up')}</button>`,
+        `<button data-act="snapshot" data-call-id="${id}" class="px-2 py-1 text-xs text-blue-600 border border-blue-300 rounded hover:bg-blue-50 hover:text-blue-800"><i class="fa-solid fa-camera"></i> ${t('Snapshot')}</button>`,
         `<button data-act="play" data-call-id="${id}" class="px-2 py-1 text-xs text-green-600 border border-green-300 rounded hover:bg-green-50 hover:text-green-800"><i class="fa-solid fa-play"></i> Play</button>`,
         `<button data-act="stop" data-call-id="${id}" class="px-2 py-1 text-xs text-amber-600 border border-amber-300 rounded hover:bg-amber-50 hover:text-amber-800"><i class="fa-solid fa-stop"></i> Stop</button>`,
         `<button data-act="status" data-call-id="${id}" class="px-2 py-1 text-xs text-slate-600 border border-slate-300 rounded hover:bg-slate-50 hover:text-slate-800"><i class="fa-solid fa-circle-info"></i> Status</button>`,

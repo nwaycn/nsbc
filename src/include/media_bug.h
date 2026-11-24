@@ -28,6 +28,9 @@ typedef enum {
     BUG_RTP_HEADER_ONLY = 0x02, /* 仅 RTP 固定头+扩展头（不含 payload）——rtp_parse 之后 hook */
     BUG_RTCP_MIRROR    = 0x04, /* RTCP 报文镜像 */
     BUG_SIPCAPTURE_TAP = 0x08, /* SIP 消息旁路（txn 状态机挂接，不进 relay） */
+    BUG_PCM_READ       = 0x10, /* 解码后的 PCM（S16，只读）：VAD/ASR 消费 */
+    BUG_PCM_WRITE      = 0x20, /* 编码前的 PCM（S16，可写/替换） */
+    BUG_VIDEO_AU       = 0x40, /* 完整视频访问单元（AU 边界对齐，带 key 标志） */
 } media_bug_type_t;
 
 /* 帧描述：回调输入参数（consumer 只读） */
@@ -35,13 +38,20 @@ typedef struct {
     void *call_key;           /* b2b_call_t*（不透明，仅做表键比较） */
     int   leg;                /* 0=A腿 1=B腿 */
     media_bug_type_t type;
-    uint8_t  *data;           /* 帧数据（完整 RTP / RTCP / SIP） */
+    uint8_t  *data;           /* 帧数据（完整 RTP / RTCP / SIP / 视频 AU） */
     size_t    data_len;       /* data 字节数 */
     /* RTP header fields（BUG_RAW_RTP/BUG_RTP_HEADER_ONLY 时有效） */
     uint32_t  ssrc;
     uint16_t  seq;
     uint32_t  ts;
     uint8_t   pt;
+    /* 解码后的 PCM（BUG_PCM_READ/BUG_PCM_WRITE 时有效，S16 交织）*/
+    const int16_t *pcm;
+    size_t    samples;        /* 每声道采样点数 */
+    int       rate;           /* 8000/16000/48000 */
+    int       channels;       /* 1/2 */
+    int       codec_id;       /* 该腿协商 codec（media_codec.h codec_id_t）*/
+    int       keyframe;       /* BUG_VIDEO_AU：1=关键帧 */
     /* 源/目的地址（网络字节序） */
     uint32_t  src_ip;
     uint32_t  dst_ip;
@@ -88,6 +98,26 @@ void media_bug_dispatch_sip(void *call_key, const uint8_t *sip_msg, size_t n,
                             uint32_t src_ip, uint16_t src_port,
                             uint32_t dst_ip, uint16_t dst_port);
 
+/* PCM 旁路（解码后/编码前，BUG_PCM_READ / BUG_PCM_WRITE）。
+ * is_write=1 时为编码前 PCM（回调可改写缓冲）；0 为解码后只读。 */
+void media_bug_dispatch_pcm(void *call_key, int side,
+                            const int16_t *pcm, size_t samples, int rate,
+                            int channels, int codec_id, int is_write);
+
+/* 视频访问单元旁路（BUG_VIDEO_AU，AU 边界对齐） */
+void media_bug_dispatch_video_au(void *call_key, int side,
+                                 const uint8_t *au, size_t len,
+                                 int codec_id, int keyframe, uint32_t ts,
+                                 uint32_t ssrc);
+
+/* 是否可能有视频消费者（供媒体路径决定是否做关键帧解析等额外开销）*/
+int  media_bug_video_active(void);
+
+/* 生命周期：LEG_CONFIRMED 时调用（触发 ops.on_answer），
+ * call destroy 时调用（触发 ops.on_destroy + 清理 per-call bug）。 */
+void media_bug_notify_answer(void *call_key);
+void media_bug_notify_destroy(void *call_key);
+
 /* ===== 全局消费者注册（hep_sink / 质检 / 录音旁路等用）===== */
 
 /* 全局消费者：不依赖手动 attach uuid_media_bug，
@@ -104,8 +134,16 @@ typedef struct {
 int media_bug_register_global_consumer(const media_bug_consumer_t *c);
 void media_bug_unregister_global_consumer(const media_bug_consumer_t *c);
 
+/* P2-9：消费者自身丢帧（如异步 ring 溢出/忙）上报，汇总到 show media_bugs 的
+ * dropped 计数。按 (cb, ud) 定位已注册槽位；未注册则忽略。 */
+void media_bug_consumer_note_drop(media_bug_cb_t cb, void *ud, uint64_t n);
+
 /* OAM 状态输出（供 uuid_media_bug list / hep status 内部复用） */
 int media_bug_status(char *out, size_t outsz);
+
+/* P2-10：调试期一致性校验（消费者槽/ops 槽/per-call bug/快照链）。
+ * 返回发现的问题数；out 输出逐条报告（可为 NULL）。 */
+int media_bug_selftest(char *out, size_t cap);
 
 /* ===== Phase 2: media_bug_ops_t 多 ops 注册表 =====
  *

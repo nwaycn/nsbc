@@ -1,4 +1,4 @@
-/* 视频 RTP 打包 / 解包实现（RFC 6184 / RFC 7741） */
+/* 视频 RTP 打包 / 解包实现（RFC 6184 / RFC 7798 / RFC 7741 / RFC 9628） */
 #include "rtp_video.h"
 
 #include <stdlib.h>
@@ -140,6 +140,110 @@ int rtp_h264_depack_feed(rtp_h264_depack_t *d,
     *au_ts  = d->ts;
     *key    = rtp_video_is_keyframe(RTP_PAYLOAD_H264, d->au, d->len);
     d->len  = 0;
+    d->in_fu = 0;
+    return 1;
+}
+
+/* ============================================================================
+ * H.265 解包（RFC 7798）
+ * ==========================================================================*/
+int rtp_h265_depack_init(rtp_h265_depack_t *d)
+{
+    if (!d) return NSBC_INVAL;
+    memset(d, 0, sizeof(*d));
+    return NSBC_OK;
+}
+
+void rtp_h265_depack_free(rtp_h265_depack_t *d)
+{
+    if (!d) return;
+    free(d->au);
+    memset(d, 0, sizeof(*d));
+}
+
+/* 追加一个完整 NAL（带 Annex-B 起始码） */
+static int h265_append_nal(rtp_h265_depack_t *d, const uint8_t *nal, size_t len)
+{
+    int rc = au_append(&d->au, &d->len, &d->cap, k_start_code, 4);
+    if (rc != NSBC_OK) return rc;
+    return au_append(&d->au, &d->len, &d->cap, nal, len);
+}
+
+int rtp_h265_depack_feed(rtp_h265_depack_t *d,
+                         const uint8_t *payload, size_t len,
+                         int marker, uint32_t ts,
+                         const uint8_t **au, size_t *au_len,
+                         uint32_t *au_ts, int *key)
+{
+    if (!d || !payload || len < 2) return NSBC_INVAL;
+
+    /* 时间戳切换视为上一个 AU 结束（丢包时 marker 可能丢失） */
+    if (d->have_ts && ts != d->ts && d->len > 0) {
+        d->len = 0;
+        d->in_fu = 0;
+    }
+
+    int type = (payload[0] >> 1) & 0x3F;
+
+    if (type <= 47) {
+        /* single NAL unit（含 VPS/SPS/PPS/IRAP 等） */
+        int rc = h265_append_nal(d, payload, len);
+        if (rc != NSBC_OK) { d->len = 0; return rc; }
+        d->in_fu = 0;
+    } else if (type == 48) {
+        /* AP：PayloadHdr(2) + [2 字节 NAL 长度 + NAL]...
+         * 假设 sprop-max-don-diff=0（无 DONL）——主流 SDP 均如此。 */
+        size_t off = 2;
+        while (off + 2 <= len) {
+            size_t nl = ((size_t)payload[off] << 8) | payload[off + 1];
+            off += 2;
+            if (nl == 0 || off + nl > len) break;
+            int rc = h265_append_nal(d, payload + off, nl);
+            if (rc != NSBC_OK) { d->len = 0; return rc; }
+            off += nl;
+        }
+        d->in_fu = 0;
+    } else if (type == 49) {
+        /* FU：PayloadHdr(2) + FU header(1)，重建 2 字节 NAL 头 */
+        if (len < 3) return 0;
+        uint8_t fu = payload[2];
+        int start = (fu & 0x80) != 0;
+        int end   = (fu & 0x40) != 0;
+        int nt    = fu & 0x3F;
+        if (start) {
+            uint8_t nh[2];
+            /* 保留 F / LayerId，替换 NAL 类型；TID/LayerId 低位沿用原 PayloadHdr */
+            nh[0] = (uint8_t)((payload[0] & 0x81) | ((uint8_t)nt << 1));
+            nh[1] = payload[1];
+            int rc = au_append(&d->au, &d->len, &d->cap, k_start_code, 4);
+            if (rc == NSBC_OK)
+                rc = au_append(&d->au, &d->len, &d->cap, nh, 2);
+            if (rc == NSBC_OK)
+                rc = au_append(&d->au, &d->len, &d->cap, payload + 3, len - 3);
+            if (rc != NSBC_OK) { d->len = 0; return rc; }
+            d->in_fu = 1;
+        } else if (d->in_fu) {
+            int rc = au_append(&d->au, &d->len, &d->cap, payload + 3, len - 3);
+            if (rc != NSBC_OK) { d->len = 0; d->in_fu = 0; return rc; }
+        }
+        if (end) d->in_fu = 0;
+    } else {
+        /* PACI(50)/保留类型不支持，忽略 */
+        return 0;
+    }
+
+    d->ts = ts;
+    d->have_ts = 1;
+
+    if (!marker) return 0;
+
+    if (d->len == 0) return 0;
+    au_zero_tail(d->au, d->cap, d->len);
+    *au     = d->au;
+    *au_len = d->len;
+    *au_ts  = d->ts;
+    *key    = rtp_video_is_keyframe(RTP_PAYLOAD_H265, d->au, d->len);
+    d->len   = 0;
     d->in_fu = 0;
     return 1;
 }
@@ -397,6 +501,57 @@ int rtp_h264_pack(const uint8_t *au, size_t len, size_t mtu,
 }
 
 /* ============================================================================
+ * H.265 打包（RFC 7798）
+ * ==========================================================================*/
+int rtp_h265_pack(const uint8_t *au, size_t len, size_t mtu,
+                  rtp_video_pkt_cb cb, void *ud)
+{
+    if (!au || len == 0 || !cb) return NSBC_INVAL;
+    if (mtu < 64) mtu = RTP_VIDEO_MTU_DEFAULT;
+
+    nal_span_t spans[128];
+    int n = 0;
+    /* 与 H.264 共用 Annex-B 切分（只按起始码切，与 NAL 语法无关） */
+    int rc = h264_annexb_spans(au, len, spans, 128, &n);
+    if (rc != NSBC_OK) return rc;
+
+    uint8_t buf[RTP_VIDEO_MTU_DEFAULT + 16];
+    size_t pkt_mtu = mtu > sizeof(buf) ? sizeof(buf) : mtu;
+
+    for (int i = 0; i < n; ++i) {
+        const uint8_t *nal = au + spans[i].off;
+        size_t nl = spans[i].len;
+        int last_nal = (i == n - 1);
+
+        if (nl < 2) continue;   /* H.265 NAL 头固定 2 字节 */
+
+        if (nl <= pkt_mtu - 2) {
+            cb(ud, nal, nl, last_nal);
+            continue;
+        }
+        /* FU 分片：PayloadHdr 类型置 49，FU header 携带原始 NAL 类型 */
+        uint8_t hdr0 = (uint8_t)((nal[0] & 0x81) | (49u << 1));
+        uint8_t hdr1 = nal[1];
+        uint8_t nt   = (uint8_t)((nal[0] >> 1) & 0x3F);
+        size_t off = 2;
+        size_t chunk = pkt_mtu - 3;
+        while (off < nl) {
+            size_t take = nl - off;
+            if (take > chunk) take = chunk;
+            int start = (off == 2);
+            int end = (off + take >= nl);
+            buf[0] = hdr0;
+            buf[1] = hdr1;
+            buf[2] = (uint8_t)((start ? 0x80 : 0) | (end ? 0x40 : 0) | nt);
+            memcpy(buf + 3, nal + off, take);
+            cb(ud, buf, take + 3, last_nal && end);
+            off += take;
+        }
+    }
+    return NSBC_OK;
+}
+
+/* ============================================================================
  * VP9 打包
  * ==========================================================================*/
 int rtp_vp9_pack(const uint8_t *frame, size_t len, size_t mtu,
@@ -479,6 +634,25 @@ int rtp_video_is_keyframe(int rtp_payload, const uint8_t *au, size_t len)
                 if (n < len) {
                     int t = au[n] & 0x1F;
                     if (t == 5 || t == 7) return 1;   /* IDR / SPS */
+                }
+                i = n;
+                continue;
+            }
+            ++i;
+        }
+        return 0;
+    }
+
+    if (rtp_payload == RTP_PAYLOAD_H265) {
+        size_t i = 0;
+        while (i + 4 <= len) {
+            if (au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 1) {
+                size_t n = i + 3;
+                if (n + 2 <= len) {
+                    int t = (au[n] >> 1) & 0x3F;
+                    /* IRAP（BLA/IDR/CRA 16..21）或 VPS(32)/SPS(33)/PPS(34) */
+                    if ((t >= 16 && t <= 21) || t == 32 || t == 33 || t == 34)
+                        return 1;
                 }
                 i = n;
                 continue;

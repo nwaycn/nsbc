@@ -63,6 +63,7 @@ static void av_fini(struct nsbc_ctx *ctx)
     codec_registry_unregister(CODEC_H264);
     codec_registry_unregister(CODEC_VP8);
     codec_registry_unregister(CODEC_VP9);
+    codec_registry_unregister(CODEC_H265);
 
 #ifdef HAVE_FFMPEG
     llog(LOG_INFO, "av", "all 10 FFmpeg-backed codecs unregistered");

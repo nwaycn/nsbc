@@ -233,6 +233,75 @@ static int g729_encode(codec_sess_t *s, const media_frame_t *in,
     return NSBC_OK;
 }
 
+/* RTP 载荷 → 多帧视图（RFC 3551：一个 RTP payload 可级联 N 个 10B 帧；
+ * Annex B 的 2B SID 帧标记 speech=0）。transcode 引擎据此逐帧解码。 */
+static int g729_rtp_unpack(codec_sess_t *s, const uint8_t *payload, size_t len,
+                           codec_frame_t *frames, int max_frames, int *n_frames)
+{
+    (void)s;
+    if (payload == NULL || frames == NULL || n_frames == NULL || max_frames <= 0)
+        return NSBC_INVAL;
+    int n = 0;
+    size_t off = 0;
+    while (off < len && n < max_frames) {
+        if (len - off >= G729_FRAME_BYTES) {
+            frames[n].data    = payload + off;
+            frames[n].len     = G729_FRAME_BYTES;
+            frames[n].samples = G729_FRAME_SAMPLES;
+            frames[n].speech  = 1;
+            off += G729_FRAME_BYTES;
+        } else if (len - off >= G729_SID_BYTES) {
+            frames[n].data    = payload + off;
+            frames[n].len     = G729_SID_BYTES;
+            frames[n].samples = G729_FRAME_SAMPLES;
+            frames[n].speech  = 0;
+            off += G729_SID_BYTES;
+        } else {
+            break;   /* 尾部 1 字节残片，丢弃 */
+        }
+        n++;
+    }
+    *n_frames = n;
+    return n > 0 ? NSBC_OK : NSBC_INVAL;
+}
+
+/* 多帧 → 单个 RTP payload（按 ptime 聚合）。G.729 帧可无损级联。 */
+static int g729_rtp_pack(codec_sess_t *s, const codec_frame_t *frames,
+                         int n_frames, uint8_t *out, size_t cap, size_t *out_len)
+{
+    (void)s;
+    if (frames == NULL || out == NULL || out_len == NULL || n_frames < 0)
+        return NSBC_INVAL;
+    size_t w = 0;
+    for (int i = 0; i < n_frames; ++i) {
+        if (frames[i].data == NULL || frames[i].len == 0) continue;
+        if (frames[i].len > cap - w) break;
+        memcpy(out + w, frames[i].data, frames[i].len);
+        w += frames[i].len;
+    }
+    *out_len = w;
+    return NSBC_OK;
+}
+
+/* 丢包隐藏：bcg729 的 frameErasureFlag=1 产生 80 样本替代 PCM。 */
+static int g729_plc(codec_sess_t *s, media_frame_t *out)
+{
+    if (s == NULL || out == NULL || out->pcm == NULL) return NSBC_INVAL;
+    uint8_t bits[G729_FRAME_BYTES];
+    int16_t frame_out[G729_FRAME_SAMPLES];
+
+    memset(bits, 0, sizeof(bits));
+    bcg729Decoder((bcg729DecoderChannelContextStruct *)s->dec_ctx,
+                  bits, G729_FRAME_BYTES,
+                  1,    /* frameErasureFlag：1=丢包，走 PLC */
+                  0, 0, frame_out);
+    memcpy(out->pcm, frame_out, sizeof(frame_out));
+    out->samples  = G729_FRAME_SAMPLES;
+    out->rate     = 8000;
+    out->channels = 1;
+    return NSBC_OK;
+}
+
 #endif /* HAVE_BCG729 */
 
 /* ============================================================================
@@ -287,6 +356,11 @@ static const codec_ops_t G729_OPS = {
     .fini        = g729_fini,
     .decode      = g729_decode,
     .encode      = g729_encode,
+#ifdef HAVE_BCG729
+    .rtp_unpack  = g729_rtp_unpack,
+    .rtp_pack    = g729_rtp_pack,
+    .plc         = g729_plc,
+#endif
     /* Registry v2 元数据 */
     .api_version = NSBC_CODEC_API_VERSION,
     .sdp_name    = "G729",
@@ -295,12 +369,18 @@ static const codec_ops_t G729_OPS = {
     .payload     = RTP_PAYLOAD_SIMPLE,
     .priority    = 70,
     .caps        = CODEC_CAP_DEC | CODEC_CAP_ENC | CODEC_CAP_STATEFUL,
+    .rtp_clock_rate  = 8000,
+    .pcm_sample_rate = 8000,
+    .frame_samples   = G729_FRAME_SAMPLES,
 };
 
 int g729_register(void)
 {
     return codec_registry_register(&G729_OPS);
 }
+
+/* 自注册到 mod_codecs 的内置 codec 段 */
+NSBC_CODEC_REGISTRAR(g729_register)
 
 /*
     Author:       李浩 (Li Hao)

@@ -41,7 +41,8 @@ where
         .route("/cmd/help", get(cmd_help::<C>))
         // === REQ-EXT-API-001: 结构化端点（方便外部系统的 JSON API 消费）===
         .route("/originate", post(originate::<C>))
-        .route("/calls/{id}/hangup", post(hangup::<C>))
+        .route("/calls/:id/hangup", post(hangup::<C>))
+        .route("/calls/:id/snapshot", post(snapshot::<C>))
         .route("/calls", get(list_calls::<C>))
         .route("/system/status", get(system_status::<C>))
         .route("/system/version", get(system_version::<C>))
@@ -201,6 +202,46 @@ where
 }
 
 // ======================================================================
+// POST /ext/v1/calls/{id}/snapshot  —— 结构化快捷端点（内部调 exec_cmd snapshot）
+// ======================================================================
+
+/// 请求体可选：leg 0=A 1=B -1=双腿（默认），frames 1..3（默认 1，取最清晰帧）。
+async fn snapshot<C>(
+    State(st): State<Arc<AppState<C>>>,
+    Extension(claims): Extension<ExtKeyClaims>,
+    Path(call_id): Path<String>,
+    body: Option<Json<crate::routes::calls::SnapshotBody>>,
+) -> Result<impl IntoResponse, ApiError>
+where
+    C: CoreApi + Clone + 'static,
+{
+    require_scope(&claims, ApiKeyScope::Readwrite)?;
+    if !crate::routes::calls::valid_call_id(&call_id) {
+        return Err(ApiError::BadRequest("invalid call_id".into()));
+    }
+    let b = body.map(|Json(b)| b).unwrap_or_default();
+    if let Some(l) = b.leg {
+        if !(-1..=1).contains(&l) {
+            return Err(ApiError::BadRequest("leg must be -1, 0 or 1".into()));
+        }
+    }
+    if let Some(f) = b.frames {
+        if !(1..=3).contains(&f) {
+            return Err(ApiError::BadRequest("frames must be 1..3".into()));
+        }
+    }
+    // 位置参数：frames 需要 leg 占位（省略时 -1=双腿）
+    let mut cmd = format!("snapshot {}", call_id);
+    if let Some(f) = b.frames {
+        cmd.push_str(&format!(" {} {f}", b.leg.unwrap_or(-1)));
+    } else if let Some(l) = b.leg {
+        cmd.push_str(&format!(" {l}"));
+    }
+    let output = st.core.exec_cmd(&cmd).await?;
+    Ok((StatusCode::OK, output))
+}
+
+// ======================================================================
 // GET /ext/v1/calls  —— 结构化快捷端点（内部调 list_calls）
 // ======================================================================
 
@@ -309,7 +350,7 @@ pub struct ApiDocs {
 
 pub const SCOPES: &[ScopeDesc] = &[
     ScopeDesc { scope: "readonly",  can: "GET /calls, /system/*, /cmd/help, /docs", example: "监控面板 / BI 报表" },
-    ScopeDesc { scope: "readwrite", can: "readonly + POST /cmd (任意命令) + /originate + /calls/{id}/hangup + GET /events/stream", example: "呼叫中心 / CRM / AI Agent" },
+    ScopeDesc { scope: "readwrite", can: "readonly + POST /cmd (任意命令) + /originate + /calls/{id}/{hangup,snapshot} + GET /events/stream", example: "呼叫中心 / CRM / AI Agent" },
     ScopeDesc { scope: "admin",     can: "readwrite + Web UI 侧 API Key / Webhook 管理（需 JWT + L2）", example: "系统管理员" },
 ];
 
@@ -319,6 +360,7 @@ pub const ENDPOINTS: &[EndpointDesc] = &[
     EndpointDesc { method: "GET",  path: "/docs",                 min_scope: "readonly",  desc: "本端点 — 完整 introspection 元数据（端点清单 + scope 分级 + 版本）" },
     EndpointDesc { method: "POST", path: "/originate",            min_scope: "readwrite", desc: "结构化快捷端点：发外呼 {\"call_url\": \"user/1000 &echo\"}。内部调 exec_cmd(originate ...)" },
     EndpointDesc { method: "POST", path: "/calls/{id}/hangup",    min_scope: "readwrite", desc: "结构化快捷端点：挂断指定 Call-ID。内部调 exec_cmd(hangup ...)" },
+    EndpointDesc { method: "POST", path: "/calls/{id}/snapshot",  min_scope: "readwrite", desc: "结构化快捷端点：启动视频抓图（body {leg,frames} 可选），返回核心 OK/ERR 文本（含 job_id）。内部调 exec_cmd(snapshot ...)" },
     EndpointDesc { method: "GET",  path: "/calls",                min_scope: "readonly",  desc: "活动呼叫列表（show channels 的 JSON 化）" },
     EndpointDesc { method: "GET",  path: "/system/status",        min_scope: "readonly",  desc: "系统状态快照（stats / show calls / show registrations 综合）" },
     EndpointDesc { method: "GET",  path: "/system/version",       min_scope: "readonly",  desc: "Web + Core 版本" },

@@ -1,9 +1,9 @@
-/* RFC 4028 会话定时器——粗骨架（REQ-SIP-014，P0）
+/* RFC 4028 会话定时器（REQ-SIP-014，P0）
  *
  * 纯协商/判定逻辑（不碰 transport，可在单测中直接验证）；
- * TODO(P0 接线)：b2bua INVITE 协商分支挂 offer/negotiate/arm，
- * 时间轮在 interval*500ms（refresher）与 interval+grace（被刷新方）
- * 各 arm 一个回调；刷新失败/超时走 b2b_terminate 发 BYE。
+ * 接线在 b2bua.c：INVITE/200 OK 协商后按腿 arm 两个时间轮节点
+ * （interval/2 发刷新、interval+grace 判超时），刷新走 re-INVITE，
+ * 刷新失败/超时由 b2b_terminate 发 BYE 拆话。
  */
 #include "sip_sess_timer.h"
 
