@@ -2264,6 +2264,9 @@ static int sig_start(struct nsbc_ctx *ctx)
     bc.rt = ctx->rt;
     if (b2b_core_create(&bc, &s->b2b) != NSBC_OK) {
         llog(LOG_CRIT, "sig", "b2b core create failed");
+        /* 创建失败时所有权仍在本地：strdup 的 ext IP 需释放，避免每次启动重试泄漏 */
+        free((void *)bc.external_sip_ip);
+        free((void *)bc.external_rtp_ip);
         return NSBC_ERR;
     }
     ctx->b2b = s->b2b;

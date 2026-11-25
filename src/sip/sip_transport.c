@@ -238,6 +238,10 @@ struct sip_transport {
      * sip_tr_add_listeners() 追加。内部去重——同一端口不重复监听。 */
     int udp_fds[SIP_TR_FD_MAX];
     int udp_fd_count;
+    /* P3-15：源端口 → fd 的惰性缓存。多 UDP listener 时，发送路径原需每个报文
+     * 循环 getsockname 找匹配端口；改为 fd 集合变化时失效、首次发送时构建一次。 */
+    uint16_t udp_fd_port[SIP_TR_FD_MAX];
+    int      udp_port_cache_valid;
     int tcp_lfds[SIP_TR_FD_MAX];
     int tcp_count;
     int tls_lfds[SIP_TR_FD_MAX];
@@ -699,6 +703,13 @@ static tr_conn_t *conn_accept(sip_transport_t *t, int lfd, int is_tls)
         tr_conn_t **nv = realloc(t->conns, cap * sizeof(*nv));
         if (!nv) {
             pthread_mutex_unlock(&t->conn_lock);
+            /* 回退 per-IP 连接计数，否则分配失败一次就永久占用该 IP 的配额 */
+            if (ip_counted) {
+                pthread_mutex_lock(&t->ip_conn_lock);
+                if (t->ip_conn_count[ip_bucket] > 0)
+                    t->ip_conn_count[ip_bucket]--;
+                pthread_mutex_unlock(&t->ip_conn_lock);
+            }
             close(fd);
             return NULL;
         }
@@ -711,6 +722,13 @@ static tr_conn_t *conn_accept(sip_transport_t *t, int lfd, int is_tls)
     size_t fcap = t->cfg.max_msg * 2 + 16;
     tr_conn_t *c = calloc(1, sizeof(*c) + fcap - 1);
     if (!c) {
+        /* 回退 per-IP 连接计数，否则分配失败一次就永久占用该 IP 的配额 */
+        if (ip_counted) {
+            pthread_mutex_lock(&t->ip_conn_lock);
+            if (t->ip_conn_count[ip_bucket] > 0)
+                t->ip_conn_count[ip_bucket]--;
+            pthread_mutex_unlock(&t->ip_conn_lock);
+        }
         close(fd);
         return NULL;
     }
@@ -1150,6 +1168,7 @@ int sip_tr_create(const sip_tr_cfg_t *cfg, sip_transport_t **out)
                 return NSBC_ERR;
             }
             t->udp_fds[t->udp_fd_count++] = fd;
+            __atomic_store_n(&t->udp_port_cache_valid, 0, __ATOMIC_RELEASE);
             reactor_t *r = cfg->mgr ? reactor_mgr_get(cfg->mgr, i) : cfg->re;
             reactor_add(r, fd, EPOLLIN, on_udp_event, t);
             llog(LOG_INFO, "sip", "udp fd=%d bound reactor[%u]", fd, i);
@@ -1284,13 +1303,25 @@ int sip_tr_send(sip_transport_t *t, sip_tr_proto_t proto,
                  use_port, t->udp_fd_count, fdlist);
         }
         if (use_port > 0 && t->udp_fd_count > 1) {
+            /* P3-15：惰性构建 port→fd 缓存，逐包不再循环 getsockname。 */
+            if (!__atomic_load_n(&t->udp_port_cache_valid, __ATOMIC_ACQUIRE)) {
+                pthread_mutex_lock(&t->ip_conn_lock);
+                if (!t->udp_port_cache_valid) {
+                    for (int i = 0; i < t->udp_fd_count; ++i) {
+                        struct sockaddr_in sin; socklen_t sl = sizeof(sin);
+                        uint16_t p = 0;
+                        if (t->udp_fds[i] >= 0 &&
+                            getsockname(t->udp_fds[i], (struct sockaddr *)&sin, &sl) == 0)
+                            p = ntohs(sin.sin_port);
+                        t->udp_fd_port[i] = p;
+                    }
+                    __atomic_store_n(&t->udp_port_cache_valid, 1, __ATOMIC_RELEASE);
+                }
+                pthread_mutex_unlock(&t->ip_conn_lock);
+            }
             for (int i = 0; i < t->udp_fd_count; ++i) {
-                struct sockaddr_in sin; socklen_t sl = sizeof(sin);
-                if (t->udp_fds[i] >= 0 &&
-                    getsockname(t->udp_fds[i], (struct sockaddr *)&sin, &sl) == 0 &&
-                    ntohs(sin.sin_port) == use_port) {
+                if (t->udp_fds[i] >= 0 && t->udp_fd_port[i] == use_port) {
                     udp = t->udp_fds[i];
-                    llog(LOG_DEBUG, "sip-tr", "UDP send match: i=%d fd=%d port=%u", i, udp, use_port);
                     break;
                 }
             }
@@ -1437,6 +1468,7 @@ int sip_tr_add_listeners(sip_transport_t *t, const char *listen_ip,
                 return NSBC_ERR;
             }
             t->udp_fds[t->udp_fd_count++] = fd;
+            __atomic_store_n(&t->udp_port_cache_valid, 0, __ATOMIC_RELEASE);
             sip_tr_reactor_add(t->cfg.re, fd, EPOLLIN, on_udp_event, t);
             llog(LOG_NOTICE, "sip", "added udp listener %s:%u (total=%d)",
                  listen_ip, udp_port, t->udp_fd_count);
@@ -1613,6 +1645,7 @@ int sip_tr_sync_from_profiles(sip_transport_t *t)
                 t->udp_fds[j] = t->udp_fds[j + 1];
             t->udp_fds[t->udp_fd_count - 1] = -1;
             t->udp_fd_count--;
+            __atomic_store_n(&t->udp_port_cache_valid, 0, __ATOMIC_RELEASE);
             closed++;
         }
     }

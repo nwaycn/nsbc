@@ -706,17 +706,23 @@ static void dispatch_frame(const uint8_t *frame, size_t len)
          * 占满一颗核 + 让后续 CMD_REQ 排队。
          * 方案：pthread_create detached 执行 —— poll thread 立即回去 poll。 */
         _cmd_job_t *j = calloc(1, sizeof(*j));
+        if (!j) {
+            /* 分配失败：退回同步执行；full_payload 仍归本函数，末尾统一 free */
+            uds_handle_core_cmd(ticket, full_payload, full_len);
+            break;
+        }
         j->ticket  = ticket;
         j->payload = full_payload;       /* 所有权转移给 worker */
         j->len     = full_len;
         pthread_t tid;
-        if (pthread_create(&tid, NULL, uds_handle_core_cmd_worker, j) == 0)
+        if (pthread_create(&tid, NULL, uds_handle_core_cmd_worker, j) == 0) {
             pthread_detach(tid);
-        else {
-            uds_handle_core_cmd(ticket, full_payload, full_len); /* fallback 同步 */
+            full_payload = NULL;   /* worker 接管，防止下面 free */
+        } else {
+            /* 线程创建失败：同步执行后释放 job；payload 仍归本函数统一 free */
+            uds_handle_core_cmd(ticket, full_payload, full_len);
             free(j);
         }
-        full_payload = NULL;   /* 防止下面 free — worker 接管 */
         break;
     }
     case FT_HELLO_ACK:
