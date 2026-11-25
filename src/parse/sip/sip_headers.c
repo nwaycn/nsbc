@@ -2,6 +2,7 @@
  * （v/f/t/i/m/l/k/s/c/e/u/r/x/o） */
 
 #include "sip_common.h"
+#include <pthread.h>
 
 static const struct {
     const char      *name;
@@ -69,6 +70,17 @@ static const struct {
     {"WWW-Authenticate",       SIP_H_WWW_AUTHENTICATE},
 };
 
+/* P2-10：头部名长度只取决于静态表，初始化一次即可。
+ * 原实现对每次查找的每一项都 strlen，最多 60 次/行；改为缓存后查找只剩比较。 */
+static size_t      hdr_name_len[NSBC_ARRAY_SIZE(hdr_tab)];
+static pthread_once_t hdr_name_len_once = PTHREAD_ONCE_INIT;
+
+static void hdr_name_len_init(void)
+{
+    for (size_t i = 0; i < NSBC_ARRAY_SIZE(hdr_tab); ++i)
+        hdr_name_len[i] = strlen(hdr_tab[i].name);
+}
+
 sip_hdr_type_t sip_hdr_type_lookup(const char *name, size_t len)
 {
     if (len == 1) {
@@ -90,8 +102,9 @@ sip_hdr_type_t sip_hdr_type_lookup(const char *name, size_t len)
         }
         return SIP_H_UNKNOWN;
     }
+    pthread_once(&hdr_name_len_once, hdr_name_len_init);
     for (size_t i = 0; i < NSBC_ARRAY_SIZE(hdr_tab); ++i) {
-        size_t n = strlen(hdr_tab[i].name);
+        size_t n = hdr_name_len[i];
         if (n == len && sip_ci_eq(name, hdr_tab[i].name, n))
             return hdr_tab[i].type;
     }

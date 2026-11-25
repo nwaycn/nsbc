@@ -85,6 +85,11 @@ static void reactor_drain_wake_fd(reactor_t *r)
 
 static unsigned reactor_run_tasks(reactor_t *r, unsigned budget)
 {
+    /* P3-20：队列为空时直接返回，避免每个 epoll 批次都进 task_lock。
+     * task_count 用原子读作提示；提交方入队后会 reactor_wake，
+     * 即便此处漏判，下一轮 epoll 也会立即被唤醒并拾取。 */
+    if (__atomic_load_n(&r->task_count, __ATOMIC_ACQUIRE) == 0)
+        return 0;
     unsigned done = 0;
     while (done < budget) {
         pthread_mutex_lock(&r->task_lock);
@@ -93,7 +98,8 @@ static unsigned reactor_run_tasks(reactor_t *r, unsigned budget)
             r->task_head = task->next;
             if (!r->task_head)
                 r->task_tail = NULL;
-            --r->task_count;
+            /* 与无锁快路径的 __atomic_load_n 配对，避免混用非原子读写 */
+            __atomic_sub_fetch(&r->task_count, 1, __ATOMIC_RELEASE);
         }
         pthread_mutex_unlock(&r->task_lock);
         if (!task)
@@ -442,7 +448,8 @@ int reactor_call(reactor_t *r, reactor_task_fn fn, void *arg)
     else
         r->task_head = &task;
     r->task_tail = &task;
-    ++r->task_count;
+    /* 与无锁快路径的 __atomic_load_n 配对，避免混用非原子读写 */
+    __atomic_add_fetch(&r->task_count, 1, __ATOMIC_RELEASE);
     ++r->task_submitted;
     pthread_mutex_unlock(&r->task_lock);
     reactor_wake(r);

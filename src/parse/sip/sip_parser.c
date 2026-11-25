@@ -11,10 +11,11 @@ static nsbc_rc_t get_line(const char *buf, size_t len, size_t *pos,
     if (i >= len)
         return NSBC_ERR;
     size_t start = i;
-    while (i < len && buf[i] != '\n')
-        ++i;
-    if (i >= len)
+    /* P2-10：memchr 替代逐字节找换行（libc 向量化）。 */
+    const char *nl = (const char *)memchr(buf + i, '\n', len - i);
+    if (!nl)
         return NSBC_ERR;
+    i = (size_t)(nl - buf);
     *ls = buf + start;
     *le = (i > start && buf[i - 1] == '\r') ? buf + i - 1 : buf + i;
     *pos = i + 1;
@@ -38,9 +39,9 @@ nsbc_rc_t sip_parse_ex(sip_msg_t *m, const char *buf, size_t len,
 
     if (len == 0 || len > SIP_MAX_MSG)
         return NSBC_ERR;
-    for (size_t i = 0; i < len; ++i)
-        if (buf[i] == '\0')
-            return NSBC_ERR;
+    /* P2-10：NUL 检查用 memchr，一次向量扫描替代逐字节循环。 */
+    if (memchr(buf, '\0', len))
+        return NSBC_ERR;
 
     size_t pos = 0;
     const char *ls, *le;

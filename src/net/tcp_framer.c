@@ -131,14 +131,17 @@ int tcp_framer_feed(tcp_framer_t *f, const uint8_t *data, size_t len,
         memcpy(f->buf + f->end, data, len);
     f->end += len;
 
+    /* P2-11：用局部偏移 off 推进解析，循环内不再每次 memmove；
+     * 只在批量解析结束（或出错返回）时 compact 一次，避免一批 k 条消息的 O(k²) 拷贝。 */
+    size_t off = f->start;
+    const uint8_t *end = f->buf + f->end;
+
     for (;;) {
-        compact(f);
-        const uint8_t *p = f->buf + f->start;
-        const uint8_t *end = f->buf + f->end;
+        const uint8_t *p = f->buf + off;
         /* RFC 5626 §3.5.1：独立 CRLF 为连接保活，直接跳过 */
         while (end - p >= 2 && p[0] == '\r' && p[1] == '\n') {
             p += 2;
-            f->start += 2;
+            off += 2;
         }
         if (p >= end)
             break;
@@ -146,6 +149,8 @@ int tcp_framer_feed(tcp_framer_t *f, const uint8_t *data, size_t len,
         if (!hend) {
             if ((size_t)(end - p) > f->max_msg) {
                 *out_rc = FRAME_OVERFLOW;
+                f->start = off;
+                compact(f);
                 return NSBC_OK;
             }
             break;
@@ -154,23 +159,29 @@ int tcp_framer_feed(tcp_framer_t *f, const uint8_t *data, size_t len,
         frame_rc_t rc = parse_content_length(p, hend, &cl);
         if (rc != FRAME_OK) {
             *out_rc = FRAME_PROTO;
+            f->start = off;
+            compact(f);
             return NSBC_OK;
         }
         size_t total = (size_t)(hend - p) + (size_t)cl;
         if (total > f->max_msg) {
             *out_rc = FRAME_OVERFLOW;
+            f->start = off;
+            compact(f);
             return NSBC_OK;
         }
         if ((size_t)(end - p) < total)
             break; /* 等正文剩余字节 */
         if (cb && cb(ud, p, total) != 0) {
-            f->start += total;
+            off += total;
             break;
         }
-        f->start += total;
+        off += total;
         ++*n_msgs;
         *out_rc = FRAME_OK;
     }
+    f->start = off;
+    compact(f);
     /* 帧状态（OK/NEED_MORE/OVERFLOW/PROTO）一律经 *out_rc 给出；
      * 只有单包超缓冲这类资源错误才以返回值上报 */
     return NSBC_OK;

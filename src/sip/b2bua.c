@@ -289,68 +289,61 @@ static size_t nat_sdp_rewrite(char *sdp, size_t sdp_len, size_t cap,
      * 通用方案：遍历整个 SDP buffer，找出所有 RFC1918/CGNAT/回环私网 IP
      * 字符串并原地替换（要求 new_ip_len <= old_ip_len，否则跳过）。 */
 
-    char *p = sdp;
     char *end = sdp + sdp_len;
     size_t new_ip_len = strlen(new_rtp_ip);
     size_t changed = 0;
 
-    while (p < end) {
-        /* 在剩余 buffer 里找 IPv4 候选（点分四段，最长 IPv4 = 15B） */
-        char *ip_start = NULL;
-        int ip_len = 0;
-        for (char *q = p; q + 7 <= end && !ip_start; q++) {
-            /* 粗筛选：必须数字开头且含至少 2 个 '.' */
-            size_t qcap = (size_t)(end - q);
-            if ((q[0] >= '0' && q[0] <= '9')
-                && memchr(q, '.', qcap)
-                && memchr(q + 1, '.', qcap > 1 ? qcap - 1 : 0)) {
-                int dots = 0;
-                int len = 0;
-                for (len = 0; len < 15 && q + len < end
-                     && ((q[len] >= '0' && q[len] <= '9') || q[len] == '.'); len++) {
-                    if (q[len] == '.') dots++;
-                }
-                if (dots == 3 && len >= 7) {
-                    /* 边界检查：IP 前后不能是数字/字母（避免 192.168.1.1000 的 192.168.1.1 被误匹配） */
-                    char prev = (q > p) ? q[-1] : ' ';
-                    char next_ch = (q + len < end) ? q[len] : ' ';
-                    int prev_ok = (prev == ' ' || prev == '\r' || prev == '\n'
-                                   || prev == ':' || prev == ';' || prev == '@'
-                                   || prev == '-' || prev == ',' || prev == '/'
-                                   || prev == '=' || prev == '>' || prev == '"'
-                                   || prev == '<');
-                    int next_ok = (next_ch == ' ' || next_ch == '\r' || next_ch == '\n'
-                                   || next_ch == ':' || next_ch == ';' || next_ch == '-'
-                                   || next_ch == ',' || next_ch == '/' || next_ch == '"');
-                    if (prev_ok && next_ok) {
-                        ip_start = q;
-                        ip_len = len;
-                    }
-                }
-            }
+    /* P1-5：单趟线性扫描。每个字节只被常量次检查，不再对每个起点做
+     * "从当前位置 memchr 到缓冲区末尾" 的扫描（原实现最坏 O(n²)）。
+     * 语义保持：仅改写前后边界合法、恰好 3 个点、长度 >= 7 的 IPv4 token；
+     * 非私网 token 直接整体跳过，不回退重扫。 */
+    char *q = sdp;
+    while (q < end) {
+        if (!(q[0] >= '0' && q[0] <= '9')) { ++q; continue; }
+        /* 起始边界：token 前必须是分隔符（文件开头视为空格） */
+        if (q != sdp) {
+            char prev = q[-1];
+            int prev_ok = (prev == ' ' || prev == '\r' || prev == '\n'
+                           || prev == ':' || prev == ';' || prev == '@'
+                           || prev == '-' || prev == ',' || prev == '/'
+                           || prev == '=' || prev == '>' || prev == '"'
+                           || prev == '<');
+            if (!prev_ok) { ++q; continue; }
         }
-        if (!ip_start) break;
+        int len = 0, dots = 0;
+        while (len < 15 && q + len < end &&
+               ((q[len] >= '0' && q[len] <= '9') || q[len] == '.')) {
+            if (q[len] == '.') ++dots;
+            ++len;
+        }
+        int ok = (dots == 3 && len >= 7);
+        if (ok) {
+            char next_ch = (q + len < end) ? q[len] : ' ';
+            ok = (next_ch == ' ' || next_ch == '\r' || next_ch == '\n'
+                  || next_ch == ':' || next_ch == ';' || next_ch == '-'
+                  || next_ch == ',' || next_ch == '/' || next_ch == '"');
+        }
+        if (!ok) { ++q; continue; }
 
-        /* 提取 IP 字符串做 b2b_is_private_ip 判定 */
+        /* token [q, q+len) 是候选 IPv4，提取判定是否私网 */
         char ip_str[INET_ADDRSTRLEN] = {0};
+        int ip_len = len;
         if (ip_len >= INET_ADDRSTRLEN) ip_len = INET_ADDRSTRLEN - 1;
-        memcpy(ip_str, ip_start, (size_t)ip_len);
+        memcpy(ip_str, q, (size_t)ip_len);
 
         if (b2b_is_private_ip(ip_str)) {
-            if (new_ip_len <= (size_t)ip_len) {
-                memcpy(ip_start, new_rtp_ip, new_ip_len);
-                if (new_ip_len < (size_t)ip_len)
-                    memset(ip_start + new_ip_len, ' ', (size_t)ip_len - new_ip_len);
+            if (new_ip_len <= (size_t)len) {
+                memcpy(q, new_rtp_ip, new_ip_len);
+                if (new_ip_len < (size_t)len)
+                    memset(q + new_ip_len, ' ', (size_t)len - new_ip_len);
                 changed++;
             } else {
                 llog(LOG_WARN, "b2b",
                      "nat_sdp: new_ip(%zuB) > old_ip(%dB) for '%s', skip",
-                     new_ip_len, ip_len, ip_str);
+                     new_ip_len, len, ip_str);
             }
-            p = ip_start + ip_len;  /* 不管改没改，推进到 IP 之后 */
-        } else {
-            p = ip_start + 1;  /* 不是私网 IP → 跳过这个位置继续找 */
         }
+        q += len;
     }
 
     if (changed)
@@ -1152,6 +1145,10 @@ void b2b_core_destroy(b2b_core_t *co)
     if (!co)
         return;
     co->stopping = 1;   /* REQ-ORIGINATE-003 待补：唤醒 bridge wait loop 尽快退出 */
+    /* external_*_ip 由 signaling 侧 strdup 后随 b2b_cfg_t 按值转入，创建成功即由
+     * core 拥有；旧实现只 free(co) 导致每次创建/销毁泄漏两份字符串。 */
+    free((void *)co->cfg.external_sip_ip);
+    free((void *)co->cfg.external_rtp_ip);
     mem_slab_destroy(co->slab);
     for (int i = 0; i < B2B_CALL_SHARDS; ++i)
         pthread_mutex_destroy(&co->sh[i].lock);

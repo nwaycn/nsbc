@@ -193,18 +193,17 @@ loc_rc_t loc_upsert(loc_db_t *db, const loc_binding_t *b, uint64_t now_ms)
             loc_node_t **pp2 = &aor->bindings;
             while (*pp2 && *pp2 != lru) pp2 = &(*pp2)->next;
             if (*pp2) {
-                char evicted_contact[LOC_CONTACT_MAX];
                 uint64_t evicted_expire = lru->b.expire_ms;
-                snprintf(evicted_contact, sizeof(evicted_contact), "%s",
-                         lru->b.contact);
+                /* P3-19：llog 同步格式化，直接传 lru->b.contact 即可，
+                 * 省去 128B 的 snprintf 临时拷贝（日志必须在覆盖 lru->b 之前发）。 */
+                llog(LOG_INFO, "loc",
+                     "loc_upsert LRU-evict aor=%s contact=%s expire_ms=%lu now_ms=%lu",
+                     b->aor, lru->b.contact, (unsigned long)evicted_expire,
+                     (unsigned long)now_ms);
                 *pp2 = lru->next;
                 lru->b = *b;
                 lru->next = aor->bindings;
                 aor->bindings = lru;
-                llog(LOG_INFO, "loc",
-                     "loc_upsert LRU-evict aor=%s contact=%s expire_ms=%lu now_ms=%lu",
-                     b->aor, evicted_contact, (unsigned long)evicted_expire,
-                     (unsigned long)now_ms);
                 pthread_mutex_unlock(&s->lock);
                 return LOC_OK;
             }

@@ -1962,9 +1962,13 @@ static void ban_clear_counts(const char *ip)
  *   不能把同 IP 的正常 REGISTER 也封死。所以 INVITE flood 的 ban 只在
  *   b2bua INVITE 入口生效；reactor 层前置检查只 block REGISTER auth fail /
  *   REGISTER ratelimit 这类真正针对注册的威胁。 */
-static int ban_is_banned(const char *ip, int allow_reasons)
+/* 内部版本：调用方已完成私网判定，跳过重复的 inet_pton（P1-1 热路径优化）。
+ * ban_is_banned 仅在此之上加私网前置检查，语义完全一致。 */
+static int ban_is_banned_nopriv(const char *ip, int allow_reasons)
 {
-    if (ban_is_private_ip(ip)) return 0;
+    /* 表空时零成本返回：不取 clock、不碰全局锁。仅作提示，竞争下漏判一包可接受。 */
+    if (__atomic_load_n(&g_ban_count, __ATOMIC_RELAXED) == 0)
+        return 0;
     uint64_t now = nsbc_now_ms();
     int hit = 0;
     pthread_mutex_lock(&g_ban_lock);
@@ -1992,6 +1996,13 @@ static int ban_is_banned(const char *ip, int allow_reasons)
     return hit;
 }
 
+/* 对外版本：保留私网跳过（ban producer / guard / INVITE 入口共用）。 */
+static int ban_is_banned(const char *ip, int allow_reasons)
+{
+    if (ban_is_private_ip(ip)) return 0;
+    return ban_is_banned_nopriv(ip, allow_reasons);
+}
+
 /* reactor 层前置封禁/黑名单查询（recvfrom 后 parse 前调用）。
  * 只查 IP：ban_is_banned（动态 auto-ban 表）+ security_check_ip（静态 CIDR 黑名单）。
  * 不查 UA/号码前缀——它们需要 parse 后的 SIP 头，放在 b2bua 层更合适。
@@ -1999,6 +2010,15 @@ static int ban_is_banned(const char *ip, int allow_reasons)
 int security_is_blocked(const nsbc_sa_t *src)
 {
     if (!src) return 0;
+    /* P1-1 快速路径：deny/allow CIDR 与封禁表全空、且静态黑名单未启用时，
+     * 直接放行，不做 inet_ntop/inet_pton、不取任何全局锁。
+     * g_ban_count 用原子读作提示——即便与并发插入存在极窄竞争而漏判一包，
+     * 下一包即恢复，符合“尽力而为”的封禁语义，但不影响已存在的封禁条目
+     * （因为一旦非 0，就会走完整路径）。 */
+    if (g_allow_cidr_n == 0 && g_deny_cidr_n == 0 &&
+        !g_cfg.block_on_register && !g_cfg.block_on_invite &&
+        __atomic_load_n(&g_ban_count, __ATOMIC_RELAXED) == 0)
+        return 0;
     /* Key must be the PURE IP (no port): nsbc_sa_fmt() appends ":port",
      * which never matches the ban table (keyed by pure IP from
      * registrar/guard paths) nor parses as an address for CIDR matching.
@@ -2031,7 +2051,7 @@ int security_is_blocked(const nsbc_sa_t *src)
      *    排除 BAN_REASON_INV_FLOOD（INVITE 主动频率）—— 运营商 NAT 把多个用户汇
      *    聚到同一出口 IP，其中一人发 INVITE flood 不能把同 IP 的正常 REGISTER
      *    也封死。INVITE flood ban 延后到 b2bua INVITE 入口再 block。 */
-    if (ban_is_banned(ip, BAN_REASON_AUTH_FAIL | BAN_REASON_REG_REQ | BAN_REASON_INV_REQ)) {
+    if (ban_is_banned_nopriv(ip, BAN_REASON_AUTH_FAIL | BAN_REASON_REG_REQ | BAN_REASON_INV_REQ)) {
         static unsigned dbg = 0;
         if (dbg++ % 1024 == 0)
             log_notice("security",
