@@ -178,11 +178,18 @@ typedef struct ai_session {
     int       transfer_pending;
 
     struct ai_session *next;
+    struct ai_session *hnext;   /* P1-3：call_key 哈希桶链，替代热路径 O(N) 线性扫描 */
 } ai_session_t;
+
+#define AI_STORE_BUCKETS 256   /* 2 的幂 */
 
 typedef struct ai_store {
     pthread_mutex_t lock;
     ai_session_t   *head;
+    /* P1-3：call_key → session 的分片哈希。媒体线程每包查找从 O(会话数) 降到 O(1)。
+     * hcount 用原子读作快速判空（无会话时热路径直接返回，不取锁）。 */
+    ai_session_t   *htab[AI_STORE_BUCKETS];
+    int             hcount;
     bridge_mgr_t   *bridge;
     void           *bridge_hook;
     ai_cfg_t        cfg;
@@ -230,14 +237,54 @@ static int ai_first_audio_pt(b2b_call_t *call)
     return 0;
 }
 
+/* P1-3：call_key 哈希桶操作。以下 *_locked 后缀表示调用方必须持 st->lock。 */
+static unsigned ai_ck_bucket(const void *k)
+{
+    uintptr_t v = (uintptr_t)k;
+    v ^= v >> 7;
+    return (unsigned)(v & (AI_STORE_BUCKETS - 1));
+}
+
+static ai_session_t *ai_store_find_locked(ai_store_t *st, void *call_key)
+{
+    for (ai_session_t *s = st->htab[ai_ck_bucket(call_key)]; s; s = s->hnext)
+        if (s->call_key == call_key)
+            return s;
+    return NULL;
+}
+
+static void ai_store_link_locked(ai_store_t *st, ai_session_t *s)
+{
+    unsigned b = ai_ck_bucket(s->call_key);
+    s->hnext = st->htab[b];
+    st->htab[b] = s;
+    __atomic_add_fetch(&st->hcount, 1, __ATOMIC_RELAXED);
+    s->next = st->head;
+    st->head = s;
+}
+
+static void ai_store_unlink_locked(ai_store_t *st, ai_session_t *s)
+{
+    unsigned b = ai_ck_bucket(s->call_key);
+    ai_session_t **hp = &st->htab[b];
+    while (*hp && *hp != s)
+        hp = &(*hp)->hnext;
+    if (*hp) {
+        *hp = s->hnext;
+        __atomic_sub_fetch(&st->hcount, 1, __ATOMIC_RELAXED);
+    }
+    ai_session_t **pp = &st->head;
+    while (*pp && *pp != s)
+        pp = &(*pp)->next;
+    if (*pp)
+        *pp = s->next;
+}
+
 static ai_session_t *ai_session_find_or_create(ai_store_t *st, void *call_key,
                                                int pt_in, const char *src)
 {
     pthread_mutex_lock(&st->lock);
-    ai_session_t *s = NULL;
-    for (s = st->head; s; s = s->next) {
-        if (s->call_key == call_key) break;
-    }
+    ai_session_t *s = ai_store_find_locked(st, call_key);
     if (!s) {
         s = (ai_session_t *)calloc(1, sizeof(*s));
         if (!s) { pthread_mutex_unlock(&st->lock); return NULL; }
@@ -260,7 +307,7 @@ static ai_session_t *ai_session_find_or_create(ai_store_t *st, void *call_key,
         for (int i = 0; i < 2; i++) {
             ai_dsp_init(&s->dsp[i]);
         }
-        st->head = s;
+        ai_store_link_locked(st, s);
         llog(LOG_INFO, "ai",
              "session opened call=%p pt=%d via=%s HPF init AECM=%s NS=%s AGC=%s",
              call_key, pt_in, src,
@@ -520,10 +567,14 @@ static void ai_ring_put(ai_session_t *s, const int16_t *pcm, size_t n)
               : (s->r_tail - s->r_head));
     }
     if (space >= ring_len) {
-        for (size_t i = 0; i < ring_len; ++i) {
-            s->ring[s->r_head++] = ring_data[i];
-            if (s->r_head >= AI_RING_CAP) s->r_head = 0;
-        }
+        /* P2-12：两段 memcpy 替代逐字节写 + 每字节取模。 */
+        size_t first = AI_RING_CAP - s->r_head;
+        if (first > ring_len) first = ring_len;
+        memcpy(&s->ring[s->r_head], ring_data, first);
+        if (ring_len > first)
+            memcpy(s->ring, ring_data + first, ring_len - first);
+        s->r_head += ring_len;
+        if (s->r_head >= AI_RING_CAP) s->r_head -= AI_RING_CAP;
     }
 }
 
@@ -599,11 +650,11 @@ static void ai_rec_feed(void *ud, void *call_key,
      * 只有 dialplan 配了 "ai" app（如拨 9999）时 ai_app_exec 才显式创建 session，
      * 避免分机对打、落地呼叫等误进入 AI 管道。
      * 找不到 session → 说明这个 call 没走 AI dialplan → 直接 return，零开销。*/
+    /* P1-3：无会话时直接返回，媒体线程热路径不取锁（hcount 原子读作提示）。 */
+    if (__atomic_load_n(&st->hcount, __ATOMIC_RELAXED) == 0)
+        return;
     pthread_mutex_lock(&st->lock);
-    ai_session_t *s = NULL;
-    for (s = st->head; s; s = s->next) {
-        if (s->call_key == call_key) break;
-    }
+    ai_session_t *s = ai_store_find_locked(st, call_key);
     pthread_mutex_unlock(&st->lock);
     if (!s) return;   /* 没有 dialplan ai app 触发 → 跳过 */
 
@@ -781,10 +832,7 @@ int ai_set_producer(void *call_key, int producer)
 {
     if (!call_key) return NSBC_INVAL;
     pthread_mutex_lock(&g_ai.lock);
-    ai_session_t *s = NULL;
-    for (s = g_ai.head; s; s = s->next) {
-        if (s->call_key == call_key) break;
-    }
+    ai_session_t *s = ai_store_find_locked(&g_ai, call_key);
     if (!s) { pthread_mutex_unlock(&g_ai.lock); return NSBC_NOENT; }
     pthread_mutex_lock(&s->lock);
     int old_producer = s->producer;
@@ -822,10 +870,7 @@ size_t ai_get_rx_audio(void *call_key, uint8_t *out_buf, size_t out_max_len)
 {
     if (!call_key || !out_buf || out_max_len == 0) return 0;
     pthread_mutex_lock(&g_ai.lock);
-    ai_session_t *s = NULL;
-    for (s = g_ai.head; s; s = s->next) {
-        if (s->call_key == call_key) break;
-    }
+    ai_session_t *s = ai_store_find_locked(&g_ai, call_key);
     if (!s || !s->running) { pthread_mutex_unlock(&g_ai.lock); return 0; }
 
     pthread_mutex_lock(&s->lock);
@@ -861,10 +906,7 @@ int ai_send_tx_audio(void *call_key, const uint8_t *data, size_t len, int format
     if (!call_key || !data || len == 0) return NSBC_INVAL;
 
     pthread_mutex_lock(&g_ai.lock);
-    ai_session_t *s = NULL;
-    for (s = g_ai.head; s; s = s->next) {
-        if (s->call_key == call_key) break;
-    }
+    ai_session_t *s = ai_store_find_locked(&g_ai, call_key);
     if (!s) { pthread_mutex_unlock(&g_ai.lock); return NSBC_NOENT; }
     pthread_mutex_unlock(&g_ai.lock);
 
@@ -1077,9 +1119,7 @@ static void *ai_session_thread_stub(void *arg)
     /* 线程退出清理 */
     pthread_mutex_lock(&st->lock);
     pthread_mutex_lock(&s->lock);
-    ai_session_t **pp = &st->head;
-    while (*pp && *pp != s) pp = &(*pp)->next;
-    if (*pp) *pp = s->next;
+    ai_store_unlink_locked(st, s);
     pthread_mutex_unlock(&s->lock);
     pthread_mutex_unlock(&st->lock);
 
@@ -1111,9 +1151,7 @@ static void ai_on_call_destroy(void *call_key, int a_final, void *ud)
 
     ai_session_t *victim = NULL;
     pthread_mutex_lock(&st->lock);
-    for (ai_session_t *s = st->head; s; s = s->next) {
-        if (s->call_key == call_key) { victim = s; break; }
-    }
+    victim = ai_store_find_locked(st, call_key);
     pthread_mutex_unlock(&st->lock);
 
     if (!victim) return;
@@ -1242,10 +1280,7 @@ int ai_request_transfer(void *call_key, const char *dest)
     }
 
     pthread_mutex_lock(&g_ai.lock);
-    ai_session_t *s = NULL;
-    for (s = g_ai.head; s; s = s->next) {
-        if (s->call_key == call_key) break;
-    }
+    ai_session_t *s = ai_store_find_locked(&g_ai, call_key);
     if (!s) {
         pthread_mutex_unlock(&g_ai.lock);
         llog(LOG_WARN, "ai", "ai_request_transfer: no session for call=%p", call_key);
@@ -1330,10 +1365,7 @@ static app_rc_t ai_app_exec(app_ctx_t *c, const char *data, void *ud)
         return APP_RC_FAILED;
 
     pthread_mutex_lock(&st->lock);
-    ai_session_t *s = NULL;
-    for (s = st->head; s; s = s->next) {
-        if (s->call_key == c->call_key) break;
-    }
+    ai_session_t *s = ai_store_find_locked(st, c->call_key);
     if (!s) {
         pthread_mutex_unlock(&st->lock);
         /* ★ 修复 payload 误判：pt_in 不能硬编码 0（PCMU）。
@@ -1464,23 +1496,69 @@ static void ai_fini(struct nsbc_ctx *ctx)
         g_ai.bridge_hook = NULL;
     }
 
+    /* 先持锁标记所有 session 退出，再在锁外 join：
+     * 线程退出路径会调 ai_set_producer() 反向获取 g_ai.lock，原实现持锁
+     * pthread_join 在存在活跃 AI 会话时必然死锁；且 join 成功后线程已自行
+     * 从链表摘除并 free(session)，原实现随后再 free 一次是双重释放。 */
     pthread_mutex_lock(&g_ai.lock);
-    ai_session_t *s = g_ai.head;
-    while (s) {
-        ai_session_t *nx = s->next;
-        if (s->running) {
-            s->running = 0;
-            pthread_join(s->th, NULL);
-        }
-        for (int i = 0; i < 2; i++) {
-            ai_dsp_free(&s->dsp[i]);
-        }
-        pthread_mutex_destroy(&s->lock);
-        free(s);
-        s = nx;
+    size_t nsess = 0;
+    for (ai_session_t *s = g_ai.head; s; s = s->next) {
+        s->running = 0;
+        ++nsess;
     }
-    g_ai.head = NULL;
+    pthread_t *ths = nsess ? (pthread_t *)calloc(nsess, sizeof(*ths)) : NULL;
+    size_t nth = 0;
+    if (ths || nsess == 0) {
+        for (ai_session_t *s = g_ai.head; s; s = s->next)
+            if (s->th)          /* 0 = 从未成功创建线程（calloc 初值） */
+                ths[nth++] = s->th;
+    }
     pthread_mutex_unlock(&g_ai.lock);
+
+    if (ths || nsess == 0) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += 10;
+        for (size_t i = 0; i < nth; ++i) {
+            if (pthread_timedjoin_np(ths[i], NULL, &ts) != 0)
+                llog(LOG_WARN, "ai", "fini join timeout — thread left for process exit");
+        }
+        free(ths);
+
+        pthread_mutex_lock(&g_ai.lock);
+        ai_session_t *s = g_ai.head;
+        while (s) {
+            ai_session_t *nx = s->next;
+            if (s->th) {
+                /* 线程超时未退出：不释放，避免 UAF（进程即将退出） */
+                s = nx;
+                continue;
+            }
+            /* 线程从未启动的 session 也可能已被媒体线程建过转码器，需一并释放 */
+            if (s->rx_tc) { transcode_close(s->rx_tc); s->rx_tc = NULL; }
+            if (s->tx_tc) { transcode_close(s->tx_tc); s->tx_tc = NULL; }
+            if (s->tx_pcm16_enc) {
+                const codec_ops_t *ops = codec_registry_find(
+                    s->in_codec != CODEC_NONE ? s->in_codec : CODEC_PCMA);
+                if (ops && ops->fini) ops->fini(s->tx_pcm16_enc);
+                s->tx_pcm16_enc = NULL;
+            }
+            for (int i = 0; i < 2; i++) {
+                ai_dsp_free(&s->dsp[i]);
+            }
+            pthread_mutex_destroy(&s->lock);
+            free(s);
+            s = nx;
+        }
+        g_ai.head = NULL;
+        for (int i = 0; i < AI_STORE_BUCKETS; ++i)
+            g_ai.htab[i] = NULL;
+        __atomic_store_n(&g_ai.hcount, 0, __ATOMIC_RELAXED);
+        pthread_mutex_unlock(&g_ai.lock);
+    } else {
+        llog(LOG_WARN, "ai", "fini: calloc failed, %zu session(s) left for process exit",
+             nsess);
+    }
     pthread_mutex_destroy(&g_ai.lock);
 
     memset(&g_ai, 0, sizeof(g_ai));
