@@ -186,6 +186,9 @@
         </div>
         <div class="video-box">
           <video id="remoteVideo" autoplay playsinline></video>
+          <!--  远端音频单独承载：对端不开摄像头时 video 轨一直无帧，<video> 的 play()
+                不会真正启动，音频也就出不来。 -->
+          <audio id="remoteAudio" autoplay playsinline style="display:none"></audio>
           <div class="lbl"><span class="dot off" id="remoteDot"></span>Remote</div>
           <div class="meters">
             <div class="mrow"><span class="mkey">A</span><div class="mbar"><i id="remoteAudioBar"></i></div><span class="mval" id="remoteAudioVal">0</span></div>
@@ -262,7 +265,7 @@
   </div>
 
 </div>
-<script src="js/nsbc-phone.js?v=20261112a"></script>
+<script src="js/nsbc-phone.js?v=20261125a"></script>
 <script>
 // =============================================================================
 // 媒体能量指示（仅本页增强，不改 nsbc-phone.js）
@@ -288,6 +291,8 @@
 
   function makeMeter(ids) {
     const video = document.getElementById(ids.video);
+    // 远端音频改由独立 <audio> 承载时，电平表要从 audio 元素取流
+    const audioEl = ids.audio ? document.getElementById(ids.audio) : null;
     const bars = {
       a: document.getElementById(ids.audioBar),
       av: document.getElementById(ids.audioVal),
@@ -301,7 +306,7 @@
     const cx = cv.getContext('2d', { willReadFrequently: true });
 
     const st = {
-      video, bars,
+      video, audioEl, bars,
       stream: null, srcNode: null, analyser: null, buf: null,
       prev: null, lastSample: 0, aLvl: 0, vLvl: 0, _a: -1, _v: -1,
     };
@@ -388,14 +393,18 @@
   const meters = [
     makeMeter({ video: 'localVideo', audioBar: 'localAudioBar', audioVal: 'localAudioVal',
                 motionBar: 'localMotionBar', motionVal: 'localMotionVal' }),
-    makeMeter({ video: 'remoteVideo', audioBar: 'remoteAudioBar', audioVal: 'remoteAudioVal',
+    makeMeter({ video: 'remoteVideo', audio: 'remoteAudio',
+                audioBar: 'remoteAudioBar', audioVal: 'remoteAudioVal',
                 motionBar: 'remoteMotionBar', motionVal: 'remoteMotionVal' }),
   ].filter(Boolean);
   if (!meters.length) return;
 
   // srcObject 变化检测
   setInterval(() => {
-    for (const m of meters) m.bind(m.video.srcObject || null);
+    for (const m of meters) {
+      const src = m.audioEl ? (m.audioEl.srcObject || null) : (m.video.srcObject || null);
+      m.bind(src);
+    }
   }, 500);
 
   (function loop(now) {

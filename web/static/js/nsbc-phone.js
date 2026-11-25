@@ -396,6 +396,52 @@ function tryPlayWithGesture(el) {
   }
 }
 
+// ============ 远端音视频分流绑定 ============
+/*  把 remoteStream 拆成两路：音频轨 → <audio id="remoteAudio">，视频轨 → <video id="remoteVideo">。
+ *  原因：对端不开摄像头时视频轨一直 muted（永远没有帧），Chrome 的 <video> 要等第一帧
+ *  才进入 HAVE_METADATA，play() 的 Promise 一直 pending（表现为 paused=false 但
+ *  readyState=0 / currentTime 不走 / webkitAudioDecodedByteCount=0），音频也不会出声。
+ *  页面没有 remoteAudio 元素时退回旧行为（整条流挂 remoteVideo）。 */
+function bindRemoteElements() {
+  if (!remoteStream || remoteStream.getTracks().length === 0) return;
+  const rv = $('remoteVideo');
+  const ra = $('remoteAudio');
+  const dot = $('remoteDot');
+  if (dot) dot.className = 'dot on';
+
+  if (ra) {
+    const at = remoteStream.getAudioTracks();
+    if (at.length) {
+      const cur = ra.srcObject instanceof MediaStream ? ra.srcObject : null;
+      if (!(cur && at.every(t => cur.getTrackById(t.id)))) {
+        ra.srcObject = new MediaStream(at);
+      }
+      try { ra.muted = false; } catch (_) {}
+      tryPlayWithGesture(ra);
+    }
+  }
+  if (rv) {
+    const vt = remoteStream.getVideoTracks();
+    if (ra) {
+      // 有独立 audio 元素时，video 元素只放视频轨
+      if (vt.length) {
+        const cur = rv.srcObject instanceof MediaStream ? rv.srcObject : null;
+        if (!(cur && vt.every(t => cur.getTrackById(t.id)))) {
+          rv.srcObject = new MediaStream(vt);
+          window.__nsbcRvBound = true;
+        }
+      }
+    } else if (rv.srcObject !== remoteStream) {
+      rv.srcObject = remoteStream;
+      window.__nsbcRvBound = true;
+    }
+    if (rv.srcObject) {  // 没有视频轨时不空调用 play()，避免留下永久 pending
+      try { rv.muted = false; rv.unmute && rv.unmute(); } catch (_) {}
+      tryPlayWithGesture(rv);
+    }
+  }
+}
+
 // ============ PC 装配 ============
 function attachPC(pc, session) {
   if (!pc) return;
@@ -408,14 +454,8 @@ function attachPC(pc, session) {
       remoteStream.addTrack(e.track);
     }
     $('remoteDot').className = 'dot on';
-    // ★ 立即绑 srcObject — 等 connectionState connected 可能因 autoplay 拒掉 play()
-    const rv = $('remoteVideo');
-    if (rv && rv.srcObject !== remoteStream) {
-      rv.srcObject = remoteStream;
-      window.__nsbcRvBound = true;
-      try { rv.muted = false; rv.unmute && rv.unmute(); } catch(_) {}
-      tryPlayWithGesture(rv);
-    }
+    // ★ 立即分流绑定 — 等 connectionState connected 可能因 autoplay 拒掉 play()
+    bindRemoteElements();
   };
 
   pc.ondatachannel = (e) => {
@@ -431,14 +471,9 @@ function attachPC(pc, session) {
       dumpMediaStats(pc, 'connected');
       // ★ Media管道完全就绪后，再统一绑 srcObject + play()
       // 此时 DTLS/SRTP 已建立，Chrome 不会再因内部 load() 打断 play()
-      const rv = $('remoteVideo');
-      if (rv && remoteStream && remoteStream.getTracks().length > 0) {
-        if (!window.__nsbcRvBound) {
-          rv.srcObject = remoteStream;
-          window.__nsbcRvBound = true;
-          log('info', `📺 remoteVideo.srcObject 绑定 (${remoteStream.getTracks().length} tracks)`);
-        }
-        tryPlayWithGesture(rv);
+      if (remoteStream && remoteStream.getTracks().length > 0) {
+        bindRemoteElements();
+        log('info', `📺 远端元素绑定 (${remoteStream.getTracks().length} tracks)`);
       }
     }
     if (st === 'failed' || st === 'disconnected') {
@@ -466,13 +501,7 @@ function attachPC(pc, session) {
         }
       });
       $('remoteDot').className = 'dot on';
-      const rv = $('remoteVideo');
-      if (rv && rv.srcObject !== remoteStream) {
-        rv.srcObject = remoteStream;
-        window.__nsbcRvBound = true;
-        try { rv.muted = false; rv.unmute && rv.unmute(); } catch(_) {}
-        tryPlayWithGesture(rv);
-      }
+      bindRemoteElements();
     }
   }, 10);
 }
@@ -492,6 +521,7 @@ function bindRemoteTracks(pc) {
   }
   if (remoteStream.getTracks().length > 0) {
     $('remoteDot').className = 'dot on';
+    bindRemoteElements();
   }
 }
 
@@ -937,6 +967,7 @@ function onCallEnd(reason) {
 function stopMedia() {
   window.__nsbcRvBound = false;  // Reset，让下次通话能重新绑定 srcObject
   _playingEls.delete($('remoteVideo'));
+  _playingEls.delete($('remoteAudio'));
   _playingEls.delete($('localVideo'));
 
   if (localStream) {
@@ -945,6 +976,7 @@ function stopMedia() {
   }
   if ($('localVideo')) $('localVideo').srcObject = null;
   if ($('remoteVideo')) $('remoteVideo').srcObject = null;
+  if ($('remoteAudio')) $('remoteAudio').srcObject = null;
   remoteStream = null;
   $('localDot').className = 'dot off'; $('remoteDot').className = 'dot off';
 }
