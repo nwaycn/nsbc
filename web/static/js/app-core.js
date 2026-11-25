@@ -1855,7 +1855,23 @@ window.nsbcSnapshot = async function(callId) {
   try {
     const started = await API.post('/calls/' + encodeURIComponent(callId) + '/snapshot', { frames: 1 });
     const jobs = (started && started.jobs) || [];
-    if (!jobs.length) throw new Error('NO_VIDEO');
+    const skipped = (started && started.skipped) || [];
+    const hints = {
+      NO_VIDEO: t('No video on this leg'),
+      NO_KEYFRAME: t('No keyframe received (video peer did not respond to PLI)'),
+      NO_CODEC: t('Video codec has no decoder on this server'),
+      NO_PARAM_SETS: t('No SPS/PPS received for this leg'),
+      DECODE_FAIL: t('Video decode failed'),
+      TIMEOUT: t('No frame captured before timeout'),
+      FETCH_FAIL: t('Failed to download snapshot image'),
+    };
+    const legName = (l) => (l === 0 ? t('A-leg') : (l === 1 ? t('B-leg') : ('leg ' + l)));
+    if (!jobs.length) {
+      if (skipped.length) {
+        throw new Error(skipped.map(s => legName(s.leg) + ': ' + (hints[s.reason] || s.reason)).join('; '));
+      }
+      throw new Error('NO_VIDEO');
+    }
     const pollOneJob = async (job) => {
       let last = 'TIMEOUT';
       for (let i = 0; i < 20; i++) {
@@ -1885,30 +1901,23 @@ window.nsbcSnapshot = async function(callId) {
       } catch (e) { return { job, ok: false, why: 'FETCH_FAIL' }; }
     };
     const results = await Promise.all(jobs.map(pollOneJob));
-    const hints = {
-      NO_VIDEO: t('No video on this call'),
-      NO_KEYFRAME: t('No keyframe received (video peer did not respond to PLI)'),
-      NO_CODEC: t('Video codec has no decoder on this server'),
-      DECODE_FAIL: t('Video decode failed'),
-      TIMEOUT: t('No frame captured before timeout'),
-      FETCH_FAIL: t('Failed to download snapshot image'),
-    };
     const successes = results.filter(r => r.ok);
     const failures = results.filter(r => !r.ok);
+    const badLines = failures.map(r => legName(r.job.leg) + ': ' + (hints[r.why] || r.why))
+      .concat(skipped.map(s => legName(s.leg) + ': ' + (hints[s.reason] || s.reason)));
     if (!successes.length) {
-      const why = failures[0] ? (hints[failures[0].why] || failures[0].why) : 'UNKNOWN';
-      throw new Error(why);
+      throw new Error(badLines.length ? badLines.join('; ') : 'UNKNOWN');
     }
     let html = '';
-    if (failures.length) {
+    if (badLines.length) {
       html += '<div style="font-size:12px;color:#b91c1c;background:#fef2f2;border:1px solid #fecaca;padding:6px 10px;border-radius:4px;margin-bottom:10px">';
-      html += failures.map(r => 'leg ' + r.job.leg + ': ' + (hints[r.why] || r.why)).join('<br>');
+      html += badLines.join('<br>');
       html += '</div>';
     }
     html += '<div style="display:flex;gap:12px;flex-wrap:wrap">';
     html += successes.map(r =>
       '<div style="flex:1;min-width:240px">' +
-      '<div style="font-size:12px;color:#6b7280;margin-bottom:6px">leg ' + r.job.leg + ' \xB7 job ' + r.job.job_id + '</div>' +
+      '<div style="font-size:12px;color:#6b7280;margin-bottom:6px">' + legName(r.job.leg) + ' \xB7 job ' + r.job.job_id + '</div>' +
       '<img src="' + r.dataUrl + '" style="max-width:100%;border-radius:6px">' +
       '</div>'
     ).join('');
