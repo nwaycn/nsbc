@@ -19,17 +19,26 @@ uint64_t nsbc_wall_ms(void) { return nsbc_wall_us() / 1000ULL; }
 int nsbc_wall_iso8601(char *out, size_t outsz)
 {
     struct timespec ts;
-    struct tm tmv;
     clock_gettime(CLOCK_REALTIME, &ts);
-    localtime_r(&ts.tv_sec, &tmv);
-    long off = tmv.tm_gmtoff;
-    char sign = off >= 0 ? '+' : '-';
-    long aoff = off >= 0 ? off : -off;
-    int n = snprintf(out, outsz,
-                     "%04d-%02d-%02dT%02d:%02d:%02d.%03ld%c%02ld:%02ld",
-                     tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
-                     tmv.tm_hour, tmv.tm_min, tmv.tm_sec,
-                     ts.tv_nsec / 1000000L, sign, aoff / 3600,
+    /* P3-17：localtime_r + 日期格式化的结果在同一秒内不变，按线程缓存，
+     * 每次日志只重算毫秒与时区偏移，输出格式与精度完全不变。 */
+    static _Thread_local time_t c_sec;
+    static _Thread_local char   c_prefix[24];  /* "YYYY-MM-DDTHH:MM:SS" */
+    static _Thread_local long   c_off;
+    static _Thread_local char   c_sign;
+    if (ts.tv_sec != c_sec) {
+        struct tm tmv;
+        localtime_r(&ts.tv_sec, &tmv);
+        c_off = tmv.tm_gmtoff;
+        c_sign = c_off >= 0 ? '+' : '-';
+        snprintf(c_prefix, sizeof(c_prefix), "%04d-%02d-%02dT%02d:%02d:%02d",
+                 tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+                 tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+        c_sec = ts.tv_sec;
+    }
+    long aoff = c_off >= 0 ? c_off : -c_off;
+    int n = snprintf(out, outsz, "%s.%03ld%c%02ld:%02ld", c_prefix,
+                     ts.tv_nsec / 1000000L, c_sign, aoff / 3600,
                      (aoff % 3600) / 60);
     return (n > 0 && (size_t)n < outsz) ? NSBC_OK : NSBC_NOMEM;
 }
