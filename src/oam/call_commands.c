@@ -1867,8 +1867,17 @@ static int cmd_snapshot(cmd_ctx_t *c, int argc, char **argv, void *ud)
     for (int k = 0; k < count; ++k) {
         int L = (leg < 0) ? k : leg;
         if (!media_bridge_call_has_video(m, call, L)) {
-            if (leg >= 0)
+            /* leg<0（web 抓图）时回一行 SKIP 给前端，避免"只有单边图"且无解释；
+             * 服务端另留一条日志，区分"该腿没协商视频"与"job 失败"。 */
+            llog(LOG_INFO, "oam",
+                 "snapshot: skip leg=%d call=%s (video_pt_allowed_count=0)",
+                 L, callid);
+            if (leg >= 0) {
                 c->io_printf(c->io_ud, "ERR no video on leg %d\n", L);
+            } else {
+                /* web 一次抓两条腿：把跳过原因回给前端，避免"只有单边图"无解释 */
+                c->io_printf(c->io_ud, "SKIP snapshot leg=%d reason=NO_VIDEO\n", L);
+            }
             continue;
         }
         snapshot_result_t why = SNAPSHOT_OK;
@@ -1877,6 +1886,9 @@ static int cmd_snapshot(cmd_ctx_t *c, int argc, char **argv, void *ud)
         if (id == 0) {
             c->io_printf(c->io_ud, "ERR snapshot %s (leg %d)\n",
                          snapshot_result_name(why), L);
+            if (leg < 0)
+                c->io_printf(c->io_ud, "SKIP snapshot leg=%d reason=%s\n",
+                             L, snapshot_result_name(why));
             continue;
         }
         c->io_printf(c->io_ud, "OK snapshot job=%" PRIu64

@@ -342,12 +342,23 @@ pub struct SnapshotJob {
     pub frames: u32,
 }
 
+/// Leg that could not be captured (no negotiated video / job start failure).
+/// Core emits `SKIP snapshot leg=<n> reason=<NAME>` per leg when leg=-1.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SnapshotSkip {
+    pub leg: i32,
+    pub reason: String,
+}
+
 /// Result of starting snapshot job(s) (V2 §3.4.4, L1 audit). The JPEG is produced
 /// asynchronously; the caller polls `snapshot_status`/`snapshot-status` by job_id or
 /// subscribes to the `SNAPSHOT` event.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct SnapshotStart {
     pub jobs: Vec<SnapshotJob>,
+    /// Legs that were requested but not captured, with the core-side reason.
+    /// Lets the UI show both A-leg and B-leg cards (image or explicit reason).
+    pub skipped: Vec<SnapshotSkip>,
 }
 
 /// Single Leg media plane view (REQ-OBS-010). None = core has no collection source
@@ -1478,6 +1489,7 @@ pub fn parse_hangup(body: &str) -> Result<(), CoreError> {
 /// `ERR snapshot <REASON> (leg N)` / `ERR no video on leg N`.
 pub fn parse_snapshot(body: &str) -> Result<SnapshotStart, CoreError> {
     let mut jobs = Vec::new();
+    let mut skipped = Vec::new();
     let mut last_err: Option<String> = None;
     for raw in body.lines() {
         let line = raw.trim();
@@ -1486,6 +1498,19 @@ pub fn parse_snapshot(body: &str) -> Result<SnapshotStart, CoreError> {
         }
         if line == "ERR notfound" {
             return Err(CoreError::NotFound("call-id not found".into()));
+        }
+        if let Some(rest) = line.strip_prefix("SKIP snapshot ") {
+            let mut leg = -1i32;
+            let mut reason = String::from("UNKNOWN");
+            for tok in rest.split_whitespace() {
+                if let Some(v) = tok.strip_prefix("leg=") {
+                    leg = v.parse().unwrap_or(-1);
+                } else if let Some(v) = tok.strip_prefix("reason=") {
+                    reason = v.to_string();
+                }
+            }
+            skipped.push(SnapshotSkip { leg, reason });
+            continue;
         }
         if let Some(rest) = line.strip_prefix("OK snapshot job=") {
             let mut job_id = 0u64;
@@ -1507,8 +1532,10 @@ pub fn parse_snapshot(body: &str) -> Result<SnapshotStart, CoreError> {
             last_err = Some(msg.trim().to_string());
         }
     }
-    if !jobs.is_empty() {
-        return Ok(SnapshotStart { jobs });
+    /* 双腿都没起来（例如都没协商视频）时也要把 SKIP 明细回给前端，
+     * 否则只剩一条 “ERR no video on any leg”，前端无法说明是哪条腿。 */
+    if !jobs.is_empty() || !skipped.is_empty() {
+        return Ok(SnapshotStart { jobs, skipped });
     }
     if let Some(msg) = last_err {
         return Err(CoreError::CoreRejected(msg));

@@ -237,6 +237,7 @@ async fn snapshot<C: CoreApi + Clone + 'static>(
         "status": "started",
         "call_id": id,
         "jobs": started.jobs,
+        "skipped": started.skipped,
     })))
 }
 
