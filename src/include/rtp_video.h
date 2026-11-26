@@ -43,6 +43,13 @@ int  rtp_h264_depack_feed(rtp_h264_depack_t *d,
                           const uint8_t **au, size_t *au_len,
                           uint32_t *au_ts, int *key);
 
+/* 发送端不打 marker 时的收尾：新 ts 与已累积 AU 的 ts 不同即视为该 AU
+ * 已完整。返回 1=产出 AU（指针仅在下次 feed/flush 前有效），0=无可收尾数据。
+ * 调用方应在 rtp_h264_depack_feed() 之前调用。 */
+int  rtp_h264_depack_flush(rtp_h264_depack_t *d, uint32_t new_ts,
+                           const uint8_t **au, size_t *au_len,
+                           uint32_t *au_ts, int *key);
+
 /* ------------------------------------------------------------------ VP8 */
 typedef struct {
     uint8_t *au;

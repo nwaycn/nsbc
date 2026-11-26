@@ -144,6 +144,30 @@ int rtp_h264_depack_feed(rtp_h264_depack_t *d,
     return 1;
 }
 
+/* 发送端未打 marker 时的收尾：H.264 的 marker 位在部分终端（如 Linphone）
+ * 恒为 0，若只依赖 marker，AU 永远不会交付。时间戳切换即说明上一 AU 结束。 */
+int rtp_h264_depack_flush(rtp_h264_depack_t *d, uint32_t new_ts,
+                          const uint8_t **au, size_t *au_len,
+                          uint32_t *au_ts, int *key)
+{
+    if (!d) return NSBC_INVAL;
+    if (!d->have_ts || d->len == 0 || new_ts == d->ts) return 0;
+    if (d->in_fu) {
+        /* FU-A 分片未收完：该 AU 不完整，丢弃等下一帧 */
+        d->len = 0;
+        d->in_fu = 0;
+        return 0;
+    }
+    au_zero_tail(d->au, d->cap, d->len);
+    *au     = d->au;
+    *au_len = d->len;
+    *au_ts  = d->ts;
+    *key    = rtp_video_is_keyframe(RTP_PAYLOAD_H264, d->au, d->len);
+    d->len  = 0;
+    d->in_fu = 0;
+    return 1;
+}
+
 /* ============================================================================
  * H.265 解包（RFC 7798）
  * ==========================================================================*/

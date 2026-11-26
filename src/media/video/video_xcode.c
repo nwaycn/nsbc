@@ -301,6 +301,27 @@ static int xcode_frame(video_xcode_t *vx, const uint8_t *au, size_t au_len,
     return 0;
 }
 
+/* 完整 AU 的交付：tap 只投递，否则走解码/重编码转发链 */
+static int xcode_deliver_au(video_xcode_t *vx, const uint8_t *au, size_t au_len,
+                            uint32_t au_ts, int key,
+                            video_xcode_emit_fn emit, void *ud)
+{
+    /* 观察模式：直接把源编码 AU 交给 sink，不解码/不重编码 */
+    if (vx->tap) {
+        video_xcode_au_fn afn = __atomic_load_n(&vx->au_fn, __ATOMIC_ACQUIRE);
+        if (afn)
+            afn(__atomic_load_n(&vx->au_ud, __ATOMIC_RELAXED),
+                au, au_len, au_ts, key);
+        /* 首个关键帧之前请求 PLI；之后不再打扰对端 */
+        if (!vx->got_key) {
+            if (key) vx->got_key = 1;
+            else     vx->need_pli = 1;
+        }
+        return 0;
+    }
+    return xcode_frame(vx, au, au_len, au_ts, key, emit, ud);
+}
+
 int video_xcode_input(video_xcode_t *vx,
                       const uint8_t *payload, size_t len,
                       int marker, uint32_t rtp_ts,
@@ -314,6 +335,16 @@ int video_xcode_input(video_xcode_t *vx,
     uint32_t au_ts = 0;
     int key = 0;
     int r;
+
+    /*  H.264 发送端可能不打 marker（Linphone 恒为 0），仅靠 marker 收帧会
+     *  永远拿不到 AU。时间戳切换即上一 AU 结束：先 flush 再喂当前包。 */
+    if (vx->src_kind == 1) {
+        r = rtp_h264_depack_flush(&vx->dep.h264, rtp_ts,
+                                  &au, &au_len, &au_ts, &key);
+        if (r < 0) return r;
+        if (r > 0)
+            (void)xcode_deliver_au(vx, au, au_len, au_ts, key, emit, ud);
+    }
 
     if (vx->src_kind == 1)
         r = rtp_h264_depack_feed(&vx->dep.h264, payload, len, marker, rtp_ts,
@@ -331,21 +362,7 @@ int video_xcode_input(video_xcode_t *vx,
     if (r < 0) return r;
     if (r == 0) return 0;
 
-    /* 观察模式：直接把源编码 AU 交给 sink，不解码/不重编码 */
-    if (vx->tap) {
-        video_xcode_au_fn afn = __atomic_load_n(&vx->au_fn, __ATOMIC_ACQUIRE);
-        if (afn)
-            afn(__atomic_load_n(&vx->au_ud, __ATOMIC_RELAXED),
-                au, au_len, au_ts, key);
-        /* 首个关键帧之前请求 PLI；之后不再打扰对端 */
-        if (!vx->got_key) {
-            if (key) vx->got_key = 1;
-            else     vx->need_pli = 1;
-        }
-        return 0;
-    }
-
-    return xcode_frame(vx, au, au_len, au_ts, key, emit, ud);
+    return xcode_deliver_au(vx, au, au_len, au_ts, key, emit, ud);
 }
 
 /*
