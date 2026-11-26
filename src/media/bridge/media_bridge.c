@@ -397,6 +397,7 @@ struct rtp_relay {
     uint32_t diag_srtp_fail[2];/* 每侧 SRTP unprotect 失败计数 */
     uint32_t diag_vrx[2];      /* 每侧已打印的 VIDEO_RX 条数 */
     uint32_t diag_vrx_nox[2];  /* 视频 PT 到了但没有 vxcode 的计数 */
+    uint32_t diag_vdrop[2];    /* 未协商视频 PT 的丢弃计数（不再按音频透传） */
     uint32_t diag_vsniff[2];   /* 视频载荷指纹采样次数（每侧前 3 包） */
     uint32_t diag_vkf[2];      /* 视频流起始主动请求关键帧的次数 */
     /*  视频 seq 缺口 → 代接收端向源腿补发 PLI（见 relay_recv_one 的
@@ -1939,21 +1940,30 @@ packet_ready:
                     ++r->diag_vsniff[side];
                 }
                 if (!is_vpt && r->node->neg_v_valid && pkt.pt >= 96 &&
-                    pkt.pt != r->node->dtmf_pt[side] && pkt.payload_len > 200) {
-                    /*  信令 answer 与实际发送 PT 不一致时（浏览器客户端白名单
-                     *  删码但内部仍发原 PT），只做诊断计数，不贸然转码——
-                     *  把未知编码喂给固定编码的解码器会污染输出。
-                     *  根因修复在 web 端 VIDEO_KEEP_MAIN。
-                     *  注：这种情况下若对端也接受该 PT，包会按原 PT 透传
-                     *  （下方 out_vid 判定），并不是丢弃。 */
+                    pkt.pt != r->node->dtmf_pt[side] && pkt.payload_len > 200 &&
+                    !pt_in_list((uint8_t)pkt.pt, r->node->audio_pt[side],
+                                r->node->audio_n[side])) {
+                    /*  信令协商的视频 PT 与实际发送 PT 不一致。以前只做诊断、
+                     *  继续往下走"原样转发"：但此时该 PT 不在目标腿的视频表里，
+                     *  out_vid=0，包会按音频流发到目标腿的音频端口（或音频 latch），
+                     *  对端按未协商 PT 丢弃，同时还污染音频流。
+                     *  改为直接丢弃：等对端按当前 SDP 的 PT 重发。
+                     *  （正常协商下 video_pt_allowed 与对端 answer 一致，不会命中这里。） */
                     if (r->diag_vrx_nox[side] < 3 ||
                         r->diag_vrx_nox[side] % 500 == 0)
                         llog(LOG_WARN, "relay",
                              "VIDEO_PT_MISMATCH side=%d pt=%u len=%zu "
-                             "allowed_count=%d（信令与实际 PT 不一致，不转码/按原 PT 透传）",
+                             "allowed_count=%d（信令与实际 PT 不一致，丢弃）",
                              side, (unsigned)pkt.pt, pkt.payload_len,
                              r->node->video_pt_allowed_count[side]);
                     ++r->diag_vrx_nox[side];
+                    if (r->diag_vdrop[side] < 3 || r->diag_vdrop[side] % 500 == 0)
+                        llog(LOG_WARN, "relay",
+                             "VIDEO_PT_DROP side=%d pt=%u len=%zu ssrc=0x%08x "
+                             "（未协商的视频 PT，不落到音频路径）",
+                             side, (unsigned)pkt.pt, pkt.payload_len, pkt.ssrc);
+                    ++r->diag_vdrop[side];
+                    continue;
                 }
                 if (vx && is_vpt) {
                     if (r->diag_vrx[side] < 5 || r->diag_vrx[side] % 500 == 0)
@@ -6621,26 +6631,17 @@ int bridge_answer_hook(void *call, const char *in, size_t inlen,
             int va_ok = sdp_video_select(e->a_offer_sdp, e->a_offer_len, &va);
             int vb_ok = sdp_video_select(in, inlen, &vb);
             if (va_ok && va.port > 0 && vb_ok && vb.port > 0) {
-                /*  浏览器端白名单会改写 answer 的 SDP 文本：它删掉 offer 里
-                 *  它实际仍在发送的 PT（实测 offer "96 97 98"=VP8/H264/VP9，
-                 *  answer 文本只剩 "97 98"=H264/VP9，而 Chrome 实际仍按
-                 *  offer 首项 96(VP8) 发流）。
-                 *  若按 answer 的 PT/codec 定计划，会建出永不命中的
-                 *  video_xcode(H264 97→VP8 96)，并把 96 判成"未协商 PT"
-                 *  原样透传。判定：answer 的视频 PT 不在 offer 视频 fmt-list
-                 *  里 → 回退为 offer 侧 codec/PT（同 codec 同 PT，纯透传）。 */
-                sdp_xc_mline_t ovm;
-                int in_offer = 0;
-                sdp_xc_parse(e->a_offer_sdp, e->a_offer_len, SDP_M_VIDEO, &ovm);
-                for (int i = 0; i < ovm.n; ++i)
-                    if (ovm.c[i].pt == vb.pt) { in_offer = 1; break; }
-                if (!in_offer) {
-                    llog(LOG_WARN, "media",
-                         "answer_hook: video B pt=%u 不在 offer fmt-list → "
-                         "回退 offer codec %s(pt=%d)（answer 文本被客户端改写）",
-                         (unsigned)vb.pt, va.enc, va.pt);
-                    vb = va;
-                }
+                /*  以 B 的 answer 为权威：answer 里的 PT/codec 就是对端实际
+                 *  收发视频用的 PT。SBC 在发往 B 的 offer 里追加过 VP8/VP9
+                 *  候选（sdp_xc_add_offer_audio），浏览器合法地挑这些 PT 时
+                 *  answer 只剩 97/98，这是 RFC 3264 允许的 fmt 子集，不是
+                 *  "客户端改写 answer 文本"。
+                 *  旧逻辑拿 A 的原始 offer 校验 answer PT，一旦浏览器选了
+                 *  追加候选就回退成 A 侧 codec，两腿 codec 不同却又不建转码：
+                 *  A 发的 H264 以 PT=96 到 B（answer 里没 96）被丢，B 发的
+                 *  VP8/97 原样到 A（只认 96）也被丢 → 视频双向全黑。
+                 *  现在按 answer 定 B 腿，A/B codec 不同由下面的 video_xcode
+                 *  （H264↔VP8/VP9）转码。 */
                 e->neg_v_a_pt  = (uint8_t)va.pt;
                 e->neg_v_a_cid = va.cid;
                 e->neg_v_b_pt  = (uint8_t)vb.pt;
